@@ -10800,6 +10800,17 @@ pub fn run_tui(
             // while the user is typing in a pane.
             if action.is_none() && !is_ctrl_c {
                 action = global_action_for_mode(&kb, ui.mode, &key);
+                // PRD #336: ToggleOrchestrationSplit is scoped to orchestration
+                // tabs only. global_action_for_mode has no tab context, so a
+                // Ctrl+l typed into a Dashboard/Mode-tab pane would otherwise be
+                // claimed here and never reach the PTY (breaking readline's
+                // clear-screen). Un-resolve it on any other tab so the key
+                // falls through to the normal PaneInput forwarding path.
+                if matches!(action, Some(Action::ToggleOrchestrationSplit))
+                    && !matches!(tab_manager.active_tab(), Tab::Orchestration { .. })
+                {
+                    action = None;
+                }
             }
 
             // Tab cycling in Normal mode: move_left/move_right (defaults h/l)
