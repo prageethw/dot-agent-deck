@@ -29,21 +29,29 @@ fn has_collapsed_frame(grid: &str, role: &str) -> bool {
         .any(|line| line.trim_start().starts_with(&prefix))
 }
 
+/// Escape `s` as a single POSIX shell word using the standard single-quote
+/// idiom (close the quote, emit an escaped literal `'`, reopen the quote), so
+/// an embedded build path containing shell metacharacters can't be
+/// misinterpreted by the `/bin/sh` script it's spliced into.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Overwrite the fixture's `beta-agent.sh` placeholder with the ABSOLUTE path
 /// of the freshly built test binary baked in (mirrors `write_card_agent` in
 /// `e2e_dashboard_selection.rs`), rather than relying on `dot-agent-deck`
 /// resolving correctly on PATH — a dev machine may have a separately
 /// installed `dot-agent-deck` shadowing the build under test.
 fn write_beta_agent(deck: &TuiDeck) {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let body = format!(
         "#!/bin/sh\n\
          printf 'BETA_ROLE_SENTINEL\\n'\n\
          printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"beta-sess\"}}' \\\n\
-         | \"{bin}\" hook --agent claude-code >/dev/null 2>&1\n\
+         | {bin} hook --agent claude-code >/dev/null 2>&1\n\
          sleep 1\n\
          printf '%s' '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"beta-sess\",\"tool_name\":\"Bash\"}}' \\\n\
-         | \"{bin}\" hook --agent claude-code >/dev/null 2>&1\n\
+         | {bin} hook --agent claude-code >/dev/null 2>&1\n\
          sleep 600\n"
     );
     let path = deck.workdir().join("beta-agent.sh");
