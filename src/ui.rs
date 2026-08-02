@@ -21374,6 +21374,165 @@ mod tests {
         );
     }
 
+    /// Scenario: PRD #336 spawn-order regression. Dispatch the real
+    /// `Action::SpawnPane` to open orchestration tab A at the default split,
+    /// dispatch `Action::ToggleOrchestrationSplit` to narrow it, then
+    /// manually set `ACTIVE_ORCHESTRATION_SPLIT_NARROW` to simulate the
+    /// render loop syncing it from the now-narrow, still-active tab A —
+    /// exactly what happens on the frame between the toggle and a
+    /// follow-up spawn. Dispatch a second `Action::SpawnPane` to open a
+    /// brand-new orchestration tab B and assert two things: B's own
+    /// `split_narrow` field defaults to `false` (per-tab STATE is
+    /// correctly isolated), and B's role panes' recorded
+    /// `AgentSpawnOptions::cols` match A's initial (default-split) cols —
+    /// because both tabs were opened untoggled, they must agree. A spawn-
+    /// order bug in `orchestration_role_pane_dims` (which reads the stale
+    /// thread-local instead of B's own default state) makes B's cols equal
+    /// the NARROW-derived width instead, since the render loop hasn't had a
+    /// chance to resync the thread-local for B yet.
+    #[spec("orchestration/layout/003")]
+    #[test]
+    fn layout_003_new_orchestration_tab_spawns_at_default_split_even_when_another_tab_is_narrow() {
+        // Clean slate: don't rely on test-execution order for this shared
+        // thread-local (layout_002 resets it, but tests can interleave on
+        // the same worker thread).
+        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(false));
+
+        fn orch_config(name: &str) -> OrchestrationConfig {
+            OrchestrationConfig {
+                name: name.to_string(),
+                roles: vec![
+                    OrchestrationRoleConfig {
+                        name: "orchestrator".to_string(),
+                        command: "cat".to_string(),
+                        start: true,
+                        description: None,
+                        prompt_template: None,
+                        clear: false,
+                    },
+                    OrchestrationRoleConfig {
+                        name: "worker".to_string(),
+                        command: "cat".to_string(),
+                        start: false,
+                        description: None,
+                        prompt_template: None,
+                        clear: false,
+                    },
+                ],
+            }
+        }
+
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // Spawn orchestration tab A at the default (untoggled) split.
+        let req_a = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "tab-a".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(orch_config("tab-a")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req_a)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+
+        // Toggle tab A (now active) to the narrow 25/75 split.
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationSplit,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        match tm.active_tab() {
+            Tab::Orchestration { split_narrow, .. } => {
+                assert!(*split_narrow, "tab A should be narrow after the toggle")
+            }
+            _ => panic!("expected orchestration tab A to be active"),
+        }
+        // Simulate the render loop's per-frame sync (src/ui.rs, the
+        // `ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(*split_narrow))`
+        // line in the `Tab::Orchestration` arm of the tab_view match): with
+        // tab A active and narrow, the very next frame sets this thread-
+        // local to `true` — BEFORE a follow-up `Action::SpawnPane` dispatch
+        // (below) gets a chance to open tab B.
+        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(true));
+
+        // Spawn a brand-new orchestration tab B. Internally this reaches
+        // `orchestration_role_pane_dims`, which reads the thread-local set
+        // above while sizing B's role panes.
+        let req_b = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "tab-b".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(orch_config("tab-b")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req_b)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+
+        // Reset the thread-local BEFORE asserting so a failing assertion
+        // still leaves it clean for a later test on this worker thread.
+        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(false));
+
+        // Per-tab STATE isolation: B's own `split_narrow` field must default
+        // to `false` regardless of A's toggled state.
+        match tm.active_tab() {
+            Tab::Orchestration { split_narrow, .. } => assert!(
+                !*split_narrow,
+                "tab B's own split_narrow field must default to false, \
+                 independent of tab A's toggled state"
+            ),
+            _ => panic!("expected orchestration tab B to be active"),
+        }
+
+        // Per-tab PTY-SIZING isolation (the spawn-order bug): A and B were
+        // both spawned at the default (untoggled) state, so their role
+        // panes' recorded `cols` must match. A's 2 roles are recorded
+        // first, B's 2 roles second.
+        let cols = pc.recorded_spawn_cols();
+        assert_eq!(cols.len(), 4, "expected 2 role panes each for tabs A and B");
+        let (cols_a, cols_b) = (&cols[0..2], &cols[2..4]);
+        assert_eq!(
+            cols_b, cols_a,
+            "tab B's role panes should spawn at the SAME default-split \
+             width as tab A's did (both opened untoggled) — got B={cols_b:?} \
+             vs A={cols_a:?}; B was sized using tab A's stale narrow (25/75) \
+             ACTIVE_ORCHESTRATION_SPLIT_NARROW thread-local because \
+             orchestration_role_pane_dims reads it before the render loop \
+             has a chance to resync it for the newly-spawned tab"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Bell transition detection tests
     // -----------------------------------------------------------------------
@@ -24238,6 +24397,12 @@ mod tests {
         next: std::sync::Mutex<u32>,
         memberships: std::sync::Mutex<Vec<Option<TabMembership>>>,
         agent_generation: std::sync::Mutex<String>,
+        /// PRD #336 spawn-order regression (`orchestration/layout/003`): the
+        /// `AgentSpawnOptions::cols` recorded for every
+        /// `create_pane_with_options` call, in call order — lets a test
+        /// correlate each role pane's initial PTY width with the tab it
+        /// belongs to.
+        spawn_cols: std::sync::Mutex<Vec<u16>>,
     }
 
     impl CapturingPaneController {
@@ -24246,6 +24411,7 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 memberships: std::sync::Mutex::new(Vec::new()),
                 agent_generation: std::sync::Mutex::new("original".to_string()),
+                spawn_cols: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -24261,6 +24427,11 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        /// See `spawn_cols` field doc.
+        fn recorded_spawn_cols(&self) -> Vec<u16> {
+            self.spawn_cols.lock().unwrap().clone()
         }
 
         fn rebind_agents(&self) {
@@ -24279,6 +24450,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(opts.tab_membership.clone());
+            self.spawn_cols.lock().unwrap().push(opts.cols);
             let mut n = self.next.lock().unwrap();
             let id = format!("pane-{n}");
             *n += 1;

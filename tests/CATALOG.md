@@ -2012,6 +2012,13 @@ without depending on the config struct API.
 - **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/006`); per-tab scoping across multiple orchestration tabs; the second-press round-trip back to 34/66 (covered by `tabs/orchestration/006`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/layout/003 — A brand-new orchestration tab spawns its role panes at the default 34/66 split even when another already-open orchestration tab is toggled to the narrow 25/75 split (PRD #336 spawn-order regression).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** dispatch `Action::SpawnPane` to open orchestration tab A at the default split, dispatch `Action::ToggleOrchestrationSplit` to narrow it, then set `ACTIVE_ORCHESTRATION_SPLIT_NARROW` to simulate the render loop syncing it from the now-narrow, still-active tab A (the state a follow-up spawn would observe before the next frame runs); dispatch a second `Action::SpawnPane` to open a brand-new orchestration tab B. B's own `split_narrow` field defaults to `false` (per-tab STATE is correctly isolated); B's role panes' recorded `AgentSpawnOptions::cols` must equal A's initial (default-split) cols, since both tabs were opened untoggled. Catches the case where `orchestration_role_pane_dims` sizes B's role panes using the stale `ACTIVE_ORCHESTRATION_SPLIT_NARROW` thread-local left over from tab A instead of B's own default state.
+- **Does not assert:** the visible rendered grid or a live render-loop resync (the thread-local's post-spawn correction on the next frame is out of scope — this test pins the SPAWN-TIME dims only); mode or dashboard tabs (unaffected by this thread-local).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
