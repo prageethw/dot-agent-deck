@@ -1988,8 +1988,9 @@ fn right_column_pane_dims(
 
 /// Dashboard pane: right 67% of width, height divided across `pane_count`
 /// panes per the active `PaneLayout`. `is_focused` matters in `Stacked`
-/// mode (focused gets the lion's share, unfocused collapse to a 1-row
-/// title bar); in `Tiled` it's ignored. `show_tab_bar` matches
+/// mode (PRD #311: the focused pane fills the whole column, unfocused
+/// panes reserve zero rows — this helper returns a zero-row chunk for
+/// them); in `Tiled` it's ignored. `show_tab_bar` matches
 /// `TabManager::show_tab_bar` and adds 1 row of chrome.
 pub(crate) fn dashboard_pane_dims(
     area: Rect,
@@ -2014,8 +2015,9 @@ pub(crate) fn dashboard_pane_dims(
 /// gutter), height divided across `role_count` role panes per `layout`.
 ///
 /// `role_index` matters only in `Stacked` mode, where role 0 is the
-/// expanded slot and every other role collapses to a 1-row title bar —
-/// mirroring the renderer's "expand the first slot if nothing is
+/// expanded slot (PRD #311: it fills the whole column and every other
+/// role reserves zero rows — this helper returns a zero-row chunk for
+/// them) — mirroring the renderer's "expand the first slot if nothing is
 /// focused" fallback (see `render_terminal_panes` Stacked branch). In
 /// `Tiled` mode `role_index` is ignored (height divides equally).
 ///
@@ -11243,8 +11245,9 @@ fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Opti
 /// exactly how `render_terminal_panes` lays panes out for the given
 /// `PaneLayout` and resolved focus. Single source of truth so the layout pass
 /// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
-/// `Tiled`: equal vertical division. `Stacked`: the expanded slot fills, every
-/// other pane collapses to a 1-row title bar.
+/// `Tiled`: equal vertical division. `Stacked` (PRD #311): the expanded slot
+/// fills the whole area and every other pane reserves zero rows (`Length(0)`) —
+/// it is not drawn at all, rather than collapsing to a 1-row title bar.
 fn pane_stack_rects(
     area: Rect,
     pane_ids: &[String],
@@ -11287,9 +11290,11 @@ fn pane_stack_rects(
 /// orchestration role transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
 ///
-/// A pane whose target inner area has a zero dimension (a collapsed Stacked
-/// slot, or a viewport too small for the border) is skipped — matching the old
-/// helpers' `rows > 0 && cols > 0` guard. `resize_pane_pty` is the one resize
+/// A pane whose target inner area has a zero dimension (a `Tiled` pane with no
+/// room, or a viewport too small for the border) is skipped — matching the old
+/// helpers' `rows > 0 && cols > 0` guard. A non-focused `Stacked` pane is NOT a
+/// zero case here: `pane_target_dims` sizes it as if focused (PRD #311), so it
+/// keeps a stable PTY size even while undrawn. `resize_pane_pty` is the one resize
 /// primitive and handles local vs stream-backed panes itself (stream panes
 /// coalesce to the daemon; see `embedded_pane.rs`), so no per-backend
 /// special-casing is needed here.
@@ -15690,10 +15695,14 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_pane_dims_stacked_unfocused_collapses_to_title_bar() {
-        // Unfocused in stacked mode: chunk = 1; rows = saturating_sub(2) = 0.
-        // `resize_pane_pty` callers gate on rows > 0, so this just signals
-        // "don't bother dispatching a resize for this pane right now."
+    fn dashboard_pane_dims_stacked_unfocused_reserves_zero_rows() {
+        // PRD #311: a non-focused Stacked pane is not drawn and reserves zero
+        // rows (no collapsed title bar). This spawn-path helper mirrors that by
+        // returning a zero-row chunk for the unfocused case: chunk = 1; rows =
+        // saturating_sub(2) = 0. Spawn-time resize callers gate on rows > 0, so
+        // this just signals "don't dispatch a resize for this pane right now";
+        // the per-frame `resize_panes_to_layout` pass later sizes the pane's PTY
+        // as if focused (see `FrameLayout::pane_target_dims`).
         let (rows, _cols) = dashboard_pane_dims(
             Rect::new(0, 0, 100, 30),
             3,
@@ -15769,9 +15778,9 @@ mod tests {
         // In Stacked mode with no focused role, role_index 0 mirrors
         // the renderer's "expand the first slot if nothing is focused"
         // fallback (see `render_terminal_panes` Stacked branch). Role
-        // 0 gets the lion's share; others collapse to the 1-row
-        // sentinel that resize callers gate on (`rows > 0` skips the
-        // resize).
+        // 0 fills the whole column; others reserve zero rows (PRD #311),
+        // so this helper returns the zero-row sentinel that spawn-time
+        // resize callers gate on (`rows > 0` skips the resize).
         let area = Rect::new(0, 0, 100, 30);
         let (rows_focused, _) =
             orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false);
