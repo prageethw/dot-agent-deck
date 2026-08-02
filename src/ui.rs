@@ -21266,13 +21266,15 @@ mod tests {
     /// (`ORCHESTRATION_LEFT_PERCENT` / `ORCHESTRATION_PANES_PERCENT`) to a
     /// narrower-sidebar 25/75. Resolve a simulated Ctrl+l `KeyEvent` through
     /// `key_action_for_mode` — the exact `KeyEvent -> Action` seam the live
-    /// event loop uses (per its own doc comment, PRD #241 M1) — and recompute
-    /// the orchestration tab's frame geometry via `compute_frame_layout`, the
-    /// single per-frame layout pass `render_frame` and the pre-draw PTY-resize
-    /// pass both read. Today Ctrl+l is not in the `ACTIONS` default table (PRD
-    /// #336's own verification), so `key_action_for_mode` resolves no Action
-    /// and the geometry is unchanged from the 34/66 default — this test pins
-    /// the intended post-toggle 25/75 geometry and fails on both counts.
+    /// event loop uses (per its own doc comment, PRD #241 M1) — confirming it
+    /// now resolves a split-toggle Action, then simulate the resulting
+    /// dispatch + render-sync (out of scope for this pure-geometry test) by
+    /// setting the `ACTIVE_ORCHESTRATION_SPLIT_NARROW` thread-local directly,
+    /// and recompute the orchestration tab's frame geometry via
+    /// `compute_frame_layout`, the single per-frame layout pass `render_frame`
+    /// and the pre-draw PTY-resize pass both read, pinning the post-toggle
+    /// 25/75 geometry. Full end-to-end dispatch coverage lives in the L2
+    /// test, tabs/orchestration/006.
     #[spec("orchestration/layout/002")]
     #[test]
     fn layout_002_ctrl_l_toggles_orchestration_split_narrow() {
@@ -21321,13 +21323,21 @@ mod tests {
         assert!(
             action.is_some(),
             "Ctrl+l should resolve to a split-toggle Action on an orchestration \
-             tab; got None — Ctrl+l is not yet registered in the ACTIONS table"
+             tab; got None — Ctrl+l is missing from the ACTIONS table"
         );
 
-        // Recompute the same geometry after the (today, no-op) keypress. There
-        // is no per-tab ratio state yet for a toggle to flip, so this is
-        // identical to `before` — the narrow 25/75 split this test pins
-        // never materializes.
+        // `key_action_for_mode` is a pure KeyEvent -> Action resolver with no
+        // side effects, so the toggle itself (flipping the active tab's real
+        // `Tab::Orchestration::split_narrow` field via `dispatch_action`) and
+        // the render-time sync of that field into
+        // `ACTIVE_ORCHESTRATION_SPLIT_NARROW` (the thread-local
+        // `compute_frame_layout` reads) are both out of scope for this pure-
+        // geometry L1 test. Set the thread-local directly to simulate what
+        // that dispatch + render-sync would have produced. Does not assert
+        // dispatch or the per-tab field itself — full end-to-end coverage of
+        // that path lives in the L2 test, tabs/orchestration/006.
+        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(true));
+
         let after = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -21337,6 +21347,10 @@ mod tests {
             None,
             1,
         );
+        // Reset immediately so a later test on this worker thread never
+        // observes a leaked `true` from this one.
+        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(false));
+
         let FrameContent::Cards {
             dashboard_area: after_dashboard,
             panes_area: after_panes,
