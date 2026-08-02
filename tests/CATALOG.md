@@ -1088,6 +1088,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/006 — `Ctrl+l` toggles an orchestration tab's sidebar/pane-column split between the default 34/66 and a narrower-sidebar 25/75, and back on a second press (PRD #336).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** opening a real orchestration tab renders the pane column's left edge at the default 34%-width boundary; pressing `Ctrl+l` moves that boundary to the narrower-sidebar 25%-width position (sidebar visibly narrows, pane column visibly widens); a second `Ctrl+l` restores the original 34%-width boundary.
+- **Does not assert:** per-tab scoping across multiple open orchestration tabs (out of scope for this entry — PRD #336 scope note); persistence of the toggled state across restart (explicitly out of scope per the PRD); remapping the chord via config.
+- **Platform coverage:** mac+linux.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
@@ -1996,6 +2003,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** in the ~34%-width single-column orchestration card area at a typical ~48-row card height, the renderer's `visible_rows = available / card_height` fits all 7 decks with no scrolling and the 7th deck actually renders in the visible slice; a much larger deck count (20) still engages scrolling, so right-sizing the card height does not remove the scroll fallback.
 - **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/002 — `Ctrl+l` resolves to a split-toggle `Action` on an orchestration tab, and the toggled geometry is the narrower-sidebar 25/75 split (PRD #336).
+- **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** an orchestration tab's default frame geometry is the fixed 34/66 split (`dashboard_area` / `panes_area` widths); resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Some` action; the frame geometry recomputed after the keypress is the narrower-sidebar 25/75 split.
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/006`); per-tab scoping across multiple orchestration tabs; the second-press round-trip back to 34/66 (covered by `tabs/orchestration/006`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/route

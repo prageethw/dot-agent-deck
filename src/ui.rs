@@ -21196,6 +21196,105 @@ mod tests {
         );
     }
 
+    /// Scenario: PRD #336 — pressing Ctrl+l on an orchestration tab should
+    /// toggle the sidebar/pane-column split from the default 34/66
+    /// (`ORCHESTRATION_LEFT_PERCENT` / `ORCHESTRATION_PANES_PERCENT`) to a
+    /// narrower-sidebar 25/75. Resolve a simulated Ctrl+l `KeyEvent` through
+    /// `key_action_for_mode` — the exact `KeyEvent -> Action` seam the live
+    /// event loop uses (per its own doc comment, PRD #241 M1) — and recompute
+    /// the orchestration tab's frame geometry via `compute_frame_layout`, the
+    /// single per-frame layout pass `render_frame` and the pre-draw PTY-resize
+    /// pass both read. Today Ctrl+l is not in the `ACTIONS` default table (PRD
+    /// #336's own verification), so `key_action_for_mode` resolves no Action
+    /// and the geometry is unchanged from the 34/66 default — this test pins
+    /// the intended post-toggle 25/75 geometry and fails on both counts.
+    #[spec("orchestration/layout/002")]
+    #[test]
+    fn layout_002_ctrl_l_toggles_orchestration_split_narrow() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let tab_view = ActiveTabView::Orchestration {
+            role_pane_ids: role_pane_ids.clone(),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orchestration".into()],
+            active_index: 0,
+        };
+
+        let before = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &role_pane_ids,
+            PaneLayout::Tiled,
+            None,
+            1,
+        );
+        let FrameContent::Cards {
+            dashboard_area: before_dashboard,
+            panes_area: before_panes,
+            ..
+        } = before.content
+        else {
+            panic!("Orchestration tab must produce FrameContent::Cards");
+        };
+        // Sanity: today's fixed default is the 34/66 split (34% of the 100-wide
+        // frame_area, matching ORCHESTRATION_LEFT_PERCENT / _PANES_PERCENT).
+        assert_eq!(before_dashboard.width, 34);
+        assert_eq!(
+            before_panes.expect("role panes => a right column").width,
+            66
+        );
+
+        // Simulate the Ctrl+l keypress through the SAME KeyEvent -> Action
+        // resolver the live loop calls (PRD #241 M1's `key_action_for_mode`),
+        // with the default keybinding config (no user remap involved).
+        let kb = KeybindingConfig::default();
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let action = key_action_for_mode(&kb, UiMode::Normal, &ctrl_l);
+        assert!(
+            action.is_some(),
+            "Ctrl+l should resolve to a split-toggle Action on an orchestration \
+             tab; got None — Ctrl+l is not yet registered in the ACTIONS table"
+        );
+
+        // Recompute the same geometry after the (today, no-op) keypress. There
+        // is no per-tab ratio state yet for a toggle to flip, so this is
+        // identical to `before` — the narrow 25/75 split this test pins
+        // never materializes.
+        let after = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &role_pane_ids,
+            PaneLayout::Tiled,
+            None,
+            1,
+        );
+        let FrameContent::Cards {
+            dashboard_area: after_dashboard,
+            panes_area: after_panes,
+            ..
+        } = after.content
+        else {
+            panic!("Orchestration tab must produce FrameContent::Cards");
+        };
+        assert_eq!(
+            after_dashboard.width, 25,
+            "sidebar should narrow to 25% width after Ctrl+l toggles the \
+             orchestration split; got {} (still the 34/66 default)",
+            after_dashboard.width
+        );
+        assert_eq!(
+            after_panes.expect("role panes => a right column").width,
+            75,
+            "pane column should widen to 75% width after Ctrl+l toggles the \
+             orchestration split; got {:?}",
+            after_panes.map(|r| r.width)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Bell transition detection tests
     // -----------------------------------------------------------------------
