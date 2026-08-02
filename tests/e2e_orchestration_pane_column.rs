@@ -29,6 +29,19 @@ fn has_collapsed_frame(grid: &str, role: &str) -> bool {
         .any(|line| line.trim_start().starts_with(&prefix))
 }
 
+/// A sidebar deck card's title row (`render_session_card` in `src/ui.rs`)
+/// carries the role's display name and its live status word on the SAME
+/// rendered line, joined by the card's `\u{00b7}` separator (`" \u{00b7} {name} "`
+/// on the left, `" {dot} {status} "` on the right of the same `Block`). Search
+/// for `"\u{00b7} {role}"` plus `status` together on one line so the check is
+/// scoped to `role`'s own card rather than any occurrence of `status`
+/// anywhere on the settled grid (e.g. another role's card, or pane content).
+fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
+    let role_needle = format!("\u{00b7} {role}");
+    grid.lines()
+        .any(|line| line.contains(&role_needle) && line.contains(status))
+}
+
 /// Escape `s` as a single POSIX shell word using the standard single-quote
 /// idiom (close the quote, emit an escaped literal `'`, reopen the quote), so
 /// an embedded build path containing shell metacharacters can't be
@@ -111,7 +124,7 @@ fn orchestration_006_stacked_pane_column_hides_collapsed_frames_while_agents_sta
     // events, while its pane is not the expanded/focused slot.
     assert!(
         common::wait_until(Duration::from_secs(15), || {
-            deck.snapshot_grid().contains("Working")
+            has_role_status(&deck.snapshot_grid(), "beta", "Working")
         }),
         "the non-focused beta role's sidebar status never transitioned to \
          Working while its pane was collapsed/not drawn:\n{}",
