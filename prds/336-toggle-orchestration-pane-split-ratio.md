@@ -1,6 +1,6 @@
 # PRD #336: Toggle orchestration pane-column split ratio
 
-**Status**: Not started
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-08-03
 
@@ -51,12 +51,12 @@ None. This is TUI-side rendering state, no daemon protocol, no hooks, no orchest
 
 ## Milestones
 
-- [ ] **M1 — Per-tab split-ratio state added.** A field tracking narrow/default state exists per orchestration tab, defaulting to the 34/66 ratio.
-- [ ] **M2 — Toggle action wired.** New `Action` registered with default chord `Ctrl+l`; pressing it in an orchestration tab flips the tab's ratio state.
-- [ ] **M3 — Layout call sites resolve the active ratio.** The three `ORCHESTRATION_LEFT_PERCENT`/`ORCHESTRATION_PANES_PERCENT` call sites use the per-tab state instead of the fixed constants.
-- [ ] **M4 — L1 snapshot coverage.** `insta` render tests pin both ratio states' geometry for an orchestration tab, per CLAUDE.md rule 4.
-- [ ] **M5 — L2 coverage.** A vt100 test drives a real orchestration tab, toggles the chord, and asserts the visible column-width change and the round-trip back to default.
-- [ ] **M6 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with the new binding; changelog fragment added.
+- [x] **M1 — Per-tab split-ratio state added.** A field tracking narrow/default state exists per orchestration tab, defaulting to the 34/66 ratio.
+- [x] **M2 — Toggle action wired.** New `Action` registered with default chord `Ctrl+l`; pressing it in an orchestration tab flips the tab's ratio state.
+- [x] **M3 — Layout call sites resolve the active ratio.** The three `ORCHESTRATION_LEFT_PERCENT`/`ORCHESTRATION_PANES_PERCENT` call sites use the per-tab state instead of the fixed constants.
+- [x] **M4 — L1 snapshot coverage.** `insta` render tests pin both ratio states' geometry for an orchestration tab, per CLAUDE.md rule 4.
+- [x] **M5 — L2 coverage.** A vt100 test drives a real orchestration tab, toggles the chord, and asserts the visible column-width change and the round-trip back to default.
+- [x] **M6 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with the new binding; changelog fragment added.
 
 ## Risks
 
@@ -73,3 +73,7 @@ None. This is TUI-side rendering state, no daemon protocol, no hooks, no orchest
 ### 2026-08-03 — Created
 
 Split out of the "1/3 vs 1/4 sidebar width" ask as a quick, scoped toggle. Distinct from #312 (retiring the global layout toggle) and #313 (full zoom) — this is a narrower, additive keybinding on the same layout seam.
+
+### 2026-08-03 — M1-M6 complete
+
+Per-tab split state, the `toggle_orchestration_split` action (default `Ctrl+l`), and the three `ui.rs` call sites all landed with L1 (`orchestration/layout/002`) and L2 (`tabs/orchestration/006`) coverage green. Docs (`docs/keyboard-shortcuts.md`) and the changelog fragment (`changelog.d/336.feature.md`) close out M6 — implementation complete.
