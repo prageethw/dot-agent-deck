@@ -44,7 +44,7 @@ Once the dashboard is running, press `?` inside the app to see all shortcuts. Th
 Running `dot-agent-deck` opens a two-column layout with native embedded terminal panes:
 
 - **Left (1/3)** — the dashboard, displaying a card grid of agent sessions
-- **Right (2/3)** — agent panes where Claude Code, OpenCode, Pi, or Codex instances run (stacked by default, toggle to tiled with `Ctrl+t`)
+- **Right (2/3)** — agent panes where Claude Code, OpenCode, Pi, or Codex instances run (stacked by default — only the focused pane is shown, at full height; toggle to tiled with `Ctrl+t` to see every pane at once)
 
 ![Two-column layout showing the dashboard card on the left and a Claude Code agent pane on the right](./img/getting-started-launching.jpg)
 

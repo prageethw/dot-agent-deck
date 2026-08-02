@@ -22,7 +22,7 @@ All the keyboard shortcuts below continue to work unchanged.
 |---|---|---|
 | `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
-| `Ctrl+T` | Toggle stacked / tiled layout | Any mode |
+| `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 
 ### `Ctrl+W` closes only from command mode
