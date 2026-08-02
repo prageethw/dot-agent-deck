@@ -15931,6 +15931,114 @@ mod tests {
         );
     }
 
+    /// Scenario: Render a 7-role Orchestration tab (mirroring issue #307's
+    /// `orchestrator`/`developer`/`tester`/`reviewer`/`releaser`/`researcher`/
+    /// `documenter` roster) in `PaneLayout::Stacked` through the real
+    /// `compute_frame_layout` + `render_frame` path into a `TestBackend`, with
+    /// no pane explicitly focused (so the first role, `orchestrator`, is the
+    /// resolved expanded slot per `stacked_expanded_index`'s fallback). Assert
+    /// (1) the expanded role's rect height equals the FULL pane-column height —
+    /// no rows ceded to collapsed frames — and (2) none of the other six
+    /// roles' pane ids appear anywhere in the rendered grid, i.e. no collapsed
+    /// `Borders::TOP` title block is drawn for a non-focused pane. PRD #311:
+    /// today `pane_stack_rects` reserves a 1-row title bar per non-focused pane
+    /// (RED on both counts — the expanded rect is short by 6 rows and every
+    /// other role's id shows up in a collapsed frame's title); the fix reclaims
+    /// those rows for the focused pane and stops drawing the collapsed arm.
+    #[spec("orchestration/layout/002")]
+    #[test]
+    fn layout_002_stacked_orchestration_hides_collapsed_frames() {
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState::default();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+
+        let role_names = [
+            "orchestrator",
+            "developer",
+            "tester",
+            "reviewer",
+            "releaser",
+            "researcher",
+            "documenter",
+        ];
+        let pane_ids: Vec<String> = role_names.iter().map(|r| format!("role-{r}")).collect();
+
+        let tab_view = ActiveTabView::Orchestration {
+            role_pane_ids: pane_ids.clone(),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["seven-roles".into()],
+            active_index: 0,
+        };
+
+        let mut expanded_rect: Option<Rect> = None;
+        let mut panes_area: Option<Rect> = None;
+
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &pane_ids,
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+
+                let FrameContent::Cards {
+                    panes_area: this_panes_area,
+                    pane_rects,
+                    ..
+                } = &layout.content
+                else {
+                    panic!("Orchestration tab must produce FrameContent::Cards");
+                };
+                panes_area = Some(this_panes_area.expect("7 role panes => a right pane column"));
+                expanded_rect = pane_rects
+                    .iter()
+                    .find(|(id, _)| id == &pane_ids[0])
+                    .map(|(_, r)| *r);
+
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                );
+            })
+            .unwrap();
+
+        let panes_area = panes_area.expect("pane column rect captured during draw");
+        let expanded_rect = expanded_rect.expect("orchestrator role rect captured during draw");
+        assert_eq!(
+            expanded_rect.height, panes_area.height,
+            "the focused role's pane must reclaim the FULL pane-column height \
+             (no rows ceded to collapsed frames): expanded={expanded_rect:?} \
+             column={panes_area:?}"
+        );
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        for id in &pane_ids[1..] {
+            assert!(
+                !rendered.contains(id.as_str()),
+                "non-focused role pane {id} must not render a collapsed title \
+                 frame in PaneLayout::Stacked:\n{rendered}"
+            );
+        }
+    }
+
     // PRD #144 — `modal_rect` is the shared content-driven modal sizer: clamp the
     // desired content dims into `[min, 90% of terminal]`, never exceeding the
     // terminal bounds, and center the result. Pure data, so a plain unit test.
