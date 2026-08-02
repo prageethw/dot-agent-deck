@@ -110,3 +110,45 @@ fn orchestration_006_ctrl_l_toggles_pane_column_split() {
         deck.snapshot_grid()
     );
 }
+
+/// Scenario: Launch a real interactive Bash/readline pane on the Dashboard (a
+/// NON-orchestration tab) with the `minimal` fixture, print a unique sentinel
+/// line, then press Ctrl+l. Bash's readline binds Ctrl+l to `clear-screen`, so
+/// if the byte reaches the PTY the terminal clears and the sentinel line
+/// disappears from the rendered grid. The PRD #336 keybinding (`global_action`,
+/// src/ui.rs) must claim Ctrl+l as `Action::ToggleOrchestrationSplit` ONLY on an
+/// orchestration tab; today it claims Ctrl+l unconditionally (no tab-context
+/// check), so on this Dashboard pane the keystroke never reaches the shell —
+/// `dispatch_action`'s handler no-ops outside `Tab::Orchestration` — and the
+/// sentinel line survives. RED today: the wait for the sentinel to disappear
+/// times out because Ctrl+l is swallowed instead of forwarded.
+#[spec("tabs/orchestration/007")]
+#[test]
+fn orchestration_007_ctrl_l_forwards_to_pty_on_non_orchestration_tab() {
+    const SENTINEL: &str = "CTRLL_FWD_SENTINEL_9f3c";
+
+    let deck = TuiDeck::builder()
+        .with_continue_session(
+            "ctrl-l-dashboard-shell",
+            "env PS1='CTRLL> ' bash --noprofile --norc -i",
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
+    deck.wait_for_string("CTRLL>");
+
+    deck.send_keys(format!("echo {SENTINEL}\r").as_bytes());
+    deck.wait_for_string(SENTINEL);
+
+    deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
+    let cleared = deck
+        .wait_for_grid_predicate_within(Duration::from_secs(3), |grid| !grid.contains(SENTINEL));
+    assert!(
+        cleared,
+        "Ctrl+l did not reach the shell pane on a non-orchestration tab — \
+         readline's clear-screen never ran, so the sentinel line is still \
+         visible after 3s. The global keybinding resolver claimed Ctrl+l as \
+         Action::ToggleOrchestrationSplit even though the active tab is not \
+         an orchestration tab (PRD #336 scope violation).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}

@@ -1095,6 +1095,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** per-tab scoping across multiple open orchestration tabs (out of scope for this entry — PRD #336 scope note); persistence of the toggled state across restart (explicitly out of scope per the PRD); remapping the chord via config.
 - **Platform coverage:** mac+linux.
 
+##### tabs/orchestration/007 — `Ctrl+l` must still forward to a live pane's PTY when the active tab is NOT an orchestration tab.
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (a real interactive `bash --noprofile --norc -i` pane on the Dashboard, no LLM tokens spent).
+- **Asserts:** on a Dashboard (non-orchestration) tab with a live shell pane in PaneInput mode, printing a unique sentinel line then pressing `Ctrl+l` must trigger readline's `clear-screen` binding and remove the sentinel from the rendered grid, proving the raw byte reached the PTY. Pins the PRD #336 scope note that `Action::ToggleOrchestrationSplit` only claims `Ctrl+l` on an orchestration tab — regression coverage for the Greptile P1 finding on PR #342 (the global resolver claimed `Ctrl+l` unconditionally, swallowing it on every other tab).
+- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/006`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check).
+- **Platform coverage:** mac+linux.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
