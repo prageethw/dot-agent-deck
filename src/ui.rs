@@ -2067,19 +2067,25 @@ pub(crate) fn dashboard_pane_dims(
 /// the spawn path, which spawns `Tiled` with no role focused yet — hence
 /// the `focused_role_index` parameter is gone and role 0 is the
 /// Stacked expanded slot.
+///
+/// `narrow` selects the split percentages via `orchestration_split_percents`
+/// directly rather than reading the `ACTIVE_ORCHESTRATION_SPLIT_NARROW`
+/// thread-local — this helper only ever spawns a brand-new (or restored)
+/// tab, which per PRD #336 always starts at the default split regardless
+/// of another tab's toggled state, so callers always pass `false`.
 pub(crate) fn orchestration_role_pane_dims(
     frame_area: Rect,
     role_count: usize,
     role_index: usize,
     layout: PaneLayout,
     show_tab_bar: bool,
+    narrow: bool,
 ) -> (u16, u16) {
     // Stacked: role 0 is the expanded slot, mirroring the renderer's
     // "expand the first slot if nothing is focused" fallback. Tiled
     // ignores `is_focused` (equal division).
     let is_focused = role_index == 0;
-    let (_, panes_percent) =
-        orchestration_split_percents(ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.get()));
+    let (_, panes_percent) = orchestration_split_percents(narrow);
     right_column_pane_dims(
         frame_area,
         panes_percent,
@@ -7325,6 +7331,7 @@ fn dispatch_action(
                         0,
                         PaneLayout::Tiled,
                         true,
+                        false,
                     );
                     match tab_manager.open_orchestration_tab(
                         &orch_config,
@@ -8997,6 +9004,7 @@ pub fn run_tui(
                             0,
                             PaneLayout::Tiled,
                             true,
+                            false,
                         );
                         // Empty saved prompt → `None` so the delivery gate
                         // writes nothing (matching the live path's "no prompt"
@@ -15862,8 +15870,14 @@ mod tests {
         // 100 * 66 / 100 = 66; cols = 64. Critical assertion: cols = 64,
         // NOT 65 (which is what `dashboard_pane_dims` would return for
         // the same input). The 1-col gap is exactly the F3 drift bug.
-        let (rows, cols) =
-            orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), 2, 0, PaneLayout::Tiled, false);
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            2,
+            0,
+            PaneLayout::Tiled,
+            false,
+            false,
+        );
         assert_eq!((rows, cols), (12, 64));
     }
 
@@ -15876,7 +15890,7 @@ mod tests {
         // re-introduces the F3 spawn-vs-render drift.
         let area = Rect::new(0, 0, 200, 50);
         let (_rows, helper_cols) =
-            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Tiled, false);
+            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Tiled, false, false);
         // Inner cols = right-column width - 2 (pane borders).
         let renderer_cols = (area.width * ORCHESTRATION_PANES_PERCENT / 100).saturating_sub(2);
         assert_eq!(helper_cols, renderer_cols);
@@ -15890,10 +15904,10 @@ mod tests {
     fn orchestration_role_pane_dims_tiled_divides_height_equally() {
         // 4 roles, Tiled: every role_index returns the same dims.
         let area = Rect::new(0, 0, 100, 30);
-        let r0 = orchestration_role_pane_dims(area, 4, 0, PaneLayout::Tiled, true);
-        let r1 = orchestration_role_pane_dims(area, 4, 1, PaneLayout::Tiled, true);
-        let r2 = orchestration_role_pane_dims(area, 4, 2, PaneLayout::Tiled, true);
-        let r3 = orchestration_role_pane_dims(area, 4, 3, PaneLayout::Tiled, true);
+        let r0 = orchestration_role_pane_dims(area, 4, 0, PaneLayout::Tiled, true, false);
+        let r1 = orchestration_role_pane_dims(area, 4, 1, PaneLayout::Tiled, true, false);
+        let r2 = orchestration_role_pane_dims(area, 4, 2, PaneLayout::Tiled, true, false);
+        let r3 = orchestration_role_pane_dims(area, 4, 3, PaneLayout::Tiled, true, false);
         assert_eq!(r0, r1);
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
@@ -15909,9 +15923,9 @@ mod tests {
         // resize).
         let area = Rect::new(0, 0, 100, 30);
         let (rows_focused, _) =
-            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false);
+            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false, false);
         let (rows_unfocused, _) =
-            orchestration_role_pane_dims(area, 3, 1, PaneLayout::Stacked, false);
+            orchestration_role_pane_dims(area, 3, 1, PaneLayout::Stacked, false, false);
         assert!(rows_focused > rows_unfocused);
         assert_eq!(rows_unfocused, 0);
     }
@@ -15935,8 +15949,14 @@ mod tests {
         let main_height = area.height.saturating_sub(chrome_rows);
         let expanded_outer = main_height.saturating_sub(role_count - 1);
         let expanded_inner = expanded_outer.saturating_sub(2);
-        let (helper_rows, _) =
-            orchestration_role_pane_dims(area, role_count as usize, 0, PaneLayout::Stacked, false);
+        let (helper_rows, _) = orchestration_role_pane_dims(
+            area,
+            role_count as usize,
+            0,
+            PaneLayout::Stacked,
+            false,
+            false,
+        );
         assert_eq!(helper_rows, expanded_inner);
     }
 
@@ -15944,8 +15964,14 @@ mod tests {
     fn orchestration_role_pane_dims_zero_role_count_does_not_divide_by_zero() {
         // Defensive: role_count = 0 (transient state during a tab
         // teardown). Clamp to 1 so the helper returns a sane value.
-        let (rows, cols) =
-            orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), 0, 0, PaneLayout::Tiled, false);
+        let (rows, cols) = orchestration_role_pane_dims(
+            Rect::new(0, 0, 100, 30),
+            0,
+            0,
+            PaneLayout::Tiled,
+            false,
+            false,
+        );
         // main_height = 29, count = 1, chunk = 29, rows = 27.
         // right_width = 66, cols = 64.
         assert_eq!((rows, cols), (27, 64));
