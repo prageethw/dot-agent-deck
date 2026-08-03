@@ -12160,6 +12160,15 @@ pub fn run_tui(
         // tab label's aggregate color agrees with what's actually on screen.
         // Non-orchestration tabs get `None` — this feature doesn't touch them.
         let pane_status_for_tabs: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
+        // Fork-only — steer the active Orchestration tab's focus to the
+        // lowest-order WaitingForInput pane every frame, reusing the same
+        // `pane_status_for_tabs` join PRD #333's tab-label coloring reads
+        // above. Applied the same way `remap_focus_after_reactive_change`'s
+        // result is applied elsewhere in this function: `Some(new_id)` means
+        // focus actually moved, so re-focus it on the live pane controller.
+        if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&pane_status_for_tabs) {
+            let _ = pane.focus_pane(&new_id);
+        }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
             .tabs()
             .iter()
