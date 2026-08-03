@@ -199,9 +199,13 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_bytes(b"\x04");
     deck.wait_for_string("Dir:");
+    // The restored pane was named "launcher-codex" (its `with_continue_session`
+    // pane name); with no agent-type badge, that display name is the card's
+    // identity text.
     assert!(
-        deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(15)),
-        "the non-codex launcher never produced a Codex card after startup install+trust:\n{}",
+        deck.wait_for_grid_string_within("launcher-codex", Duration::from_secs(15)),
+        "the non-codex launcher never produced a card for its Codex session after startup \
+         install+trust:\n{}",
         deck.snapshot_grid()
     );
     assert!(
