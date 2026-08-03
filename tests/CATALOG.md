@@ -69,10 +69,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the status badge color (`status/badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/008 — Agent cards retain their registry-colored type badges even when they have friendly display names (PRD #20 M7, review finding 9).
+##### dashboard/pane/008 — Agent cards render with NO agent-type badge, even when they have friendly display names (fork-only rename/hide, never pushed upstream — reverses PRD #20 M7 / review finding 9 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
 - **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
-- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted.
+- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain NO registry agent-type label text and NO cell anywhere on the card carries that agent's registry `badge_color`; complete color-aware buffers are snapshotted.
 - **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -347,6 +347,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** after Never, re-opening the new-pane flow for the same cwd does not surface the auto-prompt.
 - **Does not assert:** filesystem path of the suppression list (an implementation detail).
+- **Platform coverage:** mac+linux.
+
+#### dashboard/title
+
+##### dashboard/title/001 — The dashboard title bar renders the fork's `worker-deck` app name, not upstream's `dot-agent-deck` (fork-only rename, never pushed upstream).
+- **Layer:** L2 (PTY end-to-end) — the title bar is painted by the private `render_frame`, which has no public `..._to_buffer` L1 seam.
+- **Agent:** none (empty `minimal` fixture — dashboard shows "No active sessions").
+- **Asserts:** the rendered grid contains `worker-deck` and does not contain the literal `dot-agent-deck` app-name string.
+- **Does not assert:** the trailing `N session(s)` text (unaffected by the rename, covered elsewhere) or any other chrome (tab strip, button bar).
 - **Platform coverage:** mac+linux.
 
 ### Statuses

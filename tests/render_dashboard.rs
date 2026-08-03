@@ -419,11 +419,14 @@ fn pane_007_pi_card_shows_pi_identity() {
 }
 
 /// Scenario: Render a live Codex session with no friendly display name into a
-/// color-aware card buffer. The title must expose the first-class `Codex`
-/// identity and every cell in that label must use Codex's registry badge color.
+/// color-aware card buffer. Fork-only rename/hide (never pushed upstream):
+/// the agent-type badge is removed entirely, so the card must show NO
+/// `Codex` label text and NO cell anywhere on the card in Codex's registry
+/// badge color. Repeats the check for named Claude Code / OpenCode / Pi /
+/// Codex cards, where the friendly display name must still render.
 #[spec("dashboard/pane/008")]
 #[test]
-fn pane_008_codex_card_shows_colored_identity_badge() {
+fn pane_008_codex_card_omits_agent_type_badge() {
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "wrapped-01".to_string(),
@@ -447,23 +450,18 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
     let buffer = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
     let text = buffer_to_text(&buffer);
     assert!(
-        text.contains("Codex"),
-        "a wrapped Codex pane must render the Codex identity:\n{text}"
+        !text.contains("Codex"),
+        "the agent-type badge is removed from cards; a wrapped Codex pane's \
+         card must not render the `Codex` label anywhere:\n{text}"
     );
 
-    let expected = dot_agent_deck::agent_registry::spec(&AgentType::Codex).badge_color;
-    let mut colored_label_found = false;
-    for y in 0..buffer.area().height {
-        for x in 0..=buffer.area().width.saturating_sub(5) {
-            let symbols: String = (x..x + 5).map(|cx| buffer[(cx, y)].symbol()).collect();
-            if symbols == "Codex" {
-                colored_label_found |= (x..x + 5).all(|cx| buffer[(cx, y)].fg == expected);
-            }
-        }
-    }
+    let would_be_badge_color = dot_agent_deck::agent_registry::spec(&AgentType::Codex).badge_color;
+    let has_badge_colored_cell = (0..buffer.area().height)
+        .any(|y| (0..buffer.area().width).any(|x| buffer[(x, y)].fg == would_be_badge_color));
     assert!(
-        colored_label_found,
-        "the rendered Codex identity must use registry badge color {expected:?}:\n{}",
+        !has_badge_colored_cell,
+        "no cell should carry Codex's registry badge color {would_be_badge_color:?} \
+         once the badge is removed:\n{}",
         buffer_to_color_text(&buffer)
     );
 
@@ -493,26 +491,23 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         let expected_color = dot_agent_deck::agent_registry::spec(&agent_type).badge_color;
         let text = buffer_to_text(&named_buffer);
         assert!(
-            text.contains(label),
-            "a named {agent_type:?} card must retain its registry agent-type badge alongside {friendly_name:?}:\n{text}"
+            !text.contains(label),
+            "the agent-type badge is removed from cards; a named {agent_type:?} \
+             card must not render its registry `{label}` label anywhere, even \
+             alongside the friendly name {friendly_name:?}:\n{text}"
         );
-        let colored = (0..named_buffer.area().height).any(|y| {
-            (0..=named_buffer
-                .area()
-                .width
-                .saturating_sub(label.chars().count() as u16))
-                .any(|x| {
-                    let symbols: String = (x..x + label.chars().count() as u16)
-                        .map(|cx| named_buffer[(cx, y)].symbol())
-                        .collect();
-                    symbols == label
-                        && (x..x + label.chars().count() as u16)
-                            .all(|cx| named_buffer[(cx, y)].fg == expected_color)
-                })
+        assert!(
+            text.contains(friendly_name),
+            "a named {agent_type:?} card must still render its friendly display \
+             name {friendly_name:?} once the badge is removed:\n{text}"
+        );
+        let has_badge_colored_cell = (0..named_buffer.area().height).any(|y| {
+            (0..named_buffer.area().width).any(|x| named_buffer[(x, y)].fg == expected_color)
         });
         assert!(
-            colored,
-            "the named {agent_type:?} card's `{label}` badge must use registry color {expected_color:?}:\n{}",
+            !has_badge_colored_cell,
+            "no cell on the named {agent_type:?} card should carry registry \
+             color {expected_color:?} once the badge is removed:\n{}",
             buffer_to_color_text(&named_buffer)
         );
         named_badges.push_str(&format!(
