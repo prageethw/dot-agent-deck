@@ -1109,6 +1109,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); the L1 geometry math (covered by `orchestration/layout/002`); a real LLM agent (all three roles are shell stand-ins); dashboard-tab (non-orchestration) collapsed frames.
 - **Platform coverage:** mac+linux.
 
+##### tabs/orchestration/009 — An orchestration tab's tab-bar label renders in the color of the single highest-priority state among its panes (PRD #333).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** given an orchestration tab whose panes carry a mix of `SessionStatus` values, the rendered tab-bar label's foreground color is `palette::status_color()` of the SINGLE highest-priority status among them, in the fixed order Error(Red) > WaitingForInput(Yellow) > Working(Green) > Thinking/Compacting(Blue) > Idle/Unknown(DarkGray) — covering (a) one `Error` among several `Idle` panes -> Red; (b) one `WaitingForInput` among `Working`/`Idle` (no `Error`) -> Yellow; (c) all `Idle` -> DarkGray; (d) a mix of `Thinking` and `Working` (no higher-priority state) -> Green, since Working outranks Thinking. Also asserts a non-orchestration tab's label is unaffected (same base color as any other unaffected tab).
+- **Does not assert:** the aggregate-priority resolver as a standalone pure-function unit test (PRD #333 M1, may land separately); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
+- **Platform coverage:** mac+linux+windows.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
