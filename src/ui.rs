@@ -4956,8 +4956,12 @@ pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> O
 
 /// Truncate a sequence of styled title segments to `max_chars` total characters,
 /// appending a single `…` (in the last surviving segment's style) when they
-/// don't all fit, while preserving each segment's style — letting the coloured
-/// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+/// don't all fit, while preserving each segment's style. Fork-only removed the
+/// coloured agent-type badge from the title, so the styles this now protects are
+/// the dimmed numeric shortcut prefix and the `history` / `view-only` marker —
+/// each keeps its own styling even on a narrow card. (PRD #339 separately moved
+/// the Last/Tools stats off the title onto the bottom border, so those never
+/// reach this function.)
 ///
 /// For single-width text this produces the same character sequence as
 /// [`truncate_with_ellipsis`] on the concatenated input, so text-only snapshots
@@ -12649,12 +12653,25 @@ fn render_frame(
     // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
     if state.sessions.is_empty() {
+        let outer =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(dashboard_area);
+        let title = Paragraph::new(Line::from(vec![
+            Span::styled(
+                " worker-deck ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("— 0 session(s)", text_primary()),
+        ]));
+        frame.render_widget(title, outer[0]);
+
         let vertical = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
             Constraint::Fill(1),
         ])
-        .split(dashboard_area);
+        .split(outer[1]);
         let msg = Paragraph::new(format!(
             "No active sessions. Press {MOD_KEY}+n to create a pane."
         ))
@@ -12714,7 +12731,7 @@ fn render_frame(
     };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
-            " dot-agent-deck ",
+            " worker-deck ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -13872,9 +13889,9 @@ fn render_stats_bar(
     // per agent type (~12-18 columns each) pushed the `tools` total and the
     // `mode:` indicator off-screen on a real multi-agent deck, which is how the
     // breakdown was actually observed: `… │ 19 idle │ 14 ClaudeCode` and
-    // nothing after it. The information was redundant anyway — every card
-    // already carries its registry-colored type badge (`render_session_card`),
-    // directly under this bar.
+    // nothing after it. The information was redundant anyway — every card's
+    // status dot and label (`render_session_card`) already summarize agent
+    // state directly under this bar.
 
     // Always show total tools
     spans.push(Span::styled("  \u{2502}  ", text_dim()));
@@ -16454,11 +16471,11 @@ fn render_session_card(
     let title_bold = text_primary().add_modifier(Modifier::BOLD);
     // PRD #20 M4: a session whose live_target is not `Live` (e.g. a wrapped
     // Codex pane surfaced history-only) can't accept live input. Render it
-    // distinctly — dim the numeric input shortcut and show a `history` /
-    // `view-only` marker next to the type badge — so a view-only card announces
-    // both what it is and that typing into it won't reach the agent. `Live`
-    // sessions (every native PTY pane, and any fixture that declared no
-    // live_target) render exactly as before.
+    // distinctly — dim the numeric input shortcut and show a trailing `history` /
+    // `view-only` marker — so a view-only card announces both what it is and
+    // that typing into it won't reach the agent. `Live` sessions (every native
+    // PTY pane, and any fixture that declared no live_target) render exactly as
+    // before.
     let writable = session.writable();
     let is_live = writable == crate::event::Writable::Live;
     let shortcut_style = if is_live {
@@ -16471,28 +16488,18 @@ fn render_session_card(
         crate::event::Writable::HistoryOnly => " history ",
         crate::event::Writable::None => " view-only ",
     };
-    // PRD #20 M5 / finding #9: the agent-type label carries its registry badge
-    // colour so EVERY card exposes a coloured type badge (cross-agent: Claude /
-    // OpenCode / Pi / Codex each get their registry colour). The rest of the
-    // title stays primary text. A friendly `display_name` now renders ALONGSIDE
-    // the badge (`<type> · <name>`) rather than replacing it — most real panes
-    // have a display name, so dropping the badge there hid the type in the
-    // common case. A non-live card additionally shows a trailing
+    // Fork-only: the agent-type badge (registry-coloured type label) is
+    // removed from the card title entirely — no colour, no text. The title
+    // now shows only the friendly `display_name`, or the session id when
+    // there is none. A non-live card additionally shows a trailing
     // `history` / `view-only` marker.
-    let badge_style = Style::default()
-        .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
-        .add_modifier(Modifier::BOLD);
-    // The marker is appended AFTER the `<type> · <id-or-name>` so the
-    // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
-    // stays intact — only a trailing view-only annotation is added.
-    let label_after_badge = display_name
-        .map(|name| format!(" · {name} "))
-        .unwrap_or_else(|| format!(" · {id_display} "));
+    let identity_text = display_name
+        .map(|name| format!("{name} "))
+        .unwrap_or_else(|| format!("{id_display} "));
     let title_segments: Vec<(String, Style)> = {
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (format!("{}", session.agent_type), badge_style),
-            (label_after_badge, title_bold),
+            (identity_text, title_bold),
         ];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));

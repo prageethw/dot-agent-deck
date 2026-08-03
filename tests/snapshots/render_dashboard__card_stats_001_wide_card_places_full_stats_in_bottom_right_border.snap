@@ -1,9 +1,8 @@
 ---
 source: tests/render_dashboard.rs
-assertion_line: 227
 expression: rendered
 ---
-┌ 1 ClaudeCode · api-svc ────────────────────────────────────────── ● Thinking ┐
+┌ 1 api-svc ─────────────────────────────────────────────────────── ● Thinking ┐
 │Dir:  api-svc                                                                 │
 │Prmt: move the stats into the border                                          │
 │                                                                              │

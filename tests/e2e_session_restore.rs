@@ -862,21 +862,17 @@ fn restore_014_recognized_agent_is_idle_before_first_hook() {
         .launch_with_fixture("minimal");
 
     deck.wait_for_string("restored-opencode");
-    // Match the card's `<type> ·` badge, not the display name. Cards render
-    // `<type> · <name>` and the dashboard truncates the name to the card width,
-    // so with the embedded pane taking most of the row this one reads
-    // `OpenCode · restored-open…` — a full-name match on this line cannot
-    // succeed. That is what silently broke here when the type badge landed
-    // (#217, one day after this test): the behaviour stayed correct while the
-    // predicate stopped matching. `src/ui.rs` documents `<type> · …` as the
-    // shape callers match on, so it is the stable thing to assert; the
-    // `wait_for_string` above already proved the restored name is on screen, and
-    // the unrecognized state this guards against renders the badge as
-    // `No agent` (the `AgentType` Display), so the badge alone distinguishes it.
+    // Fork-only: cards no longer carry an agent-type badge, so the recognized
+    // vs. unrecognized distinction this test guards is now visible only through
+    // the status label — a recognized agent renders its real status (`Idle`
+    // here), while an unrecognized one renders the `No agent` placeholder
+    // (`is_placeholder` in `render_session_card`). Match a truncation-safe
+    // prefix of the display name (the dashboard truncates to card width) on the
+    // same line as `Idle`, and confirm the placeholder label is absent.
     let idle = common::wait_until(Duration::from_secs(10), || {
         let grid = deck.snapshot_grid();
         grid.lines().any(|line| {
-            line.contains("OpenCode ·") && line.contains("Idle") && !line.contains("No agent")
+            line.contains("restored-op") && line.contains("Idle") && !line.contains("No agent")
         })
     });
     assert!(
