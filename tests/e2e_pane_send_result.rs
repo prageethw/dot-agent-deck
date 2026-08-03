@@ -86,7 +86,7 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
         "the dashboard must surface `{feedback}` instead of entering PaneInput or silently dropping the send\nFinal grid:\n{grid}"
     );
     assert!(
-        grid.contains("Codex"),
+        grid.contains("history-codex"),
         "a rejected history-only send must not remove the dashboard card\nFinal grid:\n{grid}"
     );
 }
