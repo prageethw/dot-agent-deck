@@ -234,6 +234,10 @@ struct TabBarInfo {
     show: bool,
     labels: Vec<String>,
     active_index: usize,
+    /// PRD #333: per-tab pane statuses, aligned with `labels` — `Some` for an
+    /// Orchestration tab (used to color its label), `None` for every other
+    /// tab.
+    orchestration_statuses: Vec<Option<Vec<SessionStatus>>>,
 }
 
 struct DirPickerState {
@@ -10287,10 +10291,30 @@ pub fn run_tui(
                 },
             })
             .collect();
+        // PRD #333: join each Orchestration tab's role panes to their live
+        // status through the SAME `state.sessions[*].status` source the deck
+        // cards and embedded-pane borders read (`build_pane_status`), so the
+        // tab label's aggregate color agrees with what's actually on screen.
+        // Non-orchestration tabs get `None` — this feature doesn't touch them.
+        let pane_status_for_tabs: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
+        let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
+            .tabs()
+            .iter()
+            .map(|tab| match tab {
+                Tab::Orchestration { role_pane_ids, .. } => Some(
+                    role_pane_ids
+                        .iter()
+                        .filter_map(|pid| pane_status_for_tabs.get(pid.as_str()).cloned())
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
             active_index: tab_manager.active_index(),
+            orchestration_statuses: tab_bar_orchestration_statuses,
         };
         // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
         // compute → resize → render, all against the SAME live frame area.
@@ -11444,12 +11468,17 @@ struct TabStripRects {
     closes: Vec<(usize, Rect)>,
 }
 
+/// PRD #333: `orchestration_statuses[i]` carries tab `i`'s pane statuses
+/// (`Some` for an Orchestration tab, `None` for every tab this feature
+/// doesn't touch) so its label can render in `palette::status_color()` of
+/// the highest-priority status among them.
 fn render_tab_strip(
     frame: &mut Frame,
     area: Rect,
     labels: &[String],
     closeable: &[bool],
     active_index: usize,
+    orchestration_statuses: &[Option<&[SessionStatus]>],
 ) -> TabStripRects {
     // PRD #13: the tab-bar row is left unpainted so the terminal's own
     // background shows through (no absolute `tab_bar_bg` fill).
@@ -11480,6 +11509,16 @@ fn render_tab_strip(
             active_style
         } else {
             base_style
+        };
+        // PRD #333: an orchestration tab's label takes the color of the
+        // single highest-priority status among its panes instead of the
+        // base label color. Tabs this feature doesn't touch (`None`) are
+        // untouched.
+        let style = match orchestration_statuses.get(i).copied().flatten() {
+            Some(statuses) => style.fg(palette::status_color(&palette::highest_priority_status(
+                statuses,
+            ))),
+            None => style,
         };
 
         // Divider between tabs (not before the first).
@@ -11984,12 +12023,18 @@ fn render_frame(
         // terminal-relative — the active tab is cued with Modifier::REVERSED,
         // not an absolute background tint.
         let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
+        let orchestration_statuses: Vec<Option<&[SessionStatus]>> = tab_bar
+            .orchestration_statuses
+            .iter()
+            .map(|statuses| statuses.as_deref())
+            .collect();
         let strip = render_tab_strip(
             frame,
             tab_bar_rect,
             &tab_bar.labels,
             &closeable,
             tab_bar.active_index,
+            &orchestration_statuses,
         );
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
@@ -17365,11 +17410,14 @@ pub fn render_rename_bar_to_buffer(rename_text: &str, width: u16) -> ratatui::bu
 /// rendered cells (e.g. the presence of a `[×]` close glyph on Mode /
 /// Orchestration tabs and its absence on the Dashboard tab) without a PTY.
 /// `closeable[i]` marks whether tab `i` carries a close affordance.
+/// `orchestration_statuses[i]` is `Some(pane statuses)` for an orchestration
+/// tab (PRD #333) or `None` for a tab this feature doesn't touch.
 pub fn render_tab_bar_to_buffer(
     labels: &[&str],
     closeable: &[bool],
     active_index: usize,
     width: u16,
+    orchestration_statuses: &[Option<&[SessionStatus]>],
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -17385,7 +17433,14 @@ pub fn render_tab_bar_to_buffer(
                 width,
                 height: 1,
             };
-            render_tab_strip(frame, area, &owned, closeable, active_index);
+            render_tab_strip(
+                frame,
+                area,
+                &owned,
+                closeable,
+                active_index,
+                orchestration_statuses,
+            );
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -17903,6 +17958,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into(), "Mode".into()],
             active_index: 0,
+            orchestration_statuses: vec![],
         };
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
         // A 1-row bottom bar (this fixture exercises the split math, not the
@@ -17968,6 +18024,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into(), "demo".into()],
             active_index: 1,
+            orchestration_statuses: vec![],
         };
         let layout = compute_frame_layout(
             frame_area,
@@ -18050,6 +18107,7 @@ mod tests {
             show: true,
             labels: vec!["seven-roles".into()],
             active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
         };
 
         let mut expanded_rect: Option<Rect> = None;
@@ -19789,6 +19847,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -19878,6 +19937,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -20016,6 +20076,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -20363,6 +20424,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -20455,6 +20517,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -20522,6 +20585,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
+                    orchestration_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -23369,6 +23433,7 @@ mod tests {
             show: true,
             labels: vec!["Orchestration".into()],
             active_index: 0,
+            orchestration_statuses: vec![],
         };
 
         let before = compute_frame_layout(

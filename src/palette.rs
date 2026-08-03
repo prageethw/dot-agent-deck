@@ -124,3 +124,57 @@ pub fn status_color(status: &SessionStatus) -> Color {
         SessionStatus::Unknown => STATUS_IDLE,
     }
 }
+
+/// This status's rank in the PRD #333 fixed priority order — lower ranks
+/// win. Mirrors the aliasing [`status_color`] already applies (Compacting
+/// shares Thinking's rank, Unknown shares Idle's) so a status that resolves
+/// to the same color also resolves to the same priority.
+fn priority_rank(status: &SessionStatus) -> u8 {
+    match status {
+        SessionStatus::Error => 0,
+        SessionStatus::WaitingForInput => 1,
+        SessionStatus::Working => 2,
+        SessionStatus::Thinking | SessionStatus::Compacting => 3,
+        SessionStatus::Idle | SessionStatus::Unknown => 4,
+    }
+}
+
+/// PRD #333 M1 — resolve the single highest-priority `SessionStatus` among an
+/// orchestration tab's pane statuses, per the fixed order Error > NeedsInput >
+/// Working > Thinking > Idle (ties within a rank keep whichever status was
+/// encountered first). An empty slice (a tab with no panes) falls back to
+/// `Idle`, the same neutral "nothing going on" state an all-Idle tab
+/// resolves to.
+pub fn highest_priority_status(statuses: &[SessionStatus]) -> SessionStatus {
+    statuses
+        .iter()
+        .min_by_key(|status| priority_rank(status))
+        .cloned()
+        .unwrap_or(SessionStatus::Idle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: feed `highest_priority_status` slices covering every rank in
+    /// the PRD #333 table (including the Compacting→Thinking and
+    /// Unknown→Idle aliases) and confirm it always returns the single
+    /// highest-priority status present, plus the defined no-panes fallback.
+    #[test]
+    fn highest_priority_status_orders_by_priority() {
+        use SessionStatus::*;
+
+        assert_eq!(highest_priority_status(&[Idle, Error, Idle]), Error);
+        assert_eq!(
+            highest_priority_status(&[Working, WaitingForInput, Idle]),
+            WaitingForInput
+        );
+        assert_eq!(highest_priority_status(&[Idle, Idle, Idle]), Idle);
+        assert_eq!(highest_priority_status(&[Thinking, Working]), Working);
+        assert_eq!(highest_priority_status(&[Compacting, Idle]), Compacting);
+        assert_eq!(highest_priority_status(&[Unknown, Idle]), Unknown);
+        assert_eq!(highest_priority_status(&[Error, WaitingForInput]), Error);
+        assert_eq!(highest_priority_status(&[]), Idle);
+    }
+}
