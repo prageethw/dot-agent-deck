@@ -162,14 +162,14 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     // 50/50 mode tab (a second tab whose strip carries a `×` close glyph).
     deck.wait_for_absence("[Submit]"); // form closed
     deck.wait_until_grid("schedule submit settles into a card or a mode tab", |g| {
-        g.contains("dot-agent-deck \u{2014}") || g.contains("×")
+        g.contains("worker-deck \u{2014}") || g.contains("×")
     });
 
     let grid = deck.snapshot_grid();
     assert!(
-        grid.contains("dot-agent-deck \u{2014}"),
+        grid.contains("worker-deck \u{2014}"),
         "the `schedule` authoring session must open as a single-agent DASHBOARD CARD: the \
-         dashboard's `dot-agent-deck — N session(s)` title renders only on the Dashboard \
+         dashboard's `worker-deck — N session(s)` title renders only on the Dashboard \
          tab, so its presence is what proves the authoring session stayed a card.\nGrid:\n{grid}"
     );
     assert!(

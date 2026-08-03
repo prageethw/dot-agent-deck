@@ -62,17 +62,17 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** absolute-time clocks (`Last:` is rendered against a fixed test clock).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/007 — A Pi pane's card renders the Pi agent-type identity (PRD #201 M2.2).
+##### dashboard/pane/007 — A Pi pane's card omits the agent-type badge, same as every other agent type (fork-only rename/hide, never pushed upstream — reverses PRD #201 M2.2 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`-style buffer text assertion).
 - **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Pi` and no display name).
-- **Asserts:** a live Pi session with no friendly name renders its card title in the `<agent-type> · <session-id>` form showing the Pi identity (`Pi · orch-01`) — with NO experimental flag touched, since the Pi surface ships visible by default (PRD #201 reverses Design Decision #8, un-gating Pi); the fixture's cwd basename and session id carry no capital `Pi`, so the match pins the agent-type Display specifically. The card must NOT show `ClaudeCode` / `OpenCode` / `No agent` — a plain `pi` pane is first-class, not "No agent".
+- **Asserts:** a live Pi session with no friendly name renders its card title as the bare session id (`orch-01`), with NO `Pi` / `ClaudeCode` / `OpenCode` / `Codex` / `No agent` label text anywhere on the card and no cell carrying Pi's registry `badge_color` — a plain `pi` pane un-badged renders exactly like any other agent type, not falling back to showing its type name.
 - **Does not assert:** the status badge color (`status/badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/008 — Agent cards retain their registry-colored type badges even when they have friendly display names (PRD #20 M7, review finding 9).
+##### dashboard/pane/008 — Agent cards render with NO agent-type badge, even when they have friendly display names (fork-only rename/hide, never pushed upstream — reverses PRD #20 M7 / review finding 9 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
 - **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
-- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted.
+- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain NO registry agent-type label text and NO cell anywhere on the card carries that agent's registry `badge_color`; complete color-aware buffers are snapshotted.
 - **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -88,7 +88,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
 - **Layer:** L1 (in-process `AppState::aggregate_stats` + ratatui `TestBackend` stats render).
 - **Agent:** none (22 synthetic sessions: 14 Claude Code + 8 Codex).
-- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the type information stays on the cards, which each carry a registry-colored badge.
+- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the breakdown was redundant anyway, since each card's status dot and label already summarize agent state (fork-only: cards no longer carry a registry-colored agent-type badge either).
 - **Does not assert:** priority-ordered truncation for bars too narrow even for the status counts, or exact badge colors.
 - **Platform coverage:** mac+linux+windows.
 
@@ -347,6 +347,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** after Never, re-opening the new-pane flow for the same cwd does not surface the auto-prompt.
 - **Does not assert:** filesystem path of the suppression list (an implementation detail).
+- **Platform coverage:** mac+linux.
+
+#### dashboard/title
+
+##### dashboard/title/001 — The dashboard title bar renders the fork's `worker-deck` app name, not upstream's `dot-agent-deck` (fork-only rename, never pushed upstream).
+- **Layer:** L2 (PTY end-to-end) — the title bar is painted by the private `render_frame`, which has no public `..._to_buffer` L1 seam.
+- **Agent:** none (empty `minimal` fixture — dashboard shows "No active sessions").
+- **Asserts:** the rendered grid contains `worker-deck` and does not contain the literal `dot-agent-deck` app-name string.
+- **Does not assert:** the trailing `N session(s)` text (unaffected by the rename, covered elsewhere) or any other chrome (tab strip, button bar).
 - **Platform coverage:** mac+linux.
 
 ### Statuses
@@ -2328,7 +2337,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/wrap/001 — A synthetic Codex JSONL stream runs through the real wrapper, daemon event stream, and PTY-attached dashboard (PRD #20 M7).
 - **Layer:** L2 PTY-attached (`TuiDeck`, real binary + daemon, deterministic shell stand-in, no authentication or LLM).
 - **Agent:** synthetic stand-in wrapped with `dot-agent-deck wrap --agent codex`.
-- **Asserts:** realistic turn-start and turn-completed lines become typed Codex `AgentEvent`s carrying `AGENT_EVENT_SCHEMA_VERSION`; because the wrapper is inside a daemon-managed pane, events declare `Pty/Live`; `WriteAndSubmit` returns Applied and the child records the submitted line; the rendered card visibly shows the Codex identity and transitions Thinking → Idle.
+- **Asserts:** realistic turn-start and turn-completed lines become typed Codex `AgentEvent`s carrying `AGENT_EVENT_SCHEMA_VERSION`; because the wrapper is inside a daemon-managed pane, events declare `Pty/Live`; `WriteAndSubmit` returns Applied and the child records the submitted line; the rendered card visibly shows this pane's identity and transitions Thinking → Idle (fork-only: no agent-type badge — the card's identity is its own pane id, since no display name was given).
 - **Does not assert:** model authentication or Codex CLI behavior (covered by `codex/live/001`).
 - **Platform coverage:** mac+linux.
 
@@ -2532,10 +2541,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### pi/live
 
-##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders the experimental-gated Pi identity plus a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4 + PRD #180 reel-eligibility).
+##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4 + PRD #180 reel-eligibility).
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180, unlike the HEADLESS `chain-smoke/pi/001` + `scheduler/pi/001`). Mirrors `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs` and the reference `scheduler/dispatch/013`. The bundled extension is materialized into the per-test HOME BEFORE launch (`TuiDeckBuilder::with_pi_extension`) so the deck's lazy-spawned daemon — and the pi child it spawns, which inherits that HOME — auto-discovers it at boot; `OPENROUTER_API_KEY` + the built-binary PATH are threaded into the deck via `with_env` (the key is never printed). Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
 - **Agent:** REAL `pi` (`--provider openrouter --model openai/gpt-5-nano --approve`, the cheapest GPT-5.x tier that reliably runs a directive turn) as a single interactive pane restored from a staged saved session. Flaky-tolerant pre-PR tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when `pi` / `OPENROUTER_API_KEY` is absent.
-- **Asserts (on the rendered vt100 grid):** after detaching to the dashboard, the Pi pane's card shows a REAL, extension-driven status TRANSITION with NO hook installed — `Thinking` (extension `agent_start`→running), an Idle → running transition the daemon never produces on its own for a hook-less Pi pane (a freshly-spawned pane defaults to Idle, and `session_start` now reports Idle for parity with Claude/OpenCode/Codex, so `Thinking` — not the retired `Needs Input` — is the extension-only proof), then a settle back to `Idle` (extension `agent_settled`→finished, polled on the CURRENT grid so it can only be the post-turn settled frame — this is the turn-end→Idle mapping the fix changed, so a regression to "Needs Input" fails here) — and the card title carries the experimental-flag-gated first-class Pi identity (`Pi ·`, the `AgentType` Display, which the lowercase `pi` command never produces). The `Thinking` step is scanned over the rolling byte history so a transient frame still matches; generous 180s ceilings sized to confidence (Design Decision #7).
+- **Asserts (on the rendered vt100 grid):** after detaching to the dashboard, the Pi pane's card shows a REAL, extension-driven status TRANSITION with NO hook installed — `Thinking` (extension `agent_start`→running), an Idle → running transition the daemon never produces on its own for a hook-less Pi pane (a freshly-spawned pane defaults to Idle, and `session_start` now reports Idle for parity with Claude/OpenCode/Codex, so `Thinking` — not the retired `Needs Input` — is the extension-only proof), then a settle back to `Idle` (extension `agent_settled`→finished, polled on the CURRENT grid so it can only be the post-turn settled frame — this is the turn-end→Idle mapping the fix changed, so a regression to "Needs Input" fails here) — and the card itself stays on screen throughout, identified by its pane id (fork-only: no agent-type badge, so there is no `Pi ·` identity to render). The `Thinking` step is scanned over the rolling byte history so a transient frame still matches; generous 180s ceilings sized to confidence (Design Decision #7).
 - **Does not assert:** the orchestrator→worker delegation chain (a single live Pi pane fully satisfies rule 4; the delegate route is pinned headless by `chain-smoke/pi/001` and LIVE + injection-seeded by `pi/live/002`); any specific text pi prints; the directed sentinel file (`pi_live_sentinel_4b1a.txt`) is a best-effort/logged secondary signal, not a gate, since the rendered status transition already proves the pi turn ran.
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap gpt-5-nano directive turn (create one file) — well under Decision 23's <$0.05/run bound.
@@ -2544,7 +2553,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, demo-reel-eligible per PRD #180). Closes the gap left by `chain-smoke/pi/001` (headless, CLI-arg seeded) and `pi/live/001` (single live pane): a two-role orchestration is staged as a `.dot-agent-deck.toml` (`[[orchestrations]] name = "pi-parity"`, an `orchestrator` START role running an IDLE real `pi` + a `coder` role running an IDLE real `claude`, neither carrying a CLI-arg prompt) plus a `session.toml` whose `OrchestrationSnapshot.orchestrator_prompt` is the delegate directive; on the daemon-empty restore the deck spawns both role panes IDLE and REPLAYS the directive into the pi START role via the PRODUCTION `write_and_submit_to_pane` injection primitive (single-line write, SUBMIT_DELAY, then `\r`) — the exact auto-submit path shipped code relies on. The bundled Pi extension is materialized into the per-test HOME BEFORE launch (`with_pi_extension`); imported Claude credentials + `with_claude_project_trust` for the shared orchestration cwd clear the worker's first-run gates; `OPENROUTER_API_KEY` + the built-binary PATH are threaded in via `with_env` (the key is never printed). Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
 - **Agent:** REAL `pi` orchestrator (`--provider openrouter --model openai/gpt-5-nano --approve`, seeded ONLY by injection — no CLI-arg prompt) + REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`, `--allowedTools Bash Read Write`) worker with the NORMAL toolset (no `--no-builtin-tools`, no stand-ins). Flaky-tolerant pre-PR tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when `pi` / `claude` / credentials / `OPENROUTER_API_KEY` are absent.
 - **Asserts:** AUTO-SUBMIT CHECKPOINT (GAP #1) — the daemon writes `.dot-agent-deck/worker-task-coder.md` ONLY inside `handle_delegate`, so its appearance is the isolated proof that pi AUTO-SUBMITTED the daemon-INJECTED seed and called the native `delegate` tool; the delegate pointer `worker-task-coder` renders LIVE in the worker pane on the orchestration grid (the user-visible "delegation happening + worker" reality); and the full chain landed — the delegated worker created the sentinel `pi_inject_orch_sentinel_5e8c.txt` (contents `PI_INJECT_ORCH_OK`) and the daemon wrote `.dot-agent-deck/work-done-coder.md`. Generous per-step ceilings sized to confidence, not token cost (Design Decision #7).
-- **Does not assert:** the experimental-gated `Pi ·` card title (a named orchestration role pane titles its card with the ROLE name, not the agent-type identity — that surface is pinned by `pi/live/001` + `dashboard/pane/007`); the exact task text pi forwards (the sentinel filename + content are the literal tokens that must survive LLM phrasing); the extension's per-event state mapping (covered by the TS unit tests + synthetic `status/agent-event/003`).
+- **Does not assert:** any agent-type card title (fork-only: no card carries one; a named orchestration role pane titles its card with the ROLE name regardless — the no-badge surface is pinned by `pi/live/001` + `dashboard/pane/007`); the exact task text pi forwards (the sentinel filename + content are the literal tokens that must survive LLM phrasing); the extension's per-event state mapping (covered by the TS unit tests + synthetic `status/agent-event/003`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap gpt-5-nano turn (orchestrator delegates) + one short Haiku turn (worker creates a file + work-done) — well under Decision 23's <$0.05/run bound.
 

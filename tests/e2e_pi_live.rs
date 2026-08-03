@@ -274,18 +274,19 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         );
     }
 
-    // --- Pi first-class IDENTITY on the card (experimental-flag-gated render
-    // seam). By now the extension's agent-events have upgraded the card's
-    // agent_type to Pi, and with the flag ON the card title reads `Pi · <id>`.
-    // The `Pi ·` marker is the AgentType Display identity — the lowercase `pi`
-    // command never produces a capital-`Pi` title, so this pins the gated Pi
-    // surface specifically.
+    // --- Retained card IDENTITY (fork-only: the agent-type badge / `Pi ·`
+    // marker this fork removes is gone entirely — `features::show_pi_agent`
+    // no longer exists, so there is no registry label left to key off). With
+    // an empty pane name, the card falls back to this sole, first pane's
+    // internal identity, `pane-1` — the same fallback `codex_wrap_001`
+    // observes for an unnamed restored pane. The status transitions already
+    // asserted above are the load-bearing proof that a real Pi agent drove
+    // this card; this just confirms the card itself is still on screen.
     let grid = deck.snapshot_grid();
     assert!(
-        grid.contains("Pi ·"),
-        "the Pi pane's card title never showed the experimental-gated Pi identity (`Pi ·`) on \
-         the rendered grid, even though the extension drove real status transitions — the \
-         gated `features::show_pi_agent` render seam did not surface the Pi identity.\n\
+        grid.contains("pane-1"),
+        "the Pi pane's card never showed its pane identity (`pane-1`) on the rendered grid, even \
+         though the extension drove real status transitions.\n\
          Final grid:\n{grid}"
     );
 
