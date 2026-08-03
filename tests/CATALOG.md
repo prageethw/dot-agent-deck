@@ -1132,7 +1132,21 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/006 — In a real multi-role orchestration tab under `PaneLayout::Stacked`, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
+##### tabs/orchestration/006 — `Ctrl+l` toggles an orchestration tab's sidebar/pane-column split between the default 34/66 and a narrower-sidebar 25/75, and back on a second press (PRD #336).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** opening a real orchestration tab renders the pane column's left edge at the default 34%-width boundary; pressing `Ctrl+l` moves that boundary to the narrower-sidebar 25%-width position (sidebar visibly narrows, pane column visibly widens); a second `Ctrl+l` restores the original 34%-width boundary.
+- **Does not assert:** per-tab scoping across multiple open orchestration tabs (out of scope for this entry — PRD #336 scope note); persistence of the toggled state across restart (explicitly out of scope per the PRD); remapping the chord via config.
+- **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/007 — `Ctrl+l` must still forward to a live pane's PTY when the active tab is NOT an orchestration tab.
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (a real interactive `bash --noprofile --norc -i` pane on the Dashboard, no LLM tokens spent).
+- **Asserts:** on a Dashboard (non-orchestration) tab with a live shell pane in PaneInput mode, printing a unique sentinel line then pressing `Ctrl+l` must trigger readline's `clear-screen` binding and remove the sentinel from the rendered grid, proving the raw byte reached the PTY. Pins the PRD #336 scope note that `Action::ToggleOrchestrationSplit` only claims `Ctrl+l` on an orchestration tab — regression coverage for the Greptile P1 finding on PR #342 (the global resolver claimed `Ctrl+l` unconditionally, swallowing it on every other tab).
+- **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/006`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check).
+- **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/008 — In a real multi-role orchestration tab under `PaneLayout::Stacked`, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
 - **Layer:** L2 (PTY-attached, `tests/e2e_orchestration_pane_column.rs`).
 - **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: a 3-role orchestration — `orchestrator` (start), `alpha`, `beta` — each printing a unique sentinel; `beta`'s script additionally self-posts real `SessionStart`/`PreToolUse` hook events via `dot-agent-deck hook --agent claude-code`, resolved to the freshly built test binary, so its sidebar status transitions Idle -> Working while its pane is not the focused/expanded slot).
 - **Asserts:** (a) with `orchestrator` focused/expanded, the settled grid carries no collapsed `Borders::TOP` title-bar frame for either non-focused role (`alpha`, `beta`) — matched by a row that, after trimming only leading blank columns, begins with the bare role name directly followed by border-fill dashes, a pattern only the collapsed-pane block itself can produce; (b) `beta`'s sidebar status card visibly transitions to `Working` purely from its own self-posted hook events while never becoming the focused pane, proving a non-focused role's agent lifecycle (PTY, hook delivery, status) is untouched by the rendering change; (c) driving `j`/`k` (Normal mode) round-trips focus orchestrator -> alpha -> beta -> alpha -> orchestrator, and each role's own sentinel text is visible again once it becomes the expanded pane, proving no lost scrollback or stale fragment across a focus switch.
@@ -2067,7 +2081,21 @@ without depending on the config struct API.
 - **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/002 — In a 7-role orchestration tab with `PaneLayout::Stacked`, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
+##### orchestration/layout/002 — `Ctrl+l` resolves to a split-toggle `Action` on an orchestration tab, and the toggled geometry is the narrower-sidebar 25/75 split (PRD #336).
+- **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** an orchestration tab's default frame geometry is the fixed 34/66 split (`dashboard_area` / `panes_area` widths); resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Some` action; the frame geometry recomputed after the keypress is the narrower-sidebar 25/75 split.
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/006`); per-tab scoping across multiple orchestration tabs; the second-press round-trip back to 34/66 (covered by `tabs/orchestration/006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/003 — A brand-new orchestration tab spawns its role panes at the default 34/66 split even when another already-open orchestration tab is toggled to the narrow 25/75 split (PRD #336 spawn-order regression).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** dispatch `Action::SpawnPane` to open orchestration tab A at the default split, dispatch `Action::ToggleOrchestrationSplit` to narrow it, then set `ACTIVE_ORCHESTRATION_SPLIT_NARROW` to simulate the render loop syncing it from the now-narrow, still-active tab A (the state a follow-up spawn would observe before the next frame runs); dispatch a second `Action::SpawnPane` to open a brand-new orchestration tab B. B's own `split_narrow` field defaults to `false` (per-tab STATE is correctly isolated); B's role panes' recorded `AgentSpawnOptions::cols` must equal A's initial (default-split) cols, since both tabs were opened untoggled. Catches the case where `orchestration_role_pane_dims` sizes B's role panes using the stale `ACTIVE_ORCHESTRATION_SPLIT_NARROW` thread-local left over from tab A instead of B's own default state.
+- **Does not assert:** the visible rendered grid or a live render-loop resync (the thread-local's post-spawn correction on the next frame is out of scope — this test pins the SPAWN-TIME dims only); mode or dashboard tabs (unaffected by this thread-local).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/004 — In a 7-role orchestration tab with `PaneLayout::Stacked`, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
 - **Layer:** L1 (in-process `compute_frame_layout` + `render_frame` driven through a real `ratatui::Terminal<TestBackend>`, via `EmbeddedPaneController::for_render_only_tests()`; no PTY, no subprocess). Lives in `src/ui.rs`'s own `#[cfg(test)]` module (same pattern as `tabs/orchestration/003-005`) because the geometry helpers under test (`pane_stack_rects`, `stacked_expanded_index`, `render_terminal_panes`) are module-private and unreachable from `tests/*.rs`.
 - **Agent:** none (7 synthetic role pane ids, no backing PTYs).
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
