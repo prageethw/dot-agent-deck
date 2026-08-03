@@ -53,7 +53,7 @@ fn open_second_tab(deck: &TuiDeck) {
 /// active after creation), click the inactive `Dashboard` tab header in the
 /// top strip. The deck must switch to the Dashboard view — the same outcome
 /// as pressing Tab / Ctrl+PageUp — so the dashboard's session-count title
-/// (`dot-agent-deck — N session(s)`, shown only on the Dashboard tab, not on
+/// (`worker-deck — N session(s)`, shown only on the Dashboard tab, not on
 /// a Mode tab) appears, proving click-to-switch funnels through the shared
 /// tab-switch action.
 #[spec("mouse/tabstrip/001")]
@@ -71,7 +71,7 @@ fn tabstrip_001_click_header_switches_tab() {
 
     // Switching to the Dashboard tab shows the dashboard's session-count title
     // (the Mode tab view does not render it).
-    deck.wait_for_string("dot-agent-deck \u{2014}");
+    deck.wait_for_string("worker-deck \u{2014}");
 }
 
 /// Scenario: With a Dashboard tab and a Mode tab open, click the `[×]`

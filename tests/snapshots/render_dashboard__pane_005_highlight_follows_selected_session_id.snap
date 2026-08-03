@@ -2,7 +2,7 @@
 source: tests/render_dashboard.rs
 expression: buffer_to_text(&buffer)
 ---
-┌ 1 ClaudeCode · example-alpha ───────────────────────────────────── ● Working ┐
+┌ 1 example-alpha ────────────────────────────────────────────────── ● Working ┐
 │Dir:  alpha                                                                   │
 │Prmt: do the thing                                                            │
 │                                                                              │
@@ -10,7 +10,7 @@ expression: buffer_to_text(&buffer)
 │                                                                              │
 │                                                                              │
 └────────────────────────────────────────────────────────── Last: 0s  Tools: 3 ┘
-┌ ▸ 2 ClaudeCode · example-beta ──────────────────────────────────── ● Working ┐
+┌ ▸ 2 example-beta ───────────────────────────────────────────────── ● Working ┐
 │Dir:  beta                                                                    │
 │Prmt: do the thing                                                            │
 │                                                                              │
@@ -18,7 +18,7 @@ expression: buffer_to_text(&buffer)
 │                                                                              │
 │                                                                              │
 └────────────────────────────────────────────────────────── Last: 0s  Tools: 3 ┘
-┌ 3 ClaudeCode · example-gamma ───────────────────────────────────── ● Working ┐
+┌ 3 example-gamma ────────────────────────────────────────────────── ● Working ┐
 │Dir:  gamma                                                                   │
 │Prmt: do the thing                                                            │
 │                                                                              │
