@@ -1169,6 +1169,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the aggregate-priority resolver as a standalone pure-function unit test (PRD #333 M1, may land separately); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/010 — Within an orchestration tab, focus auto-follows the lowest-order pane currently `WaitingForInput`, recomputed continuously and scoped to the active tab only (fork-only, no PRD/issue).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map keyed by pane id, no panes/PTYs).
+- **Asserts:** with zero panes `WaitingForInput`, the resolver returns `None` and leaves `focused_role_pane_id` exactly as manually set; a non-focused pane transitioning to `WaitingForInput` steals focus; with two panes concurrently `WaitingForInput`, focus resolves to the lower-order one; a newly-arriving LOWER-order waiting pane steals focus away from a currently-focused HIGHER-order pane that is itself still waiting (the "instant, can interrupt" tradeoff, confirmed with the user); once the currently-focused waiting pane is already the lowest-order one waiting, a repeat call is a no-op (no flicker); resolving the focused pane's `WaitingForInput` status advances focus to whichever remaining pane is now the lowest-order one still waiting; and a background (non-active) orchestration tab's newly-waiting pane has zero effect on that tab's stored focus and never changes `TabManager::active_index()`.
+- **Does not assert:** the per-frame call site that feeds live `SessionStatus` into the resolver during `run_tui` (the render loop wiring, `src/ui.rs`); any visible rendering of the focused-pane border/highlight; hook-driven status transitions (statuses here are synthetic, not sourced from real events).
+- **Platform coverage:** mac+linux+windows.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).

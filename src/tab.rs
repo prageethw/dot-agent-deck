@@ -393,6 +393,44 @@ impl TabManager {
         target
     }
 
+    /// Fork-only — continuously steer the active tab's focus to the
+    /// lowest-`role_pane_ids`-order pane that is `WaitingForInput`, so the
+    /// user always lands on the pane most likely to need their attention
+    /// next. No-op for any active tab that isn't `Tab::Orchestration`, and
+    /// by construction never touches another tab or switches which tab is
+    /// active. Re-evaluated from scratch on every call (intended to be
+    /// driven once per frame from the render loop): if no pane in the
+    /// active tab is waiting, `focused_role_pane_id` is left untouched and
+    /// `None` is returned; otherwise the lowest-order waiting pane is
+    /// computed and, only when it differs from the currently stored focus,
+    /// `focused_role_pane_id` is updated and `Some(new_id)` is returned so
+    /// the caller can apply the change on the pane controller (no-op /
+    /// `None` when the target is already focused, to avoid flicker).
+    pub fn auto_focus_waiting_pane(
+        &mut self,
+        pane_status: &HashMap<&str, crate::state::SessionStatus>,
+    ) -> Option<String> {
+        let Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            ..
+        } = &mut self.tabs[self.active_index]
+        else {
+            return None;
+        };
+        let target = role_pane_ids.iter().find(|id| {
+            matches!(
+                pane_status.get(id.as_str()),
+                Some(crate::state::SessionStatus::WaitingForInput)
+            )
+        })?;
+        if focused_role_pane_id.as_deref() == Some(target.as_str()) {
+            return None;
+        }
+        *focused_role_pane_id = Some(target.clone());
+        Some(target.clone())
+    }
+
     pub fn show_tab_bar(&self) -> bool {
         self.tabs.len() > 1
     }
@@ -1233,6 +1271,41 @@ mod tests {
         }
     }
 
+    /// Three roles (`orchestrator` start=true, `alpha`, `beta`) in spawn
+    /// order, for auto-focus tests that need to distinguish lowest- vs
+    /// higher-order waiting panes among more than two roles.
+    fn orch_config_3(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "echo orch".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "alpha".to_string(),
+                    command: "echo alpha".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "beta".to_string(),
+                    command: "echo beta".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        }
+    }
+
     /// Scenario: Create an orchestration with a user-typed name ("My Custom
     /// Run") and confirm the tab shows it; then simulate detach/reattach via
     /// the hydration entry point and confirm the user-typed title is
@@ -1752,5 +1825,152 @@ mod tests {
 
         // Sanity: every assertion above came from a real focus_pane call.
         assert!(pc.focus_calls().len() >= 6);
+    }
+
+    /// Scenario: Within a single active orchestration tab (roles
+    /// `orchestrator` < `alpha` < `beta` in spawn order), drive a synthetic
+    /// `SessionStatus` map through `TabManager::auto_focus_waiting_pane` to
+    /// pin the exact resolution rule: no waiting panes leaves manual focus
+    /// alone, a newly-waiting pane steals focus, ties resolve to the
+    /// lowest-order waiting pane (even stealing focus mid-input from a
+    /// higher-order pane that is itself still waiting), an already-lowest
+    /// focused pane is a no-op, and resolving the focused pane advances to
+    /// the next-lowest still-waiting pane. A second orchestration tab then
+    /// proves a background tab's newly-waiting pane has zero effect and
+    /// never flips the active tab.
+    #[spec("tabs/orchestration/010")]
+    #[test]
+    fn orchestration_010_auto_focus_follows_lowest_order_waiting_pane() {
+        use crate::state::SessionStatus;
+
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tm
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tm.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let alpha = role_ids[1].clone();
+        let beta = role_ids[2].clone();
+
+        // No pane is WaitingForInput: the resolver is a no-op and
+        // `focused_role_pane_id` starts (and stays) at its default `None`.
+        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
+        status.insert(orchestrator.as_str(), SessionStatus::Idle);
+        status.insert(alpha.as_str(), SessionStatus::Working);
+        status.insert(beta.as_str(), SessionStatus::Idle);
+        assert_eq!(tm.auto_focus_waiting_pane(&status), None);
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration {
+                focused_role_pane_id: None,
+                ..
+            }
+        ));
+
+        // Simulate the user manually focusing a pane. With still nothing
+        // waiting, the manual choice must be left exactly as set.
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            *focused_role_pane_id = Some(orchestrator.clone());
+        }
+        assert_eq!(tm.auto_focus_waiting_pane(&status), None);
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
+        ));
+
+        // `beta` (non-focused, highest order) transitions to
+        // WaitingForInput: it steals focus from the manually-set `orchestrator`.
+        status.insert(beta.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(
+            tm.auto_focus_waiting_pane(&status).as_deref(),
+            Some(beta.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
+        ));
+
+        // `alpha` also becomes WaitingForInput: with two panes concurrently
+        // waiting, focus resolves to the LOWER-order one (`alpha`), not the
+        // currently-focused `beta`.
+        status.insert(alpha.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(
+            tm.auto_focus_waiting_pane(&status).as_deref(),
+            Some(alpha.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // `alpha` is already the lowest-order waiting pane and already
+        // focused: a repeat call must be a no-op (no flicker).
+        assert_eq!(tm.auto_focus_waiting_pane(&status), None);
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // `orchestrator` (lower order than the currently-focused `alpha`)
+        // newly transitions to WaitingForInput while `alpha` is itself
+        // still waiting: focus jumps to `orchestrator` anyway — the
+        // confirmed "steal focus mid-input" tradeoff.
+        status.insert(orchestrator.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(
+            tm.auto_focus_waiting_pane(&status).as_deref(),
+            Some(orchestrator.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
+        ));
+
+        // Resolving the focused pane (`orchestrator` -> Idle) advances focus
+        // to the next-lowest STILL-waiting pane (`alpha`), even though the
+        // higher-order `beta` is also still waiting.
+        status.insert(orchestrator.as_str(), SessionStatus::Idle);
+        assert_eq!(
+            tm.auto_focus_waiting_pane(&status).as_deref(),
+            Some(alpha.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // Open a second orchestration tab, which becomes active and leaves
+        // the first as a BACKGROUND tab.
+        let (orch2_idx, _role_ids2) = tm
+            .open_orchestration_tab(&orch_config_3("orch-2"), "/work", None, None, (24, 80))
+            .expect("open second orchestration tab");
+        assert_eq!(tm.active_index(), orch2_idx);
+
+        // `orchestrator` newly transitions to WaitingForInput again on the
+        // now-BACKGROUND first tab — the lowest-order role, which would
+        // steal focus if that tab were active.
+        status.insert(orchestrator.as_str(), SessionStatus::WaitingForInput);
+        let result = tm.auto_focus_waiting_pane(&status);
+
+        // The active tab (`orch-2`) has none of its own panes represented
+        // in `status`, so there is nothing to focus there.
+        assert_eq!(result, None);
+        // Auto-focus never changes which TAB is active.
+        assert_eq!(
+            tm.active_index(),
+            orch2_idx,
+            "auto-focus must never switch the active tab"
+        );
+        // The background tab's stored focus is untouched — still `alpha`,
+        // unaffected by `orchestrator`'s newly-arrived WaitingForInput
+        // status while that tab isn't the active one.
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
     }
 }
