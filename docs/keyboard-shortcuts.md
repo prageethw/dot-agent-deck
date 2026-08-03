@@ -18,6 +18,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
+| `Ctrl+L` | Toggle the orchestration tab's sidebar/pane-column split ratio between 34/66 and 25/75 | **Orchestration tabs only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 
 ### Which mode you're in
@@ -158,6 +159,7 @@ Notation is case-insensitive for modifier and named keys (`ctrl+enter` == `Ctrl+
 
 [global]
 toggle_layout = "Alt+Shift+l"   # move it off Ctrl+t
+toggle_orchestration_split = "Alt+Shift+s"   # move it off Ctrl+l
 new_pane = ""                    # disable the new-pane shortcut
 
 [dashboard]
@@ -174,6 +176,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) — works from any mode |
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
+| `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration tab's sidebar/pane-column split between 34/66 and 25/75 — **orchestration tabs only**; no effect elsewhere |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
 `close_pane` lives in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind it to is command-mode only and reaches the pane as ordinary input everywhere else.
