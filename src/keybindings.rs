@@ -56,6 +56,9 @@ pub enum Action {
     NewPane,
     ClosePane,
     ToggleLayout,
+    /// PRD #336: toggle an orchestration tab's sidebar/pane-column split
+    /// between the default 34/66 ratio and a narrower-sidebar 25/75.
+    ToggleOrchestrationSplit,
     Jump1,
     Jump2,
     Jump3,
@@ -101,9 +104,10 @@ pub struct ActionSpec {
 /// The `default` notations mirror the authoritative hardcoded checks in
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
-///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout); `1`..`9`
-///   jump to a card. (Quit is deliberately absent — `Ctrl+C` is a hardcoded,
-///   non-overridable modal trigger, not a remappable action.)
+///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
+///   (toggle orchestration split); `1`..`9` jump to a card. (Quit is
+///   deliberately absent — `Ctrl+C` is a hardcoded, non-overridable modal
+///   trigger, not a remappable action.)
 /// - dashboard Normal-mode keys: `j`/`k`/`h`/`l`, `/`, `r`, `?`, `Enter`,
 ///   `Esc`, `y`, `n`.
 pub const ACTIONS: &[ActionSpec] = &[
@@ -135,6 +139,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_layout",
         default: "Ctrl+t",
         description: "Toggle layout",
+    },
+    ActionSpec {
+        action: Action::ToggleOrchestrationSplit,
+        section: Section::Global,
+        name: "toggle_orchestration_split",
+        default: "Ctrl+l",
+        description: "Toggle orchestration split",
     },
     ActionSpec {
         action: Action::Jump1,
