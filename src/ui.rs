@@ -21934,6 +21934,13 @@ mod tests {
             self.focused.lock().unwrap().push(id.to_string());
             Ok(())
         }
+        /// Tabs/orchestration/011: the most recently `focus_pane`d id — mirrors
+        /// `EmbeddedPaneController::focused_pane_id`'s live "which pane is
+        /// focused right now" read, which the real render loop feeds into
+        /// `compute_frame_layout` after applying `auto_focus_waiting_pane`.
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.lock().unwrap().last().cloned()
+        }
         fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
             Ok(Vec::new())
         }
@@ -22693,6 +22700,147 @@ mod tests {
             state.blocking_read().sessions.len(),
             sessions_before,
             "no session may be removed when the selection is inactive"
+        );
+    }
+
+    /// Scenario: Open a 2-role Orchestration tab and manually focus the
+    /// higher-order `coder` role, then mark the lower-order `orchestrator`
+    /// role `WaitingForInput` in a synthetic status map. Mirror the ACTUAL
+    /// per-frame call site in `run_tui` (`src/ui.rs`, around the
+    /// `auto_focus_waiting_pane` call) line for line — call
+    /// `TabManager::auto_focus_waiting_pane`, apply its `Some(new_id)` result
+    /// via `pane.focus_pane`, then read the live focus back off the SAME pane
+    /// controller exactly as the render loop does before calling
+    /// `compute_frame_layout` — instead of asserting on `TabManager`'s internal
+    /// field the way `tabs/orchestration/010` does. Feed that focus through
+    /// `compute_frame_layout` + `render_frame` into a real `TestBackend`
+    /// terminal and assert on the OBSERVABLE render-layout outcome: under
+    /// `PaneLayout::Stacked` the auto-focused `orchestrator` role reclaims the
+    /// full pane-column height and the manually-focused-but-superseded `coder`
+    /// role cedes its slot to zero height — closing the PR #5 Greptile gap
+    /// that nothing exercised the render-loop wiring itself, only the resolver
+    /// in isolation.
+    #[spec("tabs/orchestration/011")]
+    #[test]
+    fn orchestration_011_render_loop_applies_auto_focus_to_expanded_pane() {
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tab_manager.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let coder = role_ids[1].clone();
+
+        // Simulate the user having manually focused the higher-order `coder`
+        // role — the state auto-focus must be willing to steal focus away
+        // from once a lower-order role starts waiting.
+        let _ = pc.focus_pane(&coder);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(coder.clone());
+        } else {
+            panic!("expected an active Orchestration tab");
+        }
+
+        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
+        status.insert(orchestrator.as_str(), SessionStatus::WaitingForInput);
+        status.insert(coder.as_str(), SessionStatus::Working);
+
+        // Mirror src/ui.rs's per-frame call site verbatim: resolve, then apply
+        // via `focus_pane` on the pane controller — not just the TabManager's
+        // own bookkeeping.
+        if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&status) {
+            let _ = pc.focus_pane(&new_id);
+        }
+
+        // Mirror the render loop's read-back of live focus off the SAME pane
+        // controller `focus_pane` was just applied to — the value fed into
+        // `compute_frame_layout` as `focused_pane_id`.
+        let focused_pane_id = pc.focused_pane_id();
+        assert_eq!(
+            focused_pane_id.as_deref(),
+            Some(orchestrator.as_str()),
+            "the pane controller must report the auto-focused role as focused"
+        );
+
+        let role_pane_ids = match tab_manager.active_tab() {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("expected an active Orchestration tab"),
+        };
+        let tab_view = ActiveTabView::Orchestration {
+            role_pane_ids: role_pane_ids.clone(),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["orch".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState::default();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+
+        let mut pane_rects: Vec<(String, Rect)> = Vec::new();
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &role_pane_ids,
+                    PaneLayout::Stacked,
+                    focused_pane_id.as_deref(),
+                    1,
+                );
+                if let FrameContent::Cards {
+                    pane_rects: rects, ..
+                } = &layout.content
+                {
+                    pane_rects = rects.clone();
+                }
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                );
+            })
+            .unwrap();
+
+        let expanded = pane_rects
+            .iter()
+            .find(|(id, _)| id == &orchestrator)
+            .map(|(_, r)| *r)
+            .expect("orchestrator rect captured during draw");
+        let collapsed = pane_rects
+            .iter()
+            .find(|(id, _)| id == &coder)
+            .map(|(_, r)| *r)
+            .expect("coder rect captured during draw");
+        assert!(
+            expanded.height > 0,
+            "the render-loop-applied auto-focus must reclaim the Stacked slot \
+             for the waiting `orchestrator` role: {expanded:?}"
+        );
+        assert_eq!(
+            collapsed.height, 0,
+            "the manually-focused-but-superseded `coder` role must cede its \
+             slot once auto-focus moves on: {collapsed:?}"
         );
     }
 
