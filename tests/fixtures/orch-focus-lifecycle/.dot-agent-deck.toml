@@ -1,0 +1,23 @@
+# Fixture for PRD #311's `tabs/orchestration/006`: a 3-role orchestration
+# (orchestrator + two workers) where every role prints a unique sentinel on
+# start, and the non-start `beta` role additionally self-posts real
+# `SessionStart` / `PreToolUse` hook events (via `dot-agent-deck hook
+# claude-code`, resolved through PATH) so its sidebar status card transitions
+# Idle -> Working while it is NOT the focused/expanded role pane — proving a
+# non-focused role keeps running and its status keeps updating even though its
+# pane is not drawn (or, pre-fix, collapsed to a titled 1-row frame).
+[[orchestrations]]
+name = "focus-lifecycle"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "printf 'ORCH_ROLE_SENTINEL\\n'; sleep 600"
+start = true
+
+[[orchestrations.roles]]
+name = "alpha"
+command = "printf 'ALPHA_ROLE_SENTINEL\\n'; sleep 600"
+
+[[orchestrations.roles]]
+name = "beta"
+command = "./beta-agent.sh"

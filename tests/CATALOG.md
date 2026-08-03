@@ -1016,11 +1016,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### tabs/mode
 
-##### tabs/mode/001 — Selecting a mode on the new-pane form opens a mode tab with the agent pane on the left and persistent side panes stacked on the right.
-- **Layer:** L2.
-- **Agent:** none (fixture `.dot-agent-deck.toml` with one persistent pane).
-- **Asserts:** new tab appears in the tab bar; agent pane is in the left half; side pane region renders on the right.
-- **Does not assert:** the side pane's command output content beyond non-empty PTY bytes.
+##### tabs/mode/001 — Selecting a mode on the new-pane form opens a mode tab with the agent pane on the left and persistent side panes stacked on the right; both side panes render SIMULTANEOUSLY under the deck's default (Stacked) global `pane_layout` (PRD #311 regression guard).
+- **Layer:** L2 (PTY-attached, `tests/e2e_mode_tab_layout.rs`).
+- **Agent:** none (fixture `tests/fixtures/mode-two-side-panes` with TWO persistent side panes, each printing a unique sentinel and idling).
+- **Asserts:** the new-pane form's Mode selection opens a Mode tab (tab strip appears); with the deck's default `PaneLayout::Stacked` global, BOTH side panes' sentinels are visible in the grid at the same time — proving the Mode tab's side-pane column (hardcoded `PaneLayout::Tiled` in `render_mode_tab`, `src/ui.rs`) does not read the shared global `pane_layout` field (PRD #311's Open Question 2 risk) and so never collapses a side pane to a titled 1-row frame regardless of the global's value.
+- **Does not assert:** the side pane's command output content beyond the sentinel line; the agent pane's exact left-half geometry (covered by `compute_frame_layout_mode_geometry`, a plain unit test in `src/ui.rs`); orchestration/dashboard pane-column geometry (covered by `orchestration/layout/002`).
 - **Platform coverage:** mac+linux.
 
 ##### tabs/mode/002 — `Ctrl+w` on a mode tab tears down the entire workspace (agent + all side panes).
@@ -1100,6 +1100,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (a real interactive `bash --noprofile --norc -i` pane on the Dashboard, no LLM tokens spent).
 - **Asserts:** on a Dashboard (non-orchestration) tab with a live shell pane in PaneInput mode, printing a unique sentinel line then pressing `Ctrl+l` must trigger readline's `clear-screen` binding and remove the sentinel from the rendered grid, proving the raw byte reached the PTY. Pins the PRD #336 scope note that `Action::ToggleOrchestrationSplit` only claims `Ctrl+l` on an orchestration tab — regression coverage for the Greptile P1 finding on PR #342 (the global resolver claimed `Ctrl+l` unconditionally, swallowing it on every other tab).
 - **Does not assert:** the orchestration-tab toggle behavior itself (covered by `tabs/orchestration/006`); Mode-tab or other non-Dashboard tab types (Dashboard is sufficient to prove the missing tab-context check).
+- **Platform coverage:** mac+linux.
+
+##### tabs/orchestration/008 — In a real multi-role orchestration tab under `PaneLayout::Stacked`, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
+- **Layer:** L2 (PTY-attached, `tests/e2e_orchestration_pane_column.rs`).
+- **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: a 3-role orchestration — `orchestrator` (start), `alpha`, `beta` — each printing a unique sentinel; `beta`'s script additionally self-posts real `SessionStart`/`PreToolUse` hook events via `dot-agent-deck hook --agent claude-code`, resolved to the freshly built test binary, so its sidebar status transitions Idle -> Working while its pane is not the focused/expanded slot).
+- **Asserts:** (a) with `orchestrator` focused/expanded, the settled grid carries no collapsed `Borders::TOP` title-bar frame for either non-focused role (`alpha`, `beta`) — matched by a row that, after trimming only leading blank columns, begins with the bare role name directly followed by border-fill dashes, a pattern only the collapsed-pane block itself can produce; (b) `beta`'s sidebar status card visibly transitions to `Working` purely from its own self-posted hook events while never becoming the focused pane, proving a non-focused role's agent lifecycle (PTY, hook delivery, status) is untouched by the rendering change; (c) driving `j`/`k` (Normal mode) round-trips focus orchestrator -> alpha -> beta -> alpha -> orchestrator, and each role's own sentinel text is visible again once it becomes the expanded pane, proving no lost scrollback or stale fragment across a focus switch.
+- **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); the L1 geometry math (covered by `orchestration/layout/002`); a real LLM agent (all three roles are shell stand-ins); dashboard-tab (non-orchestration) collapsed frames.
 - **Platform coverage:** mac+linux.
 
 #### tabs/selection
@@ -2024,6 +2031,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** dispatch `Action::SpawnPane` to open orchestration tab A at the default split, dispatch `Action::ToggleOrchestrationSplit` to narrow it, then set `ACTIVE_ORCHESTRATION_SPLIT_NARROW` to simulate the render loop syncing it from the now-narrow, still-active tab A (the state a follow-up spawn would observe before the next frame runs); dispatch a second `Action::SpawnPane` to open a brand-new orchestration tab B. B's own `split_narrow` field defaults to `false` (per-tab STATE is correctly isolated); B's role panes' recorded `AgentSpawnOptions::cols` must equal A's initial (default-split) cols, since both tabs were opened untoggled. Catches the case where `orchestration_role_pane_dims` sizes B's role panes using the stale `ACTIVE_ORCHESTRATION_SPLIT_NARROW` thread-local left over from tab A instead of B's own default state.
 - **Does not assert:** the visible rendered grid or a live render-loop resync (the thread-local's post-spawn correction on the next frame is out of scope — this test pins the SPAWN-TIME dims only); mode or dashboard tabs (unaffected by this thread-local).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/layout/004 — In a 7-role orchestration tab with `PaneLayout::Stacked`, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
+- **Layer:** L1 (in-process `compute_frame_layout` + `render_frame` driven through a real `ratatui::Terminal<TestBackend>`, via `EmbeddedPaneController::for_render_only_tests()`; no PTY, no subprocess). Lives in `src/ui.rs`'s own `#[cfg(test)]` module (same pattern as `tabs/orchestration/003-005`) because the geometry helpers under test (`pane_stack_rects`, `stacked_expanded_index`, `render_terminal_panes`) are module-private and unreachable from `tests/*.rs`.
+- **Agent:** none (7 synthetic role pane ids, no backing PTYs).
+- **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
+- **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/route

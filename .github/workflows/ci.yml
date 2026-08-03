@@ -24,9 +24,85 @@ concurrency:
 
 permissions:
   contents: read
+  # `changes` reads the PR's file list to decide whether the Rust jobs have
+  # anything to inspect.
+  pull-requests: read
 
 jobs:
+  # Renovate automerges devbox digest/pin/patch/minor bumps (renovate.json), and
+  # those PRs touch nothing but devbox.json / devbox.lock. No Rust job can
+  # observe such a change — every one of them installs its toolchain directly via
+  # dtolnay/rust-toolchain and taiki-e/install-action, never through devbox — so
+  # they burn ~4 minutes across three runners to re-prove a tree that did not
+  # move. This gate skips them for that one case and leaves the `devbox` job,
+  # which is the only check that can actually see the diff.
+  #
+  # Same reasoning as the path filter on aarch64-crossbuild-check.yml: run the
+  # expensive leg exactly when the thing it guards changed.
+  #
+  # Scoped to Renovate on purpose. A HUMAN PR touching only devbox files still
+  # gets the full matrix — the cost is trivial at that frequency, and the author
+  # may well be mid-way through a change that grows beyond devbox on the next
+  # push.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      devbox_only: ${{ steps.detect.outputs.devbox_only }}
+    steps:
+      - id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          # Anything that is not a Renovate PR gets the full matrix. On `push` to
+          # main and on workflow_dispatch there is no pull_request payload, so
+          # PR_AUTHOR is empty and we exit here — which is what keeps the
+          # post-merge verification described above intact. That matters most for
+          # exactly these PRs: they land unreviewed, so the push-to-main run is
+          # the first time the Rust jobs ever see the merged result.
+          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
+            echo "author='${PR_AUTHOR:-}' is not Renovate -> full CI"
+            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `|| true` so a transient API failure falls into the fail-safe below
+          # rather than aborting under `set -e`. A failed `changes` job would
+          # skip every Rust job via `needs`, which is the one outcome worth
+          # engineering against here.
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+          echo "changed files:"
+          echo "$files"
+
+          # Fail safe: an empty list means the API told us nothing useful. Run
+          # everything rather than read that as "nothing to test".
+          if [ -z "$files" ]; then
+            echo "no files reported -> full CI"
+            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS= read -r f; do
+            case "$f" in
+              devbox.json | devbox.lock) ;;
+              *)
+                echo "'$f' is outside devbox -> full CI"
+                echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          done <<< "$files"
+
+          echo "devbox files only -> skipping the Rust jobs"
+          echo "devbox_only=true" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -81,6 +157,8 @@ jobs:
   # a Windows VM is tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9),
   # not M8.
   build-windows:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -113,6 +191,8 @@ jobs:
   # Unix at the source level and compile to empty crates), macOS *is* unix, so
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
   build-macos:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -128,7 +208,10 @@ jobs:
       - run: cargo clippy -- -D warnings
       - run: cargo nextest run
 
+  # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -136,3 +219,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  # devbox.json / devbox.lock had NO CI coverage until this job. Every other job
+  # installs its toolchain directly (dtolnay/rust-toolchain, taiki-e/install-action,
+  # cargo install), so a Renovate devbox bump went green on all five checks
+  # without a single one of them resolving the lock or running a pinned tool.
+  # That is not a hypothetical gap: Renovate automerges devbox digest/pin/patch/
+  # minor, so those bumps land unreviewed against checks structurally incapable
+  # of seeing them. #338 (vals 0.44.5 -> 0.45.0, which carried an upstream
+  # optional-provider build-tag refactor) was green on all five while nothing had
+  # executed `vals` at all — and `vals` is what resolves every secret in
+  # .env.vals.yaml for the devbox shell.
+  #
+  # DELIBERATELY NOT the version source for the build jobs. Those use
+  # dtolnay/rust-toolchain@stable on purpose: they answer "does this still
+  # compile on CURRENT stable", which is also what release.yml ships with,
+  # whereas devbox pins rustc 1.97.0 for a reproducible contributor shell.
+  # Routing CI through devbox would trade the upstream-breakage signal for a pin,
+  # and build-windows could not follow anyway — Nix has no native Windows
+  # support, and that job exists to exercise the MSVC toolchain.
+  #
+  # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
+  # unvalidated; add a macos-latest leg if that gap starts to bite.
+  devbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jetify-com/devbox-install-action@v0.15.0
+        with:
+          # Caches the whole Nix store keyed on devbox.json. Worth it: the
+          # `path:gcloud#google-cloud-sdk` flake pulls nixpkgs-unstable and
+          # builds the SDK, which dominates a cold run.
+          enable-cache: true
+      # A FILE, not an inline `bash -c '…'`: devbox flattens its trailing args
+      # into one string and re-parses them through a shell, so a quoted
+      # multi-line argument is destroyed before bash sees it. That is what broke
+      # the first version of this job on main (devbox 0.17.5, `invalid version
+      # 'set'`). See the header of the script for the detail.
+      - run: devbox run -- bash scripts/devbox-smoke.sh

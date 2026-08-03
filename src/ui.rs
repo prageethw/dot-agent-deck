@@ -2002,10 +2002,12 @@ fn right_column_pane_dims(
     let count = pane_count.max(1);
     let chunk_height = match layout {
         PaneLayout::Tiled => main_height / count,
+        // PRD #311: the expanded slot now takes the WHOLE main height — no
+        // per-collapsed-pane row is carved off, since non-focused panes
+        // reserve zero rows instead of a 1-row title bar.
         PaneLayout::Stacked => {
             if is_focused {
-                let unfocused = count.saturating_sub(1);
-                main_height.saturating_sub(unfocused)
+                main_height
             } else {
                 1
             }
@@ -2018,8 +2020,9 @@ fn right_column_pane_dims(
 
 /// Dashboard pane: right 67% of width, height divided across `pane_count`
 /// panes per the active `PaneLayout`. `is_focused` matters in `Stacked`
-/// mode (focused gets the lion's share, unfocused collapse to a 1-row
-/// title bar); in `Tiled` it's ignored. `show_tab_bar` matches
+/// mode (PRD #311: the focused pane fills the whole column, unfocused
+/// panes reserve zero rows — this helper returns a zero-row chunk for
+/// them); in `Tiled` it's ignored. `show_tab_bar` matches
 /// `TabManager::show_tab_bar` and adds 1 row of chrome.
 pub(crate) fn dashboard_pane_dims(
     area: Rect,
@@ -2044,8 +2047,9 @@ pub(crate) fn dashboard_pane_dims(
 /// gutter), height divided across `role_count` role panes per `layout`.
 ///
 /// `role_index` matters only in `Stacked` mode, where role 0 is the
-/// expanded slot and every other role collapses to a 1-row title bar —
-/// mirroring the renderer's "expand the first slot if nothing is
+/// expanded slot (PRD #311: it fills the whole column and every other
+/// role reserves zero rows — this helper returns a zero-row chunk for
+/// them) — mirroring the renderer's "expand the first slot if nothing is
 /// focused" fallback (see `render_terminal_panes` Stacked branch). In
 /// `Tiled` mode `role_index` is ignored (height divides equally).
 ///
@@ -11148,11 +11152,14 @@ enum FrameContent {
     /// of panes shown in `panes_area`. `pane_rects` is each pane's OUTER rect
     /// in that column (M4: same `pane_stack_rects` split `render_terminal_panes`
     /// draws into, so the PTY-resize target and the rendered rect can't drift).
+    /// `pane_layout` is threaded through so `pane_target_dims` (PRD #311 M2)
+    /// can tell a genuinely-empty `Stacked` slot apart from a `Tiled` one.
     Cards {
         dashboard_area: Rect,
         panes_area: Option<Rect>,
         pane_ids: Vec<String>,
         pane_rects: Vec<(String, Rect)>,
+        pane_layout: PaneLayout,
     },
     /// Mode tab: single agent pane (left 50%) and stacked side panes
     /// (right 50%). `side_pane_rects` is the per-side-pane OUTER rect keyed by
@@ -11173,16 +11180,35 @@ impl FrameLayout {
     /// `TerminalWidget`'s inner content area is the OUTER rect shrunk by the
     /// 1-cell border on each side, so `(rows, cols) = (h - 2, w - 2)`. This is
     /// the single source `resize_panes_to_layout` drives PTYs from (invariant
-    /// 2). Collapsed Stacked panes resolve to a zero dimension and are filtered
-    /// by the caller.
+    /// 2).
+    ///
+    /// PRD #311 M2: a non-focused `Stacked` pane is not drawn and its rect
+    /// collapses to zero height, but its PTY still needs a defined, stable
+    /// size — otherwise an agent reflows to something arbitrary the moment it
+    /// loses focus and reflows again when it regains it. Resolution of Open
+    /// Question 1: size it "as if focused" — since the expanded slot always
+    /// fills the WHOLE pane column once every other slot reserves zero rows,
+    /// that is simply `panes_area` (dims shared with the pane that is
+    /// actually expanded this frame). `Tiled` is untouched: a zero-height
+    /// `Tiled` rect is a genuine "no room" case, not an undrawn pane.
     fn pane_target_dims(&self) -> Vec<(&str, u16, u16)> {
         // Inner area of a bordered pane = outer minus 1 cell on each side.
         let dims = |rect: Rect| (rect.height.saturating_sub(2), rect.width.saturating_sub(2));
         let mut out = Vec::new();
         match &self.content {
-            FrameContent::Cards { pane_rects, .. } => {
+            FrameContent::Cards {
+                pane_rects,
+                panes_area,
+                pane_layout,
+                ..
+            } => {
                 for (id, rect) in pane_rects {
-                    let (rows, cols) = dims(*rect);
+                    let target = if *pane_layout == PaneLayout::Stacked && rect.height == 0 {
+                        panes_area.unwrap_or(*rect)
+                    } else {
+                        *rect
+                    };
+                    let (rows, cols) = dims(target);
                     out.push((id.as_str(), rows, cols));
                 }
             }
@@ -11289,6 +11315,7 @@ fn compute_frame_layout(
                 panes_area,
                 pane_ids,
                 pane_rects,
+                pane_layout,
             }
         }
         ActiveTabView::Orchestration { role_pane_ids, .. } => {
@@ -11307,6 +11334,7 @@ fn compute_frame_layout(
                 panes_area,
                 pane_ids,
                 pane_rects,
+                pane_layout,
             }
         }
     };
@@ -11379,8 +11407,9 @@ fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Opti
 /// exactly how `render_terminal_panes` lays panes out for the given
 /// `PaneLayout` and resolved focus. Single source of truth so the layout pass
 /// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
-/// `Tiled`: equal vertical division. `Stacked`: the expanded slot fills, every
-/// other pane collapses to a 1-row title bar.
+/// `Tiled`: equal vertical division. `Stacked` (PRD #311): the expanded slot
+/// fills the whole area and every other pane reserves zero rows (`Length(0)`) —
+/// it is not drawn at all, rather than collapsing to a 1-row title bar.
 fn pane_stack_rects(
     area: Rect,
     pane_ids: &[String],
@@ -11396,8 +11425,9 @@ fn pane_stack_rects(
             .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
             .collect(),
         PaneLayout::Stacked => {
-            // Focused pane gets remaining space; unfocused get a single
-            // collapsed title row (`title_bar_height = 1`).
+            // PRD #311: the focused pane gets the ENTIRE area; non-focused
+            // panes are not drawn at all, so they reserve zero rows rather
+            // than a collapsed 1-row title bar.
             let expanded = stacked_expanded_index(pane_ids, focused_id);
             pane_ids
                 .iter()
@@ -11406,7 +11436,7 @@ fn pane_stack_rects(
                     if expanded == Some(i) {
                         Constraint::Fill(1)
                     } else {
-                        Constraint::Length(1)
+                        Constraint::Length(0)
                     }
                 })
                 .collect()
@@ -11422,9 +11452,11 @@ fn pane_stack_rects(
 /// orchestration role transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
 ///
-/// A pane whose target inner area has a zero dimension (a collapsed Stacked
-/// slot, or a viewport too small for the border) is skipped — matching the old
-/// helpers' `rows > 0 && cols > 0` guard. `resize_pane_pty` is the one resize
+/// A pane whose target inner area has a zero dimension (a `Tiled` pane with no
+/// room, or a viewport too small for the border) is skipped — matching the old
+/// helpers' `rows > 0 && cols > 0` guard. A non-focused `Stacked` pane is NOT a
+/// zero case here: `pane_target_dims` sizes it as if focused (PRD #311), so it
+/// keeps a stable PTY size even while undrawn. `resize_pane_pty` is the one resize
 /// primitive and handles local vs stream-backed panes itself (stream panes
 /// coalesce to the daemon; see `embedded_pane.rs`), so no per-backend
 /// special-casing is needed here.
@@ -11589,6 +11621,7 @@ fn render_frame(
             panes_area,
             pane_ids,
             pane_rects,
+            ..
         } => (*dashboard_area, *panes_area, pane_ids, pane_rects),
     };
 
@@ -12023,50 +12056,30 @@ fn render_terminal_panes(
             }
         }
         PaneLayout::Stacked => {
-            // Focused pane gets remaining space; unfocused get a single
-            // collapsed title row. `stacked_expanded_index` resolves which slot
-            // expands (focused, else first) — the same decision the split used.
+            // PRD #311: only the focused pane is drawn — non-focused panes
+            // render nothing at all (no collapsed title-bar frame).
+            // `stacked_expanded_index` resolves which slot expands (focused,
+            // else first) — the same decision the split used.
             let focused_idx = stacked_expanded_index(pane_ids, focused_id.as_deref());
-            for (i, pane_id) in pane_ids.iter().enumerate() {
-                let is_expanded = focused_idx == Some(i);
-                let title = pane_name(pane_id);
-                if is_expanded {
-                    if let Some(screen) = ctrl.get_screen(pane_id) {
-                        let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                        // PRD #84 M5: the expanded pane was sized to `chunks[i]`
-                        // by `resize_panes_to_layout` this frame — attest it.
-                        let mut widget =
-                            TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                                .contract_guaranteed(true)
-                                .with_input_active(input_active);
-                        // PRD #155 (M3): same status threading as the Tiled arm.
-                        if let Some(status) = pane_status.get(pane_id.as_str()) {
-                            widget = widget.with_status(status.clone());
-                        }
-                        if is_focused {
-                            focused_pane_rect = Some(chunks[i]);
-                            focused_screen = Some(screen);
-                        }
-                        frame.render_widget(widget, chunks[i]);
+            if let Some(i) = focused_idx {
+                let pane_id = &pane_ids[i];
+                if let Some(screen) = ctrl.get_screen(pane_id) {
+                    let title = pane_name(pane_id);
+                    let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
+                    // PRD #84 M5: the expanded pane was sized to `chunks[i]`
+                    // by `resize_panes_to_layout` this frame — attest it.
+                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
+                        .contract_guaranteed(true)
+                        .with_input_active(input_active);
+                    // PRD #155 (M3): same status threading as the Tiled arm.
+                    if let Some(status) = pane_status.get(pane_id.as_str()) {
+                        widget = widget.with_status(status.clone());
                     }
-                } else {
-                    // Collapsed: show a titled border block. PRD #155 (M3): a
-                    // collapsed pane is by definition not the expanded/focused
-                    // slot, so the unified Option-A precedence resolves its
-                    // border to the agent's STATUS color — the SAME palette role
-                    // the Tiled and expanded-Stacked arms apply via
-                    // `with_status`, so a given state looks identical across all
-                    // embedded-pane contexts (criterion #2). Panes without a
-                    // backing session status keep the dimmed fallback.
-                    let border_style = pane_status
-                        .get(pane_id.as_str())
-                        .map(|status| Style::default().fg(palette::status_color(status)))
-                        .unwrap_or_else(text_dim);
-                    let block = Block::default()
-                        .borders(Borders::TOP)
-                        .border_style(border_style)
-                        .title(format!(" {title} "));
-                    frame.render_widget(block, chunks[i]);
+                    if is_focused {
+                        focused_pane_rect = Some(chunks[i]);
+                        focused_screen = Some(screen);
+                    }
+                    frame.render_widget(widget, chunks[i]);
                 }
             }
         }
@@ -15830,9 +15843,9 @@ mod tests {
 
     #[test]
     fn dashboard_pane_dims_stacked_focused_takes_remainder() {
-        // 100×30, 3 panes, stacked, focused: unfocused = 2; main = 29;
-        // chunk = 29 - 2 = 27; rows = 25. The other two panes collapse
-        // to 1-row title bars (next assertion).
+        // PRD #311: the focused slot takes the WHOLE main height (no rows
+        // ceded to collapsed siblings). 100×30, 3 panes, stacked, focused:
+        // main = 29; chunk = 29; rows = 27.
         let (rows, cols) = dashboard_pane_dims(
             Rect::new(0, 0, 100, 30),
             3,
@@ -15840,14 +15853,18 @@ mod tests {
             PaneLayout::Stacked,
             false,
         );
-        assert_eq!((rows, cols), (25, 65));
+        assert_eq!((rows, cols), (27, 65));
     }
 
     #[test]
-    fn dashboard_pane_dims_stacked_unfocused_collapses_to_title_bar() {
-        // Unfocused in stacked mode: chunk = 1; rows = saturating_sub(2) = 0.
-        // `resize_pane_pty` callers gate on rows > 0, so this just signals
-        // "don't bother dispatching a resize for this pane right now."
+    fn dashboard_pane_dims_stacked_unfocused_reserves_zero_rows() {
+        // PRD #311: a non-focused Stacked pane is not drawn and reserves zero
+        // rows (no collapsed title bar). This spawn-path helper mirrors that by
+        // returning a zero-row chunk for the unfocused case: chunk = 1; rows =
+        // saturating_sub(2) = 0. Spawn-time resize callers gate on rows > 0, so
+        // this just signals "don't dispatch a resize for this pane right now";
+        // the per-frame `resize_panes_to_layout` pass later sizes the pane's PTY
+        // as if focused (see `FrameLayout::pane_target_dims`).
         let (rows, _cols) = dashboard_pane_dims(
             Rect::new(0, 0, 100, 30),
             3,
@@ -15929,9 +15946,9 @@ mod tests {
         // In Stacked mode with no focused role, role_index 0 mirrors
         // the renderer's "expand the first slot if nothing is focused"
         // fallback (see `render_terminal_panes` Stacked branch). Role
-        // 0 gets the lion's share; others collapse to the 1-row
-        // sentinel that resize callers gate on (`rows > 0` skips the
-        // resize).
+        // 0 fills the whole column; others reserve zero rows (PRD #311),
+        // so this helper returns the zero-row sentinel that spawn-time
+        // resize callers gate on (`rows > 0` skips the resize).
         let area = Rect::new(0, 0, 100, 30);
         let (rows_focused, _) =
             orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false, false);
@@ -15951,15 +15968,15 @@ mod tests {
     fn orchestration_role_pane_dims_stacked_role_zero_matches_renderer_expanded_height() {
         // Drift guard: the helper's expanded-row height for the Stacked
         // expanded slot (role 0) must equal the renderer's expanded height.
-        // The renderer gives the expanded slot `Constraint::Fill(1)` after
-        // carving 1-row title bars off the other (count-1) slots — i.e. the
-        // expanded inner height = main_height - (count-1) - 2 (border).
+        // PRD #311: the renderer gives the expanded slot `Constraint::Fill(1)`
+        // after every other slot reserves ZERO rows (no collapsed title bars
+        // any more) — i.e. the expanded inner height = main_height - 2
+        // (border only, no per-collapsed-pane subtraction).
         let area = Rect::new(0, 0, 200, 50);
         let role_count: u16 = 4;
         let chrome_rows: u16 = 1; // hints bar; no tab bar in this test
         let main_height = area.height.saturating_sub(chrome_rows);
-        let expanded_outer = main_height.saturating_sub(role_count - 1);
-        let expanded_inner = expanded_outer.saturating_sub(2);
+        let expanded_inner = main_height.saturating_sub(2);
         let (helper_rows, _) = orchestration_role_pane_dims(
             area,
             role_count as usize,
@@ -16030,6 +16047,7 @@ mod tests {
             panes_area,
             pane_ids: laid_out_ids,
             pane_rects,
+            ..
         } = layout.content
         else {
             panic!("Dashboard tab must produce FrameContent::Cards");
@@ -16109,6 +16127,114 @@ mod tests {
                 ("s1".to_string(), Rect::new(50, 20, 50, 19)),
             ]
         );
+    }
+
+    /// Scenario: Render a 7-role Orchestration tab (mirroring issue #307's
+    /// `orchestrator`/`developer`/`tester`/`reviewer`/`releaser`/`researcher`/
+    /// `documenter` roster) in `PaneLayout::Stacked` through the real
+    /// `compute_frame_layout` + `render_frame` path into a `TestBackend`, with
+    /// no pane explicitly focused (so the first role, `orchestrator`, is the
+    /// resolved expanded slot per `stacked_expanded_index`'s fallback). Assert
+    /// (1) the expanded role's rect height equals the FULL pane-column height —
+    /// no rows ceded to collapsed frames — and (2) none of the other six
+    /// roles' pane ids appear anywhere in the rendered grid, i.e. no collapsed
+    /// `Borders::TOP` title block is drawn for a non-focused pane. PRD #311:
+    /// today `pane_stack_rects` reserves a 1-row title bar per non-focused pane
+    /// (RED on both counts — the expanded rect is short by 6 rows and every
+    /// other role's id shows up in a collapsed frame's title); the fix reclaims
+    /// those rows for the focused pane and stops drawing the collapsed arm.
+    #[spec("orchestration/layout/004")]
+    #[test]
+    fn layout_004_stacked_orchestration_hides_collapsed_frames() {
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState::default();
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+
+        let role_names = [
+            "orchestrator",
+            "developer",
+            "tester",
+            "reviewer",
+            "releaser",
+            "researcher",
+            "documenter",
+        ];
+        let pane_ids: Vec<String> = role_names.iter().map(|r| format!("role-{r}")).collect();
+
+        let tab_view = ActiveTabView::Orchestration {
+            role_pane_ids: pane_ids.clone(),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["seven-roles".into()],
+            active_index: 0,
+        };
+
+        let mut expanded_rect: Option<Rect> = None;
+        let mut panes_area: Option<Rect> = None;
+
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &pane_ids,
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+
+                let FrameContent::Cards {
+                    panes_area: this_panes_area,
+                    pane_rects,
+                    ..
+                } = &layout.content
+                else {
+                    panic!("Orchestration tab must produce FrameContent::Cards");
+                };
+                panes_area = Some(this_panes_area.expect("7 role panes => a right pane column"));
+                expanded_rect = pane_rects
+                    .iter()
+                    .find(|(id, _)| id == &pane_ids[0])
+                    .map(|(_, r)| *r);
+
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                );
+            })
+            .unwrap();
+
+        let panes_area = panes_area.expect("pane column rect captured during draw");
+        let expanded_rect = expanded_rect.expect("orchestrator role rect captured during draw");
+        assert_eq!(
+            expanded_rect.height, panes_area.height,
+            "the focused role's pane must reclaim the FULL pane-column height \
+             (no rows ceded to collapsed frames): expanded={expanded_rect:?} \
+             column={panes_area:?}"
+        );
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        for id in &pane_ids[1..] {
+            assert!(
+                !rendered.contains(id.as_str()),
+                "non-focused role pane {id} must not render a collapsed title \
+                 frame in PaneLayout::Stacked:\n{rendered}"
+            );
+        }
     }
 
     // PRD #144 — `modal_rect` is the shared content-driven modal sizer: clamp the
