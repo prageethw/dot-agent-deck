@@ -344,26 +344,24 @@ fn guard_002_no_absolute_bg_in_source() {
 }
 
 /// Scenario: Render a single dashboard card for a live `AgentType::Pi` session
-/// with NO display name (so the card title falls back to the
-/// `<agent-type> · <session-id>` form) into a `TestBackend` buffer, then assert
-/// the rendered card surface shows the Pi agent-type identity ("Pi") in its
-/// title — proving a plain `pi` pane (`command = "pi"`) is rendered as a
-/// first-class agent, not "No agent". The fixture's cwd basename and session id
-/// carry no capital-`Pi`, so the only way "Pi ·" reaches the grid is via the
-/// agent-type Display; the card must NOT show ClaudeCode / OpenCode / No agent.
+/// with NO display name (so the card title falls back to the plain
+/// `<session-id>` form) into a `TestBackend` buffer, then assert the rendered
+/// card surface shows the session id but carries no agent-type badge — no
+/// `Pi` / `ClaudeCode` / `OpenCode` / `No agent` label text anywhere, and no
+/// cell in Pi's registry `badge_color`. Fork-only: the badge is removed from
+/// every card, so a Pi pane must render exactly like any other agent type
+/// once un-badged, not fall back to showing its type name.
 #[spec("dashboard/pane/007")]
 #[test]
 fn pane_007_pi_card_shows_pi_identity() {
-    // PRD #201 M2.2 (test-plan row 2): a Pi pane's card renders the Pi identity.
-    // The `AgentType` Display impl prints "Pi" and `render_session_card`'s
-    // no-display-name branch titles the card `<agent_type> · <id>`. The cwd
-    // basename (`workspace`) and session id (`orch-01`) deliberately contain no
-    // capital `Pi`, so the assertion pins the agent-type identity specifically
-    // rather than an incidental substring.
-    //
-    // PRD #201 (Design Decision #8 reversed): the Pi surface ships visible by
-    // default — it is NOT gated behind the experimental flag — so this test
-    // touches no flag and expects the Pi identity to render unconditionally.
+    // Fork-only badge removal: `render_session_card` no longer emits the
+    // `(agent_type_text, badge_style)` segment for any agent type, so a
+    // no-display-name Pi pane's title falls back to the bare session id
+    // (`orch-01`), with no `Pi` text and no registry badge colour anywhere
+    // on the card. This mirrors the same-shape assertions in
+    // `pane_008_codex_card_omits_agent_type_badge` but pins the Pi agent
+    // type specifically, since Pi historically needed its own identity
+    // check (PRD #201) to prove it renders as a first-class agent at all.
     //
     // `last_activity = now` keeps any rendered `Last: Xs ago` at `0s ago`
     // (mirrors `pane_004`).
@@ -402,20 +400,32 @@ fn pane_007_pi_card_shows_pi_identity() {
     );
     let text = buffer_to_text(&buffer);
 
-    // The Pi agent-type identity surfaces in the card title (`Pi · orch-01`).
+    // The bare session id still surfaces in the card title, since there is
+    // no display name to fall back to.
     assert!(
-        text.contains("Pi · orch-01"),
-        "a Pi pane's card title must show the Pi agent-type identity \
-         (`Pi · orch-01`):\n{text}"
+        text.contains("orch-01"),
+        "a Pi pane's card title must show the session id `orch-01` once the \
+         agent-type badge is removed:\n{text}"
     );
-    // ...and it must be Pi specifically — not another agent type or the
-    // placeholder.
-    for other in ["ClaudeCode", "OpenCode", "No agent"] {
+    // The agent-type badge is gone entirely — no type label for Pi or any
+    // other agent type leaks onto the card.
+    for other in ["Pi", "ClaudeCode", "OpenCode", "Codex", "No agent"] {
         assert!(
             !text.contains(other),
-            "a Pi pane's card must not show `{other}`:\n{text}"
+            "a Pi pane's card must not show the agent-type label `{other}` \
+             once the badge is removed:\n{text}"
         );
     }
+    // ...and no cell should carry Pi's registry badge color either.
+    let would_be_badge_color = dot_agent_deck::agent_registry::spec(&AgentType::Pi).badge_color;
+    let has_badge_colored_cell = (0..buffer.area().height)
+        .any(|y| (0..buffer.area().width).any(|x| buffer[(x, y)].fg == would_be_badge_color));
+    assert!(
+        !has_badge_colored_cell,
+        "no cell should carry Pi's registry badge color {would_be_badge_color:?} \
+         once the badge is removed:\n{}",
+        buffer_to_color_text(&buffer)
+    );
 }
 
 /// Scenario: Render a live Codex session with no friendly display name into a
