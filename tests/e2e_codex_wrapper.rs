@@ -97,9 +97,11 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         "the wrapped Codex card never visibly entered Thinking:\n{}",
         deck.snapshot_grid()
     );
+    // No agent-type badge to key off anymore; the sole restored pane's
+    // auto-assigned display name ("pane-1") is the retained identity text.
     assert!(
-        deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(10)),
-        "the live dashboard card did not show the Codex identity:\n{}",
+        deck.wait_for_grid_string_within("pane-1", Duration::from_secs(10)),
+        "the live dashboard card did not show its pane identity:\n{}",
         deck.snapshot_grid()
     );
 
@@ -198,9 +200,12 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
 
     deck.send_bytes(b"\x04");
     deck.wait_for_string("Dir:");
+    // No agent-type badge to key off anymore; with no form-supplied pane name,
+    // `resolve_display_name` falls back to the literal spawned command, so the
+    // card's identity text is the `codex …` invocation itself.
     assert!(
-        deck.wait_for_grid_string_within("Codex", Duration::from_secs(30)),
-        "the automatically wrapped interactive session never rendered a Codex card:\n{}",
+        deck.wait_for_grid_string_within("codex", Duration::from_secs(30)),
+        "the automatically wrapped interactive session never rendered a card for its command:\n{}",
         deck.snapshot_grid()
     );
     assert!(

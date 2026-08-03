@@ -2,7 +2,7 @@
 source: tests/render_dashboard.rs
 expression: buffer_to_text(&buffer)
 ---
-┌ 1 ClaudeCode · example-coder ───────────────────────────────────── ● Working ┐
+┌ 1 example-coder ────────────────────────────────────────────────── ● Working ┐
 │Dir:  example-project                                                         │
 │Prmt: fix the login bug                                                       │
 │                                                                              │
