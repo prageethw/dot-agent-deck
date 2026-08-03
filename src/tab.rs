@@ -393,6 +393,44 @@ impl TabManager {
         target
     }
 
+    /// Fork-only — continuously steer the active tab's focus to the
+    /// lowest-`role_pane_ids`-order pane that is `WaitingForInput`, so the
+    /// user always lands on the pane most likely to need their attention
+    /// next. No-op for any active tab that isn't `Tab::Orchestration`, and
+    /// by construction never touches another tab or switches which tab is
+    /// active. Re-evaluated from scratch on every call (intended to be
+    /// driven once per frame from the render loop): if no pane in the
+    /// active tab is waiting, `focused_role_pane_id` is left untouched and
+    /// `None` is returned; otherwise the lowest-order waiting pane is
+    /// computed and, only when it differs from the currently stored focus,
+    /// `focused_role_pane_id` is updated and `Some(new_id)` is returned so
+    /// the caller can apply the change on the pane controller (no-op /
+    /// `None` when the target is already focused, to avoid flicker).
+    pub fn auto_focus_waiting_pane(
+        &mut self,
+        pane_status: &HashMap<&str, crate::state::SessionStatus>,
+    ) -> Option<String> {
+        let Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            ..
+        } = &mut self.tabs[self.active_index]
+        else {
+            return None;
+        };
+        let target = role_pane_ids.iter().find(|id| {
+            matches!(
+                pane_status.get(id.as_str()),
+                Some(crate::state::SessionStatus::WaitingForInput)
+            )
+        })?;
+        if focused_role_pane_id.as_deref() == Some(target.as_str()) {
+            return None;
+        }
+        *focused_role_pane_id = Some(target.clone());
+        Some(target.clone())
+    }
+
     pub fn show_tab_bar(&self) -> bool {
         self.tabs.len() > 1
     }
