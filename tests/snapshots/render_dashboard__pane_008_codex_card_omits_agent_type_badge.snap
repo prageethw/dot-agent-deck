@@ -3,7 +3,7 @@ source: tests/render_dashboard.rs
 assertion_line: 478
 expression: buffer_to_color_text(&buffer)
 ---
-[Blue/Reset]"┌" [Reset/Reset]" 1  wrapped-01 " [Blue/Reset]"─────────────────────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"┌" [Reset/Reset]" 1 wrapped-01 " [Blue/Reset]"──────────────────────────────────────────────────── ● Thinking ┐"
 [Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                         Last: 0s ago  Tools: 0" [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
 [Blue/Reset]"│" [Blue/Reset]"│"

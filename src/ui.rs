@@ -4709,8 +4709,9 @@ fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
 /// appending a single `…` (in the last surviving segment's style) when they
 /// don't all fit. Produces the SAME character sequence as
 /// [`truncate_with_ellipsis`] on the concatenated text — so text-only snapshots
-/// are unchanged — but preserves each segment's style, letting the coloured
-/// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+/// are unchanged — but preserves each segment's style, so the dimmed shortcut
+/// prefix and the `history` / `view-only` marker keep their own styling even on
+/// a narrow card.
 fn truncate_styled_segments(
     segments: Vec<(String, Style)>,
     max_chars: usize,
@@ -12366,9 +12367,9 @@ fn render_stats_bar(
     // per agent type (~12-18 columns each) pushed the `tools` total and the
     // `mode:` indicator off-screen on a real multi-agent deck, which is how the
     // breakdown was actually observed: `… │ 19 idle │ 14 ClaudeCode` and
-    // nothing after it. The information was redundant anyway — every card
-    // already carries its registry-colored type badge (`render_session_card`),
-    // directly under this bar.
+    // nothing after it. The information was redundant anyway — every card's
+    // status dot and label (`render_session_card`) already summarize agent
+    // state directly under this bar.
 
     // Always show total tools
     spans.push(Span::styled("  \u{2502}  ", text_dim()));
@@ -14610,11 +14611,11 @@ fn render_session_card(
     let title_bold = text_primary().add_modifier(Modifier::BOLD);
     // PRD #20 M4: a session whose live_target is not `Live` (e.g. a wrapped
     // Codex pane surfaced history-only) can't accept live input. Render it
-    // distinctly — dim the numeric input shortcut and show a `history` /
-    // `view-only` marker next to the type badge — so a view-only card announces
-    // both what it is and that typing into it won't reach the agent. `Live`
-    // sessions (every native PTY pane, and any fixture that declared no
-    // live_target) render exactly as before.
+    // distinctly — dim the numeric input shortcut and show a trailing `history` /
+    // `view-only` marker — so a view-only card announces both what it is and
+    // that typing into it won't reach the agent. `Live` sessions (every native
+    // PTY pane, and any fixture that declared no live_target) render exactly as
+    // before.
     let writable = session.writable();
     let is_live = writable == crate::event::Writable::Live;
     let shortcut_style = if is_live {
@@ -14633,8 +14634,8 @@ fn render_session_card(
     // there is none. A non-live card additionally shows a trailing
     // `history` / `view-only` marker.
     let identity_text = display_name
-        .map(|name| format!(" {name} "))
-        .unwrap_or_else(|| format!(" {id_display} "));
+        .map(|name| format!("{name} "))
+        .unwrap_or_else(|| format!("{id_display} "));
     let title_segments: Vec<(String, Style)> = {
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),

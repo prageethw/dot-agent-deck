@@ -353,7 +353,7 @@ fn guard_002_no_absolute_bg_in_source() {
 /// once un-badged, not fall back to showing its type name.
 #[spec("dashboard/pane/007")]
 #[test]
-fn pane_007_pi_card_shows_pi_identity() {
+fn pane_007_pi_card_omits_agent_type_badge() {
     // Fork-only badge removal: `render_session_card` no longer emits the
     // `(agent_type_text, badge_style)` segment for any agent type, so a
     // no-display-name Pi pane's title falls back to the bare session id
@@ -380,8 +380,8 @@ fn pane_007_pi_card_shows_pi_identity() {
         first_prompts: vec!["orchestrate the release".to_string()],
         pane_id: Some("pi-pane-1".to_string()),
         agent_id: Some("1".to_string()),
-        // No friendly name → the title uses the `<agent_type> · <id>` form,
-        // which is where the Pi identity surfaces.
+        // No friendly name → the title falls back to the bare session id;
+        // no agent-type badge form exists to fall back to instead.
         display_name: None,
     };
     let width: u16 = 80;
