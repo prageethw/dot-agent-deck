@@ -312,6 +312,13 @@ pub struct SessionState {
     /// the live scheduler-spawn case, where the name would otherwise degrade
     /// to the truncated pane id. `None` for ordinary hook-driven sessions.
     pub display_name: Option<String>,
+    /// PRD #361 Item 1: the tool name from the `PermissionRequest` that most
+    /// recently armed `WaitingForInput`, single-slot (not a queue — Claude
+    /// Code only ever shows one outstanding prompt per pane). `ToolStart`
+    /// clears `WaitingForInput` when the incoming tool name matches this
+    /// marker, and clears the marker itself; a non-matching tool (the
+    /// concurrent-subagent case, #86/`4d31103`) leaves both untouched.
+    pub pending_permission_tool: Option<String>,
 }
 
 impl SessionState {
@@ -2548,6 +2555,7 @@ impl AppState {
                 pane_id: Some(pane_id),
                 agent_id,
                 display_name: None,
+                pending_permission_tool: None,
             },
         );
     }
@@ -3461,6 +3469,7 @@ impl AppState {
                 // recompute it from metadata here (reviewer LOW-2: it was a
                 // redundant duplicate of that block).
                 display_name: None,
+                pending_permission_tool: None,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -3533,7 +3542,22 @@ impl AppState {
                 session.active_tool = None;
             }
             EventType::ToolStart => {
-                if session.status != SessionStatus::WaitingForInput {
+                if session.status == SessionStatus::WaitingForInput {
+                    // PRD #361 Item 1: only the approved tool's own ToolStart
+                    // clears the badge. No marker (a plain notification wait,
+                    // not a permission prompt) means any tool starting must be
+                    // the human's reply taking effect — clear. A marker only
+                    // clears when the incoming tool name matches it; a
+                    // non-matching tool is the concurrent-subagent case
+                    // (#86/`4d31103`) and must leave WaitingForInput alone.
+                    let matches_pending = match session.pending_permission_tool.as_deref() {
+                        None => true,
+                        Some(pending) => Some(pending) == event.tool_name.as_deref(),
+                    };
+                    if matches_pending {
+                        session.status = SessionStatus::Working;
+                    }
+                } else {
                     session.status = SessionStatus::Working;
                 }
                 session.active_tool = Some(ActiveTool {
@@ -3548,8 +3572,13 @@ impl AppState {
                     session.status = SessionStatus::Thinking;
                 }
             }
-            EventType::WaitingForInput | EventType::PermissionRequest => {
+            EventType::WaitingForInput => {
                 session.status = SessionStatus::WaitingForInput;
+                session.pending_permission_tool = None;
+            }
+            EventType::PermissionRequest => {
+                session.status = SessionStatus::WaitingForInput;
+                session.pending_permission_tool = event.tool_name.clone();
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -3566,6 +3595,15 @@ impl AppState {
                 session.status = SessionStatus::Error;
             }
             EventType::SessionEnd => unreachable!(),
+        }
+
+        // PRD #361 Item 1: the marker is only meaningful while WaitingForInput
+        // is armed — once the status has moved on by any path (ToolStart's
+        // own clear above, ToolEnd, a fresh SessionStart/Idle/Compacting/Error,
+        // etc.), drop it so a stale tool name never lingers to mismatch a
+        // later, unrelated permission prompt.
+        if session.status != SessionStatus::WaitingForInput {
+            session.pending_permission_tool = None;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
