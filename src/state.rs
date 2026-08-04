@@ -312,6 +312,22 @@ pub struct SessionState {
     /// the live scheduler-spawn case, where the name would otherwise degrade
     /// to the truncated pane id. `None` for ordinary hook-driven sessions.
     pub display_name: Option<String>,
+    /// PRD #361 Item 1 / PRD #372 (Greptile finding): the tool name from the
+    /// `PermissionRequest` that most recently armed `WaitingForInput`,
+    /// single-slot (not a queue — Claude Code only ever shows one
+    /// outstanding prompt per pane). Three states, not two:
+    /// - `None` — no permission is pending (plain notification wait); any
+    ///   `ToolStart` clears the badge.
+    /// - `Some(None)` — a permission IS pending but its tool name is
+    ///   unknown (OpenCode's `permissionPayload` never sends `tool_name`,
+    ///   see `src/opencode_manage.rs`); an unrelated `ToolStart` must NOT
+    ///   clear the badge, since a name-based match is impossible and a
+    ///   guess would reopen the concurrent-subagent regression
+    ///   (#86/`4d31103`).
+    /// - `Some(Some(name))` — a permission is pending with a known name;
+    ///   `ToolStart` clears the badge only when the incoming tool name
+    ///   matches.
+    pub pending_permission_tool: Option<Option<String>>,
 }
 
 impl SessionState {
@@ -2585,6 +2601,7 @@ impl AppState {
                 pane_id: Some(pane_id),
                 agent_id,
                 display_name: None,
+                pending_permission_tool: None,
             },
         );
     }
@@ -3498,6 +3515,7 @@ impl AppState {
                 // recompute it from metadata here (reviewer LOW-2: it was a
                 // redundant duplicate of that block).
                 display_name: None,
+                pending_permission_tool: None,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -3570,7 +3588,27 @@ impl AppState {
                 session.active_tool = None;
             }
             EventType::ToolStart => {
-                if session.status != SessionStatus::WaitingForInput {
+                if session.status == SessionStatus::WaitingForInput {
+                    // PRD #361 Item 1 / PRD #372: only the approved tool's own
+                    // ToolStart clears the badge. No marker at all (a plain
+                    // notification wait, not a permission prompt) means any
+                    // tool starting must be the human's reply taking effect —
+                    // clear. A marker with a known name only clears when the
+                    // incoming tool name matches it. A marker with NO name
+                    // (OpenCode's nameless `PermissionRequest`) can never be
+                    // name-matched, so it must NOT clear here — a guess would
+                    // reopen the concurrent-subagent regression
+                    // (#86/`4d31103`); it can only clear via the plain
+                    // `WaitingForInput` notification path.
+                    let matches_pending = match session.pending_permission_tool.as_ref() {
+                        None => true,
+                        Some(None) => false,
+                        Some(Some(pending)) => Some(pending.as_str()) == event.tool_name.as_deref(),
+                    };
+                    if matches_pending {
+                        session.status = SessionStatus::Working;
+                    }
+                } else {
                     session.status = SessionStatus::Working;
                 }
                 session.active_tool = Some(ActiveTool {
@@ -3585,8 +3623,13 @@ impl AppState {
                     session.status = SessionStatus::Thinking;
                 }
             }
-            EventType::WaitingForInput | EventType::PermissionRequest => {
+            EventType::WaitingForInput => {
                 session.status = SessionStatus::WaitingForInput;
+                session.pending_permission_tool = None;
+            }
+            EventType::PermissionRequest => {
+                session.status = SessionStatus::WaitingForInput;
+                session.pending_permission_tool = Some(event.tool_name.clone());
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -3603,6 +3646,15 @@ impl AppState {
                 session.status = SessionStatus::Error;
             }
             EventType::SessionEnd => unreachable!(),
+        }
+
+        // PRD #361 Item 1: the marker is only meaningful while WaitingForInput
+        // is armed — once the status has moved on by any path (ToolStart's
+        // own clear above, ToolEnd, a fresh SessionStart/Idle/Compacting/Error,
+        // etc.), drop it so a stale tool name never lingers to mismatch a
+        // later, unrelated permission prompt.
+        if session.status != SessionStatus::WaitingForInput {
+            session.pending_permission_tool = None;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
