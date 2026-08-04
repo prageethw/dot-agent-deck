@@ -1400,6 +1400,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the (absence of a) tracing log line.
 - **Platform coverage:** mac+linux.
 
+#### hooks/permission
+
+##### hooks/permission/001 — A `PreToolUse`/`ToolStart` for the SAME tool a permission prompt was just approved for clears the WaitingForInput badge (PRD #361 Item 1).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` → `ToolStart`, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session).
+- **Asserts:** after a `PermissionRequest` for `Bash` arms WaitingForInput, a `ToolStart` carrying the SAME tool name (`Bash`) moves the status to `Working` instead of leaving it stuck on WaitingForInput for the tool's whole run.
+- **Does not assert:** the TUI-side `y`/`n` keystroke or `Action::SendPermissionResponse` PTY write (covered by `prompt/permission/*`); which status a non-matching-name `ToolStart` produces (`hooks/permission/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### hooks/permission/002 — A `PreToolUse`/`ToolStart` for an UNRELATED tool while a different tool's permission prompt is pending does NOT clear WaitingForInput (PRD #361 Item 1 regression pin).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` → `ToolStart` for a different tool name, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session).
+- **Asserts:** after a `PermissionRequest` for `Bash` arms WaitingForInput, a `ToolStart` carrying a DIFFERENT tool name (`Read`) — modeling a concurrent subagent's own tool starting — leaves the status at WaitingForInput.
+- **Does not assert:** the eventual clearing of that pending `Bash` prompt (out of scope for this pin); `hooks/permission/001` covers the matching-name clear.
+- **Platform coverage:** mac+linux+windows.
+
+##### hooks/permission/003 — A `PermissionRequest` with no `tool_name` (OpenCode's real `permission.asked` payload shape) does NOT let an unrelated `ToolStart` clear WaitingForInput (Greptile finding on PRD #361 Item 1's marker logic).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` with `tool_name: None` → `ToolStart` for an unrelated tool, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session; the nameless-`tool_name` shape mirrors OpenCode's real `permission.asked` payload, which `src/opencode_manage.rs`'s `permissionPayload` never populates with a `tool_name` field).
+- **Asserts:** a `PermissionRequest` carrying `tool_name: None` still arms WaitingForInput, and a subsequent `ToolStart` for an unrelated tool (`Read`) leaves the status at WaitingForInput rather than being treated as a plain notification-wait clear — `pending_permission_tool = None` from a nameless prompt must not be confused with "no permission pending at all".
+- **Does not assert:** which status a `ToolStart` produces once the SAME nameless-prompt's approval genuinely lands (no tool name is available to match against, so this case is inherently a "leave it pending" one, not a "clear on match" one).
+- **Platform coverage:** mac+linux+windows.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
