@@ -2155,6 +2155,50 @@ without depending on the config struct API.
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
 - **Platform coverage:** mac+linux+windows.
 
+#### orchestration/lock
+
+##### orchestration/lock/001 — A freshly opened orchestration tab starts with command-entry LOCKED (PRD #361 Item 3).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** dispatching a real `Action::SpawnPane` to open a fresh two-role orchestration (`orchestrator` start + `worker`) leaves the new tab's per-tab lock field engaged — only the orchestrator pane accepts direct input until `Ctrl+e` unlocks it.
+- **Does not assert:** the actual PTY-forward gating behavior (covered by `orchestration/lock/004`); the `Ctrl+e` toggle itself (covered by `orchestration/lock/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/002 — `Ctrl+e` resolves to the new toggle `Action` from `PaneInput` mode and flips the per-tab lock field locked -> unlocked -> locked (PRD #361 Item 3).
+- **Layer:** L1 (`key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses, plus `dispatch_action` against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** resolving a simulated `Ctrl+e` `KeyEvent` through `key_action_for_mode` from `UiMode::PaneInput` with the default keybinding config yields `Action::ToggleOrchestrationLock`; dispatching it once against a real orchestration tab unlocks it, dispatching it again re-locks it.
+- **Does not assert:** the visible status message on toggle, if any; per-tab isolation of the toggle (covered by `orchestration/lock/003`); the actual PTY-forward gating (covered by `orchestration/lock/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/003 — The command-entry lock is per-orchestration-tab: toggling one tab's lock does not affect a second open orchestration tab's lock state, in either direction (PRD #361 Item 3 resolved decision).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** unlock orchestration tab A via the toggle action; open a brand-new orchestration tab B and confirm it starts LOCKED — its own default — regardless of A's now-unlocked state; switch back to A and confirm it is STILL unlocked, untouched by B's spawn; toggle B's own lock and confirm A remains unaffected by that toggle too.
+- **Does not assert:** the visible rendered grid or cross-tab-type scoping (Mode/Dashboard tabs have no lock at all, out of scope per the PRD); the actual PTY-forward gating (covered by `orchestration/lock/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/004 — While an orchestration tab is locked (the default), a keystroke aimed at a non-orchestrator role's PTY is dropped before reaching it; the orchestrator pane's own input is never gated; `Ctrl+e` unlocks the tab and keystrokes to the non-orchestrator role then forward normally (PRD #361 Item 3).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** with a real orchestration tab open (default LOCKED), a sentinel typed into the still-focused orchestrator role is echoed by its `cat` process (never gated, lock state notwithstanding); focusing the non-orchestrator "worker" role (`1`-`9` jump) and typing a sentinel while still locked never reaches the worker's PTY (no terminal echo appears within a 2s poll window, since a dropped keystroke never reaches `write_raw_bytes`); sending `Ctrl+e` then typing a third sentinel into the same still-focused worker pane DOES forward and appear, proving the unlock takes effect immediately for the currently-focused pane.
+- **Does not assert:** the visible status-message text on a dropped keystroke (the PRD names an example, `"Pane locked — Ctrl+e to unlock"`, following the `RequestConfigGen` no-op-with-feedback convention, but does not mandate exact wording); per-tab isolation (covered by `orchestration/lock/003`); global chords during the lock (covered by `orchestration/lock/005`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/005 — The small always-available global `Ctrl+`-chord set (resolved before the PTY-forward fallback the lock gates) keeps working identically regardless of the lock or which pane is focused (PRD #361 Item 3).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** with a real orchestration tab open and the non-orchestrator "worker" role focused (tab still LOCKED, the default), pressing `Ctrl+t` (`toggle_layout`) still surfaces its `Layout: …` status message — the same observable `keybindings/remap/001` uses — proving the lock gate sits entirely inside the PTY-forward fallback and never touches `global_action_for_mode`'s chord set. Regression guard mirroring `tabs/orchestration/007`'s role for Item 4.
+- **Does not assert:** every global chord individually (`Ctrl+d`/`Ctrl+n`/`Ctrl+w`/the split-cycle chord/`Ctrl+e` itself) — `Ctrl+t` is sufficient to prove the fallback-only gate placement, matching how `tabs/orchestration/007` used a single chord for the analogous Item 4 proof; the locked-drop behavior itself (covered by `orchestration/lock/004`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/006 — With a REAL interactive Claude Haiku agent in the non-orchestrator role (not the `cat` stub `orchestration/lock/004` uses), the command-entry lock still gates a directive typed toward its PTY while locked, and still forwards it once `Ctrl+e` unlocks (CLAUDE.md rule 4 / Greptile PR #374 follow-up).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** REAL interactive Claude Code CLI pinned to `claude-haiku-4-5-20251001` (`orch-lock-live` fixture — orchestrator stays a `cat` stub, already proven never-gated by `orchestration/lock/004`, to keep the run to a single real-agent role).
+- **Asserts:** with a real orchestration tab open (default LOCKED) and the worker role focused, a create-sentinel-file directive typed into its PTY never results in the sentinel file appearing on disk (the agent never received it); `Ctrl+e` unlocks the tab, and a second directive with a different sentinel typed into the still-focused worker pane DOES result in that file being created, proving a genuine agent — not just `cat` echo — receives and acts on input only once unlocked; the first (locked) sentinel is confirmed still absent at the end, ruling out a buffer-then-flush implementation instead of an outright drop.
+- **Does not assert:** the orchestrator pane's own never-gated input (covered by `orchestration/lock/004`); per-tab isolation (covered by `orchestration/lock/003`); global chords during the lock (covered by `orchestration/lock/005`); exact LLM response wording or timing.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]

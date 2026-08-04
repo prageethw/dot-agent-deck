@@ -1,0 +1,19 @@
+# Fixture for the L2 REAL-agent orchestration command-entry lock proof
+# (orchestration/lock/006, CLAUDE.md rule 4 / Greptile PR #374 follow-up).
+# `orchestration/lock/004` already proves the gate with two `cat` stubs; this
+# fixture swaps the non-orchestrator role for a REAL interactive Claude Haiku
+# agent so the same lock/unlock behavior is proven against a genuine agent
+# process, not just raw PTY echo. The orchestrator stays `cat` (already
+# proven never-gated) to keep the run's cost and non-determinism to a single
+# real agent turn.
+[[orchestrations]]
+name = "lock-live"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
