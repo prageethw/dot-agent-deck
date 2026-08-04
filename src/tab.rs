@@ -66,6 +66,31 @@ pub enum OrchestrationRoleStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Split stage (PRD #336, extended to a 3-stage cycle by PRD #361 Item 4)
+// ---------------------------------------------------------------------------
+
+/// The Ctrl+l sidebar/pane-column split cycle shared by Orchestration and
+/// Dashboard tabs. `Default` is each tab type's own fixed ratio
+/// (Orchestration 34/66, Dashboard 33/67); `Narrow` (25/75) and `Hidden`
+/// (0/100, sidebar collapsed) are the same fixed ratios on either tab type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitStage {
+    Default,
+    Narrow,
+    Hidden,
+}
+
+/// Advance one Ctrl+l press: `Default -> Narrow -> Hidden -> Default`, looping
+/// indefinitely.
+pub fn next_split_stage(stage: SplitStage) -> SplitStage {
+    match stage {
+        SplitStage::Default => SplitStage::Narrow,
+        SplitStage::Narrow => SplitStage::Hidden,
+        SplitStage::Hidden => SplitStage::Default,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tab enum
 // ---------------------------------------------------------------------------
 
@@ -78,6 +103,12 @@ pub enum Tab {
         /// selection to the wrong card. `UiState.selected_index` is
         /// derived from this each frame.
         selected_session_id: Option<String>,
+        /// PRD #361 Item 4: this tab's sidebar/pane-column split stage.
+        /// `Default` = the fixed 33/67 ratio. Per-tab so toggling one
+        /// Dashboard tab doesn't affect another (there is normally only
+        /// one Dashboard tab, but the field mirrors Orchestration's
+        /// per-tab isolation for consistency).
+        split_stage: SplitStage,
     },
     Mode {
         id: TabId,
@@ -134,24 +165,11 @@ pub enum Tab {
         /// consumed by `auto_focus_waiting_pane` was never remembered, and the
         /// all-clear move for it never fired.
         all_clear_pending: bool,
-        /// PRD #336: whether the sidebar/pane-column split is toggled to the
-        /// narrower-sidebar 25/75 ratio. `false` = the 34/66 default.
-        ///
-        /// The split is GLOBAL, not per-tab: sidebar width is a reading
-        /// preference, not a property of which orchestration is open. This
-        /// field is therefore a per-tab *mirror* of
-        /// [`TabManager::orchestration_split_narrow`], which is the single
-        /// source of truth. Only two writers exist, both inside `TabManager`
-        /// and both in this file — the construction sites (which seed it from
-        /// the global) and [`TabManager::toggle_orchestration_split`] (which
-        /// rewrites the global and every open orchestration tab in one pass).
-        /// Nothing outside `TabManager` may write it, so the invariant "every
-        /// `Tab::Orchestration::split_narrow` equals the global" holds at every
-        /// point a reader could observe it, with no call-ordering requirement.
-        ///
-        /// Deliberately not persisted across launches — a fresh process starts
-        /// at the 34/66 default (PRD #336 keeps persistence out of scope).
-        split_narrow: bool,
+        /// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: this
+        /// tab's sidebar/pane-column split stage. `Default` = the 34/66
+        /// ratio. Per-tab so toggling one orchestration tab doesn't affect
+        /// another.
+        split_stage: SplitStage,
     },
 }
 
@@ -174,13 +192,6 @@ pub struct TabManager {
     active_index: usize,
     next_id: TabId,
     pane_controller: Arc<dyn PaneController>,
-    /// PRD #336: the orchestration sidebar/pane-column split, as a GLOBAL
-    /// reading preference — `true` = the narrower-sidebar 25/75 ratio,
-    /// `false` = the 34/66 default. Single source of truth; see
-    /// [`Tab::Orchestration::split_narrow`] for why it lives here rather than
-    /// on the tab, and [`toggle_orchestration_split`](Self::toggle_orchestration_split)
-    /// for the one place it changes.
-    orchestration_split_narrow: bool,
 }
 
 impl TabManager {
@@ -188,46 +199,12 @@ impl TabManager {
         Self {
             tabs: vec![Tab::Dashboard {
                 selected_session_id: None,
+                split_stage: SplitStage::Default,
             }],
             active_index: 0,
             next_id: 1,
             pane_controller,
-            orchestration_split_narrow: false,
         }
-    }
-
-    /// PRD #336: the current GLOBAL orchestration split. Read by the spawn
-    /// path so a role pane's PTY opens at the width it will actually be
-    /// rendered at, rather than at the default the tab no longer starts from.
-    pub fn orchestration_split_narrow(&self) -> bool {
-        self.orchestration_split_narrow
-    }
-
-    /// PRD #336: flip the GLOBAL orchestration split and apply it to every
-    /// open orchestration tab, returning the new value.
-    ///
-    /// The split is global because sidebar width is a reading preference, not
-    /// a property of which orchestration is open: per-tab state meant every
-    /// newly opened tab reset to 34/66, so anyone who prefers the narrow
-    /// sidebar re-toggled forever.
-    ///
-    /// Owning it here — rather than in a thread-local or a free-floating
-    /// global, as an earlier revision did — is what keeps the global scope
-    /// from recreating that revision's ordering hazard. `TabManager` already
-    /// owns `tabs`, so the write to the global and the writes to every tab
-    /// happen together in one `&mut self` method that cannot be observed
-    /// half-applied. No caller has to remember to sync anything before
-    /// rendering, which is precisely the assumption the thread-local rested
-    /// on.
-    pub fn toggle_orchestration_split(&mut self) -> bool {
-        let narrow = !self.orchestration_split_narrow;
-        self.orchestration_split_narrow = narrow;
-        for tab in &mut self.tabs {
-            if let Tab::Orchestration { split_narrow, .. } = tab {
-                *split_narrow = narrow;
-            }
-        }
-        narrow
     }
 
     pub fn tab_count(&self) -> usize {
@@ -952,8 +929,7 @@ impl TabManager {
             // off of.
             had_waiting_pane: false,
             all_clear_pending: false,
-            // PRD #336: adopt the current GLOBAL split, not the 34/66 default.
-            split_narrow: self.orchestration_split_narrow,
+            split_stage: SplitStage::Default,
         });
 
         let index = self.tabs.len() - 1;
@@ -1091,12 +1067,7 @@ impl TabManager {
             // history — the same clean slate a fresh one gets above.
             had_waiting_pane: false,
             all_clear_pending: false,
-            // PRD #336: a hydrated/restored tab adopts the current GLOBAL
-            // split, exactly like a freshly opened one — the split belongs to
-            // the session, not to the tab. The global itself is not persisted
-            // across launches, so a restore during startup lands on the 34/66
-            // default; a restore mid-session picks up whatever is in effect.
-            split_narrow: self.orchestration_split_narrow,
+            split_stage: SplitStage::Default,
         });
 
         let index = self.tabs.len() - 1;
@@ -1642,6 +1613,7 @@ mod tests {
         // Stamp a distinct remembered id onto each tab variant.
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = &mut tm.tabs[0]
         {
             *selected_session_id = Some("sess-dashboard".to_string());
@@ -1668,7 +1640,7 @@ mod tests {
 
         assert!(matches!(
             &tm.tabs[0],
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "sess-dashboard"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "sess-dashboard"
         ));
         assert!(matches!(
             &tm.tabs[mode_idx],
@@ -1743,6 +1715,7 @@ mod tests {
 
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("s2".to_string()),
+            split_stage: SplitStage::Default,
         };
         // No focused pane: index derives purely from the remembered id.
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
@@ -1753,7 +1726,7 @@ mod tests {
         assert_eq!(idx, Some(2));
         assert!(matches!(
             &dash,
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "s3"
         ));
 
         // Gating: running the sync while a Mode tab is active returns
@@ -1772,7 +1745,7 @@ mod tests {
         assert_eq!(idx, None);
         assert!(matches!(
             &dash,
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "s3"
         ));
     }
 
@@ -1790,13 +1763,15 @@ mod tests {
         let filtered: &[(&str, Option<&str>)] = &[("s1", Some("p1")), ("s2", Some("p2"))];
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("gone".to_string()),
+            split_stage: SplitStage::Default,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(0));
         assert!(matches!(
             &dash,
             Tab::Dashboard {
-                selected_session_id: None
+                selected_session_id: None,
+                ..
             }
         ));
 
@@ -1817,7 +1792,7 @@ mod tests {
             status: OrchestrationStatus::WaitingForOrchestrator,
             had_waiting_pane: false,
             all_clear_pending: false,
-            split_narrow: false,
+            split_stage: SplitStage::Default,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1849,7 +1824,7 @@ mod tests {
             status: OrchestrationStatus::WaitingForOrchestrator,
             had_waiting_pane: false,
             all_clear_pending: false,
-            split_narrow: false,
+            split_stage: SplitStage::Default,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
