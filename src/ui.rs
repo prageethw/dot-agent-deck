@@ -5064,6 +5064,7 @@ fn mirror_selection_into_focus(
 /// silently regressing the feature. Inlining either step back into
 /// `run_tui` would defeat that — keep the call site in `run_tui` a
 /// one-liner to this helper.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_normal_mode_key(
     key: KeyEvent,
     ui: &mut UiState,
@@ -5072,6 +5073,7 @@ fn dispatch_normal_mode_key(
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
     kb: &KeybindingConfig,
+    _tab_manager: &mut TabManager,
 ) -> Action {
     let prev_selected_index = ui.selected_index;
     let result = handle_normal_key(key, ui, total, selected_status, kb);
@@ -8948,7 +8950,16 @@ fn handle_key_event(
                     .as_ref()
                     .and_then(|sid| snapshot.sessions.get(sid))
                     .map(|session| session.status.clone());
-                dispatch_normal_mode_key(key, ui, total, selected_status, filtered, pane, &kb)
+                dispatch_normal_mode_key(
+                    key,
+                    ui,
+                    total,
+                    selected_status,
+                    filtered,
+                    pane,
+                    &kb,
+                    tab_manager,
+                )
             }
             UiMode::Filter => handle_filter_key(key, ui),
             UiMode::Help => handle_help_key(key, ui),
@@ -21895,8 +21906,11 @@ mod tests {
         ui.selected_index = Some(0);
 
         let kb = KeybindingConfig::default();
-        let press = |ui: &mut UiState, key: KeyEvent| {
-            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc, &kb);
+        let mut tab_manager = TabManager::new(Arc::new(RecordingFocusPC {
+            focused: std::sync::Mutex::new(Vec::new()),
+        }));
+        let mut press = |ui: &mut UiState, key: KeyEvent| {
+            dispatch_normal_mode_key(key, ui, total, None, &filtered, &pc, &kb, &mut tab_manager);
         };
 
         // j: 0 → 1, focus mirrored to p1.
@@ -23276,6 +23290,7 @@ mod tests {
             &filtered,
             pc.as_ref(),
             &kb,
+            &mut tab_manager,
         );
 
         assert_eq!(
