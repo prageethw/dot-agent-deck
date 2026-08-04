@@ -5810,6 +5810,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
+            pending_permission_tool: None,
             pane_id: Some("pane-745".into()),
             agent_id: Some("agent-745".into()),
             display_name: None,

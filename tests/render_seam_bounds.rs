@@ -51,6 +51,7 @@ fn fixture_session() -> SessionState {
         tool_count: 0,
         last_user_prompt: None,
         first_prompts: Vec::new(),
+        pending_permission_tool: None,
         pane_id: Some("pane-1".to_string()),
         agent_id: Some("1".to_string()),
         display_name: None,
