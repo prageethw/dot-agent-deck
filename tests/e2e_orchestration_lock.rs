@@ -48,19 +48,12 @@ fn focus_worker_role(deck: &TuiDeck) {
     deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
 }
 
-/// Scenario: Open a real orchestration tab (default LOCKED). First confirm
-/// the orchestrator pane's own input is never gated: type a sentinel into it
-/// and see it echoed by its `cat` process. Then focus the non-orchestrator
-/// "worker" role and, while still locked, type a second sentinel — it must
-/// NOT reach the worker's PTY (no terminal echo, since `write_raw_bytes` is
-/// never called for a dropped keystroke), so it never appears on the
-/// rendered grid. Finally send `Ctrl+e` to unlock and type a third sentinel
-/// into the still-focused worker pane — it must now forward and appear
-/// (echoed by that pane's own `cat`). RED today: there is no lock at all, so
-/// the "locked" sentinel reaches the worker's PTY same as the others and the
-/// negative assertion fails (this test also can't compile today as part of
-/// the crate, since `src/ui.rs`'s new `orchestration/lock/00[1-3]` tests
-/// reference the not-yet-implemented lock field/action).
+/// Scenario: Open a real orchestration tab (default LOCKED) and confirm the
+/// focused orchestrator pane's own input is never gated, while a keystroke
+/// aimed at the non-orchestrator "worker" role does not reach its PTY. Send
+/// `Ctrl+e` to unlock and confirm a keystroke into the still-focused worker
+/// pane now forwards and echoes. RED today: there is no lock at all, so the
+/// locked-state negative assertion fails.
 #[spec("orchestration/lock/004")]
 #[test]
 fn orchestration_lock_004_forwarding_gated_by_lock_state() {
@@ -108,19 +101,12 @@ fn orchestration_lock_004_forwarding_gated_by_lock_state() {
 }
 
 /// Scenario: Open a real orchestration tab, focus the non-orchestrator
-/// "worker" role (leaving the tab in its default LOCKED state), then press
-/// `Ctrl+t` (`toggle_layout`) — one of the small always-available global
-/// chords `global_action_for_mode` resolves BEFORE the PTY-forward fallback
-/// the lock gates (per the PRD's investigation, item 3's gate sits entirely
-/// inside that fallback). The toggle must fire identically regardless of the
-/// lock or which pane is focused, surfacing its `Layout: …` status message
-/// (the same observable `e2e_keybindings.rs::remap_001` uses). Regression
-/// guard mirroring `tabs/orchestration/007`'s role for Item 4 — this chord
-/// already works today with no lock gate present, so it is not itself a
-/// runtime-RED assertion; its RED status today comes from the same crate-
-/// wide compile failure as `orchestration/lock/001`-`004` (the lock field/
-/// action referenced by the other new tests don't exist yet). Its value is
-/// guarding against an overly-broad gate implementation once the lock ships.
+/// "worker" role while the tab is LOCKED, then press `Ctrl+t`
+/// (`toggle_layout`) and confirm it still fires and surfaces its
+/// `Layout: …` status message — global chords resolve before the PTY-forward
+/// fallback the lock gates. Regression guard against an overly-broad gate
+/// implementation; its RED status today comes only from the crate-wide
+/// compile failure shared with `orchestration/lock/001`-`004`.
 #[spec("orchestration/lock/005")]
 #[test]
 fn orchestration_lock_005_global_chord_unaffected_by_lock_state() {
