@@ -7274,6 +7274,17 @@ fn dispatch_action(
                     *selected_session_id = Some(filtered[idx].0.clone());
                 }
                 mirror_selection_into_focus(prev, ui, filtered, pane);
+                // PRD #373 M2 fix: stamp this Orchestration tab's OWN
+                // activity clock ONLY when it's the active tab — a
+                // Dashboard-tab card click must not touch any Orchestration
+                // tab's clock (see `Tab::Orchestration::last_role_pane_activity_at`).
+                if let Tab::Orchestration {
+                    last_role_pane_activity_at,
+                    ..
+                } = tab_manager.active_tab_mut()
+                {
+                    *last_role_pane_activity_at = Some(std::time::Instant::now());
+                }
             }
         }
         // PRD #80 M4: `/` key or [Filter /] button → filter mode.
@@ -7297,9 +7308,20 @@ fn dispatch_action(
             {
                 entry.dismissed = true;
             }
-            focus_deck(idx, ui, filtered, snapshot, state, pane);
+            let focused = focus_deck(idx, ui, filtered, snapshot, state, pane);
             // PRD #84 M4: focusing a card can change which Stacked pane expands;
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
+            // PRD #373 M2 fix: stamp this Orchestration tab's OWN activity
+            // clock ONLY when it's the active tab (see
+            // `Tab::Orchestration::last_role_pane_activity_at`).
+            if focused
+                && let Tab::Orchestration {
+                    last_role_pane_activity_at,
+                    ..
+                } = tab_manager.active_tab_mut()
+            {
+                *last_role_pane_activity_at = Some(std::time::Instant::now());
+            }
         }
         // Mode tab in-tab navigation (j/Down): move side-pane focus down.
         // PRD #83: focus is tracked by stable pane id (`focused_pane_id`), so
@@ -7533,6 +7555,16 @@ fn dispatch_action(
                             // on a new pane counts as activity — same as the
                             // digit-jump path in `focus_deck`.
                             ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+                            // PRD #373 M2 fix: also stamp this Orchestration
+                            // tab's OWN activity clock — see
+                            // `Tab::Orchestration::last_role_pane_activity_at`.
+                            if let Tab::Orchestration {
+                                last_role_pane_activity_at,
+                                ..
+                            } = tab_manager.active_tab_mut()
+                            {
+                                *last_role_pane_activity_at = Some(std::time::Instant::now());
+                            }
                         }
                         Err(PaneError::CommandFailed(ref msg)) => {
                             state.blocking_write().sessions.remove(sid);
@@ -8350,6 +8382,17 @@ fn dispatch_action(
                     ui.status_message = Some((e.to_string(), std::time::Instant::now()));
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+                // PRD #373 M2 fix: also stamp this Orchestration tab's OWN
+                // activity clock, scoped so an unrelated Dashboard/Mode-tab
+                // keystroke can never suppress this tab's inactivity
+                // snap-back (see `Tab::Orchestration::last_role_pane_activity_at`).
+                if let Tab::Orchestration {
+                    last_role_pane_activity_at,
+                    ..
+                } = tab_manager.active_tab_mut()
+                {
+                    *last_role_pane_activity_at = Some(std::time::Instant::now());
+                }
             }
         }
         // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
@@ -10331,19 +10374,27 @@ pub fn run_tui(
             // that gate matters): the edge-triggered all-clear move to
             // the orchestrator role.
             let _ = pane.focus_pane(&new_id);
-        } else if let Some(last_activity_at) = ui.last_pane_keystroke_at
-            && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-                std::time::Instant::now(),
-                last_activity_at,
-                TabManager::INACTIVITY_TIMEOUT,
-            )
-        {
+        } else if let Some(last_activity_at) = (match tab_manager.active_tab() {
+            Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } => *last_role_pane_activity_at,
+            _ => None,
+        }) && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
+            std::time::Instant::now(),
+            last_activity_at,
+            TabManager::INACTIVITY_TIMEOUT,
+        ) {
             // PRD #373 M2 — only reached when neither branch above moved
-            // focus this frame: 30 seconds with no pane-forwarded
-            // activity snaps focus back to the orchestrator role. Skipped
-            // entirely while `last_pane_keystroke_at` is still `None`
-            // (nothing has happened yet this session) rather than
-            // fabricating a start time for the timer.
+            // focus this frame: 30 seconds with no pane-forwarded activity
+            // ON THIS TAB snaps focus back to the orchestrator role. Reads
+            // the ACTIVE tab's own `last_role_pane_activity_at` rather than
+            // the global `ui.last_pane_keystroke_at` — a global timestamp
+            // let unrelated Dashboard/Mode-tab activity reset an
+            // Orchestration tab's clock (PRD #373 M2 scope-leak fix).
+            // Skipped entirely while it's still `None` (nothing has
+            // happened yet on this tab) rather than fabricating a start
+            // time for the timer.
             let _ = pane.focus_pane(&new_id);
         }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
@@ -11381,6 +11432,16 @@ pub fn run_tui(
                     // arrives at the agent as a standalone submit, not fused
                     // with the paste tail.
                     ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+                    // PRD #373 M2 fix: also stamp this Orchestration tab's
+                    // OWN activity clock — see `ForwardToPane`'s matching
+                    // stamp and `Tab::Orchestration::last_role_pane_activity_at`.
+                    if let Tab::Orchestration {
+                        last_role_pane_activity_at,
+                        ..
+                    } = tab_manager.active_tab_mut()
+                    {
+                        *last_role_pane_activity_at = Some(std::time::Instant::now());
+                    }
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;

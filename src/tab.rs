@@ -127,6 +127,14 @@ pub enum Tab {
         /// window in M2). Starts `false`: a freshly-opened tab has no
         /// "was waiting" history to edge-trigger off of.
         had_waiting_pane: bool,
+        /// PRD #373 M2 fix: this tab's OWN last-activity instant, tracked
+        /// per-tab rather than reusing the global `UiState::last_pane_keystroke_at`
+        /// — a global timestamp let unrelated Dashboard/Mode-tab activity reset
+        /// an Orchestration tab's 30s inactivity clock. Stamped whenever a
+        /// keystroke is forwarded to this tab's focused role pane, or focus
+        /// manually lands on a role pane, WHILE this tab is active. `None` until
+        /// the first such event.
+        last_role_pane_activity_at: Option<std::time::Instant>,
     },
 }
 
@@ -788,6 +796,7 @@ impl TabManager {
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
             had_waiting_pane: false,
+            last_role_pane_activity_at: None,
         });
 
         let index = self.tabs.len() - 1;
@@ -923,6 +932,7 @@ impl TabManager {
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
             had_waiting_pane: false,
+            last_role_pane_activity_at: None,
         });
 
         let index = self.tabs.len() - 1;
@@ -1674,6 +1684,7 @@ mod tests {
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
             had_waiting_pane: false,
+            last_role_pane_activity_at: None,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1705,6 +1716,7 @@ mod tests {
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
             had_waiting_pane: false,
+            last_role_pane_activity_at: None,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
