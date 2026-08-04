@@ -23571,23 +23571,25 @@ mod tests {
         );
     }
 
-    /// Scenario: PRD #336 — pressing Ctrl+l on an orchestration tab should
-    /// toggle the sidebar/pane-column split from the default 34/66
-    /// (`ORCHESTRATION_LEFT_PERCENT` / `ORCHESTRATION_PANES_PERCENT`) to a
-    /// narrower-sidebar 25/75. Resolve a simulated Ctrl+l `KeyEvent` through
+    /// Scenario: PRD #361 Item 4 extends PRD #336's two-stage Ctrl+l toggle
+    /// on an orchestration tab to a three-stage cycle — Default (34/66) ->
+    /// Narrow (25/75) -> Hidden (0/100, sidebar collapsed) -> Default,
+    /// looping indefinitely. Resolve a simulated Ctrl+l `KeyEvent` through
     /// `key_action_for_mode` — the exact `KeyEvent -> Action` seam the live
     /// event loop uses (per its own doc comment, PRD #241 M1) — confirming it
-    /// now resolves a split-toggle Action, then simulate the resulting
-    /// dispatch + render-sync (out of scope for this pure-geometry test) by
-    /// setting the `ACTIVE_ORCHESTRATION_SPLIT_NARROW` thread-local directly,
-    /// and recompute the orchestration tab's frame geometry via
-    /// `compute_frame_layout`, the single per-frame layout pass `render_frame`
-    /// and the pre-draw PTY-resize pass both read, pinning the post-toggle
-    /// 25/75 geometry. Full end-to-end dispatch coverage lives in the L2
-    /// test, tabs/orchestration/006.
+    /// still resolves a split-cycle Action, then walk the pure
+    /// `next_split_stage` resolver through all three stages, simulating the
+    /// resulting dispatch + render-sync at each step (out of scope for this
+    /// pure-geometry test, same technique as before) by setting the
+    /// `ACTIVE_ORCHESTRATION_SPLIT_STAGE` thread-local directly, and
+    /// recomputing the orchestration tab's frame geometry via
+    /// `compute_frame_layout` at every stage, pinning all three geometries
+    /// plus the wrap back to Default. Full end-to-end dispatch coverage
+    /// (both tab types) lives in the L2 tests, tabs/orchestration/006 and
+    /// tabs/dashboard/001.
     #[spec("orchestration/layout/002")]
     #[test]
-    fn layout_002_ctrl_l_toggles_orchestration_split_narrow() {
+    fn layout_002_ctrl_l_cycles_orchestration_split_stages() {
         let frame_area = Rect::new(0, 0, 100, 40);
         let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
         let tab_view = ActiveTabView::Orchestration {
@@ -23600,89 +23602,205 @@ mod tests {
             orchestration_statuses: vec![],
         };
 
-        let before = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &role_pane_ids,
-            PaneLayout::Tiled,
-            None,
-            1,
-        );
-        let FrameContent::Cards {
-            dashboard_area: before_dashboard,
-            panes_area: before_panes,
-            ..
-        } = before.content
-        else {
-            panic!("Orchestration tab must produce FrameContent::Cards");
+        // Simulates the dispatch + render-sync (setting the thread-local
+        // `compute_frame_layout` reads) that a real Ctrl+l press drives, then
+        // returns the (dashboard_area.width, panes_area.width) pair for the
+        // given stage. Does not assert dispatch or the per-tab field itself —
+        // full end-to-end coverage of that path lives in the L2 tests.
+        let layout_for = |stage: SplitStage| {
+            ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(stage));
+            let layout = compute_frame_layout(
+                frame_area,
+                &tab_view,
+                &tab_bar,
+                &role_pane_ids,
+                PaneLayout::Tiled,
+                None,
+                1,
+            );
+            let FrameContent::Cards {
+                dashboard_area,
+                panes_area,
+                ..
+            } = layout.content
+            else {
+                panic!("Orchestration tab must produce FrameContent::Cards");
+            };
+            (
+                dashboard_area.width,
+                panes_area.expect("role panes => a right column").width,
+            )
         };
-        // Sanity: today's fixed default is the 34/66 split (34% of the 100-wide
-        // frame_area, matching ORCHESTRATION_LEFT_PERCENT / _PANES_PERCENT).
-        assert_eq!(before_dashboard.width, 34);
-        assert_eq!(
-            before_panes.expect("role panes => a right column").width,
-            66
-        );
 
-        // Simulate the Ctrl+l keypress through the SAME KeyEvent -> Action
-        // resolver the live loop calls (PRD #241 M1's `key_action_for_mode`),
-        // with the default keybinding config (no user remap involved).
+        // Sanity: today's fixed default is the 34/66 split (34% of the
+        // 100-wide frame_area, matching ORCHESTRATION_LEFT_PERCENT /
+        // _PANES_PERCENT).
+        assert_eq!(layout_for(SplitStage::Default), (34, 66));
+
+        // Confirm Ctrl+l still resolves to a split-cycle Action through the
+        // SAME KeyEvent -> Action resolver the live loop calls (PRD #241 M1's
+        // key_action_for_mode), with the default keybinding config (no user
+        // remap involved).
         let kb = KeybindingConfig::default();
         let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
         let action = key_action_for_mode(&kb, UiMode::Normal, &ctrl_l);
         assert!(
             action.is_some(),
-            "Ctrl+l should resolve to a split-toggle Action on an orchestration \
+            "Ctrl+l should resolve to a split-cycle Action on an orchestration \
              tab; got None — Ctrl+l is missing from the ACTIONS table"
         );
 
-        // `key_action_for_mode` is a pure KeyEvent -> Action resolver with no
-        // side effects, so the toggle itself (flipping the active tab's real
-        // `Tab::Orchestration::split_narrow` field via `dispatch_action`) and
-        // the render-time sync of that field into
-        // `ACTIVE_ORCHESTRATION_SPLIT_NARROW` (the thread-local
-        // `compute_frame_layout` reads) are both out of scope for this pure-
-        // geometry L1 test. Set the thread-local directly to simulate what
-        // that dispatch + render-sync would have produced. Does not assert
-        // dispatch or the per-tab field itself — full end-to-end coverage of
-        // that path lives in the L2 test, tabs/orchestration/006.
-        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(true));
+        // Walk the full 3-stage cycle via `next_split_stage` — the pure
+        // resolver the real Ctrl+l dispatch handler is expected to call —
+        // pinning each stage's geometry in turn.
+        let mut stage = SplitStage::Default;
 
-        let after = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &role_pane_ids,
-            PaneLayout::Tiled,
-            None,
-            1,
+        stage = next_split_stage(stage);
+        assert_eq!(
+            stage,
+            SplitStage::Narrow,
+            "first Ctrl+l press should advance Default -> Narrow"
         );
+        assert_eq!(
+            layout_for(stage),
+            (25, 75),
+            "Narrow stage should render the 25/75 sidebar/pane-column split"
+        );
+
+        stage = next_split_stage(stage);
+        assert_eq!(
+            stage,
+            SplitStage::Hidden,
+            "second Ctrl+l press should advance Narrow -> Hidden"
+        );
+        assert_eq!(
+            layout_for(stage),
+            (0, 100),
+            "Hidden stage should collapse the sidebar to 0 width and give \
+             the pane column the full 100% width"
+        );
+
+        stage = next_split_stage(stage);
+        assert_eq!(
+            stage,
+            SplitStage::Default,
+            "third Ctrl+l press should loop Hidden back to Default"
+        );
+        assert_eq!(
+            layout_for(stage),
+            (34, 66),
+            "looping back to Default should restore the original 34/66 split"
+        );
+
         // Reset immediately so a later test on this worker thread never
-        // observes a leaked `true` from this one.
-        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(false));
+        // observes a leaked non-Default stage from this one.
+        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+    }
 
-        let FrameContent::Cards {
-            dashboard_area: after_dashboard,
-            panes_area: after_panes,
-            ..
-        } = after.content
-        else {
-            panic!("Orchestration tab must produce FrameContent::Cards");
+    /// Scenario: PRD #361 Item 4 extends the orchestration-only Ctrl+l
+    /// split-toggle (PRD #336) to Dashboard tabs, sharing the same
+    /// `SplitStage` cycle and `next_split_stage` resolver but using the
+    /// Dashboard tab's OWN default ratio (33/67, distinct from
+    /// Orchestration's 34/66) as stage 1. Mirrors
+    /// `layout_002_ctrl_l_cycles_orchestration_split_stages`'s technique: walk
+    /// `next_split_stage` through the full cycle, simulating each stage's
+    /// dispatch + render-sync via an `ACTIVE_DASHBOARD_SPLIT_STAGE`
+    /// thread-local (the Dashboard counterpart of
+    /// `ACTIVE_ORCHESTRATION_SPLIT_STAGE`), and recomputing a Dashboard tab's
+    /// frame geometry via `compute_frame_layout` at every stage. RED today:
+    /// Dashboard tabs have no split-toggle at all — `compute_frame_layout`'s
+    /// `ActiveTabView::Dashboard` arm always uses the fixed
+    /// `DASHBOARD_LEFT_PERCENT`/`DASHBOARD_PANES_PERCENT` constants
+    /// regardless of any stage. Full end-to-end dispatch coverage lives in
+    /// the L2 test, tabs/dashboard/001.
+    #[spec("dashboard/layout/001")]
+    #[test]
+    fn layout_001_ctrl_l_cycles_dashboard_split_stages() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let pane_ids = vec!["p0".to_string(), "p1".to_string()];
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
         };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+
+        let layout_for = |stage: SplitStage| {
+            ACTIVE_DASHBOARD_SPLIT_STAGE.with(|c| c.set(stage));
+            let layout = compute_frame_layout(
+                frame_area,
+                &tab_view,
+                &tab_bar,
+                &pane_ids,
+                PaneLayout::Tiled,
+                None,
+                1,
+            );
+            let FrameContent::Cards {
+                dashboard_area,
+                panes_area,
+                ..
+            } = layout.content
+            else {
+                panic!("Dashboard tab must produce FrameContent::Cards");
+            };
+            (
+                dashboard_area.width,
+                panes_area.expect("two panes => a right pane column").width,
+            )
+        };
+
+        // Sanity: today's fixed default is the 33/67 split — the Dashboard
+        // tab's own ratio, distinct from Orchestration's 34/66.
+        assert_eq!(layout_for(SplitStage::Default), (33, 67));
+
+        let mut stage = SplitStage::Default;
+
+        stage = next_split_stage(stage);
         assert_eq!(
-            after_dashboard.width, 25,
-            "sidebar should narrow to 25% width after Ctrl+l toggles the \
-             orchestration split; got {} (still the 34/66 default)",
-            after_dashboard.width
+            stage,
+            SplitStage::Narrow,
+            "first Ctrl+l press should advance Default -> Narrow"
         );
         assert_eq!(
-            after_panes.expect("role panes => a right column").width,
-            75,
-            "pane column should widen to 75% width after Ctrl+l toggles the \
-             orchestration split; got {:?}",
-            after_panes.map(|r| r.width)
+            layout_for(stage),
+            (25, 75),
+            "Narrow stage should render the 25/75 sidebar/pane-column split \
+             on a Dashboard tab, same fixed ratio as an Orchestration tab"
         );
+
+        stage = next_split_stage(stage);
+        assert_eq!(
+            stage,
+            SplitStage::Hidden,
+            "second Ctrl+l press should advance Narrow -> Hidden"
+        );
+        assert_eq!(
+            layout_for(stage),
+            (0, 100),
+            "Hidden stage should collapse the Dashboard sidebar to 0 width \
+             and give the pane column the full 100% width"
+        );
+
+        stage = next_split_stage(stage);
+        assert_eq!(
+            stage,
+            SplitStage::Default,
+            "third Ctrl+l press should loop Hidden back to Default"
+        );
+        assert_eq!(
+            layout_for(stage),
+            (33, 67),
+            "looping back to Default should restore the Dashboard tab's own \
+             33/67 split, not the Orchestration tab's 34/66"
+        );
+
+        // Reset immediately so a later test on this worker thread never
+        // observes a leaked non-Default stage from this one.
+        ACTIVE_DASHBOARD_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
     }
 
     /// Scenario: PRD #336 spawn-order regression. Dispatch the real
