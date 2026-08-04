@@ -34,7 +34,7 @@ git rebase upstream/main          # conflicts resolved HERE — once, per-commit
 git push --force-with-lease origin fork-only
 git checkout main
 git reset --hard fork-only
-git push --force origin main
+git push --force origin main   # force-with-lease won't help here: we didn't fetch origin, so its tracking ref for main may be stale
 ```
 
 **This rewrites history on both branches, intentionally.** The rebase gives `fork-only`'s commits new SHAs, and `main` is force-pushed to match. That is expected for this workflow, not an accident. Anyone holding a stale local clone of either branch must **hard-reset to the new history** after a sync (`git fetch && git reset --hard origin/<branch>`) — a plain `git pull` will produce a tangled merge, not the intended state.
