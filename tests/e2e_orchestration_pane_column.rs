@@ -37,79 +37,149 @@ fn open_orchestration(deck: &TuiDeck) {
 
 /// Column index of the orchestration tab's role-pane column's LEFT edge: the
 /// role-pane box drawn for the fixture's `start = true` role ("orchestrator")
-/// renders its title fused into the top border as `┌orchestrator───…`, so the
-/// column of that `┌` is exactly `panes_area.x` — the boundary between the
+/// renders its title fused into the top border as `┌orchestrator───…` (Plain,
+/// unfocused/PaneInput) or `┏orchestrator───…` (Thick, focused command-mode —
+/// `TerminalWidget` in `src/terminal_widget.rs`), so the column of whichever
+/// glyph is present is exactly `panes_area.x` — the boundary between the
 /// sidebar (role list) and the pane column that `ORCHESTRATION_LEFT_PERCENT`
 /// / `ORCHESTRATION_PANES_PERCENT` (src/ui.rs:1951-1952) control. Distinct
 /// from the sidebar's own truncated `orchestrat…` card label, so there is no
 /// collision risk.
 fn pane_column_left_edge(grid: &str) -> u16 {
     for line in grid.lines() {
-        if let Some(byte_idx) = line.find("┌orchestrator") {
+        if let Some(byte_idx) = line
+            .find("┌orchestrator")
+            .or_else(|| line.find("┏orchestrator"))
+        {
             return line[..byte_idx].chars().count() as u16;
         }
     }
     panic!("orchestrator role-pane box top border not found in grid:\n{grid}");
 }
 
-/// Scenario: open a real orchestration tab (120-col PTY) at the default 34/66
-/// split, confirm the pane column's left edge sits at the expected ~34%-width
-/// boundary, then send Ctrl+l and wait for that boundary to move to the
-/// narrower-sidebar 25%-width position (sidebar visibly narrows, pane column
-/// visibly widens). Send Ctrl+l again and confirm the boundary returns to the
-/// original 34% position. RED today: Ctrl+l is unbound (PRD #336 verified
-/// against the `ACTIONS` default table), so the boundary never moves and the
-/// wait for the narrow geometry times out.
+/// Scenario: Open two real orchestration tabs (120-col PTY) and Ctrl+l cycle
+/// tab A through Default (34/66) -> Narrow (25/75) -> Hidden (sidebar
+/// collapsed) -> Default, confirming the pane column's left-edge boundary at
+/// each stage. Interleave tab B's own cycle in between to confirm each tab
+/// tracks its own split stage independently. RED today: the toggle only has
+/// two stages, so the Hidden-stage waits time out.
 #[spec("tabs/orchestration/006")]
 #[test]
-fn orchestration_006_ctrl_l_toggles_pane_column_split() {
+fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
 
     open_orchestration(&deck);
-    deck.wait_for_string("worker"); // 2nd role card -> orchestration tab is up
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab A is up
 
-    // Baseline: the default 34/66 split puts the pane column's left edge at
+    // Baseline: the default 34/66 split puts tab A's pane-column left edge at
     // 34% of the 120-col frame (col 40 or 41, depending on Percentage
-    // rounding) — well clear of both the 25%-split boundary (col 30) this
-    // test pins after the toggle.
+    // rounding).
     let default_edge = pane_column_left_edge(&deck.snapshot_grid());
     assert!(
         (40..=41).contains(&default_edge),
-        "expected the default 34/66 split's pane-column edge near col 40/41, \
-         got {default_edge}\nGrid:\n{}",
+        "expected tab A's default 34/66 split's pane-column edge near col \
+         40/41, got {default_edge}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
-    // Ctrl+l: toggle to the narrower-sidebar 25/75 split. The sidebar
-    // narrows and the pane column widens, so the boundary column DECREASES
-    // (25% of 120 = col 30) — a `contains` window tolerates rounding without
-    // caring about the exact boundary constant.
+    // Ctrl+l on tab A: Default -> Narrow (25/75, edge ~col 30).
     deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
-    let narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        let edge = pane_column_left_edge(grid);
-        (29..=30).contains(&edge)
+    let a_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        (29..=30).contains(&pane_column_left_edge(grid))
     });
     assert!(
-        narrowed,
-        "Ctrl+l did not narrow the sidebar to the 25/75 split within 3s — \
+        a_narrowed,
+        "Ctrl+l did not narrow tab A's sidebar to the 25/75 split within 3s \
+         — pane-column edge stayed at {}\nGrid:\n{}",
+        pane_column_left_edge(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+
+    // Open a SECOND orchestration tab (tab B) in the same directory. A fresh
+    // tab always starts at Default, regardless of tab A's now-Narrow stage.
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
+
+    let b_default_edge = pane_column_left_edge(&deck.snapshot_grid());
+    assert!(
+        (40..=41).contains(&b_default_edge),
+        "a brand-new orchestration tab B must open at its OWN default 34/66 \
+         split regardless of tab A's Narrow stage, got {b_default_edge}\
+         \nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Ctrl+l on tab B: Default -> Narrow.
+    deck.send_bytes(b"\x0c");
+    let b_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        (29..=30).contains(&pane_column_left_edge(grid))
+    });
+    assert!(
+        b_narrowed,
+        "Ctrl+l did not narrow tab B's sidebar to the 25/75 split within 3s\
+         \nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Ctrl+l on tab B: Narrow -> Hidden (sidebar collapsed, edge exactly 0 —
+    // 0% of any width has no rounding ambiguity).
+    deck.send_bytes(b"\x0c");
+    let b_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        pane_column_left_edge(grid) == 0
+    });
+    assert!(
+        b_hidden,
+        "a second Ctrl+l on tab B did not collapse its sidebar to the \
+         Hidden stage within 3s — pane-column edge stayed at {}\nGrid:\n{}",
+        pane_column_left_edge(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+
+    // Switch back to tab A (Shift+Tab -> previous tab). Cross-tab isolation:
+    // tab A's split must still be Narrow — untouched by tab B's Narrow ->
+    // Hidden presses, even though both tabs were driven through the exact
+    // same Ctrl+l chord. Tab B's start-role pane is still live-focused in
+    // PaneInput mode, and `cycle_tab_action` only responds to Shift+Tab in
+    // Normal mode — otherwise the bytes forward straight to the pane — so
+    // return to Normal mode first.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> tab A
+    let a_still_narrow = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        (29..=30).contains(&pane_column_left_edge(grid))
+    });
+    assert!(
+        a_still_narrow,
+        "toggling tab B's split must not move tab A's split — expected tab \
+         A still Narrow (edge ~col 30) after switching back, got {}\nGrid:\n{}",
+        pane_column_left_edge(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+
+    // Finish tab A's own cycle: Narrow -> Hidden.
+    deck.send_bytes(b"\x0c");
+    let a_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        pane_column_left_edge(grid) == 0
+    });
+    assert!(
+        a_hidden,
+        "Ctrl+l did not advance tab A from Narrow to Hidden within 3s — \
          pane-column edge stayed at {}\nGrid:\n{}",
         pane_column_left_edge(&deck.snapshot_grid()),
         deck.snapshot_grid()
     );
 
-    // Second Ctrl+l: toggle back to the 34/66 default.
+    // Hidden -> Default, completing tab A's loop.
     deck.send_bytes(b"\x0c");
-    let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        let edge = pane_column_left_edge(grid);
-        (40..=41).contains(&edge)
+    let a_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        (40..=41).contains(&pane_column_left_edge(grid))
     });
     assert!(
-        restored,
-        "a second Ctrl+l did not restore the 34/66 default split within 3s — \
-         pane-column edge stayed at {}\nGrid:\n{}",
+        a_restored,
+        "a third Ctrl+l on tab A did not restore the 34/66 default split \
+         within 3s — pane-column edge stayed at {}\nGrid:\n{}",
         pane_column_left_edge(&deck.snapshot_grid()),
         deck.snapshot_grid()
     );
