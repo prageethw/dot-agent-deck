@@ -74,3 +74,30 @@ fn hooks_permission_002_tool_start_for_an_unrelated_tool_preserves_waiting_for_i
         "an unrelated tool's ToolStart must not clear a badge that isn't waiting on it"
     );
 }
+
+/// Scenario: A session reaches WaitingForInput via a `PermissionRequest` that carries no tool name — OpenCode's real `permission.asked` payload never includes one (`src/opencode_manage.rs`'s `permissionPayload` sends only `session_id`/`event`/`prompt`/`cwd`). An unrelated tool's concurrent `ToolStart` must NOT clear the badge, same as the named case in `hooks/permission/002`.
+#[spec("hooks/permission/003")]
+#[test]
+fn hooks_permission_003_tool_start_after_a_nameless_permission_request_preserves_waiting_for_input()
+{
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+
+    state.apply_event(event(EventType::SessionStart, None));
+    state.apply_event(event(EventType::PermissionRequest, None));
+    assert_eq!(
+        state.sessions[SESSION_ID].status,
+        SessionStatus::WaitingForInput,
+        "precondition: a nameless permission prompt must still arm WaitingForInput"
+    );
+
+    state.apply_event(event(EventType::ToolStart, Some("Read")));
+
+    assert_eq!(
+        state.sessions[SESSION_ID].status,
+        SessionStatus::WaitingForInput,
+        "a PermissionRequest with no tool_name sets pending_permission_tool to None, \
+         indistinguishable from 'no permission pending' — an unrelated ToolStart must \
+         not be treated as the human's approval taking effect and clear the badge"
+    );
+}

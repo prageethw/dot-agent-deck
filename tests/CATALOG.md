@@ -1398,6 +1398,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the eventual clearing of that pending `Bash` prompt (out of scope for this pin); `hooks/permission/001` covers the matching-name clear.
 - **Platform coverage:** mac+linux+windows.
 
+##### hooks/permission/003 — A `PermissionRequest` with no `tool_name` (OpenCode's real `permission.asked` payload shape) does NOT let an unrelated `ToolStart` clear WaitingForInput (Greptile finding on PRD #361 Item 1's marker logic).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` with `tool_name: None` → `ToolStart` for an unrelated tool, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session; the nameless-`tool_name` shape mirrors OpenCode's real `permission.asked` payload, which `src/opencode_manage.rs`'s `permissionPayload` never populates with a `tool_name` field).
+- **Asserts:** a `PermissionRequest` carrying `tool_name: None` still arms WaitingForInput, and a subsequent `ToolStart` for an unrelated tool (`Read`) leaves the status at WaitingForInput rather than being treated as a plain notification-wait clear — `pending_permission_tool = None` from a nameless prompt must not be confused with "no permission pending at all".
+- **Does not assert:** which status a `ToolStart` produces once the SAME nameless-prompt's approval genuinely lands (no tool name is available to match against, so this case is inherently a "leave it pending" one, not a "clear on match" one).
+- **Platform coverage:** mac+linux+windows.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
