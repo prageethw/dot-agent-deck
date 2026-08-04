@@ -27,8 +27,14 @@
     ],
     "scripts": {
       "agent": ["claude"],
+      "claude-opus-devbox": [
+        "claude-opus-devbox \"$@\""
+      ],
       "claude-sonnet-devbox": [
         "claude-sonnet-devbox \"$@\""
+      ],
+      "claude-haiku-devbox": [
+        "claude-haiku-devbox \"$@\""
       ],
       "codex-devbox": [
         "codex-devbox \"$@\""
