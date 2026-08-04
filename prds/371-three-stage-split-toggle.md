@@ -93,7 +93,7 @@ Both `ActiveTabView::Dashboard` and `ActiveTabView::Orchestration` arms in `comp
 
 ### Experimental-flag question (CLAUDE.md rule 9)
 
-Candidate answer **no**, same reasoning as PRD #341 — a keybinding-driven layout affordance with no new state that persists or affects other users/agents, cheap to verify with L1/L2 coverage. To be confirmed at `/prd-start` for this fork branch.
+**Resolved: No — visible by default.** A keybinding-driven layout affordance with no persisted state, and existing L1/L2 test coverage is sufficient verification. Matches precedent (PRD #336/#333/#341).
 
 ## Success Criteria
 
@@ -111,7 +111,7 @@ Candidate answer **no**, same reasoning as PRD #341 — a keybinding-driven layo
 - [x] **M4 — Layout call sites resolve the active stage.** Both `compute_frame_layout` arms use `split_stage_percents` instead of the fixed constants directly.
 - [x] **M5 — L1 snapshot coverage.** `insta` render tests (`layout_001_ctrl_l_cycles_dashboard_split_stages`, `layout_002_ctrl_l_cycles_orchestration_split_stages`, `src/ui.rs`) pin all three stages' geometry for an Orchestration tab and a Dashboard tab.
 - [x] **M6 — L2 coverage.** `tests/e2e_orchestration_pane_column.rs::orchestration_006_ctrl_l_cycles_pane_column_split_stages` and `tests/e2e_dashboard_pane_column.rs::dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration` drive the chord through the full 3-stage cycle on both tab types and assert cross-tab / cross-tab-type isolation.
-- [ ] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with the new binding and its scope; changelog fragment added.
+- [x] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with the new binding and its scope; changelog fragment added.
 
 ## Risks
 
@@ -121,5 +121,5 @@ Candidate answer **no**, same reasoning as PRD #341 — a keybinding-driven layo
 ## Open Questions
 
 1. **Persistence across restarts.** Not proposed as in-scope: `Tab` has no `Serialize`/`Deserialize` derive, and session snapshots are built into separate `Saved*` structs rather than mirroring `Tab` automatically, so wiring `split_stage` through snapshot/restore is real (if probably small) additional work, not a free field default. Left for a follow-up if users want it.
-2. **Experimental flag gating** — to be settled at `/prd-start` for this branch (see Technical Approach above for judgment).
+2. **Experimental flag gating** — resolved: no, visible by default (see Technical Approach above).
 3. **Action naming** — `CycleSplitStage` (as landed) vs. `ToggleSplitStage` (reads oddly for a 3-state cycle vs. a 2-state toggle) vs. `CyclePaneSplit`. Settled as `CycleSplitStage` in the landed implementation; noted here only for history.
