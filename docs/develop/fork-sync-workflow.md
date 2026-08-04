@@ -4,6 +4,21 @@ This repository is a **fork**: `origin` is `prageethw/dot-agent-deck` and `upstr
 
 If you only read one section, read [The sync procedure](#the-sync-procedure).
 
+## Verify the active config before delegating work
+
+Before delegating any work from a checkout (root checkout, worktree, or PR review branch), verify that the active `.dot-agent-deck.toml` role commands map to the fork's wrapper scripts, not upstream's original per-model scripts:
+
+```bash
+grep -A1 'name = "coder"' .dot-agent-deck.toml
+# expect: command = "devbox run claude-sonnet-devbox"
+```
+
+If that command instead reads `devbox run agent-coder`, `devbox run pi-sol`, `devbox run oc-big`, `devbox run codex-big`, or similar upstream-style names, the checkout predates the fork's devbox-wrapper customisation (PR #7) and delegated workers will silently launch with the wrong model/tool — no error, just wrong behaviour observable only by noticing the wrong model running.
+
+**Why this can happen silently:** any checkout on a branch/commit that predates the fork's config customisation — or any branch built directly off an old upstream point — carries the pre-fork config. There is no validation step that catches the mismatch; delegation just proceeds with whatever command the checkout's `.dot-agent-deck.toml` happens to specify.
+
+**Fix/mitigation:** always delegate work from `main` or `fork-only`'s current tip (both carry the fork's config as of the most recent sync), and re-run the check above after any branch switch — especially after switching to review a PR, check out an older branch, or create a fresh worktree.
+
 ## The two-branch model, and why
 
 There are two long-lived branches:
