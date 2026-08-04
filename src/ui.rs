@@ -8661,6 +8661,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
         return Some(Action::CycleSplitStage);
     }
+    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
+        return Some(Action::ToggleOrchestrationLock);
+    }
     // PRD #313. Same shape as the split above and for the same reason: a pure
     // chord→action mapping here, narrowed to (orchestration tab, command mode)
     // by `scope_zoom` at the one dispatch site that has tab context. The
@@ -8674,9 +8677,6 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     }
     if kb.matches(KbAction::ClosePane, key) {
         return Some(Action::CloseSelected);
-    }
-    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
-        return Some(Action::ToggleOrchestrationLock);
     }
     // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -20670,6 +20670,7 @@ pub fn render_orchestration_frame_to_buffer(
                 tool_count: 0,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
+                pending_permission_tool: None,
                 pane_id: Some(pane_ids[i].clone()),
                 agent_id: None,
                 display_name: None,

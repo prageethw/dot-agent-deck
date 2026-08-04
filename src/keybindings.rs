@@ -115,7 +115,8 @@ pub struct ActionSpec {
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
 ///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
-///   (toggle orchestration split), `Ctrl+z` (PRD #313: zoom the focused pane);
+///   (toggle orchestration split), `Ctrl+e` (toggle orchestration
+///   command-entry lock), `Ctrl+z` (PRD #313: zoom the focused pane);
 ///   `1`..`9` jump to a card. `Ctrl+z` is claimed ONLY in command mode, so in a
 ///   pane it still reaches the agent as `0x1a` job control — the same
 ///   command-mode-only narrowing `Ctrl+l` and `Ctrl+w` already use. (Quit is

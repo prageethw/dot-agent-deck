@@ -194,6 +194,13 @@ pub enum Tab {
         /// ratio. Per-tab so toggling one orchestration tab doesn't affect
         /// another.
         split_stage: SplitStage,
+        /// PRD #374 (#361 Item 3): whether direct keystroke entry to
+        /// non-orchestrator role panes on this tab is locked. Starts
+        /// `true` — only the orchestrator pane accepts direct input until
+        /// `Ctrl+e` unlocks it. Per-tab, following the `split_stage`
+        /// precedent: toggling one orchestration tab's lock never affects
+        /// another open orchestration tab.
+        command_entry_locked: bool,
     },
 }
 
@@ -960,6 +967,7 @@ impl TabManager {
             // unzoomed regardless of what any other tab is doing.
             zoomed: false,
             split_stage: SplitStage::Default,
+            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -1101,6 +1109,7 @@ impl TabManager {
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
             split_stage: SplitStage::Default,
+            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -1829,6 +1838,7 @@ mod tests {
             all_clear_pending: false,
             zoomed: false,
             split_stage: SplitStage::Default,
+            command_entry_locked: true,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1862,6 +1872,7 @@ mod tests {
             all_clear_pending: false,
             zoomed: false,
             split_stage: SplitStage::Default,
+            command_entry_locked: true,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
