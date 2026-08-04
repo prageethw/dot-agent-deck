@@ -20,7 +20,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
-| `Ctrl+L` | Toggle the orchestration sidebar/pane-column split ratio between 34/66 and 25/75 (applies to every orchestration tab) | **Orchestration tabs, command mode only** |
+| `Ctrl+L` | Cycle the sidebar/pane-column split: Default → Narrow (25/75) → Hidden (sidebar gone, pane column full-width) → Default. Scoped per tab — cycling one tab never moves another, including another tab of the same type | **Dashboard and Orchestration tabs** |
 | `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame, and the card sidebar and the other panes are not drawn. Press it again to restore the view you had. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 | `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, and only while the `experimental` flag is on |
@@ -230,7 +230,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag; without it the chord is never claimed.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
-| `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration sidebar/pane-column split between 34/66 and 25/75 — one press applies to every orchestration tab, including ones you open afterwards. **Orchestration tabs, command mode only**; in a pane, and on every other tab, the chord is ordinary input for whatever is running there |
+| `toggle_orchestration_split` | `Ctrl+l` | Cycle the active tab's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**; scoped per tab, no effect elsewhere |
 | `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame, hiding the card sidebar and the other panes; press again to restore. Per-tab, and never saved. **Dashboard and orchestration tabs, command mode only**; in a pane it is still job control for your agent, and in the filter/rename rows and on a Mode tab it is ordinary input |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
