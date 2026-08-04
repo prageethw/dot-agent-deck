@@ -395,6 +395,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the trailing `N session(s)` text (unaffected by the rename, covered elsewhere) or any other chrome (tab strip, button bar).
 - **Platform coverage:** mac+linux.
 
+#### dashboard/layout
+
+##### dashboard/layout/001 — `Ctrl+l` resolves to the same split-cycle `Action` on a Dashboard tab, and walking the `SplitStage` resolver through the full 3-stage cycle (Default 33/67 -> Narrow 25/75 -> Hidden 0/100 -> Default) pins each stage's geometry, using the Dashboard tab's own default ratio rather than Orchestration's (PRD #361 Item 4).
+- **Layer:** L1 (pure-data `compute_frame_layout` geometry; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** a Dashboard tab's default frame geometry is the fixed 33/67 split (`dashboard_area` / `panes_area` widths), distinct from Orchestration's 34/66; walking the pure `next_split_stage` resolver Default -> Narrow -> Hidden -> Default and recomputing the frame geometry at each step (via an `ACTIVE_DASHBOARD_SPLIT_STAGE` thread-local, the Dashboard counterpart of `orchestration/layout/002`'s `ACTIVE_ORCHESTRATION_SPLIT_STAGE`) pins the 25/75 Narrow split, the 0/100 Hidden split (sidebar fully collapsed, pane column full-width), and the wrap back to the original 33/67 Default split.
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/dashboard/001`); cross-tab or cross-tab-type scoping (covered by `tabs/dashboard/001`); Orchestration-tab geometry (covered by `orchestration/layout/002`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Statuses
 
 #### status/transition
@@ -1141,11 +1150,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/006 — `Ctrl+l` toggles an orchestration tab's sidebar/pane-column split between the default 34/66 and a narrower-sidebar 25/75, and back on a second press (PRD #336).
+##### tabs/orchestration/006 — `Ctrl+l` cycles an orchestration tab's sidebar/pane-column split through the three PRD #361 stages — default 34/66, narrower-sidebar 25/75, and Hidden (sidebar collapsed, 0/100) — looping back to default, and a second open orchestration tab's stage is unaffected by the first tab's cycling (PRD #336, extended to three stages by PRD #361 Item 4).
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
 - **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
-- **Asserts:** opening a real orchestration tab renders the pane column's left edge at the default 34%-width boundary; pressing `Ctrl+l` moves that boundary to the narrower-sidebar 25%-width position (sidebar visibly narrows, pane column visibly widens); a second `Ctrl+l` restores the original 34%-width boundary.
-- **Does not assert:** per-tab scoping across multiple open orchestration tabs (out of scope for this entry — PRD #336 scope note); persistence of the toggled state across restart (explicitly out of scope per the PRD); remapping the chord via config.
+- **Asserts:** opening a real orchestration tab A renders the pane column's left edge at the default 34%-width boundary; `Ctrl+l` moves that boundary to the narrower-sidebar 25%-width position; opening a SECOND real orchestration tab B in the same directory renders it at its OWN default 34%-width boundary regardless of tab A's now-Narrow stage; cycling tab B through Narrow then Hidden (edge at column 0, sidebar fully collapsed) and switching back to tab A confirms tab A's stage is STILL Narrow — untouched by tab B's presses; finishing tab A's own cycle (Narrow -> Hidden -> Default) restores its original 34%-width boundary, proving the 3-stage loop and per-tab isolation together.
+- **Does not assert:** persistence of the toggled state across restart (explicitly out of scope per the PRD); remapping the chord via config; Dashboard-tab coverage (the Dashboard/Orchestration cross-tab-type isolation case lives in `tabs/dashboard/001`).
 - **Platform coverage:** mac+linux.
 
 ##### tabs/orchestration/007 — `Ctrl+l` must still forward to a live pane's PTY when the active tab is NOT an orchestration tab.
@@ -1210,6 +1219,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** against a real `TabManager`-opened 2-role Orchestration tab with focus manually landed on the non-orchestrator `coder` role and its `last_role_pane_activity_at` set to a synthetic 31-second-stale `Instant`, driving the REAL `dispatch_normal_mode_key` with a `k` keypress over a `filtered` session list whose pane ids match the tab's role panes — mirroring `jk_navigation_mirrors_selection_into_focus`'s technique — moves `ui.selected_index` and, via the real `mirror_selection_into_focus` call inside it, focuses the orchestrator role's pane on the SAME pane controller, confirming the cycling itself works. It then asserts `Tab::Orchestration::last_role_pane_activity_at` is fresh (`Some`, sub-second-old) as a result of that single call — which FAILS today (RED) because `dispatch_normal_mode_key`'s call site is not gated/stamped the way `Action::SelectCard`/`FocusCard`/`Focus`/`ForwardToPane` are.
 - **Does not assert:** the resolver's own resolution rules (covered by `tabs/orchestration/010`/`012`/`013`) or the render-loop `else if` chain's consumption of the field (covered by `tabs/orchestration/014`); any visible rendering; the blocked-keystroke reset (PRD #373 M3, deferred until #374).
 - **Platform coverage:** mac+linux+windows.
+
+#### tabs/dashboard
+
+##### tabs/dashboard/001 — `Ctrl+l` cycles a Dashboard tab's sidebar/pane-column split through the three PRD #361 stages — default 33/67, narrower-sidebar 25/75, and Hidden (sidebar collapsed, 0/100) — looping back to default, and an open Orchestration tab's stage is unaffected by the Dashboard tab's cycling and vice versa.
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture; a `with_continue_session` stub `cat` pane for the Dashboard tab plus the fixture's `demo-orch` orchestration, no LLM tokens spent).
+- **Asserts:** a Dashboard tab with one live pane renders the pane column's left edge at the default 33%-width boundary; `Ctrl+l` cycles it through the narrower-sidebar 25%-width position and the Hidden 0%-width (sidebar fully collapsed) position and back to 33%; opening a SECOND, real Orchestration tab in the same directory renders it at its OWN default 34%-width boundary regardless of the Dashboard tab's stage; toggling the Orchestration tab to Narrow and switching back to the Dashboard tab confirms the Dashboard tab's split is STILL Default — untouched by the Orchestration tab's toggle, proving cross-tab-type isolation in both directions.
+- **Does not assert:** persistence of the toggled state across restart; remapping the chord via config; the reverse direction of the isolation check (toggling the Dashboard tab first, then confirming a pre-existing Orchestration tab is unaffected — `tabs/orchestration/006` covers same-type isolation, and this entry's Orchestration-tab toggle happens strictly after all Dashboard-tab assertions, so the two entries together cover both toggle orders without duplicating the full matrix).
+- **Platform coverage:** mac+linux.
 
 #### tabs/selection
 
@@ -1409,6 +1427,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** launching with neither `~/.claude/` nor `~/.opencode/` does not write any settings file and the TUI starts normally.
 - **Does not assert:** the (absence of a) tracing log line.
 - **Platform coverage:** mac+linux.
+
+#### hooks/permission
+
+##### hooks/permission/001 — A `PreToolUse`/`ToolStart` for the SAME tool a permission prompt was just approved for clears the WaitingForInput badge (PRD #361 Item 1).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` → `ToolStart`, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session).
+- **Asserts:** after a `PermissionRequest` for `Bash` arms WaitingForInput, a `ToolStart` carrying the SAME tool name (`Bash`) moves the status to `Working` instead of leaving it stuck on WaitingForInput for the tool's whole run.
+- **Does not assert:** the TUI-side `y`/`n` keystroke or `Action::SendPermissionResponse` PTY write (covered by `prompt/permission/*`); which status a non-matching-name `ToolStart` produces (`hooks/permission/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### hooks/permission/002 — A `PreToolUse`/`ToolStart` for an UNRELATED tool while a different tool's permission prompt is pending does NOT clear WaitingForInput (PRD #361 Item 1 regression pin).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` → `ToolStart` for a different tool name, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session).
+- **Asserts:** after a `PermissionRequest` for `Bash` arms WaitingForInput, a `ToolStart` carrying a DIFFERENT tool name (`Read`) — modeling a concurrent subagent's own tool starting — leaves the status at WaitingForInput.
+- **Does not assert:** the eventual clearing of that pending `Bash` prompt (out of scope for this pin); `hooks/permission/001` covers the matching-name clear.
+- **Platform coverage:** mac+linux+windows.
+
+##### hooks/permission/003 — A `PermissionRequest` with no `tool_name` (OpenCode's real `permission.asked` payload shape) does NOT let an unrelated `ToolStart` clear WaitingForInput (Greptile finding on PRD #361 Item 1's marker logic).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` with `tool_name: None` → `ToolStart` for an unrelated tool, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session; the nameless-`tool_name` shape mirrors OpenCode's real `permission.asked` payload, which `src/opencode_manage.rs`'s `permissionPayload` never populates with a `tool_name` field).
+- **Asserts:** a `PermissionRequest` carrying `tool_name: None` still arms WaitingForInput, and a subsequent `ToolStart` for an unrelated tool (`Read`) leaves the status at WaitingForInput rather than being treated as a plain notification-wait clear — `pending_permission_tool = None` from a nameless prompt must not be confused with "no permission pending at all".
+- **Does not assert:** which status a `ToolStart` produces once the SAME nameless-prompt's approval genuinely lands (no tool name is available to match against, so this case is inherently a "leave it pending" one, not a "clear on match" one).
+- **Platform coverage:** mac+linux+windows.
 
 ### Pane / agent lifecycle
 
@@ -2121,11 +2162,11 @@ without depending on the config struct API.
 - **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/002 — `Ctrl+l` resolves to a split-toggle `Action` on an orchestration tab, and the toggled geometry is the narrower-sidebar 25/75 split (PRD #336).
+##### orchestration/layout/002 — `Ctrl+l` resolves to a split-cycle `Action` on an orchestration tab, and walking the `SplitStage` resolver through the full 3-stage cycle (Default 34/66 -> Narrow 25/75 -> Hidden 0/100 -> Default) pins each stage's geometry (PRD #336, extended to three stages by PRD #361 Item 4).
 - **Layer:** L1 (pure-data `compute_frame_layout` geometry + `key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses; no PTY, no TestBackend render).
 - **Agent:** none.
-- **Asserts:** an orchestration tab's default frame geometry is the fixed 34/66 split (`dashboard_area` / `panes_area` widths); resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Some` action; the frame geometry recomputed after the keypress is the narrower-sidebar 25/75 split.
-- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/006`); per-tab scoping across multiple orchestration tabs; the second-press round-trip back to 34/66 (covered by `tabs/orchestration/006`).
+- **Asserts:** an orchestration tab's default frame geometry is the fixed 34/66 split (`dashboard_area` / `panes_area` widths); resolving a simulated `Ctrl+l` `KeyEvent` through `key_action_for_mode` with the default keybinding config yields `Some` action; walking the pure `next_split_stage` resolver Default -> Narrow -> Hidden -> Default and recomputing the frame geometry at each step pins the 25/75 Narrow split, the 0/100 Hidden split (sidebar fully collapsed, pane column full-width), and the wrap back to the original 34/66 Default split.
+- **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/orchestration/006`); per-tab scoping across multiple orchestration tabs (covered by `tabs/orchestration/006`); Dashboard-tab geometry (covered by `dashboard/layout/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/layout/003 — A brand-new orchestration tab spawns its role panes at the default 34/66 split even when another already-open orchestration tab is toggled to the narrow 25/75 split (PRD #336 spawn-order regression).
@@ -2141,6 +2182,50 @@ without depending on the config struct API.
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
 - **Platform coverage:** mac+linux+windows.
+
+#### orchestration/lock
+
+##### orchestration/lock/001 — A freshly opened orchestration tab starts with command-entry LOCKED (PRD #361 Item 3).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** dispatching a real `Action::SpawnPane` to open a fresh two-role orchestration (`orchestrator` start + `worker`) leaves the new tab's per-tab lock field engaged — only the orchestrator pane accepts direct input until `Ctrl+e` unlocks it.
+- **Does not assert:** the actual PTY-forward gating behavior (covered by `orchestration/lock/004`); the `Ctrl+e` toggle itself (covered by `orchestration/lock/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/002 — `Ctrl+e` resolves to the new toggle `Action` from `PaneInput` mode and flips the per-tab lock field locked -> unlocked -> locked (PRD #361 Item 3).
+- **Layer:** L1 (`key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses, plus `dispatch_action` against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** resolving a simulated `Ctrl+e` `KeyEvent` through `key_action_for_mode` from `UiMode::PaneInput` with the default keybinding config yields `Action::ToggleOrchestrationLock`; dispatching it once against a real orchestration tab unlocks it, dispatching it again re-locks it.
+- **Does not assert:** the visible status message on toggle, if any; per-tab isolation of the toggle (covered by `orchestration/lock/003`); the actual PTY-forward gating (covered by `orchestration/lock/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/003 — The command-entry lock is per-orchestration-tab: toggling one tab's lock does not affect a second open orchestration tab's lock state, in either direction (PRD #361 Item 3 resolved decision).
+- **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** unlock orchestration tab A via the toggle action; open a brand-new orchestration tab B and confirm it starts LOCKED — its own default — regardless of A's now-unlocked state; switch back to A and confirm it is STILL unlocked, untouched by B's spawn; toggle B's own lock and confirm A remains unaffected by that toggle too.
+- **Does not assert:** the visible rendered grid or cross-tab-type scoping (Mode/Dashboard tabs have no lock at all, out of scope per the PRD); the actual PTY-forward gating (covered by `orchestration/lock/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/004 — While an orchestration tab is locked (the default), a keystroke aimed at a non-orchestrator role's PTY is dropped before reaching it; the orchestrator pane's own input is never gated; `Ctrl+e` unlocks the tab and keystrokes to the non-orchestrator role then forward normally (PRD #361 Item 3).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** with a real orchestration tab open (default LOCKED), a sentinel typed into the still-focused orchestrator role is echoed by its `cat` process (never gated, lock state notwithstanding); focusing the non-orchestrator "worker" role (`1`-`9` jump) and typing a sentinel while still locked never reaches the worker's PTY (no terminal echo appears within a 2s poll window, since a dropped keystroke never reaches `write_raw_bytes`); sending `Ctrl+e` then typing a third sentinel into the same still-focused worker pane DOES forward and appear, proving the unlock takes effect immediately for the currently-focused pane.
+- **Does not assert:** the visible status-message text on a dropped keystroke (the PRD names an example, `"Pane locked — Ctrl+e to unlock"`, following the `RequestConfigGen` no-op-with-feedback convention, but does not mandate exact wording); per-tab isolation (covered by `orchestration/lock/003`); global chords during the lock (covered by `orchestration/lock/005`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/005 — The small always-available global `Ctrl+`-chord set (resolved before the PTY-forward fallback the lock gates) keeps working identically regardless of the lock or which pane is focused (PRD #361 Item 3).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** with a real orchestration tab open and the non-orchestrator "worker" role focused (tab still LOCKED, the default), pressing `Ctrl+t` (`toggle_layout`) still surfaces its `Layout: …` status message — the same observable `keybindings/remap/001` uses — proving the lock gate sits entirely inside the PTY-forward fallback and never touches `global_action_for_mode`'s chord set. Regression guard mirroring `tabs/orchestration/007`'s role for Item 4.
+- **Does not assert:** every global chord individually (`Ctrl+d`/`Ctrl+n`/`Ctrl+w`/the split-cycle chord/`Ctrl+e` itself) — `Ctrl+t` is sufficient to prove the fallback-only gate placement, matching how `tabs/orchestration/007` used a single chord for the analogous Item 4 proof; the locked-drop behavior itself (covered by `orchestration/lock/004`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/006 — With a REAL interactive Claude Haiku agent in the non-orchestrator role (not the `cat` stub `orchestration/lock/004` uses), the command-entry lock still gates a directive typed toward its PTY while locked, and still forwards it once `Ctrl+e` unlocks (CLAUDE.md rule 4 / Greptile PR #374 follow-up).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** REAL interactive Claude Code CLI pinned to `claude-haiku-4-5-20251001` (`orch-lock-live` fixture — orchestrator stays a `cat` stub, already proven never-gated by `orchestration/lock/004`, to keep the run to a single real-agent role).
+- **Asserts:** with a real orchestration tab open (default LOCKED) and the worker role focused, a create-sentinel-file directive typed into its PTY never results in the sentinel file appearing on disk (the agent never received it); `Ctrl+e` unlocks the tab, and a second directive with a different sentinel typed into the still-focused worker pane DOES result in that file being created, proving a genuine agent — not just `cat` echo — receives and acts on input only once unlocked; the first (locked) sentinel is confirmed still absent at the end, ruling out a buffer-then-flush implementation instead of an outright drop.
+- **Does not assert:** the orchestrator pane's own never-gated input (covered by `orchestration/lock/004`); per-tab isolation (covered by `orchestration/lock/003`); global chords during the lock (covered by `orchestration/lock/005`); exact LLM response wording or timing.
+- **Platform coverage:** mac+linux.
 
 #### orchestration/route
 
