@@ -57,19 +57,12 @@ fn pane_column_left_edge(grid: &str) -> u16 {
     panic!("orchestrator role-pane box top border not found in grid:\n{grid}");
 }
 
-/// Scenario: PRD #361 Item 4 extends PRD #336's two-stage Ctrl+l toggle to a
-/// three-stage cycle. Open a real orchestration tab A (120-col PTY) at the
-/// default 34/66 split, confirm the pane column's left edge sits at the
-/// expected ~34%-width boundary, Ctrl+l to Narrow (25/75, edge ~col 30), then
-/// open a SECOND real orchestration tab B in the same directory and confirm
-/// it starts at ITS OWN default 34/66 boundary despite tab A now sitting at
-/// Narrow. Drive tab B through Narrow then Hidden (sidebar collapsed, edge
-/// col 0), switch back to tab A (Shift+Tab) and confirm A's split is STILL
-/// Narrow — untouched by tab B's two extra presses, proving per-tab
-/// isolation. Finish tab A's own cycle (Narrow -> Hidden -> Default),
-/// confirming the loop wraps back to the original 34/66 boundary. RED today:
-/// the toggle only has two stages (Default/Narrow), so the Hidden-stage waits
-/// time out.
+/// Scenario: Open two real orchestration tabs (120-col PTY) and Ctrl+l cycle
+/// tab A through Default (34/66) -> Narrow (25/75) -> Hidden (sidebar
+/// collapsed) -> Default, confirming the pane column's left-edge boundary at
+/// each stage. Interleave tab B's own cycle in between to confirm each tab
+/// tracks its own split stage independently. RED today: the toggle only has
+/// two stages, so the Hidden-stage waits time out.
 #[spec("tabs/orchestration/006")]
 #[test]
 fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {

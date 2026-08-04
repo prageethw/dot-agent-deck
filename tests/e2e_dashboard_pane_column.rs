@@ -37,20 +37,13 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
     panic!("{pane_title:?} pane box top border not found in grid:\n{grid}");
 }
 
-/// Scenario: PRD #361 Item 4 extends the split-toggle to Dashboard tabs.
-/// Launch the deck with one live Dashboard pane already attached (PaneInput
-/// mode, via `with_continue_session`), press Ctrl+D to reach Normal mode, and
-/// confirm the pane column's left edge sits at the Dashboard tab's own
-/// default 33%-width boundary (distinct from Orchestration's 34%). Cycle
-/// Ctrl+l through Narrow (25%) and Hidden (0%, sidebar collapsed) and back to
-/// Default (33%), asserting the boundary moves at each stage. Then open a
-/// SECOND, real Orchestration tab in the same directory and confirm it opens
-/// at ITS OWN default 34% boundary regardless of the Dashboard tab's stage;
-/// toggle the Orchestration tab to Narrow; switch back to the Dashboard tab
-/// (Shift+Tab) and confirm its split is STILL Default — untouched by the
-/// Orchestration tab's toggle, proving cross-tab-type isolation. RED today:
-/// Dashboard tabs have no split-toggle at all, so Ctrl+l never moves the
-/// boundary and every wait below times out.
+/// Scenario: Extends the Ctrl+l split-toggle to Dashboard tabs — launch with
+/// a live Dashboard pane, Ctrl+l cycle through Default (33%) -> Narrow (25%)
+/// -> Hidden (0%) -> Default, asserting the pane column's left edge at each
+/// stage. Open a second Orchestration tab and confirm its own 34% default and
+/// toggle are unaffected by the Dashboard tab's stage, proving cross-tab-type
+/// isolation. RED today: Dashboard tabs have no split-toggle at all, so every
+/// wait below times out.
 #[spec("tabs/dashboard/001")]
 #[test]
 fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration() {

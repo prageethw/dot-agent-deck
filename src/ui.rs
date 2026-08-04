@@ -23651,22 +23651,13 @@ mod tests {
         );
     }
 
-    /// Scenario: PRD #361 Item 4 extends PRD #336's two-stage Ctrl+l toggle
-    /// on an orchestration tab to a three-stage cycle — Default (34/66) ->
-    /// Narrow (25/75) -> Hidden (0/100, sidebar collapsed) -> Default,
-    /// looping indefinitely. Resolve a simulated Ctrl+l `KeyEvent` through
-    /// `key_action_for_mode` — the exact `KeyEvent -> Action` seam the live
-    /// event loop uses (per its own doc comment, PRD #241 M1) — confirming it
-    /// still resolves a split-cycle Action, then walk the pure
-    /// `next_split_stage` resolver through all three stages, simulating the
-    /// resulting dispatch + render-sync at each step (out of scope for this
-    /// pure-geometry test, same technique as before) by setting the
-    /// `ACTIVE_ORCHESTRATION_SPLIT_STAGE` thread-local directly, and
-    /// recomputing the orchestration tab's frame geometry via
-    /// `compute_frame_layout` at every stage, pinning all three geometries
-    /// plus the wrap back to Default. Full end-to-end dispatch coverage
-    /// (both tab types) lives in the L2 tests, tabs/orchestration/006 and
-    /// tabs/dashboard/001.
+    /// Scenario: Confirms Ctrl+l resolves to a split-cycle Action via
+    /// `key_action_for_mode`, then walks the pure `next_split_stage` resolver
+    /// through the three-stage cycle (Default 34/66 -> Narrow 25/75 ->
+    /// Hidden 0/100 -> Default), recomputing the orchestration tab's frame
+    /// geometry via `compute_frame_layout` at each stage and pinning all four
+    /// widths. Full end-to-end dispatch coverage lives in the L2 tests,
+    /// tabs/orchestration/006 and tabs/dashboard/001.
     #[spec("orchestration/layout/002")]
     #[test]
     fn layout_002_ctrl_l_cycles_orchestration_split_stages() {
@@ -23777,22 +23768,14 @@ mod tests {
         ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
     }
 
-    /// Scenario: PRD #361 Item 4 extends the orchestration-only Ctrl+l
-    /// split-toggle (PRD #336) to Dashboard tabs, sharing the same
-    /// `SplitStage` cycle and `next_split_stage` resolver but using the
-    /// Dashboard tab's OWN default ratio (33/67, distinct from
-    /// Orchestration's 34/66) as stage 1. Mirrors
-    /// `layout_002_ctrl_l_cycles_orchestration_split_stages`'s technique: walk
-    /// `next_split_stage` through the full cycle, simulating each stage's
-    /// dispatch + render-sync via an `ACTIVE_DASHBOARD_SPLIT_STAGE`
-    /// thread-local (the Dashboard counterpart of
-    /// `ACTIVE_ORCHESTRATION_SPLIT_STAGE`), and recomputing a Dashboard tab's
-    /// frame geometry via `compute_frame_layout` at every stage. RED today:
-    /// Dashboard tabs have no split-toggle at all — `compute_frame_layout`'s
-    /// `ActiveTabView::Dashboard` arm always uses the fixed
-    /// `DASHBOARD_LEFT_PERCENT`/`DASHBOARD_PANES_PERCENT` constants
-    /// regardless of any stage. Full end-to-end dispatch coverage lives in
-    /// the L2 test, tabs/dashboard/001.
+    /// Scenario: Mirrors `layout_002`'s technique to extend the Ctrl+l
+    /// split-toggle to Dashboard tabs, walking `next_split_stage` through the
+    /// full cycle via the `ACTIVE_DASHBOARD_SPLIT_STAGE` thread-local and
+    /// recomputing frame geometry at each stage, starting from Dashboard's
+    /// own 33/67 default. RED today: `compute_frame_layout`'s Dashboard arm
+    /// always uses the fixed `DASHBOARD_LEFT_PERCENT`/`_PANES_PERCENT`
+    /// constants regardless of stage. Full end-to-end dispatch coverage lives
+    /// in the L2 test, tabs/dashboard/001.
     #[spec("dashboard/layout/001")]
     #[test]
     fn layout_001_ctrl_l_cycles_dashboard_split_stages() {
