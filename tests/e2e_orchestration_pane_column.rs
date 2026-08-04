@@ -37,15 +37,20 @@ fn open_orchestration(deck: &TuiDeck) {
 
 /// Column index of the orchestration tab's role-pane column's LEFT edge: the
 /// role-pane box drawn for the fixture's `start = true` role ("orchestrator")
-/// renders its title fused into the top border as `┌orchestrator───…`, so the
-/// column of that `┌` is exactly `panes_area.x` — the boundary between the
+/// renders its title fused into the top border as `┌orchestrator───…` (Plain,
+/// unfocused/PaneInput) or `┏orchestrator───…` (Thick, focused command-mode —
+/// `TerminalWidget` in `src/terminal_widget.rs`), so the column of whichever
+/// glyph is present is exactly `panes_area.x` — the boundary between the
 /// sidebar (role list) and the pane column that `ORCHESTRATION_LEFT_PERCENT`
 /// / `ORCHESTRATION_PANES_PERCENT` (src/ui.rs:1951-1952) control. Distinct
 /// from the sidebar's own truncated `orchestrat…` card label, so there is no
 /// collision risk.
 fn pane_column_left_edge(grid: &str) -> u16 {
     for line in grid.lines() {
-        if let Some(byte_idx) = line.find("┌orchestrator") {
+        if let Some(byte_idx) = line
+            .find("┌orchestrator")
+            .or_else(|| line.find("┏orchestrator"))
+        {
             return line[..byte_idx].chars().count() as u16;
         }
     }
@@ -74,7 +79,7 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     deck.wait_for_string("No active sessions");
 
     open_orchestration(&deck);
-    deck.wait_for_string("worker"); // 2nd role card -> tab A is up
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab A is up
 
     // Baseline: the default 34/66 split puts tab A's pane-column left edge at
     // 34% of the 120-col frame (col 40 or 41, depending on Percentage
@@ -103,7 +108,7 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // Open a SECOND orchestration tab (tab B) in the same directory. A fresh
     // tab always starts at Default, regardless of tab A's now-Narrow stage.
     open_orchestration(&deck);
-    deck.wait_for_string("worker"); // 2nd role card -> tab B is up
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
 
     let b_default_edge = pane_column_left_edge(&deck.snapshot_grid());
     assert!(
@@ -143,7 +148,11 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // Switch back to tab A (Shift+Tab -> previous tab). Cross-tab isolation:
     // tab A's split must still be Narrow — untouched by tab B's Narrow ->
     // Hidden presses, even though both tabs were driven through the exact
-    // same Ctrl+l chord.
+    // same Ctrl+l chord. Tab B's start-role pane is still live-focused in
+    // PaneInput mode, and `cycle_tab_action` only responds to Shift+Tab in
+    // Normal mode — otherwise the bytes forward straight to the pane — so
+    // return to Normal mode first.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> tab A
     let a_still_narrow = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         (29..=30).contains(&pane_column_left_edge(grid))

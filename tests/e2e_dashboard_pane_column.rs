@@ -15,16 +15,22 @@ use common::TuiDeck;
 use spec::spec;
 
 /// Left edge (in columns) of a Tiled pane's box whose title fuses into the
-/// top border as `┌<pane_title>` — the boundary between the sidebar (deck
-/// cards / role list) and the pane column that the split-stage percentages
-/// control. Generalizes `e2e_orchestration_pane_column.rs`'s
-/// `pane_column_left_edge` (hardcoded to the "orchestrator" role name) to any
-/// pane title, so it covers both a Dashboard pane's session name and an
-/// orchestration role name from the same helper.
+/// top border as `┌<pane_title>` (Plain, unfocused/PaneInput) or
+/// `┏<pane_title>` (Thick, focused command-mode — `TerminalWidget` in
+/// `src/terminal_widget.rs`) — the boundary between the sidebar (deck cards /
+/// role list) and the pane column that the split-stage percentages control.
+/// Generalizes `e2e_orchestration_pane_column.rs`'s `pane_column_left_edge`
+/// (hardcoded to the "orchestrator" role name) to any pane title, so it
+/// covers both a Dashboard pane's session name and an orchestration role name
+/// from the same helper.
 fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
-    let needle = format!("┌{pane_title}");
+    let plain_needle = format!("┌{pane_title}");
+    let thick_needle = format!("┏{pane_title}");
     for line in grid.lines() {
-        if let Some(byte_idx) = line.find(&needle) {
+        if let Some(byte_idx) = line
+            .find(&plain_needle)
+            .or_else(|| line.find(&thick_needle))
+        {
             return line[..byte_idx].chars().count() as u16;
         }
     }
@@ -111,16 +117,15 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
     );
 
     // Cross-tab-type isolation: open a SECOND, real Orchestration tab in the
-    // same directory (Ctrl+n new-pane flow; orchestration tabs open
-    // unfocused in cards view, no Ctrl+D needed) and confirm it starts at ITS
-    // OWN default 34/66 split.
+    // same directory (Ctrl+n new-pane flow) and confirm it starts at ITS OWN
+    // default 34/66 split.
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused
     deck.send_keys(b"\x1b[C"); // Right -> [Orch: demo-orch]
     deck.send_keys(b"\r"); // Mode -> Name
     deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-    deck.wait_for_string("worker"); // 2nd role card -> the orchestration tab is up
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> the orchestration tab is up
 
     let orch_default_edge = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert_eq!(
@@ -147,8 +152,21 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
     // Switch back to the Dashboard tab (Shift+Tab -> previous tab) and
     // confirm ITS split is still Default (33/67) — untouched by the
     // Orchestration tab's toggle, even though both tabs were just driven
-    // through the exact same Ctrl+l chord.
+    // through the exact same Ctrl+l chord. The freshly opened Orchestration
+    // tab's start-role pane is live-focused in PaneInput mode, and
+    // `cycle_tab_action` only responds to Shift+Tab in Normal mode —
+    // otherwise the bytes forward straight to the pane — so return to Normal
+    // mode first.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> Dashboard
+    // Confirm the tab switch itself landed (DASH_PANE's title is only ever
+    // drawn on the Dashboard tab) before polling for its exact edge — a
+    // panicking `pane_box_left_edge` used directly as a
+    // `wait_for_grid_predicate_within` predicate aborts on the first sampled
+    // grid instead of retrying, and that first sample can still show the
+    // Orchestration tab (DASH_PANE genuinely absent, not just moved) in the
+    // brief window before the switch renders.
+    deck.wait_for_string(DASH_PANE);
     let dash_still_default = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         pane_box_left_edge(grid, DASH_PANE) == 33
     });
