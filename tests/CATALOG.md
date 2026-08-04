@@ -1183,6 +1183,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the resolver's own resolution rules (lowest-order tie-break, no-op/flicker avoidance, background-tab isolation — covered exhaustively by `tabs/orchestration/010`); visible glyph/border content of a real agent pane (no backing PTY here — `render_terminal_panes` draws nothing without a live `EmbeddedPaneController`-backed screen, so the assertion is the `compute_frame_layout` rect geometry, the same technique `orchestration/layout/004` uses); a PTY-attached end-to-end reproduction of `run_tui` itself (out of L1 reach — `run_tui` owns a real `ratatui::init()` terminal with no test seam to substitute a `TestBackend`).
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/012 — Within an orchestration tab, the moment the last `WaitingForInput` role pane resolves, focus moves to the orchestrator role exactly once — not on every subsequent frame nothing is waiting — and coexists correctly in sequence with `auto_focus_waiting_pane` (PRD #373 M1, fork-only).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map keyed by pane id, no panes/PTYs).
+- **Asserts:** driving synthetic per-frame status maps through BOTH `auto_focus_waiting_pane` and `auto_focus_all_clear`, gated exactly the way the real `src/ui.rs` render-loop site gates them (all-clear only runs when waiting-pane found nothing to steer toward) — a manual focus is left alone while nothing is or was waiting; a newly-waiting pane steals focus via the unchanged `auto_focus_waiting_pane` path; once it resolves, `auto_focus_all_clear` snaps focus to the orchestrator role exactly once (the edge-trigger); repeated frames after the fire, and a manual focus change after the fire, are left alone (no level-triggered re-fire) until a NEW pane starts and resolves waiting, which arms and fires the edge again; a background (non-active) orchestration tab driven through a full waiting-then-resolved episode has zero effect on its stored focus and never flips `TabManager::active_index()`.
+- **Does not assert:** the render-loop call site itself actually applying the result to a live pane controller / render pass (would mirror `tabs/orchestration/011`'s technique for `auto_focus_waiting_pane`, deferred — not required by PRD #373 M1's stated scope); the 30-second inactivity timer (PRD #373 M2); the blocked-keystroke reset (PRD #373 M3, deferred until #374 lands).
+- **Platform coverage:** mac+linux+windows.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).

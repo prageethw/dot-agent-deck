@@ -10309,6 +10309,13 @@ pub fn run_tui(
         // focus actually moved, so re-focus it on the live pane controller.
         if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&pane_status_for_tabs) {
             let _ = pane.focus_pane(&new_id);
+        } else if let Some(new_id) = tab_manager.auto_focus_all_clear(&pane_status_for_tabs) {
+            // PRD #373 M1 — only reached when the branch above found
+            // nothing left to steer toward this frame (see
+            // `TabManager::auto_focus_all_clear`'s doc comment for why
+            // that gate matters): the edge-triggered all-clear move to
+            // the orchestrator role.
+            let _ = pane.focus_pane(&new_id);
         }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
             .tabs()

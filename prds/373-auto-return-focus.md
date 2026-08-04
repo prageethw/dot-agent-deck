@@ -1,10 +1,10 @@
 # PRD #373: Auto-return focus to the orchestrator pane (Orchestration tabs only)
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-08-04
 **GitHub Issue**: [#373](https://github.com/vfarcic/dot-agent-deck/issues/373) (closed upstream as not-planned; this fork continues the work independently)
-**Related**: Split from #361, alongside #371/#372/#374 (siblings). Structurally depends on [#374](https://github.com/vfarcic/dot-agent-deck/issues/374) (command-entry lock) for its combined interaction test — see Technical Approach and Open Questions. `src/tab.rs` (`Tab::Orchestration`, `role_pane_ids`, `focused_role_pane_id`, `start_role_index`, `auto_focus_waiting_pane` — fork-only), `src/ui.rs` (`UiState::last_pane_keystroke_at`, `Action::ForwardToPane`, per-frame call site around `src/ui.rs:9750-9758`)
+**Related**: Split from #361, alongside #371/#372/#374 (siblings). Structurally depends on [#374](https://github.com/vfarcic/dot-agent-deck/issues/374) (command-entry lock) for its combined interaction test — see Technical Approach and Open Questions. `src/tab.rs` (`Tab::Orchestration`, `role_pane_ids`, `focused_role_pane_id`, `start_role_index`, `auto_focus_waiting_pane`, `auto_focus_all_clear` — fork-only), `src/ui.rs` (`UiState::last_pane_keystroke_at`, `Action::ForwardToPane`, per-frame call site around `src/ui.rs:10304-10317` — line drifted from the M1-time `9750-9758` reference below)
 
 ## Problem Statement
 
@@ -47,7 +47,7 @@ The edge-trigger and timer mechanics are described in Solution Overview above. O
 
 ## Milestones
 
-- [ ] **M1 — All-clear focus move.** New edge-triggered `TabManager` method alongside `auto_focus_waiting_pane`, wired at the same per-frame site (`src/ui.rs:9750-9758`); unit tests for the edge-trigger (fires once, not every frame) and coexistence with `auto_focus_waiting_pane`.
+- [x] **M1 — All-clear focus move.** New edge-triggered `TabManager` method alongside `auto_focus_waiting_pane`, wired at the same per-frame site (`src/ui.rs:9750-9758`); unit tests for the edge-trigger (fires once, not every frame) and coexistence with `auto_focus_waiting_pane`. Landed as `TabManager::auto_focus_all_clear` (`src/tab.rs`) + `Tab::Orchestration::had_waiting_pane` edge state, wired at `src/ui.rs` (line drifted to ~10310); test `tabs/orchestration/012`.
 - [ ] **M2 — 30-second inactivity snap-back.** Timer scoped to the active Orchestration tab, reset by a forwarded keystroke (per the Decision above); unit test for elapse → snap-back and reset-on-activity.
 - [ ] **M3 — Blocked-keystroke reset (deferred until #374 lands).** Extend the timer reset to also fire on a blocked keystroke attempt against a locked pane, once #374's lock exists to attempt one against; combined-interaction test per Technical Approach.
 - [ ] **M4 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated if any new binding is introduced (none expected — this is timer/focus behavior, not a new chord); changelog fragment.
@@ -55,13 +55,14 @@ The edge-trigger and timer mechanics are described in Solution Overview above. O
 ## Risks
 
 - **Cross-item coupling with #374.** This item's inactivity timer and #374's lock share the same keystroke-forwarding choke point (`Action::ForwardToPane`); the Decision above (a blocked keystroke on a locked pane still resets the timer) means the gate inside #374's PTY-forward fallback must record that attempt before dropping the key, not just short-circuit. M3 exists specifically to catch this at the seam once #374 lands, rather than assuming it in isolation.
-- **Experimental-flag candidate.** Per CLAUDE.md rule 9, candidate for **yes** — it's a new, potentially surprising behavior (focus moves out from under the user without a keypress) scoped to Orchestration tabs. Unlike a keybinding the user presses on purpose, this one *acts on its own* via a timer, which is exactly the kind of thing worth letting users opt into first. Recommend flagging it; to be confirmed at `/prd-start` for this branch.
+- **Experimental-flag candidate, decided against.** Per CLAUDE.md rule 9, this was raised as a candidate for gating behind `experimental` — it's a new, potentially surprising behavior (focus moves out from under the user without a keypress) scoped to Orchestration tabs. Resolved at `/prd-start` for this branch: ship visible by default, no flag. No `features::show_*` wrapper, no graduation follow-up needed.
 
 ## Open Questions
 
-1. **Experimental flag gating** — to be settled at `/prd-start` for this branch (see Risks above for judgment).
+1. ~~Experimental flag gating~~ — Resolved at `/prd-start`: ships visible by default, not gated behind `experimental` (see Risks above).
 2. **M3 sequencing** — this PRD's M1/M2 can land and ship independently of #374; M3 (the blocked-keystroke reset and its combined test) is explicitly deferred until #374 lands. Track #374's status before scheduling M3.
 
 Resolved (previously open, decided by the user before implementation started):
 
 - **Does "activity" include blocked keystrokes on a locked pane?** Resolved: yes — a blocked/attempted keystroke to a locked pane counts as activity and resets the 30-second timer (see Solution Overview's Decision).
+- **Experimental flag gating?** Resolved at `/prd-start`: no — ships visible by default.

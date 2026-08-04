@@ -118,6 +118,15 @@ pub enum Tab {
         /// to the narrower-sidebar 25/75 ratio. `false` = the 34/66 default.
         /// Per-tab so toggling one orchestration tab doesn't affect another.
         split_narrow: bool,
+        /// PRD #373 M1: edge-trigger state for the all-clear focus move —
+        /// whether any role pane in this tab was `WaitingForInput` as of
+        /// the last `auto_focus_all_clear` call. Refreshed every call so
+        /// the all-clear move fires exactly once, on the frame where this
+        /// flips from `true` to `false`, rather than every frame nothing
+        /// is waiting (which would fight the 30s manual-focus grace
+        /// window in M2). Starts `false`: a freshly-opened tab has no
+        /// "was waiting" history to edge-trigger off of.
+        had_waiting_pane: bool,
     },
 }
 
@@ -431,6 +440,62 @@ impl TabManager {
         Some(target.clone())
     }
 
+    /// PRD #373 M1 — fork-only. Edge-triggered sibling of
+    /// [`Self::auto_focus_waiting_pane`]: the instant the active
+    /// Orchestration tab's last `WaitingForInput` role pane resolves (no
+    /// pane in `role_pane_ids` is waiting anymore, having had at least one
+    /// waiting as of the previous call), focus moves to that tab's
+    /// orchestrator role (`role_pane_ids[start_role_index]`) exactly once.
+    /// No-op for any active tab that isn't `Tab::Orchestration`.
+    ///
+    /// Deliberately edge- rather than level-triggered: `had_waiting_pane`
+    /// is refreshed on every call regardless of outcome, but the focus
+    /// move itself only fires on the `true` → `false` transition. A
+    /// level-triggered version (fire whenever nothing is waiting) would
+    /// pin focus to the orchestrator on every frame and defeat M2's
+    /// 30-second manual-focus grace window — the human could never look
+    /// at another pane at all.
+    ///
+    /// Intended to be called once per frame from the same render-loop
+    /// site as `auto_focus_waiting_pane`, and only when THAT call
+    /// returned `None` for the frame (nothing left to steer toward) — see
+    /// the call site in `src/ui.rs`. Already-correct focus (already on
+    /// the orchestrator) is a no-op, matching `auto_focus_waiting_pane`'s
+    /// no-flicker behavior.
+    pub fn auto_focus_all_clear(
+        &mut self,
+        pane_status: &HashMap<&str, crate::state::SessionStatus>,
+    ) -> Option<String> {
+        let Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            start_role_index,
+            had_waiting_pane,
+            ..
+        } = &mut self.tabs[self.active_index]
+        else {
+            return None;
+        };
+        let now_waiting = role_pane_ids.iter().any(|id| {
+            matches!(
+                pane_status.get(id.as_str()),
+                Some(crate::state::SessionStatus::WaitingForInput)
+            )
+        });
+        let was_waiting = *had_waiting_pane;
+        *had_waiting_pane = now_waiting;
+        if now_waiting || !was_waiting {
+            return None;
+        }
+        let orchestrator = role_pane_ids.get(*start_role_index)?;
+        if focused_role_pane_id.as_deref() == Some(orchestrator.as_str()) {
+            return None;
+        }
+        let orchestrator = orchestrator.clone();
+        *focused_role_pane_id = Some(orchestrator.clone());
+        Some(orchestrator)
+    }
+
     pub fn show_tab_bar(&self) -> bool {
         self.tabs.len() > 1
     }
@@ -671,6 +736,7 @@ impl TabManager {
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
+            had_waiting_pane: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -805,6 +871,7 @@ impl TabManager {
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
+            had_waiting_pane: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1555,6 +1622,7 @@ mod tests {
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
+            had_waiting_pane: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1585,6 +1653,7 @@ mod tests {
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
             split_narrow: false,
+            had_waiting_pane: false,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
@@ -1971,6 +2040,166 @@ mod tests {
         assert!(matches!(
             &tm.tabs[orch_idx],
             Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+    }
+
+    /// Scenario: Within a single active orchestration tab (roles
+    /// `orchestrator` < `alpha` < `beta`), drive synthetic `SessionStatus`
+    /// maps through BOTH `auto_focus_waiting_pane` and
+    /// `auto_focus_all_clear` per frame, gated exactly the way the real
+    /// `src/ui.rs` render-loop site gates them (all-clear only runs when
+    /// waiting-pane found nothing to steer toward). Proves the full
+    /// coexistence story end to end: a manual focus is left alone while
+    /// nothing is waiting; a newly-waiting pane steals focus as before
+    /// (`auto_focus_waiting_pane`, unchanged); once it resolves, the
+    /// all-clear move snaps focus back to the orchestrator role exactly
+    /// once — not on every subsequent frame, and not again for a manual
+    /// focus change until a NEW pane starts and resolves waiting. A second
+    /// (background) orchestration tab proves the all-clear move, like its
+    /// sibling, never touches an inactive tab or switches which tab is
+    /// active.
+    #[spec("tabs/orchestration/012")]
+    #[test]
+    fn orchestration_012_all_clear_focus_move_is_edge_triggered() {
+        use crate::state::SessionStatus;
+
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tm
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tm.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let alpha = role_ids[1].clone();
+        let beta = role_ids[2].clone();
+
+        // Mirrors the gating at the real per-frame call site in
+        // `src/ui.rs`: `auto_focus_all_clear` only runs when
+        // `auto_focus_waiting_pane` found nothing to steer toward.
+        fn frame(tm: &mut TabManager, status: &HashMap<&str, SessionStatus>) -> Option<String> {
+            tm.auto_focus_waiting_pane(status)
+                .or_else(|| tm.auto_focus_all_clear(status))
+        }
+
+        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
+        status.insert(orchestrator.as_str(), SessionStatus::Idle);
+        status.insert(alpha.as_str(), SessionStatus::Idle);
+        status.insert(beta.as_str(), SessionStatus::Idle);
+
+        // Nothing waiting, nothing was waiting before: no move at all.
+        assert_eq!(frame(&mut tm, &status), None);
+
+        // Manual focus (simulating the user navigating) must be left alone
+        // while there's no waiting history to edge-trigger off of.
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            *focused_role_pane_id = Some(alpha.clone());
+        }
+        assert_eq!(frame(&mut tm, &status), None);
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // `beta` becomes WaitingForInput: `auto_focus_waiting_pane` steals
+        // focus to it exactly as `orchestration_010` pins — unchanged by
+        // this PRD.
+        status.insert(beta.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(frame(&mut tm, &status).as_deref(), Some(beta.as_str()));
+
+        // Next frame: `beta` still waiting and already focused, so
+        // `auto_focus_waiting_pane` no-ops and `auto_focus_all_clear` runs
+        // (per the gate) — it records the waiting history but must not
+        // move focus while something is still waiting.
+        assert_eq!(frame(&mut tm, &status), None);
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
+        ));
+
+        // `beta` resolves: the all-clear edge fires — focus snaps to the
+        // orchestrator role exactly once.
+        status.insert(beta.as_str(), SessionStatus::Idle);
+        assert_eq!(
+            frame(&mut tm, &status).as_deref(),
+            Some(orchestrator.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
+        ));
+
+        // Repeated frames with nothing waiting and already on the
+        // orchestrator must NOT fire again — this is the edge- vs
+        // level-triggered distinction the PRD calls out explicitly.
+        assert_eq!(frame(&mut tm, &status), None);
+        assert_eq!(frame(&mut tm, &status), None);
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
+        ));
+
+        // The human manually looks at another pane after the all-clear
+        // already fired for `beta`'s waiting episode. Nothing is waiting
+        // and nothing new has started waiting since the last fire, so the
+        // all-clear must leave this manual choice alone — it must not
+        // immediately snap back on every frame (that would defeat M2's
+        // future 30-second grace window).
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            *focused_role_pane_id = Some(alpha.clone());
+        }
+        assert_eq!(frame(&mut tm, &status), None);
+        assert!(
+            matches!(
+                &tm.tabs[orch_idx],
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+            ),
+            "edge-triggered: must not repeatedly snap back once already fired for this episode"
+        );
+
+        // A NEW waiting episode (`alpha`, already focused, starts waiting)
+        // arms the edge again; its resolution fires the all-clear a
+        // second time, proving this isn't a one-shot-forever flag.
+        status.insert(alpha.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(frame(&mut tm, &status), None);
+        status.insert(alpha.as_str(), SessionStatus::Idle);
+        assert_eq!(
+            frame(&mut tm, &status).as_deref(),
+            Some(orchestrator.as_str())
+        );
+
+        // Open a second orchestration tab, which becomes active and leaves
+        // the first as a BACKGROUND tab.
+        let (orch2_idx, _role_ids2) = tm
+            .open_orchestration_tab(&orch_config_3("orch-2"), "/work", None, None, (24, 80))
+            .expect("open second orchestration tab");
+        assert_eq!(tm.active_index(), orch2_idx);
+
+        // Drive the first (now background) tab's roles through a full
+        // waiting-then-resolved episode. Both methods only ever touch
+        // `self.tabs[self.active_index]`, so this must have zero effect
+        // on the background tab and must never switch which tab is active.
+        status.insert(alpha.as_str(), SessionStatus::WaitingForInput);
+        let result = frame(&mut tm, &status);
+        assert_eq!(result, None);
+        status.insert(alpha.as_str(), SessionStatus::Idle);
+        let result = frame(&mut tm, &status);
+        assert_eq!(result, None);
+        assert_eq!(
+            tm.active_index(),
+            orch2_idx,
+            "the all-clear move must never switch the active tab"
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
         ));
     }
 }
