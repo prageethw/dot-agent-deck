@@ -21854,6 +21854,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            pending_permission_tool: None,
             shell_synthetic_working: false,
         };
 
@@ -24355,6 +24356,7 @@ mod tests {
             pane_id: Some(pane.to_string()),
             agent_id: None,
             display_name: None,
+            pending_permission_tool: None,
             shell_synthetic_working: false,
         };
         let s0 = make("s0", "p0");
@@ -25663,6 +25665,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            pending_permission_tool: None,
             shell_synthetic_working: false,
         }
     }
@@ -25884,6 +25887,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            pending_permission_tool: None,
             shell_synthetic_working: false,
         };
 
@@ -25919,6 +25923,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            pending_permission_tool: None,
             shell_synthetic_working: false,
         };
 
@@ -25945,6 +25950,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            pending_permission_tool: None,
             shell_synthetic_working: false,
         };
 
