@@ -42,7 +42,7 @@ See Solution Overview above for the mechanism. One genuine ambiguity that this e
 
 ### Experimental-flag question (CLAUDE.md rule 9)
 
-**No**, and not really a candidate at all — it's a correctness fix to an existing, already-shipped status indicator, not a new surface. Flag-gating a bug fix would mean the bug persists by default until a user opts into the flag, which inverts the point of fixing it.
+**Resolved: No — visible by default.** Bug fix to an existing, already-shipped status indicator, not a new surface; flag-gating it would mean the bug persists by default until a user opts in, which inverts the point of fixing it.
 
 ## Success Criteria
 
@@ -54,7 +54,7 @@ See Solution Overview above for the mechanism. One genuine ambiguity that this e
 
 - [x] **M1 — Single-slot pending-permission marker.** Implemented the discriminated clear in `AppState::apply_event` using name-matching (per the Decision above), not a `tool_use_id`.
 - [x] **M2 — Regression coverage.** `tests/hooks_permission.rs::hooks_permission_001_tool_start_matching_the_approved_tool_clears_waiting_for_input` and `hooks_permission_002_tool_start_for_an_unrelated_tool_preserves_waiting_for_input` — the approve → tool starts → status clears case, and a repeat of the `4d31103`/#86 concurrent-subagent scenario (still preserves `WaitingForInput` in that case).
-- [ ] **M3 — Docs and changelog.** `docs/keyboard-shortcuts.md` (if applicable) and a changelog fragment for the bug fix.
+- [x] **M3 — Docs and changelog.** `docs/keyboard-shortcuts.md` (if applicable) and a changelog fragment for the bug fix. No `keyboard-shortcuts.md` update applies — no keybinding, interaction, or user-facing status label changed; this only fixes when an already-existing status clears. `changelog.d/372.bugfix.md` added.
 
 ## Risks
 
