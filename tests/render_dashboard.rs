@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
-use dot_agent_deck::tab::Tab;
+use dot_agent_deck::tab::{SplitStage, Tab};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
@@ -1557,6 +1557,7 @@ fn pane_005_highlight_follows_selected_session_id() {
     // session id — and must be 1, not 0.
     let mut tab = Tab::Dashboard {
         selected_session_id: Some("sess-beta".to_string()),
+        split_stage: SplitStage::Default,
     };
     let selected_index = sync_and_derive_selection(&mut tab, None, &filtered, None)
         .expect("dashboard derives an index");
