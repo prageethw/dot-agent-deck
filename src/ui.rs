@@ -22951,23 +22951,23 @@ mod tests {
     /// `mirror_selection_into_focus` — with no `Action::ForwardToPane`
     /// ever having run — stamps `ui.last_pane_keystroke_at` on its own,
     /// same as the digit-jump/Enter-on-card stamp sites; (2) the real
-    /// per-frame `else if` chain (`src/ui.rs:10325-10348`), mirrored line
+    /// per-frame `else if` chain (`src/ui.rs:10377-10398`), mirrored line
     /// for line as `orchestration_011` mirrors its `auto_focus_waiting_pane`
     /// -only predecessor, applies the 30s snap-back through the pane
-    /// controller once a synthetic 31s-stale timestamp is fed in; and (3)
-    /// a scoping check: `Action::SelectCard` (`src/ui.rs:7265-7278`) calls
-    /// `mirror_selection_into_focus` unconditionally — only the
-    /// `selected_session_id` write is gated on `Tab::Dashboard` — so a
-    /// plain Dashboard-tab card click also stamps the SAME global
-    /// `last_pane_keystroke_at` an Orchestration-tab snap-back reads. This
-    /// is currently a real scope leak (not a harmless one): with the
-    /// `coder` role's own focus already 31s+ stale, a fresh, unrelated
-    /// Dashboard click still suppresses that frame's snap-back, because
-    /// `auto_focus_after_inactivity` has no way to distinguish a
-    /// Dashboard-card stamp from an Orchestration-role stamp. Part 3 below
-    /// pins the REQUIRED (post-fix) behavior — the snap-back must still
-    /// fire — so it is expected to fail (RED) against today's global-field
-    /// implementation until Orchestration-tab activity is tracked per-tab.
+    /// controller by reading the active tab's OWN
+    /// `Tab::Orchestration::last_role_pane_activity_at` field, exactly as
+    /// production now does; and (3) a scoping check: `Action::SelectCard`
+    /// (`src/ui.rs:7265-7278`) calls `mirror_selection_into_focus`
+    /// unconditionally — only the `selected_session_id` write is gated on
+    /// `Tab::Dashboard` — so a plain Dashboard-tab card click also stamps
+    /// the GLOBAL `ui.last_pane_keystroke_at`, but the M2 cross-tab
+    /// scope-leak fix (`441f043`) left the Orchestration tab's OWN
+    /// `last_role_pane_activity_at` untouched by that click. Part 3 pins
+    /// this REQUIRED behavior: with `coder`'s own `last_role_pane_activity_at`
+    /// genuinely 31s+ stale, an unrelated Dashboard-tab click (which only
+    /// resets the global field) must not suppress the snap-back — the
+    /// per-frame chain reads the per-tab field, not the global one, so the
+    /// snap-back still fires.
     #[spec("tabs/orchestration/014")]
     #[test]
     fn orchestration_014_render_loop_wiring_applies_inactivity_snap_back() {
@@ -23077,13 +23077,18 @@ mod tests {
         // happens. Also re-focus `coder` on the pane controller directly
         // (every real focus-change call site keeps `pc` and the tab's
         // bookkeeping in sync) so the upcoming switch-out capture doesn't
-        // see stale data.
+        // see stale data. Stamp THIS tab's own `last_role_pane_activity_at`
+        // stale too — the field the fixed per-frame chain now reads — since
+        // nothing else in this test (`mirror_selection_into_focus` alone
+        // never touches it) has set it.
         if let Tab::Orchestration {
             focused_role_pane_id,
+            last_role_pane_activity_at,
             ..
         } = tab_manager.active_tab_mut()
         {
             *focused_role_pane_id = Some(coder.clone());
+            *last_role_pane_activity_at = Some(Instant::now() - Duration::from_secs(31));
         }
         let _ = pc.focus_pane(&coder);
         ui.last_pane_keystroke_at = Some(Instant::now() - Duration::from_secs(31));
@@ -23153,13 +23158,17 @@ mod tests {
             let _ = pc.focus_pane(&new_id);
         } else if let Some(new_id) = tab_manager.auto_focus_all_clear(&status) {
             let _ = pc.focus_pane(&new_id);
-        } else if let Some(last_activity_at) = ui.last_pane_keystroke_at
-            && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-                Instant::now(),
-                last_activity_at,
-                TabManager::INACTIVITY_TIMEOUT,
-            )
-        {
+        } else if let Some(last_activity_at) = (match tab_manager.active_tab() {
+            Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } => *last_role_pane_activity_at,
+            _ => None,
+        }) && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
+            Instant::now(),
+            last_activity_at,
+            TabManager::INACTIVITY_TIMEOUT,
+        ) {
             let _ = pc.focus_pane(&new_id);
         }
 
