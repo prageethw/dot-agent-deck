@@ -384,6 +384,7 @@ fn make_session(
         pane_id: Some(pane_id.to_string()),
         agent_id: Some(agent_id.to_string()),
         display_name: None,
+        pending_permission_tool: None,
         shell_synthetic_working: false,
     }
 }
@@ -2694,6 +2695,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         pane_id: Some(pane.to_string()),
         agent_id: Some(agent_id.to_string()),
         display_name: None,
+        pending_permission_tool: None,
         shell_synthetic_working: false,
     };
 
