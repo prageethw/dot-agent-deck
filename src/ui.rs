@@ -30,7 +30,10 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
-use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
+use crate::tab::{
+    OrchestrationRoleStatus, OrchestrationStatus, SplitStage, Tab, TabId, TabManager,
+    next_split_stage,
+};
 use crate::tab_layout::fit_tab_labels;
 use crate::terminal_widget::TerminalWidget;
 
@@ -1984,36 +1987,51 @@ pub(crate) const DASHBOARD_LEFT_PERCENT: u16 = 33;
 pub(crate) const DASHBOARD_PANES_PERCENT: u16 = 67;
 pub(crate) const ORCHESTRATION_LEFT_PERCENT: u16 = 34;
 pub(crate) const ORCHESTRATION_PANES_PERCENT: u16 = 66;
-/// PRD #336: the narrower-sidebar split an orchestration tab toggles to.
-pub(crate) const ORCHESTRATION_LEFT_PERCENT_NARROW: u16 = 25;
-pub(crate) const ORCHESTRATION_PANES_PERCENT_NARROW: u16 = 75;
+/// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: the
+/// narrower-sidebar split either tab type toggles to.
+pub(crate) const SPLIT_LEFT_PERCENT_NARROW: u16 = 25;
+pub(crate) const SPLIT_PANES_PERCENT_NARROW: u16 = 75;
+/// PRD #361 Item 4: the Hidden stage — sidebar fully collapsed, pane column
+/// takes the whole width.
+pub(crate) const SPLIT_LEFT_PERCENT_HIDDEN: u16 = 0;
+pub(crate) const SPLIT_PANES_PERCENT_HIDDEN: u16 = 100;
 
 thread_local! {
-    /// PRD #336: mirrors the ACTIVE orchestration tab's `split_narrow` flag
-    /// (`Tab::Orchestration::split_narrow`) for the two layout call sites
+    /// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: mirrors the
+    /// ACTIVE orchestration tab's `split_stage` field
+    /// (`Tab::Orchestration::split_stage`) for the two layout call sites
     /// below, neither of which has a tab identity or spare parameter slot to
     /// receive it directly (`compute_frame_layout`'s signature is a fixed,
     /// widely-tested seam; `orchestration_role_pane_dims` mirrors it for
     /// consistency). The render loop refreshes this from the active tab
     /// every frame, right before computing layout — the same
     /// read-fresh-every-frame pattern `ui.pane_layout` already uses.
-    static ACTIVE_ORCHESTRATION_SPLIT_NARROW: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    static ACTIVE_ORCHESTRATION_SPLIT_STAGE: std::cell::Cell<SplitStage> =
+        const { std::cell::Cell::new(SplitStage::Default) };
+    /// PRD #361 Item 4: the Dashboard-tab counterpart of
+    /// `ACTIVE_ORCHESTRATION_SPLIT_STAGE`, mirroring the active Dashboard
+    /// tab's `Tab::Dashboard::split_stage` field for the same layout call
+    /// site.
+    static ACTIVE_DASHBOARD_SPLIT_STAGE: std::cell::Cell<SplitStage> =
+        const { std::cell::Cell::new(SplitStage::Default) };
 }
 
-/// PRD #336: resolve the orchestration sidebar/pane-column split percentages
-/// for the given narrow flag — `(25, 75)` when narrow, `(34, 66)` (the
-/// default) otherwise. Single source of truth replacing direct references to
-/// `ORCHESTRATION_LEFT_PERCENT` / `ORCHESTRATION_PANES_PERCENT` at their call
-/// sites so both agree with the active tab's toggle state.
-pub(crate) fn orchestration_split_percents(narrow: bool) -> (u16, u16) {
-    if narrow {
-        (
-            ORCHESTRATION_LEFT_PERCENT_NARROW,
-            ORCHESTRATION_PANES_PERCENT_NARROW,
-        )
-    } else {
-        (ORCHESTRATION_LEFT_PERCENT, ORCHESTRATION_PANES_PERCENT)
+/// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: resolve the
+/// sidebar/pane-column split percentages for `stage`, given the tab type's
+/// own `(default_left, default_panes)` ratio for `SplitStage::Default`.
+/// `Narrow`/`Hidden` use the same fixed ratios on every tab type. Single
+/// source of truth replacing direct references to the `*_LEFT_PERCENT` /
+/// `*_PANES_PERCENT` constants at their call sites so both agree with the
+/// active tab's toggle state.
+pub(crate) fn split_stage_percents(
+    stage: SplitStage,
+    default_left: u16,
+    default_panes: u16,
+) -> (u16, u16) {
+    match stage {
+        SplitStage::Default => (default_left, default_panes),
+        SplitStage::Narrow => (SPLIT_LEFT_PERCENT_NARROW, SPLIT_PANES_PERCENT_NARROW),
+        SplitStage::Hidden => (SPLIT_LEFT_PERCENT_HIDDEN, SPLIT_PANES_PERCENT_HIDDEN),
     }
 }
 
@@ -2106,8 +2124,8 @@ pub(crate) fn dashboard_pane_dims(
 /// the `focused_role_index` parameter is gone and role 0 is the
 /// Stacked expanded slot.
 ///
-/// `narrow` selects the split percentages via `orchestration_split_percents`
-/// directly rather than reading the `ACTIVE_ORCHESTRATION_SPLIT_NARROW`
+/// `narrow` selects the split percentages via `split_stage_percents`
+/// directly rather than reading the `ACTIVE_ORCHESTRATION_SPLIT_STAGE`
 /// thread-local — this helper only ever spawns a brand-new (or restored)
 /// tab, which per PRD #336 always starts at the default split regardless
 /// of another tab's toggled state, so callers always pass `false`.
@@ -2123,7 +2141,16 @@ pub(crate) fn orchestration_role_pane_dims(
     // "expand the first slot if nothing is focused" fallback. Tiled
     // ignores `is_focused` (equal division).
     let is_focused = role_index == 0;
-    let (_, panes_percent) = orchestration_split_percents(narrow);
+    let stage = if narrow {
+        SplitStage::Narrow
+    } else {
+        SplitStage::Default
+    };
+    let (_, panes_percent) = split_stage_percents(
+        stage,
+        ORCHESTRATION_LEFT_PERCENT,
+        ORCHESTRATION_PANES_PERCENT,
+    );
     right_column_pane_dims(
         frame_area,
         panes_percent,
@@ -3644,10 +3671,13 @@ pub enum Action {
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
-    /// PRD #336: toggle the active orchestration tab's sidebar/pane-column
-    /// split between the default 34/66 ratio and the narrower-sidebar 25/75
-    /// (Ctrl+L). No effect outside an orchestration tab.
-    ToggleOrchestrationSplit,
+    /// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: cycle the
+    /// active tab's sidebar/pane-column split — `Default -> Narrow -> Hidden
+    /// -> Default` (Ctrl+L). Orchestration tabs claim this mode-
+    /// independently; Dashboard tabs claim it only in Normal mode (a
+    /// focused Dashboard pane forwards Ctrl+L to its PTY instead). No effect
+    /// on a Mode tab.
+    CycleSplitStage,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -5104,6 +5134,7 @@ pub fn sync_and_derive_selection(
     match tab {
         Tab::Dashboard {
             selected_session_id,
+            ..
         } => {
             if let Some(fid) = focused_pane_id
                 && let Some((sid, _)) = filtered.iter().find(|(_, pid)| *pid == Some(fid))
@@ -5480,6 +5511,7 @@ fn switch_tab_with_focus(
         // remembered pane → feed `restored_focus` → pre-seed the baseline.
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab()
             && let Some(sid) = selected_session_id
             && let Some(session) = snapshot.sessions.get(sid)
@@ -6423,7 +6455,7 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
         return Some(Action::ToggleLayout);
     }
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
-        return Some(Action::ToggleOrchestrationSplit);
+        return Some(Action::CycleSplitStage);
     }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
@@ -6975,19 +7007,38 @@ fn dispatch_action(
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
         }
-        // Ctrl+l: toggle the active orchestration tab's sidebar/pane-column
-        // split (PRD #336). No-op outside an orchestration tab.
-        Action::ToggleOrchestrationSplit => {
-            if let Tab::Orchestration { split_narrow, .. } = tab_manager.active_tab_mut() {
-                *split_narrow = !*split_narrow;
-                let split_name = if *split_narrow { "25/75" } else { "34/66" };
-                // Mirroring `ToggleLayout`: flip the per-tab flag here and let
-                // the next frame's render loop (which refreshes
-                // `ACTIVE_ORCHESTRATION_SPLIT_NARROW` from the active tab
-                // before `compute_frame_layout` / `resize_panes_to_layout`)
-                // pick up the new split and reflow the focused pane's PTY.
+        // Ctrl+l: cycle the active tab's sidebar/pane-column split stage
+        // (PRD #336, extended to a 3-stage Default -> Narrow -> Hidden cycle
+        // by PRD #361 Item 4). No-op on a Mode tab.
+        Action::CycleSplitStage => {
+            let stage_and_percents = match tab_manager.active_tab_mut() {
+                Tab::Orchestration { split_stage, .. } => {
+                    *split_stage = next_split_stage(*split_stage);
+                    Some(split_stage_percents(
+                        *split_stage,
+                        ORCHESTRATION_LEFT_PERCENT,
+                        ORCHESTRATION_PANES_PERCENT,
+                    ))
+                }
+                Tab::Dashboard { split_stage, .. } => {
+                    *split_stage = next_split_stage(*split_stage);
+                    Some(split_stage_percents(
+                        *split_stage,
+                        DASHBOARD_LEFT_PERCENT,
+                        DASHBOARD_PANES_PERCENT,
+                    ))
+                }
+                Tab::Mode { .. } => None,
+            };
+            // Mirroring `ToggleLayout`: flip the per-tab field here and let
+            // the next frame's render loop (which refreshes
+            // `ACTIVE_ORCHESTRATION_SPLIT_STAGE` / `ACTIVE_DASHBOARD_SPLIT_STAGE`
+            // from the active tab before `compute_frame_layout` /
+            // `resize_panes_to_layout`) pick up the new split and reflow the
+            // focused pane's PTY.
+            if let Some((left, panes)) = stage_and_percents {
                 ui.status_message =
-                    Some((format!("Split: {split_name}"), std::time::Instant::now()));
+                    Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
             }
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
@@ -7258,6 +7309,7 @@ fn dispatch_action(
                 ui.selected_index = Some(idx);
                 if let Tab::Dashboard {
                     selected_session_id,
+                    ..
                 } = tab_manager.active_tab_mut()
                 {
                     *selected_session_id = Some(filtered[idx].0.clone());
@@ -8832,16 +8884,25 @@ fn handle_key_event(
     // while the user is typing in a pane.
     if action.is_none() && !is_ctrl_c {
         action = global_action_for_mode(&kb, ui.mode, &key);
-        // PRD #336: ToggleOrchestrationSplit is scoped to orchestration
-        // tabs only. global_action_for_mode has no tab context, so a
-        // Ctrl+l typed into a Dashboard/Mode-tab pane would otherwise be
-        // claimed here and never reach the PTY (breaking readline's
-        // clear-screen). Un-resolve it on any other tab so the key
-        // falls through to the normal PaneInput forwarding path.
-        if matches!(action, Some(Action::ToggleOrchestrationSplit))
-            && !matches!(tab_manager.active_tab(), Tab::Orchestration { .. })
-        {
-            action = None;
+        // PRD #336, extended to a 3-stage cycle by PRD #361 Item 4:
+        // CycleSplitStage is scoped per tab type. global_action_for_mode has
+        // no tab context, so a Ctrl+l typed into a pane on a tab/mode that
+        // doesn't claim it would otherwise be claimed here and never reach
+        // the PTY (breaking readline's clear-screen). Orchestration tabs
+        // claim Ctrl+l mode-independently — unchanged PRD #336 behavior, not
+        // something this PRD revisits. Dashboard tabs claim it ONLY in
+        // Normal mode (cards view, no pane focused), so a focused Dashboard
+        // pane's Ctrl+l still forwards to its PTY (e.g. readline's
+        // clear-screen). Mode tabs never claim it.
+        if matches!(action, Some(Action::CycleSplitStage)) {
+            let claims_ctrl_l = match tab_manager.active_tab() {
+                Tab::Orchestration { .. } => true,
+                Tab::Dashboard { .. } => ui.mode == UiMode::Normal,
+                Tab::Mode { .. } => false,
+            };
+            if !claims_ctrl_l {
+                action = None;
+            }
         }
     }
 
@@ -10244,9 +10305,16 @@ pub fn run_tui(
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
         let tab_view = match tab_manager.active_tab() {
-            Tab::Dashboard { .. } => ActiveTabView::Dashboard {
-                exclude_pane_ids: tab_manager.all_managed_pane_ids(),
-            },
+            Tab::Dashboard { split_stage, .. } => {
+                // PRD #361 Item 4: refresh the active-tab split mirror every
+                // frame, the same read-fresh pattern `ui.pane_layout` already
+                // uses — `compute_frame_layout` has no spare parameter to
+                // receive this directly (see `ACTIVE_DASHBOARD_SPLIT_STAGE`).
+                ACTIVE_DASHBOARD_SPLIT_STAGE.with(|c| c.set(*split_stage));
+                ActiveTabView::Dashboard {
+                    exclude_pane_ids: tab_manager.all_managed_pane_ids(),
+                }
+            }
             Tab::Mode {
                 name,
                 agent_pane_id,
@@ -10261,14 +10329,14 @@ pub fn run_tui(
             },
             Tab::Orchestration {
                 role_pane_ids,
-                split_narrow,
+                split_stage,
                 ..
             } => {
                 // PRD #336: refresh the active-tab split mirror every frame,
                 // the same read-fresh pattern `ui.pane_layout` already uses —
                 // `compute_frame_layout` has no spare parameter to receive
-                // this directly (see `ACTIVE_ORCHESTRATION_SPLIT_NARROW`).
-                ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(*split_narrow));
+                // this directly (see `ACTIVE_ORCHESTRATION_SPLIT_STAGE`).
+                ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(*split_stage));
                 ActiveTabView::Orchestration {
                     role_pane_ids: role_pane_ids.clone(),
                 }
@@ -11762,12 +11830,13 @@ fn compute_frame_layout(
                 .filter(|&id| !exclude_pane_ids.contains(id))
                 .cloned()
                 .collect();
-            let (dashboard_area, panes_area) = split_cards_area(
-                main_area,
-                &pane_ids,
+            let (left_percent, panes_percent) = split_stage_percents(
+                ACTIVE_DASHBOARD_SPLIT_STAGE.with(|c| c.get()),
                 DASHBOARD_LEFT_PERCENT,
                 DASHBOARD_PANES_PERCENT,
             );
+            let (dashboard_area, panes_area) =
+                split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
             FrameContent::Cards {
                 dashboard_area,
@@ -11783,8 +11852,11 @@ fn compute_frame_layout(
                 .filter(|&id| role_pane_ids.contains(id))
                 .cloned()
                 .collect();
-            let (left_percent, panes_percent) =
-                orchestration_split_percents(ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.get()));
+            let (left_percent, panes_percent) = split_stage_percents(
+                ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.get()),
+                ORCHESTRATION_LEFT_PERCENT,
+                ORCHESTRATION_PANES_PERCENT,
+            );
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
@@ -22167,6 +22239,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -22303,6 +22376,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -22479,6 +22553,7 @@ mod tests {
         ui.selected_index = None; // inactive
         let mut tab = Tab::Dashboard {
             selected_session_id: None,
+            split_stage: SplitStage::Default,
         };
         reconcile_dashboard_selection(&mut ui, &mut tab, Some("p1"), &filtered);
         assert_eq!(
@@ -22492,6 +22567,7 @@ mod tests {
         ui2.selected_index = None;
         let mut tab2 = Tab::Dashboard {
             selected_session_id: None,
+            split_stage: SplitStage::Default,
         };
         reconcile_dashboard_selection(&mut ui2, &mut tab2, None, &filtered);
         assert_eq!(
@@ -22623,6 +22699,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -23115,6 +23192,7 @@ mod tests {
             ui.selected_index = Some(1);
             if let Tab::Dashboard {
                 selected_session_id,
+                ..
             } = tab_manager.active_tab_mut()
             {
                 *selected_session_id = Some("s1".to_string());
@@ -23229,6 +23307,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("agent-sess".to_string());
@@ -23279,6 +23358,7 @@ mod tests {
         ui.selected_index = None; // inactive
         let mut tab = Tab::Dashboard {
             selected_session_id: None,
+            split_stage: SplitStage::Default,
         };
         let filtered: [(&str, Option<&str>); 3] =
             [("s0", Some("p0")), ("s1", Some("p1")), ("s2", Some("p2"))];
@@ -23805,14 +23885,14 @@ mod tests {
 
     /// Scenario: PRD #336 spawn-order regression. Dispatch the real
     /// `Action::SpawnPane` to open orchestration tab A at the default split,
-    /// dispatch `Action::ToggleOrchestrationSplit` to narrow it, then
-    /// manually set `ACTIVE_ORCHESTRATION_SPLIT_NARROW` to simulate the
+    /// dispatch `Action::CycleSplitStage` to narrow it, then
+    /// manually set `ACTIVE_ORCHESTRATION_SPLIT_STAGE` to simulate the
     /// render loop syncing it from the now-narrow, still-active tab A —
     /// exactly what happens on the frame between the toggle and a
     /// follow-up spawn. Dispatch a second `Action::SpawnPane` to open a
     /// brand-new orchestration tab B and assert two things: B's own
-    /// `split_narrow` field defaults to `false` (per-tab STATE is
-    /// correctly isolated), and B's role panes' recorded
+    /// `split_stage` field defaults to `SplitStage::Default` (per-tab STATE
+    /// is correctly isolated), and B's role panes' recorded
     /// `AgentSpawnOptions::cols` match A's initial (default-split) cols —
     /// because both tabs were opened untoggled, they must agree. A spawn-
     /// order bug in `orchestration_role_pane_dims` (which reads the stale
@@ -23825,7 +23905,7 @@ mod tests {
         // Clean slate: don't rely on test-execution order for this shared
         // thread-local (layout_002 resets it, but tests can interleave on
         // the same worker thread).
-        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(false));
+        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
 
         fn orch_config(name: &str) -> OrchestrationConfig {
             OrchestrationConfig {
@@ -23882,7 +23962,7 @@ mod tests {
 
         // Toggle tab A (now active) to the narrow 25/75 split.
         let _ = dispatch_action(
-            Action::ToggleOrchestrationSplit,
+            Action::CycleSplitStage,
             &mut ui,
             pc.as_ref(),
             &state,
@@ -23893,18 +23973,22 @@ mod tests {
             frame_area,
         );
         match tm.active_tab() {
-            Tab::Orchestration { split_narrow, .. } => {
-                assert!(*split_narrow, "tab A should be narrow after the toggle")
+            Tab::Orchestration { split_stage, .. } => {
+                assert_eq!(
+                    *split_stage,
+                    SplitStage::Narrow,
+                    "tab A should be narrow after the toggle"
+                )
             }
             _ => panic!("expected orchestration tab A to be active"),
         }
         // Simulate the render loop's per-frame sync (src/ui.rs, the
-        // `ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(*split_narrow))`
+        // `ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(*split_stage))`
         // line in the `Tab::Orchestration` arm of the tab_view match): with
         // tab A active and narrow, the very next frame sets this thread-
-        // local to `true` — BEFORE a follow-up `Action::SpawnPane` dispatch
+        // local to `Narrow` — BEFORE a follow-up `Action::SpawnPane` dispatch
         // (below) gets a chance to open tab B.
-        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(true));
+        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Narrow));
 
         // Spawn a brand-new orchestration tab B. Internally this reaches
         // `orchestration_role_pane_dims`, which reads the thread-local set
@@ -23931,14 +24015,15 @@ mod tests {
 
         // Reset the thread-local BEFORE asserting so a failing assertion
         // still leaves it clean for a later test on this worker thread.
-        ACTIVE_ORCHESTRATION_SPLIT_NARROW.with(|c| c.set(false));
+        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
 
-        // Per-tab STATE isolation: B's own `split_narrow` field must default
-        // to `false` regardless of A's toggled state.
+        // Per-tab STATE isolation: B's own `split_stage` field must default
+        // to `SplitStage::Default` regardless of A's toggled state.
         match tm.active_tab() {
-            Tab::Orchestration { split_narrow, .. } => assert!(
-                !*split_narrow,
-                "tab B's own split_narrow field must default to false, \
+            Tab::Orchestration { split_stage, .. } => assert_eq!(
+                *split_stage,
+                SplitStage::Default,
+                "tab B's own split_stage field must default to SplitStage::Default, \
                  independent of tab A's toggled state"
             ),
             _ => panic!("expected orchestration tab B to be active"),
@@ -23956,7 +24041,7 @@ mod tests {
             "tab B's role panes should spawn at the SAME default-split \
              width as tab A's did (both opened untoggled) — got B={cols_b:?} \
              vs A={cols_a:?}; B was sized using tab A's stale narrow (25/75) \
-             ACTIVE_ORCHESTRATION_SPLIT_NARROW thread-local because \
+             ACTIVE_ORCHESTRATION_SPLIT_STAGE thread-local because \
              orchestration_role_pane_dims reads it before the render loop \
              has a chance to resync it for the newly-spawned tab"
         );
