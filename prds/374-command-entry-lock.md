@@ -1,6 +1,6 @@
 # PRD #374: Lock command entry to the orchestrator pane, `Ctrl+e` to unlock (Orchestration tabs only)
 
-**Status**: Not Started
+**Status**: Implementation complete — PR pending
 **Priority**: Medium
 **Created**: 2026-08-04
 **GitHub Issue**: [#374](https://github.com/vfarcic/dot-agent-deck/issues/374) (closed upstream as not-planned; this fork continues the work independently)
@@ -51,9 +51,9 @@ The gate itself lives in a small helper (`gate_pane_input_key`) called from `han
 
 ## Milestones
 
-- [ ] **M1 — `ToggleOrchestrationLock` action wired.** New `Action`, default chord `Ctrl+e`, registered in `src/keybindings.rs`; per-tab lock-state field (`command_entry_locked: bool`, default `true`) added on `Tab::Orchestration`.
-- [ ] **M2 — PTY-forward gate.** `handle_pane_input_key`'s call site gated on active tab / focused-pane identity / lock state; dropped keystrokes surface a status message; global chords verified unaffected.
-- [ ] **M3 — L1/L2 coverage.** Unit tests (L1, `src/ui.rs`) pin the default-locked state, the `Ctrl+e` toggle, and per-tab isolation; vt100 tests (L2, `tests/e2e_orchestration_lock.rs`) drive the real PTY-forward gate and a global-chord regression guard.
+- [x] **M1 — `ToggleOrchestrationLock` action wired.** New `Action`, default chord `Ctrl+e`, registered in `src/keybindings.rs`; per-tab lock-state field (`command_entry_locked: bool`, default `true`) added on `Tab::Orchestration`.
+- [x] **M2 — PTY-forward gate.** `handle_pane_input_key`'s call site gated on active tab / focused-pane identity / lock state via `gate_pane_input_key`; dropped keystrokes surface the "Pane locked — Ctrl+e to unlock" status message; global chords verified unaffected (`orchestration_lock_005`).
+- [x] **M3 — L1/L2 coverage.** `orchestration_lock_001`-`003` (L1, `src/ui.rs`) pin the default-locked state, the `Ctrl+e` toggle, and per-tab isolation; `orchestration_lock_004`-`005` (L2, `tests/e2e_orchestration_lock.rs`) drive the real PTY-forward gate and the global-chord regression guard.
 - [ ] **M4 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with `Ctrl+e`; changelog fragment.
 
 ## Risks

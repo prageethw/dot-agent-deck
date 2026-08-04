@@ -3678,6 +3678,9 @@ pub enum Action {
     /// focused Dashboard pane forwards Ctrl+L to its PTY instead). No effect
     /// on a Mode tab.
     CycleSplitStage,
+    /// PRD #374 (#361 Item 3): toggle the active orchestration tab's
+    /// command-entry lock (Ctrl+E). No effect outside an orchestration tab.
+    ToggleOrchestrationLock,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -4259,6 +4262,46 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
     } else {
         Action::Continue
     }
+}
+
+/// PRD #374 (#361 Item 3): status message shown when a keystroke is dropped
+/// because the active orchestration tab's command-entry lock is engaged.
+/// Follows this codebase's existing no-op-with-feedback convention (e.g.
+/// `RequestConfigGen`'s "No active agent session to send prompt to.").
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+e to unlock";
+
+/// PRD #374 (#361 Item 3): gate the PTY-forward fallback [`handle_pane_input_key`]
+/// produces against the active orchestration tab's command-entry lock. When
+/// the active tab is `Tab::Orchestration`, its lock is engaged, and the
+/// currently focused pane is not the orchestrator
+/// (`role_pane_ids[start_role_index]`), a would-be `Action::ForwardToPane` is
+/// dropped (returned as `Action::Continue`) before it ever reaches the
+/// pane's PTY. The orchestrator pane's own input is never gated, and
+/// non-orchestration tabs (Dashboard/Mode) are unaffected — this is the sole
+/// gate site, so global chords resolved earlier by `global_action_for_mode`
+/// are never touched by it.
+fn gate_pane_input_key(
+    action: Action,
+    tab_manager: &TabManager,
+    pane: &dyn PaneController,
+) -> Action {
+    if !matches!(action, Action::ForwardToPane(_)) {
+        return action;
+    }
+    let Tab::Orchestration {
+        command_entry_locked: true,
+        role_pane_ids,
+        start_role_index,
+        ..
+    } = tab_manager.active_tab()
+    else {
+        return action;
+    };
+    let orchestrator_pane_id = role_pane_ids.get(*start_role_index).map(String::as_str);
+    if pane.focused_pane_id().as_deref() == orchestrator_pane_id {
+        return action;
+    }
+    Action::Continue
 }
 
 /// PRD #241 M3: the close-confirmation dialog's whole state — which option is
@@ -6457,6 +6500,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
         return Some(Action::CycleSplitStage);
     }
+    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
+        return Some(Action::ToggleOrchestrationLock);
+    }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
     }
@@ -7039,6 +7085,26 @@ fn dispatch_action(
             if let Some((left, panes)) = stage_and_percents {
                 ui.status_message =
                     Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
+            }
+        }
+        // Ctrl+e: toggle the active orchestration tab's command-entry lock
+        // (PRD #374 / #361 Item 3). No-op outside an orchestration tab.
+        Action::ToggleOrchestrationLock => {
+            if let Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *command_entry_locked = !*command_entry_locked;
+                let lock_name = if *command_entry_locked {
+                    "locked"
+                } else {
+                    "unlocked"
+                };
+                ui.status_message = Some((
+                    format!("Pane entry: {lock_name}"),
+                    std::time::Instant::now(),
+                ));
             }
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
@@ -8904,6 +8970,16 @@ fn handle_key_event(
                 action = None;
             }
         }
+        // PRD #374 (#361 Item 3): same reasoning as ToggleOrchestrationSplit
+        // above — Ctrl+e is scoped to orchestration tabs. On a Dashboard/
+        // Mode-tab pane, un-resolve it so the key falls through to the
+        // normal PaneInput forwarding path instead of being silently
+        // swallowed here.
+        if matches!(action, Some(Action::ToggleOrchestrationLock))
+            && !matches!(tab_manager.active_tab(), Tab::Orchestration { .. })
+        {
+            action = None;
+        }
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -8978,7 +9054,19 @@ fn handle_key_event(
             }
             UiMode::DirPicker => handle_dir_picker_key(key, ui),
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
-            UiMode::PaneInput => handle_pane_input_key(key),
+            UiMode::PaneInput => {
+                let candidate = handle_pane_input_key(key);
+                let gated = gate_pane_input_key(candidate.clone(), tab_manager, pane);
+                if matches!(candidate, Action::ForwardToPane(_))
+                    && matches!(gated, Action::Continue)
+                {
+                    ui.status_message = Some((
+                        ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                gated
+            }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
             UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
             UiMode::QuitConfirm => {
@@ -24067,6 +24155,7 @@ mod tests {
     /// Dispatches a real `Action::SpawnPane` opening a fresh orchestration
     /// (via [`lock_test_orch_config`]) against `tm`, making it the active
     /// tab. Shared setup for the Item 3 lock tests below.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_lock_test_orchestration(
         tm: &mut TabManager,
         pc: &CapturingPaneController,
