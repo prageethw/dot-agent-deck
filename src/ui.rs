@@ -24033,6 +24033,332 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // PRD #361 Item 3: command-entry lock on Orchestration tabs
+    // -----------------------------------------------------------------------
+
+    /// Two-role `orchestrator` (start) / `worker` orchestration config, shared
+    /// by the Item 3 lock tests below — mirrors the `orch_config` helper
+    /// `orchestration/layout/003` defines locally, kept separate (module-level
+    /// here) since three tests in this section all need it.
+    fn lock_test_orch_config(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        }
+    }
+
+    /// Dispatches a real `Action::SpawnPane` opening a fresh orchestration
+    /// (via [`lock_test_orch_config`]) against `tm`, making it the active
+    /// tab. Shared setup for the Item 3 lock tests below.
+    fn spawn_lock_test_orchestration(
+        tm: &mut TabManager,
+        pc: &CapturingPaneController,
+        ui: &mut UiState,
+        state: &SharedState,
+        snapshot: &AppState,
+        frame_area: Rect,
+        tmp_dir: &std::path::Path,
+        name: &str,
+    ) {
+        let req = NewPaneRequest {
+            dir: tmp_dir.to_path_buf(),
+            name: name.to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config(name)),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            ui,
+            pc,
+            state,
+            tm,
+            snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+    }
+
+    /// Scenario: PRD #361 Item 3 locks direct keystroke entry to the
+    /// orchestrator pane by default on every Orchestration tab. Dispatch a
+    /// real `Action::SpawnPane` opening a fresh orchestration and assert the
+    /// new tab's per-tab lock field starts engaged (locked) — mirroring the
+    /// `split_stage` per-tab-field precedent `orchestration/layout/003`
+    /// establishes for Item 4. RED today: `Tab::Orchestration` has no lock
+    /// field at all, so this fails to compile.
+    #[spec("orchestration/lock/001")]
+    #[test]
+    fn orchestration_lock_001_new_orchestration_tab_starts_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-default",
+        );
+
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                *command_entry_locked,
+                "a freshly opened orchestration tab must start with \
+                 command-entry LOCKED — only the orchestrator pane accepts \
+                 direct input until Ctrl+e unlocks it"
+            ),
+            _ => panic!("expected a real orchestration tab to be active"),
+        }
+    }
+
+    /// Scenario: PRD #361 Item 3 adds `Ctrl+e` (default chord, confirmed
+    /// free during PRD investigation) as the toggle for the command-entry
+    /// lock. First confirm the chord resolves to the new
+    /// `Action::ToggleOrchestrationLock` through `key_action_for_mode` — the
+    /// same production `KeyEvent -> Action` seam `orchestration/layout/002`
+    /// used to pin `Ctrl+l` — from `UiMode::PaneInput` specifically (the mode
+    /// a focused, possibly-locked pane is actually in, and where the lock
+    /// matters), then dispatch the action twice against a real orchestration
+    /// tab and confirm the per-tab field flips locked -> unlocked -> locked.
+    /// RED today: neither `Action::ToggleOrchestrationLock` nor the `Ctrl+e`
+    /// binding exist, so this fails to compile.
+    #[spec("orchestration/lock/002")]
+    #[test]
+    fn orchestration_lock_002_ctrl_e_toggles_the_lock() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-toggle",
+        );
+
+        // Ctrl+e must resolve to the toggle action from PaneInput mode using
+        // the DEFAULT keybinding config (no user remap involved).
+        let kb = KeybindingConfig::default();
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_e);
+        assert!(
+            matches!(resolved, Some(Action::ToggleOrchestrationLock)),
+            "Ctrl+e must resolve to Action::ToggleOrchestrationLock from \
+             PaneInput mode so it works while a (possibly locked) pane is \
+             focused, not just from Normal mode"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                !*command_entry_locked,
+                "the first Ctrl+e toggle should UNLOCK the tab"
+            ),
+            _ => panic!("expected orchestration tab to be active"),
+        }
+
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                *command_entry_locked,
+                "the second Ctrl+e toggle should RE-LOCK the tab"
+            ),
+            _ => panic!("expected orchestration tab to be active"),
+        }
+    }
+
+    /// Scenario: PRD #361 Item 3's resolved decision: the command-entry lock
+    /// is per-orchestration-tab, not global. Spawn orchestration tab A,
+    /// unlock it (one Ctrl+e-equivalent dispatch), then spawn a brand-new
+    /// orchestration tab B and confirm B starts locked regardless of A's now-
+    /// unlocked state; switch back to A and confirm A is STILL unlocked
+    /// (untouched by B's spawn); toggle B's own lock and confirm A remains
+    /// unaffected by that too. Mirrors `orchestration/layout/003`'s
+    /// per-tab-isolation technique for `split_stage`. RED today: same
+    /// compile failure as `orchestration/lock/001`/`002` (no lock field/
+    /// action yet).
+    #[spec("orchestration/lock/003")]
+    #[test]
+    fn orchestration_lock_003_per_tab_isolation() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // Tab A: spawn, then unlock via the toggle action.
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-iso-a",
+        );
+        let idx_a = tm.active_index();
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(!*command_entry_locked, "tab A should be unlocked here"),
+            _ => panic!("expected orchestration tab A to be active"),
+        }
+
+        // Tab B: a brand-new orchestration must start LOCKED regardless of
+        // A's now-unlocked state.
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-iso-b",
+        );
+        let idx_b = tm.active_index();
+        assert_ne!(idx_a, idx_b, "tab B must be a distinct tab from tab A");
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                *command_entry_locked,
+                "tab B must start LOCKED — its own default — regardless of \
+                 tab A's toggled-unlocked state"
+            ),
+            _ => panic!("expected orchestration tab B to be active"),
+        }
+
+        // Switch back to A: still unlocked, untouched by B's spawn.
+        assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                !*command_entry_locked,
+                "tab A must remain unlocked after spawning tab B — spawning \
+                 a second orchestration tab must not reset an unrelated \
+                 tab's lock state"
+            ),
+            _ => panic!("expected orchestration tab A to be active"),
+        }
+
+        // Toggle B's own lock; A must still be unaffected by B's toggle.
+        assert!(tm.switch_to(idx_b), "switching to tab B must succeed");
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(!*command_entry_locked, "tab B should now be unlocked"),
+            _ => panic!("expected orchestration tab B to be active"),
+        }
+        assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
+        match tm.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                !*command_entry_locked,
+                "tab A's lock state must be untouched by toggling tab B's \
+                 lock — per-tab isolation must hold in both directions"
+            ),
+            _ => panic!("expected orchestration tab A to be active"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Bell transition detection tests
     // -----------------------------------------------------------------------
 
