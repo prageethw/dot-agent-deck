@@ -2192,6 +2192,13 @@ without depending on the config struct API.
 - **Does not assert:** every global chord individually (`Ctrl+d`/`Ctrl+n`/`Ctrl+w`/the split-cycle chord/`Ctrl+e` itself) — `Ctrl+t` is sufficient to prove the fallback-only gate placement, matching how `tabs/orchestration/007` used a single chord for the analogous Item 4 proof; the locked-drop behavior itself (covered by `orchestration/lock/004`).
 - **Platform coverage:** mac+linux.
 
+##### orchestration/lock/006 — With a REAL interactive Claude Haiku agent in the non-orchestrator role (not the `cat` stub `orchestration/lock/004` uses), the command-entry lock still gates a directive typed toward its PTY while locked, and still forwards it once `Ctrl+e` unlocks (CLAUDE.md rule 4 / Greptile PR #374 follow-up).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** REAL interactive Claude Code CLI pinned to `claude-haiku-4-5-20251001` (`orch-lock-live` fixture — orchestrator stays a `cat` stub, already proven never-gated by `orchestration/lock/004`, to keep the run to a single real-agent role).
+- **Asserts:** with a real orchestration tab open (default LOCKED) and the worker role focused, a create-sentinel-file directive typed into its PTY never results in the sentinel file appearing on disk (the agent never received it); `Ctrl+e` unlocks the tab, and a second directive with a different sentinel typed into the still-focused worker pane DOES result in that file being created, proving a genuine agent — not just `cat` echo — receives and acts on input only once unlocked; the first (locked) sentinel is confirmed still absent at the end, ruling out a buffer-then-flush implementation instead of an outright drop.
+- **Does not assert:** the orchestrator pane's own never-gated input (covered by `orchestration/lock/004`); per-tab isolation (covered by `orchestration/lock/003`); global chords during the lock (covered by `orchestration/lock/005`); exact LLM response wording or timing.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
