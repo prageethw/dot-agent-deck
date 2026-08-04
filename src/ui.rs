@@ -23196,6 +23196,117 @@ mod tests {
         );
     }
 
+    /// Scenario: gap `coder` flagged after `441f043` — `dispatch_normal_mode_key`
+    /// (`src/ui.rs:5067-5080`, invoked from `run_tui`'s Normal-mode arm at
+    /// `src/ui.rs:8951`) is a FOURTH caller of `mirror_selection_into_focus`
+    /// beyond the three `Action::SelectCard`/`FocusCard`/`Focus` call sites the
+    /// M2 wiring fix stamps `last_role_pane_activity_at` at. With a real
+    /// `TabManager`-opened 2-role Orchestration tab, focus manually landed on
+    /// the non-orchestrator `coder` role and its `last_role_pane_activity_at`
+    /// set to a synthetic 31-second-stale `Instant`, drives the REAL
+    /// `dispatch_normal_mode_key` with a `k` keypress over a `filtered` list
+    /// whose pane ids match the tab's role panes (mirroring
+    /// `jk_navigation_mirrors_selection_into_focus`'s technique) to cycle focus
+    /// from `coder` onto the orchestrator role's pane. Confirms the cycling
+    /// itself reaches the pane controller, then asserts
+    /// `last_role_pane_activity_at` is fresh as a result of that single call —
+    /// which fails today (RED) because this call site isn't gated/stamped.
+    #[spec("tabs/orchestration/015")]
+    #[test]
+    fn orchestration_015_role_pane_cycling_stamps_activity_clock() {
+        use std::time::{Duration, Instant};
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tab_manager.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let coder = role_ids[1].clone();
+
+        // Land focus on the non-orchestrator `coder` role, with its own
+        // activity clock already 31s+ stale — the same starting state
+        // `orchestration_013`/`014` use for the snap-back scenario.
+        let _ = pc.focus_pane(&coder);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            last_role_pane_activity_at,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(coder.clone());
+            *last_role_pane_activity_at = Some(Instant::now() - Duration::from_secs(31));
+        } else {
+            panic!("expected an active Orchestration tab");
+        }
+
+        // A `filtered` session list whose pane ids match the tab's role
+        // panes, sorted so `coder` sits at index 1 — the same shape
+        // `jk_navigation_mirrors_selection_into_focus` drives, just keyed to
+        // this tab's real role pane ids instead of synthetic `p0`/`p1`/`p2`.
+        let mut snapshot = AppState::default();
+        let mut orch_sess = make_session(SessionStatus::Idle);
+        orch_sess.session_id = "role-0-orchestrator".to_string();
+        orch_sess.pane_id = Some(orchestrator.clone());
+        snapshot
+            .sessions
+            .insert("role-0-orchestrator".to_string(), orch_sess);
+        let mut coder_sess = make_session(SessionStatus::Idle);
+        coder_sess.session_id = "role-1-coder".to_string();
+        coder_sess.pane_id = Some(coder.clone());
+        snapshot
+            .sessions
+            .insert("role-1-coder".to_string(), coder_sess);
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+        let total = filtered.len();
+
+        let mut ui = default_ui();
+        ui.selected_index = Some(1); // currently on `coder` (role-1-coder)
+        let kb = KeybindingConfig::default();
+
+        // Drive the REAL production dispatch path: `k` cycles up, from
+        // `coder` (index 1) to the orchestrator role (index 0).
+        dispatch_normal_mode_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut ui,
+            total,
+            None,
+            &filtered,
+            pc.as_ref(),
+            &kb,
+        );
+
+        assert_eq!(
+            ui.selected_index,
+            Some(0),
+            "k must cycle selection up from `coder` to the orchestrator role"
+        );
+        assert_eq!(
+            pc.focused_pane_id().as_deref(),
+            Some(orchestrator.as_str()),
+            "dispatch_normal_mode_key's mirror_selection_into_focus call must \
+             land real pane-controller focus on the orchestrator role"
+        );
+
+        let last_activity_at = match tab_manager.active_tab() {
+            Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } => *last_role_pane_activity_at,
+            _ => None,
+        };
+        assert!(
+            last_activity_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
+            "cycling to a different role pane via dispatch_normal_mode_key must \
+             stamp this Orchestration tab's last_role_pane_activity_at, same as \
+             the SelectCard/FocusCard/Focus/ForwardToPane stamp sites do — a \
+             user actively j/k-cycling through role panes must not have their \
+             engagement mistaken for inactivity by the 30s snap-back"
+        );
+    }
+
     /// Scenario: PR #151 e2e regression (e2e_render_contract::layout_002) — the
     /// inactive-selection close no-op (selection_012) must NOT suppress closing a
     /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
