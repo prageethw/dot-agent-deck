@@ -5073,11 +5073,22 @@ fn dispatch_normal_mode_key(
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
     kb: &KeybindingConfig,
-    _tab_manager: &mut TabManager,
+    tab_manager: &mut TabManager,
 ) -> Action {
     let prev_selected_index = ui.selected_index;
     let result = handle_normal_key(key, ui, total, selected_status, kb);
     mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
+    // PRD #373 M2 fix: stamp this Orchestration tab's OWN activity clock —
+    // j/k/arrow/Tab role-pane cycling is active engagement and must not be
+    // mistaken for inactivity by the 30s snap-back (see
+    // `Tab::Orchestration::last_role_pane_activity_at`).
+    if let Tab::Orchestration {
+        last_role_pane_activity_at,
+        ..
+    } = tab_manager.active_tab_mut()
+    {
+        *last_role_pane_activity_at = Some(std::time::Instant::now());
+    }
     result
 }
 
