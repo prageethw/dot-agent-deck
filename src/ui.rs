@@ -7790,14 +7790,14 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleOrchestrationSplit, key) {
         return Some(Action::CycleSplitStage);
     }
+    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
+        return Some(Action::ToggleOrchestrationLock);
+    }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
     }
     if kb.matches(KbAction::ClosePane, key) {
         return Some(Action::CloseSelected);
-    }
-    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
-        return Some(Action::ToggleOrchestrationLock);
     }
     // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
