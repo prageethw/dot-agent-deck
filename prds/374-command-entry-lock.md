@@ -54,16 +54,16 @@ The gate itself lives in a small helper (`gate_pane_input_key`) called from `han
 - [x] **M1 — `ToggleOrchestrationLock` action wired.** New `Action`, default chord `Ctrl+e`, registered in `src/keybindings.rs`; per-tab lock-state field (`command_entry_locked: bool`, default `true`) added on `Tab::Orchestration`.
 - [x] **M2 — PTY-forward gate.** `handle_pane_input_key`'s call site gated on active tab / focused-pane identity / lock state via `gate_pane_input_key`; dropped keystrokes surface the "Pane locked — Ctrl+e to unlock" status message; global chords verified unaffected (`orchestration_lock_005`).
 - [x] **M3 — L1/L2 coverage.** `orchestration_lock_001`-`003` (L1, `src/ui.rs`) pin the default-locked state, the `Ctrl+e` toggle, and per-tab isolation; `orchestration_lock_004`-`005` (L2, `tests/e2e_orchestration_lock.rs`) drive the real PTY-forward gate and the global-chord regression guard.
-- [ ] **M4 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with `Ctrl+e`; changelog fragment.
+- [x] **M4 — Docs and changelog.** `docs/keyboard-shortcuts.md` updated with `Ctrl+e`; changelog fragment.
 
 ## Risks
 
 - **Cross-item coupling with #373.** This item's lock and #373's inactivity timer share the same keystroke-forwarding choke point (`Action::ForwardToPane`); #373's Decision (a blocked keystroke on a locked pane still resets its timer) means #373's M3 gate needs to record a blocked-attempt signal once it lands here, not just observe a drop. Tracked on #373's side, not this PRD's.
-- **Experimental-flag candidate.** Per CLAUDE.md rule 9, candidate for **yes**, and probably the strongest case among the four split-out items — it changes default keyboard behavior in a way a user could easily not expect (typing "does nothing" on a pane they can see) until they learn about `Ctrl+e`. A flag lets it ship without surprising existing users mid-session. To be confirmed at `/prd-start` for this branch.
+- **Experimental-flag candidate — resolved: No.** Per CLAUDE.md rule 9, this was flagged as the strongest candidate for **yes** among the four split-out items pre-implementation, since it changes default keyboard behavior in a way a user could easily not expect (typing "does nothing" on a pane they can see) until they learn about `Ctrl+e`. **Resolved: No — visible by default.** Keybinding-driven affordance (a status message on every drop tells the user why nothing happened, and `Ctrl+e` is discoverable the moment it's tried), no persisted state, and existing L1/L2 coverage is sufficient verification. Matches precedent (PRD #336/#333/#341).
 
 ## Open Questions
 
-1. **Experimental flag gating** — to be settled at `/prd-start` for this branch (see Risks above for judgment).
+1. **Experimental flag gating** — resolved: no, visible by default (see Risks above).
 
 Resolved (previously open, decided by the user before implementation started):
 
