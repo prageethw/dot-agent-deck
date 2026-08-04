@@ -19,6 +19,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+L` | Cycle the sidebar/pane-column split: Default → Narrow (25/75) → Hidden (sidebar gone, pane column full-width) → Default. Scoped per tab — cycling one tab never moves another, including another tab of the same type | **Dashboard and Orchestration tabs** |
+| `Ctrl+E` | Toggle command-entry lock — while locked, typing on any pane other than the orchestrator's does not reach that pane's PTY | **Orchestration tabs only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 
 ### Which mode you're in
@@ -30,6 +31,10 @@ Three other things follow the mode:
 - **The cursor.** The focused pane shows a cursor only while you are typing into it. A cursor means, without exception, that what you type lands in that pane.
 - **The focused pane dims, with a banner.** Entering command mode dims the focused pane's content — still perfectly readable, just visibly inert — and overlays a `COMMAND MODE · Ctrl+D to type` banner. The banner clears itself after a moment, or immediately when you press a command-mode key or click a bottom-bar button; a key that isn't bound to anything keeps it up, because that is the moment you most likely thought you were talking to the agent. The dimming stays for as long as you are in command mode.
 - **The selected dashboard card.** It keeps its `▸ ` marker in both modes so you never lose track of the selection, but its highlight is de-emphasised while you are typing in a pane — the deck looks inert exactly when the pane looks live.
+
+### `Ctrl+E` locks command entry to the orchestrator pane
+
+In an Orchestration tab, direct keystrokes are locked to the orchestrator pane by default — typing while focused on any other pane in that tab does not reach that pane's PTY, and a status message ("Pane locked — Ctrl+e to unlock") confirms the keystroke was dropped rather than silently swallowed. `Ctrl+e` toggles the lock; while unlocked, every pane in that tab accepts direct input normally, same as before. The lock is per-tab — toggling it in one Orchestration tab never affects another open tab — and the orchestrator pane itself always accepts input regardless of lock state. `Ctrl+e` and every other global chord (`Ctrl+d`, `Ctrl+n`, `Ctrl+w`, `Ctrl+t`, `Ctrl+l`) keep working from any pane, locked or not. Dashboard and Mode tabs are unaffected — `Ctrl+e` on those falls through as ordinary input (e.g. readline's end-of-line binding).
 
 ### `Ctrl+W` closes only from command mode
 
@@ -177,6 +182,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_split` | `Ctrl+l` | Cycle the active tab's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**; scoped per tab, no effect elsewhere |
+| `toggle_orchestration_lock` | `Ctrl+e` | Toggle command-entry lock — while locked (the default), only the orchestrator pane accepts direct input — **orchestration tabs only**; falls through as ordinary pane input elsewhere |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
 `close_pane` lives in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind it to is command-mode only and reaches the pane as ordinary input everywhere else.
