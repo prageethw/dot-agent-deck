@@ -4991,6 +4991,11 @@ fn focus_deck(
                         ),
                         std::time::Instant::now(),
                     ));
+                    // PRD #373 M2: a digit-jump (`Action::FocusCard`) that lands
+                    // on a new pane counts as activity — see
+                    // `mirror_selection_into_focus`'s stamp for the cycling-key
+                    // counterpart and why the 30s inactivity timer needs both.
+                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                     // PRD #84 M4: focusing a pane just updates focus state; the
                     // per-frame `resize_panes_to_layout` pass sizes the (now
                     // possibly expanded) pane to its inner area on the next
@@ -5031,7 +5036,7 @@ fn focus_deck(
 /// change or the new selection lacks a `pane_id`.
 fn mirror_selection_into_focus(
     prev_selected_index: Option<usize>,
-    ui: &UiState,
+    ui: &mut UiState,
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
 ) {
@@ -5041,6 +5046,12 @@ fn mirror_selection_into_focus(
         && let Some(pane_id) = session.pane_id.as_ref()
     {
         let _ = pane.focus_pane(pane_id);
+        // PRD #373 M2: a manual selection move (arrow/Tab/j-k cycling, card
+        // click) that lands on a new pane counts as activity, same as a
+        // forwarded keystroke — the 30s inactivity timer
+        // (`TabManager::auto_focus_after_inactivity`) must start from the
+        // moment focus lands, not only from a later keystroke into the pane.
+        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
     }
 }
 
@@ -7518,6 +7529,10 @@ fn dispatch_action(
                                 ),
                                 std::time::Instant::now(),
                             ));
+                            // PRD #373 M2: Enter-on-card (`Action::Focus`) landing
+                            // on a new pane counts as activity — same as the
+                            // digit-jump path in `focus_deck`.
+                            ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                         }
                         Err(PaneError::CommandFailed(ref msg)) => {
                             state.blocking_write().sessions.remove(sid);
@@ -10315,6 +10330,20 @@ pub fn run_tui(
             // `TabManager::auto_focus_all_clear`'s doc comment for why
             // that gate matters): the edge-triggered all-clear move to
             // the orchestrator role.
+            let _ = pane.focus_pane(&new_id);
+        } else if let Some(last_activity_at) = ui.last_pane_keystroke_at
+            && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
+                std::time::Instant::now(),
+                last_activity_at,
+                TabManager::INACTIVITY_TIMEOUT,
+            )
+        {
+            // PRD #373 M2 — only reached when neither branch above moved
+            // focus this frame: 30 seconds with no pane-forwarded
+            // activity snaps focus back to the orchestrator role. Skipped
+            // entirely while `last_pane_keystroke_at` is still `None`
+            // (nothing has happened yet this session) rather than
+            // fabricating a start time for the timer.
             let _ = pane.focus_pane(&new_id);
         }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager

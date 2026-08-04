@@ -496,6 +496,57 @@ impl TabManager {
         Some(orchestrator)
     }
 
+    /// PRD #373 M2 — fork-only. How long [`Self::auto_focus_after_inactivity`]
+    /// waits, once focus has landed on a non-orchestrator role with no
+    /// further activity, before snapping focus back to the orchestrator.
+    pub const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// PRD #373 M2 — fork-only. 30-second inactivity snap-back: if the
+    /// active Orchestration tab's focus is on a non-orchestrator role and
+    /// `now.duration_since(last_activity_at)` has reached `timeout`, focus
+    /// moves to that tab's orchestrator role (`role_pane_ids[start_role_index]`)
+    /// and its id is returned. No-op for any active tab that isn't
+    /// `Tab::Orchestration`.
+    ///
+    /// Fully stateless per call, unlike the edge-triggered
+    /// [`Self::auto_focus_all_clear`]: elapsed time is recomputed fresh
+    /// from `now`/`last_activity_at` every call, with no new per-tab
+    /// field. This lets the timer re-arm on its own after focus lands on
+    /// a non-orchestrator role again — the caller (the per-frame render
+    /// loop) is responsible for supplying a `last_activity_at` that
+    /// reflects the most recent human activity.
+    ///
+    /// Already-correct focus (`focused_role_pane_id` is `None` or already
+    /// the orchestrator) is a no-op, matching the sibling auto-focus
+    /// methods' no-flicker behavior.
+    pub fn auto_focus_after_inactivity(
+        &mut self,
+        now: std::time::Instant,
+        last_activity_at: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        let Tab::Orchestration {
+            role_pane_ids,
+            focused_role_pane_id,
+            start_role_index,
+            ..
+        } = &mut self.tabs[self.active_index]
+        else {
+            return None;
+        };
+        let orchestrator = role_pane_ids.get(*start_role_index)?;
+        let focused = focused_role_pane_id.as_deref()?;
+        if focused == orchestrator.as_str() {
+            return None;
+        }
+        if now.duration_since(last_activity_at) < timeout {
+            return None;
+        }
+        let orchestrator = orchestrator.clone();
+        *focused_role_pane_id = Some(orchestrator.clone());
+        Some(orchestrator)
+    }
+
     pub fn show_tab_bar(&self) -> bool {
         self.tabs.len() > 1
     }
