@@ -59,6 +59,10 @@ pub enum Action {
     /// PRD #336: toggle an orchestration tab's sidebar/pane-column split
     /// between the default 34/66 ratio and a narrower-sidebar 25/75.
     ToggleOrchestrationSplit,
+    /// PRD #374 (#361 Item 3): toggle an orchestration tab's command-entry
+    /// lock — whether direct keystrokes reach a focused non-orchestrator
+    /// role pane's PTY.
+    ToggleOrchestrationLock,
     Jump1,
     Jump2,
     Jump3,
@@ -105,7 +109,8 @@ pub struct ActionSpec {
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
 ///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
-///   (toggle orchestration split); `1`..`9` jump to a card. (Quit is
+///   (toggle orchestration split), `Ctrl+e` (toggle orchestration
+///   command-entry lock); `1`..`9` jump to a card. (Quit is
 ///   deliberately absent — `Ctrl+C` is a hardcoded, non-overridable modal
 ///   trigger, not a remappable action.)
 /// - dashboard Normal-mode keys: `j`/`k`/`h`/`l`, `/`, `r`, `?`, `Enter`,
@@ -146,6 +151,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_orchestration_split",
         default: "Ctrl+l",
         description: "Toggle orchestration split",
+    },
+    ActionSpec {
+        action: Action::ToggleOrchestrationLock,
+        section: Section::Global,
+        name: "toggle_orchestration_lock",
+        default: "Ctrl+e",
+        description: "Toggle orchestration command-entry lock",
     },
     ActionSpec {
         action: Action::Jump1,
