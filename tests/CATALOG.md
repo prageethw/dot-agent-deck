@@ -1382,6 +1382,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the (absence of a) tracing log line.
 - **Platform coverage:** mac+linux.
 
+#### hooks/permission
+
+##### hooks/permission/001 — A `PreToolUse`/`ToolStart` for the SAME tool a permission prompt was just approved for clears the WaitingForInput badge (PRD #361 Item 1).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` → `ToolStart`, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session).
+- **Asserts:** after a `PermissionRequest` for `Bash` arms WaitingForInput, a `ToolStart` carrying the SAME tool name (`Bash`) moves the status to `Working` instead of leaving it stuck on WaitingForInput for the tool's whole run.
+- **Does not assert:** the TUI-side `y`/`n` keystroke or `Action::SendPermissionResponse` PTY write (covered by `prompt/permission/*`); which status a non-matching-name `ToolStart` produces (`hooks/permission/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### hooks/permission/002 — A `PreToolUse`/`ToolStart` for an UNRELATED tool while a different tool's permission prompt is pending does NOT clear WaitingForInput (PRD #361 Item 1 regression pin).
+- **Layer:** L1 (in-process `AppState::apply_event` sequence — `SessionStart` → `PermissionRequest` → `ToolStart` for a different tool name, no PTY, no daemon socket).
+- **Agent:** none (synthetic ClaudeCode session).
+- **Asserts:** after a `PermissionRequest` for `Bash` arms WaitingForInput, a `ToolStart` carrying a DIFFERENT tool name (`Read`) — modeling a concurrent subagent's own tool starting — leaves the status at WaitingForInput.
+- **Does not assert:** the eventual clearing of that pending `Bash` prompt (out of scope for this pin); `hooks/permission/001` covers the matching-name clear.
+- **Platform coverage:** mac+linux+windows.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
