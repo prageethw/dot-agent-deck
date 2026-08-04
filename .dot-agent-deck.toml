@@ -81,7 +81,7 @@ name = "dot-agent-deck"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run agent-orchestrator"
+command = "devbox run claude-sonnet-devbox"
 # command = "devbox run pi-big"   # pi (Opus, high thinking)
 start = true
 prompt_template = """
@@ -158,28 +158,28 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run agent-coder"
+command = "devbox run claude-sonnet-devbox"
 # command = "devbox run oc-big"   # opencode (gpt-5.6-sol)
 description = "Implements features, fixes bugs, refactors code"
 prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. In a TDD chain, make the tester's failing test pass by changing PRODUCTION code only — never edit the tester-authored tests to force them green; if you think a tester test is wrong, report it back instead of editing it. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. Then COMMIT your changes (use a descriptive message; reference the PRD number if relevant) — DO NOT signal work-done with uncommitted changes in the working tree. Run `git status` to verify the tree is clean before calling `dot-agent-deck work-done`. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run pi-sol"
+command = "devbox run codex-devbox"
 # command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run oc-big"
+command = "devbox run codex-devbox"
 # command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "tester"
-command = "devbox run codex-big"
+command = "devbox run claude-sonnet-devbox"
 # command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
@@ -198,7 +198,7 @@ Whenever you are blocked or missing critical context — including the out-of-re
 
 [[orchestrations.roles]]
 name = "release"
-command = "devbox run agent-release"
+command = "devbox run claude-sonnet-devbox"
 # command = "devbox run oc-release"
 clear = false
 description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
