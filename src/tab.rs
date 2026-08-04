@@ -2202,4 +2202,173 @@ mod tests {
             Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
         ));
     }
+
+    /// Scenario: In an active Orchestration tab, manually focus a
+    /// non-orchestrator role, then drive `auto_focus_after_inactivity`
+    /// through synthetic `Instant`/`Duration` values (no real sleeps) to
+    /// prove the 30-second snap-back: under the timeout it's a no-op, at
+    /// or past it focus snaps to the orchestrator role exactly once, a
+    /// stale re-check once already on the orchestrator stays a no-op, and
+    /// re-focusing away and letting 30s elapse again re-arms and fires
+    /// again (stateless, not edge-triggered). Also proves a fresh
+    /// `last_activity_at` (simulating a keystroke) resets the timer even
+    /// when a naive "time since focus landed" would have elapsed, and
+    /// that a background orchestration tab and a non-Orchestration active
+    /// tab are both left untouched.
+    #[spec("tabs/orchestration/013")]
+    #[test]
+    fn orchestration_013_inactivity_snap_back_after_30s() {
+        use std::time::{Duration, Instant};
+
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tm
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tm.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let alpha = role_ids[1].clone();
+
+        fn focus(tm: &mut TabManager, idx: usize, id: &str) {
+            if let Tab::Orchestration {
+                focused_role_pane_id,
+                ..
+            } = &mut tm.tabs[idx]
+            {
+                *focused_role_pane_id = Some(id.to_string());
+            }
+        }
+
+        // 1. Manually focus `alpha` (non-orchestrator). Less than the
+        // timeout has elapsed since the last activity: no move.
+        focus(&mut tm, orch_idx, &alpha);
+        let t0 = Instant::now();
+        assert_eq!(
+            tm.auto_focus_after_inactivity(
+                t0 + Duration::from_secs(10),
+                t0,
+                TabManager::INACTIVITY_TIMEOUT,
+            ),
+            None
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // 2. Exactly the timeout has now elapsed: fires, snaps to the
+        // orchestrator role, returns its id.
+        assert_eq!(
+            tm.auto_focus_after_inactivity(
+                t0 + TabManager::INACTIVITY_TIMEOUT,
+                t0,
+                TabManager::INACTIVITY_TIMEOUT,
+            )
+            .as_deref(),
+            Some(orchestrator.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
+        ));
+
+        // 3. Already on the orchestrator: a further-stale check against
+        // the same `last_activity_at` must not fire again (no-flicker,
+        // matching the sibling auto-focus methods' no-op-when-correct
+        // behavior).
+        assert_eq!(
+            tm.auto_focus_after_inactivity(
+                t0 + Duration::from_secs(120),
+                t0,
+                TabManager::INACTIVITY_TIMEOUT,
+            ),
+            None
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == orchestrator
+        ));
+
+        // Re-manually-focus `alpha` and let 30s elapse again: this is
+        // stateless per-call (not edge-triggered like
+        // `auto_focus_all_clear`), so it re-arms with no special handling
+        // and fires a second time.
+        focus(&mut tm, orch_idx, &alpha);
+        let t1 = Instant::now();
+        assert_eq!(
+            tm.auto_focus_after_inactivity(t1, t1, TabManager::INACTIVITY_TIMEOUT),
+            None,
+            "no time elapsed yet: must not fire"
+        );
+        assert_eq!(
+            tm.auto_focus_after_inactivity(
+                t1 + TabManager::INACTIVITY_TIMEOUT,
+                t1,
+                TabManager::INACTIVITY_TIMEOUT,
+            )
+            .as_deref(),
+            Some(orchestrator.as_str()),
+            "re-armed after re-focusing away: must fire again"
+        );
+
+        // 4. Reset case: focus lands on `alpha`, then a fresh keystroke
+        // updates `last_activity_at` partway through. Even though a naive
+        // "time since focus landed" (`now - t2`) would have exceeded the
+        // timeout, the actual elapsed time since the fresh activity
+        // (`now - last_activity_at`) has not — no snap-back.
+        focus(&mut tm, orch_idx, &alpha);
+        let t2 = Instant::now();
+        let now = t2 + Duration::from_secs(35); // would exceed 30s since focus landed
+        let last_activity_at = t2 + Duration::from_secs(33); // fresh keystroke 2s before `now`
+        assert_eq!(
+            tm.auto_focus_after_inactivity(now, last_activity_at, TabManager::INACTIVITY_TIMEOUT),
+            None,
+            "a fresh keystroke must reset the timer even if focus landed >= 30s ago"
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // 5. Open a second orchestration tab, which becomes active and
+        // leaves the first as a BACKGROUND tab with `alpha` focused and
+        // stale activity. The call only ever touches the active tab, so
+        // the background tab's stored focus and the active index must be
+        // unaffected.
+        let (orch2_idx, _role_ids2) = tm
+            .open_orchestration_tab(&orch_config_3("orch-2"), "/work", None, None, (24, 80))
+            .expect("open second orchestration tab");
+        assert_eq!(tm.active_index(), orch2_idx);
+        let t3 = Instant::now();
+        let result = tm.auto_focus_after_inactivity(
+            t3 + Duration::from_secs(3600),
+            t3,
+            TabManager::INACTIVITY_TIMEOUT,
+        );
+        assert_eq!(result, None);
+        assert_eq!(
+            tm.active_index(),
+            orch2_idx,
+            "must never switch the active tab"
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // 6. Non-Orchestration active tab: switching to the Dashboard tab
+        // (always index 0) must make the call a pure no-op regardless of
+        // how stale `last_activity_at` is.
+        assert!(tm.switch_to(0));
+        let t4 = Instant::now();
+        assert_eq!(
+            tm.auto_focus_after_inactivity(
+                t4 + Duration::from_secs(3600),
+                t4,
+                TabManager::INACTIVITY_TIMEOUT,
+            ),
+            None
+        );
+        assert_eq!(tm.active_index(), 0);
+    }
 }

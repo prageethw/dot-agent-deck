@@ -1190,6 +1190,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the render-loop call site itself actually applying the result to a live pane controller / render pass (would mirror `tabs/orchestration/011`'s technique for `auto_focus_waiting_pane`, deferred — not required by PRD #373 M1's stated scope); the 30-second inactivity timer (PRD #373 M2); the blocked-keystroke reset (PRD #373 M3, deferred until #374 lands).
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/013 — In an active orchestration tab, 30+ seconds of no forwarded-keystroke activity while focus sits on a non-orchestrator role snaps focus back to the orchestrator role; a fresh activity update resets the timer (PRD #373 M2, fork-only).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`).
+- **Agent:** none (mock `PaneController`; synthetic `Instant`/`Duration` values, no real sleeps and no panes/PTYs).
+- **Asserts:** driving `TabManager::auto_focus_after_inactivity` with synthetic `now`/`last_activity_at`/`TabManager::INACTIVITY_TIMEOUT` values against a manually-focused non-orchestrator role in the active orchestration tab — under the timeout it's a no-op; at/past the timeout it fires exactly once, snapping focus to the orchestrator role and returning its id; a further-stale check once already on the orchestrator stays a no-op (no-flicker); re-focusing away and letting the timeout elapse again re-arms and fires a second time, proving this is stateless per-call rather than edge-triggered like `auto_focus_all_clear`; an updated `last_activity_at` (simulating a fresh keystroke) resets the timer and suppresses the snap-back even when a naive "time since focus landed" would have exceeded the timeout; a background (non-active) orchestration tab with a non-orchestrator role focused and stale activity is unaffected and `TabManager::active_index()` never changes; a non-Orchestration active tab (Dashboard) is a pure no-op.
+- **Does not assert:** the render-loop call site wiring `UiState::last_pane_keystroke_at` into the `now`/`last_activity_at` arguments each frame (coder's follow-up, not this unit test); the blocked-keystroke reset on a locked pane (PRD #373 M3, deferred until #374 lands).
+- **Platform coverage:** mac+linux+windows.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
