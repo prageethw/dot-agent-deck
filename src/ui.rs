@@ -22899,12 +22899,14 @@ mod tests {
     /// `selected_session_id` write is gated on `Tab::Dashboard` — so a
     /// plain Dashboard-tab card click also stamps the SAME global
     /// `last_pane_keystroke_at` an Orchestration-tab snap-back reads. This
-    /// turns out to be a real scope leak (not a harmless one): with the
+    /// is currently a real scope leak (not a harmless one): with the
     /// `coder` role's own focus already 31s+ stale, a fresh, unrelated
     /// Dashboard click still suppresses that frame's snap-back, because
     /// `auto_focus_after_inactivity` has no way to distinguish a
-    /// Dashboard-card stamp from an Orchestration-role stamp — see the
-    /// `TODO(PRD #373 scope leak)` at the point this is pinned down.
+    /// Dashboard-card stamp from an Orchestration-role stamp. Part 3 below
+    /// pins the REQUIRED (post-fix) behavior — the snap-back must still
+    /// fire — so it is expected to fail (RED) against today's global-field
+    /// implementation until Orchestration-tab activity is tracked per-tab.
     #[spec("tabs/orchestration/014")]
     #[test]
     fn orchestration_014_render_loop_wiring_applies_inactivity_snap_back() {
@@ -23100,37 +23102,27 @@ mod tests {
             let _ = pc.focus_pane(&new_id);
         }
 
-        // TODO(PRD #373 scope leak): this IS a real scope leak, not a
-        // harmless one. `last_pane_keystroke_at` is a single global
-        // `UiState` field, and `Action::SelectCard` stamps it from ANY
-        // active tab (src/ui.rs:7265-7278 — the `if let Tab::Dashboard`
-        // guard covers only the `selected_session_id` write, not the
-        // `mirror_selection_into_focus` call after it). So a fresh,
-        // wholly unrelated Dashboard-tab click DELAYS a legitimately
-        // overdue Orchestration-tab snap-back: the per-frame chain reads
-        // the recent Dashboard stamp and — correctly, given only that
-        // input — concludes fewer than 30s have passed, even though
-        // `coder`'s own focus is 31s+ stale. A user bouncing between the
-        // Dashboard and an Orchestration tab can keep the M2 snap-back
-        // from ever firing. This PRD is explicitly scoped to Orchestration
-        // tabs only (Dashboard/Mode out of scope); fixing this (e.g.
-        // scoping the stamp to `Tab::Orchestration`, or keying the
-        // timestamp per tab) is out of scope for this test-only task.
+        // Invariant this pins: Orchestration-tab inactivity tracking must
+        // be per-tab, not derived from a global last-keystroke timestamp
+        // shared with Dashboard/Mode tabs.
+        //
+        // `coder`'s own focus on THIS Orchestration tab is genuinely 31s+
+        // stale — the just-now Dashboard-tab click is unrelated activity
+        // on a different tab and must not be able to reset this tab's own
+        // 30-second clock. So the snap-back must still fire this frame.
         assert_eq!(
             pc.focused_pane_id().as_deref(),
-            Some(coder.as_str()),
-            "documents the ACTUAL current behavior: the unrelated \
-             Dashboard click's recent global stamp suppresses this frame's \
-             snap-back even though `coder`'s own focus is genuinely 31s+ \
-             stale"
+            Some(orchestrator.as_str()),
+            "an unrelated Dashboard-tab click must not suppress this \
+             Orchestration tab's own overdue snap-back — `coder`'s focus \
+             here is genuinely 31s+ stale regardless of Dashboard activity"
         );
         assert!(
             matches!(
                 tab_manager.active_tab(),
-                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == &coder
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == &orchestrator
             ),
-            "the snap-back must NOT have fired this frame per the scope \
-             leak documented above"
+            "the tab's own bookkeeping must reflect the snap-back firing"
         );
     }
 
