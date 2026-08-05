@@ -10645,10 +10645,24 @@ pub fn run_tui(
             // has been dispatched to the pane it was aimed at.
             let _ = pane.focus_pane(&new_id);
         } else if let Some(last_activity_at) = (match tab_manager.active_tab() {
+            // PRD #373 M2 fix (post-#374): only the LOCKED (default) state
+            // ever arms this timer. #374 locks command entry to the
+            // orchestrator by default, so genuinely continuous typing on a
+            // role pane is only possible after a deliberate Ctrl+e unlock —
+            // and a wall-clock "time since last stamp" check is inherently
+            // racy against render-loop stalls (a frame that takes even a
+            // few hundred ms to get around to draining queued keystrokes
+            // makes the last stamp look stale even though the user never
+            // stopped typing). Gating on `command_entry_locked` sidesteps
+            // that race entirely for the unlocked case: while unlocked,
+            // this branch is skipped outright, no timer runs, so there's no
+            // stale timestamp to misread. Re-locking (or leaving the tab)
+            // resumes normal inactivity tracking.
             Tab::Orchestration {
                 last_role_pane_activity_at,
+                command_entry_locked,
                 ..
-            } => *last_role_pane_activity_at,
+            } if *command_entry_locked => *last_role_pane_activity_at,
             _ => None,
         }) && !crossterm::event::poll(std::time::Duration::from_millis(0))?
             && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
@@ -10663,18 +10677,19 @@ pub fn run_tui(
         {
             // PRD #373 M2 — only reached when neither branch above moved
             // focus this frame: 30 seconds with no pane-forwarded activity
-            // ON THIS TAB snaps focus back to the orchestrator role. Reads
-            // the ACTIVE tab's own `last_role_pane_activity_at` rather than
-            // the global `ui.last_pane_keystroke_at` — a global timestamp
-            // let unrelated Dashboard/Mode-tab activity reset an
-            // Orchestration tab's clock (PRD #373 M2 scope-leak fix).
-            // Skipped entirely while it's still `None` (nothing has
-            // happened yet on this tab) rather than fabricating a start
-            // time for the timer. Also skipped while ANY role pane on this
-            // tab is still `WaitingForInput` — `auto_focus_after_inactivity`
-            // gates itself on the `had_waiting_pane` flag
-            // `observe_waiting_panes` refreshes from `pane_status_for_tabs`
-            // before the chain on every frame, so this branch can't fight
+            // ON THIS TAB, while the tab is still command-entry LOCKED,
+            // snaps focus back to the orchestrator role. Reads the ACTIVE
+            // tab's own `last_role_pane_activity_at` rather than the global
+            // `ui.last_pane_keystroke_at` — a global timestamp let
+            // unrelated Dashboard/Mode-tab activity reset an Orchestration
+            // tab's clock (PRD #373 M2 scope-leak fix). Skipped entirely
+            // while it's still `None` (nothing has happened yet on this
+            // tab) rather than fabricating a start time for the timer.
+            // Also skipped while ANY role pane on this tab is still
+            // `WaitingForInput` — `auto_focus_after_inactivity` gates
+            // itself on the `had_waiting_pane` flag `observe_waiting_panes`
+            // refreshes from `pane_status_for_tabs` before the chain on
+            // every frame, so this branch can't fight
             // `auto_focus_waiting_pane` by yanking focus off a role that's
             // still asking the human a question.
             //

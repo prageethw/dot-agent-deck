@@ -23,14 +23,24 @@
 //! real-agent panes, not these).
 //!
 //! The production interval is `TabManager::INACTIVITY_TIMEOUT`
-//! (`src/tab.rs`), hardcoded to 30 real seconds at its sole per-frame call
-//! site (`src/ui.rs`, the `auto_focus_after_inactivity` branch of the
-//! auto-focus chain) with no test-only override today. This test sets
-//! `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS=2` on the spawned binary,
-//! mirroring the existing `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` seam
-//! (`src/agent_pty.rs`, `src/daemon.rs`) — but nothing in production reads
-//! that variable yet, so this is expected to be RED for that reason (in
-//! addition to pinning the behavior itself).
+//! (`src/tab.rs`), read at its sole per-frame call site (`src/ui.rs`, the
+//! `auto_focus_after_inactivity` branch of the auto-focus chain) via the
+//! `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS` test seam this test sets to a
+//! short interval, mirroring the existing `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS`
+//! seam (`src/agent_pty.rs`, `src/daemon.rs`).
+//!
+//! That branch only ever arms while the tab is command-entry LOCKED
+//! (PRD #374's default state): #374 makes the orchestrator the only pane
+//! typable by default, so genuinely continuous typing on a role pane is
+//! only possible after a deliberate Ctrl+e unlock, and a wall-clock "time
+//! since last keystroke" check is inherently racy against render-loop
+//! stalls — a frame that takes even a few hundred ms to drain queued
+//! keystrokes makes the last stamp look stale even though the user never
+//! stopped typing. Gating the timer on the LOCKED state removes that race
+//! for the unlocked case entirely (no timer runs, so there's nothing to
+//! misread), which is why this test drives Part 1 (idle -> snap-back)
+//! while still LOCKED and only unlocks for Part 2 (the continuous-typing
+//! control).
 //!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
@@ -88,23 +98,20 @@ fn expanded_header(role: &str) -> String {
     format!("┌{role}")
 }
 
-/// Scenario: Open a real orchestration tab, unlock it (so this test is
-/// isolated from PRD #361/#374's separate lock behavior), and focus the
-/// non-orchestrator "worker" role. With ZERO further input, once the
-/// (shortened) inactivity interval elapses, confirm a subsequent keystroke
-/// sent with NO manual refocus shows up inside the ORCHESTRATOR's own
-/// expanded pane box on the rendered grid rather than the worker's — i.e.
-/// focus visibly snapped back on its own. Then, as the control half,
-/// re-focus the worker role and keep sending it small keystrokes
+/// Scenario: Open a real orchestration tab, still in its default LOCKED
+/// (PRD #374) state, and focus the non-orchestrator "worker" role. With
+/// ZERO further input, once the (shortened) inactivity interval elapses,
+/// confirm a subsequent keystroke sent with NO manual refocus shows up
+/// inside the ORCHESTRATOR's own expanded pane box on the rendered grid
+/// rather than the worker's — i.e. focus visibly snapped back on its own.
+/// Then, as the control half, deliberately UNLOCK the tab (Ctrl+e),
+/// re-focus the worker role, and keep sending it small keystrokes
 /// throughout an interval LONGER than the configured timeout; confirm a
 /// final keystroke still lands in the worker's own expanded box, proving
-/// ongoing activity suppresses the snap-back. RED today: there is no
-/// test-only override for the production 30-second interval, so the real
-/// interval never elapses within this test's short waits.
+/// the unlocked state suppresses the snap-back entirely.
 #[spec("orchestration/focus/001")]
 #[test]
 fn orchestration_focus_001_inactivity_snap_back_visible_on_real_binary() {
-    const WORKER_INITIAL: &str = "FOCUS001_WORKER_INITIAL_3d18";
     const ORCH_AFTER_IDLE: &str = "FOCUS001_ORCH_IDLE_9b62";
     const WORKER_REFOCUS: &str = "FOCUS001_WORKER_REFOCUS_4e07";
     const WORKER_FINAL: &str = "FOCUS001_WORKER_FINAL_c581";
@@ -131,32 +138,31 @@ fn orchestration_focus_001_inactivity_snap_back_visible_on_real_binary() {
     deck.send_keys(format!("{ORCH_SETTLE}\r").as_bytes());
     deck.wait_for_string(ORCH_SETTLE);
 
-    // Unlock the tab (PRD #361/#374's command-entry lock is out of scope
-    // here — already covered by `orchestration/lock/004`-`006`) so every
-    // keystroke below forwards to whichever pane is focused, regardless of
-    // lock state.
-    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05
-
     let orch_expanded = expanded_header("orchestrator");
     let worker_expanded = expanded_header("worker");
 
-    // --- Part 1: manually focus the worker role, then send NOTHING for
-    // the configured inactivity interval -> expect an automatic snap-back.
+    // --- Part 1: manually focus the worker role while the tab is STILL
+    // LOCKED (PRD #374's default) — the M2 inactivity timer only ever
+    // arms while locked (PRD #373 M2 fix), so this is the state that
+    // matters for the idle -> snap-back assertion below. Then send
+    // NOTHING for the configured inactivity interval -> expect an
+    // automatic snap-back.
     focus_worker_role(&deck);
 
     // Confirm the forwarding target really is the worker before relying
-    // on the timer: the worker's box must be the expanded one, and the
-    // sentinel must land inside it.
-    deck.send_keys(format!("{WORKER_INITIAL}\r").as_bytes());
+    // on the timer. Can't confirm via a typed+echoed sentinel here — the
+    // tab is still locked, so a keystroke aimed at the worker pane is
+    // dropped before it reaches the PTY (PRD #374) — so this checks the
+    // expanded header alone.
     let initial_ok = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        grid.contains(&worker_expanded) && grid.contains(WORKER_INITIAL)
+        grid.contains(&worker_expanded)
     });
     assert!(
         initial_ok,
-        "a sentinel typed right after focusing the worker role never showed \
-         up inside the worker's own expanded pane box (needle {worker_expanded:?}) \
-         — cannot proceed with the inactivity assertion below without \
-         confirming the initial focus target first.\n\
+        "focusing the worker role never showed its expanded pane box on \
+         screen (needle {worker_expanded:?}) — cannot proceed with the \
+         inactivity assertion below without confirming the initial focus \
+         target first.\n\
          === rendered grid ===\n{}",
         deck.snapshot_grid(),
     );
@@ -188,9 +194,14 @@ fn orchestration_focus_001_inactivity_snap_back_visible_on_real_binary() {
         deck.snapshot_grid(),
     );
 
-    // --- Part 2 (control): re-focus the worker role, then keep it ALIVE
-    // with small keystrokes spanning MORE wall-clock time than the
-    // configured timeout -> expect NO snap-back this time.
+    // --- Part 2 (control): deliberately UNLOCK the tab (PRD #374) — the
+    // M2 timer only ever arms while locked (PRD #373 M2 fix), so
+    // unlocking removes the snap-back risk for the rest of this test
+    // entirely, rather than racing a wall-clock "time since last
+    // keystroke" check against render-loop jitter. Then re-focus the
+    // worker role and keep it ALIVE with small keystrokes spanning MORE
+    // wall-clock time than the configured timeout -> expect NO snap-back.
+    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05 -> unlock
     focus_worker_role(&deck);
     deck.send_keys(format!("{WORKER_REFOCUS}\r").as_bytes());
     let refocus_ok = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
@@ -216,7 +227,13 @@ fn orchestration_focus_001_inactivity_snap_back_visible_on_real_binary() {
         false
     });
 
-    deck.send_keys(format!("{WORKER_FINAL}\r").as_bytes());
+    // Leading `\r` first: the loop above lands the cursor mid-line after
+    // ~80 raw `x` bytes with no line breaks of their own (the `cat` stub
+    // echoes verbatim), close enough to the pane's column width that the
+    // sentinel below would otherwise wrap across a line boundary and
+    // break the plain `contains` substring check even though the text is
+    // genuinely there.
+    deck.send_keys(format!("\r{WORKER_FINAL}\r").as_bytes());
     let stayed_on_worker = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
         grid.contains(&worker_expanded) && grid.contains(WORKER_FINAL)
     });
