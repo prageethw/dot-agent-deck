@@ -389,6 +389,52 @@ jobs:
       # about `--all-targets --features e2e`, not about package selection.
       - run: cargo nextest run --workspace
 
+  # Fork-only. Runs the L2 PTY/e2e tier (CLAUDE.md rule 5) in CI so it no
+  # longer has to run on a contributor's own machine, competing with
+  # everything else they have open — the L2 suite spawns real dot-agent-deck
+  # binaries and PTYs, and running it locally alongside a rebuild/rebase/test
+  # cycle repeatedly starved the local machine (load average 20+, memory
+  # pressure) during PRD #373's own review. Moving it to a CI runner's
+  # dedicated resources sidesteps that entirely.
+  #
+  # DELIBERATELY INFORMATIONAL, NOT A REQUIRED GATE: `continue-on-error:
+  # true` so a red run never blocks a PR. CLAUDE.md rule 5 already documents
+  # this tier as flaky-tolerant (timing-sensitive PTY/real-process
+  # assertions), and this repo's own release pipeline broke once already
+  # (2026-08-04) from a required check it could not itself satisfy — making
+  # e2e required would risk the same failure mode for a tier that is
+  # expected to be noisier than the fast tier, not less. Treat a red run
+  # here as a signal worth reading, not a merge blocker.
+  #
+  # NO API KEYS CONFIGURED, AND THAT IS FINE FOR NOW: only 4 of the 64
+  # `tests/e2e_*.rs` files (`e2e_pi_live`, `e2e_issue_dispatch_real`,
+  # `e2e_issue_dispatch_live`, `e2e_scheduler_live_surface`) spend real LLM
+  # tokens against a live agent CLI + credentials; every one of them
+  # self-skips at runtime (Decision 26, `skip_unless!(...)` /
+  # `check_claude_available()` / `OPENROUTER_API_KEY` checks) rather than
+  # failing when the CLI or key is absent. The other 60 files drive the real
+  # spawned binary over a PTY against synthetic `cat`/scripted stub agents —
+  # no network, no spend, no secrets — and run for real here. Wiring real
+  # credentials (an `ANTHROPIC_API_KEY`/`OPENROUTER_API_KEY` secret, and
+  # installing the `claude`/`codex`/`pi` CLIs) to also cover those 4 is a
+  # separate follow-up with its own cost/security tradeoffs, not bundled in.
+  #
+  # ubuntu-latest, matching `build` (not build-macos/build-windows): the
+  # Unix-domain-socket daemon/attach/hook suites this tier depends on are
+  # gated to Unix at the source level, same reasoning as `build-windows`'s
+  # comment above.
+  e2e:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --features e2e
+
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
     needs: changes
