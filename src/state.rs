@@ -3653,13 +3653,22 @@ impl AppState {
             EventType::SessionEnd => unreachable!(),
         }
 
-        // PRD #370 M2: any event other than `ShellBusy` clears the synthetic
-        // marker — a real, agent-emitted event (or a completed `ShellIdle`
-        // revert) means the CURRENT status is no longer "the daemon guessed
-        // Working from OS-level foreground-pgid alone," so a later
-        // out-of-order/duplicate `ShellIdle` must not revert a real status
-        // back to `Idle`.
-        if event.event_type != EventType::ShellBusy {
+        // PRD #370 M2: any REAL event other than `ShellBusy` clears the
+        // synthetic marker — a real, agent-emitted event (or a completed
+        // `ShellIdle` revert) means the CURRENT status is no longer "the
+        // daemon guessed Working from OS-level foreground-pgid alone," so a
+        // later out-of-order/duplicate `ShellIdle` must not revert a real
+        // status back to `Idle`.
+        //
+        // Greptile review: `Unknown` must be excluded from the clear, same
+        // as `ShellBusy` — it is the `#[serde(other)]` catch-all for a
+        // future event type THIS build can't recognize, not proof of real
+        // agent activity. Clearing on it would let a future informational
+        // event type land between a `ShellBusy` and its paired `ShellIdle`
+        // and permanently strand the session at `Working` (the `ShellIdle`
+        // would see the marker already false and become a no-op) — exactly
+        // the silent-break `#[serde(other)]` exists to prevent.
+        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
             session.shell_synthetic_working = false;
         }
 
