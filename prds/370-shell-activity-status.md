@@ -1,6 +1,6 @@
 # PRD #370: Treat underlying shell activity as Working status inside a worker pane
 
-**Status**: Not started
+**Status**: In progress — M1 complete
 **Priority**: Medium
 **Created**: 2026-08-04 (issue filed) / 2026-08-05 (PRD written)
 **GitHub Issue**: [#370](https://github.com/vfarcic/dot-agent-deck/issues/370)
@@ -37,7 +37,7 @@ Extend `src/platform/proc/unix.rs`'s existing pgid-resolution helpers (used toda
 
 ## Milestones
 
-- [ ] **M1 — Foreground-pgid query helper.** `foreground_pgid`-style helper added to `src/platform/proc/unix.rs`, reusing existing pgid-resolution code paths rather than duplicating them.
+- [x] **M1 — Foreground-pgid query helper.** `foreground_pgid` added to `src/platform/proc/{unix,windows}.rs` (Unix: wraps `portable_pty::MasterPty::process_group_leader`, i.e. `tcgetpgrp`; Windows: unconditional `None`, the trait doesn't expose the method there at all) plus `RunningAgent::shell_foreground_busy` in `src/agent_pty.rs`. Two tests: a raw-`openpty` mechanism test and an end-to-end test through the real `AgentPtyRegistry::spawn_agent` path.
 - [ ] **M2 — Tick-driven comparison and status signal.** Per-pane foreground-vs-shell pgid comparison wired into the tick loop; precedence rules against agent-emitted `SessionStatus` values made explicit.
 - [ ] **M3 — Status integration.** Signal reaches the same `SessionStatus` consumers as hook/wrapper-derived events (tab coloring, footer, etc.) without a separate code path per consumer.
 - [ ] **M4 — Test coverage.** Unit tests for pgid-mismatch → `Working`, pgid-match → no override, and non-clobbering of a genuine in-flight agent status.
