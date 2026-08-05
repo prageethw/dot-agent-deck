@@ -5154,11 +5154,15 @@ fn dispatch_normal_mode_key(
     // PRD #373 M2 fix: stamp this Orchestration tab's OWN activity clock —
     // j/k/arrow/Tab role-pane cycling is active engagement and must not be
     // mistaken for inactivity by the 30s snap-back (see
-    // `Tab::Orchestration::last_role_pane_activity_at`).
-    if let Tab::Orchestration {
-        last_role_pane_activity_at,
-        ..
-    } = tab_manager.active_tab_mut()
+    // `Tab::Orchestration::last_role_pane_activity_at`). Gated on the SAME
+    // condition `mirror_selection_into_focus` checks internally — the key
+    // actually moved `ui.selected_index` — so an unbound/no-op key doesn't
+    // refresh the clock and indefinitely defer a legitimate snap-back.
+    if prev_selected_index != ui.selected_index
+        && let Tab::Orchestration {
+            last_role_pane_activity_at,
+            ..
+        } = tab_manager.active_tab_mut()
     {
         *last_role_pane_activity_at = Some(std::time::Instant::now());
     }
@@ -6976,6 +6980,19 @@ fn send_config_gen_prompt(
                 // pre-draw `resize_panes_to_layout` on the next frame.
             }
             let _ = pane.focus_pane(pane_id);
+            // PRD #373 M2 fix: landing focus on a role pane through this
+            // path is active engagement too — stamp the tab's OWN activity
+            // clock, same as the SelectCard/FocusCard/Focus/ForwardToPane/
+            // paste/`dispatch_normal_mode_key` sites do, so the pane the
+            // user was just sent to doesn't inherit a stale (or `None`)
+            // timestamp and get snapped away on the next frame's 30s check.
+            if let Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *last_role_pane_activity_at = Some(std::time::Instant::now());
+            }
             ui.mode = UiMode::PaneInput;
             ui.status_message = Some((
                 "Config prompt sent — press Enter to execute.".to_string(),
@@ -10572,7 +10589,12 @@ pub fn run_tui(
             // Orchestration tab's clock (PRD #373 M2 scope-leak fix).
             // Skipped entirely while it's still `None` (nothing has
             // happened yet on this tab) rather than fabricating a start
-            // time for the timer.
+            // time for the timer. Also skipped while ANY role pane on this
+            // tab is still `WaitingForInput` — `auto_focus_after_inactivity`
+            // gates itself on the `had_waiting_pane` flag the branch above
+            // refreshes from `pane_status_for_tabs` every frame, so this
+            // branch can't fight `auto_focus_waiting_pane` by yanking focus
+            // off a role that's still asking the human a question.
             let _ = pane.focus_pane(&new_id);
         }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager

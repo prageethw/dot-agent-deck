@@ -567,6 +567,20 @@ impl TabManager {
     /// Already-correct focus (`focused_role_pane_id` is `None` or already
     /// the orchestrator) is a no-op, matching the sibling auto-focus
     /// methods' no-flicker behavior.
+    ///
+    /// PRD #373 M2 review fix — never fires while a role pane on this tab
+    /// is still `WaitingForInput`. `auto_focus_waiting_pane` returns `None`
+    /// once it has ALREADY steered focus onto the waiting role (its
+    /// no-flicker design), and `auto_focus_all_clear` also returns `None`
+    /// while something is still waiting, so without this gate the per-frame
+    /// chain in `src/ui.rs` fell all the way through to this method and
+    /// yanked focus off a role the human is genuinely being asked to
+    /// answer — the exact "fighting between this behavior and
+    /// `auto_focus_waiting_pane`" the PRD rules out. The gate reads
+    /// `had_waiting_pane`, which `auto_focus_all_clear` refreshes from the
+    /// live status map on every call, so it is current for the frame
+    /// (that method always runs before this one in the chain) and needs no
+    /// `pane_status` argument here — keeping this signature stable.
     pub fn auto_focus_after_inactivity(
         &mut self,
         now: std::time::Instant,
@@ -577,11 +591,15 @@ impl TabManager {
             role_pane_ids,
             focused_role_pane_id,
             start_role_index,
+            had_waiting_pane,
             ..
         } = &mut self.tabs[self.active_index]
         else {
             return None;
         };
+        if *had_waiting_pane {
+            return None;
+        }
         let orchestrator = role_pane_ids.get(*start_role_index)?;
         let focused = focused_role_pane_id.as_deref()?;
         if focused == orchestrator.as_str() {
