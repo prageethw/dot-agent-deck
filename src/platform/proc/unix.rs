@@ -182,6 +182,21 @@ pub fn send_sigterm_to_child_group(
 }
 
 // ---------------------------------------------------------------------------
+// Foreground process-group query (PRD #370 M1).
+// ---------------------------------------------------------------------------
+
+/// The pty's current foreground process-group id (`tcgetpgrp` under the
+/// hood, via `portable_pty::MasterPty::process_group_leader`), or `None` if
+/// the backend can't report one (e.g. the master fd is already closed).
+///
+/// This is the Unix half of the [`foreground_pgid`] seam; see `windows.rs`
+/// for why the Windows half is an unconditional `None` rather than a
+/// best-effort implementation.
+pub fn foreground_pgid(master: &dyn portable_pty::MasterPty) -> Option<i32> {
+    master.process_group_leader()
+}
+
+// ---------------------------------------------------------------------------
 // Daemon-stop termination by PID (lifted from build_version_handshake.rs).
 // ---------------------------------------------------------------------------
 

@@ -573,6 +573,21 @@ pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Foreground process-group query (PRD #370 M1).
+// ---------------------------------------------------------------------------
+
+/// Always `None` on Windows: `portable_pty::MasterPty::process_group_leader`
+/// is `#[cfg(unix)]`-only on the trait itself (there is no Windows console
+/// analogue of a pty foreground process group — Windows pipes/conpty have no
+/// equivalent of `tcgetpgrp`), so the method does not exist to call here at
+/// all. See `unix.rs` for the real implementation. Callers must treat `None`
+/// as "no signal available" and fall back to whatever status they already
+/// have, never as "not busy".
+pub fn foreground_pgid(_master: &dyn portable_pty::MasterPty) -> Option<i32> {
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
