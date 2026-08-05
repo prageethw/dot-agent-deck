@@ -105,6 +105,7 @@ fn selected_card_fixture() -> SessionState {
         agent_id: None,
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     }
 }
 

@@ -4019,6 +4019,50 @@ impl AgentPtyRegistry {
         records
     }
 
+    /// PRD #370 M2: a snapshot of `(pane_id, shell_foreground_busy)` for
+    /// every live agent that has both a known `pane_id_env` and a platform
+    /// that can report a foreground pgid at all. Panes without a
+    /// `pane_id_env` can't be correlated back to a session via
+    /// `AppState::pane_hook_session_id`, and `shell_foreground_busy`
+    /// returning `None` (Windows; see [`RunningAgent::shell_foreground_busy`])
+    /// means "no opinion" — both are skipped rather than guessed at, so the
+    /// daemon's poll loop only ever acts on a real signal. One lock
+    /// acquisition covers every agent, matching [`Self::agent_records`]'s
+    /// shape, so the poll loop doesn't take the registry lock once per pane
+    /// per tick.
+    pub fn shell_foreground_busy_snapshot(&self) -> Vec<(String, bool)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .values()
+            .filter(|agent| !agent.exited.load(Ordering::SeqCst))
+            .filter_map(|agent| {
+                let pane_id = agent.pane_id_env.clone()?;
+                let busy = agent.shell_foreground_busy()?;
+                Some((pane_id, busy))
+            })
+            .collect()
+    }
+
+    /// PRD #370 M2 test-only seam: `inner` is private (by design — every
+    /// other cross-module accessor returns an owned snapshot, never the
+    /// live lock), but `daemon.rs`'s integration test needs to type into a
+    /// spawned pane's PTY directly to prove the real monitor task reacts to
+    /// it. `#[cfg(test)]` keeps this out of the production API surface
+    /// entirely.
+    #[cfg(test)]
+    pub(crate) fn agent_writer(
+        &self,
+        id: &str,
+    ) -> Option<Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(id)
+            .map(|a| a.writer.clone())
+    }
+
     /// Update the per-agent display name and cwd captured in the registry
     /// (M2.11). Each value is validated independently — invalid display
     /// names are rejected and stored as `None`, invalid cwds likewise.
