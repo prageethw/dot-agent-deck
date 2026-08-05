@@ -2156,6 +2156,15 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
 - **Cost note:** one short GPT-4o-mini worker turn per observation.
 
+#### orchestration/focus
+
+##### orchestration/focus/001 — With a real Orchestration tab open and focus manually moved to a non-orchestrator role, 30 seconds (shortened for the test) with no activity snaps focus back to the orchestrator pane on its own; ongoing activity on the non-orchestrator role suppresses the snap-back (PRD #373 M2, CLAUDE.md rule 4 gap-closer).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture — two stub `cat` roles, no LLM tokens spent).
+- **Asserts:** with a real orchestration tab open, unlocked (isolating this test from PRD #361/#374's separate lock behavior, covered by `orchestration/lock/004`-`006`), and the non-orchestrator "worker" role manually focused, a keystroke sent after the (shortened) inactivity interval elapses with zero prior input reaches the ORCHESTRATOR pane's own daemon-side scrollback rather than the worker's — proving `TabManager::auto_focus_after_inactivity` moved focus back on its own with no manual refocus from the test; then, as the control half, re-focusing the worker role and sending it small keystrokes throughout an interval longer than the configured timeout keeps a final keystroke landing in the WORKER's own scrollback, proving ongoing activity resets the timer and suppresses the snap-back.
+- **Does not assert:** the all-clear focus move or the edge-trigger (M1, covered by `tabs/orchestration/012`); the resolver's exact timing rules or per-tab scoping (L1, covered by `tabs/orchestration/013`-`018`); the blocked-keystroke-counts-as-activity extension (split out to PRD #383, tracked there); the command-entry lock itself (covered by `orchestration/lock/004`-`006`).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
