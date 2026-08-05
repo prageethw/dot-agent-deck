@@ -9161,6 +9161,29 @@ fn handle_key_event(
                         ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
                         std::time::Instant::now(),
                     ));
+                    // PRD #373 M3: a keystroke DROPPED by #374's
+                    // command-entry lock still counts as activity. The
+                    // human is plainly engaged with this role pane even
+                    // though nothing reached its PTY, so the 30s
+                    // inactivity snap-back has to be deferred exactly as
+                    // a forwarded keystroke defers it — otherwise typing
+                    // at a locked pane looks idle, focus is yanked to
+                    // the (always-unlocked) orchestrator mid-typing, and
+                    // the NEXT keystrokes land there instead of being
+                    // dropped. Stamped here, at the drop site, rather
+                    // than inside `gate_pane_input_key`: the gate stays
+                    // a pure `&TabManager` predicate, and this branch is
+                    // already the exact "was forwardable, got blocked"
+                    // condition. Only reachable on an Orchestration tab
+                    // (the gate returns the action untouched for every
+                    // other tab type), so the match below always hits.
+                    if let Tab::Orchestration {
+                        last_role_pane_activity_at,
+                        ..
+                    } = tab_manager.active_tab_mut()
+                    {
+                        *last_role_pane_activity_at = Some(std::time::Instant::now());
+                    }
                 }
                 gated
             }
@@ -10579,7 +10602,11 @@ pub fn run_tui(
             && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
                 std::time::Instant::now(),
                 last_activity_at,
-                TabManager::INACTIVITY_TIMEOUT,
+                // Normally `TabManager::INACTIVITY_TIMEOUT`; shortened only
+                // by the `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS` test seam
+                // so a PTY-attached e2e can observe the snap-back in a
+                // spawned process without waiting 30 real seconds.
+                TabManager::inactivity_timeout_from_env(),
             )
         {
             // PRD #373 M2 — only reached when neither branch above moved
@@ -23705,6 +23732,124 @@ mod tests {
              outside mirror_selection_into_focus's own \
              selected_index-changed gate, so even a no-op key refreshes \
              the clock and indefinitely defers a legitimate 30s snap-back"
+        );
+    }
+
+    /// Scenario: PRD #373 M3, the combined interaction with #374's
+    /// command-entry lock. With a real `TabManager`-opened Orchestration tab
+    /// (locked by default), focus manually landed on the non-orchestrator
+    /// `coder` role and that tab's `last_role_pane_activity_at` set to a
+    /// stale `Instant` 31 seconds ago, drives the REAL `handle_key_event`
+    /// with a plain `x` in `UiMode::PaneInput` — the keystroke #374's lock
+    /// drops before it reaches the PTY. Confirms the drop actually happened
+    /// (the lock status message is up), then asserts the tab's activity
+    /// clock was refreshed anyway and that `auto_focus_after_inactivity` no
+    /// longer fires: a human typing at a locked pane is engaged, not idle,
+    /// so the blocked keystroke must reset the 30s snap-back timer.
+    #[spec("tabs/orchestration/019")]
+    #[test]
+    fn orchestration_019_blocked_keystroke_resets_inactivity_timer() {
+        use std::time::{Duration, Instant};
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tab_manager.active_index(), orch_idx);
+        let coder = role_ids[1].clone();
+
+        // The tab must start LOCKED for this to be the blocked-keystroke
+        // path at all (`orchestration/lock/001` pins that default; asserted
+        // here so this test can never silently become the FORWARDED case).
+        match tab_manager.active_tab() {
+            Tab::Orchestration {
+                command_entry_locked,
+                ..
+            } => assert!(
+                *command_entry_locked,
+                "a freshly opened orchestration tab must start locked"
+            ),
+            _ => panic!("expected an active Orchestration tab"),
+        }
+
+        // Land focus on the non-orchestrator `coder` role — the only place
+        // the lock drops keystrokes — with its own activity clock set to a
+        // known stale `Instant`, the same starting state
+        // `orchestration_013`/`014`/`015`/`018` use.
+        let stale = Instant::now() - Duration::from_secs(31);
+        let _ = pc.focus_pane(&coder);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            last_role_pane_activity_at,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(coder.clone());
+            *last_role_pane_activity_at = Some(stale);
+        } else {
+            panic!("expected an active Orchestration tab");
+        }
+
+        let snapshot = AppState::default();
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = Vec::new();
+        let mut ui = default_ui();
+        // The mode a focused (possibly locked) pane is actually in — where
+        // `gate_pane_input_key` runs.
+        ui.mode = UiMode::PaneInput;
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        // The lock's own feedback is the proof this WAS the blocked path and
+        // not an ordinary forward.
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some(ORCHESTRATION_LOCK_STATUS_MESSAGE),
+            "the keystroke must have been dropped by #374's command-entry \
+             lock — without that, this test isn't exercising the \
+             blocked-keystroke path at all"
+        );
+
+        let last_activity_at = match tab_manager.active_tab() {
+            Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } => *last_role_pane_activity_at,
+            _ => None,
+        };
+        assert!(
+            last_activity_at.is_some_and(|t| t > stale && t.elapsed() < Duration::from_secs(1)),
+            "a keystroke BLOCKED by the command-entry lock must still stamp \
+             this Orchestration tab's last_role_pane_activity_at — the human \
+             is plainly engaged with the pane even though nothing reached \
+             the PTY (PRD #373's resolved activity definition), so the 30s \
+             clock has to reset just as it does for a forwarded keystroke"
+        );
+
+        // The outcome that actually matters: with the clock reset, the
+        // snap-back that was due a moment ago must no longer fire.
+        assert_eq!(
+            tab_manager.auto_focus_after_inactivity(
+                Instant::now(),
+                last_activity_at.expect("stamped above"),
+                TabManager::INACTIVITY_TIMEOUT,
+            ),
+            None,
+            "after a blocked keystroke the inactivity snap-back must be \
+             deferred — otherwise a user typing at a locked role pane gets \
+             yanked to the orchestrator mid-typing and their next \
+             keystrokes land there instead"
         );
     }
 

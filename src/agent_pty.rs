@@ -88,6 +88,16 @@ pub const DOT_AGENT_DECK_EXIT_WHEN_ORPHANED: &str = "DOT_AGENT_DECK_EXIT_WHEN_OR
 /// orphan watchdog (e.g. a detached test daemon whose parent is already PID 1).
 pub const DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
 
+/// PRD #373 test seam: overrides [`crate::tab::TabManager::INACTIVITY_TIMEOUT`],
+/// the interval an Orchestration tab waits with no activity on a
+/// non-orchestrator role pane before snapping focus back to the orchestrator.
+/// Integer seconds; unset, unparseable or `0` keeps the 30-second production
+/// default (see `crate::tab::TabManager::inactivity_timeout_from_env`). This exists so a
+/// PTY-attached e2e can observe the snap-back in a spawned process — where a
+/// fake `Instant` cannot be injected — without waiting 30 real seconds. It is
+/// deliberately NOT a user-facing config option.
+pub const DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS: &str = "DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS";
+
 /// PRD #201 native prompt delivery: how long the daemon waits for a Pi pane's
 /// extension to pull a stashed seed via `get-seed` (→ `pi.sendUserMessage`)
 /// before falling back to typing the seed into the PTY (the safety net that

@@ -549,6 +549,30 @@ impl TabManager {
     /// further activity, before snapping focus back to the orchestrator.
     pub const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+    /// Resolve the inactivity interval the per-frame call site feeds to
+    /// [`Self::auto_focus_after_inactivity`]. Normally
+    /// [`Self::INACTIVITY_TIMEOUT`]; overridable via
+    /// [`crate::agent_pty::DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS`] as a
+    /// **test seam only** — a PTY-attached e2e drives a separately spawned
+    /// binary and cannot inject a fake `Instant` into it, so shortening the
+    /// real interval is the only way to observe the snap-back without
+    /// waiting 30 wall-clock seconds.
+    ///
+    /// Mirrors [`crate::daemon::idle_shutdown_from_env`]: absent,
+    /// unparseable or `0` all fall back to the production default, so a typo
+    /// can never disable (or zero out) the timer.
+    pub fn inactivity_timeout_from_env() -> std::time::Duration {
+        let secs = match std::env::var(crate::agent_pty::DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS) {
+            Ok(v) => v.parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        if secs == 0 {
+            Self::INACTIVITY_TIMEOUT
+        } else {
+            std::time::Duration::from_secs(secs)
+        }
+    }
+
     /// PRD #373 M2 — fork-only. 30-second inactivity snap-back: if the
     /// active Orchestration tab's focus is on a non-orchestrator role and
     /// `now.duration_since(last_activity_at)` has reached `timeout`, focus
