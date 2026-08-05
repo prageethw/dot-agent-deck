@@ -10575,11 +10575,13 @@ pub fn run_tui(
                 ..
             } => *last_role_pane_activity_at,
             _ => None,
-        }) && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-            std::time::Instant::now(),
-            last_activity_at,
-            TabManager::INACTIVITY_TIMEOUT,
-        ) {
+        }) && !crossterm::event::poll(std::time::Duration::from_millis(0))?
+            && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
+                std::time::Instant::now(),
+                last_activity_at,
+                TabManager::INACTIVITY_TIMEOUT,
+            )
+        {
             // PRD #373 M2 — only reached when neither branch above moved
             // focus this frame: 30 seconds with no pane-forwarded activity
             // ON THIS TAB snaps focus back to the orchestrator role. Reads
@@ -10595,6 +10597,32 @@ pub fn run_tui(
             // refreshes from `pane_status_for_tabs` every frame, so this
             // branch can't fight `auto_focus_waiting_pane` by yanking focus
             // off a role that's still asking the human a question.
+            //
+            // The `poll(0ms)` peek above closes an event-ordering race: this
+            // chain runs once per outer-loop iteration BEFORE that same
+            // iteration's `poll(16ms)`/`read()` further down, so a keystroke
+            // already sitting in the OS input buffer hasn't yet had a chance
+            // to refresh `last_role_pane_activity_at`. Without the peek, the
+            // chain could decide "30+ seconds elapsed" off a stale timestamp,
+            // snap focus back to the orchestrator, and then dispatch that
+            // already-queued keystroke — aimed at the role pane — into the
+            // orchestrator instead. Peeking (never *consuming*) and skipping
+            // this branch for the iteration defers the decision: the pending
+            // event is read and dispatched normally below, stamping the clock
+            // if it's a relevant keystroke, and the next iteration's chain
+            // sees the fresh timestamp. The guard is deliberately specific to
+            // this branch — the two above steer focus toward something the
+            // user needs to see, while this one yanks focus away.
+            //
+            // This behavior has no regression test: the race needs a real
+            // OS-level keystroke to land in a few-microsecond window relative
+            // to our own `crossterm::event::poll` call, at the exact moment
+            // the 30s threshold is crossed. crossterm's event source is a raw
+            // terminal/OS call, not routed through `PaneController` or any
+            // other injectable seam, so "a key is already queued in the OS
+            // buffer right now" can't be simulated deterministically at L1 or
+            // L2. Fixing it untested (rather than leaving it a documented
+            // known limitation) was an explicit call.
             let _ = pane.focus_pane(&new_id);
         }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
@@ -23522,20 +23550,16 @@ mod tests {
         );
     }
 
-    /// Scenario: review finding — `send_config_gen_prompt` (`src/ui.rs:6953-6992`)
-    /// writes the config-gen prompt into a role pane, switches to and
-    /// focuses its owning Orchestration tab, and records the focus via
-    /// `TabManager::record_focus` — but unlike the other gated call sites
+    /// Scenario: with a real `TabManager`-opened 2-role Orchestration tab,
+    /// drives the REAL `send_config_gen_prompt` targeting the
+    /// non-orchestrator `coder` role pane and confirms it focuses that pane
+    /// on the real pane controller. Asserts the tab's own
+    /// `last_role_pane_activity_at` ends up `Some` and fresh, so this path
+    /// stamps the clock like the other gated call sites
     /// (`Action::SelectCard`/`FocusCard`/`Focus`/`ForwardToPane`, paste,
-    /// `dispatch_normal_mode_key`) never stamps `Tab::Orchestration::
-    /// last_role_pane_activity_at`. With a real `TabManager`-opened 2-role
-    /// Orchestration tab, drives the REAL `send_config_gen_prompt` targeting
-    /// the non-orchestrator `coder` role pane, confirms it focuses that pane
-    /// on the real pane controller, then asserts the tab's own activity
-    /// clock ends up `Some` and fresh — this fails today (RED) because
-    /// nothing on this path stamps it, so a role pane reached via this path
-    /// can inherit a stale (or `None`) timestamp and misbehave on the very
-    /// next frame's 30s inactivity check.
+    /// `dispatch_normal_mode_key`) — a role pane reached this way must not
+    /// inherit a stale (or `None`) timestamp and misbehave on the very next
+    /// frame's 30s inactivity check.
     #[spec("tabs/orchestration/017")]
     #[test]
     fn orchestration_017_send_config_gen_prompt_stamps_activity() {
@@ -23577,13 +23601,8 @@ mod tests {
         );
     }
 
-    /// Scenario: review finding — `dispatch_normal_mode_key` (`src/ui.rs:5141-5166`)
-    /// stamps `last_role_pane_activity_at` UNCONDITIONALLY after calling
-    /// `mirror_selection_into_focus`, regardless of whether the key actually
-    /// changed `ui.selected_index` — the stamp sits OUTSIDE
-    /// `mirror_selection_into_focus`'s own `selected_index`-changed gate.
-    /// With a real `TabManager`-opened 2-role Orchestration tab, focus
-    /// manually landed on the non-orchestrator `coder` role and its
+    /// Scenario: with a real `TabManager`-opened 2-role Orchestration tab,
+    /// focus manually landed on the non-orchestrator `coder` role and its
     /// `last_role_pane_activity_at` set to a known stale `Instant`, drives
     /// the REAL `dispatch_normal_mode_key` with `z` — not bound to any
     /// Normal-mode action by default, verified against every `default:`
@@ -23591,9 +23610,9 @@ mod tests {
     /// through to `Action::Continue` without touching `ui.selected_index`
     /// at all. Confirms the selection genuinely didn't move, then asserts
     /// `last_role_pane_activity_at` is UNCHANGED (still the original stale
-    /// `Instant`, not refreshed) — this fails today (RED) since the current
-    /// code stamps unconditionally, so even a no-op key refreshes the clock
-    /// and indefinitely defers a legitimate 30s snap-back.
+    /// `Instant`): the stamp is gated on the selection actually moving, so
+    /// a no-op key can't refresh the clock and indefinitely defer a
+    /// legitimate 30s snap-back.
     #[spec("tabs/orchestration/018")]
     #[test]
     fn orchestration_018_unbound_key_does_not_stamp_activity() {
