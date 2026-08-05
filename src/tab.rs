@@ -2482,4 +2482,119 @@ mod tests {
         );
         assert_eq!(tm.active_index(), 0);
     }
+
+    /// Scenario: reproduces the review finding that the per-frame
+    /// three-way chain in `src/ui.rs` (`auto_focus_waiting_pane` →
+    /// `auto_focus_all_clear` → `auto_focus_after_inactivity`, mirrored
+    /// verbatim here including reading `Tab::Orchestration::
+    /// last_role_pane_activity_at` straight off the active tab, exactly
+    /// as that call site does) fights `auto_focus_waiting_pane`. A role
+    /// pane starts `WaitingForInput` and the first frame steers focus to
+    /// it as designed. 31+ seconds then pass with that role STILL
+    /// `WaitingForInput` (never resolved) and its activity clock never
+    /// refreshed since auto-focus itself doesn't stamp it — exactly the
+    /// scenario where the human should still be looking at the waiting
+    /// pane. `auto_focus_waiting_pane` now no-ops (already-correct focus,
+    /// its no-flicker design) and `auto_focus_all_clear` also no-ops
+    /// (still waiting), so today's chain falls through to
+    /// `auto_focus_after_inactivity`, which yanks focus to the
+    /// orchestrator anyway — a direct violation of the PRD's "no fighting
+    /// between this behavior and `auto_focus_waiting_pane`" success
+    /// criterion.
+    #[spec("tabs/orchestration/016")]
+    #[test]
+    fn orchestration_016_inactivity_timer_fights_waiting_pane_focus() {
+        use crate::state::SessionStatus;
+        use std::time::{Duration, Instant};
+
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tm
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tm.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let alpha = role_ids[1].clone();
+
+        // Mirrors the real per-frame call site (`src/ui.rs`'s three-way
+        // `if let ... else if let ... else if let` chain) VERBATIM,
+        // including reading `last_role_pane_activity_at` straight off the
+        // active tab — as of this writing there is no "any role still
+        // waiting" gate there, so none is added here either.
+        fn frame(
+            tm: &mut TabManager,
+            status: &HashMap<&str, SessionStatus>,
+            now: Instant,
+        ) -> Option<String> {
+            if let Some(new_id) = tm.auto_focus_waiting_pane(status) {
+                Some(new_id)
+            } else if let Some(new_id) = tm.auto_focus_all_clear(status) {
+                Some(new_id)
+            } else if let Some(last_activity_at) = match tm.active_tab() {
+                Tab::Orchestration {
+                    last_role_pane_activity_at,
+                    ..
+                } => *last_role_pane_activity_at,
+                _ => None,
+            } {
+                tm.auto_focus_after_inactivity(
+                    now,
+                    last_activity_at,
+                    TabManager::INACTIVITY_TIMEOUT,
+                )
+            } else {
+                None
+            }
+        }
+
+        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
+        status.insert(orchestrator.as_str(), SessionStatus::Idle);
+        status.insert(alpha.as_str(), SessionStatus::Idle);
+
+        // Activity was last recorded at `t0` — e.g. some earlier manual
+        // interaction — and, critically, never gets refreshed by
+        // `auto_focus_waiting_pane`'s own programmatic steer below, since
+        // that path isn't one of the gated stamp sites.
+        let t0 = Instant::now();
+        if let Tab::Orchestration {
+            last_role_pane_activity_at,
+            ..
+        } = &mut tm.tabs[orch_idx]
+        {
+            *last_role_pane_activity_at = Some(t0);
+        }
+
+        // `alpha` becomes WaitingForInput: the first frame steers focus
+        // onto it via `auto_focus_waiting_pane`, unchanged from
+        // `orchestration_010`/`012`.
+        status.insert(alpha.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(frame(&mut tm, &status, t0).as_deref(), Some(alpha.as_str()));
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+
+        // 31+ seconds pass. `alpha` is STILL WaitingForInput — never
+        // resolved — so this is exactly the scenario where the human
+        // should still be looking at it.
+        let now = t0 + Duration::from_secs(31);
+        let result = frame(&mut tm, &status, now);
+
+        assert_eq!(
+            result, None,
+            "the inactivity branch must not steal focus away from a role \
+             that is STILL WaitingForInput — that's exactly when the \
+             human should still be looking at it, not when the \
+             30s-inactivity snap-back should fire"
+        );
+        assert!(
+            matches!(
+                &tm.tabs[orch_idx],
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+            ),
+            "focus must remain on the still-waiting role `alpha`, not get \
+             yanked to the orchestrator by the inactivity timer fighting \
+             auto_focus_waiting_pane"
+        );
+    }
 }

@@ -23500,6 +23500,171 @@ mod tests {
         );
     }
 
+    /// Scenario: review finding — `send_config_gen_prompt` (`src/ui.rs:6953-6992`)
+    /// writes the config-gen prompt into a role pane, switches to and
+    /// focuses its owning Orchestration tab, and records the focus via
+    /// `TabManager::record_focus` — but unlike the other gated call sites
+    /// (`Action::SelectCard`/`FocusCard`/`Focus`/`ForwardToPane`, paste,
+    /// `dispatch_normal_mode_key`) never stamps `Tab::Orchestration::
+    /// last_role_pane_activity_at`. With a real `TabManager`-opened 2-role
+    /// Orchestration tab, drives the REAL `send_config_gen_prompt` targeting
+    /// the non-orchestrator `coder` role pane, confirms it focuses that pane
+    /// on the real pane controller, then asserts the tab's own activity
+    /// clock ends up `Some` and fresh — this fails today (RED) because
+    /// nothing on this path stamps it, so a role pane reached via this path
+    /// can inherit a stale (or `None`) timestamp and misbehave on the very
+    /// next frame's 30s inactivity check.
+    #[spec("tabs/orchestration/017")]
+    #[test]
+    fn orchestration_017_send_config_gen_prompt_stamps_activity() {
+        use std::time::Duration;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tab_manager.active_index(), orch_idx);
+        let coder = role_ids[1].clone();
+
+        let mut ui = default_ui();
+
+        send_config_gen_prompt(&coder, "/work", &mut ui, pc.as_ref(), &mut tab_manager);
+
+        assert_eq!(
+            pc.focused_pane_id().as_deref(),
+            Some(coder.as_str()),
+            "send_config_gen_prompt must focus the target role pane on success"
+        );
+
+        let last_activity_at = match tab_manager.active_tab() {
+            Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } => *last_role_pane_activity_at,
+            _ => None,
+        };
+        assert!(
+            last_activity_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
+            "send_config_gen_prompt landing focus on a role pane must stamp \
+             this Orchestration tab's last_role_pane_activity_at, same as the \
+             SelectCard/FocusCard/Focus/ForwardToPane/dispatch_normal_mode_key \
+             stamp sites do — otherwise a role pane reached via this path can \
+             inherit a stale (or None) timestamp and misbehave on the very \
+             next frame's 30s inactivity check"
+        );
+    }
+
+    /// Scenario: review finding — `dispatch_normal_mode_key` (`src/ui.rs:5141-5166`)
+    /// stamps `last_role_pane_activity_at` UNCONDITIONALLY after calling
+    /// `mirror_selection_into_focus`, regardless of whether the key actually
+    /// changed `ui.selected_index` — the stamp sits OUTSIDE
+    /// `mirror_selection_into_focus`'s own `selected_index`-changed gate.
+    /// With a real `TabManager`-opened 2-role Orchestration tab, focus
+    /// manually landed on the non-orchestrator `coder` role and its
+    /// `last_role_pane_activity_at` set to a known stale `Instant`, drives
+    /// the REAL `dispatch_normal_mode_key` with `z` — not bound to any
+    /// Normal-mode action by default, verified against every `default:`
+    /// binding in `src/keybindings.rs` — so `handle_normal_key` falls
+    /// through to `Action::Continue` without touching `ui.selected_index`
+    /// at all. Confirms the selection genuinely didn't move, then asserts
+    /// `last_role_pane_activity_at` is UNCHANGED (still the original stale
+    /// `Instant`, not refreshed) — this fails today (RED) since the current
+    /// code stamps unconditionally, so even a no-op key refreshes the clock
+    /// and indefinitely defers a legitimate 30s snap-back.
+    #[spec("tabs/orchestration/018")]
+    #[test]
+    fn orchestration_018_unbound_key_does_not_stamp_activity() {
+        use std::time::{Duration, Instant};
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tab_manager
+            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tab_manager.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let coder = role_ids[1].clone();
+
+        // Land focus on the non-orchestrator `coder` role, with its own
+        // activity clock set to a known stale `Instant` — the same starting
+        // state `orchestration_013`/`014`/`015` use.
+        let stale = Instant::now() - Duration::from_secs(31);
+        let _ = pc.focus_pane(&coder);
+        if let Tab::Orchestration {
+            focused_role_pane_id,
+            last_role_pane_activity_at,
+            ..
+        } = tab_manager.active_tab_mut()
+        {
+            *focused_role_pane_id = Some(coder.clone());
+            *last_role_pane_activity_at = Some(stale);
+        } else {
+            panic!("expected an active Orchestration tab");
+        }
+
+        // A `filtered` session list whose pane ids match the tab's role
+        // panes, sorted so `coder` sits at index 1 — same shape
+        // `orchestration_015` drives.
+        let mut snapshot = AppState::default();
+        let mut orch_sess = make_session(SessionStatus::Idle);
+        orch_sess.session_id = "role-0-orchestrator".to_string();
+        orch_sess.pane_id = Some(orchestrator.clone());
+        snapshot
+            .sessions
+            .insert("role-0-orchestrator".to_string(), orch_sess);
+        let mut coder_sess = make_session(SessionStatus::Idle);
+        coder_sess.session_id = "role-1-coder".to_string();
+        coder_sess.pane_id = Some(coder.clone());
+        snapshot
+            .sessions
+            .insert("role-1-coder".to_string(), coder_sess);
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+        let total = filtered.len();
+
+        let mut ui = default_ui();
+        ui.selected_index = Some(1); // currently on `coder` (role-1-coder)
+        let kb = KeybindingConfig::default();
+
+        dispatch_normal_mode_key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &mut ui,
+            total,
+            None,
+            &filtered,
+            pc.as_ref(),
+            &kb,
+            &mut tab_manager,
+        );
+
+        assert_eq!(
+            ui.selected_index,
+            Some(1),
+            "an unbound key must not move role-pane selection at all — if \
+             this fails, `z` is no longer a safe unbound-key fixture and \
+             the test needs a different key"
+        );
+
+        let last_activity_at = match tab_manager.active_tab() {
+            Tab::Orchestration {
+                last_role_pane_activity_at,
+                ..
+            } => *last_role_pane_activity_at,
+            _ => None,
+        };
+        assert_eq!(
+            last_activity_at,
+            Some(stale),
+            "an unbound Normal-mode key that doesn't move role focus must \
+             leave last_role_pane_activity_at UNCHANGED — \
+             dispatch_normal_mode_key stamps it unconditionally today, \
+             outside mirror_selection_into_focus's own \
+             selected_index-changed gate, so even a no-op key refreshes \
+             the clock and indefinitely defers a legitimate 30s snap-back"
+        );
+    }
+
     /// Scenario: PR #151 e2e regression (e2e_render_contract::layout_002) — the
     /// inactive-selection close no-op (selection_012) must NOT suppress closing a
     /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
