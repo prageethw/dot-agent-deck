@@ -77,6 +77,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `fc45d01` | `docs(prd-370): create PRD #370 - shell activity working status [skip ci]` | **PERMANENT** fork-only (doc) |
 | `703b4d2` | `docs(prd-383): create PRD #383 - blocked-keystroke reset for the Orchestration inactivity timer [skip ci]` | **PERMANENT** fork-only (doc) |
 | `d6e1d21` | `feat(prd-370): treat underlying shell activity as Working status inside a worker pane (#14)` | **PERMANENT** fork-only |
+| `08a9402` | `fork-only: run the L2 e2e tier in CI as an informational, non-blocking job` | **PERMANENT** fork-only |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of this sync (2026-08-05). Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`. This sync also picked up 7 commits (`30c5f79` through `d6e1d21`) that had landed directly on `main` since the previous sync without ever being added to `fork-only` — a reminder that `fork-only` needs to be kept current as fork-specific work lands on `main`, not just rebuilt at sync time. Consider re-curating it (or running the sync procedure) more often than "whenever it's badly out of date" to keep this drift small.
 
