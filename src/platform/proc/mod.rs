@@ -131,12 +131,14 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 #[cfg(unix)]
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
+    foreground_pgid, pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait,
+    terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
+    foreground_pgid, pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait,
+    terminate_pid,
 };
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the
