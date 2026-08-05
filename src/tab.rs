@@ -2501,24 +2501,17 @@ mod tests {
         assert_eq!(tm.active_index(), 0);
     }
 
-    /// Scenario: reproduces the review finding that the per-frame
-    /// three-way chain in `src/ui.rs` (`auto_focus_waiting_pane` →
-    /// `auto_focus_all_clear` → `auto_focus_after_inactivity`, mirrored
-    /// verbatim here including reading `Tab::Orchestration::
-    /// last_role_pane_activity_at` straight off the active tab, exactly
-    /// as that call site does) fights `auto_focus_waiting_pane`. A role
-    /// pane starts `WaitingForInput` and the first frame steers focus to
-    /// it as designed. 31+ seconds then pass with that role STILL
-    /// `WaitingForInput` (never resolved) and its activity clock never
-    /// refreshed since auto-focus itself doesn't stamp it — exactly the
-    /// scenario where the human should still be looking at the waiting
-    /// pane. `auto_focus_waiting_pane` now no-ops (already-correct focus,
-    /// its no-flicker design) and `auto_focus_all_clear` also no-ops
-    /// (still waiting), so today's chain falls through to
-    /// `auto_focus_after_inactivity`, which yanks focus to the
-    /// orchestrator anyway — a direct violation of the PRD's "no fighting
-    /// between this behavior and `auto_focus_waiting_pane`" success
-    /// criterion.
+    /// Scenario: drives the per-frame three-way chain from `src/ui.rs`
+    /// (`auto_focus_waiting_pane` → `auto_focus_all_clear` →
+    /// `auto_focus_after_inactivity`, mirrored verbatim here including
+    /// reading `Tab::Orchestration::last_role_pane_activity_at` straight
+    /// off the active tab) across a role pane that goes `WaitingForInput`
+    /// and stays that way: the first frame steers focus onto it, then 31+
+    /// seconds pass with the role still waiting and its activity clock
+    /// never refreshed (auto-focus itself doesn't stamp it). Asserts focus
+    /// stays on the still-waiting role — the inactivity branch must not
+    /// fight `auto_focus_waiting_pane` by yanking focus to the
+    /// orchestrator while a role is still asking the human a question.
     #[spec("tabs/orchestration/016")]
     #[test]
     fn orchestration_016_inactivity_timer_fights_waiting_pane_focus() {
