@@ -1662,6 +1662,25 @@ pub struct RunningAgent {
     pub seed_delivered_native: bool,
 }
 
+impl RunningAgent {
+    /// PRD #370 M1: `true` when this pane's PTY foreground process group
+    /// differs from the shell's own pid — i.e. a child command currently
+    /// owns the terminal's foreground, so the pane is actively busy even if
+    /// no agent-emitted hook/wrapper event says so (the gap this PRD closes:
+    /// an agent shelling out to a long-running command with no event in
+    /// between reports stale `Idle` today). `None` when there is no signal
+    /// to act on: the platform can't report a foreground pgid at all
+    /// (`crate::platform::proc::foreground_pgid` returns `None`
+    /// unconditionally on Windows — see that module) or this child's own
+    /// pid is unavailable. Callers must treat `None` as "no opinion", never
+    /// as "not busy".
+    pub fn shell_foreground_busy(&self) -> Option<bool> {
+        let shell_pid = self.child.process_id()? as i32;
+        let fg_pgid = crate::platform::proc::foreground_pgid(self.master.as_ref())?;
+        Some(fg_pgid != shell_pid)
+    }
+}
+
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
 /// Carries the registry id plus the spawn-time `DOT_AGENT_DECK_PANE_ID`
 /// captured in [`RunningAgent::pane_id_env`], so the TUI can rebuild its
@@ -6059,6 +6078,146 @@ mod spawn_tests {
             pid_is_dead(pid),
             "pid {pid} should be dead after ChildGuard drop"
         );
+    }
+
+    // PRD #370 M1: the pure detection primitive `foreground_pgid` is built
+    // on. A real interactive shell is its own foreground process-group
+    // leader while sitting at its prompt; once it forks a foreground job
+    // (any command without `&`), job control makes that job the new
+    // foreground process group until it finishes, then the shell reclaims
+    // it. This is the OS-level fact the whole PRD hangs a "shell is busy"
+    // signal on, independent of any agent-emitted hook/wrapper event.
+    #[cfg(unix)]
+    #[test]
+    fn foreground_pgid_differs_while_a_foreground_child_runs() {
+        use std::io::Write as _;
+
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        // Deliberately `/bin/sh`, not `$SHELL`: whether a shell enables job
+        // control (and thus forks a new foreground pgid per command) when
+        // spawned this way is shell-dependent — e.g. interactive zsh here
+        // did not exhibit it, while `/bin/sh` reliably does. `/bin/sh` keeps
+        // this test deterministic across developer machines regardless of
+        // login shell.
+        let cmd = CommandBuilder::new("/bin/sh");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn should succeed");
+        let shell_pid = child.process_id().expect("child should expose a pid") as i32;
+        drop(pair.slave);
+
+        // Poll for the idle baseline — right after spawn the shell may not
+        // have claimed the foreground pgid yet.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut idle_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        while idle_pgid != Some(shell_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            idle_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        }
+        assert_eq!(
+            idle_pgid,
+            Some(shell_pid),
+            "an idle shell should be its own foreground process group"
+        );
+
+        // Start a foreground job that keeps running, so it becomes the new
+        // foreground pgid until it exits.
+        let mut writer = pair.master.take_writer().expect("take_writer");
+        writer.write_all(b"sleep 5\n").expect("write sleep command");
+        writer.flush().expect("flush");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut busy_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        while busy_pgid == Some(shell_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            busy_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        }
+        assert_ne!(
+            busy_pgid,
+            Some(shell_pid),
+            "a running foreground child must not report the shell's own pgid"
+        );
+
+        // A single-pid `child.kill()` (SIGHUP) only reaches `/bin/sh` itself,
+        // not the still-running `sleep 5` foreground job it forked into its
+        // own process group — `sh` then blocks in its own `wait()` for that
+        // child, so a plain `child.wait()` here would hang for the rest of
+        // the 5 s sleep. `force_kill_child_and_wait` reaches the whole group
+        // (`killpg(SIGKILL)`, same as production teardown), so `sleep 5`
+        // dies too and this returns promptly. Drop the writer/master first
+        // per that function's own doc, so any PTY I/O they're blocked on
+        // unblocks before the kill.
+        drop(writer);
+        drop(pair.master);
+        let group = crate::platform::proc::AgentProcessGroup::adopt(Some(shell_pid as u32));
+        crate::platform::proc::force_kill_child_and_wait(&mut child, &group);
+    }
+
+    /// PRD #370 M1: `RunningAgent::shell_foreground_busy` end-to-end through
+    /// the real registry spawn path — no mock PTY, no synthetic events. This
+    /// is the exact gap the PRD reports: today a role's shell running a
+    /// foreground command with no agent hook/wrapper event in between has no
+    /// signal at all that it is busy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_foreground_busy_reflects_a_running_foreground_child() {
+        use std::io::Write as _;
+
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let busy = |registry: &AgentPtyRegistry| -> Option<bool> {
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .get(&id)
+                .and_then(|a| a.shell_foreground_busy())
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = busy(&registry);
+        while state != Some(false) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state = busy(&registry);
+        }
+        assert_eq!(state, Some(false), "an idle shell should not read busy");
+
+        let writer = {
+            let inner = registry.inner.lock().unwrap();
+            inner.agents.get(&id).unwrap().writer.clone()
+        };
+        {
+            let mut w = writer.lock().await;
+            w.write_all(b"sleep 5\n").expect("write sleep command");
+            w.flush().expect("flush");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = busy(&registry);
+        while state != Some(true) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state = busy(&registry);
+        }
+        assert_eq!(
+            state,
+            Some(true),
+            "a running foreground child must read busy with no agent event at all"
+        );
+
+        registry.close_agent(&id).unwrap();
     }
 
     #[test]
