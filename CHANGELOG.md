@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.35.6] - 2026-08-04
+
+### Added
+
+- **The stacked pane layout no longer wastes a row per non-focused pane**
+  In the default `Stacked` pane layout, every non-focused pane used to render as an empty 1-row title-bar frame — a border drawn around nothing. In a 7-role orchestration tab ([#307](https://github.com/vfarcic/dot-agent-deck/issues/307)), that was six rows spent on frames for `developer`, `tester`, `reviewer`, `releaser`, `researcher` and `documenter`, none of which showed anything: on a laptop screen, roughly 13% of the vertical space. The orchestration sidebar already shows each role's live status, tool counts and click-to-focus, so the collapsed frame was a strictly poorer second copy of information already on screen.
+  Non-focused panes are no longer drawn at all. The focused pane now reclaims every row the collapsed frames used to occupy. Nothing about agent lifecycle changes — every pane's PTY stays open, every agent keeps running, hooks keep arriving, and the sidebar (or dashboard cards) keeps showing live status for all of them. A non-focused pane's PTY is now sized as though it were the focused slot, so switching focus is instant with no resize thrash or reflow.
+  Mode tabs, which render their two side panes simultaneously by design, are unaffected — they already use a fixed tiled split regardless of the global pane-layout setting.
+
+### Fixed
+
+  Fixed watch-wrapped mode panes staying permanently blank for commands that do not exit. Persistent panes (`[[modes.panes]]`) default to `watch = true`, which runs the command through the built-in `dot-agent-deck watch`; that wrapper showed the command's output only once the command finished. A pane running `tail -f app.log`, `kubectl logs -f`, or a dev server therefore showed nothing at all — no output, no error, no hint why.
+  Watched commands now show their output as it is produced, so long-running and slow commands paint progressively. stdout and stderr appear interleaved in the order they arrive, rather than all of stdout followed by all of stderr.
+
+### Miscellaneous
+
+  Fixed the e2e test harness leaking temp directories, which could make a healthy branch fail dozens of unrelated-looking tests. Every temp dir the harness creates now nests under one per-process root that is removed when the process exits, and `cargo xtask clean-e2e-tmp` reaps whatever an interrupted run left behind. When the temp filesystem is genuinely too full, the suite now says so explicitly instead of surfacing the exhaustion as agent and daemon failures. This is developer tooling only — no change to the shipped binary.
+  Fixed the local Windows pre-PR type-check (`scripts/windows-cross-check.sh`), which had been failing on every branch — including a clean `main` — since the reqwest 0.13 upgrade moved rustls onto its `aws-lc-rs` provider. It died inside `aws-lc-sys`'s build script, compiling that crate's ~600 C files with Linux gcc and Linux system headers against a Windows target, so it never reached a single line of this repo's own code and the documented gate produced no signal at all. The check now shims the C compiler the same way it already shimmed the archiver — `cargo check` never links, so nothing reads either artefact — which skips the C build entirely and leaves the Rust type-check real. A cold run takes about fifteen seconds and a warm one about five.
+  CI now runs that script too, in a parallel `windows-cross-check` job, so the same silent rot cannot recur — nothing had ever exercised it, which is why a permanently-red documented gate went unnoticed for months. That job is not a second Windows code gate; `build-windows` still owns Windows, compiling natively with clippy and tests on a real Windows runner, and was unaffected by this bug throughout. This is developer tooling only, with no change to the shipped binary.
+
+
+
 ## [0.35.5] - 2026-08-03
 
 ### Added

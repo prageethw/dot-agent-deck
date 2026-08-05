@@ -153,7 +153,9 @@ bash .claude/skills/verify-pr/setup.sh <pr-number> --baseline
 bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>-base --only <failing-step>
 ```
 
-Fails at the merge-base too → not this PR's defect. Say so, and note that `main` needs a fix.
+Fails at the merge-base too → not this PR's defect. Say so — but read the next paragraph before concluding that `main` needs a fix.
+
+**The worktree is not a control.** A baseline worktree holds the *diff* constant; it does not hold the *environment* constant. Both worktrees sit at a long `../dot-agent-deck-pr-<n>` path that the main checkout does not have, and both carry a cold `target/`. Measured on #352: `tabstrip_003` failed in the PR worktree, failed again in a clean-`origin/main` worktree, and was reported as a `main` defect — wrongly. The test was matching its sentinel inside the wrapped command line the pane's shell echoed, and where that line wrapped depended on the length of the checkout's absolute path, so it was deterministically red under `../dot-agent-deck-*` and green in the main checkout. (The genuine bug behind it — `watch` buffering a non-exiting command's output instead of streaming it — was already filed as #367 and fixed independently.) So "fails at the baseline too" rules out the PR; it does not rule out the review harness. Before writing "`main` needs a fix", re-run that one test in the **main checkout**: if it passes there, the trigger is something the worktree introduced — path length, a fixture keyed to `$PWD`, a cold build dir — and the finding belongs to this skill, not to `main`. For the same reason, other sessions' `../dot-agent-deck-*` worktrees failing the same test is not corroboration: they reproduce the artifact, not the defect.
 
 **Flakes.** The e2e tier is flaky-tolerant by design (rule 5), and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
 

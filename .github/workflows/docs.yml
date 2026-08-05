@@ -16,7 +16,15 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # Named `docs-build`, not `build`, so the check-run name is unique across
+  # workflows. `ci.yml` also has a `build` job, and branch protection matches
+  # required status checks by bare context NAME with no workflow qualifier — two
+  # jobs sharing one name makes "require `build`" ambiguous on any PR that
+  # touches docs/** or site/**, since both report under it. Renamed so that
+  # `build` unambiguously means ci.yml's fmt/clippy/test/linkage gate and can be
+  # required. (`release.yml` also has a `build`, but it only ever triggers on
+  # tags, so it never collides on a PR.)
+  docs-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
