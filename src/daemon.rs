@@ -717,6 +717,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
+    // PRD #370 M2: unconditional, unlike the idle monitor above — every
+    // daemon needs this regardless of the idle-shutdown config, since it's
+    // the only signal source for a role's shelled-out foreground command.
+    let shell_activity_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_shell_activity_monitor(registry, monitor_state, monitor_event_tx).await;
+        })
+    };
+
     let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown).await;
 
     if let Some(h) = attach_handle {
@@ -725,6 +737,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = idle_handle {
         h.abort();
     }
+    shell_activity_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -971,6 +984,96 @@ async fn run_idle_monitor(
         // notify_one was called between iterations, so a signal that lands
         // after we read the counters but before we await isn't lost.
         change_notify.notified().await;
+    }
+}
+
+/// PRD #370 M2: periodically checks every live pane's PTY foreground process
+/// group against its shell's own — see
+/// [`crate::agent_pty::RunningAgent::shell_foreground_busy`] — and
+/// synthesizes `ShellBusy`/`ShellIdle` events through the SAME pipeline real
+/// hook events use (`event_tx` broadcast + `AppState::apply_event`), so a
+/// pane running a foreground shell command (e.g. a role's `cargo build`)
+/// reads `Working` even when no agent-emitted hook/wrapper event fires in
+/// between. Edge-triggered per pane — only emits on a busy/idle transition,
+/// never every tick — so this never floods attached clients with redundant
+/// events; `apply_event`'s own precedence rules (see its `ShellBusy`/
+/// `ShellIdle` arms) are what keep it from ever clobbering a real status.
+///
+/// Skips any pane with no already-known session
+/// (`AppState::pane_hook_session_id` returns `None`) — a bare shell pane
+/// that has never emitted a single agent event has no `SessionState` to
+/// update at all. Documented M2 scope boundary (PRD #370), not a bug: this
+/// mechanism promotes an agent's OWN idle gaps, not a shell nobody's
+/// tracking. No internal shutdown signal — like `scheduler_handle`, this
+/// task is torn down by `.abort()` in `run_daemon_with`'s cleanup.
+async fn run_shell_activity_monitor(
+    pty_registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
+    // between feeling responsive and negligible overhead (one registry lock
+    // + a `tcgetpgrp` per live pane); revisit if profiling ever says
+    // otherwise.
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let snapshot = pty_registry.shell_foreground_busy_snapshot();
+        let seen: std::collections::HashSet<&str> = snapshot
+            .iter()
+            .map(|(pane_id, _)| pane_id.as_str())
+            .collect();
+        // Drop panes that disappeared from the registry since the last poll
+        // (closed / respawned) so a later reuse of the same pane id starts
+        // edge-detection from a clean slate instead of inheriting a stale
+        // busy/idle reading.
+        last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
+
+        for (pane_id, busy) in snapshot {
+            let changed = last_known.get(&pane_id).copied() != Some(busy);
+            last_known.insert(pane_id.clone(), busy);
+            if !changed {
+                continue;
+            }
+
+            let Some(session_id) = state.read().await.pane_hook_session_id(&pane_id) else {
+                continue;
+            };
+
+            let event = AgentEvent {
+                session_id,
+                // Deliberate: `AppState::apply_event` only ever UPGRADES a
+                // session's `agent_type` FROM `None`, never overwrites a
+                // known type with it — so this never regresses a real,
+                // hook-learned agent type.
+                agent_type: crate::event::AgentType::None,
+                event_type: if busy {
+                    crate::event::EventType::ShellBusy
+                } else {
+                    crate::event::EventType::ShellIdle
+                },
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(pane_id),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            };
+
+            // Same fan-out-before-apply order the hook ingestion path uses
+            // (see `run_hook_loop` below): the broadcast reaches attached
+            // clients whether or not the local `apply_event` accepts it.
+            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+            state.write().await.apply_event(event);
+        }
     }
 }
 
@@ -1316,6 +1419,114 @@ mod hook_ingestion_tests {
         // we tear the registry down — strictly sequences cleanup instead of
         // racing `shutdown_all` against the still-live loop task.
         let _ = handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #370's whole point, end to end. Spawn a real `/bin/sh`
+    /// pane, seed it a known session the way a real hook `SessionStart`
+    /// would (so `AppState::pane_hook_session_id` can resolve it), run the
+    /// real `run_shell_activity_monitor` against it, then type a short
+    /// foreground `sleep` into the pane's PTY directly (no agent hooks
+    /// involved at all). The monitored session's status must flip to
+    /// `Working` while the sleep runs and revert to `Idle` once it exits —
+    /// proving the daemon-synthesized `ShellBusy`/`ShellIdle` signal reaches
+    /// `AppState` through the exact pipeline this PRD reports missing.
+    #[tokio::test]
+    async fn shell_activity_monitor_reflects_a_real_foreground_command() {
+        use std::io::Write as _;
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-370".to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        // Seed exactly as a real hook SessionStart would — this is what
+        // populates BOTH `AppState.sessions` and the `pane_hook_session_id`
+        // correlation the monitor depends on to resolve "which session does
+        // pane-370's shell activity belong to."
+        state.write().await.apply_event(AgentEvent {
+            session_id: "sess-370".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-370".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        assert_eq!(
+            state.read().await.sessions["sess-370"].status,
+            crate::state::SessionStatus::Idle
+        );
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            async move { run_shell_activity_monitor(registry, state, event_tx).await }
+        });
+
+        // Type a short foreground command directly into the pane's PTY — no
+        // agent, no hook, nothing but the raw shell.
+        {
+            let writer = registry
+                .agent_writer(&agent_id)
+                .expect("spawned agent must be in the registry");
+            let mut w = writer.lock().await;
+            w.write_all(b"sleep 2\n").expect("write sleep command");
+            w.flush().expect("flush");
+        }
+
+        let status = |state: SharedState| async move {
+            state.read().await.sessions["sess-370"].status.clone()
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut current = status(state.clone()).await;
+        while current != crate::state::SessionStatus::Working
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            current = status(state.clone()).await;
+        }
+        assert_eq!(
+            current,
+            crate::state::SessionStatus::Working,
+            "the monitor must promote the session to Working while the foreground \
+             sleep runs, with zero agent-emitted events involved"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut current = status(state.clone()).await;
+        while current != crate::state::SessionStatus::Idle && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            current = status(state.clone()).await;
+        }
+        assert_eq!(
+            current,
+            crate::state::SessionStatus::Idle,
+            "the monitor must revert the session to Idle once the foreground \
+             sleep finishes and the shell reclaims the pty"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
         registry.shutdown_all();
     }
 

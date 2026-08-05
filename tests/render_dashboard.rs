@@ -93,6 +93,7 @@ fn pane_004_card_title_row() {
         agent_id: Some("1".to_string()),
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -137,6 +138,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         agent_id: Some("agent-card-stats".to_string()),
         display_name: Some("api-svc".to_string()),
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     }
 }
 
@@ -520,6 +522,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         agent_id: None,
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -701,6 +704,7 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         // no agent-type badge form exists to fall back to instead.
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -782,6 +786,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         agent_id: Some("1".to_string()),
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1003,6 +1008,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     }
 }
 
@@ -1579,6 +1585,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         agent_id: Some(name.to_string()),
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -1696,6 +1703,7 @@ fn filled_session() -> SessionState {
         agent_id: Some("1".to_string()),
         display_name: None,
         pending_permission_tool: None,
+        shell_synthetic_working: false,
     }
 }
 

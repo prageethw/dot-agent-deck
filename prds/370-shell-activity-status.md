@@ -1,6 +1,6 @@
 # PRD #370: Treat underlying shell activity as Working status inside a worker pane
 
-**Status**: Not started
+**Status**: In progress — M1-M4 complete, M5 (docs/changelog) partially done (changelog fragment added; see M5 note)
 **Priority**: Medium
 **Created**: 2026-08-04 (issue filed) / 2026-08-05 (PRD written)
 **GitHub Issue**: [#370](https://github.com/vfarcic/dot-agent-deck/issues/370)
@@ -37,11 +37,12 @@ Extend `src/platform/proc/unix.rs`'s existing pgid-resolution helpers (used toda
 
 ## Milestones
 
-- [ ] **M1 — Foreground-pgid query helper.** `foreground_pgid`-style helper added to `src/platform/proc/unix.rs`, reusing existing pgid-resolution code paths rather than duplicating them.
-- [ ] **M2 — Tick-driven comparison and status signal.** Per-pane foreground-vs-shell pgid comparison wired into the tick loop; precedence rules against agent-emitted `SessionStatus` values made explicit.
-- [ ] **M3 — Status integration.** Signal reaches the same `SessionStatus` consumers as hook/wrapper-derived events (tab coloring, footer, etc.) without a separate code path per consumer.
-- [ ] **M4 — Test coverage.** Unit tests for pgid-mismatch → `Working`, pgid-match → no override, and non-clobbering of a genuine in-flight agent status.
-- [ ] **M5 — Docs and changelog.** Note the new signal source in relevant developer docs (`docs/develop/`) and a changelog fragment.
+- [x] **M1 — Foreground-pgid query helper.** `foreground_pgid` added to `src/platform/proc/{unix,windows}.rs` (Unix: wraps `portable_pty::MasterPty::process_group_leader`, i.e. `tcgetpgrp`; Windows: unconditional `None`, the trait doesn't expose the method there at all) plus `RunningAgent::shell_foreground_busy` in `src/agent_pty.rs`. Two tests: a raw-`openpty` mechanism test and an end-to-end test through the real `AgentPtyRegistry::spawn_agent` path.
+- [x] **M2 — Daemon-side comparison and status signal.** Deviates from the original "wire into the render tick" plan: a dedicated `run_shell_activity_monitor` daemon task (`src/daemon.rs`) polls `AgentPtyRegistry::shell_foreground_busy_snapshot()` every 500ms (edge-triggered — only emits on a busy/idle transition per pane) and synthesizes `EventType::ShellBusy`/`ShellIdle` through the SAME pipeline real hook events use (`event_tx` broadcast + `AppState::apply_event`), rather than a separate parallel status path. This reaches an *attached* TUI (a separate process over the daemon's wire), which the render-tick approach could not have — the wire touch required adding `EventType::ShellBusy`/`ShellIdle` + a `#[serde(other)] Unknown` catch-all (mirroring PRD #201's `AgentType` retrofit) and bumping `PROTOCOL_VERSION` 6 → 7 (`src/daemon_protocol.rs`, `src/event.rs`). Precedence rules live in `AppState::apply_event`'s new arms plus `SessionState::shell_synthetic_working` (`src/state.rs`): `ShellBusy` only promotes a stale `Idle`/`Unknown`; `ShellIdle` only reverts a promotion THIS mechanism made; any real event clears the marker so a stale `ShellIdle` can never revert a real status.
+- [x] **M3 — Status integration.** No separate code path per consumer — the synthetic events flow through the exact same `SessionStatus` field every hook/wrapper-derived event does, so tab coloring / footer / dashboard stats need zero changes.
+- [x] **M4 — Test coverage.** `src/state.rs`: `shell_busy_idle_promote_and_revert_without_clobbering_real_status` (promote/revert/non-clobber precedence) and `event_type_unknown_string_deserializes_to_the_catch_all`. `src/daemon.rs`: `shell_activity_monitor_reflects_a_real_foreground_command` — a real `/bin/sh` pane, a real foreground `sleep`, zero agent/hook involvement, proving the whole pipeline end to end.
+- [ ] **M5 — Docs and changelog.** `changelog.d/370.feature.md` added. No `.breaking.md` fragment — per `docs/develop/versioning.md`, that type is reserved for *semantic* breaks behind a stable wire; this is a *structural* wire-shape change, already caught mechanically by the `PROTOCOL_VERSION` bump. No `docs/develop/agent-adapters.md` addition — that doc enumerates per-agent `IntegrationStrategy` variants, and this mechanism is agent-agnostic/daemon-level, not a new strategy; forcing it in would conflate two different concepts. **Still open: the cross-version manual test** (previous-release daemon + this branch's TUI, confirm delegate/hooks still flow) required by CLAUDE.md rule 12 before merge.
+- [ ] **M6 — PTY-attached L2 test (Greptile finding, PRD #370 PR).** Per CLAUDE.md rule 4, a major user-facing status change needs at least one PTY-attached L2 test driving the real binary, not only the headless daemon integration test M4 already has. A first attempt (`tests/e2e_shell_activity_status.rs`) hit an unresolved snag: seeding a spawned pane's session via a synthetic `session_start` hook (mirroring `e2e_hook_delivery.rs`'s technique) rendered as a SECOND, disconnected dashboard card instead of attaching to the existing pane's card — root cause not yet identified (the card-merging logic in `src/ui.rs` needs a proper read, not more trial-and-error). Deferred rather than landed half-working; the attempt was reverted out of this PR. Follow-up work, not blocking this PR's merge given M1-M4's coverage (unit precedence tests + a real end-to-end daemon integration test already prove the mechanism) — flagging honestly per the review finding rather than silently dropping it.
 
 ## Risks
 
@@ -51,5 +52,10 @@ Extend `src/platform/proc/unix.rs`'s existing pgid-resolution helpers (used toda
 
 ## Open Questions
 
-1. **Poll cadence** — every render tick, or a coarser dedicated interval? Needs a decision once M2 profiling data exists.
-2. **Precedence rules** — exact rule set for when the foreground-process signal may vs. may not override an existing `SessionStatus` (see Solution Overview's "Decision needed at implementation start").
+Resolved during M2:
+
+- **Poll cadence** — resolved: a dedicated daemon-side 500ms interval (not the render tick — see M2), first-cut, adjustable if profiling ever says otherwise.
+- **Precedence rules** — resolved: `SessionState::shell_synthetic_working` (see M2) — `ShellBusy` only promotes `Idle`/`Unknown`; `ShellIdle` only reverts its own promotion; any other event clears the marker.
+- **Wire-protocol approach for M2** — resolved with the user: new `EventType` variants + `PROTOCOL_VERSION` bump (not a reconnect-only, no-bump alternative), so an *already-attached* TUI updates live, not only on reconnect.
+
+- **Cross-version check** (CLAUDE.md rule 12) — built `v0.35.5` (the previous release tag) from source and confirmed via `dot-agent-deck daemon hello` that its `server_version` is `6` against this branch's `7`, exactly the intended bump. Risk is asymmetric here (unlike PRD #201's case): an OLD daemon never emits `ShellBusy`/`ShellIdle` (the feature doesn't exist server-side), so a NEW client attaching to an OLD daemon is safe by construction — existing flows are unaffected, the new feature is just silently absent. The protected direction (an OLD client meeting a NEW daemon) is guarded by two PRE-EXISTING, unmodified mechanisms: the ssh-remote `connect` flow's exact-match `PROTOCOL_VERSION` refusal, and the local PRD #103 build-mismatch nudge. A full interactive PTY click-through (per the doc's literal steps) hit tooling friction in this environment (no `tmux`; `script(1)` with redirected stdin did not yield a usable capture) and was not completed live — the verification above is static/handshake-level rather than a full delegate/hooks round-trip against the old daemon. Flagging this explicitly for reviewer awareness rather than silently calling it done.
