@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::platform::ipc::{IpcListener, IpcStream};
 
@@ -849,10 +849,14 @@ async fn run_idle_monitor(
 /// hook events use (`event_tx` broadcast + `AppState::apply_event`), so a
 /// pane running a foreground shell command (e.g. a role's `cargo build`)
 /// reads `Working` even when no agent-emitted hook/wrapper event fires in
-/// between. Edge-triggered per pane — only emits on a busy/idle transition,
-/// never every tick — so this never floods attached clients with redundant
-/// events; `apply_event`'s own precedence rules (see its `ShellBusy`/
-/// `ShellIdle` arms) are what keep it from ever clobbering a real status.
+/// between. Per pane the trigger is edge-driven (a busy/idle transition) PLUS
+/// level-aware (PRD #386 M6b — the scan reads busy while the session's status
+/// has regressed to `Idle`/`Unknown`, as it does when Claude Code backgrounds
+/// a command at its 120s Bash cap and the resulting `Stop` hook lands as
+/// `Idle`), never every tick, so this never floods attached clients with
+/// redundant events; `apply_event`'s own precedence rules (see its
+/// `ShellBusy`/`ShellIdle` arms) are what keep it from ever clobbering a real
+/// status.
 ///
 /// Skips any pane with no already-known session
 /// (`AppState::pane_hook_session_id` returns `None`) — a bare shell pane
@@ -899,15 +903,99 @@ async fn run_shell_activity_monitor(
         last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
 
         for (pane_id, busy) in snapshot {
-            let changed = last_known.get(&pane_id).copied() != Some(busy);
-            last_known.insert(pane_id.clone(), busy);
-            if !changed {
+            let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
+
+            // Cheap path, and the overwhelmingly common one: a pane whose scan
+            // reads idle and whose reading did not just change has nothing to
+            // report, so it never takes the state lock at all.
+            if !changed && !busy {
                 continue;
             }
 
-            let Some(session_id) = state.read().await.pane_hook_session_id(&pane_id) else {
-                continue;
+            // PRD #386 M6b: the trigger is edge-driven PLUS level-aware. A
+            // purely edge-triggered monitor emits exactly one `ShellBusy` per
+            // busy window — at the rising edge — which is the whole reported
+            // bug: Claude Code's Bash tool backgrounds a command at its 120s
+            // cap, the agent ends its turn, the real `Stop` hook maps to
+            // `EventType::Idle` (`src/hook.rs`) and knocks the pane back to
+            // `Idle` while the command runs on. The scan still reads busy, but
+            // it read busy *before* `Stop` too, so there is no new edge and
+            // nothing ever re-promotes: measured at ~9.7 minutes of wrong
+            // badge for a ~700s command.
+            //
+            // So also re-emit when the scan reads busy AND the session's
+            // status has actually regressed to `Idle`/`Unknown`. That is a
+            // monitor-side correction only — it adds no precedence rule and
+            // changes no wire format; `apply_event`'s `ShellBusy` arm still
+            // decides what (if anything) to promote, and still promotes
+            // exactly `Idle`/`Unknown`, so a real `WaitingForInput`/`Error`/
+            // `Thinking`/`Working` is never overridden by this signal.
+            //
+            // It cannot spam the pipeline either: the re-emit is conditioned
+            // on the very status the emitted event corrects. One `ShellBusy`
+            // lands, `apply_event` moves the session to `Working`, and the
+            // next poll reads `Working` and sends nothing — a steady-state
+            // busy pane is silent until something knocks it back to `Idle`
+            // again.
+            let (session_id, agent_id, status_regressed) = {
+                let state = state.read().await;
+                let Some(session_id) = state.pane_hook_session_id(&pane_id) else {
+                    continue;
+                };
+                let session = state.sessions.get(&session_id);
+                // PRD #386 M6b: carry the pane's agent id. `apply_event`'s
+                // same-agent reuse guard matches an incoming event onto an
+                // existing card for the pane ONLY when the two `agent_id`s
+                // agree, and it is the client (not the daemon) where that
+                // matters: the DAEMON's card is keyed by the hook session id
+                // this event already carries, so it resolves either way, but
+                // an attached TUI mints its card at spawn time under a
+                // `pane-<id>` key with the spawn `agent_id` on it, and the
+                // real hook events are remapped onto THAT card. A synthesized
+                // event with `agent_id: None` failed the guard, missed the
+                // card, and created a SECOND, phantom session under the raw
+                // hook id — so the daemon read `Working` while the dashboard
+                // the user is looking at kept rendering the real card as
+                // `Idle` (plus a stray extra card). Measured directly: in a
+                // `006` run the TUI resolved every real event onto its card
+                // and ONLY `ShellBusy` onto a session of its own.
+                //
+                // Taken from the pane's own session rather than invented, so
+                // it is exactly the id the card was minted with; `None` when
+                // the session is not known yet, which is the pre-existing
+                // behaviour and no worse than it.
+                let agent_id = session.and_then(|session| session.agent_id.clone());
+                // A pane id with no `SessionState` yet is left to the rising
+                // edge alone — there is no status to have regressed, and
+                // guessing one would emit on every tick until the session
+                // materializes.
+                let regressed = busy
+                    && session.is_some_and(|session| {
+                        matches!(
+                            session.status,
+                            crate::state::SessionStatus::Idle
+                                | crate::state::SessionStatus::Unknown
+                        )
+                    });
+                (session_id, agent_id, regressed)
             };
+
+            if !changed && !status_regressed {
+                continue;
+            }
+
+            if !changed {
+                // Only ever the corrective re-emit — a transition logs
+                // nothing, and a steady-state busy pane reaches here at most
+                // once per regression, so this cannot become a per-tick line
+                // even at `RUST_LOG=debug`. It is the one place a "why is the
+                // badge still Idle?" investigation needs to look.
+                debug!(
+                    pane_id = %pane_id,
+                    "shell-activity: re-emitting ShellBusy — scan still reads busy while the \
+                     session fell back to Idle/Unknown"
+                );
+            }
 
             let event = AgentEvent {
                 session_id,
@@ -928,7 +1016,11 @@ async fn run_shell_activity_monitor(
                 user_prompt: None,
                 metadata: std::collections::HashMap::new(),
                 pane_id: Some(pane_id),
-                agent_id: None,
+                // The pane's own agent id — see where it is read above. This
+                // is what lets an attached TUI resolve the event onto the
+                // card it already renders for this pane instead of minting a
+                // phantom session beside it.
+                agent_id,
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
