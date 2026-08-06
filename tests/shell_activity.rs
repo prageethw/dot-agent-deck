@@ -1,18 +1,26 @@
-//! PRD #386 M1 — the process-table primitive the descendant-scan
-//! shell-activity signal is built on: `process_table()` enumerates every
-//! process on the machine (Unix; `None` on Windows), and `descendants()`
-//! walks that table from a root pid, cycle-safely.
+//! PRD #386 M1/M2 — the process-table primitive and the structural
+//! discriminator the descendant-scan shell-activity signal is built on:
+//! `process_table()` enumerates every process on the machine (Unix; `None`
+//! on Windows) including each process's POSIX session id (`ProcessInfo`),
+//! `descendants()` walks that table from a root pid cycle-safely, and
+//! `descendant_shell_activity()` classifies a table as busy/idle by
+//! `getsid(descendant) != getsid(root_pid)` — the structural test that
+//! replaced this PRD's original argv-match condition 3 (see the PRD's Work
+//! Log, 2026-08-06).
 //!
-//! Per the PRD's Test Plan, this proves nothing about the feature working in
-//! a real pane — that is the explicit lesson of PRD #370, whose one
-//! end-to-end test was a correct mechanism test wired to nothing real. This
-//! file exists so a later failure in the mechanism localises; M3/M4/M6
-//! (later milestones) carry the burden of proving the signal actually fires.
+//! Per the PRD's Test Plan, M1 proves nothing about the feature working in a
+//! real pane — that is the explicit lesson of PRD #370, whose one
+//! end-to-end test was a correct mechanism test wired to nothing real. M2
+//! proves the classification is correct against the measured process shapes,
+//! including the CI trap where the agent itself has no controlling
+//! terminal. M3/M4/M6 (later milestones) carry the burden of proving the
+//! signal actually fires in a real pane.
 //!
-//! RED until M1 lands: `dot_agent_deck::platform::proc::{ProcessInfo,
-//! process_table, descendants}` do not exist yet, so this test binary fails
-//! to compile. That compile-level RED is the point — coder implements to
-//! this file's intended API.
+//! RED until M1/M2 land: `dot_agent_deck::platform::proc::{ProcessInfo,
+//! process_table, descendants, descendant_shell_activity}` do not exist yet
+//! (or, for `ProcessInfo`, exist without a `session_id` field), so this test
+//! binary fails to compile. That compile-level RED is the point — coder
+//! implements to this file's intended API.
 
 #[cfg(unix)]
 use std::ffi::CString;
@@ -27,7 +35,9 @@ use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use dot_agent_deck::platform::proc::{ProcessInfo, descendants, process_table};
+use dot_agent_deck::platform::proc::{
+    ProcessInfo, descendant_shell_activity, descendants, process_table,
+};
 
 use spec::spec;
 
@@ -167,8 +177,11 @@ fn spawn_detached_grandchild(marker: &str) -> SpawnedGrandchild {
 /// process shape a real Claude Bash-tool child has in a real pane. Calls the
 /// not-yet-written `process_table()` + `descendants()` primitives and
 /// asserts `target` is found as a descendant of the test's own pid, with no
-/// controlling terminal, session-leader true, and its full argv containing
-/// the marker.
+/// controlling terminal, session-leader true, its full argv containing the
+/// marker, and — the amended assertion — a `session_id` that differs from
+/// the test process's own (read independently via `libc::getsid(0)`), the
+/// real-process proof that `getsid` reads what condition 3 of the
+/// discriminator assumes it reads.
 #[cfg(unix)]
 #[spec("status/shell-activity/001")]
 #[test]
@@ -212,6 +225,19 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
         "descendant argv must be the full command line — marker {marker:?} not found in {:?}",
         target.argv
     );
+
+    // SAFETY: `getsid(2)` with pid 0 means "the caller's own session id"; it
+    // is async-signal-safe and has no side effects. This is an independent
+    // oracle (not routed through `process_table()`) proving `target.session_id`
+    // — the field the discriminator's condition 3 is built on — actually
+    // reflects what `getsid` reports, rather than merely differing from some
+    // other field by coincidence.
+    let own_sid = unsafe { libc::getsid(0) };
+    assert_ne!(
+        target.session_id, own_sid,
+        "a setsid()'d grandchild must be its own session leader: its session id must differ \
+         from the test process's own (target={target:?}, own_sid={own_sid})"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +256,15 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
 #[spec("status/shell-activity/002")]
 #[test]
 fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
+    // `session_id` is irrelevant to cycle-termination — every row shares one
+    // arbitrary value so the walk's own logic (ppid-following, cycle
+    // detection) is what's under test, not the discriminator.
+    const IRRELEVANT_SID: i32 = 1000;
     let table = vec![
         ProcessInfo {
             pid: 2,
             ppid: 1,
+            session_id: IRRELEVANT_SID,
             has_controlling_tty: false,
             session_leader: false,
             argv: "cycle-entry".to_string(),
@@ -241,6 +272,7 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
         ProcessInfo {
             pid: 1,
             ppid: 2,
+            session_id: IRRELEVANT_SID,
             has_controlling_tty: false,
             session_leader: false,
             argv: "cycle-back-to-root".to_string(),
@@ -248,6 +280,7 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
         ProcessInfo {
             pid: 3,
             ppid: 2,
+            session_id: IRRELEVANT_SID,
             has_controlling_tty: false,
             session_leader: false,
             argv: "past-the-cycle".to_string(),
@@ -269,6 +302,148 @@ fn shell_activity_002_descendant_walk_terminates_on_a_ppid_cycle() {
         vec![2, 3],
         "the walk must report each reachable descendant exactly once and must not \
          re-report the root (pid 1) even though the cycle links back to it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M2 — the structural discriminator (any platform — pure data, no real
+// processes, no `ps`). Fixture rows are the measured tables from
+// `.dot-agent-deck/386-argv-notes.md` §4a / the PRD's own reproduction of it:
+// a live agent pane's `getsid(2)` table and its `ps -Ao pid,ppid,pgid,tty,stat,args`
+// table, both captured 2026-08-06 against Claude Code 2.1.220. The two
+// captures were taken at different instants and so carry different pids for
+// the Bash-tool subtree (61296 in the `ps` capture, 63120 in the `getsid`
+// capture); this fixture uses the `getsid` capture's pid (63120) as the row
+// identity and attributes to it the no-controlling-tty / session-leader
+// shape the PRD states is true of "every Bash-tool child measured" (not
+// specific to either single capture).
+//
+// Session id caveat, reported rather than invented: the `getsid` table
+// names an explicit session id for only three of the five confounders
+// (context7, engram, caffeinate — all `sid=51698`, the agent's own). It does
+// not list `task-master` or `pysemgrep`. Their session id here (also
+// `51698`) is derived, not separately `getsid`-measured: the `ps` table
+// shows `pgid=51698` for both, on the same `ttys014` as the three confirmed
+// rows, and none of the five ever appears with a `pgid` that isn't also a
+// confirmed session id elsewhere in the same tables — so `pgid` and `sid`
+// coincide throughout this tree (true for the pane leader and for the three
+// confirmed confounders alike). Flagged here, and in the work-done report,
+// rather than silently presented as a direct `getsid` reading.
+// ---------------------------------------------------------------------------
+
+const AGENT_PID: i32 = 51757;
+const AGENT_SID: i32 = 51698;
+const BASH_TOOL_SID: i32 = 63118;
+
+/// The agent's own row plus its five measured long-lived children
+/// (`context7`, `task-master`, `engram`, `pysemgrep`, `caffeinate`), all in
+/// the agent's own session on the pane's tty. `flip_ctty_to_none` simulates
+/// the CI trap: every row (the agent included) reporting no controlling
+/// terminal, exactly the container shape `.dot-agent-deck/386-argv-notes.md`
+/// §5 measured (`tty_nr = 0` for PID 1 under `docker run` without `-t`).
+fn backbone_rows(flip_ctty_to_none: bool) -> Vec<ProcessInfo> {
+    let has_ctty = !flip_ctty_to_none;
+    let mut rows = vec![ProcessInfo {
+        pid: AGENT_PID,
+        // Parent is the pane leader (devbox), not itself a descendant of
+        // AGENT_PID and so never reachable by the walk — included only so
+        // `descendant_shell_activity` can look up the agent's own session id
+        // from the same table it classifies against.
+        ppid: 51698,
+        session_id: AGENT_SID,
+        has_controlling_tty: has_ctty,
+        session_leader: false,
+        argv: "claude --model opus".to_string(),
+    }];
+    for (pid, argv) in [
+        (51787, "npm exec @upstash/context7-mcp"),
+        (51788, "npm exec task-master-ai"),
+        (51789, "engram mcp --tools=agent"),
+        (51807, "pysemgrep mcp"),
+        (60798, "caffeinate -i -t 300"),
+    ] {
+        rows.push(ProcessInfo {
+            pid,
+            ppid: AGENT_PID,
+            session_id: AGENT_SID,
+            has_controlling_tty: has_ctty,
+            session_leader: false,
+            argv: argv.to_string(),
+        });
+    }
+    rows
+}
+
+/// The measured Bash-tool descendant: `setsid`-detached into its own
+/// session (`BASH_TOOL_SID`, differing from `AGENT_SID`), no controlling
+/// terminal, its own session leader — already true in the CI-trap case, so
+/// unlike [`backbone_rows`] this has no `flip_ctty_to_none` parameter.
+fn bash_tool_descendant_row() -> ProcessInfo {
+    ProcessInfo {
+        pid: 63120,
+        ppid: AGENT_PID,
+        session_id: BASH_TOOL_SID,
+        has_controlling_tty: false,
+        session_leader: true,
+        argv: "/bin/zsh -c source …/shell-snapshots/snapshot-zsh-… && eval …".to_string(),
+    }
+}
+
+/// Scenario: builds three pairs of fixture tables from the measured
+/// `getsid`/`ps` captures in `.dot-agent-deck/386-argv-notes.md` and the
+/// PRD — Table A (backbone plus the Bash-tool descendant), Table B (backbone
+/// only), and a CI-trap variant of both where every row, the agent included,
+/// reports no controlling terminal. Calls the not-yet-written
+/// `descendant_shell_activity()` with the argv cross-check disabled
+/// (`shapes: &[]`) throughout, and asserts Table A classifies busy, Table B
+/// classifies idle, and the CI-trap variant of each classifies identically
+/// to its non-trap counterpart — pinning both that the session-id test alone
+/// excludes every measured confounder and that the exclusion survives the
+/// container shape where a bare no-controlling-terminal test would collapse.
+#[spec("status/shell-activity/003")]
+#[test]
+fn shell_activity_003_session_id_discriminator_classifies_the_measured_confounders() {
+    // Table A: backbone + the measured Bash-tool descendant -> busy.
+    let mut table_a = backbone_rows(false);
+    table_a.push(bash_tool_descendant_row());
+    assert_eq!(
+        descendant_shell_activity(&table_a, AGENT_PID, &[]),
+        Some(true),
+        "a descendant in a different POSIX session than the agent must classify the pane as busy"
+    );
+
+    // Table B: backbone only, argv cross-check disabled -> idle. This is
+    // what pins the claim the whole design rests on: the session-id test
+    // alone, with no argv help, already excludes every measured confounder.
+    let table_b = backbone_rows(false);
+    assert_eq!(
+        descendant_shell_activity(&table_b, AGENT_PID, &[]),
+        Some(false),
+        "every measured confounder (context7, task-master, engram, pysemgrep, caffeinate) shares \
+         the agent's own session id; the session-id test alone, with the argv cross-check \
+         disabled, must exclude all five"
+    );
+
+    // CI trap: same two tables, every row (agent included) now reports no
+    // controlling terminal. Classification must be unchanged — the
+    // discriminator compares session ids, and must never fall back to a
+    // bare no-ctty test that would collapse here.
+    let mut table_a_ci_trap = backbone_rows(true);
+    table_a_ci_trap.push(bash_tool_descendant_row());
+    assert_eq!(
+        descendant_shell_activity(&table_a_ci_trap, AGENT_PID, &[]),
+        Some(true),
+        "classification of the busy table must not change when every process, including the \
+         agent, has no controlling terminal (the CI/container shape)"
+    );
+
+    let table_b_ci_trap = backbone_rows(true);
+    assert_eq!(
+        descendant_shell_activity(&table_b_ci_trap, AGENT_PID, &[]),
+        Some(false),
+        "classification of the confounder-only table must not change under the same CI-trap \
+         condition — this is the direct regression test for a bare no-controlling-terminal \
+         fallback"
     );
 }
 
