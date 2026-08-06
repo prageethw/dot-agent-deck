@@ -1283,6 +1283,42 @@ impl TuiDeck {
         }
     }
 
+    /// Debounced cursor read: poll [`terminal_cursor_snapshot`](Self::terminal_cursor_snapshot)
+    /// until `STABLE_SAMPLES` consecutive reads — position AND cell styling,
+    /// both fields of `TerminalCursorSnapshot`'s `PartialEq` — come back
+    /// identical, or `timeout` elapses, whichever is first. A single
+    /// snapshot taken right after a grid-content wait (e.g.
+    /// `wait_for_grid_string_within`) can land on a frame that is not yet
+    /// final: more PTY output may still be in flight, or the deck's own
+    /// synthetic block cursor (painted in `src/terminal_widget.rs` with
+    /// `Color::LightGreen`/`BOLD`) may not have been repainted at the new
+    /// position yet (PRD #393: this is what made
+    /// `orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes`
+    /// flaky — a cursor snapshot taken one frame early). Prefer this over a
+    /// bare `terminal_cursor_snapshot()` whenever the caller is about to
+    /// compare cursor position/styling across two points in time.
+    pub fn wait_for_settled_terminal_cursor(&self, timeout: Duration) -> TerminalCursorSnapshot {
+        const STABLE_SAMPLES: u32 = 3;
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+        let deadline = Instant::now() + timeout;
+        let mut last = self.terminal_cursor_snapshot();
+        let mut stable_count = 1;
+        loop {
+            if stable_count >= STABLE_SAMPLES || Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+            let current = self.terminal_cursor_snapshot();
+            if current == last {
+                stable_count += 1;
+            } else {
+                last = current;
+                stable_count = 1;
+            }
+        }
+    }
+
     /// Return the styling at one cell of the real terminal grid.
     pub fn grid_cell_style(&self, row: u16, col: u16) -> Option<GridCellStyle> {
         self.parser
