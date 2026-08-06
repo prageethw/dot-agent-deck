@@ -39,7 +39,7 @@ cargo test-fast lifecycle_001     # filter to one test
 cargo test-fast                   # run the full fast tier
 ```
 
-E2e tier — two lanes since issue #502, split by whether a test reaches a **real agent** (CLAUDE.md rule 5):
+E2e tier — two lanes since issue #502, split by whether a test reaches a **real agent** (CLAUDE.md rule 5 — see the fork note below for where lane 1 actually runs on this fork):
 
 | Lane | Command | Contents | Runs |
 | --- | --- | --- | --- |
@@ -59,6 +59,8 @@ cargo test-e2e-live claude_001          # lane 2 needs your own agent credential
 For a watch loop, `bacon test-fast` (or `bacon test-e2e` / `bacon test-e2e-live`) reruns on every save; press `f` to filter to currently-failing tests, `esc` to clear. Function names follow Decision 17's `<sub-area>_<NNN>_<suffix>` pattern, so the filter is unique by construction.
 
 [`docs/develop/e2e-lanes.md`](docs/develop/e2e-lanes.md) covers the operational side: how to drive lane 2, why a green run can still mean almost nothing, and what keeps a credential out of the `.cast` recordings the demo reel publishes.
+
+**On this fork, full-tier runs belong to CI.** The filtered forms above (`cargo test-fast <one_test>`, `cargo test-e2e <one_test>`) are *progression* testing — the new or changed tests of the task in hand — and stay local and unrestricted. The bare full-tier forms (`cargo test-fast`, `cargo test-e2e`) are *regression* testing: push the branch and read the results from CI, which runs the L2 tier via the fork's informational, non-blocking `e2e:` job, rather than running them locally to check nothing broke. The two exceptions — real-agent paths CI cannot cover for lack of credentials, and local `.cast` recordings for the demo reel — require naming which one applies. `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo xtask linkage-check` stay local and are required before every commit. See `CLAUDE.md` rule 5's fork-only addendum for the full statement.
 
 ## How to add a new test
 
