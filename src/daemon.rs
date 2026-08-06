@@ -916,26 +916,52 @@ async fn run_shell_activity_monitor(
 ) {
     // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
     // between feeling responsive and negligible overhead (one registry lock
-    // + one `ps -A` sample per tick, reused across every live pane, plus a
-    // `getsid` per row). PRD #386 M5 is where that cost gets measured and the
-    // cadence confirmed or revised; left unchanged here deliberately, so M5
-    // measures the shape that actually shipped.
+    // + one process-table sample per tick, reused across every live pane,
+    // plus a `getsid` per row). Fork issue #30 made that sample two `ps -A`
+    // invocations rather than one — the `getsid` pass is sandwiched between
+    // them so a recycled pid's session id can be distrusted — which is the
+    // shape PRD #386 M5's cost measurement should now be taken against. The
+    // cadence itself is left unchanged deliberately, so M5 measures what
+    // actually shipped.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
+        // Fork issue #29 / Greptile P2 on upstream PR #390: sample the process
+        // table through the ASYNC, budgeted sampler. The old call ran a
+        // synchronous, unbounded `ps` straight on this Tokio worker, so a slow
+        // or wedged `ps` stalled the worker — and with it the status hooks,
+        // client requests and shutdown scheduled on it — not merely this
+        // signal.
+        //
+        // **A sample that timed out or failed means `None` — "no opinion" —
+        // and must NEVER be read as "no pane is busy".** This is the one
+        // non-obvious decision in the change, so it lives here at the call
+        // site: `continue` skips the whole tick, deliberately leaving
+        // `last_known` untouched so a failed sample is a true no-op. Folding a
+        // failed sample into an empty snapshot instead would clear the
+        // edge-detection state and, on the next successful tick, re-emit a
+        // fresh `ShellIdle` for panes that never stopped being busy — silently
+        // flipping busy panes to `Idle`, which is exactly the stale-status bug
+        // PRD #386 exists to close, reintroduced through a different door.
+        let Some(table) = crate::platform::proc::process_table_async().await else {
+            continue;
+        };
+
         // PRD #386 M3: the CATALOG of measured shapes, not a set applied to
-        // every pane — `shell_foreground_busy_snapshot` selects from it per
+        // every pane — `shell_foreground_busy_snapshot_in` selects from it per
         // pane by agent kind, so a Claude pane gets the one shape measured
         // against Claude Code and an agent whose shell-tool shape has never
         // been measured gets none (structural session-id test alone). Passing
         // Claude's fingerprint to a Codex/OpenCode/Pi pane would veto a
         // genuinely detached descendant and leave the pane silently reading
         // `Idle`.
-        let snapshot = pty_registry
-            .shell_foreground_busy_snapshot(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
+        let snapshot = pty_registry.shell_foreground_busy_snapshot_in(
+            &table,
+            crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES,
+        );
         let seen: std::collections::HashSet<&str> = snapshot
             .iter()
             .map(|(pane_id, _)| pane_id.as_str())

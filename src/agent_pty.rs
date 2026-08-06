@@ -4109,8 +4109,14 @@ impl AgentPtyRegistry {
     /// belt-and-braces check.
     ///
     /// The process table is sampled **once**, before the registry lock is taken
-    /// — one `ps -A` per tick reused for every pane (PRD #386 Route A), and no
+    /// — one sample per tick reused for every pane (PRD #386 Route A), and no
     /// fork/exec while holding a lock the TUI-facing paths also take.
+    ///
+    /// **Blocking**, because sampling the table is: the daemon's poll is on a
+    /// Tokio runtime and must sample with
+    /// [`crate::platform::proc::process_table_async`] and then call
+    /// [`Self::shell_foreground_busy_snapshot_in`] with the result. This form
+    /// stays for callers that are not on a runtime (tests and diagnostics).
     pub fn shell_foreground_busy_snapshot(
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],
@@ -4118,6 +4124,20 @@ impl AgentPtyRegistry {
         let Some(table) = crate::platform::proc::process_table() else {
             return Vec::new();
         };
+        self.shell_foreground_busy_snapshot_in(&table, shapes)
+    }
+
+    /// [`Self::shell_foreground_busy_snapshot`] against a table the caller
+    /// already sampled — the form the daemon's poll uses, so the `ps` fork/exec
+    /// happens on the async sampler and never on the Tokio worker that runs
+    /// this classification (Greptile P2 on upstream PR #390).
+    ///
+    /// Pure classification: no subprocess, no I/O, one registry lock.
+    pub fn shell_foreground_busy_snapshot_in(
+        &self,
+        table: &[crate::platform::proc::ProcessInfo],
+        shapes: &[crate::platform::proc::ShellToolShape],
+    ) -> Vec<(String, bool)> {
         let inner = self.inner.lock().unwrap();
         inner
             .agents
@@ -4131,7 +4151,7 @@ impl AgentPtyRegistry {
                     .copied()
                     .filter(|shape| Some(shape.agent) == key)
                     .collect();
-                let busy = agent.shell_activity_in(&table, &for_pane)?;
+                let busy = agent.shell_activity_in(table, &for_pane)?;
                 Some((pane_id, busy))
             })
             .collect()
