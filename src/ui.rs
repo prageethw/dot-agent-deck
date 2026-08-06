@@ -1575,6 +1575,22 @@ struct UiState {
     /// is likewise driven by a single global chord (`Ctrl+t`). Not
     /// persisted: every deck starts at `Default` on launch.
     split_stage: SplitStage,
+    /// PRD #393 M2 (decision 2): the deck-global command-entry lock toggled
+    /// by `Ctrl+e`. One value for the whole deck — every Orchestration tab
+    /// reads it, so toggling on any of them changes it on all of them and a
+    /// newly opened Orchestration tab adopts the current value. Replaces the
+    /// per-tab `Tab::Orchestration::command_entry_locked` field PRD #374
+    /// added; the lock reflects how someone is working right now, not which
+    /// tab they happened to open. Same shape, lifetime and "deck-global UI
+    /// preference" semantics as `pane_layout` / `split_stage` above.
+    ///
+    /// Deck-global is about WHERE the value lives, not how far the gate
+    /// reaches (decision 3): `gate_pane_input_key` still only ever gates
+    /// `Tab::Orchestration`, and `scope_command_entry_lock` still only ever
+    /// claims the chord there, in `UiMode::Normal`. Starts `true` — only the
+    /// orchestrator pane accepts direct input until `Ctrl+e` unlocks it.
+    /// Not persisted: every deck starts locked on launch.
+    command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -1868,6 +1884,9 @@ impl UiState {
             update_available: None,
             pane_layout: PaneLayout::Stacked,
             split_stage: SplitStage::Default,
+            // PRD #393 M2: every deck starts LOCKED (PRD #374's default,
+            // now held once for the whole deck).
+            command_entry_locked: true,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             selection: None,
@@ -4286,25 +4305,34 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+e to unlock";
 
 /// PRD #374 (#361 Item 3): gate the PTY-forward fallback [`handle_pane_input_key`]
-/// produces against the active orchestration tab's command-entry lock. When
-/// the active tab is `Tab::Orchestration`, its lock is engaged, and the
-/// currently focused pane is not the orchestrator
-/// (`role_pane_ids[start_role_index]`), a would-be `Action::ForwardToPane` is
-/// dropped (returned as `Action::Continue`) before it ever reaches the
-/// pane's PTY. The orchestrator pane's own input is never gated, and
-/// non-orchestration tabs (Dashboard/Mode) are unaffected — this is the sole
-/// gate site, so global chords resolved earlier by `global_action_for_mode`
-/// are never touched by it.
+/// produces against the command-entry lock. When the active tab is
+/// `Tab::Orchestration`, the lock is engaged, and the currently focused pane
+/// is not the orchestrator (`role_pane_ids[start_role_index]`), a would-be
+/// `Action::ForwardToPane` is dropped (returned as `Action::Continue`) before
+/// it ever reaches the pane's PTY. The orchestrator pane's own input is never
+/// gated, and non-orchestration tabs (Dashboard/Mode) are unaffected — this is
+/// the sole gate site, so global chords resolved earlier by
+/// `global_action_for_mode` are never touched by it.
+///
+/// PRD #393 M2: the lock itself is read from the deck-global
+/// [`UiState::command_entry_locked`] rather than a per-tab field. Only WHERE
+/// the value lives changed — the tab-kind match below is what bounds the
+/// gate's reach to Orchestration tabs (decision 3), and it is unchanged.
+/// `ui` is taken whole rather than as a bare `bool` so M3's `WaitingForInput`
+/// carve-out can read live pane status here without another signature change.
 fn gate_pane_input_key(
     action: Action,
+    ui: &UiState,
     tab_manager: &TabManager,
     pane: &dyn PaneController,
 ) -> Action {
     if !matches!(action, Action::ForwardToPane(_)) {
         return action;
     }
+    if !ui.command_entry_locked {
+        return action;
+    }
     let Tab::Orchestration {
-        command_entry_locked: true,
         role_pane_ids,
         start_role_index,
         ..
@@ -7201,25 +7229,23 @@ fn dispatch_action(
                     Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
             }
         }
-        // Ctrl+e: toggle the active orchestration tab's command-entry lock
-        // (PRD #374 / #361 Item 3). No-op outside an orchestration tab.
+        // Ctrl+e: toggle the deck-global command-entry lock (PRD #374 /
+        // #361 Item 3; moved onto `UiState` by PRD #393 M2). The action
+        // only ever reaches here from an Orchestration tab in command mode
+        // — `scope_command_entry_lock` un-resolves it everywhere else — so
+        // there is no per-tab guard left to apply, exactly as PRD #387 M2
+        // left `Ctrl+l`'s handler a single `ui.split_stage` assignment.
         Action::ToggleOrchestrationLock => {
-            if let Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                *command_entry_locked = !*command_entry_locked;
-                let lock_name = if *command_entry_locked {
-                    "locked"
-                } else {
-                    "unlocked"
-                };
-                ui.status_message = Some((
-                    format!("Pane entry: {lock_name}"),
-                    std::time::Instant::now(),
-                ));
-            }
+            ui.command_entry_locked = !ui.command_entry_locked;
+            let lock_name = if ui.command_entry_locked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            ui.status_message = Some((
+                format!("Pane entry: {lock_name}"),
+                std::time::Instant::now(),
+            ));
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
@@ -9177,7 +9203,7 @@ fn handle_key_event(
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
             UiMode::PaneInput => {
                 let candidate = handle_pane_input_key(key);
-                let gated = gate_pane_input_key(candidate.clone(), tab_manager, pane);
+                let gated = gate_pane_input_key(candidate.clone(), ui, tab_manager, pane);
                 if matches!(candidate, Action::ForwardToPane(_))
                     && matches!(gated, Action::Continue)
                 {
