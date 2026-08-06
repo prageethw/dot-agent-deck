@@ -6654,6 +6654,45 @@ fn scope_split_stage(
     }
 }
 
+/// PRD #393 M1 (L1 `orchestration/lock/007`, L2 `orchestration/lock/008`):
+/// un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode.
+///
+/// Mirrors [`scope_split_stage`] above for the command-entry lock, for the same
+/// conflict class: `Ctrl+E` is `0x05`, readline's `end-of-line`. #374 claimed
+/// the chord on an Orchestration tab from *any* mode, so a focused pane's PTY
+/// never received the byte and the user could not move to the end of a line
+/// they were typing. Scoping the claim to `UiMode::Normal` lets `PaneInput`
+/// fall through to `handle_pane_input_key` → `keyevent_to_bytes` → `0x05` on
+/// the PTY instead; the user presses `Ctrl+D` first to toggle the lock, exactly
+/// as `Ctrl+W` (#241 M1 / #218) and `Ctrl+L` (#387 M1) already require.
+///
+/// `is_orchestration_tab` is true **only** for `Tab::Orchestration`, whose
+/// `role_pane_ids[start_role_index]` gives the chord something to mean — it is
+/// deliberately *not* `scope_split_stage`'s `has_split_sidebar`, which is also
+/// true for Dashboard tabs. PRD #393 decision 3 keeps the lock's reach
+/// unchanged: what goes deck-global at M2 is the state, not the reach.
+///
+/// This *replaces* #374's inline un-resolution rather than adding a second
+/// mechanism — the mode term is the only new condition. Kept a standalone pure
+/// function for #342/#387's stated reason: it is unit-testable without a PTY,
+/// whereas an inline `if` at the call site is only reachable through the full
+/// event loop.
+fn scope_command_entry_lock(
+    action: Option<Action>,
+    is_orchestration_tab: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::ToggleOrchestrationLock)
+            if !is_orchestration_tab || mode != UiMode::Normal =>
+        {
+            None
+        }
+        other => other,
+    }
+}
+
 /// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
 /// resolve a key the way the live loop does for a given mode.
 ///
@@ -9131,16 +9170,17 @@ fn handle_key_event(
             Tab::Mode { .. } => false,
         };
         action = scope_split_stage(action, has_split_sidebar, ui.mode);
-        // PRD #374 (#361 Item 3): same reasoning as ToggleOrchestrationSplit
-        // above — Ctrl+e is scoped to orchestration tabs. On a Dashboard/
-        // Mode-tab pane, un-resolve it so the key falls through to the
-        // normal PaneInput forwarding path instead of being silently
-        // swallowed here.
-        if matches!(action, Some(Action::ToggleOrchestrationLock))
-            && !matches!(tab_manager.active_tab(), Tab::Orchestration { .. })
-        {
-            action = None;
-        }
+        // PRD #374 (#361 Item 3), re-scoped by PRD #393 M1: same reasoning as
+        // CycleSplitStage above — Ctrl+e is claimed only on an Orchestration
+        // tab, and now only in command mode. On a Dashboard/Mode-tab pane, or
+        // inside a focused pane, un-resolve it so the key falls through to the
+        // normal PaneInput forwarding path (readline's end-of-line, 0x05)
+        // instead of being silently swallowed here. Note this is a FRESH
+        // Tab::Orchestration test, not `has_split_sidebar` above — that is
+        // also true for Dashboard tabs, whose gate reach is unchanged
+        // (#393 decision 3).
+        let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
+        action = scope_command_entry_lock(action, is_orchestration_tab, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
