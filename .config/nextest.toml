@@ -4,7 +4,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
 
 [profile.default.junit]
-path = "target/nextest/default/junit.xml"
+# Relative to the profile's STORE directory (`target/nextest/default/`), so the
+# value must not repeat that prefix. It did until issue #33, which put the report
+# at `target/nextest/default/target/nextest/default/junit.xml` — harmless while
+# nothing read it, but CI's `e2e:` job now parses this file to publish the
+# flaky/failed test list into the run summary, so the path has to be the real one.
+path = "junit.xml"
 
 # PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
 # across two orchestration tabs and drives two concurrent
@@ -33,6 +38,48 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
+# Issue #33: cap how many PTY tests run CONCURRENTLY.
+#
+# Every test in a `tests/e2e_*.rs` binary that matters here drives a real spawned
+# deck binary plus a daemon plus one or more agent PTYs, then asserts on rendered
+# UI state against fixed wall-clock deadlines (`WAIT_TIMEOUT` in
+# `tests/common/mod.rs` is 10s, and `wait_for_*_within` callers pass 2-15s). They
+# do not degrade gracefully under CPU starvation — they go red.
+#
+# Measured on the fork's informational `e2e:` job (job 92534838701, 2026-08-06):
+# nextest kept a steady FOUR tests in flight for the whole run, because GitHub's
+# standard hosted Linux runner for a public repo is 4 vCPU and nextest defaults
+# `--test-threads` to the core count. Three tests died exactly at the harness
+# deadline (`did not see "ClaudeCode" within 10s`, `did not reach grid state
+# "absence of \"worker\"" within 10s`), and a whole family of scheduler-manager
+# tests PASSED with almost no margin, at 10.2-10.4s. Different runs kill a
+# different random subset — the signature of contention, not of a per-test defect.
+#
+# Four concurrent decks on four vCPUs is the cause: each of those tests is itself
+# several processes. This caps the group at 2, so at most two decks compete. A
+# GROUP limit, not a global `--test-threads`: the other ~3400 tests in the run
+# (unit tests, plus the 26 `common::harness_unit_tests` that `tests/common/mod.rs`
+# links into EVERY `e2e_*` binary — 1820 cheap duplicates in total) keep filling
+# the remaining thread slots, so the cheap majority of the suite is untouched.
+# `cargo nextest show-config test-groups --features e2e` reports 201 members with
+# the exclusion in place, versus 2021 without it.
+#
+# Cost, from the same run's numbers: the group carries roughly 420s of busy time,
+# so a 2-wide cap floors the group at ~210s of wall clock against a test phase
+# that measured 257s. The real delta should be smaller than that arithmetic
+# suggests, because the old run was ALREADY tail-serialised — its last ~110s ran
+# exactly one test, `version_001`, whose wall clock is a compile. Either way the
+# trade is deliberate: a slower job in exchange for one that means something when
+# it is red. It applies to local `cargo test-e2e` too, which is the same direction
+# CLAUDE.md rule 5 already pushes — the L2 tier is what starved the contributor
+# machine that prompted moving this tier into CI at all.
+[test-groups]
+pty-e2e = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'binary(/^e2e_/) - test(/^common::harness_unit_tests::/)'
+test-group = 'pty-e2e'
+
 [profile.e2e]
 slow-timeout = { period = "120s", terminate-after = 2 }
 
@@ -42,6 +89,12 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 [[profile.e2e.overrides]]
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# Same carve-out for the issue #33 concurrency cap, for the same reason: an
+# override list is per-profile and is not inherited from `default`.
+[[profile.e2e.overrides]]
+filter = 'binary(/^e2e_/) - test(/^common::harness_unit_tests::/)'
+test-group = 'pty-e2e'
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
