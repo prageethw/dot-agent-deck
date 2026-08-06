@@ -259,3 +259,122 @@ fn orchestration_lock_006_real_agent_gated_by_lock_state() {
 fn tail(text: &str) -> &str {
     &text[text.len().saturating_sub(2000)..]
 }
+
+/// Scenario: PRD #393 M1 — the real-pane proof that `Ctrl+e` is claimed only
+/// in command mode. On a real Orchestration tab (`orch-lock-bash-role`
+/// fixture: a real interactive bash/readline orchestrator role, plus a
+/// `cat`-stub worker role), with the orchestrator pane focused in
+/// `PaneInput` mode: type a partial line, home the cursor with `Ctrl+a`
+/// (readline's `beginning-of-line`, a chord the deck never binds, so it is
+/// safe to use as a control that proves the harness can observe cursor
+/// movement at all), then send `Ctrl+e` (`0x05`) and confirm the cursor
+/// returns to end-of-line — proving readline's `end-of-line` genuinely ran
+/// rather than the byte being claimed as `Action::ToggleOrchestrationLock`.
+/// Then press `Ctrl+d` to reach command mode and `Ctrl+e` again, focus the
+/// non-orchestrator worker role, and confirm a keystroke now reaches its PTY
+/// (the same unlocked-forwarding technique `orchestration/lock/004`-`006`
+/// use) — proving the chord still toggles the lock from command mode. RED
+/// today: the global keybinding resolver claims `Ctrl+e` as
+/// `Action::ToggleOrchestrationLock` on every Orchestration tab regardless
+/// of mode (PRD #374), so the first `Ctrl+e` in `PaneInput` mode never
+/// reaches the orchestrator's PTY and the cursor never returns to
+/// end-of-line.
+#[spec("orchestration/lock/008")]
+#[test]
+fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
+    const PARTIAL_LINE: &str = "LOCK008_PARTIAL_f3d1";
+    const WORKER_UNLOCKED_SENTINEL: &str = "LOCK008_WORKER_UNLOCKED_7be2";
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-lock-bash-role");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
+    deck.wait_for_string("CTRLL>");
+
+    // --- Part 1: the bug, as the user sees it in the orchestrator's own
+    // pane (never gated by the lock, so this isolates the assertion from
+    // lock state entirely). ---
+
+    deck.send_keys(PARTIAL_LINE.as_bytes()); // no trailing \r -- never submitted
+    assert!(
+        deck.wait_for_grid_string_within(PARTIAL_LINE, Duration::from_secs(3)),
+        "the partial line never appeared on the rendered grid\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    let end_of_line = deck.terminal_cursor_snapshot();
+
+    // Ctrl+a (0x01) == readline's beginning-of-line. The deck binds no
+    // action to this chord, so it is a safe control: if the cursor does not
+    // move here, the harness's cursor-observation technique itself is
+    // broken, independent of anything Ctrl+e does.
+    deck.send_bytes(b"\x01");
+    let homed = common::wait_until(Duration::from_secs(2), || {
+        let cursor = deck.terminal_cursor_snapshot();
+        (cursor.row, cursor.col) != (end_of_line.row, end_of_line.col)
+    });
+    assert!(
+        homed,
+        "control check failed: Ctrl+a (readline beginning-of-line) never \
+         moved the terminal cursor away from {end_of_line:?} — the harness \
+         cannot observe cursor movement in this pane at all, so a Ctrl+e \
+         failure below would not be trustworthy either.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    let start_of_line = deck.terminal_cursor_snapshot();
+    assert_eq!(
+        start_of_line.row, end_of_line.row,
+        "Ctrl+a must move the cursor within the same row, got \
+         start_of_line={start_of_line:?} vs end_of_line={end_of_line:?}"
+    );
+    assert!(
+        start_of_line.col < end_of_line.col,
+        "Ctrl+a must move the cursor LEFT toward the beginning of the \
+         line, got start_of_line={start_of_line:?} vs end_of_line={end_of_line:?}"
+    );
+
+    // Ctrl+e (0x05) == readline's end-of-line. This is the assertion that
+    // must be RED today: the global resolver claims 0x05 as
+    // Action::ToggleOrchestrationLock on every Orchestration tab regardless
+    // of mode (PRD #374), so the byte never reaches the PTY and the cursor
+    // never moves back.
+    deck.send_bytes(b"\x05");
+    let returned_to_end = common::wait_until(Duration::from_secs(2), || {
+        let cursor = deck.terminal_cursor_snapshot();
+        (cursor.row, cursor.col) == (end_of_line.row, end_of_line.col)
+    });
+    assert!(
+        returned_to_end,
+        "Ctrl+e did not reach the focused orchestrator role pane's PTY — \
+         readline's end-of-line never ran, so the cursor never returned to \
+         {end_of_line:?} (last seen at {:?}) after 2s. The global \
+         keybinding resolver claimed 0x05 as \
+         Action::ToggleOrchestrationLock even though a role pane was \
+         focused in PaneInput mode — orchestration tabs claim Ctrl+e \
+         mode-independently (PRD #393 Problem 1 / PRD #374).\nGrid:\n{}",
+        deck.terminal_cursor_snapshot(),
+        deck.snapshot_grid()
+    );
+
+    // --- Part 2: the chord must still work, from command mode. ---
+
+    deck.send_bytes(b"\x04"); // Ctrl+d -> Normal (command) mode
+    deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock
+
+    // Focus the non-orchestrator "worker" role and confirm a keystroke now
+    // reaches its PTY — the same unlocked-forwarding technique
+    // `orchestration/lock/004`-`006` use to observe the lock's toggle state.
+    focus_worker_role(&deck);
+    deck.send_keys(format!("{WORKER_UNLOCKED_SENTINEL}\r").as_bytes());
+    assert!(
+        deck.wait_for_grid_string_within(WORKER_UNLOCKED_SENTINEL, Duration::from_secs(3)),
+        "after Ctrl+d then Ctrl+e from command mode, a keystroke typed into \
+         the non-orchestrator worker pane never reached its PTY — expected \
+         the command-mode Ctrl+e to have toggled the command-entry lock \
+         from its default LOCKED state to unlocked.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}

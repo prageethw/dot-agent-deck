@@ -25472,6 +25472,79 @@ mod tests {
         }
     }
 
+    /// Scenario: Table-driven unit test of the pure `scope_command_entry_lock`
+    /// function (PRD #393 M1) over the full cross product of
+    /// `is_orchestration_tab` (true/false) x every `UiMode` variant x the
+    /// action being `ToggleOrchestrationLock`, some other action (`Quit`),
+    /// or `None`. Mirrors `layout_005`'s structure exactly. Confirms
+    /// `ToggleOrchestrationLock` survives ONLY at
+    /// `(is_orchestration_tab = true, UiMode::Normal)`, that every other
+    /// action passes through completely untouched in every cell (including
+    /// `(false, non-Normal)`, ruling out a blanket "drop the action"
+    /// implementation), and that `None` in always yields `None` out. This
+    /// is a mechanism test only — it proves nothing about a real pane on
+    /// its own; that real-pane proof is `orchestration/lock/008`'s job.
+    /// RED today: `scope_command_entry_lock` does not exist on this branch
+    /// yet, so this test fails to COMPILE rather than fails an assertion —
+    /// the crate will build again once the coder adds the function per the
+    /// PRD's Solution Overview, replacing #374's inline un-resolution.
+    #[spec("orchestration/lock/007")]
+    #[test]
+    fn orchestration_lock_007_scope_command_entry_lock_claims_only_when_orchestration_and_normal_mode()
+     {
+        let modes = all_ui_modes();
+
+        for is_orchestration_tab in [true, false] {
+            for &mode in &modes {
+                let claims = is_orchestration_tab && mode == UiMode::Normal;
+
+                let lock_result = scope_command_entry_lock(
+                    Some(Action::ToggleOrchestrationLock),
+                    is_orchestration_tab,
+                    mode,
+                );
+                if claims {
+                    assert!(
+                        matches!(lock_result, Some(Action::ToggleOrchestrationLock)),
+                        "ToggleOrchestrationLock should survive at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                } else {
+                    assert!(
+                        lock_result.is_none(),
+                        "ToggleOrchestrationLock should be un-resolved (None) at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                }
+
+                // Every OTHER action must pass through completely untouched
+                // in EVERY cell, including (false, non-Normal) — this is
+                // the assertion that rules out implementing the fix as a
+                // blanket "drop the action" rather than one scoped
+                // specifically to ToggleOrchestrationLock.
+                let other_result =
+                    scope_command_entry_lock(Some(Action::Quit), is_orchestration_tab, mode);
+                assert!(
+                    matches!(other_result, Some(Action::Quit)),
+                    "a non-ToggleOrchestrationLock action must pass through \
+                     untouched at (is_orchestration_tab={is_orchestration_tab}, \
+                     mode={mode:?}), got {other_result:?}"
+                );
+
+                // None in, None out, in every cell.
+                let none_result = scope_command_entry_lock(None, is_orchestration_tab, mode);
+                assert!(
+                    none_result.is_none(),
+                    "None must pass through as None at \
+                     (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                     got {none_result:?}"
+                );
+            }
+        }
+    }
+
     /// Scenario: PRD #387 M2/M3 — with both a Dashboard tab and a real
     /// Orchestration tab open, dispatch `Action::CycleSplitStage` while the
     /// Orchestration tab is active and assert BOTH tab types resolve their
