@@ -1151,31 +1151,6 @@ impl EmbeddedPaneController {
         let client = self.client.clone();
         let runtime = self.runtime.clone();
 
-        // Fork issue #36: capture the snapshot only AFTER the TUI's event
-        // subscription is confirmed. The daemon registers a subscriber's
-        // broadcast receiver before it acknowledges `SubscribeEvents`, so
-        // everything it broadcasts from that point on is guaranteed to reach
-        // us — which makes the snapshot below strictly newer than the stream
-        // and closes the window where an edge-triggered event (the paired
-        // `ShellIdle`) could fall between the two and be delivered to nobody.
-        //
-        // Expiry is deliberately non-fatal: hydration proceeds with the window
-        // open (today's behaviour) rather than stalling TUI startup behind a
-        // daemon that is not answering.
-        if let Some(gate) = self.hydration_gate.clone() {
-            let subscribed = runtime.block_on(async move {
-                gate.wait_subscribed(crate::reconnect::SUBSCRIBE_READY_TIMEOUT)
-                    .await
-            });
-            if !subscribed {
-                tracing::warn!(
-                    timeout_ms = crate::reconnect::SUBSCRIBE_READY_TIMEOUT.as_millis() as u64,
-                    "hydrate_from_daemon: event subscription not confirmed in time; snapshotting \
-                     anyway — an event broadcast before the stream is up can still be lost"
-                );
-            }
-        }
-
         // Bounded list_agents call: a parked or hostile same-user daemon
         // could otherwise hang TUI startup on the blocking `block_on`. On
         // timeout we treat the result as empty (the user can reconnect)
