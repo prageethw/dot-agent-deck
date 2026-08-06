@@ -105,7 +105,7 @@ One subtlety that must be handled deliberately rather than discovered: **`observ
 
 **In-memory state.** The per-tab field is **removed, not shadowed** — keeping a global default plus a per-tab override reintroduces the "which one wins" ambiguity decision 2 exists to delete, and nothing requires a tab to diverge from the deck.
 
-- Delete `command_entry_locked: bool` from `Tab::Orchestration` (`src/tab.rs`) and its initialisers, including `src/ui.rs` test fixtures.
+- Delete `command_entry_locked: bool` from `Tab::Orchestration` — the declaration at `src/tab.rs:185` plus **exactly four** struct-literal initialisers, all in `src/tab.rs`: `:939` (`open_orchestration_tab`) and `:1076` (hydration/reconnect), both production, and `:1831` / `:1864`, fixtures in that file's own test module. **Correction, verified during M2:** this bullet previously said the initialisers include `src/ui.rs` test fixtures. There are none — every `src/ui.rs` occurrence of the field is a pattern-match *read*, never a struct-literal *write*.
 - Add `command_entry_locked: bool` to `UiState`, defaulting to `true`, directly alongside `pane_layout` and (post-#387) `split_stage` — same field, same lifetime, same deck-global-UI-preference semantics.
 - `Action::ToggleOrchestrationLock`'s handler collapses from a per-tab mutation to a single `ui.command_entry_locked = !ui.command_entry_locked`.
 
@@ -148,7 +148,19 @@ Each is independently testable; the test that proves each is named in the Test P
 - [ ] **M1 — `scope_command_entry_lock`, the chord fix.** The pure scoping function replaces #374's inline un-resolution. Orchestration tabs stop claiming `Ctrl+E` outside command mode. **Deliberately first and standalone**: it is the user-visible chord fix, independent of everything else, and the half that stands alone if the rest is rejected.
 - [ ] **M2 — Deck-global lock state.** `command_entry_locked` moves to `UiState`; the per-tab field is deleted; the toggle handler collapses to one assignment. Re-verify no persistence path touches it.
 - [ ] **M3 — The `WaitingForInput` carve-out.** `gate_pane_input_key` consults live pane status and stops gating a waiting pane; re-engages when the status clears.
-- [ ] **M4 — Delete the inactivity timer and gate the chain.** #373 M2/M3 removed in full per Migration; the surviving two-branch chain plus `observe_waiting_panes` gated on the lock; the edge latch cleared on locked→unlocked.
+- [ ] **M4 — Delete the inactivity timer and gate the chain.** #373 M2/M3 removed in full per Migration; the surviving two-branch chain plus `observe_waiting_panes` gated on the lock; the edge latch cleared on locked→unlocked. **Split during implementation into M4a (deletion) and M4b (chain gating) — see the sequencing note below.**
+
+### Sequencing correction found during implementation — M2 and M4a are one pass
+
+The milestone list above reads as if M2 and M4 are independent. They are not, and the coupling was only found once M2's RED tests existed. Recorded here because the milestone order is otherwise misleading to anyone picking this up.
+
+`auto_focus_after_inactivity`'s gating (`src/ui.rs:10742-10751`) **pattern-matches `Tab::Orchestration::command_entry_locked`** — the very field M2 removes. So M2 cannot land without breaking it. Nor can the deletion simply run first: M2's RED tests reference `ui.command_entry_locked`, so the test binary does not compile until M2 lands either. The two are mutually blocking, and the only orderings that produce a compiling tree are "both together" or "patch one temporarily and undo it later" — the latter being throwaway work on code already condemned.
+
+**Resolved: M2 and M4's deletion half ship in one coder pass** (as two commits where they split cleanly — deletion first, then the state move — so the wide subtraction stays reviewable apart from the state change). M1 remains the standalone commit the milestone ordering was really protecting, and it already shipped that way (`f854ef8`).
+
+**M4 therefore splits in two:**
+- **M4a — the deletion.** Pure subtraction: `auto_focus_after_inactivity`, `inactivity_timeout_from_env`, the `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS` seam, `last_role_pane_activity_at` and its six stamp sites, the blocked-keystroke stamp, the chain's third branch, and tests `tabs/orchestration/013`-`019`, `021`-`023` plus `orchestration/focus/001`. Ships with M2.
+- **M4b — the chain gating.** Gating the surviving two-branch chain and `observe_waiting_panes` on the deck-global lock, plus clearing the edge latch on the locked→unlocked transition. This is the PRD's only genuinely new state logic, it depends on M2's deck-global value existing, and it keeps its own tester-RED → coder cycle with `tabs/orchestration/026` as its pin.
 - [ ] **M5 — Real-pane proof.** The PTY-attached tests: `Ctrl+E` reaching a role pane's PTY, and the full locked/unlocked focus contract as a user sees it.
 - [ ] **M6 — Docs, changelog, PRD amendments, rule 12 answer.** Including the status-message wording change to name `Ctrl+D` first.
 - [ ] **M7 — Upstream contribution (optional, non-blocking, and NOT startable yet).** See "Upstream" below. This is a *net-new feature proposal*, not a port of this branch's diff, and it must not gate the fork work. **Gated on two things that are not code**: answering the three questions vfarcic left on [#369](https://github.com/vfarcic/dot-agent-deck/issues/369), and accumulating real usage evidence on the fork — he explicitly said that is the best possible argument for bringing it upstream.
