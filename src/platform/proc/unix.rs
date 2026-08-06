@@ -259,7 +259,13 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let mut pipe = child.stdout.take()?;
+    let Some(mut pipe) = child.stdout.take() else {
+        // Unreachable — stdout was just configured as a pipe — but returning
+        // without reaping would leave a zombie behind on every call.
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = pipe.read_to_end(&mut buf);
@@ -283,6 +289,10 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
             let _ = child.wait();
             break None;
         }
+        // Same shape as `terminate_child_with_grace_and_wait`'s grace poll: a
+        // child that finishes early is picked up on the next tick rather than
+        // costing the whole budget. 5 ms is well under the cost of the `ps` it
+        // is waiting on and keeps the CPU cost of the wait negligible.
         std::thread::sleep(Duration::from_millis(5));
     };
 
