@@ -6601,6 +6601,44 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
 }
 
+/// PRD #387 M1 (L1 `orchestration/layout/005`, L2 `tabs/orchestration/024`):
+/// un-resolve `CycleSplitStage` unless the deck genuinely wants to claim
+/// `Ctrl+L` — i.e. unless the active tab has a sidebar/pane-column split AND
+/// the user is in command mode.
+///
+/// `Ctrl+L` is `clear-screen` in readline and in the interactive agents the
+/// user runs *inside* a role pane, and a role pane is the most likely place on
+/// the whole deck to want a screen clear. Claiming the chord while such a pane
+/// is focused means the agent never receives `0x0c` and the clear is
+/// unobtainable — which is exactly what orchestration tabs did before this,
+/// claiming `Ctrl+L` mode-independently. Scoping the claim to command mode
+/// lets `PaneInput` fall through to `handle_pane_input_key` →
+/// `keyevent_to_bytes` → `0x0c` on the PTY instead.
+///
+/// This is the same trade, for the same conflict class, that `close_pane`'s
+/// scoping made in PRD #241 M1: a globally-bound chord that a pane's occupant
+/// also wants is claimed only in command mode, and the user pays one extra
+/// `Ctrl+D` rather than losing the chord entirely. Deliberate pattern, not a
+/// one-off — see [`global_action_for_mode`] above for the `Ctrl+W` precedent.
+///
+/// Generalizes upstream #342's `scope_orchestration_split` with one extra
+/// parameter so a single rule covers every tab type: `has_split_sidebar` is
+/// true for Dashboard and Orchestration tabs, false for Mode tabs (whose 50/50
+/// layout has no sidebar/pane-column split at all, so they never claim it).
+/// Kept a standalone pure function for the reason #342 did — it is unit
+/// testable without a PTY, whereas an inline `if` at the call site is only
+/// reachable through the full event loop.
+fn scope_split_stage(
+    action: Option<Action>,
+    has_split_sidebar: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::CycleSplitStage) if !has_split_sidebar || mode != UiMode::Normal => None,
+        other => other,
+    }
+}
+
 /// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
 /// resolve a key the way the live loop does for a given mode.
 ///
@@ -9064,26 +9102,19 @@ fn handle_key_event(
     // while the user is typing in a pane.
     if action.is_none() && !is_ctrl_c {
         action = global_action_for_mode(&kb, ui.mode, &key);
-        // PRD #336, extended to a 3-stage cycle by PRD #361 Item 4:
-        // CycleSplitStage is scoped per tab type. global_action_for_mode has
-        // no tab context, so a Ctrl+l typed into a pane on a tab/mode that
-        // doesn't claim it would otherwise be claimed here and never reach
-        // the PTY (breaking readline's clear-screen). Orchestration tabs
-        // claim Ctrl+l mode-independently — unchanged PRD #336 behavior, not
-        // something this PRD revisits. Dashboard tabs claim it ONLY in
-        // Normal mode (cards view, no pane focused), so a focused Dashboard
-        // pane's Ctrl+l still forwards to its PTY (e.g. readline's
-        // clear-screen). Mode tabs never claim it.
-        if matches!(action, Some(Action::CycleSplitStage)) {
-            let claims_ctrl_l = match tab_manager.active_tab() {
-                Tab::Orchestration { .. } => true,
-                Tab::Dashboard { .. } => ui.mode == UiMode::Normal,
-                Tab::Mode { .. } => false,
-            };
-            if !claims_ctrl_l {
-                action = None;
-            }
-        }
+        // PRD #336, extended to a 3-stage cycle by PRD #361 Item 4 and scoped
+        // uniformly by PRD #387 M1: CycleSplitStage is claimed only in command
+        // mode, and only on a tab type that HAS a sidebar/pane-column split.
+        // global_action_for_mode has no tab context, so a Ctrl+l typed into a
+        // focused pane would otherwise be claimed here and never reach the PTY
+        // (breaking readline's clear-screen and the agent's own screen clear).
+        // Dashboard and Orchestration tabs have the split; Mode tabs (50/50,
+        // no sidebar) never claim it.
+        let has_split_sidebar = match tab_manager.active_tab() {
+            Tab::Orchestration { .. } | Tab::Dashboard { .. } => true,
+            Tab::Mode { .. } => false,
+        };
+        action = scope_split_stage(action, has_split_sidebar, ui.mode);
         // PRD #374 (#361 Item 3): same reasoning as ToggleOrchestrationSplit
         // above — Ctrl+e is scoped to orchestration tabs. On a Dashboard/
         // Mode-tab pane, un-resolve it so the key falls through to the
