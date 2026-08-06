@@ -161,6 +161,8 @@ You notify at exactly these four moments and nowhere else — per-step chatter d
 
 **Lead every report you write back to the user with a short Summary** — two or three sentences naming the PRD number and/or issue number the work belongs to, what changed, and the outcome (done / blocked / needs a decision). Detail follows underneath. Someone reading only the summary should be able to tell which PRD it is and whether it needs their attention.
 
+**Include a progress table whenever the report covers work that spans more than one step** — every milestone or step of the PRD, its state, and who holds it, not only the step that just finished. Mark each row done / in flight / not started, and mark explicitly which rows need a decision from the user. Make **blocked-on-a-person** rows obvious too: this repo routinely has work that is finished on our side and waiting on an upstream maintainer, and that is not the same as work still in progress. The point is that someone reading the report can see the whole shape of the work and what is left, without reconstructing it from earlier messages.
+
 Context handoff (CRITICAL): every worker cold-starts with NO memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever you write in --task is the entire context the worker has. Therefore:
 - Always include the file paths the worker should read (the PRD path under prds/, the files being modified, etc.).
 - When chaining workers (coder → reviewer/auditor), summarize the prior worker's relevant findings or list the files they changed.
