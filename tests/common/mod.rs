@@ -1979,10 +1979,45 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
 /// holds that half as a pure function so `tests/real_agent_preflight.rs` can
 /// assert every accepted and rejected credential shape.
+///
+/// PRD #386: the credential set is no longer necessarily a FILE. Claude Code
+/// 2.x on macOS keeps it in the login Keychain as the generic-password item
+/// `Claude Code-credentials`, and `~/.claude/.credentials.json` is simply
+/// absent on a migrated host — measured on this repo's dev machine on
+/// 2026-08-06 (no file at all, Keychain item present, `claude` 2.1.220
+/// working). The file check therefore falls back to a Keychain probe instead
+/// of reporting "not found". Without that fallback EVERY real-agent test in
+/// this suite silently self-skips on macOS and reports PASS — and that is
+/// exactly the tier CLAUDE.md rule 5 exception (a) says must be run locally
+/// BECAUSE CI has no credentials to run it, so both sides would be green while
+/// proving nothing.
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
+    match check_claude_credentials_file() {
+        Ok(()) => Ok(()),
+        // A usable file is authoritative; when it is absent OR unusable the
+        // Keychain may still hold a live credential set, so the fallback
+        // decides. This never weakens the gate into "always available" — a host
+        // with neither still skips, and now names both storage locations so the
+        // next person isn't sent hunting for a file this Claude Code version
+        // never writes.
+        Err(file_reason) => {
+            if claude_keychain_credentials_present() {
+                Ok(())
+            } else {
+                Err(format!("{file_reason}{CLAUDE_KEYCHAIN_HINT}"))
+            }
+        }
+    }
+}
+
+/// The file half of [`check_claude_available`]: `~/.claude/.credentials.json`
+/// exists as a regular file, parses, and carries a usable `claudeAiOauth`
+/// entry. Kept as the first-choice path — Linux and pre-2.x installs still
+/// store credentials here.
+fn check_claude_credentials_file() -> Result<(), String> {
     // M3.1 auditor S1: every message below surfaces the abstract path so it
     // doesn't leak whether the operator is on `/Users/<name>` vs `/root` vs
     // `/home/<name>`.
@@ -2012,6 +2047,104 @@ pub fn check_claude_available() -> Result<(), String> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     claude_oauth_usable(oauth, now_ms)
+}
+
+/// Service name Claude Code 2.x files its OAuth credential set under in the
+/// macOS login Keychain.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Appended to the file-side failure when the Keychain fallback also came up
+/// empty, so a genuinely credential-less host is told about BOTH locations.
+/// Empty off macOS, where there is no Keychain to have checked and the
+/// pre-existing message is still the whole truth.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_HINT: &str = " (and the macOS login Keychain holds no `Claude Code-credentials` item either — \
+     Claude Code 2.x stores the credential set there rather than in the file)";
+#[cfg(not(target_os = "macos"))]
+const CLAUDE_KEYCHAIN_HINT: &str = "";
+
+/// Whether the macOS login Keychain holds Claude Code's credential item.
+///
+/// PRIVACY, load-bearing: this yields a BOOLEAN and nothing else. `-w` prints
+/// the password itself, so the secret is read into a local buffer purely to
+/// tell "exit 0 but empty" from "exit 0 with a credential"; the buffer is
+/// zeroed before it drops, never returned, and never formatted into an error,
+/// a panic, a log line, a test artifact or a `.cast` recording. stderr is
+/// discarded for the same reason.
+///
+/// `security` resolves the login keychain from `$HOME`, so the probe is pinned
+/// to [`host_home`]: under a relocated HOME it answers "keychain not found"
+/// (exit 44) no matter what the real user has.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_present() -> bool {
+    let probe = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .env("HOME", host_home())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match probe {
+        Ok(mut out) => {
+            let present =
+                out.status.success() && out.stdout.iter().any(|b| !b.is_ascii_whitespace());
+            out.stdout.fill(0);
+            present
+        }
+        Err(_) => false,
+    }
+}
+
+/// Non-macOS hosts keep the file-only behaviour unchanged: Linux Claude Code
+/// still writes `~/.claude/.credentials.json`, and CI — which has no
+/// credentials either way — must keep skipping.
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_present() -> bool {
+    false
+}
+
+/// Export Claude Code's credential set out of the macOS login Keychain, so
+/// [`import_claude_credentials`] can seed a per-test HOME that cannot reach the
+/// Keychain itself.
+///
+/// `None` when there is no such item, when `security` cannot be run, or when
+/// what came back is not a `claudeAiOauth` credential document — the caller
+/// then reports its file-side error instead, so an unrelated or malformed
+/// keychain item can never be written into a test HOME as if it were a login.
+///
+/// These bytes ARE the secret, unlike [`claude_keychain_credentials_present`]'s
+/// boolean. They are returned solely to be handed to
+/// [`write_credential_file_atomic_0o600`] — never logged, never formatted into
+/// an error, and never echoed to a terminal, so they cannot reach a `.cast`
+/// recording. That is the same handling the file-sourced bytes have always had.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
+    let probe = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .env("HOME", host_home())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    // `security -w` terminates the password with a newline; truncate in place
+    // rather than copying, so the secret lives in exactly one buffer.
+    let mut bytes = probe.stdout;
+    while bytes.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        bytes.pop();
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    parsed.get("claudeAiOauth")?;
+    Some(bytes)
+}
+
+/// Non-macOS hosts have no Keychain to export from; the file is the only
+/// source. See [`claude_keychain_credentials_present`].
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
+    None
 }
 
 /// The credential-shape half of [`check_claude_available`], split out as a pure
@@ -2320,13 +2453,26 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;
 
+    // PRD #386: the SOURCE is not necessarily a file any more. Claude Code 2.x
+    // on macOS keeps the credential set in the login Keychain and writes no
+    // `~/.claude/.credentials.json` at all, so the read below is a hard
+    // NotFound on a migrated host — which is what turned this import into a
+    // launch-time panic the moment `check_claude_available` learned about the
+    // Keychain. The DESTINATION still has to be a file: `security` resolves the
+    // login keychain from `$HOME`, so a daemon-spawned `claude` running under
+    // the relocated per-test HOME cannot reach the real user's keychain (it
+    // answers "keychain not found", exit 44 — measured) and has nothing but
+    // this imported file to authenticate from.
     let src_creds = src_root.join(".credentials.json");
-    let creds_bytes = read_credential_file_no_symlink(
+    let creds_bytes = match read_credential_file_no_symlink(
         &src_creds,
-        "Claude Code credentials not found at ~/.claude/.credentials.json — \
-         log in with `claude login`",
+        "Claude Code credentials not found at ~/.claude/.credentials.json \
+         nor in the macOS login Keychain — log in with `claude login`",
         "~/.claude/.credentials.json",
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(file_err) => claude_keychain_credentials_export().ok_or(file_err)?,
+    };
     write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &creds_bytes)?;
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
