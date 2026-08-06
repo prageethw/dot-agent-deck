@@ -2042,11 +2042,19 @@ fn check_claude_credentials_file() -> Result<(), String> {
         "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
          entry — log in with `claude login`",
     )?;
-    let now_ms = std::time::SystemTime::now()
+    claude_oauth_usable(oauth, now_epoch_ms())
+}
+
+/// Epoch milliseconds for the credential expiry checks, shared by the file and
+/// Keychain halves of the gate so the two cannot drift apart in how they read
+/// the clock. `0` on the impossible pre-epoch clock, which makes every expiry
+/// look live — the same fail-open-then-fail-loudly direction the rest of this
+/// gate takes.
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    claude_oauth_usable(oauth, now_ms)
+        .unwrap_or(0)
 }
 
 /// Service name Claude Code 2.x files its OAuth credential set under in the
@@ -2059,19 +2067,43 @@ const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Empty off macOS, where there is no Keychain to have checked and the
 /// pre-existing message is still the whole truth.
 #[cfg(target_os = "macos")]
-const CLAUDE_KEYCHAIN_HINT: &str = " (and the macOS login Keychain holds no `Claude Code-credentials` item either — \
-     Claude Code 2.x stores the credential set there rather than in the file)";
+const CLAUDE_KEYCHAIN_HINT: &str = " (and the macOS login Keychain holds no usable `Claude Code-credentials` item \
+     either — Claude Code 2.x stores the credential set there rather than in the \
+     file, and it is checked for the same `claudeAiOauth` shape and expiry as the \
+     file is)";
 #[cfg(not(target_os = "macos"))]
 const CLAUDE_KEYCHAIN_HINT: &str = "";
 
-/// Whether the macOS login Keychain holds Claude Code's credential item.
+/// Whether the macOS login Keychain holds a **usable** Claude Code credential
+/// set — the same question [`check_claude_credentials_file`] asks of the file,
+/// asked of the Keychain.
 ///
-/// PRIVACY, load-bearing: this yields a BOOLEAN and nothing else. `-w` prints
-/// the password itself, so the secret is read into a local buffer purely to
-/// tell "exit 0 but empty" from "exit 0 with a credential"; the buffer is
-/// zeroed before it drops, never returned, and never formatted into an error,
-/// a panic, a log line, a test artifact or a `.cast` recording. stderr is
-/// discarded for the same reason.
+/// PRD #386 auditor finding: this used to answer only "`security` exited 0 with
+/// non-empty output", so the two halves of the gate disagreed — an expired or
+/// malformed Keychain item passed where byte-identical content in a file was
+/// rejected. It now parses the exported document and applies the identical
+/// `claudeAiOauth` + [`claude_oauth_usable`] test, so a host is judged the same
+/// way whichever store its credentials live in. The consequence of the old
+/// asymmetry was a test that ran and then failed loudly deep in a PTY wait
+/// (never a silent green — [`claude_keychain_credentials_export`] already
+/// refuses to seed a test HOME from anything that is not a `claudeAiOauth`
+/// document), which is why it was a correctness fix rather than a blocker.
+///
+/// PRIVACY, load-bearing and unchanged by that fix: this yields a BOOLEAN and
+/// nothing else. `-w` prints the password itself, so the secret is read into a
+/// local buffer purely to be classified; the buffer is zeroed before it drops,
+/// never returned, and never formatted into an error, a panic, a log line, a
+/// test artifact or a `.cast` recording. stderr is discarded for the same
+/// reason, and `claude_oauth_usable`'s `Err` string — which names only the
+/// abstract `~/.claude/.credentials.json` path, per the M3.1 auditor S1
+/// property — is collapsed to a bool here rather than propagated.
+///
+/// The parse does put a second copy of the secret on the heap inside the
+/// `serde_json::Value`, which cannot be zeroed the way the byte buffer can.
+/// That copy is local, dropped at the end of this function, and never read
+/// except through `claude_oauth_usable` — the same handling
+/// [`claude_keychain_credentials_export`] has always given its own parse of
+/// the same bytes.
 ///
 /// `security` resolves the login keychain from `$HOME`, so the probe is pinned
 /// to [`host_home`]: under a relocated HOME it answers "keychain not found"
@@ -2086,10 +2118,14 @@ fn claude_keychain_credentials_present() -> bool {
         .output();
     match probe {
         Ok(mut out) => {
-            let present =
-                out.status.success() && out.stdout.iter().any(|b| !b.is_ascii_whitespace());
+            let usable = out.status.success()
+                && serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                    .ok()
+                    .as_ref()
+                    .and_then(|parsed| parsed.get("claudeAiOauth"))
+                    .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok());
             out.stdout.fill(0);
-            present
+            usable
         }
         Err(_) => false,
     }
