@@ -554,6 +554,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** scheduler dispatch, daemon socket delivery, or rendered card layout.
 - **Platform coverage:** mac+linux+windows.
 
+#### status/shell-activity
+
+##### status/shell-activity/001 — The process-table primitive finds a real, detached grandchild process as a descendant and reports its no-controlling-tty / session-leader / argv facts correctly (PRD #386 M1).
+- **Layer:** L1.
+- **Agent:** none (a real `sleep` process, spawned and `setsid()`'d by the test itself — no agent involved).
+- **Asserts:** `process_table()` enumerates the machine's processes and `descendants()` finds a real grandchild of the test process (spawned on pipes, detached via `setsid()`) as a descendant of the test's own pid; the found entry reports no controlling terminal, session-leader true, and its full argv (a uniquely marked command line). On Windows, `process_table()` returns `None` (no process-enumeration backend exists there — same contract as `foreground_pgid`).
+- **Does not assert:** that this primitive is wired into any pane's status, that the discriminator (conditions 1∧2∧3) classifies anything as "busy", or anything about a real agent pane — this is a mechanism test only, included so a later failure localises. PRD #370's failure was exactly a correct mechanism test attached to nothing; this test proves nothing about the shell-activity feature working end to end on its own.
+- **Platform coverage:** mac+linux (real-process assertion) + windows (the `None` contract).
+
+##### status/shell-activity/002 — The descendant walk terminates instead of looping forever when a synthetic process table contains a `ppid` cycle (PRD #386 M1).
+- **Layer:** L1.
+- **Agent:** none (a hand-built synthetic table — no real processes, no `ps` involved).
+- **Asserts:** `descendants()` called against a table where a `ppid` cycle loops back to the root pid returns within a bounded timeout (not an infinite loop) and reports each reachable non-root descendant exactly once, correctly excluding the root pid even though the cycle links back to it.
+- **Does not assert:** anything about how a real `ps` sample could produce such a cycle, or the discriminator/classification logic — purely a termination/dedup guarantee on the walk.
+- **Platform coverage:** mac+linux+windows (pure data, no OS process calls).
+
 ### Agent protocol
 
 #### protocol/live-target
