@@ -153,14 +153,22 @@ impl HydrationGate {
 
     /// Subscriber side: the daemon has confirmed the event stream. Idempotent —
     /// the reconnect loop calls it again after every successful re-subscribe.
+    ///
+    /// `send_replace`, NOT `send`: `watch::Sender::send` FAILS — and leaves the
+    /// value untouched — when no receiver exists yet, and that is the normal
+    /// case here. The subscriber typically confirms the stream before hydration
+    /// has called [`Self::wait_subscribed`] (which is what creates the first
+    /// receiver), so a plain `send` would silently drop the signal and leave
+    /// hydration waiting out its full timeout on a stream that was already up.
     pub fn mark_subscribed(&self) {
-        let _ = self.inner.subscribed.send(true);
+        self.inner.subscribed.send_replace(true);
     }
 
     /// Hydration side: every hydrated pane has been registered and seeded, so
-    /// buffered events can now land on real cards. Idempotent.
+    /// buffered events can now land on real cards. Idempotent. `send_replace`
+    /// for the same reason as [`Self::mark_subscribed`].
     pub fn mark_seeded(&self) {
-        let _ = self.inner.seeded.send(true);
+        self.inner.seeded.send_replace(true);
     }
 
     /// True once [`Self::mark_seeded`] has been called.
@@ -179,10 +187,14 @@ impl HydrationGate {
     /// expiry — in which case the caller should proceed anyway rather than
     /// stall TUI startup, accepting the pre-fix window for this attach.
     pub async fn wait_subscribed(&self, timeout: Duration) -> bool {
-        if self.is_subscribed() {
+        // Subscribe BEFORE reading the value. `subscribe()` marks the current
+        // value as already seen, so a receiver created after the flip would
+        // never see a `changed()` for it — checking first and subscribing after
+        // would lose a signal that landed between the two.
+        let mut rx = self.inner.subscribed.subscribe();
+        if *rx.borrow() {
             return true;
         }
-        let mut rx = self.inner.subscribed.subscribe();
         tokio::time::timeout(timeout, async move {
             // `changed()` errs only when every Sender is dropped; we hold one
             // through `self`, so this loop cannot spin.
@@ -363,6 +375,19 @@ mod tests {
         let gate = HydrationGate::armed();
         assert!(!gate.is_subscribed());
         assert!(!gate.wait_subscribed(Duration::from_millis(20)).await);
+    }
+
+    /// The production ordering: the subscriber confirms the stream BEFORE
+    /// hydration ever waits on it, so the signal has to survive being raised
+    /// with no receiver in existence. A plain `watch::Sender::send` does not —
+    /// it errs and leaves the value `false` — which would have left hydration
+    /// waiting out its full timeout on a stream that was already up.
+    #[tokio::test]
+    async fn mark_subscribed_survives_being_raised_before_anyone_waits() {
+        let gate = HydrationGate::armed();
+        gate.mark_subscribed();
+        assert!(gate.is_subscribed());
+        assert!(gate.wait_subscribed(Duration::from_millis(50)).await);
     }
 
     #[tokio::test]
