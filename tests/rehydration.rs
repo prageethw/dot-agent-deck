@@ -2634,9 +2634,11 @@ fn live_010_rehydrate_preserves_history_and_view_only_writability() {
 /// `SessionSnapshot`. When the command finishes and the daemon broadcasts the
 /// paired `ShellIdle`, the rehydrated card must return to `Idle` — the
 /// promotion's synthetic provenance has to survive the reconnect, or the
-/// dashboard shows `Working` forever (fork issue #21). A second pane whose
-/// `Working` came from a REAL agent event must NOT be reverted by the same
-/// `ShellIdle`.
+/// dashboard shows `Working` forever (fork issue #21). The shell pane has also
+/// been through a same-agent `/clear` restart first, so the synthesized events
+/// are built while its hook generation and its stable card id disagree. A
+/// second pane whose `Working` came from a REAL agent event must NOT be
+/// reverted by the same `ShellIdle`.
 #[spec("session/live/011")]
 #[test]
 fn live_011_rehydration_preserves_shell_synthetic_working() {
@@ -2660,18 +2662,35 @@ fn live_011_rehydration_preserves_shell_synthetic_working() {
         }
     }
 
-    /// The shell-activity monitor's synthesized event, built exactly the way
+    /// A same-agent `/clear` / thread restart: a fresh hook `SessionStart`
+    /// under a NEW session id but the SAME `agent_id`. `apply_event`'s reuse
+    /// guard remaps it back onto the stable card while the pane's hook
+    /// GENERATION rolls forward, so afterwards the pane's hook session id is no
+    /// longer a key into `sessions`.
+    fn rollover_event(pane_id: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: format!("sess-{pane_id}-gen2"),
+            ..hook_event(pane_id, EventType::SessionStart, None)
+        }
+    }
+
+    /// The shell-activity monitor's synthesized event, built the way
     /// `run_shell_activity_monitor` in `src/daemon.rs` builds it: the session
-    /// id and the owning agent id are both resolved off the DAEMON's state, and
-    /// the agent type is left neutral.
+    /// id and the owning agent id are resolved off the DAEMON's state
+    /// INDEPENDENTLY — the authoritative hook generation for `session_id`, and
+    /// the agent id from the pane's current CARD (`pane_session_id`), because
+    /// after a rollover the generation is not a key into `sessions`. The agent
+    /// type is left neutral. That production seam is pinned directly by
+    /// `shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover`
+    /// in `src/daemon.rs`; this mirrors its output shape.
     fn shell_event(state: &AppState, pane_id: &str, event_type: EventType) -> AgentEvent {
         let session_id = state
             .pane_hook_session_id(pane_id)
             .expect("the pane has a known hook session");
         let agent_id = state
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.agent_id.clone());
+            .pane_session_id(pane_id)
+            .and_then(|card_id| state.sessions.get(&card_id))
+            .and_then(|card| card.agent_id.clone());
         AgentEvent {
             session_id,
             agent_type: AgentType::None,
@@ -2702,7 +2721,33 @@ fn live_011_rehydration_preserves_shell_synthetic_working() {
         daemon.register_pane(pane.to_string());
         daemon.apply_event(hook_event(pane, EventType::SessionStart, None));
     }
+    // `pane-shell` additionally survives a same-agent restart BEFORE the shell
+    // command starts, so the synthesized events below are built while the
+    // pane's hook generation and its stable card id DISAGREE — the divergence
+    // that made a `sessions[hook_generation]` agent lookup miss and re-emit
+    // `agent_id: None`.
+    daemon.apply_event(rollover_event(SHELL));
+    assert_ne!(
+        daemon.pane_hook_session_id(SHELL).as_deref(),
+        Some(format!("sess-{SHELL}").as_str()),
+        "precondition: the same-agent restart rolls the hook generation past \
+         the stable card id"
+    );
+    assert!(
+        !daemon
+            .sessions
+            .contains_key(&daemon.pane_hook_session_id(SHELL).unwrap()),
+        "precondition: after the rollover the hook generation is NOT a key \
+         into `sessions`, so the agent id must come from the pane's card"
+    );
+
     let busy = shell_event(&daemon, SHELL, EventType::ShellBusy);
+    assert_eq!(
+        busy.agent_id.as_deref(),
+        Some(format!("agent-{SHELL}").as_str()),
+        "the synthesized event must still carry the owning agent id after a \
+         rollover — an unstamped one cannot reach a hydrated card"
+    );
     daemon.apply_event(busy);
     daemon.apply_event(hook_event(REAL, EventType::ToolStart, Some("Bash")));
     for pane in [SHELL, REAL] {

@@ -907,15 +907,39 @@ async fn run_shell_activity_monitor(
             // minted a PHANTOM second session on the pane and left the real card
             // stranded at `Working` — the visible half of issue #21, which the
             // provenance marker alone does not fix.
+            //
+            // The two ids are resolved INDEPENDENTLY, and deliberately so.
+            // `pane_hook_session_id` is the pane's latest hook GENERATION and
+            // is the authoritative value for `AgentEvent.session_id`; it is
+            // NOT a key into `sessions`. A same-agent `/clear` / thread
+            // restart rolls that generation forward while `apply_event`'s
+            // same-agent reuse guard deliberately keeps the CARD under its
+            // stable id (see `AppState::apply_event`'s "ORIGINAL hook
+            // session_id" comment and `Self::pane_hook_session_id`'s doc), so
+            // after a rollover the two diverge and a `sessions[generation]`
+            // lookup misses — re-emitting `agent_id: None` and minting the
+            // very phantom card this stamping exists to prevent. The agent id
+            // therefore comes from the pane's CURRENT card, resolved with the
+            // same newest-by-`last_activity` rule the rest of the daemon uses
+            // for "which session owns this pane" (`pane_session_id`, the same
+            // resolution behind `pane_writable`). `pane_session_id` returns a
+            // real card id, so the `sessions` lookup below is keyed correctly
+            // by construction.
+            //
+            // Fails SAFE: if no card resolves (or it carries no agent id),
+            // `agent_id` stays `None` and behaviour is exactly what it was
+            // before this stamping existed. Emitting no agent id is only a
+            // missed remap; emitting a WRONG one would route a live pane's
+            // shell status onto someone else's card.
             let (session_id, agent_id) = {
                 let guard = state.read().await;
                 let Some(session_id) = guard.pane_hook_session_id(&pane_id) else {
                     continue;
                 };
                 let agent_id = guard
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|session| session.agent_id.clone());
+                    .pane_session_id(&pane_id)
+                    .and_then(|card_id| guard.sessions.get(&card_id))
+                    .and_then(|card| card.agent_id.clone());
                 (session_id, agent_id)
             };
 
@@ -1378,6 +1402,132 @@ mod hook_ingestion_tests {
             crate::state::SessionStatus::Idle,
             "the monitor must revert the session to Idle once the foreground \
              sleep finishes and the shell reclaims the pty"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: fork issue #21, the emitted shape rather than the local
+    /// effect. Spawn a real `/bin/sh` pane owned by `agent-21`, seed it a hook
+    /// `SessionStart`, then seed a SECOND `SessionStart` under the SAME agent
+    /// with a NEW hook session id — a same-agent `/clear` / thread restart, so
+    /// the pane's hook generation rolls forward to `sess-21-gen2` while
+    /// `apply_event`'s reuse guard keeps the card under the stable
+    /// `sess-21-gen1`. Run the real `run_shell_activity_monitor`, subscribe to
+    /// its broadcast, and type a foreground `sleep` into the PTY. Every event
+    /// it broadcasts must report the CURRENT hook generation as its
+    /// `session_id` AND carry `agent_id: Some("agent-21")` resolved from the
+    /// pane's card — an unstamped event cannot be remapped onto a reconnected
+    /// TUI's hydrated card and mints a phantom session instead.
+    #[tokio::test]
+    async fn shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover() {
+        use std::io::Write as _;
+
+        const PANE: &str = "pane-21";
+        const AGENT: &str = "agent-21";
+        const GEN1: &str = "sess-21-gen1";
+        const GEN2: &str = "sess-21-gen2";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawned = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let session_start = |session_id: &str| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: Some(AGENT.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+
+        // Generation 1, then the same-agent restart that rolls the generation
+        // over. Both frames carry the SAME `agent_id`, which is exactly what
+        // makes `apply_event`'s reuse guard keep one stable card.
+        state.write().await.apply_event(session_start(GEN1));
+        state.write().await.apply_event(session_start(GEN2));
+        {
+            let guard = state.read().await;
+            assert_eq!(
+                guard.pane_hook_session_id(PANE).as_deref(),
+                Some(GEN2),
+                "precondition: the same-agent restart advances the pane's hook generation"
+            );
+            assert!(
+                guard.sessions.contains_key(GEN1) && !guard.sessions.contains_key(GEN2),
+                "precondition: the CARD stays under the stable id, so the hook \
+                 generation is NOT a key into `sessions` — this divergence is \
+                 what a `sessions[generation]` lookup silently misses"
+            );
+        }
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            async move { run_shell_activity_monitor(registry, state, event_tx).await }
+        });
+
+        {
+            let writer = registry
+                .agent_writer(&spawned)
+                .expect("spawned agent must be in the registry");
+            let mut w = writer.lock().await;
+            w.write_all(b"sleep 2\n").expect("write sleep command");
+            w.flush().expect("flush");
+        }
+
+        // Read broadcasts until the busy transition arrives (the monitor also
+        // emits the pane's initial idle edge), asserting the stamped shape on
+        // EVERY event it publishes — a single unstamped one is enough to mint
+        // a phantom card on a reconnected TUI.
+        let mut saw_busy = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !saw_busy && tokio::time::Instant::now() < deadline {
+            let Ok(Ok(BroadcastMsg::Event(event))) =
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            else {
+                continue;
+            };
+            assert_eq!(
+                event.session_id, GEN2,
+                "the synthesized event must report the pane's CURRENT hook \
+                 generation, which is what the daemon's send guard compares against"
+            );
+            assert_eq!(
+                event.agent_id.as_deref(),
+                Some(AGENT),
+                "the synthesized {:?} must carry the owning agent id resolved \
+                 from the pane's CARD; a `sessions[hook_generation]` lookup \
+                 misses after a same-agent restart and re-emits `None`, which \
+                 no hydrated TUI card can be remapped onto (fork issue #21)",
+                event.event_type
+            );
+            saw_busy = event.event_type == crate::event::EventType::ShellBusy;
+        }
+        assert!(
+            saw_busy,
+            "the monitor must broadcast a ShellBusy while the foreground sleep runs"
         );
 
         monitor_handle.abort();
