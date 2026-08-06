@@ -2248,6 +2248,13 @@ without depending on the config struct API.
 - **Does not assert:** PTY resizing of the reclaimed area (`resize_panes_to_layout`); mode-tab side-pane geometry (covered by `tabs/mode/001`); the sidebar deck-card capacity math (covered by `orchestration/layout/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/layout/005 — `scope_split_stage`, the pure function replacing the inline `claims_ctrl_l` match, claims `Action::CycleSplitStage` only in `UiMode::Normal` on a tab type with a sidebar split, and passes every other action through untouched everywhere else (PRD #387 M1).
+- **Layer:** L1 (pure-function unit test; `src/ui.rs`'s own `#[cfg(test)]` module, no PTY, no TestBackend render).
+- **Agent:** none.
+- **Asserts:** table-driven over the full cross product of `has_split_sidebar` (true/false) x every `UiMode` variant (enumerated via an exhaustive match so a future variant can't silently drop out of the table) x the action being `Some(Action::CycleSplitStage)`, `Some(Action::Quit)` (a representative other action), or `None`: `CycleSplitStage` survives ONLY at `(has_split_sidebar = true, mode = UiMode::Normal)` and is un-resolved to `None` at every other cell; `Action::Quit` passes through completely untouched at EVERY cell, including `(has_split_sidebar = false, mode != Normal)` — the case that rules out a blanket "drop the action" implementation; `None` in always yields `None` out.
+- **Does not assert:** dispatch through the real `KeyEvent -> Action` resolver or a live orchestration tab's rendered geometry (covered by `orchestration/layout/002`); the real-pane proof that the byte reaches a focused role pane's PTY (covered by the PTY-attached `tabs/orchestration/024`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/lock
 
 ##### orchestration/lock/001 — A freshly opened orchestration tab starts with command-entry LOCKED (PRD #361 Item 3).

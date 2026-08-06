@@ -25267,6 +25267,116 @@ mod tests {
         );
     }
 
+    /// Exhaustive match over every `UiMode` variant, returning `mode`
+    /// unchanged — a compile-time guard so `layout_005`'s cross product
+    /// below cannot silently go stale if a new `UiMode` variant is added
+    /// without updating the list this function is applied to.
+    fn assert_exhaustive_ui_mode(mode: UiMode) -> UiMode {
+        match mode {
+            UiMode::Normal
+            | UiMode::Filter
+            | UiMode::Help
+            | UiMode::Rename
+            | UiMode::DirPicker
+            | UiMode::NewPaneForm
+            | UiMode::PaneInput
+            | UiMode::StarPrompt
+            | UiMode::ConfigGenPrompt
+            | UiMode::QuitConfirm
+            | UiMode::StopConfirm
+            | UiMode::ScheduledTasks
+            | UiMode::CloseConfirm => mode,
+        }
+    }
+
+    /// Every `UiMode` variant, run through [`assert_exhaustive_ui_mode`] so
+    /// the list can't quietly drop a variant a future edit adds to the enum.
+    fn all_ui_modes() -> Vec<UiMode> {
+        [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Help,
+            UiMode::Rename,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::PaneInput,
+            UiMode::StarPrompt,
+            UiMode::ConfigGenPrompt,
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::ScheduledTasks,
+            UiMode::CloseConfirm,
+        ]
+        .into_iter()
+        .map(assert_exhaustive_ui_mode)
+        .collect()
+    }
+
+    /// Scenario: Table-driven unit test of the pure `scope_split_stage`
+    /// function (PRD #387 M1) over the full cross product of
+    /// `has_split_sidebar` (true/false) x every `UiMode` variant x the
+    /// action being `CycleSplitStage`, some other action (`Quit`), or
+    /// `None`. Confirms `CycleSplitStage` survives ONLY at
+    /// `(has_split_sidebar = true, UiMode::Normal)`, that every other
+    /// action passes through completely untouched in every cell (including
+    /// `(false, non-Normal)`, ruling out a blanket "drop the action"
+    /// implementation), and that `None` in always yields `None` out. RED
+    /// today: `scope_split_stage` does not exist on `main` yet, so this
+    /// test fails to COMPILE rather than fails an assertion — the crate
+    /// will build again once the coder adds the function per the PRD's
+    /// Solution Overview.
+    #[spec("orchestration/layout/005")]
+    #[test]
+    fn layout_005_scope_split_stage_claims_cycle_split_stage_only_when_sidebar_and_normal_mode() {
+        let modes = all_ui_modes();
+
+        for has_split_sidebar in [true, false] {
+            for &mode in &modes {
+                let claims = has_split_sidebar && mode == UiMode::Normal;
+
+                let cycle_result =
+                    scope_split_stage(Some(Action::CycleSplitStage), has_split_sidebar, mode);
+                if claims {
+                    assert!(
+                        matches!(cycle_result, Some(Action::CycleSplitStage)),
+                        "CycleSplitStage should survive at \
+                         (has_split_sidebar={has_split_sidebar}, mode={mode:?}), \
+                         got {cycle_result:?}"
+                    );
+                } else {
+                    assert!(
+                        cycle_result.is_none(),
+                        "CycleSplitStage should be un-resolved (None) at \
+                         (has_split_sidebar={has_split_sidebar}, mode={mode:?}), \
+                         got {cycle_result:?}"
+                    );
+                }
+
+                // Every OTHER action must pass through completely untouched
+                // in EVERY cell, including (false, non-Normal) — this is
+                // the assertion that rules out implementing the fix as a
+                // blanket "drop the action" rather than one scoped
+                // specifically to CycleSplitStage.
+                let other_result = scope_split_stage(Some(Action::Quit), has_split_sidebar, mode);
+                assert!(
+                    matches!(other_result, Some(Action::Quit)),
+                    "a non-CycleSplitStage action must pass through untouched \
+                     at (has_split_sidebar={has_split_sidebar}, mode={mode:?}), \
+                     got {other_result:?}"
+                );
+
+                // None in, None out, in every cell.
+                let none_result = scope_split_stage(None, has_split_sidebar, mode);
+                assert!(
+                    none_result.is_none(),
+                    "None must pass through as None at \
+                     (has_split_sidebar={has_split_sidebar}, mode={mode:?}), \
+                     got {none_result:?}"
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // PRD #361 Item 3: command-entry lock on Orchestration tabs
     // -----------------------------------------------------------------------
