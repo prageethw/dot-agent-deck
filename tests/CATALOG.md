@@ -1276,6 +1276,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the click-to-`Action::SelectCard` mouse mapping itself; `mirror_selection_into_focus`'s own no-op rules (covered by `tabs/orchestration/014`); the equivalent gate on the keyboard path (covered by `tabs/orchestration/015`/`018`); any visible rendering.
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/024 — `Ctrl+l` must forward to a focused orchestration role pane's PTY, not be claimed as the split-cycle action, while the deck is in `PaneInput` mode (PRD #387 Defect 1 / M1b — the reported bug, in a real pane).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-bash-role` fixture — a single orchestrator role running a real interactive `bash --noprofile --norc -i`, no LLM tokens spent).
+- **Asserts:** opening a real orchestration tab from the `orch-bash-role` fixture lands the deck in `PaneInput` mode with the orchestrator role pane already focused; printing a unique sentinel line then pressing `Ctrl+l` must trigger readline's `clear-screen` binding and remove the sentinel from the rendered grid, proving the raw `0x0c` byte reached the role pane's PTY rather than being claimed as `Action::CycleSplitStage`. Regression coverage for PRD #387 Defect 1: orchestration tabs claimed `Ctrl+l` mode-independently, so a focused role pane's agent never received its own clear-screen.
+- **Does not assert:** the split-cycle toggle behavior itself when NOT a role pane is focused (covered by `tabs/orchestration/006`); the already-guarded Dashboard-tab case (covered by `tabs/orchestration/007`); Mode-tab coverage (Mode tabs never claim `Ctrl+l` and have no sidebar split to toggle).
+- **Platform coverage:** mac+linux.
+
 #### tabs/dashboard
 
 ##### tabs/dashboard/001 — `Ctrl+l` cycles a Dashboard tab's sidebar/pane-column split through the three PRD #361 stages — default 33/67, narrower-sidebar 25/75, and Hidden (sidebar collapsed, 0/100) — looping back to default, and an open Orchestration tab's stage is unaffected by the Dashboard tab's cycling and vice versa.

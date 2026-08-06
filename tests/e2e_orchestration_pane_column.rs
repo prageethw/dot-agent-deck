@@ -227,6 +227,53 @@ fn orchestration_007_ctrl_l_forwards_to_pty_on_non_orchestration_tab() {
     );
 }
 
+/// Scenario: Open a real orchestration tab from the `orch-bash-role`
+/// fixture, whose orchestrator (start) role runs an interactive bash/
+/// readline shell instead of a `cat` stub. `open_orchestration` lands the
+/// deck in `PaneInput` mode with that role pane already focused (mirroring
+/// `e2e_orchestration_lock.rs::open_orchestration`'s documented landing
+/// state) — no unlock is needed because the lock never gates the
+/// orchestrator's own pane. Print a unique sentinel, then press Ctrl+l.
+/// Bash's readline binds Ctrl+l to `clear-screen`, so if the raw byte
+/// reaches the PTY the terminal clears and the sentinel disappears from the
+/// rendered grid. RED today (PRD #387 Defect 1): the inline `claims_ctrl_l`
+/// match (`src/ui.rs`, ~9077-9086) claims Ctrl+l as
+/// `Action::CycleSplitStage` on EVERY orchestration tab regardless of UI
+/// mode, so the byte never reaches the focused role pane and the sentinel
+/// survives.
+#[spec("tabs/orchestration/024")]
+#[test]
+fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane() {
+    const SENTINEL: &str = "CTRLL_ORCH_ROLE_FWD_SENTINEL_6d2a";
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-bash-role");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode
+    deck.wait_for_string("CTRLL>");
+
+    deck.send_keys(format!("echo {SENTINEL}\r").as_bytes());
+    deck.wait_for_string(SENTINEL);
+
+    deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
+    let cleared = deck
+        .wait_for_grid_predicate_within(Duration::from_secs(3), |grid| !grid.contains(SENTINEL));
+    assert!(
+        cleared,
+        "Ctrl+l did not reach the focused orchestration role pane's PTY — \
+         readline's clear-screen never ran, so the sentinel line is still \
+         visible after 3s. The global keybinding resolver claimed Ctrl+l as \
+         Action::CycleSplitStage even though a role pane was focused in \
+         PaneInput mode — orchestration tabs claim Ctrl+l mode-independently \
+         (PRD #387 Defect 1).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// A collapsed `Stacked` pane renders a `Block` with `Borders::TOP` and
 /// `.title(format!(" {title} "))` — no other cell content. On the settled
 /// grid that row, after trimming ONLY the leading blank columns (the sidebar
