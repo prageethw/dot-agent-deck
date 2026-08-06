@@ -197,7 +197,10 @@ pub fn foreground_pgid(master: &dyn portable_pty::MasterPty) -> Option<i32> {
 }
 
 // ---------------------------------------------------------------------------
-// Process-table sample (PRD #386 M1).
+// Process-table sample (PRD #386 M1; hardened by fork issues #29/#30 and
+// Greptile's P2 on upstream PR #390 — the sample is now budgeted, runs off the
+// Tokio worker, and distrusts a `getsid` answer whose pid may have been
+// recycled).
 // ---------------------------------------------------------------------------
 
 /// A process's POSIX session id, or a negative value if it could not be read
@@ -214,34 +217,177 @@ fn getsid_or_negative(pid: i32) -> i32 {
     unsafe { libc::getsid(pid) }
 }
 
-/// Sample every process on the machine into a [`super::ProcessInfo`] table
-/// (PRD #386 M1, Route A), or `None` if `ps` could not be run or produced
-/// nothing parseable.
+/// The `ps` invocation every sample uses. `-w -w` disables `ps`'s width
+/// truncation on both macOS and Linux, so the argv column survives whole; the
+/// trailing `=` on every `-o` field suppresses the header line entirely.
+const PS_PROGRAM: &str = "ps";
+const PS_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="];
+
+/// Wall-clock budget for one whole [`process_table`] / [`process_table_async`]
+/// sample — **both** `ps` invocations plus the `getsid` pass between them
+/// (fork issue #29: `ps` previously ran unbounded).
 ///
-/// One `ps -A` per call, parsed once and reusable for *every* pane in that
-/// poll, so the cost is one fork/exec per poll cycle rather than per pane. The
-/// session id of each row comes from [`getsid_or_negative`], not from `ps`.
+/// Why 2 s. A healthy `ps -A` on macOS or Linux costs single-digit to low tens
+/// of milliseconds, so 2 s is ~50–200× the honest cost and cannot plausibly
+/// fire on a healthy machine — including this repo's own test runs, which have
+/// been measured at load averages of 11–19 where a fork/exec can be delayed by
+/// hundreds of milliseconds. It is also small enough to be worth having: the
+/// production caller polls every 500 ms, so a wedged `ps` costs at most one
+/// extra sample's worth of staleness per tick instead of parking the poll (and,
+/// before the async move below, a Tokio worker) forever.
+pub(crate) const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Run `program args…` with its stdout captured, abandoning it if it has not
+/// finished within `budget`. `None` means "no usable output": spawn failed, the
+/// budget elapsed, or the process exited non-zero.
+///
+/// The child is polled through the [`std::process::Child`] this function owns
+/// and is never reaped before the kill decision is made, so the SIGKILL cannot
+/// land on a recycled pid. stdout is drained on a helper thread because `ps -A`
+/// output routinely exceeds a pipe buffer: waiting on the child while nothing
+/// reads the pipe would deadlock the very timeout this exists to enforce.
+fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<String> {
+    use std::io::Read;
+
+    if budget.is_zero() {
+        return None;
+    }
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                program,
+                ?budget,
+                "process-table sample exceeded its budget — killing it and reporting no sample"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let stdout = reader.join().ok()?;
+    if !status?.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// The async twin of [`capture_bounded`], for callers on a Tokio runtime.
+///
+/// `kill_on_drop` is what makes the timeout real: when `tokio::time::timeout`
+/// drops the inner future, the child is dropped, killed, and reaped by Tokio's
+/// orphan reaper. That is also why this is a `tokio::process::Command` rather
+/// than a `spawn_blocking` wrapper around [`capture_bounded`] — see
+/// [`process_table_async`].
+async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
+    if budget.is_zero() {
+        return None;
+    }
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(output) = tokio::time::timeout(budget, command.output()).await else {
+        tracing::warn!(
+            program,
+            ?budget,
+            "process-table sample exceeded its budget — killing it and reporting no sample"
+        );
+        return None;
+    };
+    let output = output.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Turn a captured `ps` table into rows, resolve each row's session id, then
+/// confirm those answers against a second sample — the shared body of
+/// [`process_table`] and [`process_table_async`].
+///
+/// The two `ps` invocations sandwich the `getsid` pass, which is what closes
+/// most of the PID-reuse window (fork issue #30); see
+/// [`super::scan::invalidate_unconfirmed_session_ids`] for the invariant and
+/// for the residual window that remains. The cost is the second `ps` per
+/// sample, which is exactly the number PRD #386's M5 measurement should be
+/// taken against.
+fn confirm_sample(first: &str, confirm: &str) -> Option<Vec<super::ProcessInfo>> {
+    let mut rows = super::scan::parse_ps_table(first, &getsid_or_negative);
+    if rows.is_empty() {
+        return None;
+    }
+    super::scan::invalidate_unconfirmed_session_ids(&mut rows, confirm);
+    Some(rows)
+}
+
+/// Sample every process on the machine into a [`super::ProcessInfo`] table
+/// (PRD #386 M1, Route A), or `None` if the sample could not be taken —
+/// `ps` failed to run, exceeded [`PS_SAMPLE_BUDGET`], or produced nothing
+/// parseable.
+///
+/// **Blocking.** The daemon's 500 ms poll must use [`process_table_async`]
+/// instead; this synchronous form is for callers that are not on a Tokio
+/// runtime (tests and diagnostics).
+///
+/// One sample is parsed once and reusable for *every* pane in a poll, so the
+/// cost is per poll cycle rather than per pane. The session id of each row
+/// comes from [`getsid_or_negative`], not from `ps` — and is kept only if a
+/// second `ps` still describes the same process (fork issue #30).
 ///
 /// Route B (native enumeration — `/proc/<pid>/{stat,cmdline}` on Linux,
 /// `sysctl(KERN_PROC_ALL)` on macOS) stays open behind PRD #386's M5
 /// measurement; it removes the subprocess at the cost of two platform-specific
 /// implementations, and is only worth taking if the measurement says so.
 pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
-    // `-w -w` disables `ps`'s width truncation on both macOS and Linux, so the
-    // argv column survives whole; the trailing `=` on every `-o` field
-    // suppresses the header line entirely.
-    let output = std::process::Command::new("ps")
-        .args(["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let rows = super::scan::parse_ps_table(&stdout, &getsid_or_negative);
-    if rows.is_empty() { None } else { Some(rows) }
+    let deadline = std::time::Instant::now() + PS_SAMPLE_BUDGET;
+    let first = capture_bounded(PS_PROGRAM, &PS_ARGS, PS_SAMPLE_BUDGET)?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let confirm = capture_bounded(PS_PROGRAM, &PS_ARGS, remaining)?;
+    confirm_sample(&first, &confirm)
+}
+
+/// [`process_table`] for callers on a Tokio runtime — the form the daemon's
+/// shell-activity poll uses.
+///
+/// Greptile P2 on upstream PR #390: the poll ran the synchronous
+/// `Command::output()` directly on a Tokio worker thread, so a slow or wedged
+/// `ps` stalled that worker and with it every other task scheduled on it —
+/// status hooks, client requests, shutdown. `tokio::process::Command` is used
+/// rather than wrapping the blocking form in `spawn_blocking` because only the
+/// former makes the timeout *effective*: cancelling a `spawn_blocking` call
+/// returns to the caller but leaves the blocking thread wedged on the same `ps`
+/// forever, consuming a pool slot per poll, whereas dropping the async future
+/// kills and reaps the child (`kill_on_drop`).
+pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+    let deadline = std::time::Instant::now() + PS_SAMPLE_BUDGET;
+    let first = capture_bounded_async(PS_PROGRAM, &PS_ARGS, PS_SAMPLE_BUDGET).await?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let confirm = capture_bounded_async(PS_PROGRAM, &PS_ARGS, remaining).await?;
+    confirm_sample(&first, &confirm)
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +586,125 @@ mod tests {
         assert!(pin_process(std::process::id()).unwrap().is_some());
         assert!(pin_process(0).unwrap().is_some());
         assert!(pin_process(u32::MAX).unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Process-table sampling (fork issues #29/#30, Greptile P2 on PR #390).
+    //
+    // These stand on their own deliberately: `status/shell-activity/005` and
+    // `007` cover this code with a real agent, but they self-skip in CI for
+    // lack of Claude credentials, so the sampling contract has to be pinned
+    // here or it is not pinned anywhere CI actually runs.
+    // -----------------------------------------------------------------------
+
+    /// A sample that outruns its budget must report **no sample** (`None`), not
+    /// an empty or partial one — and must give up at roughly the budget rather
+    /// than waiting for the child. `Some(String::new())` here would be read by
+    /// the caller as "the table is empty", and a wedged `ps` would then flip
+    /// every busy pane to `Idle` — the exact PRD #386 failure mode, through a
+    /// different door.
+    #[test]
+    fn a_sample_that_outruns_its_budget_reports_no_sample() {
+        let started = std::time::Instant::now();
+        let captured = capture_bounded("sleep", &["30"], Duration::from_millis(200));
+        assert_eq!(captured, None, "a timed-out sample must never yield output");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget must actually bound the call (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// Same contract on the async path the daemon's poll actually uses: the
+    /// budget bounds the call, and a timed-out sample is `None`.
+    #[tokio::test]
+    async fn an_async_sample_that_outruns_its_budget_reports_no_sample() {
+        let started = std::time::Instant::now();
+        let captured = capture_bounded_async("sleep", &["30"], Duration::from_millis(200)).await;
+        assert_eq!(captured, None, "a timed-out sample must never yield output");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget must actually bound the call (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// A sample that fails outright — a non-zero exit, or a program that is not
+    /// there to run at all — is also "no sample", never an empty table.
+    #[test]
+    fn a_failed_sample_reports_no_sample() {
+        assert_eq!(
+            capture_bounded("false", &[], PS_SAMPLE_BUDGET),
+            None,
+            "a non-zero exit must not be read as an empty process table"
+        );
+        assert_eq!(
+            capture_bounded(
+                "dot-agent-deck-no-such-program-exists",
+                &[],
+                PS_SAMPLE_BUDGET
+            ),
+            None,
+            "a spawn failure must not be read as an empty process table"
+        );
+    }
+
+    /// The async twin of the failure contract.
+    #[tokio::test]
+    async fn a_failed_async_sample_reports_no_sample() {
+        assert_eq!(
+            capture_bounded_async("false", &[], PS_SAMPLE_BUDGET).await,
+            None
+        );
+        assert_eq!(
+            capture_bounded_async(
+                "dot-agent-deck-no-such-program-exists",
+                &[],
+                PS_SAMPLE_BUDGET
+            )
+            .await,
+            None
+        );
+    }
+
+    /// The healthy path is unchanged by the bounding: a process that finishes
+    /// inside its budget still hands back its whole stdout, on both forms.
+    #[tokio::test]
+    async fn a_healthy_sample_still_returns_its_whole_output() {
+        assert_eq!(
+            capture_bounded("echo", &["hello"], PS_SAMPLE_BUDGET).as_deref(),
+            Some("hello\n")
+        );
+        assert_eq!(
+            capture_bounded_async("echo", &["hello"], PS_SAMPLE_BUDGET)
+                .await
+                .as_deref(),
+            Some("hello\n")
+        );
+    }
+
+    /// End to end on a real machine: both sampling forms still enumerate the
+    /// live process table (the `001`–`004` behaviour), and the running test
+    /// process — which by construction cannot be recycled while it is asking —
+    /// survives the fork-issue-#30 confirmation pass with a readable session id.
+    #[tokio::test]
+    async fn both_sampling_forms_still_enumerate_the_live_process_table() {
+        let own_pid = std::process::id() as i32;
+        for (label, table) in [
+            ("sync", process_table()),
+            ("async", process_table_async().await),
+        ] {
+            let table = table.unwrap_or_else(|| panic!("{label} sample must enumerate on unix"));
+            let own = table
+                .iter()
+                .find(|row| row.pid == own_pid)
+                .unwrap_or_else(|| panic!("{label} sample must contain the caller's own pid"));
+            assert!(
+                own.session_id > 0,
+                "the caller's own row cannot have been recycled mid-sample, so its session id \
+                 must survive the confirmation pass ({label}): {own:?}"
+            );
+        }
     }
 
     #[test]
