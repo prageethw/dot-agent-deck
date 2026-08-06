@@ -487,18 +487,29 @@ impl TabManager {
     /// returns nothing. No-op for any active tab that isn't
     /// `Tab::Orchestration`.
     ///
-    /// **Must be called exactly once per frame, unconditionally, before
-    /// the auto-focus chain runs** — never from inside one of that
-    /// chain's branches. That contract is the whole point of splitting
-    /// this out. The observation used to live inside
+    /// **Must be called exactly once per frame while the deck is locked,
+    /// before the auto-focus chain runs** — never from inside one of that
+    /// chain's branches. Being outside the chain is the whole point of
+    /// splitting this out. The observation used to live inside
     /// `auto_focus_all_clear`, which the render loop only calls when
     /// `auto_focus_waiting_pane` returned `None`; so on the frame a role
     /// first went `WaitingForInput` — the frame where `auto_focus_waiting_pane`
     /// steers focus onto it and therefore wins the chain — nothing
     /// recorded the waiting state. A waiting episode observed in a single
     /// frame was forgotten entirely and its all-clear move never fired.
-    /// Observing unconditionally makes "current for the frame" a property
-    /// of the state rather than of the branch ordering.
+    /// Observing outside the chain makes "current for the frame" a
+    /// property of the state rather than of the branch ordering; that
+    /// hazard is still real and `tabs/orchestration/020` still pins it.
+    ///
+    /// PRD #393 M4b narrowed "unconditionally" to "while the deck is
+    /// locked": the render loop skips this call, and the whole chain with
+    /// it, on every frame `ui.command_entry_locked` is `false`, so an
+    /// unlocked deck makes no focus decision that could fight the human.
+    /// The compensation is [`Self::clear_waiting_pane_latch`], which the
+    /// locked→unlocked toggle calls so a latch set before the unlock
+    /// cannot survive across the unlocked stretch and be misread as a
+    /// fresh all-clear edge on re-lock. Within a locked stretch the
+    /// once-per-frame-before-the-chain contract is unchanged.
     pub fn observe_waiting_panes(
         &mut self,
         pane_status: &HashMap<&str, crate::state::SessionStatus>,
@@ -522,6 +533,41 @@ impl TabManager {
             *all_clear_pending = true;
         }
         *had_waiting_pane = now_waiting;
+    }
+
+    /// PRD #393 M4b — fork-only. Resets the active Orchestration tab's
+    /// waiting-episode edge state (`had_waiting_pane` /
+    /// `all_clear_pending`) to "nothing seen yet". No-op for any active
+    /// tab that isn't `Tab::Orchestration`, exactly like
+    /// [`Self::observe_waiting_panes`].
+    ///
+    /// Called from the locked→unlocked half of the command-entry lock
+    /// toggle, and only from there. It exists because M4b stops running
+    /// [`Self::observe_waiting_panes`] while the deck is unlocked, which
+    /// makes one — and only one — trace go wrong: a role goes
+    /// `WaitingForInput` while LOCKED (so the latch is genuinely set), the
+    /// human unlocks mid-episode (the chain stops, freezing the latch at
+    /// `true`), the pane then resolves unobserved, and on re-lock that
+    /// stale `true` meets a now-idle status and is misread as a fresh
+    /// `true` → `false` edge — yanking focus to the orchestrator, away
+    /// from wherever the human deliberately put it. Clearing on the
+    /// transition makes re-locking start from a clean slate.
+    ///
+    /// An episode that both begins *and* ends inside the unlocked stretch
+    /// needs no fix and never did: with the chain fully skipped, nothing
+    /// ever touches the latch, so nothing goes stale.
+    /// `tabs/orchestration/026` is written against the straddling trace.
+    pub fn clear_waiting_pane_latch(&mut self) {
+        let Tab::Orchestration {
+            had_waiting_pane,
+            all_clear_pending,
+            ..
+        } = &mut self.tabs[self.active_index]
+        else {
+            return;
+        };
+        *had_waiting_pane = false;
+        *all_clear_pending = false;
     }
 
     /// PRD #373 M1 — fork-only. Edge-triggered sibling of
