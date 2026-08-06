@@ -894,8 +894,29 @@ async fn run_shell_activity_monitor(
                 continue;
             }
 
-            let Some(session_id) = state.read().await.pane_hook_session_id(&pane_id) else {
-                continue;
+            // Fork issue #21: resolve the OWNING AGENT alongside the session,
+            // and stamp it on the synthesized event below. The daemon itself
+            // never needed it — its own card is keyed by exactly this
+            // `session_id`, so `apply_event` finds it by direct lookup — but an
+            // ATTACHED TUI that has since reconnected keys the same card by the
+            // hydration-minted `pane-{pane_id}` instead, and the only thing that
+            // remaps an incoming event onto it is `apply_event`'s same-pane
+            // reuse guard, which matches on `agent_id`. With `agent_id: None`
+            // that guard could never match a hydrated card (whose id is
+            // `Some(..)`), so every post-reconnect `ShellBusy`/`ShellIdle`
+            // minted a PHANTOM second session on the pane and left the real card
+            // stranded at `Working` — the visible half of issue #21, which the
+            // provenance marker alone does not fix.
+            let (session_id, agent_id) = {
+                let guard = state.read().await;
+                let Some(session_id) = guard.pane_hook_session_id(&pane_id) else {
+                    continue;
+                };
+                let agent_id = guard
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.agent_id.clone());
+                (session_id, agent_id)
             };
 
             let event = AgentEvent {
@@ -917,7 +938,7 @@ async fn run_shell_activity_monitor(
                 user_prompt: None,
                 metadata: std::collections::HashMap::new(),
                 pane_id: Some(pane_id),
-                agent_id: None,
+                agent_id,
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
