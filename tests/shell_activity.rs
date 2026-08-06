@@ -35,6 +35,10 @@ use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+#[cfg(unix)]
+use dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
 use dot_agent_deck::platform::proc::{
     ProcessInfo, descendant_shell_activity, descendants, process_table,
 };
@@ -445,6 +449,190 @@ fn shell_activity_003_session_id_discriminator_classifies_the_measured_confounde
          condition — this is the direct regression test for a bare no-controlling-terminal \
          fallback"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M3 — `AgentPtyRegistry::shell_foreground_busy_snapshot` (the public seam
+// over `RunningAgent::shell_foreground_busy`) wired onto the descendant scan.
+// Unix only — spawns a real PTY pane and a real `setsid()`'d, `ps`-visible
+// child; there is no process table to scan on Windows.
+// ---------------------------------------------------------------------------
+
+/// RAII guard for the detached target's real pid, so a panic between
+/// discovering it and the explicit kill below still reaps it rather than
+/// leaking a 30s `sleep` into the runner's process tree — the same pattern
+/// `SpawnedGrandchild` uses in `status/shell-activity/001`. A second SIGKILL
+/// after the process has already exited just returns ESRCH, which this
+/// ignores.
+#[cfg(unix)]
+struct KillOnDrop(Option<i32>);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // SAFETY: `pid` is a real pid this process learned from its own
+            // `process_table()` sample; SIGKILL on an already-exited pid is a
+            // no-op ESRCH.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Scenario: spawns a real PTY pane running `/bin/sh` through
+/// `AgentPtyRegistry::spawn_agent` (the same registry path a real agent pane
+/// uses), whose script sleeps briefly and then has a `python3` child call
+/// `os.setsid()` and `execv` into `/bin/sleep` — a genuine `setsid`-detached,
+/// marker-tagged, Bash-tool-argv-shaped process on pipes, off the pane's PTY
+/// entirely, exactly the topology `status/shell-activity/386-argv-notes.md`
+/// measured for a real Claude Bash-tool child and the one #370's own test
+/// never exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
+/// and asserts the pane reads idle before the detached child appears, busy
+/// while it lives — independently confirmed via `process_table()` +
+/// `descendants()` that the found descendant has no controlling terminal, is
+/// its own session leader, and carries a session id different from the
+/// pane's own shell — and idle again once the child is killed.
+#[cfg(unix)]
+#[spec("status/shell-activity/004")]
+#[test]
+fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
+    const PANE_ID: &str = "shell-activity-004-pane";
+    let marker = format!("shell-activity-004-target-{}", std::process::id());
+    // `sleep 0.3` guarantees an observable idle window before the detached
+    // child appears; the python3 one-liner setsid()'s itself (detaching from
+    // the pane's controlling terminal and becoming its own session leader,
+    // exactly as Claude Code's Bash-tool child does) and execv's into
+    // `/bin/sleep 30` with an argv crafted to carry the measured Bash-tool
+    // shape (`shell-snapshots/snapshot-` and `&& eval `) so the argv
+    // cross-check is exercised against a real process, not just a fixture
+    // string. 30s is a generous backstop bound in case the test panics
+    // before the explicit kill below runs; `KillOnDrop` and the explicit
+    // kill both aim to end it long before that. The trailing `sleep 5` keeps
+    // the pane's own shell alive (and so its registry entry) past the
+    // detached child's death — without it the shell has nothing left to run
+    // and exits the instant the killed child is reaped, so the pane
+    // disappears from the snapshot instead of reading idle.
+    let command = format!(
+        "sleep 0.3; python3 -c \"import os; os.setsid(); os.execv('/bin/sleep', \
+         ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; sleep 5"
+    );
+
+    let registry = AgentPtyRegistry::new();
+    let id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&command),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string()),
+                // Pins the `-c` wrap shell so the script's syntax is
+                // predictable across developer machines regardless of login
+                // shell; consumed by the wrap decision only, never exported
+                // into the child's own environment.
+                ("SHELL".to_string(), "/bin/sh".to_string()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+    let shell_pid = registry
+        .child_pid(&id)
+        .expect("spawned agent must expose a pid") as i32;
+
+    let mut target_guard = KillOnDrop(None);
+
+    let busy_for_pane = |registry: &AgentPtyRegistry| -> Option<bool> {
+        registry
+            .shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])
+            .into_iter()
+            .find(|(pane_id, _)| pane_id == PANE_ID)
+            .map(|(_, busy)| busy)
+    };
+
+    // Falling edge before the rising edge: the script hasn't launched the
+    // detached child yet, so the pane must read idle.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut state = busy_for_pane(&registry);
+    while state != Some(false) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        state = busy_for_pane(&registry);
+    }
+    assert_eq!(
+        state,
+        Some(false),
+        "an idle shell with no detached descendant yet must not read busy"
+    );
+
+    // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut state = busy_for_pane(&registry);
+    while state != Some(true) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        state = busy_for_pane(&registry);
+    }
+    assert_eq!(
+        state,
+        Some(true),
+        "a real detached-on-pipes descendant, off the pane's PTY entirely, in its own POSIX \
+         session, carrying the Bash-tool argv shape, must read busy — this is exactly the #370 \
+         defect: the old tcgetpgrp body compares pgids on the pane's own PTY and can never \
+         observe a child that never touches it"
+    );
+
+    // Independent oracle: confirm this is genuinely the topology #370 could
+    // never see, not just that the snapshot happened to say `true`.
+    let table = process_table().expect("process_table() must enumerate on unix");
+    let own_row = table
+        .iter()
+        .find(|p| p.pid == shell_pid)
+        .expect("the pane's own shell must appear in its own process table sample");
+    let target = descendants(&table, shell_pid)
+        .into_iter()
+        .find(|p| p.argv.contains(&marker))
+        .unwrap_or_else(|| {
+            panic!(
+                "detached target carrying marker {marker:?} not found among descendants of \
+                 shell pid {shell_pid}"
+            )
+        })
+        .clone();
+    assert!(
+        !target.has_controlling_tty,
+        "the detached child must have no controlling terminal — it never touches the pane's \
+         PTY: {target:?}"
+    );
+    assert!(
+        target.session_leader,
+        "a setsid()'d child must be its own session leader: {target:?}"
+    );
+    assert_ne!(
+        target.session_id, own_row.session_id,
+        "the detached child must be in a different POSIX session than the pane's own shell — \
+         the load-bearing condition the whole discriminator rests on: {target:?}"
+    );
+    target_guard.0 = Some(target.pid);
+
+    // Falling edge: kill the detached child and confirm the signal clears. A
+    // test that only asserted the rising edge would pass against an
+    // implementation that never clears.
+    // SAFETY: `target.pid` was just read from this process's own
+    // `process_table()` sample.
+    unsafe {
+        libc::kill(target.pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut state = busy_for_pane(&registry);
+    while state != Some(false) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        state = busy_for_pane(&registry);
+    }
+    assert_eq!(
+        state,
+        Some(false),
+        "once the detached descendant exits the pane must read idle again — a test that only \
+         asserts the rising edge would pass against an implementation that never clears"
+    );
+
+    registry.close_agent(&id).unwrap();
 }
 
 // ---------------------------------------------------------------------------
