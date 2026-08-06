@@ -1286,17 +1286,23 @@ impl TuiDeck {
     /// Debounced cursor read: poll [`terminal_cursor_snapshot`](Self::terminal_cursor_snapshot)
     /// until `STABLE_SAMPLES` consecutive reads — position AND cell styling,
     /// both fields of `TerminalCursorSnapshot`'s `PartialEq` — come back
-    /// identical, or `timeout` elapses, whichever is first. A single
-    /// snapshot taken right after a grid-content wait (e.g.
-    /// `wait_for_grid_string_within`) can land on a frame that is not yet
-    /// final: more PTY output may still be in flight, or the deck's own
-    /// synthetic block cursor (painted in `src/terminal_widget.rs` with
-    /// `Color::LightGreen`/`BOLD`) may not have been repainted at the new
-    /// position yet (PRD #393: this is what made
-    /// `orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes`
-    /// flaky — a cursor snapshot taken one frame early). Prefer this over a
-    /// bare `terminal_cursor_snapshot()` whenever the caller is about to
-    /// compare cursor position/styling across two points in time.
+    /// identical, or `timeout` elapses, whichever is first.
+    ///
+    /// On its own this only proves "nothing changed for ~60ms," which a
+    /// snapshot taken the INSTANT a keystroke is sent trivially satisfies —
+    /// the write hasn't even reached the PTY yet, so the first several reads
+    /// all agree on the stale pre-keystroke value and this returns
+    /// immediately without ever observing the keystroke's effect. Calling
+    /// this directly right after `send_bytes`/`send_keys` is that trap; use
+    /// [`wait_for_terminal_cursor_change_then_settle`](Self::wait_for_terminal_cursor_change_then_settle)
+    /// instead whenever a prior snapshot is available to diverge from. This
+    /// primitive is for the complementary case — settling on the FINAL frame
+    /// once some external wait (e.g. `wait_for_grid_string_within`) has
+    /// already established that change is underway or done, where a bare
+    /// `terminal_cursor_snapshot()` could still land one frame early: more
+    /// PTY output may be in flight, or the deck's own synthetic block cursor
+    /// (painted in `src/terminal_widget.rs` with `Color::LightGreen`/`BOLD`)
+    /// may not have been repainted at the new position yet.
     pub fn wait_for_settled_terminal_cursor(&self, timeout: Duration) -> TerminalCursorSnapshot {
         const STABLE_SAMPLES: u32 = 3;
         const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -1316,6 +1322,51 @@ impl TuiDeck {
                 last = current;
                 stable_count = 1;
             }
+        }
+    }
+
+    /// Two-phase cursor wait for "this keystroke should move the cursor away
+    /// from `from`": first a coarse, cheap `(row, col)` divergence check
+    /// (catches "did anything move at all", bounded by `timeout`), then a
+    /// hand-off to
+    /// [`wait_for_settled_terminal_cursor`](Self::wait_for_settled_terminal_cursor)
+    /// (bounded by whatever of `timeout` remains) so the returned snapshot
+    /// reflects the FINAL frame rather than the first one where the coarse
+    /// check happened to pass.
+    ///
+    /// PRD #393: collapsing this into a single stability-only wait (poll
+    /// `terminal_cursor_snapshot()` until N consecutive reads agree, with no
+    /// divergence check) made
+    /// `orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes`
+    /// flaky in the OPPOSITE direction on a loaded CI runner: called right
+    /// after `send_bytes`, before the keystroke has propagated through the
+    /// PTY round trip at all, the first several reads all agree on the
+    /// unchanged pre-keystroke value — which is trivially "stable" — so it
+    /// returned that stale snapshot within one poll interval instead of
+    /// waiting for the real change. Requiring an actual `(row, col)` change
+    /// from a known `from` baseline before settling closes that gap.
+    ///
+    /// If the cursor never diverges from `from` within `timeout`, returns
+    /// the last (still-`from`-equal) snapshot observed — the caller's own
+    /// assertion on the returned value produces the diagnostic, exactly as
+    /// it would for a real product regression.
+    pub fn wait_for_terminal_cursor_change_then_settle(
+        &self,
+        from: TerminalCursorSnapshot,
+        timeout: Duration,
+    ) -> TerminalCursorSnapshot {
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snap = self.terminal_cursor_snapshot();
+            if (snap.row, snap.col) != (from.row, from.col) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                return self.wait_for_settled_terminal_cursor(remaining);
+            }
+            if Instant::now() >= deadline {
+                return snap;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 

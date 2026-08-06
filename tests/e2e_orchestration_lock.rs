@@ -309,6 +309,12 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     // pane (never gated by the lock, so this isolates the assertion from
     // lock state entirely). ---
 
+    // Baseline captured BEFORE typing starts, so the first cursor read below
+    // has something to diverge from (see
+    // `TuiDeck::wait_for_terminal_cursor_change_then_settle`'s doc comment
+    // for why a divergence check, not just a stability check, is required).
+    let pre_type = deck.terminal_cursor_snapshot();
+
     deck.send_keys(PARTIAL_LINE.as_bytes()); // no trailing \r -- never submitted
     assert!(
         deck.wait_for_grid_string_within(PARTIAL_LINE, Duration::from_secs(3)),
@@ -318,16 +324,17 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     // Not a plain `terminal_cursor_snapshot()`: the substring landing on the
     // grid only proves those bytes were applied, not that the deck has
     // finished echoing (more may be in flight) or repainted its own
-    // block-cursor overlay at the final position (PRD #393 flake — see
-    // `TuiDeck::wait_for_settled_terminal_cursor`'s doc comment).
-    let end_of_line = deck.wait_for_settled_terminal_cursor(Duration::from_secs(2));
+    // block-cursor overlay at the final position (PRD #393 flake).
+    let end_of_line =
+        deck.wait_for_terminal_cursor_change_then_settle(pre_type, Duration::from_secs(3));
 
     // Ctrl+a (0x01) == readline's beginning-of-line. The deck binds no
     // action to this chord, so it is a safe control: if the cursor does not
     // move here, the harness's cursor-observation technique itself is
     // broken, independent of anything Ctrl+e does.
     deck.send_bytes(b"\x01");
-    let start_of_line = deck.wait_for_settled_terminal_cursor(Duration::from_secs(2));
+    let start_of_line =
+        deck.wait_for_terminal_cursor_change_then_settle(end_of_line, Duration::from_secs(3));
     assert!(
         (start_of_line.row, start_of_line.col) != (end_of_line.row, end_of_line.col),
         "control check failed: Ctrl+a (readline beginning-of-line) never \
@@ -353,7 +360,8 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     // of mode (PRD #374), so the byte never reaches the PTY and the cursor
     // never moves back.
     deck.send_bytes(b"\x05");
-    let after_ctrl_e = deck.wait_for_settled_terminal_cursor(Duration::from_secs(2));
+    let after_ctrl_e =
+        deck.wait_for_terminal_cursor_change_then_settle(start_of_line, Duration::from_secs(3));
     assert!(
         (after_ctrl_e.row, after_ctrl_e.col) == (end_of_line.row, end_of_line.col),
         "Ctrl+e did not reach the focused orchestrator role pane's PTY — \
