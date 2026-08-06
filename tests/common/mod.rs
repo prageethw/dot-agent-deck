@@ -2057,6 +2057,25 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Would the gate accept this credential document? Parses the bytes, requires a
+/// `claudeAiOauth` entry, and applies [`claude_oauth_usable`] — the one place
+/// that question is answered, so the availability check, the Keychain probe and
+/// the import all judge a credential set by the same rule regardless of where
+/// it came from.
+///
+/// Takes bytes rather than a parsed value so callers holding a secret buffer
+/// can classify it and then zero it. The parse does put a second copy of the
+/// secret in the `serde_json::Value`, which cannot be zeroed the way a byte
+/// buffer can; it is local, dropped when this returns, and never read except
+/// through `claude_oauth_usable`.
+fn claude_credential_document_usable(raw: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|parsed| parsed.get("claudeAiOauth"))
+        .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok())
+}
+
 /// Service name Claude Code 2.x files its OAuth credential set under in the
 /// macOS login Keychain.
 #[cfg(target_os = "macos")]
@@ -2118,12 +2137,7 @@ fn claude_keychain_credentials_present() -> bool {
         .output();
     match probe {
         Ok(mut out) => {
-            let usable = out.status.success()
-                && serde_json::from_slice::<serde_json::Value>(&out.stdout)
-                    .ok()
-                    .as_ref()
-                    .and_then(|parsed| parsed.get("claudeAiOauth"))
-                    .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok());
+            let usable = out.status.success() && claude_credential_document_usable(&out.stdout);
             out.stdout.fill(0);
             usable
         }
@@ -2144,9 +2158,11 @@ fn claude_keychain_credentials_present() -> bool {
 /// Keychain itself.
 ///
 /// `None` when there is no such item, when `security` cannot be run, or when
-/// what came back is not a `claudeAiOauth` credential document — the caller
-/// then reports its file-side error instead, so an unrelated or malformed
-/// keychain item can never be written into a test HOME as if it were a login.
+/// what came back is not a **usable** `claudeAiOauth` credential document (the
+/// same rule the gate applies — see [`claude_credential_document_usable`]) —
+/// the caller then reports its file-side error instead, so an unrelated,
+/// malformed or spent keychain item can never be written into a test HOME as
+/// if it were a login.
 ///
 /// These bytes ARE the secret, unlike [`claude_keychain_credentials_present`]'s
 /// boolean. They are returned solely to be handed to
@@ -2171,8 +2187,14 @@ fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
     while bytes.last().is_some_and(|b| b.is_ascii_whitespace()) {
         bytes.pop();
     }
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    parsed.get("claudeAiOauth")?;
+    // Same usability rule the gate applies (PRD #386 review): an expired or
+    // malformed Keychain item is not a source worth seeding a test HOME from,
+    // and returning it would hand the caller a credential set
+    // `check_claude_available` would have rejected.
+    if !claude_credential_document_usable(&bytes) {
+        bytes.fill(0);
+        return None;
+    }
     Some(bytes)
 }
 
@@ -2499,6 +2521,17 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     // the relocated per-test HOME cannot reach the real user's keychain (it
     // answers "keychain not found", exit 44 — measured) and has nothing but
     // this imported file to authenticate from.
+    //
+    // PRD #386 review (Greptile P1): the source is chosen by USABILITY, not by
+    // mere readability. `check_claude_available` accepts the host when EITHER
+    // source is usable, so a stale/expired/malformed but perfectly readable
+    // `~/.claude/.credentials.json` sitting beside a live Keychain item used to
+    // pass preflight (on the Keychain) and then seed the test HOME from the
+    // file — launching the isolated `claude` with credentials the gate had
+    // already rejected, and failing the real-agent test deep in a PTY wait on a
+    // host that is genuinely logged in. Same rule, same order, as the gate:
+    // a usable file wins, else the Keychain, else copy what we have and let it
+    // fail loudly rather than silently importing nothing.
     let src_creds = src_root.join(".credentials.json");
     let creds_bytes = match read_credential_file_no_symlink(
         &src_creds,
@@ -2506,7 +2539,8 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
          nor in the macOS login Keychain — log in with `claude login`",
         "~/.claude/.credentials.json",
     ) {
-        Ok(bytes) => bytes,
+        Ok(bytes) if claude_credential_document_usable(&bytes) => bytes,
+        Ok(bytes) => claude_keychain_credentials_export().unwrap_or(bytes),
         Err(file_err) => claude_keychain_credentials_export().ok_or(file_err)?,
     };
     write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &creds_bytes)?;
