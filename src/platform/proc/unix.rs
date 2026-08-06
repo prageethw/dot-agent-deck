@@ -335,22 +335,60 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Turn a captured `ps` table into rows, resolve each row's session id, then
-/// confirm those answers against a second sample — the shared body of
-/// [`process_table`] and [`process_table_async`].
+/// The sampling sequence itself, over an injected `capture` (called twice) and
+/// an injected session-id resolver — the shared body of [`process_table`] and
+/// [`process_table_async`].
 ///
-/// The two `ps` invocations sandwich the `getsid` pass, which is what closes
-/// most of the PID-reuse window (fork issue #30); see
-/// [`super::scan::invalidate_unconfirmed_session_ids`] for the invariant and
-/// for the residual window that remains. The cost is the second `ps` per
-/// sample, which is exactly the number PRD #386's M5 measurement should be
-/// taken against.
-fn confirm_sample(first: &str, confirm: &str) -> Option<Vec<super::ProcessInfo>> {
-    let mut rows = super::scan::parse_ps_table(first, &getsid_or_negative);
+/// **The order of the three steps is the entire fix for fork issue #30 and is
+/// not incidental**: the `getsid` pass must run strictly *between* the two
+/// captures. Capturing both samples first and only then reading session ids
+/// leaves the whole reuse window between the second capture and `getsid`
+/// unprotected — a pid can exit and be recycled there, and the confirmation
+/// then vouches for a `getsid` answer that describes the replacement process.
+/// (Exactly that inversion shipped in this change's first draft and was caught
+/// in review.) `capture` and `session_id_of` are injected rather than called
+/// directly so `the_getsid_pass_runs_between_the_two_captures` can observe the
+/// sequence and fail if it is ever reordered again.
+///
+/// See [`super::scan::invalidate_unconfirmed_session_ids`] for the invariant
+/// the confirmation enforces and for the residual window that remains. The cost
+/// is the second `ps` per sample, which is the shape PRD #386's M5 measurement
+/// should be taken against.
+fn sample_table(
+    mut capture: impl FnMut() -> Option<String>,
+    session_id_of: impl Fn(i32) -> i32,
+) -> Option<Vec<super::ProcessInfo>> {
+    let first = capture()?;
+    let mut rows = super::scan::parse_ps_table(&first, &session_id_of);
     if rows.is_empty() {
         return None;
     }
-    super::scan::invalidate_unconfirmed_session_ids(&mut rows, confirm);
+    let confirm = capture()?;
+    super::scan::invalidate_unconfirmed_session_ids(&mut rows, &confirm);
+    Some(rows)
+}
+
+/// [`sample_table`] for an async `capture`. Kept as a separate function rather
+/// than unified because the two capture forms are genuinely different types
+/// (`Option<String>` vs a future of one); the *sequence* below must stay
+/// identical to the blocking twin's, and both are pinned by their own ordering
+/// test.
+async fn sample_table_async<F, Fut, S>(
+    mut capture: F,
+    session_id_of: S,
+) -> Option<Vec<super::ProcessInfo>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+    S: Fn(i32) -> i32,
+{
+    let first = capture().await?;
+    let mut rows = super::scan::parse_ps_table(&first, &session_id_of);
+    if rows.is_empty() {
+        return None;
+    }
+    let confirm = capture().await?;
+    super::scan::invalidate_unconfirmed_session_ids(&mut rows, &confirm);
     Some(rows)
 }
 
@@ -373,11 +411,17 @@ fn confirm_sample(first: &str, confirm: &str) -> Option<Vec<super::ProcessInfo>>
 /// measurement; it removes the subprocess at the cost of two platform-specific
 /// implementations, and is only worth taking if the measurement says so.
 pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+    // One deadline for the whole sample: each capture gets whatever is left of
+    // [`PS_SAMPLE_BUDGET`], so a slow first `ps` cannot buy the second one a
+    // fresh full budget.
     let deadline = std::time::Instant::now() + PS_SAMPLE_BUDGET;
-    let first = capture_bounded(PS_PROGRAM, &PS_ARGS, PS_SAMPLE_BUDGET)?;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let confirm = capture_bounded(PS_PROGRAM, &PS_ARGS, remaining)?;
-    confirm_sample(&first, &confirm)
+    sample_table(
+        || {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            capture_bounded(PS_PROGRAM, &PS_ARGS, remaining)
+        },
+        getsid_or_negative,
+    )
 }
 
 /// [`process_table`] for callers on a Tokio runtime — the form the daemon's
@@ -393,11 +437,16 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 /// forever, consuming a pool slot per poll, whereas dropping the async future
 /// kills and reaps the child (`kill_on_drop`).
 pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+    // One deadline for the whole sample — see the blocking twin.
     let deadline = std::time::Instant::now() + PS_SAMPLE_BUDGET;
-    let first = capture_bounded_async(PS_PROGRAM, &PS_ARGS, PS_SAMPLE_BUDGET).await?;
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let confirm = capture_bounded_async(PS_PROGRAM, &PS_ARGS, remaining).await?;
-    confirm_sample(&first, &confirm)
+    sample_table_async(
+        || {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            capture_bounded_async(PS_PROGRAM, &PS_ARGS, remaining)
+        },
+        getsid_or_negative,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +740,72 @@ mod tests {
                 .as_deref(),
             Some("hello\n")
         );
+    }
+
+    /// Fork issue #30, and the defect Greptile caught in this change's first
+    /// draft: the `getsid` pass must run **between** the two captures, not after
+    /// both of them. Capturing twice and only then reading session ids leaves
+    /// the entire window between the second capture and `getsid` unprotected —
+    /// a pid recycled there is vouched for by a confirmation that was taken
+    /// before the answer it is supposed to validate even existed.
+    ///
+    /// Drives the sequence with an injected capture and resolver that record
+    /// when they are called, and asserts the order is capture → getsid →
+    /// capture. Both sampling forms are pinned, because the sequence is written
+    /// out once per form.
+    #[tokio::test]
+    async fn the_getsid_pass_runs_between_the_two_captures() {
+        use std::cell::RefCell;
+
+        const FIRST: &str = "100     1 ttys014  claude --model opus\n";
+        // The confirmation reports a different parent for pid 100, so applying
+        // it must invalidate the session id — proving it was applied *after*
+        // the resolver ran, not merely fetched.
+        const CONFIRM: &str = "100   999 ttys014  claude --model opus\n";
+
+        let expected = ["capture", "getsid", "capture"];
+
+        let log = RefCell::new(Vec::<&'static str>::new());
+        let resolver = |_: i32| {
+            log.borrow_mut().push("getsid");
+            100
+        };
+        let mut captures = 0;
+        let sync_rows = sample_table(
+            || {
+                log.borrow_mut().push("capture");
+                captures += 1;
+                Some(if captures == 1 { FIRST } else { CONFIRM }.to_string())
+            },
+            resolver,
+        )
+        .expect("a one-row sample must produce a table");
+        assert_eq!(log.borrow().as_slice(), &expected);
+        assert_eq!(
+            sync_rows[0].session_id, -1,
+            "the confirmation must be applied to the session ids the resolver produced"
+        );
+
+        let log = RefCell::new(Vec::<&'static str>::new());
+        let resolver = |_: i32| {
+            log.borrow_mut().push("getsid");
+            100
+        };
+        let mut captures = 0;
+        let async_rows = sample_table_async(
+            || {
+                log.borrow_mut().push("capture");
+                captures += 1;
+                std::future::ready(Some(
+                    if captures == 1 { FIRST } else { CONFIRM }.to_string(),
+                ))
+            },
+            resolver,
+        )
+        .await
+        .expect("a one-row sample must produce a table");
+        assert_eq!(log.borrow().as_slice(), &expected);
+        assert_eq!(async_rows[0].session_id, -1);
     }
 
     /// End to end on a real machine: both sampling forms still enumerate the
