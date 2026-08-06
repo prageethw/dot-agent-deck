@@ -25291,7 +25291,22 @@ mod tests {
             let FrameContent::Cards { panes_area, .. } = layout.content else {
                 panic!("Orchestration tab must produce FrameContent::Cards");
             };
-            panes_area.expect("role panes => a right column").width
+            // `panes_area.width` is the OUTER pane-column width (the raw
+            // split percentage of `frame_area`, before border chrome is
+            // drawn) — see `compute_frame_layout_cards_two_panes_geometry`
+            // and `layout_002`, which pin it exactly equal to the split
+            // percentage with no adjustment. `AgentSpawnOptions::cols`, by
+            // contrast, is the PTY's INNER width: `right_column_pane_dims`
+            // (src/ui.rs) computes `cols = right_width.saturating_sub(2)`
+            // to leave room for the pane's border columns — the same
+            // subtraction the `orchestration_role_pane_dims_*` seam guards
+            // pin. Subtract the 2 border columns here so this helper
+            // derives the same INNER quantity the recorded spawn `cols`
+            // actually is; comparing outer-vs-inner directly is an off-by-2.
+            panes_area
+                .expect("role panes => a right column")
+                .width
+                .saturating_sub(2)
         };
 
         // A's 2 roles are recorded first, B's 2 roles second.

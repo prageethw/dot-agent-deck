@@ -224,6 +224,12 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // Orchestration tab just as the Orchestration tab's earlier toggle
     // propagated to the Dashboard tab.
     deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Orchestration
+    // Same hazard as the Shift+Tab switch above (see the comment at line
+    // 184-190): confirm the tab switch itself landed before polling for the
+    // exact edge, so a panicking `pane_box_left_edge` isn't used directly as
+    // a predicate against a first-sampled grid that can still show the
+    // Dashboard tab ("orchestrator" genuinely absent, not just moved).
+    deck.wait_for_string("orchestrator");
     let orch_also_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         pane_box_left_edge(grid, "orchestrator") == 34
     });

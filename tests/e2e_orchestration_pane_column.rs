@@ -69,6 +69,10 @@ fn pane_column_left_edge(grid: &str) -> u16 {
 /// orchestration tab always lands the deck in PaneInput mode focused on its
 /// start-role pane — so Ctrl+D precedes each toggle press that follows a
 /// tab open, entering Normal mode first exactly as a real user now must.
+/// PRD #387 M5: at tab B's Hidden stage, also assert directly that NEITHER
+/// role's sidebar card marker is present on the grid — proving Hidden
+/// genuinely renders no sidebar content, not merely that the pane column's
+/// left edge reached column 0.
 #[spec("tabs/orchestration/006")]
 #[test]
 fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
@@ -141,6 +145,22 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
          3s — pane-column edge stayed at {}\nGrid:\n{}",
         pane_column_left_edge(&deck.snapshot_grid()),
         deck.snapshot_grid()
+    );
+
+    // PRD #387 M5: `pane_column_left_edge(grid) == 0` above proves the pane
+    // column's own box starts at column 0, which is necessary but not
+    // sufficient — it does not rule out sidebar content still being drawn
+    // (e.g. a stray card fragment) that this substring search never looks
+    // for. Directly assert NEITHER role's sidebar card marker
+    // ("\u{00b7} <role>", the same needle `has_role_status` below uses to
+    // find a sidebar deck card's title row) is present anywhere on the
+    // settled grid, so Hidden is proven to render NO sidebar at all.
+    let hidden_grid = deck.snapshot_grid();
+    assert!(
+        !hidden_grid.contains("\u{00b7} orchestrator") && !hidden_grid.contains("\u{00b7} worker"),
+        "Hidden must render NO sidebar content at all — found a sidebar \
+         role-card marker on the grid even though the pane column's left \
+         edge reported column 0\nGrid:\n{hidden_grid}"
     );
 
     // Switch back to tab A (Shift+Tab -> previous tab). Shared-stage proof
