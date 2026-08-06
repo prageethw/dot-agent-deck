@@ -57,9 +57,21 @@ fn pane_004_card_title_row() {
     // doesn't need its own fn — keeping the test body
     // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // Both timestamps use one current instant so the fixture starts with a
-    // compact `0s` elapsed value; a fixed calendar instant previously drifted
-    // into a large hour count as the test aged (M3 fix).
+    // Both timestamps derive from one current instant so the fixture starts
+    // with a compact `0s` elapsed value; a fixed calendar instant previously
+    // drifted into a large hour count as the test aged (M3 fix). `last_activity`
+    // is nudged 30s into the *future* of that instant rather than left equal to
+    // it (issue #15): the bottom border's `Last:` field is computed from
+    // `Utc::now()` at render time (`format_elapsed`, src/ui.rs), not at fixture
+    // build time, and that renderer clamps a negative elapsed delta to zero
+    // (`delta.num_seconds().max(0)`). Seeding `last_activity == now` put the
+    // rendered value exactly on the boundary between `0s` and `1s` — any
+    // scheduling delay between building the fixture and the snapshot render
+    // (routine under parallel test load) could tip it over intermittently. A
+    // *past* offset (e.g. `now - 500ms`) would only shrink that safety margin
+    // further; nudging forward instead means the render-time delta stays
+    // negative (clamped to `0s`) for any render happening within 30s of this
+    // instant, which comfortably covers ordinary scheduling jitter.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "sess-abc123".to_string(),
@@ -71,7 +83,7 @@ fn pane_004_card_title_row() {
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 7,
         last_user_prompt: Some("fix the login bug".to_string()),
@@ -745,6 +757,24 @@ fn pane_007_pi_card_omits_agent_type_badge() {
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_omits_agent_type_badge() {
+    // `last_activity` is nudged 30s into the future of `now` rather than left
+    // equal to it (issue #15): this fixture feeds both the immediate snapshot
+    // below AND the later `pane_008_named_agent_badges` snapshot (via
+    // `session.clone()` in the loop further down), so by the time the second
+    // snapshot renders, real wall-clock time has already passed doing the
+    // first snapshot's assertions and comparisons. The bottom border's
+    // `Last:` field is computed from `Utc::now()` at render time
+    // (`format_elapsed`, src/ui.rs), not at fixture build time, so seeding
+    // `last_activity == now` raced that elapsed computation across a whole
+    // second boundary under any scheduling delay (routine under parallel test
+    // load) — intermittently rendering `Last: 1s` instead of the pinned
+    // `Last: 0s`. A *past* offset (e.g. `now - 500ms`) would only shrink the
+    // safety margin further and make the race worse, not fix it. Nudging
+    // forward instead relies on `format_elapsed`'s existing clamp of a
+    // negative elapsed delta to zero (`delta.num_seconds().max(0)`): the
+    // render-time delta stays negative (clamped to `0s`) for any render
+    // happening within 30s of this instant, comfortably covering both
+    // snapshots in this test.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "wrapped-01".to_string(),
@@ -753,7 +783,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         status: SessionStatus::Thinking,
         active_tool: None,
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: Some("inspect the repository".to_string()),
@@ -1531,7 +1561,12 @@ fn pane_005_highlight_follows_selected_session_id() {
     // stable id (highlighting card 0) would visibly diff the snapshot.
     //
     // All sessions share one current activity time, keeping their compact
-    // bottom-border elapsed values identical in the snapshot.
+    // bottom-border elapsed values identical in the snapshot. `last_activity`
+    // is nudged 30s into the future of that shared instant rather than left
+    // equal to it — see the identical rationale in `pane_004_card_title_row`
+    // above (issue #15): the render-time `Last:` field races the wall clock
+    // when seeded at exactly `now`, and `format_elapsed`'s clamp to zero for a
+    // negative delta (src/ui.rs) makes a forward offset the safe fix.
     let now = chrono::Utc::now();
     let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
         session_id: sid.to_string(),
@@ -1543,7 +1578,7 @@ fn pane_005_highlight_follows_selected_session_id() {
             detail: Some("src/main.rs".to_string()),
         }),
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 3,
         last_user_prompt: Some("do the thing".to_string()),
