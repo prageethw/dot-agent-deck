@@ -1,6 +1,6 @@
 # PRD #370: Treat underlying shell activity as Working status inside a worker pane
 
-**Status**: In progress — M1-M4 complete, M5 (docs/changelog) partially done (changelog fragment added; see M5 note)
+**Status**: Superseded by PRD [#386](https://github.com/vfarcic/dot-agent-deck/issues/386) — the `tcgetpgrp` mechanism shipped but never fired in any real pane; see the 2026-08-06 Work Log entry for the measurements and what is kept.
 **Priority**: Medium
 **Created**: 2026-08-04 (issue filed) / 2026-08-05 (PRD written)
 **GitHub Issue**: [#370](https://github.com/vfarcic/dot-agent-deck/issues/370)
