@@ -2322,25 +2322,25 @@ without depending on the config struct API.
 
 #### orchestration/lock
 
-##### orchestration/lock/001 — A freshly opened orchestration tab starts with command-entry LOCKED (PRD #361 Item 3).
+##### orchestration/lock/001 — A freshly opened orchestration tab observes the deck-global command-entry lock LOCKED (PRD #393 M2 decision 2, was PRD #361 Item 3's per-tab version).
 - **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
 - **Agent:** none.
-- **Asserts:** dispatching a real `Action::SpawnPane` to open a fresh two-role orchestration (`orchestrator` start + `worker`) leaves the new tab's per-tab lock field engaged — only the orchestrator pane accepts direct input until `Ctrl+e` unlocks it.
+- **Asserts:** dispatching a real `Action::SpawnPane` to open a fresh two-role orchestration (`orchestrator` start + `worker`) leaves the DECK-GLOBAL `UiState::command_entry_locked` engaged — only the orchestrator pane accepts direct input until `Ctrl+e` unlocks it. Reads from `UiState`, not from a per-tab field (PRD #393 M2 deletes the latter).
 - **Does not assert:** the actual PTY-forward gating behavior (covered by `orchestration/lock/004`); the `Ctrl+e` toggle itself (covered by `orchestration/lock/002`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/lock/002 — `Ctrl+e` resolves to the new toggle `Action` from `PaneInput` mode and flips the per-tab lock field locked -> unlocked -> locked (PRD #361 Item 3).
+##### orchestration/lock/002 — `Ctrl+e` resolves to the toggle `Action` from command mode and flips the deck-global lock locked -> unlocked -> locked (PRD #393 M2 decision 2, was PRD #361 Item 3's per-tab version).
 - **Layer:** L1 (`key_action_for_mode`, the `KeyEvent -> Action` seam the live event loop uses, plus `dispatch_action` against a `CapturingPaneController`; no PTY, no TestBackend render).
 - **Agent:** none.
-- **Asserts:** resolving a simulated `Ctrl+e` `KeyEvent` through `key_action_for_mode` from `UiMode::PaneInput` with the default keybinding config yields `Action::ToggleOrchestrationLock`; dispatching it once against a real orchestration tab unlocks it, dispatching it again re-locks it.
-- **Does not assert:** the visible status message on toggle, if any; per-tab isolation of the toggle (covered by `orchestration/lock/003`); the actual PTY-forward gating (covered by `orchestration/lock/004`).
+- **Asserts:** resolving a simulated `Ctrl+e` `KeyEvent` through `key_action_for_mode` from `UiMode::Normal` (command mode — the only mode PRD #393 M1 left the chord claimed in) with the default keybinding config yields `Action::ToggleOrchestrationLock`; dispatching it once against a real orchestration tab flips the DECK-GLOBAL `UiState::command_entry_locked` to unlocked, dispatching it again re-locks it.
+- **Does not assert:** the visible status message on toggle, if any; the full `is_orchestration_tab x UiMode` scoping matrix (covered by `orchestration/lock/007`) or the real-pane chord fix (`orchestration/lock/008`); deck-global sharing across tabs (covered by `orchestration/lock/003`); the actual PTY-forward gating (covered by `orchestration/lock/004`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/lock/003 — The command-entry lock is per-orchestration-tab: toggling one tab's lock does not affect a second open orchestration tab's lock state, in either direction (PRD #361 Item 3 resolved decision).
+##### orchestration/lock/003 — The command-entry lock is deck-global: toggling on one orchestration tab changes what every open orchestration tab observes, and a newly opened orchestration tab adopts the current deck value instead of defaulting to locked (PRD #393 M2 decision 2, inverts PRD #361 Item 3's per-tab-isolation decision).
 - **Layer:** L1 (`dispatch_action` dispatched directly against a `CapturingPaneController`; no PTY, no TestBackend render).
 - **Agent:** none.
-- **Asserts:** unlock orchestration tab A via the toggle action; open a brand-new orchestration tab B and confirm it starts LOCKED — its own default — regardless of A's now-unlocked state; switch back to A and confirm it is STILL unlocked, untouched by B's spawn; toggle B's own lock and confirm A remains unaffected by that toggle too.
-- **Does not assert:** the visible rendered grid or cross-tab-type scoping (Mode/Dashboard tabs have no lock at all, out of scope per the PRD); the actual PTY-forward gating (covered by `orchestration/lock/004`).
+- **Asserts:** toggle orchestration tab A's lock (unlocking the ONE deck-global value); open a brand-new orchestration tab B and confirm it ADOPTS the current unlocked value rather than defaulting to locked; switch back to A and confirm it observes the same unlocked value; toggle FROM tab B (re-locking) and confirm tab A observes THAT change too — toggling on any Orchestration tab changes what every Orchestration tab observes.
+- **Does not assert:** the visible rendered grid; that the lock's REACH widens to Dashboard/Mode tabs — it does not, per PRD #393 decision 3, covered by `orchestration/lock/011` — only WHERE the value is stored goes deck-global; the actual PTY-forward gating (covered by `orchestration/lock/004`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/lock/004 — While an orchestration tab is locked (the default), a keystroke aimed at a non-orchestrator role's PTY is dropped before reaching it; the orchestrator pane's own input is never gated; `Ctrl+e` unlocks the tab and keystrokes to the non-orchestrator role then forward normally (PRD #361 Item 3).
@@ -2377,6 +2377,13 @@ without depending on the config struct API.
 - **Asserts:** Part 1 — with the orchestrator role pane focused in `PaneInput` mode (never gated by the lock, so this isolates the assertion from lock state entirely), typing a partial line then sending `Ctrl+a` (`0x01`, readline's beginning-of-line, a chord the deck binds to nothing) moves the terminal's hardware cursor left within the same row — the control proof that the harness can observe cursor movement in this pane at all — and sending `Ctrl+e` (`0x05`) immediately afterward moves the cursor back to the exact end-of-line position captured before `Ctrl+a`, proving the raw byte reached the PTY and readline's own end-of-line ran rather than the deck claiming it as `Action::ToggleOrchestrationLock`. Part 2 — `Ctrl+d` then `Ctrl+e` from command mode still toggles the lock: focusing the non-orchestrator worker role afterward and typing a sentinel reaches its PTY and echoes, the same unlocked-forwarding technique `orchestration/lock/004`-`006` use to observe the lock's toggle state, proving the chord was not lost entirely by the mode scoping.
 - **Does not assert:** the pure scoping function in isolation (covered by `orchestration/lock/007`); per-tab or deck-global storage of the lock value (unaffected by M1; covered by the M2 test plan rows); the `WaitingForInput` carve-out (M3); any visible status-message wording.
 - **Platform coverage:** mac+linux.
+
+##### orchestration/lock/011 — Deck-global storage moves WHERE the command-entry lock lives, not WHERE it reaches: `gate_pane_input_key` still matches only `Tab::Orchestration`, so a Dashboard or Mode tab is never gated even while the deck-global lock is engaged (PRD #393 M2 decision 3). Numbered 011 rather than 009/010 because the Test Plan reserves those IDs for M3's `WaitingForInput` carve-out, not yet created on this branch.
+- **Layer:** L1 (`gate_pane_input_key` called directly against a `CapturingPaneController`; no PTY, no TestBackend render — CapturingPaneController cannot observe a real PTY write, so the gate's return value is the only L1-observable surface for this claim).
+- **Agent:** none.
+- **Asserts:** with the deck-global lock explicitly set ENGAGED (the strongest case), `gate_pane_input_key` passes an `Action::ForwardToPane` through completely UNCHANGED both on the always-present Dashboard tab (tab 0) and on a freshly opened Mode tab — proving the gate's `Tab::Orchestration`-only match is untouched by the lock's field moving to `UiState`, i.e. moving the value deck-global does not widen the gate's reach.
+- **Does not assert:** the real PTY-forward path (no L1 harness can observe it; the Orchestration-tab gating itself is `orchestration/lock/004`-`006`); cross-tab lock sharing (covered by `orchestration/lock/003`); the `WaitingForInput` carve-out (M3, not yet built).
+- **Platform coverage:** mac+linux+windows.
 
 #### orchestration/route
 

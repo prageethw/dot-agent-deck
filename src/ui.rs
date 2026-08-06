@@ -25903,13 +25903,14 @@ mod tests {
         );
     }
 
-    /// Scenario: PRD #361 Item 3 locks direct keystroke entry to the
-    /// orchestrator pane by default on every Orchestration tab. Dispatch a
-    /// real `Action::SpawnPane` opening a fresh orchestration and assert the
-    /// new tab's per-tab lock field starts engaged (locked) — mirroring the
-    /// `split_stage` per-tab-field precedent `orchestration/layout/003`
-    /// establishes for Item 4. RED today: `Tab::Orchestration` has no lock
-    /// field at all, so this fails to compile.
+    /// Scenario: PRD #393 M2 (decision 2) moves the command-entry lock from a
+    /// per-tab `Tab::Orchestration` field to one deck-global `UiState` field.
+    /// Dispatch a real `Action::SpawnPane` opening a fresh orchestration and
+    /// assert the DECK-GLOBAL value starts LOCKED — the same default #374
+    /// established, now read from its new home. Mirrors the deck-global-field
+    /// precedent PRD #387 M2 set for `split_stage`. RED today:
+    /// `UiState::command_entry_locked` does not exist yet, so this fails to
+    /// compile.
     #[spec("orchestration/lock/001")]
     #[test]
     fn orchestration_lock_001_new_orchestration_tab_starts_locked() {
@@ -25932,31 +25933,29 @@ mod tests {
             "lock-default",
         );
 
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "a freshly opened orchestration tab must start with \
-                 command-entry LOCKED — only the orchestrator pane accepts \
-                 direct input until Ctrl+e unlocks it"
-            ),
-            _ => panic!("expected a real orchestration tab to be active"),
-        }
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "expected a real orchestration tab to be active"
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must observe the deck-global \
+             command-entry lock LOCKED — only the orchestrator pane accepts \
+             direct input until Ctrl+e unlocks it"
+        );
     }
 
-    /// Scenario: PRD #361 Item 3 adds `Ctrl+e` (default chord, confirmed
-    /// free during PRD investigation) as the toggle for the command-entry
-    /// lock. First confirm the chord resolves to the new
+    /// Scenario: PRD #393 M2 retargets the command-entry lock's toggle at the
+    /// deck-global `UiState` field. First confirm `Ctrl+e` still resolves to
     /// `Action::ToggleOrchestrationLock` through `key_action_for_mode` — the
     /// same production `KeyEvent -> Action` seam `orchestration/layout/002`
-    /// used to pin `Ctrl+l` — from `UiMode::PaneInput` specifically (the mode
-    /// a focused, possibly-locked pane is actually in, and where the lock
-    /// matters), then dispatch the action twice against a real orchestration
-    /// tab and confirm the per-tab field flips locked -> unlocked -> locked.
-    /// RED today: neither `Action::ToggleOrchestrationLock` nor the `Ctrl+e`
-    /// binding exist, so this fails to compile.
+    /// used to pin `Ctrl+l` — from `UiMode::Normal` (command mode, the only
+    /// mode M1 left the chord claimed in; the full `is_orchestration_tab x
+    /// mode` matrix is `orchestration/lock/007`'s job, not this test's), then
+    /// dispatch the action twice against a real orchestration tab and confirm
+    /// the DECK-GLOBAL `ui.command_entry_locked` flips locked -> unlocked ->
+    /// locked. RED today: `UiState::command_entry_locked` does not exist yet,
+    /// so this fails to compile.
     #[spec("orchestration/lock/002")]
     #[test]
     fn orchestration_lock_002_ctrl_e_toggles_the_lock() {
@@ -25979,16 +25978,20 @@ mod tests {
             "lock-toggle",
         );
 
-        // Ctrl+e must resolve to the toggle action from PaneInput mode using
-        // the DEFAULT keybinding config (no user remap involved).
+        // Ctrl+e must resolve to the toggle action from Normal (command)
+        // mode using the DEFAULT keybinding config (no user remap involved).
+        // PRD #393 M1 already scoped the live resolution chain
+        // (`handle_key_event`, via `scope_command_entry_lock`) to command
+        // mode only — `orchestration/lock/007`/`008` pin that exhaustively;
+        // this test only needs the toggle to still resolve from the mode it
+        // is actually claimed in.
         let kb = KeybindingConfig::default();
         let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
-        let resolved = key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_e);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_e);
         assert!(
             matches!(resolved, Some(Action::ToggleOrchestrationLock)),
             "Ctrl+e must resolve to Action::ToggleOrchestrationLock from \
-             PaneInput mode so it works while a (possibly locked) pane is \
-             focused, not just from Normal mode"
+             Normal (command) mode"
         );
 
         let _ = dispatch_action(
@@ -26002,16 +26005,10 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                !*command_entry_locked,
-                "the first Ctrl+e toggle should UNLOCK the tab"
-            ),
-            _ => panic!("expected orchestration tab to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "the first Ctrl+e toggle should UNLOCK the deck-global lock"
+        );
 
         let _ = dispatch_action(
             Action::ToggleOrchestrationLock,
@@ -26024,33 +26021,32 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "the second Ctrl+e toggle should RE-LOCK the tab"
-            ),
-            _ => panic!("expected orchestration tab to be active"),
-        }
+        assert!(
+            ui.command_entry_locked,
+            "the second Ctrl+e toggle should RE-LOCK the deck-global lock"
+        );
     }
 
-    /// Scenario: PRD #361 Item 3's resolved decision: the command-entry lock
-    /// is per-orchestration-tab, not global. Spawn orchestration tab A,
-    /// unlock it (one Ctrl+e-equivalent dispatch), then spawn a brand-new
-    /// orchestration tab B and confirm B starts locked regardless of A's now-
-    /// unlocked state; switch back to A and confirm A is STILL unlocked
-    /// (untouched by B's spawn); toggle B's own lock and confirm A remains
-    /// unaffected by that too. Borrows `orchestration/layout/003`'s
-    /// two-tab spawn-and-compare technique — though not its expectation:
-    /// PRD #387 M2 made `split_stage` deck-global, so `layout/003` now
-    /// demonstrates ADOPTION across tabs while the lock stays the per-tab
-    /// case. RED today: same compile failure as
-    /// `orchestration/lock/001`/`002` (no lock field/action yet).
+    /// Scenario: PRD #393 M2 decision 2 reverses what this test used to pin.
+    /// Renamed from `orchestration_lock_003_per_tab_isolation`, which
+    /// asserted per-tab isolation — the opposite of what this test now
+    /// checks; a stale name on an inverted test would be actively
+    /// misleading. Spawn orchestration tab A, toggle the lock (one
+    /// Ctrl+e-equivalent dispatch) while A is active, then spawn a brand-new
+    /// orchestration tab B and confirm B observes the SAME now-unlocked
+    /// deck-global value rather than defaulting back to locked (the "new tab
+    /// adopts the current value" half PRD #387's `layout_003` rewrite treats
+    /// as the part most likely to regress, so this test does the same).
+    /// Switch back to A and confirm it observes the same unlocked value too
+    /// — unaffected by which tab happens to be active. Then toggle FROM tab
+    /// B and confirm tab A observes THAT change as well: under the old
+    /// per-tab design this exact sequence proved A was UNAFFECTED by B's
+    /// toggle; under deck-global storage it must prove the opposite. RED
+    /// today: `UiState::command_entry_locked` does not exist yet, so this
+    /// fails to compile.
     #[spec("orchestration/lock/003")]
     #[test]
-    fn orchestration_lock_003_per_tab_isolation() {
+    fn orchestration_lock_003_toggle_is_deck_global_across_orchestration_tabs() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
         let pc = Arc::new(CapturingPaneController::new());
@@ -26059,7 +26055,8 @@ mod tests {
         let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
         let snapshot = AppState::default();
 
-        // Tab A: spawn, then unlock via the toggle action.
+        // Tab A: spawn (starts LOCKED, the deck-global default), then toggle
+        // it via the real toggle action.
         spawn_lock_test_orchestration(
             &mut tm,
             pc.as_ref(),
@@ -26068,9 +26065,13 @@ mod tests {
             &snapshot,
             frame_area,
             tmp.path(),
-            "lock-iso-a",
+            "lock-shared-a",
         );
         let idx_a = tm.active_index();
+        assert!(
+            ui.command_entry_locked,
+            "tab A must start locked — the deck-global default"
+        );
         let _ = dispatch_action(
             Action::ToggleOrchestrationLock,
             &mut ui,
@@ -26082,16 +26083,14 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(!*command_entry_locked, "tab A should be unlocked here"),
-            _ => panic!("expected orchestration tab A to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "toggling on tab A should unlock the deck-global lock"
+        );
 
-        // Tab B: a brand-new orchestration must start LOCKED regardless of
-        // A's now-unlocked state.
+        // Tab B: a brand-new orchestration tab must ADOPT the current
+        // deck-global value (unlocked) rather than resetting to locked —
+        // there is no per-tab field left for it to default from.
         spawn_lock_test_orchestration(
             &mut tm,
             pc.as_ref(),
@@ -26100,38 +26099,30 @@ mod tests {
             &snapshot,
             frame_area,
             tmp.path(),
-            "lock-iso-b",
+            "lock-shared-b",
         );
         let idx_b = tm.active_index();
         assert_ne!(idx_a, idx_b, "tab B must be a distinct tab from tab A");
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "tab B must start LOCKED — its own default — regardless of \
-                 tab A's toggled-unlocked state"
-            ),
-            _ => panic!("expected orchestration tab B to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "a newly opened orchestration tab must ADOPT the current \
+             deck-global value (unlocked, set by tab A's toggle) rather \
+             than defaulting back to locked"
+        );
 
-        // Switch back to A: still unlocked, untouched by B's spawn.
+        // Switch back to A: still unlocked — one shared value, unaffected by
+        // which tab happens to be active.
         assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                !*command_entry_locked,
-                "tab A must remain unlocked after spawning tab B — spawning \
-                 a second orchestration tab must not reset an unrelated \
-                 tab's lock state"
-            ),
-            _ => panic!("expected orchestration tab A to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "tab A must observe the same unlocked deck-global value after \
+             spawning tab B — there is no per-tab state left to diverge"
+        );
 
-        // Toggle B's own lock; A must still be unaffected by B's toggle.
+        // Toggle FROM tab B, then switch back to A: A must observe the
+        // change too. This is the inversion — under the old per-tab design
+        // this exact sequence proved A was UNAFFECTED by B's toggle; under
+        // the deck-global design it must prove the opposite.
         assert!(tm.switch_to(idx_b), "switching to tab B must succeed");
         let _ = dispatch_action(
             Action::ToggleOrchestrationLock,
@@ -26144,24 +26135,94 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(!*command_entry_locked, "tab B should now be unlocked"),
-            _ => panic!("expected orchestration tab B to be active"),
-        }
+        assert!(
+            ui.command_entry_locked,
+            "toggling on tab B should re-lock the deck-global lock"
+        );
         assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                !*command_entry_locked,
-                "tab A's lock state must be untouched by toggling tab B's \
-                 lock — per-tab isolation must hold in both directions"
+        assert!(
+            ui.command_entry_locked,
+            "tab A must observe tab B's toggle — toggling on ANY \
+             Orchestration tab must change what every Orchestration tab \
+             observes, per PRD #393 decision 2"
+        );
+    }
+
+    /// Scenario: PRD #393 decision 3 — deck-global storage moves WHERE the
+    /// lock value lives, not WHERE it reaches. Set the deck-global lock
+    /// ENGAGED (the strongest case) and confirm `gate_pane_input_key` passes
+    /// an `Action::ForwardToPane` through UNCHANGED on the always-present
+    /// Dashboard tab and on a freshly opened Mode tab — the gate must still
+    /// match only `Tab::Orchestration`, never widening onto other tab types
+    /// now that the lock it reads is deck-global. RED today:
+    /// `gate_pane_input_key` has no way to read a deck-global lock — neither
+    /// the field nor a parameter to receive it exist yet — so this fails to
+    /// compile.
+    #[spec("orchestration/lock/011")]
+    #[test]
+    fn orchestration_lock_011_dashboard_and_mode_tabs_stay_ungated_when_deck_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // The strongest case: the deck-global lock is engaged.
+        ui.command_entry_locked = true;
+
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "expected the always-present Dashboard tab to be active"
+        );
+        let gated = gate_pane_input_key(Action::ForwardToPane(vec![b'x']), &ui, &tm, pc.as_ref());
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Dashboard tab must never gate ForwardToPane, even while \
+                 the deck-global lock is engaged"
             ),
-            _ => panic!("expected orchestration tab A to be active"),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a \
+                 Dashboard tab, got {other:?}"
+            ),
+        }
+
+        // Open a Mode tab and repeat: same never-gated guarantee.
+        let req = mode_card_request(
+            tmp.path().to_str().expect("utf8 tmp path"),
+            "cat",
+            mode_config_local("lock-mode", 1),
+        );
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Mode { .. }),
+            "expected the Mode tab to be active after spawning it"
+        );
+        let gated = gate_pane_input_key(Action::ForwardToPane(vec![b'x']), &ui, &tm, pc.as_ref());
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Mode tab must never gate ForwardToPane, even while the \
+                 deck-global lock is engaged"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a Mode \
+                 tab, got {other:?}"
+            ),
         }
     }
 
