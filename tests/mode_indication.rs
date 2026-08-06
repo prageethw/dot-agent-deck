@@ -88,6 +88,18 @@ fn nonblank_rows(buffer: &Buffer) -> usize {
 }
 
 fn selected_card_fixture() -> SessionState {
+    // `last_activity` is nudged 30s into the future of `now` rather than left
+    // equal to it (issue #15): `mode_deck_001_selected_card_accent_tracks_mode`
+    // pins this fixture's rendered card into a color/style-aware `insta`
+    // snapshot, and the bottom border's `Last:` field is computed from
+    // `Utc::now()` at render time (`format_elapsed`, src/ui.rs), not at
+    // fixture build time. Seeding `last_activity == now` raced that
+    // render-time computation across a whole second boundary under any
+    // scheduling delay. A *past* offset (e.g. `now - 500ms`) would only
+    // shrink the safety margin further; nudging forward instead relies on
+    // `format_elapsed`'s existing clamp of a negative elapsed delta to zero
+    // (`delta.num_seconds().max(0)`), so the render-time delta stays negative
+    // (clamped to `0s`) for any render happening within 30s of this instant.
     let now = chrono::Utc::now();
     SessionState {
         session_id: "mode-card".to_string(),
@@ -96,7 +108,7 @@ fn selected_card_fixture() -> SessionState {
         status: SessionStatus::Working,
         active_tool: None,
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
