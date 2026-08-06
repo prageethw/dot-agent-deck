@@ -97,7 +97,18 @@ Kept standalone and pure for #342/#387's stated reason: it is unit-testable with
 
 **The focus chain.** Today's per-frame chain is a three-way `else if`: `auto_focus_waiting_pane` → `auto_focus_all_clear` → `auto_focus_after_inactivity`, preceded by an unconditional `observe_waiting_panes`. The third branch is deleted, and the whole chain — including `observe_waiting_panes` — is gated on the deck-global lock being engaged. While unlocked the chain does not run, so no focus decision exists to fight the human.
 
-One subtlety that must be handled deliberately rather than discovered: **`observe_waiting_panes` maintains the edge state (`had_waiting_pane` / `all_clear_pending`) that `auto_focus_all_clear` consumes.** Skipping it while unlocked means the deck stops tracking waiting episodes, so an episode that begins and ends during an unlocked stretch leaves a stale latch behind. On the locked→unlocked transition the latch must therefore be **cleared**, so that re-locking starts from a clean slate and does not fire an all-clear move for an episode the human already dealt with by hand. This is the only piece of genuinely new state logic in the PRD.
+One subtlety that must be handled deliberately rather than discovered: **`observe_waiting_panes` maintains the edge state (`had_waiting_pane` / `all_clear_pending`) that `auto_focus_all_clear` consumes.** Skipping it while unlocked means the deck stops tracking waiting episodes, so a latch set before the unlock can survive across it and be misread afterwards. On the locked→unlocked transition the latch must therefore be **cleared**, so that re-locking starts from a clean slate and does not fire an all-clear move for an episode the human already dealt with by hand. This is the only piece of genuinely new state logic in the PRD.
+
+**Correction — the hazard is narrower than first stated, and the first statement of it was wrong.** This paragraph originally described the danger as "an episode that begins **and ends** during an unlocked stretch". The tester traced that literal case by hand while writing `tabs/orchestration/026` and found it is **already safe with no fix at all**: if the whole chain including `observe_waiting_panes` is skipped on every unlocked frame, an episode that both starts and resolves inside the unlocked stretch never touches `had_waiting_pane`, so there is nothing to go stale.
+
+The real hazard needs the episode to **straddle** the transition:
+
+1. A role pane goes `WaitingForInput` while the deck is still **locked** — `observe_waiting_panes` runs and genuinely latches `had_waiting_pane = true`.
+2. The human unlocks **mid-episode**, while that pane is still waiting. The chain stops running, so the latch is frozen in its `true` state.
+3. The pane resolves while unlocked, unobserved.
+4. On re-lock, the stale `had_waiting_pane == true` is compared against a now-idle status, misread as a fresh all-clear edge, and fires a spurious focus move to the orchestrator — yanking focus away from wherever the human deliberately put it.
+
+So the clear-on-transition is not defensive tidying; it exists for exactly this straddling case, and a test written against the original "begins and ends while unlocked" wording would have passed without the fix and proved nothing. `tabs/orchestration/026` is written against the straddling trace.
 
 ## Migration
 
@@ -250,7 +261,7 @@ The full table, with catalog IDs, is the artefact under review. IDs marked **new
 | `tabs/orchestration/010`, `012`, `020` | L1 | keep | Waiting-pane steering, all-clear edge trigger, `observe_waiting_panes` — the surviving focus core. |
 | `tabs/orchestration/011` | L1 | verify | Render-loop wiring, now a two-branch chain. |
 | `tabs/orchestration/025` **new** | L1 | create | Three role panes go `WaitingForInput`; focus visits them in ascending `role_pane_ids` order, advancing as each resolves, then returns to the orchestrator on the all-clear. (Decision 5, locked half) |
-| `tabs/orchestration/026` **new** | L1 | create | While **unlocked**, no auto-focus branch fires — manual focus survives a waiting pane appearing *and* an all-clear. Re-locking resumes pinning, and the episode that elapsed while unlocked does **not** fire a stale all-clear move. Pins the latch-clearing rule. |
+| `tabs/orchestration/026` **new** | L1 | create | While **unlocked**, no auto-focus branch fires — manual focus survives a waiting pane appearing *and* an all-clear. Re-locking resumes pinning for a fresh episode. Pins the latch-clearing rule against the **straddling** trace (waiting starts while locked → unlock mid-episode → resolves unlocked → re-lock must not fire a spurious all-clear), which is the only shape where the bug is reachable — see the correction under Solution Overview. |
 | `orchestration/focus/002` **new** | L2 PTY | create | **Rule 4 headline test.** Real binary: locked, focus on the orchestrator; a worker goes waiting and visibly pulls focus; resolving returns it; `Ctrl+D`,`Ctrl+E` unlocks and manual focus then sticks across both events. This is the feature as a user actually experiences it, and it replaces `orchestration/focus/001` in the reel-eligible slot. |
 
 **Deliberately not claimed.** No test here proves anything about a specific agent's prompt rendering beyond `orchestration/lock/010`'s single real-agent case. `Ctrl+E` reaching the PTY is the contract; what a given program does with `0x05` is that program's business, and asserting on Claude Code's own output would couple the suite to another product for no added confidence.
