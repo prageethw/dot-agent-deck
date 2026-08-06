@@ -1,6 +1,6 @@
 # PRD #387: A unified, deck-global `Ctrl+L` split toggle — and a chord that stops being swallowed
 
-**Status**: Not started — PRD written, no implementation. Queued behind PRD #386.
+**Status**: M1–M6 complete, green, and reviewed — implemented on branch `prd-387-unified-deck-global-split-toggle`, pending PR. M7 (the upstream follow-up PR) remains gated on upstream PR #342 merging.
 **Priority**: Medium-High (the swallowed-chord half is a daily annoyance in the deck's primary use case; the unification half is a behaviour improvement)
 **Created**: 2026-08-06
 **GitHub Issue**: [#387](https://github.com/vfarcic/dot-agent-deck/issues/387) (filed upstream — the swallowing bug and the fix both live in upstream's own code)
@@ -150,19 +150,19 @@ The sequencing matters, because #342 introduces upstream a field the fork has al
 - **Persisting the stage across restarts.** Still out of scope, as in #371. Arguably *more* attractive once the value is deck-global and singular — but it is a separate change with its own snapshot work, and folding it in would widen the diff and the review.
 - **Changing the Default ratios themselves** (33/67, 34/66) or the Narrow/Hidden constants.
 - **Mode tabs gaining a split.** They have no sidebar/pane-column split; they simply never claim the chord.
-- **Correcting the fork-sync stack table.** Flagged in Defect 2; performed separately.
+- ~~**Correcting the fork-sync stack table.** Flagged in Defect 2; performed separately.~~ **Superseded during implementation.** Open Question 1 was resolved in favour of "now", and the correction landed as a standalone docs commit (`d1391d8`, `docs/develop/fork-sync-workflow.md`) *before* any implementation commit on this branch — so it is deliberately in the branch's diff rather than deferred. Kept as a separate commit precisely so it stays reviewable and revertible independently of the feature.
 
 ## Milestones
 
 Each is independently testable; the test that proves each one is named in the Test Plan.
 
-- [ ] **M1 — `scope_split_stage`, the chord fix.** The pure scoping function replaces the inline `claims_ctrl_l` match. Orchestration tabs stop claiming `Ctrl+L` outside command mode. **Deliberately first and standalone**: it is the user-visible bug fix, it is independent of the state move, and it is the half that stands alone if the rest is ever rejected.
-- [ ] **M2 — Deck-global state.** `split_stage` moves to `UiState`; the per-tab fields are deleted; the `CycleSplitStage` handler collapses to one assignment.
-- [ ] **M3 — One thread-local.** The two mirrors collapse into one sourced from `UiState`; both `split_cards_area` call sites read it. The layout maths is unchanged.
-- [ ] **M4 — Invert the three isolation tests.** `layout_003`, `dashboard_001`, `orchestration_006` rewritten to assert shared-stage behaviour, preserving the spawn-order/`cols` coupling in `layout_003`.
-- [ ] **M5 — Real-pane proof.** The new L2 test that a focused orchestration role pane genuinely receives `Ctrl+L`, plus the deck-global cycle driven through a real PTY.
-- [ ] **M6 — Docs, changelog, cross-version check.** `docs/keyboard-shortcuts.md`; changelog fragment; CLAUDE.md rule 12 manual cross-version test.
-- [ ] **M7 — Upstream follow-up PR.** Authored against post-#342 upstream, deleting `split_narrow` in the same PR (decision 4). Gated on #342 actually merging.
+- [x] **M1 — `scope_split_stage`, the chord fix.** The pure scoping function replaces the inline `claims_ctrl_l` match. Orchestration tabs stop claiming `Ctrl+L` outside command mode. **Deliberately first and standalone**: it is the user-visible bug fix, it is independent of the state move, and it is the half that stands alone if the rest is ever rejected.
+- [x] **M2 — Deck-global state.** `split_stage` moves to `UiState`; the per-tab fields are deleted; the `CycleSplitStage` handler collapses to one assignment.
+- [x] **M3 — One thread-local.** The two mirrors collapse into one sourced from `UiState`; both `split_cards_area` call sites read it. The layout maths is unchanged.
+- [x] **M4 — Invert the three isolation tests.** `layout_003`, `dashboard_001`, `orchestration_006` rewritten to assert shared-stage behaviour, preserving the spawn-order/`cols` coupling in `layout_003`.
+- [x] **M5 — Real-pane proof.** The new L2 test that a focused orchestration role pane genuinely receives `Ctrl+L`, plus the deck-global cycle driven through a real PTY.
+- [x] **M6 — Docs, changelog, cross-version check.** `docs/keyboard-shortcuts.md`; changelog fragment; CLAUDE.md rule 12 manual cross-version test. The cross-version check was run and **partially** confirmed — see the Work Log entry below for the delegate leg that stayed unverified and why.
+- [ ] **M7 — Upstream follow-up PR.** Authored against post-#342 upstream, deleting `split_narrow` in the same PR (decision 4). **Gated on #342 actually merging — not startable from this branch.**
 
 ## Test Plan
 
@@ -216,13 +216,29 @@ Matches the precedent #371 set for the same surface (resolved: no, visible by de
 
 ## Open Questions
 
-**1 — Should the fork-sync stack table be corrected now or at the next sync?** This PRD flags that `docs/develop/fork-sync-workflow.md` lists `ab71a28` (#336) and `30c5f79` (#371) as independently PERMANENT when the second supersedes the first, and deliberately does not correct it. Correcting it now is a one-line docs change and keeps the record honest; correcting it at the next sync means doing it with the actual conflict in front of you, when `split_narrow` is real and the resolution is concrete. Recommendation: **now**, as a standalone docs commit — the table's purpose is to be correct *before* someone relies on it during a sync.
+**1 — Should the fork-sync stack table be corrected now or at the next sync? — RESOLVED: now.** This PRD flagged that `docs/develop/fork-sync-workflow.md` lists `ab71a28` (#336) and `30c5f79` (#371) as independently PERMANENT when the second supersedes the first. Correcting it now is a one-line docs change and keeps the record honest; correcting it at the next sync means doing it with the actual conflict in front of you, when `split_narrow` is real and the resolution is concrete. Recommendation was **now**, as a standalone docs commit — the table's purpose is to be correct *before* someone relies on it during a sync — and that is what happened: `d1391d8` records #371's `SplitStage` as superseding #336's `split_narrow`, and adds the supersession procedure. The Scope section's "out of scope" bullet is annotated accordingly. Whoever runs the next sync should still re-read the table against the then-current text rather than assuming it is complete.
 
 **2 — Keep the thread-local, or pass the stage as a parameter?** The two thread-locals exist only because `compute_frame_layout`'s signature is a fixed, widely-tested seam. Collapsing to one is the minimal change and is what this PRD assumes. But a deck-global value is a much better candidate for an explicit parameter than a per-tab one was — there is exactly one, and the "read fresh every frame from the active tab" justification disappears with the per-tab field. Deferred to the implementer at M3, with a bias toward the minimal change: widening a widely-tested seam is a bigger diff than this PRD's actual subject.
 
 **3 — Does persistence become more attractive once the value is singular?** Out of scope here, and stated as such. Noting it because #371's Open Question 1 deferred persistence partly on the grounds that per-tab state made it fiddly; a single deck-global stage is a much simpler thing to persist, so the follow-up is worth revisiting on its own merits rather than inheriting #371's "not proposed as trivial" verdict.
 
 ## Work Log
+
+### 2026-08-06 — M1–M6 implemented, tested, reviewed and audited
+
+Shipped across eight commits: `6c7647f` / `1147a0d` (M1 RED), `731806c` (M1 GREEN), `31577ec` (test repair for M1's scoping), `ee4892f` (M2/M3/M4 RED batch), `84a0d1e` (M2/M3 GREEN), `0ee97f1` (M4 repair + M5 extension), `e053ab9` (M6 docs/changelog/cross-version). Reviewer and auditor both returned **no blockers**; the reviewer's two suggestions were the PRD-record corrections applied in this same update.
+
+**The staleness window really did close by construction, and two independent arguments confirm it.** `orchestration_role_pane_dims` lost its `narrow: bool` parameter and now reads the single `ACTIVE_SPLIT_STAGE` directly — necessary, because M4a asserts a brand-new tab's role panes record a *Narrow*-derived `cols`, which a hardcoded `narrow: false` could never produce. Review confirmed both production callers (live spawn `src/ui.rs:7917`, saved-session restore `:9898`) run on the TUI thread, and that `UiState::split_stage` *and* the thread-local both initialise to `SplitStage::Default`, so no un-synced non-default state can exist. The audit added a second, independent argument: command-mode key events break the input drain and render before another command-mode event, so a toggle cannot be followed by a keyboard-triggered spawn reading a stale mirror.
+
+**Two test-side defects were found *after* the RED batch, and the reason matters.** `layout_003` compared `compute_frame_layout`'s `panes_area.width` (the **outer** pane-column width) against `AgentSpawnOptions::cols` (the PTY's **inner** width) — off by exactly the 2 border columns. It survived the RED batch because that batch's RED was a *compile* failure, so the assertion arithmetic never executed even once. **Lesson worth carrying forward: a compile-level RED does not validate assertions.** The fix was test-side only; resolving it in production by making `cols` the outer width would have satisfied the test while reintroducing the F3 spawn-vs-render drift the six `orchestration_role_pane_dims_*` seam guards exist to prevent. Separately, `dashboard_001` passed a *panicking* helper directly as a `wait_for_grid_predicate_within` predicate; the harness evaluates predicates at t=0 before any sleep, so the first sample still showed the outgoing tab and the helper aborted instead of retrying. Fixed with the `wait_for_string` guard the same file already used one call earlier.
+
+**M5 needed extending, not just re-labelling.** `orchestration_006` already drove the full `Default → Narrow → Hidden → Default` cycle through a real PTY and asserted geometry at every stage — but its `Hidden` check was `pane_column_left_edge == 0`, which proves where the pane box *starts*, not that the sidebar renders *nothing*; stray sidebar fragments elsewhere on the grid would go unseen. A direct content-absence assertion was added, reusing the file's existing `· <role>` needle. Note that `orchestration_024` contributes nothing to M5 — it proves M1's mode-scoped forwarding, not split geometry.
+
+**Cross-version check: hooks confirmed, delegate unverified-not-failed.** Run against the newest pre-#387 build (`66f2c8d`, protocol 7) rather than the literal previous release (v0.35.7, protocol 6) — that protocol bump is PRD #370's and landed unreleased on `main`, so a v0.35.7 daemon would be refused at the handshake for a reason predating this branch, telling us nothing about #387. Hooks demonstrably round-tripped across the boundary. The delegate leg was **not** confirmed: the fixture's worker role runs `bash`, which the deck does not recognise as an agent, so there was nothing to inject a task into. No evidence of breakage, and the branch touches no daemon/protocol/hook code — recorded as a stated partial skip, and it must be said plainly in the PR rather than left ambiguous.
+
+**Procedural finding worth reusing: you cannot test a version boundary by simply pointing a newer TUI at an older daemon.** The build-version handshake (`src/build_version_handshake.rs`, PRD #103/#161) *silently restarts* a mismatched daemon whenever no agents are running, so the obvious procedure tests a freshly-spawned current-build daemon while appearing to test a boundary. This is exactly why rule 12 words it "with an agent under it". The procedure that works: the old binary serves; its own TUI opens an orchestration and **detaches** (not stops), leaving panes alive; the new TUI then raises `⚠ Daemon version mismatch (N agent(s) running)` and you decline the restart.
+
+**Hand-exercised, and the single most convincing observation was a ratio.** With the orchestration tab left at `Narrow`, switching to the Dashboard and pressing `Ctrl+L` **once** produced `Split: 0/100` — continuing the cycle into `Hidden` rather than restarting from the Dashboard's own `Default`. The next press gave `Split: 33/67`, a value the code only ever produces for `Tab::Dashboard`. That one number simultaneously proves the tab switch happened, the stage is shared, and `Default` still resolves per tab type rather than flattening onto one ratio — decision 3's nuance, confirmed on screen rather than only in a test. Separately, the reported bug itself was reproduced fixed three times: sentinel echoed in a focused role pane, `0x0c` sent, **no** `Split:` status appeared *and* the sentinel vanished, so the deck declined the chord and readline's clear-screen genuinely ran.
 
 ### 2026-08-06 — PRD authored; the task's stated diagnosis corrected against the code
 
