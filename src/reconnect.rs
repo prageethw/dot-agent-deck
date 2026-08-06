@@ -103,6 +103,7 @@ pub const SUBSCRIBE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// without limit. On overflow the OLDEST buffered event is dropped: the
 /// buffered window's purpose is to land the deck on the daemon's *current*
 /// state, and the newest events are the ones that carry it.
+#[allow(dead_code)]
 pub const HYDRATION_BUFFER_CAP: usize = 1024;
 
 /// Coordination handle between the event subscriber and reconnect hydration.
@@ -277,24 +278,10 @@ pub async fn run_event_subscriber(attach_path: PathBuf, state: SharedState, gate
                         recv = sub.next_event() => {
                             match recv {
                                 Ok(Some(msg)) => {
-                                    if *seeded_rx.borrow() {
-                                        // Drain first: `select!` may pick this
-                                        // branch on the same poll the gate
-                                        // opened, and buffered events must
-                                        // still land in arrival order.
-                                        drain_pending(&state, &mut pending).await;
-                                        apply_broadcast(&state, msg).await;
-                                    } else {
-                                        if pending.len() >= HYDRATION_BUFFER_CAP {
-                                            tracing::warn!(
-                                                cap = HYDRATION_BUFFER_CAP,
-                                                "subscribe_events: hydration buffer full, dropping oldest \
-                                                 held event"
-                                            );
-                                            pending.pop_front();
-                                        }
-                                        pending.push_back(msg);
-                                    }
+                                    // REVERT-CHECK (issue #36): the buffering
+                                    // half removed — apply on arrival, as the
+                                    // pre-fix subscriber did. Not for merge.
+                                    apply_broadcast(&state, msg).await;
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
