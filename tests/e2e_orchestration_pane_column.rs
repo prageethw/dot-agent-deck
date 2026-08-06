@@ -61,8 +61,11 @@ fn pane_column_left_edge(grid: &str) -> u16 {
 /// tab A through Default (34/66) -> Narrow (25/75) -> Hidden (sidebar
 /// collapsed) -> Default, confirming the pane column's left-edge boundary at
 /// each stage. Interleave tab B's own cycle in between to confirm each tab
-/// tracks its own split stage independently. RED today: the toggle only has
-/// two stages, so the Hidden-stage waits time out.
+/// tracks its own split stage independently. PRD #387 M1 scopes Ctrl+l to
+/// command mode on every tab type (not just Dashboard), and opening an
+/// orchestration tab always lands the deck in PaneInput mode focused on its
+/// start-role pane — so Ctrl+D precedes each toggle press that follows a
+/// tab open, entering Normal mode first exactly as a real user now must.
 #[spec("tabs/orchestration/006")]
 #[test]
 fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
@@ -86,6 +89,11 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     );
 
     // Ctrl+l on tab A: Default -> Narrow (25/75, edge ~col 30).
+    // `open_orchestration` left the deck in PaneInput mode, focused on tab
+    // A's start-role pane — PRD #387 M1 scopes Ctrl+l to command mode on
+    // every tab type, so Ctrl+D must enter Normal mode first or the byte
+    // forwards straight to the pane instead of cycling the split.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
     let a_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         (29..=30).contains(&pane_column_left_edge(grid))
@@ -112,7 +120,12 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
         deck.snapshot_grid()
     );
 
-    // Ctrl+l on tab B: Default -> Narrow.
+    // Ctrl+l on tab B: Default -> Narrow. Opening tab B re-lands the deck in
+    // PaneInput mode on ITS OWN start-role pane, regardless of tab A having
+    // left the deck in Normal mode above (SpawnPane's orchestration arm sets
+    // `ui.mode = UiMode::PaneInput` unconditionally), so Ctrl+D is required
+    // again here.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
     let b_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         (29..=30).contains(&pane_column_left_edge(grid))
@@ -125,7 +138,9 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     );
 
     // Ctrl+l on tab B: Narrow -> Hidden (sidebar collapsed, edge exactly 0 —
-    // 0% of any width has no rounding ambiguity).
+    // 0% of any width has no rounding ambiguity). No Ctrl+D needed here: the
+    // deck is still in Normal mode from the toggle above — CycleSplitStage
+    // never touches UiMode.
     deck.send_bytes(b"\x0c");
     let b_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         pane_column_left_edge(grid) == 0
@@ -141,11 +156,14 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // Switch back to tab A (Shift+Tab -> previous tab). Cross-tab isolation:
     // tab A's split must still be Narrow — untouched by tab B's Narrow ->
     // Hidden presses, even though both tabs were driven through the exact
-    // same Ctrl+l chord. Tab B's start-role pane is still live-focused in
-    // PaneInput mode, and `cycle_tab_action` only responds to Shift+Tab in
-    // Normal mode — otherwise the bytes forward straight to the pane — so
-    // return to Normal mode first.
-    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    // same Ctrl+l chord. The deck is ALREADY in Normal mode here (from the
+    // Ctrl+D sent before tab B's Default -> Narrow toggle above), which
+    // `cycle_tab_action` requires for Shift+Tab to switch tabs rather than
+    // forward the bytes to the pane — so no further Ctrl+D is needed.
+    // Sending one anyway would be actively harmful: Ctrl+D TOGGLES, and
+    // since tab B's start-role pane is still the deck's resume target from
+    // Normal mode, a second press here would re-enter PaneInput on tab B and
+    // break the Shift+Tab below.
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> tab A
     let a_still_narrow = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         (29..=30).contains(&pane_column_left_edge(grid))
@@ -158,7 +176,9 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
         deck.snapshot_grid()
     );
 
-    // Finish tab A's own cycle: Narrow -> Hidden.
+    // Finish tab A's own cycle: Narrow -> Hidden. No Ctrl+D needed: switching
+    // tabs (`switch_tab_with_focus`) never touches `UiMode`, so the deck is
+    // still in Normal mode from above.
     deck.send_bytes(b"\x0c");
     let a_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         pane_column_left_edge(grid) == 0
@@ -171,7 +191,8 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
         deck.snapshot_grid()
     );
 
-    // Hidden -> Default, completing tab A's loop.
+    // Hidden -> Default, completing tab A's loop. Still Normal mode, still
+    // no Ctrl+D needed.
     deck.send_bytes(b"\x0c");
     let a_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         (40..=41).contains(&pane_column_left_edge(grid))

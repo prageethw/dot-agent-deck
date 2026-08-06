@@ -42,8 +42,9 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
 /// -> Hidden (0%) -> Default, asserting the pane column's left edge at each
 /// stage. Open a second Orchestration tab and confirm its own 34% default and
 /// toggle are unaffected by the Dashboard tab's stage, proving cross-tab-type
-/// isolation. RED today: Dashboard tabs have no split-toggle at all, so every
-/// wait below times out.
+/// isolation. PRD #387 M1 scopes Ctrl+l to command mode on every tab type;
+/// opening the Orchestration tab lands the deck back in PaneInput mode on
+/// its start-role pane, so a Ctrl+D precedes that tab's own toggle press.
 #[spec("tabs/dashboard/001")]
 #[test]
 fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration() {
@@ -130,7 +131,12 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
         deck.snapshot_grid()
     );
 
-    // Toggle the Orchestration tab to Narrow.
+    // Toggle the Orchestration tab to Narrow. Opening it (Ctrl+n new-pane
+    // flow) left the deck in PaneInput mode, focused on its start-role pane
+    // — PRD #387 M1 scopes Ctrl+l to command mode on every tab type, so
+    // Ctrl+D must enter Normal mode first or the byte forwards straight to
+    // the pane instead of cycling the split.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
     let orch_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         pane_box_left_edge(grid, "orchestrator") == 25
@@ -145,12 +151,14 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
     // Switch back to the Dashboard tab (Shift+Tab -> previous tab) and
     // confirm ITS split is still Default (33/67) — untouched by the
     // Orchestration tab's toggle, even though both tabs were just driven
-    // through the exact same Ctrl+l chord. The freshly opened Orchestration
-    // tab's start-role pane is live-focused in PaneInput mode, and
-    // `cycle_tab_action` only responds to Shift+Tab in Normal mode —
-    // otherwise the bytes forward straight to the pane — so return to Normal
-    // mode first.
-    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    // through the exact same Ctrl+l chord. The deck is ALREADY in Normal
+    // mode here (from the Ctrl+D sent before the Orchestration tab's own
+    // toggle above), which `cycle_tab_action` requires for Shift+Tab to
+    // switch tabs rather than forward the bytes to the pane — so no further
+    // Ctrl+D is needed. Sending one anyway would be actively harmful: Ctrl+D
+    // TOGGLES, and since the Orchestration tab's start-role pane is still
+    // the deck's resume target from Normal mode, a second press here would
+    // re-enter PaneInput on that tab and break the Shift+Tab below.
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> Dashboard
     // Confirm the tab switch itself landed (DASH_PANE's title is only ever
     // drawn on the Dashboard tab) before polling for its exact edge — a
