@@ -842,6 +842,50 @@ async fn run_idle_monitor(
     }
 }
 
+/// PRD #386 (reviewer finding): ingest one event as a SINGLE ordered daemon
+/// operation — fan it out to attached clients and apply it to the daemon's
+/// own `AppState` under one write-lock acquisition, so every consumer
+/// observes events in the order the daemon applied them.
+///
+/// **Why it has to be one step.** Both producers — the shell-activity monitor
+/// above and the hook loop below — used to `send` and then *separately*
+/// `await` the state write lock, with the await sitting between the two. Two
+/// concurrent producers could therefore interleave: the monitor broadcasts
+/// `ShellBusy` and yields at `state.write().await`, a hook connection
+/// broadcasts `Idle` and wins the lock, and the daemon applies `Idle` then
+/// `ShellBusy` — ending at `Working` — while an attached TUI consumed
+/// `ShellBusy` then `Idle` and renders `Idle`. Nothing corrects it
+/// afterwards, which is what makes it worth fixing rather than tolerating:
+/// the monitor's level-aware re-emit (see `run_shell_activity_monitor`)
+/// tests the DAEMON's status, which is already `Working`, so no further
+/// event is ever synthesized and the pane the user is looking at stays wrong
+/// until the next unrelated edge. That is the same user-visible failure this
+/// PRD exists to repair, and the same shape as the mis-addressed synthesized
+/// event fixed in the monitor.
+///
+/// The non-atomicity is **pre-existing** — it is how the pipeline already
+/// handled any two concurrent events, including two real hooks arriving on
+/// separate connections. What #386 changes is how often the window is
+/// reachable, by adding a second, timer-driven producer that emits precisely
+/// when a real `Stop`-driven `Idle` is in flight.
+///
+/// Holding the guard across `send` is safe and adds no blocking:
+/// `broadcast::Sender::send` is synchronous, never waits on a receiver, and
+/// errs only when there are no subscribers (the expected standalone-daemon
+/// case). The property the old fan-out-before-apply comments protected —
+/// that the broadcast happens whether or not the local `apply_event` accepts
+/// the event, e.g. for an unmanaged pane id — is unchanged: both run under
+/// the same guard, unconditionally.
+async fn ingest_event(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    event: AgentEvent,
+) {
+    let mut state = state.write().await;
+    let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+    state.apply_event(event);
+}
+
 /// PRD #370 M2 / PRD #386 M3: periodically scans every live pane's PTY child
 /// for a transitive descendant detached into a POSIX session of its own — see
 /// [`crate::agent_pty::RunningAgent::shell_foreground_busy`] — and
@@ -1026,11 +1070,10 @@ async fn run_shell_activity_monitor(
                 live_target: None,
             };
 
-            // Same fan-out-before-apply order the hook ingestion path uses
-            // (see `run_hook_loop` below): the broadcast reaches attached
-            // clients whether or not the local `apply_event` accepts it.
-            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
-            state.write().await.apply_event(event);
+            // One ordered ingestion step (broadcast + apply under a single
+            // write-lock hold), exactly as the hook loop below does it — see
+            // `ingest_event` for the interleaving this closes.
+            ingest_event(&state, &event_tx, event).await;
         }
     }
 }
@@ -1137,13 +1180,6 @@ async fn run_hook_loop(
                                 agent_type = ?event.agent_type,
                                 "Received event"
                             );
-                            // Fan out to subscribed attach connections
-                            // *before* mutating local state, so the broadcast
-                            // happens whether or not the local `apply_event`
-                            // accepts the event (e.g. an unmanaged pane id).
-                            // `send` returns Err only when there are no
-                            // subscribers — that's expected and ignored.
-                            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
                             // `list_agents` — e.g. a fresh `dot-agent-deck
@@ -1187,7 +1223,24 @@ async fn run_hook_loop(
                                 }
                                 pty_registry.set_agent_type(pane_id, &event.agent_type);
                             }
-                            state.write().await.apply_event(event);
+                            // Fan out to subscribed attach connections and
+                            // apply locally as ONE ordered operation, so a
+                            // client can never observe two concurrent events
+                            // in a different order than the daemon applied
+                            // them (PRD #386 — see `ingest_event`). The
+                            // broadcast still happens whether or not the
+                            // local `apply_event` accepts the event (e.g. an
+                            // unmanaged pane id); `send` returns Err only
+                            // when there are no subscribers, which is
+                            // expected and ignored.
+                            //
+                            // The registry update above deliberately stays
+                            // *ahead* of the fan-out: it is daemon-local
+                            // bookkeeping read by `list_agents` on a
+                            // different connection, so doing it first only
+                            // means a client that reacts to the event by
+                            // listing agents sees the fresher answer.
+                            ingest_event(&state, &event_tx, event).await;
                         } else {
                             warn!("Malformed event: {line}");
                         }
