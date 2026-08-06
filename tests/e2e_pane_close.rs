@@ -223,7 +223,22 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
     });
     write_hook_line(deck.hook_socket_path(), &replacement.to_string())
         .expect("write replacement SessionStart hook");
-    deck.wait_for_string("ClaudeCode");
+    // `349e895` deleted the agent-type badge, so "ClaudeCode" renders
+    // nowhere anymore — there is no drop-in text replacement for it. What
+    // DOES observably change when this replacement `SessionStart` lands:
+    // `State::apply_event`'s same-pane/different-`agent_id` supersede path
+    // (`src/state.rs`) retires the `vanish-target` placeholder session
+    // (`agent_type: None`, which `render_session_card` shows as the
+    // placeholder status word "No agent") and inserts a brand-new session
+    // for `replacement-generation` with `agent_type: claude_code` and a
+    // fresh `SessionStatus::Idle` — no longer a placeholder, so the card's
+    // status word flips from "No agent" to "Idle". The retired session's
+    // `display_name` ("vanish-target") is inherited onto the replacement
+    // (PRD #127 finding #2), so the card's title text does NOT change —
+    // confirmed below by `contains("vanish-target")` post-confirm — which
+    // is exactly why the status word, not the title, is the only genuinely
+    // new signal proving the hook was processed and applied.
+    deck.wait_for_string("Idle");
 
     deck.send_keys(b"\x1b[B");
     deck.send_keys(b"\r");
