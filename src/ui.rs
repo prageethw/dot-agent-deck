@@ -24924,7 +24924,10 @@ mod tests {
     /// through the three-stage cycle (Default 34/66 -> Narrow 25/75 ->
     /// Hidden 0/100 -> Default), recomputing the orchestration tab's frame
     /// geometry via `compute_frame_layout` at each stage and pinning all four
-    /// widths. Full end-to-end dispatch coverage lives in the L2 tests,
+    /// widths. PRD #387 M2/M3: the stage is sourced from the single
+    /// deck-global `ACTIVE_SPLIT_STAGE` mirror, shared with Dashboard tabs
+    /// (`dashboard/layout/001`) rather than an orchestration-only mirror.
+    /// Full end-to-end dispatch coverage lives in the L2 tests,
     /// tabs/orchestration/006 and tabs/dashboard/001.
     #[spec("orchestration/layout/002")]
     #[test]
@@ -24944,10 +24947,11 @@ mod tests {
         // Simulates the dispatch + render-sync (setting the thread-local
         // `compute_frame_layout` reads) that a real Ctrl+l press drives, then
         // returns the (dashboard_area.width, panes_area.width) pair for the
-        // given stage. Does not assert dispatch or the per-tab field itself —
-        // full end-to-end coverage of that path lives in the L2 tests.
+        // given stage. Does not assert dispatch or the deck-global field
+        // itself — full end-to-end coverage of that path lives in the L2
+        // tests.
         let layout_for = |stage: SplitStage| {
-            ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(stage));
+            ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
             let layout = compute_frame_layout(
                 frame_area,
                 &tab_view,
@@ -25033,17 +25037,16 @@ mod tests {
 
         // Reset immediately so a later test on this worker thread never
         // observes a leaked non-Default stage from this one.
-        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
     }
 
     /// Scenario: Mirrors `layout_002`'s technique to extend the Ctrl+l
     /// split-toggle to Dashboard tabs, walking `next_split_stage` through the
-    /// full cycle via the `ACTIVE_DASHBOARD_SPLIT_STAGE` thread-local and
-    /// recomputing frame geometry at each stage, starting from Dashboard's
-    /// own 33/67 default. RED today: `compute_frame_layout`'s Dashboard arm
-    /// always uses the fixed `DASHBOARD_LEFT_PERCENT`/`_PANES_PERCENT`
-    /// constants regardless of stage. Full end-to-end dispatch coverage lives
-    /// in the L2 test, tabs/dashboard/001.
+    /// full cycle via the single deck-global `ACTIVE_SPLIT_STAGE` thread-local
+    /// (PRD #387 M2/M3 — the same mirror `orchestration/layout/002` sets, not
+    /// a Dashboard-only one) and recomputing frame geometry at each stage,
+    /// starting from Dashboard's own 33/67 default. Full end-to-end dispatch
+    /// coverage lives in the L2 test, tabs/dashboard/001.
     #[spec("dashboard/layout/001")]
     #[test]
     fn layout_001_ctrl_l_cycles_dashboard_split_stages() {
@@ -25060,7 +25063,7 @@ mod tests {
         };
 
         let layout_for = |stage: SplitStage| {
-            ACTIVE_DASHBOARD_SPLIT_STAGE.with(|c| c.set(stage));
+            ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
             let layout = compute_frame_layout(
                 frame_area,
                 &tab_view,
@@ -25131,32 +25134,29 @@ mod tests {
 
         // Reset immediately so a later test on this worker thread never
         // observes a leaked non-Default stage from this one.
-        ACTIVE_DASHBOARD_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
     }
 
-    /// Scenario: PRD #336 spawn-order regression. Dispatch the real
-    /// `Action::SpawnPane` to open orchestration tab A at the default split,
-    /// dispatch `Action::CycleSplitStage` to narrow it, then
-    /// manually set `ACTIVE_ORCHESTRATION_SPLIT_STAGE` to simulate the
-    /// render loop syncing it from the now-narrow, still-active tab A —
-    /// exactly what happens on the frame between the toggle and a
-    /// follow-up spawn. Dispatch a second `Action::SpawnPane` to open a
-    /// brand-new orchestration tab B and assert two things: B's own
-    /// `split_stage` field defaults to `SplitStage::Default` (per-tab STATE
-    /// is correctly isolated), and B's role panes' recorded
-    /// `AgentSpawnOptions::cols` match A's initial (default-split) cols —
-    /// because both tabs were opened untoggled, they must agree. A spawn-
-    /// order bug in `orchestration_role_pane_dims` (which reads the stale
-    /// thread-local instead of B's own default state) makes B's cols equal
-    /// the NARROW-derived width instead, since the render loop hasn't had a
-    /// chance to resync the thread-local for B yet.
+    /// Scenario: PRD #387 M4a — inverts the #336 spawn-order regression this
+    /// test used to guard. Dispatch the real `Action::SpawnPane` to open
+    /// orchestration tab A at the default split, dispatch
+    /// `Action::CycleSplitStage` to narrow the ONE deck-global `ui.split_stage`
+    /// (there is no longer a per-tab field to narrow), then manually set
+    /// `ACTIVE_SPLIT_STAGE` to simulate the render loop syncing it from
+    /// `ui.split_stage` — exactly what happens on the frame between the
+    /// toggle and a follow-up spawn. Dispatch a second `Action::SpawnPane` to
+    /// open a brand-new orchestration tab B and assert it ADOPTS the current
+    /// deck-global stage (Narrow) rather than resetting to Default, including
+    /// that its role panes' recorded `AgentSpawnOptions::cols` match the
+    /// Narrow-derived pane-column width — a mismatch here means an agent
+    /// wrapping its output to the wrong column, which is user-visible.
     #[spec("orchestration/layout/003")]
     #[test]
-    fn layout_003_new_orchestration_tab_spawns_at_default_split_even_when_another_tab_is_narrow() {
+    fn layout_003_new_orchestration_tab_adopts_the_deck_global_split_stage() {
         // Clean slate: don't rely on test-execution order for this shared
         // thread-local (layout_002 resets it, but tests can interleave on
         // the same worker thread).
-        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
 
         fn orch_config(name: &str) -> OrchestrationConfig {
             OrchestrationConfig {
@@ -25211,7 +25211,10 @@ mod tests {
             frame_area,
         );
 
-        // Toggle tab A (now active) to the narrow 25/75 split.
+        // Toggle: PRD #387 M2 collapses `CycleSplitStage`'s handler to a
+        // single `ui.split_stage = next_split_stage(ui.split_stage)`
+        // assignment — there is no more per-tab field on tab A to inspect,
+        // so the ONE deck-global field is the whole state to check.
         let _ = dispatch_action(
             Action::CycleSplitStage,
             &mut ui,
@@ -25223,23 +25226,18 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration { split_stage, .. } => {
-                assert_eq!(
-                    *split_stage,
-                    SplitStage::Narrow,
-                    "tab A should be narrow after the toggle"
-                )
-            }
-            _ => panic!("expected orchestration tab A to be active"),
-        }
-        // Simulate the render loop's per-frame sync (src/ui.rs, the
-        // `ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(*split_stage))`
-        // line in the `Tab::Orchestration` arm of the tab_view match): with
-        // tab A active and narrow, the very next frame sets this thread-
-        // local to `Narrow` — BEFORE a follow-up `Action::SpawnPane` dispatch
-        // (below) gets a chance to open tab B.
-        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Narrow));
+        assert_eq!(
+            ui.split_stage,
+            SplitStage::Narrow,
+            "the deck-global stage should be Narrow after the toggle"
+        );
+        // Simulate the render loop's per-frame sync (src/ui.rs, PRD #387
+        // M2/M3's collapsed `ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage))`
+        // line, sourced from the ONE deck-global field rather than the
+        // active tab): the very next frame sets this thread-local to
+        // `Narrow` — BEFORE a follow-up `Action::SpawnPane` dispatch (below)
+        // gets a chance to open tab B.
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage));
 
         // Spawn a brand-new orchestration tab B. Internally this reaches
         // `orchestration_role_pane_dims`, which reads the thread-local set
@@ -25264,38 +25262,95 @@ mod tests {
             frame_area,
         );
 
-        // Reset the thread-local BEFORE asserting so a failing assertion
-        // still leaves it clean for a later test on this worker thread.
-        ACTIVE_ORCHESTRATION_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+        // The deck-global stage (PRD #387 decision 2): opening tab B must
+        // NOT reset it — there is no per-tab field left to isolate B from A,
+        // and the whole point of the shared stage is that a newly opened tab
+        // adopts whatever is currently set.
+        assert_eq!(
+            ui.split_stage,
+            SplitStage::Narrow,
+            "the deck-global stage must still read Narrow after opening tab \
+             B — opening a new tab must adopt the current stage, not reset it"
+        );
 
-        // Per-tab STATE isolation: B's own `split_stage` field must default
-        // to `SplitStage::Default` regardless of A's toggled state.
-        match tm.active_tab() {
-            Tab::Orchestration { split_stage, .. } => assert_eq!(
-                *split_stage,
-                SplitStage::Default,
-                "tab B's own split_stage field must default to SplitStage::Default, \
-                 independent of tab A's toggled state"
-            ),
-            _ => panic!("expected orchestration tab B to be active"),
-        }
+        // Derive the pane-column width `compute_frame_layout` renders for a
+        // FRESH 2-role orchestration tab at `stage`, via the SAME
+        // `split_stage_percents` math `orchestration_role_pane_dims` uses to
+        // size each role pane's spawn `cols` — the render and spawn-time
+        // seams "mirror" each other by design (see `ACTIVE_SPLIT_STAGE`'s
+        // own doc comment). Used both to calibrate the recorded-cols <->
+        // rendered-width relationship against tab A's own known-Default
+        // spawn below, and to derive tab B's expected Narrow width — without
+        // hardcoding `orchestration_role_pane_dims`'s internal arithmetic
+        // here. Leaves `ACTIVE_SPLIT_STAGE` at whatever `stage` it last
+        // computed; every call site below resets it explicitly afterward.
+        let role_pane_ids = vec!["orchestrator".to_string(), "worker".to_string()];
+        let orch_tab_view = ActiveTabView::Orchestration {
+            role_pane_ids: role_pane_ids.clone(),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orchestration".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let panes_width_for = |stage: SplitStage| {
+            ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
+            let layout = compute_frame_layout(
+                frame_area,
+                &orch_tab_view,
+                &tab_bar,
+                &role_pane_ids,
+                PaneLayout::Tiled,
+                None,
+                1,
+            );
+            let FrameContent::Cards { panes_area, .. } = layout.content else {
+                panic!("Orchestration tab must produce FrameContent::Cards");
+            };
+            panes_area.expect("role panes => a right column").width
+        };
 
-        // Per-tab PTY-SIZING isolation (the spawn-order bug): A and B were
-        // both spawned at the default (untoggled) state, so their role
-        // panes' recorded `cols` must match. A's 2 roles are recorded
-        // first, B's 2 roles second.
+        // A's 2 roles are recorded first, B's 2 roles second.
         let cols = pc.recorded_spawn_cols();
         assert_eq!(cols.len(), 4, "expected 2 role panes each for tabs A and B");
         let (cols_a, cols_b) = (&cols[0..2], &cols[2..4]);
-        assert_eq!(
-            cols_b, cols_a,
-            "tab B's role panes should spawn at the SAME default-split \
-             width as tab A's did (both opened untoggled) — got B={cols_b:?} \
-             vs A={cols_a:?}; B was sized using tab A's stale narrow (25/75) \
-             ACTIVE_ORCHESTRATION_SPLIT_STAGE thread-local because \
-             orchestration_role_pane_dims reads it before the render loop \
-             has a chance to resync it for the newly-spawned tab"
-        );
+
+        // Calibration: A was spawned while the deck-global stage was
+        // Default (untoggled), so its recorded cols must equal the
+        // Default-derived pane width — establishing that recorded PTY
+        // `cols` and `compute_frame_layout`'s `panes_area.width` are the
+        // SAME quantity before trusting that equivalence for B below.
+        let default_width = panes_width_for(SplitStage::Default);
+        for &c in cols_a {
+            assert_eq!(
+                c, default_width,
+                "tab A's role panes should spawn at the Default-derived \
+                 width {default_width}, got {c}"
+            );
+        }
+
+        // The inverted assertion (PRD #387 decision 2): B now ADOPTS the
+        // deck-global stage set by the toggle above (Narrow), not its own
+        // untoggled Default — so its role panes' recorded cols must equal
+        // the NARROW-derived width, not tab A's Default-derived width. A
+        // mismatch here means an agent wrapping its output to the wrong
+        // column, which is user-visible.
+        let narrow_width = panes_width_for(SplitStage::Narrow);
+        for &c in cols_b {
+            assert_eq!(
+                c, narrow_width,
+                "tab B's role panes should spawn at the deck-global \
+                 Narrow-derived width {narrow_width} (adopting tab A's \
+                 toggled stage), got {c} — B was sized using a stale or \
+                 wrong stage instead of the current deck-global \
+                 ACTIVE_SPLIT_STAGE"
+            );
+        }
+
+        // Leave the thread-local clean for a later test on this worker
+        // thread — `panes_width_for`'s last call above left it at Narrow.
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
     }
 
     /// Exhaustive match over every `UiMode` variant, returning `mode`
@@ -25406,6 +25461,257 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Scenario: PRD #387 M2/M3 — with both a Dashboard tab and a real
+    /// Orchestration tab open, dispatch `Action::CycleSplitStage` while the
+    /// Orchestration tab is active and assert BOTH tab types resolve their
+    /// geometry from the SAME deck-global stage, walking the full
+    /// Default -> Narrow -> Hidden -> Default cycle. Pins that Dashboard and
+    /// Orchestration each keep their OWN Default ratio (33/67 vs 34/66)
+    /// while converging on the SAME 25/75 (Narrow) and 0/100 (Hidden) splits
+    /// — the convergence-plus-divergence pattern that catches an
+    /// implementation that accidentally flattens both tab types onto one
+    /// ratio instead of sharing only the STAGE. RED today: `UiState` has no
+    /// `split_stage` field and `ACTIVE_SPLIT_STAGE` does not exist, so this
+    /// fails to compile.
+    #[spec("orchestration/layout/006")]
+    #[test]
+    fn layout_006_cycle_split_stage_is_deck_global_across_tab_types() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        fn orch_config(name: &str) -> OrchestrationConfig {
+            OrchestrationConfig {
+                name: name.to_string(),
+                roles: vec![OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                }],
+            }
+        }
+
+        // Open a real Orchestration tab alongside the always-present
+        // Dashboard tab (tab 0), so both tab types genuinely coexist.
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "shared-orch".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(orch_config("shared-orch")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "expected the Orchestration tab to be active after spawning it"
+        );
+
+        // Geometry helpers for each tab type via `compute_frame_layout`,
+        // mirroring `orchestration/layout/002` / `dashboard/layout/001`'s
+        // technique — but both sourced from the SAME `ACTIVE_SPLIT_STAGE`
+        // thread-local (PRD #387 M3), which is the assertion that catches
+        // "shared" being implemented by flattening both tab types onto one
+        // ratio: a correct implementation keeps DIFFERENT Default ratios
+        // while sharing Narrow/Hidden.
+        let role_pane_ids = vec!["orchestrator".to_string()];
+        let orch_view = ActiveTabView::Orchestration {
+            role_pane_ids: role_pane_ids.clone(),
+        };
+        let orch_tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Orchestration".into()],
+            active_index: 1,
+            orchestration_statuses: vec![],
+        };
+        let dash_pane_ids = vec!["p0".to_string(), "p1".to_string()];
+        let dash_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+        };
+        let dash_tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let orch_widths = || {
+            let layout = compute_frame_layout(
+                frame_area,
+                &orch_view,
+                &orch_tab_bar,
+                &role_pane_ids,
+                PaneLayout::Tiled,
+                None,
+                1,
+            );
+            let FrameContent::Cards {
+                dashboard_area,
+                panes_area,
+                ..
+            } = layout.content
+            else {
+                panic!("Orchestration tab must produce FrameContent::Cards");
+            };
+            (
+                dashboard_area.width,
+                panes_area.expect("role panes => a right column").width,
+            )
+        };
+        let dash_widths = || {
+            let layout = compute_frame_layout(
+                frame_area,
+                &dash_view,
+                &dash_tab_bar,
+                &dash_pane_ids,
+                PaneLayout::Tiled,
+                None,
+                1,
+            );
+            let FrameContent::Cards {
+                dashboard_area,
+                panes_area,
+                ..
+            } = layout.content
+            else {
+                panic!("Dashboard tab must produce FrameContent::Cards");
+            };
+            (
+                dashboard_area.width,
+                panes_area.expect("two panes => a right pane column").width,
+            )
+        };
+
+        // Default: DIVERGENT ratios — Orchestration 34/66, Dashboard 33/67.
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage));
+        assert_eq!(
+            orch_widths(),
+            (34, 66),
+            "Orchestration must render its OWN 34/66 default, not Dashboard's"
+        );
+        assert_eq!(
+            dash_widths(),
+            (33, 67),
+            "Dashboard must render its OWN 33/67 default, not Orchestration's"
+        );
+
+        // ONE CycleSplitStage dispatch — with the ORCHESTRATION tab active —
+        // must move the SAME deck-global field both tab types read below,
+        // not just the active tab's own (deleted) per-tab field.
+        let _ = dispatch_action(
+            Action::CycleSplitStage,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.split_stage,
+            SplitStage::Narrow,
+            "a single CycleSplitStage dispatch must advance the ONE \
+             deck-global stage, not a per-tab field"
+        );
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage));
+        assert_eq!(
+            orch_widths(),
+            (25, 75),
+            "Orchestration must converge on the shared 25/75 Narrow split"
+        );
+        assert_eq!(
+            dash_widths(),
+            (25, 75),
+            "Dashboard must converge on the SAME shared 25/75 Narrow split \
+             even though only the Orchestration tab was active when \
+             CycleSplitStage was dispatched — proving the toggle is \
+             deck-global, not per-tab"
+        );
+
+        let _ = dispatch_action(
+            Action::CycleSplitStage,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.split_stage,
+            SplitStage::Hidden,
+            "second dispatch should advance Narrow -> Hidden"
+        );
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage));
+        assert_eq!(
+            orch_widths(),
+            (0, 100),
+            "Orchestration must converge on the shared Hidden split \
+             (sidebar collapsed)"
+        );
+        assert_eq!(
+            dash_widths(),
+            (0, 100),
+            "Dashboard must converge on the SAME shared Hidden split"
+        );
+
+        let _ = dispatch_action(
+            Action::CycleSplitStage,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.split_stage,
+            SplitStage::Default,
+            "third dispatch should loop Hidden -> Default"
+        );
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage));
+        assert_eq!(
+            orch_widths(),
+            (34, 66),
+            "Orchestration must diverge back to its OWN 34/66 default"
+        );
+        assert_eq!(
+            dash_widths(),
+            (33, 67),
+            "Dashboard must diverge back to its OWN 33/67 default, proving \
+             Default is per-tab-TYPE even though the STAGE itself is shared \
+             — a flattened single-ratio implementation would fail here \
+             (and above) while still passing the Narrow/Hidden convergence \
+             checks alone"
+        );
+
+        // Reset immediately so a later test on this worker thread never
+        // observes a leaked non-Default stage from this one.
+        ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
     }
 
     // -----------------------------------------------------------------------
