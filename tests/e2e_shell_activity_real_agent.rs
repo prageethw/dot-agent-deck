@@ -41,7 +41,6 @@ mod common;
 
 use std::time::Duration;
 
-use chrono::Utc;
 use common::TuiDeck;
 use dot_agent_deck::event::EventType;
 use dot_agent_deck::platform::proc::{
@@ -205,14 +204,19 @@ const SENTINEL_006: &str = "shell-activity-006-sentinel-9d21e6.log";
 const PING_COUNT_006: u32 = 200;
 /// Measured `ToolStart` -> `Idle` gap for an identical 200s ping under the
 /// 120s default Bash timeout (PRD #386 Problem Statement: `ToolStart`
-/// 01:20:53.307, `Idle` 01:23:00.372 = +127.065s). Sampling at or after this
-/// point is sampling after the `Stop`-driven `Idle` would have landed for a
-/// broken implementation; sampling any earlier would not distinguish the fix
-/// from the bug, since the badge reads `Working` from `ToolStart` regardless
-/// of which one is running.
-const SAMPLE_AFTER_TOOL_START_SECS: i64 = 127;
+/// 01:20:53.307, `Idle` 01:23:00.372 = +127.065s). Used only to size how long
+/// this test is willing to wait for the real `Idle` below — the assertion
+/// itself no longer depends on this number being exactly right, since it now
+/// waits for the genuine event rather than sleeping to a computed instant.
+const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
+/// Margin added on top of [`MEASURED_TOOL_START_TO_IDLE_SECS`] for the
+/// `Idle`-wait bound below. Generous enough to absorb normal jitter around
+/// the 120s cap without turning a run that will never see `Idle` (Claude
+/// Code ended the capped call with `ToolEnd` and no `Stop`) into an
+/// unreasonably long wait.
+const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow, then send a directive prompt instructing it to run `ping -c 200 127.0.0.1 > <sentinel> 2>&1` as its one Bash tool call under default Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the >120s-cap bug exactly. After the native `ToolStart` hook fires, switch to the dashboard and sleep until cap + ~7s has elapsed since `ToolStart` — the measured moment the `Stop`-driven `Idle` would have landed — then assert the pane's rendered card badge still reads `Working` and that a live process carrying the sentinel (and a live `ping` beneath it) is still running.
+/// Scenario: launch a real interactive Haiku Claude agent through the normal Ctrl+N new-pane flow, then send a directive prompt instructing it to run `ping -c 200 127.0.0.1 > <sentinel> 2>&1` as its one Bash tool call under default Bash settings (no `timeout` parameter, no `run_in_background`), reproducing the >120s-cap bug exactly. After the native `ToolStart` hook fires, wait for the real, native `Idle` event (mapped from Claude Code's own `Stop` hook, never fabricated) so a PASS can only mean the bug path was genuinely exercised — a run where Claude ends the capped call with `ToolEnd` and no `Stop` fails loudly with a `PRECONDITION NOT MET` message rather than silently passing. Once the real `Idle` lands, switch to the dashboard and assert the pane's rendered card badge still reads `Working`, and that a live process carrying the sentinel (and a live `ping` beneath it) is still running.
 #[spec("status/shell-activity/006")]
 #[test]
 fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working() {
@@ -221,7 +225,18 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     let deck = TuiDeck::builder()
         .with_imported_claude_credentials()
         .launch_with_fixture("minimal");
-    deck.wait_for_string("No active sessions");
+    // `wait_for_string`'s shared 10s bound is tight on a loaded machine (this
+    // one routinely runs at load average 20+) and this startup race is
+    // unrelated to anything this test asserts, so it gets a local, more
+    // generous bound here rather than widening the shared constant every
+    // other harness test relies on.
+    assert!(
+        deck.wait_for_grid_string_within("No active sessions", Duration::from_secs(30)),
+        "startup race: the deck never rendered \"No active sessions\" within 30s — this is the \
+         known loaded-machine startup flake (harness-side), not a badge or shell-activity \
+         assertion:\n{}",
+        deck.snapshot_grid()
+    );
 
     let cwd = deck.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];
@@ -271,66 +286,103 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     let agent_id = record.id;
 
     let prompt = format!(
-        "Use the Bash tool exactly once, with default settings — do not pass a timeout \
-         parameter and do not set run_in_background — to run this single command: ping -c \
-         {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Do not run any other command and do \
+        "Call the Bash tool now, as your very first action, with no preceding text or \
+         explanation. Use the Bash tool exactly once, with default settings — do not pass a \
+         timeout parameter and do not set run_in_background — to run this single command: ping \
+         -c {PING_COUNT_006} 127.0.0.1 > {SENTINEL_006} 2>&1. Do not run any other command and do \
          not alter this command in any way."
     );
     deck.send_keys(prompt.as_bytes());
     deck.send_keys(b"\r");
 
     // Precondition: the real Bash tool call actually started, under default
-    // settings — the native ToolStart hook event, not a fabricated one.
-    let tool_start = events.wait_for(
+    // settings — the native ToolStart hook event, not a fabricated one. A
+    // timeout here is a harness flake (the model never issued the Bash tool
+    // call at all — only a SessionStart shows up in `observed events`), not a
+    // badge regression; the custom message says so explicitly so a red run
+    // here is never misread as BADGE WRONG.
+    let tool_start = match events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id.as_str())
                 && event.event_type == EventType::ToolStart
                 && event.tool_name.as_deref() == Some("Bash")
         },
         Duration::from_secs(120),
-    );
+    ) {
+        Some(ev) => ev,
+        None => panic!(
+            "PRECONDITION NOT MET: no ToolStart/Bash event observed for agent {agent_id:?} \
+             within 120s — the model never issued the Bash tool call at all. This is a harness \
+             flake (prompt adherence), NOT a badge regression: rerun rather than reading this as \
+             BADGE WRONG. Observed events: {:#?}",
+            events.snapshot()
+        ),
+    };
     eprintln!(
         "shell-activity-006: ToolStart observed at {:?}",
         tool_start.timestamp
     );
 
+    // The precondition this test exists to gate on. Roughly a third of runs
+    // reach the moment that actually exercises Defect A: the rest end with
+    // Claude Code's `ToolEnd` and no `Stop`, in which case the card never
+    // leaves `Working` and the badge assertion below would hold whether or
+    // not the fix works at all. Waiting for the real, native `Idle` (mapped
+    // from the agent's own `Stop` hook, never fabricated by this test) turns
+    // the old implicit timing assumption (ToolStart + a fixed offset) into an
+    // explicit causal one: this run only counts as a PASS of the bug path if
+    // the Idle that Defect A's fix has to correct actually landed.
+    let idle_wait_timeout =
+        Duration::from_secs(MEASURED_TOOL_START_TO_IDLE_SECS + IDLE_WAIT_MARGIN_SECS);
+    let idle_event = events.try_wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(agent_id.as_str())
+                && event.event_type == EventType::Idle
+        },
+        idle_wait_timeout,
+    );
+    let Some(idle_event) = idle_event else {
+        panic!(
+            "PRECONDITION NOT MET: no native Stop-mapped Idle event observed for pane \
+             {PANE_NAME_SUFFIX_006:?} within {idle_wait_timeout:?} of ToolStart — this run never \
+             exercises the bug path (Claude Code most likely ended the capped Bash call with \
+             ToolEnd and no Stop, which is common — roughly 2 runs in 3 by the tester's own \
+             measurement). This is an inconclusive run, NOT a badge regression: rerun rather than \
+             reading this as BADGE WRONG. Observed events: {:#?}",
+            events.snapshot()
+        );
+    };
+    eprintln!(
+        "shell-activity-006: native Idle observed at {:?}, {}ms after ToolStart — this run \
+         genuinely exercises the bug path",
+        idle_event.timestamp,
+        (idle_event.timestamp - tool_start.timestamp).num_milliseconds()
+    );
+
     // Back to the dashboard: what gets sampled next must be the rendered
     // card badge a user actually glances at, not the pane's own terminal
     // content (which is where 005 correctly avoids looking, for the
-    // opposite reason — here the badge IS the point).
+    // opposite reason — here the badge IS the point). Sampled right after
+    // the real Idle above landed — the same instant a broken monitor would
+    // have painted the badge Idle.
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
 
-    // Decision 21: bounded polling only, never a raw sleep, inside an
-    // `e2e_*.rs` body — `common::wait_until` owns the actual `sleep`. The
-    // bound is generous slack over the computed wait so it can never cut the
-    // real wait short; the condition (wall-clock time) is what actually
-    // gates it.
-    let sample_at = tool_start.timestamp + chrono::Duration::seconds(SAMPLE_AFTER_TOOL_START_SECS);
-    let max_wait =
-        (sample_at - Utc::now()).to_std().unwrap_or(Duration::ZERO) + Duration::from_secs(10);
-    common::wait_until(max_wait, || Utc::now() >= sample_at);
-    eprintln!(
-        "shell-activity-006: sampling at {:?} — cap + {SAMPLE_AFTER_TOOL_START_SECS}s after \
-         ToolStart, the measured moment a Stop-driven Idle would have landed",
-        Utc::now()
-    );
-
     // The load-bearing assertion: the badge must still read Working, not the
     // stale Idle a bare `Stop -> EventType::Idle` mapping would have painted
-    // by now — this IS the reported bug, reproduced or fixed, as the user
-    // sees it.
+    // the instant the real Idle above landed — this IS the reported bug,
+    // reproduced or fixed, as the user sees it.
     assert!(
         deck.wait_for_grid_string_within("Working", Duration::from_secs(5)),
-        "the pane's badge did not read Working at cap + {SAMPLE_AFTER_TOOL_START_SECS}s — the \
+        "the pane's badge did not read Working right after the native Idle landed — the \
          reported bug (a >120s Bash call reads Idle while the command is still running) \
          reproduced:\n{}",
         deck.snapshot_grid()
     );
     assert!(
         !deck.snapshot_grid().contains("Idle"),
-        "the pane's badge read Idle alongside Working at cap + \
-         {SAMPLE_AFTER_TOOL_START_SECS}s — an inconsistent render:\n{}",
+        "the pane's badge read Idle alongside Working right after the native Idle landed — an \
+         inconsistent render:\n{}",
         deck.snapshot_grid()
     );
 
@@ -350,7 +402,7 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
         .unwrap_or_else(|| {
             panic!(
                 "no live descendant of this test carries the sentinel {SENTINEL_006:?} in its \
-                 argv at the cap + {SAMPLE_AFTER_TOOL_START_SECS}s sample point — the Bash-tool \
+                 argv at the sample point (right after the native Idle landed) — the Bash-tool \
                  call already finished, which would mean the {PING_COUNT_006}s ping finished \
                  early rather than genuinely testing the cap"
             )

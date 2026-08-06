@@ -4020,6 +4020,34 @@ impl EventSub {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    /// Like [`Self::wait_for`], but returns `None` instead of panicking when
+    /// `timeout` elapses with no match. For a caller that must distinguish
+    /// "the precondition this run needed was never met" (inconclusive) from
+    /// "the precondition landed and the assertion under it failed" (a real
+    /// regression) — a bare `wait_for` collapses both into the same panic.
+    pub fn try_wait_for(
+        &self,
+        pred: impl Fn(&dot_agent_deck::event::AgentEvent) -> bool,
+        timeout: Duration,
+    ) -> Option<dot_agent_deck::event::AgentEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(ev) = self.events.lock().unwrap().iter().find(|e| pred(e)) {
+                return Some(ev.clone());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Every broadcast `AgentEvent` collected so far, for building a
+    /// diagnostic message when [`Self::try_wait_for`] times out.
+    pub fn snapshot(&self) -> Vec<dot_agent_deck::event::AgentEvent> {
+        self.events.lock().unwrap().clone()
+    }
 }
 
 #[cfg(unix)]
