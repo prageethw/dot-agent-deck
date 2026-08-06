@@ -483,12 +483,15 @@ impl Drop for KillOnDrop {
 
 /// Scenario: spawns a real PTY pane running `/bin/sh` through
 /// `AgentPtyRegistry::spawn_agent` (the same registry path a real agent pane
-/// uses), whose script sleeps briefly and then has a `python3` child call
-/// `os.setsid()` and `execv` into `/bin/sleep` — a genuine `setsid`-detached,
-/// marker-tagged, Bash-tool-argv-shaped process on pipes, off the pane's PTY
-/// entirely, exactly the topology `status/shell-activity/386-argv-notes.md`
-/// measured for a real Claude Bash-tool child and the one #370's own test
-/// never exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
+/// uses), tagged `agent_type: Some(AgentType::ClaudeCode)` so the shape
+/// catalog actually reaches the scan (`shell_tool_shape_key` filters by
+/// agent kind before the classifier ever sees a shape), whose script sleeps
+/// briefly and then has a `python3` child call `os.setsid()` and `execv`
+/// into `/bin/sleep` — a genuine `setsid`-detached, marker-tagged,
+/// Bash-tool-argv-shaped process on pipes, off the pane's PTY entirely,
+/// exactly the topology `status/shell-activity/386-argv-notes.md` measured
+/// for a real Claude Bash-tool child and the one #370's own test never
+/// exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
 /// and asserts the pane reads idle before the detached child appears, busy
 /// while it lives — independently confirmed via `process_table()` +
 /// `descendants()` that the found descendant has no controlling terminal, is
@@ -531,6 +534,14 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
                 // into the child's own environment.
                 ("SHELL".to_string(), "/bin/sh".to_string()),
             ],
+            // Load-bearing for the argv cross-check claim below:
+            // `shell_tool_shape_key` selects `CLAUDE_BASH_TOOL_SHAPE` only
+            // for `AgentType::ClaudeCode`, and `&[]` for `None` — so without
+            // this the `&[CLAUDE_BASH_TOOL_SHAPE]` passed to
+            // `shell_foreground_busy_snapshot` below is filtered out before
+            // the scan ever sees it, and the crafted argv is never actually
+            // checked.
+            agent_type: Some(dot_agent_deck::event::AgentType::ClaudeCode),
             ..SpawnOptions::default()
         })
         .expect("spawn should succeed");
