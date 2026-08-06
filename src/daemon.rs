@@ -842,8 +842,8 @@ async fn run_idle_monitor(
     }
 }
 
-/// PRD #370 M2: periodically checks every live pane's PTY foreground process
-/// group against its shell's own — see
+/// PRD #370 M2 / PRD #386 M3: periodically scans every live pane's PTY child
+/// for a transitive descendant detached into a POSIX session of its own — see
 /// [`crate::agent_pty::RunningAgent::shell_foreground_busy`] — and
 /// synthesizes `ShellBusy`/`ShellIdle` events through the SAME pipeline real
 /// hook events use (`event_tx` broadcast + `AppState::apply_event`), so a
@@ -868,15 +868,26 @@ async fn run_shell_activity_monitor(
 ) {
     // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
     // between feeling responsive and negligible overhead (one registry lock
-    // + a `tcgetpgrp` per live pane); revisit if profiling ever says
-    // otherwise.
+    // + one `ps -A` sample per tick, reused across every live pane, plus a
+    // `getsid` per row). PRD #386 M5 is where that cost gets measured and the
+    // cadence confirmed or revised; left unchanged here deliberately, so M5
+    // measures the shape that actually shipped.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        let snapshot = pty_registry.shell_foreground_busy_snapshot();
+        // PRD #386 M3: the CATALOG of measured shapes, not a set applied to
+        // every pane — `shell_foreground_busy_snapshot` selects from it per
+        // pane by agent kind, so a Claude pane gets the one shape measured
+        // against Claude Code and an agent whose shell-tool shape has never
+        // been measured gets none (structural session-id test alone). Passing
+        // Claude's fingerprint to a Codex/OpenCode/Pi pane would veto a
+        // genuinely detached descendant and leave the pane silently reading
+        // `Idle`.
+        let snapshot = pty_registry
+            .shell_foreground_busy_snapshot(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
         let seen: std::collections::HashSet<&str> = snapshot
             .iter()
             .map(|(pane_id, _)| pane_id.as_str())
@@ -1256,17 +1267,30 @@ mod hook_ingestion_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: PRD #370's whole point, end to end. Spawn a real `/bin/sh`
-    /// pane, seed it a known session the way a real hook `SessionStart`
-    /// would (so `AppState::pane_hook_session_id` can resolve it), run the
-    /// real `run_shell_activity_monitor` against it, then type a short
-    /// foreground `sleep` into the pane's PTY directly (no agent hooks
-    /// involved at all). The monitored session's status must flip to
-    /// `Working` while the sleep runs and revert to `Idle` once it exits —
-    /// proving the daemon-synthesized `ShellBusy`/`ShellIdle` signal reaches
-    /// `AppState` through the exact pipeline this PRD reports missing.
+    /// Scenario: PRD #370's whole point, end to end, **restimulated for PRD
+    /// #386 M3**. Spawn a real `/bin/sh` pane, seed it a known session the way
+    /// a real hook `SessionStart` would (so `AppState::pane_hook_session_id`
+    /// can resolve it), run the real `run_shell_activity_monitor` against it,
+    /// then type a command into the pane's PTY directly (no agent hooks
+    /// involved at all) that launches a genuinely `setsid`-detached child. The
+    /// monitored session's status must flip to `Working` while that child runs
+    /// and revert to `Idle` once it exits — proving the daemon-synthesized
+    /// `ShellBusy`/`ShellIdle` signal reaches `AppState` through the exact
+    /// pipeline this PRD reports missing.
+    ///
+    /// **What #386 changed here, and why the pipeline assertions are unchanged.**
+    /// This test used to type a plain `sleep 2`, which #370's `tcgetpgrp` body
+    /// read as busy. #386 replaced that body with a descendant scan that fires
+    /// on a descendant in a POSIX session of its own, and a job typed into the
+    /// pane's own PTY stays in the pane's session — deliberately not busy, since
+    /// counting it would also count every long-lived MCP/`caffeinate` child a
+    /// real agent pane carries and pin the pane at `Working` forever (see
+    /// `shell_foreground_busy_ignores_a_non_detached_foreground_child`). Only
+    /// the *stimulus* moved to the topology a real Claude Bash-tool call has;
+    /// what this test proves — pane → monitor → synthesized event → `AppState`
+    /// status — is exactly what it always proved.
     #[tokio::test]
-    async fn shell_activity_monitor_reflects_a_real_foreground_command() {
+    async fn shell_activity_monitor_reflects_a_real_detached_shell_command() {
         use std::io::Write as _;
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -1315,14 +1339,28 @@ mod hook_ingestion_tests {
             async move { run_shell_activity_monitor(registry, state, event_tx).await }
         });
 
-        // Type a short foreground command directly into the pane's PTY — no
-        // agent, no hook, nothing but the raw shell.
+        // Type the command directly into the pane's PTY — no agent, no hook,
+        // nothing but the raw shell. It `fork`s, `setsid`s the child (detaching
+        // it from the pane's controlling terminal into a session of its own,
+        // exactly as Claude Code's Bash-tool child does) and `execv`s it into a
+        // 2-second `sleep`, then waits for it. The `fork` matters: an
+        // interactive `/bin/sh` has job control on and makes each foreground
+        // job its own process-group leader, and `setsid(2)` fails with EPERM
+        // for a process that already leads a group — so python must detach a
+        // *child*, not itself. The parent's `waitpid` keeps the pane occupied
+        // for the child's whole life, and the child exiting on its own is what
+        // drives the falling edge below.
         {
             let writer = registry
                 .agent_writer(&agent_id)
                 .expect("spawned agent must be in the registry");
             let mut w = writer.lock().await;
-            w.write_all(b"sleep 2\n").expect("write sleep command");
+            w.write_all(
+                b"python3 -c \"import os; pid = os.fork(); \
+                  (os.setsid(), os.execv('/bin/sleep', ['sleep', '2'])) if pid == 0 \
+                  else os.waitpid(pid, 0)\"\n",
+            )
+            .expect("write detached-child command");
             w.flush().expect("flush");
         }
 
@@ -1341,8 +1379,8 @@ mod hook_ingestion_tests {
         assert_eq!(
             current,
             crate::state::SessionStatus::Working,
-            "the monitor must promote the session to Working while the foreground \
-             sleep runs, with zero agent-emitted events involved"
+            "the monitor must promote the session to Working while the detached \
+             child runs, with zero agent-emitted events involved"
         );
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
@@ -1355,8 +1393,8 @@ mod hook_ingestion_tests {
         assert_eq!(
             current,
             crate::state::SessionStatus::Idle,
-            "the monitor must revert the session to Idle once the foreground \
-             sleep finishes and the shell reclaims the pty"
+            "the monitor must revert the session to Idle once the detached child \
+             exits and the pane has no out-of-session descendant left"
         );
 
         monitor_handle.abort();

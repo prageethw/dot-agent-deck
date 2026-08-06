@@ -114,6 +114,22 @@ pub const CLAUDE_BASH_TOOL_SHAPE: ShellToolShape = ShellToolShape {
     ],
 };
 
+/// Every shell-tool argv shape this project has actually **measured**, and
+/// nothing else (PRD #386 M3, Open Question 2).
+///
+/// This is the catalog the daemon's poll loop hands to
+/// [`crate::agent_pty::AgentPtyRegistry::shell_foreground_busy_snapshot`], which
+/// selects from it **per pane** by agent kind. An agent whose shell-tool shape
+/// has never been measured must select nothing from it and fall back to the
+/// structural test alone — handing it a fingerprint measured against a
+/// *different* product would let the cross-check veto a genuinely detached
+/// descendant, and the resulting false negative is silent (the PRD's "the
+/// failure mode to watch for is silence, not noise").
+///
+/// Adding an entry here is therefore a claim that the shape was measured
+/// against a live agent of that kind, not that it looks plausible.
+pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHAPE];
+
 /// Every transitive descendant of `root_pid` in `table`, each reported exactly
 /// once and never including `root_pid` itself.
 ///
