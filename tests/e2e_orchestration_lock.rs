@@ -55,10 +55,11 @@ fn focus_worker_role(deck: &TuiDeck) {
 
 /// Scenario: Open a real orchestration tab (default LOCKED) and confirm the
 /// focused orchestrator pane's own input is never gated, while a keystroke
-/// aimed at the non-orchestrator "worker" role does not reach its PTY. Send
-/// `Ctrl+e` to unlock and confirm a keystroke into the still-focused worker
-/// pane now forwards and echoes. RED today: there is no lock at all, so the
-/// locked-state negative assertion fails.
+/// aimed at the non-orchestrator "worker" role does not reach its PTY. Enter
+/// command mode (`Ctrl+d`) and send `Ctrl+e` to unlock — post-M1 the chord
+/// only resolves in command mode — then `Ctrl+d` back into `PaneInput` and
+/// confirm a keystroke into the still-focused worker pane now forwards and
+/// echoes.
 #[spec("orchestration/lock/004")]
 #[test]
 fn orchestration_lock_004_forwarding_gated_by_lock_state() {
@@ -96,8 +97,12 @@ fn orchestration_lock_004_forwarding_gated_by_lock_state() {
         deck.snapshot_grid()
     );
 
-    // Ctrl+e unlocks the tab.
-    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05
+    // Ctrl+e only resolves in command mode (M1): Ctrl+d into command mode,
+    // Ctrl+e to unlock, then Ctrl+d back into PaneInput so the sentinel
+    // below actually reaches the worker pane's PTY.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05 -> unlock
+    deck.send_bytes(b"\x04"); // Ctrl+d -> back to PaneInput
 
     // Unlocked: typing into the still-focused worker pane must now forward
     // normally.
@@ -171,10 +176,11 @@ fn worker_agent_id(socket: &std::path::Path) -> String {
 /// Scenario: Open a real orchestration tab (`cat` orchestrator, a REAL
 /// interactive Claude Haiku worker) locked by default, focus the worker, and
 /// type a create-sentinel-file directive — confirm the file is never created
-/// since the keystrokes never reach the agent. Send `Ctrl+e` to unlock and
-/// type a second directive with a different sentinel — confirm the real
-/// agent now receives it and creates that file, proving the lock gates a
-/// genuine agent's input, not just a `cat` stub's echo.
+/// since the keystrokes never reach the agent. Enter command mode (`Ctrl+d`)
+/// and send `Ctrl+e` to unlock, `Ctrl+d` back into `PaneInput`, then type a
+/// second directive with a different sentinel — confirm the real agent now
+/// receives it and creates that file, proving the lock gates a genuine
+/// agent's input, not just a `cat` stub's echo.
 #[spec("orchestration/lock/006")]
 #[test]
 fn orchestration_lock_006_real_agent_gated_by_lock_state() {
@@ -228,8 +234,12 @@ fn orchestration_lock_006_real_agent_gated_by_lock_state() {
         tail(&common::pane_search_key_on(&socket, &worker_id)),
     );
 
-    // Ctrl+e unlocks the tab.
-    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05
+    // Ctrl+e only resolves in command mode (M1): Ctrl+d into command mode,
+    // Ctrl+e to unlock, then Ctrl+d back into PaneInput so the directive
+    // below actually reaches the worker pane's PTY.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05 -> unlock
+    deck.send_bytes(b"\x04"); // Ctrl+d -> back to PaneInput
 
     // Unlocked: the same kind of directive into the still-focused worker
     // pane now forwards, and the real agent genuinely acts on it.
