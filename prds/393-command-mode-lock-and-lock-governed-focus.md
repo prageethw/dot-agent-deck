@@ -194,7 +194,24 @@ The answer this design already has, which should be stated plainly rather than d
 
 **4 — Fork-first was explicitly blessed, and the precondition is usage evidence, not a better PR.** *"No objection at all to the lock living in your fork in the meantime — if it turns out to earn its keystroke there, that's the best possible evidence for bringing it upstream."* So M7's gate is not "write a more persuasive description" — it is **having actually lived with this for a while and being able to report what happened.** Submitting before that evidence exists spends the invitation for nothing.
 
-**Immediate next step for the upstream track, and it is not code.** #369 ends with three questions addressed to the reporter, still unanswered: (1) what did the confusion actually look like — was it a directly-tasked worker still calling `work-done`, so the orchestrator re-planned on work it never delegated, or something else; (2) was it ever *accidental*, or always deliberate; (3) does the idle/not-delivered reporting change the calculus in practice. **Answering those honestly is the real unblock for M7**, and question (2) in particular decides whether the compelling framing is even available. These are the user's own experiences to report and must not be answered on their behalf.
+**The three questions have now been answered on #369, and the key one lands in this PRD's favour.** vfarcic asked (1) what the confusion actually looked like, (2) whether it was ever *accidental*, and (3) whether idle/not-delivered reporting changes the calculus. The reporter's answers:
+
+1. *"It was mostly orchestrator and workers contradicting each other and becoming a deadlock situation. I quickly figured out I should not be interfering with it, but until I got familiar with it, it was hard, and I still sometimes try to answer workers directly, not answering the orchestrator."*
+2. *"Most accidental, yes, we should allow people to intentionally intervene when required."*
+3. *"Sometimes, but mostly agents asking me what's next step with the prompt filled in; it is tempting to answer it at that time."*
+
+**Answer 2 is the one that matters, and it unblocks the framing.** vfarcic said the accidental case is the version he would find compelling; the reporter says it is *mostly* the accidental case. The compelling framing is therefore available, and it is the truthful one — M7 should lead with it. Answer 2 also endorses the exact shape this PRD builds rather than a hard prohibition: *"we should allow people to intentionally intervene when required"* is precisely a locked default with a deliberate unlock, and it is a direct answer to the fail-safe objection in the reporter's own words.
+
+Answer 1 adds a failure mode worth carrying upstream: the observed harm was **orchestrator and worker contradicting each other into deadlock**, not merely a stale plan. It also names an onboarding cost — the behaviour had to be learned the hard way, and is still occasionally violated by someone who now knows better. That is a strong argument for a default rather than documentation, and it is exactly the "don't do that" counter-argument's weak point: a rule you must remember is not a rule new users get for free.
+
+### Answer 3 is evidence against decision 4, and is recorded rather than buried
+
+Answer 3 says the dominant real-world temptation is *"agents asking me what's next step with the prompt filled in; it is tempting to answer it at that time."* An agent asking what to do next, with a prompt rendered and waiting, is **exactly a pane reporting `WaitingForInput`** — which decision 4 deliberately leaves ungated. So the single situation the reporter most often wants protection from is the one situation the carve-out reopens.
+
+This does not reverse decision 4 — the user resolved that question explicitly after the tension was raised, on the reading that a solicited answer is not an interruption, and that resolution stands. But the evidence arrived afterwards and points the other way, so it is recorded here rather than left to be rediscovered. Two consequences worth acting on:
+
+- **This is the thing to watch during the fork-usage period that gates M7.** The concrete question is whether, in practice, the carve-out reintroduces the "answered the worker instead of the orchestrator" mistake. If it does, decision 4 is the first thing to revisit, and Open Question 5's visual cue becomes considerably more attractive as a middle path — a pane that is *temporarily* typeable looking different from a locked one would restore the pause without restoring the block.
+- **M7 must not claim the carve-out is unambiguously an improvement.** The honest upstream framing is that it trades a small hole for the fail-safe objection's answer, with the trade-off named.
 
 Sequencing note: such a PR would sit on top of `scope_split_stage`, which upstream does not have either (#387 is fork-only; #342, its ancestor, is still unmerged). So an upstream submission would need to either carry its own scoping helper or wait on #342. **That dependency is the reason M7 is optional and non-blocking — the fork work must not wait on it.**
 
