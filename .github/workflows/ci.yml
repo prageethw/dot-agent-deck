@@ -315,7 +315,75 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --features e2e
+      # Issue #33: this job was failing on most runs, with a DIFFERENT random
+      # subset of tests each time — including on a PR that changed only prose.
+      # The failures are all the L2 harness's fixed wall-clock deadlines firing
+      # ("did not see ... within 10s") while four PTY tests, each of them several
+      # processes, compete for a 4-vCPU runner. `.config/nextest.toml` now caps
+      # concurrent PTY tests at 2, which reduces how often that happens;
+      # `--retries 2` absorbs what is left.
+      #
+      # `--retries` is set HERE, on this one command, and deliberately NOT in
+      # `.config/nextest.toml`: the fast tier (`test:` above) and every local run
+      # keep the profile's `retries = 0`, so a flake there still fails loudly.
+      #
+      # This does NOT hide regressions. A test that fails for a real reason fails
+      # all three attempts and the job stays red with a normal `FAIL`. A test that
+      # passes on retry is reported as FLAKY, not as a plain pass: the log keeps
+      # its `TRY 1 FAIL` line, the `Summary` line counts it, and the step below
+      # lifts the names onto the run page so nobody has to open the log to see
+      # them. A test that shows up in that table run after run is a test that is
+      # always retrying — treat it as broken and file it.
+      - run: cargo nextest run --features e2e --retries 2
+      # `if: always()` because the step above exits non-zero on a real failure and
+      # that is exactly when this summary is worth having. (Job-level
+      # `continue-on-error` keeps the WORKFLOW green; it does not keep later steps
+      # running.)
+      - name: Publish flaky and failed e2e tests to the run summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          import xml.etree.ElementTree as ET
+
+          REPORT = "target/nextest/default/junit.xml"
+          print("## e2e tier (informational)\n")
+          if not os.path.exists(REPORT):
+              print(f"No JUnit report at `{REPORT}` — the run never got as far as "
+                    "executing tests. Read the step log.")
+              raise SystemExit(0)
+
+          root = ET.parse(REPORT).getroot()
+          flaky, failed = [], []
+          for suite in root.iter("testsuite"):
+              for case in suite.iter("testcase"):
+                  name = f'{suite.get("name")}::{case.get("name")}'
+                  hard = case.findall("failure") + case.findall("error")
+                  reruns = case.findall("flakyFailure") + case.findall("flakyError")
+                  retried = case.findall("rerunFailure") + case.findall("rerunError")
+                  if hard:
+                      failed.append((name, 1 + len(retried)))
+                  elif reruns:
+                      flaky.append((name, 1 + len(reruns)))
+
+          if failed:
+              print("### Failed on every attempt\n")
+              print("These are not contention. Read them.\n")
+              print("| test | attempts |\n| --- | --- |")
+              for name, attempts in sorted(failed):
+                  print(f"| `{name}` | {attempts} |")
+              print()
+          if flaky:
+              print("### Passed only on retry\n")
+              print("Contention, most likely. A name that appears here run after "
+                    "run is not a blip — file it.\n")
+              print("| test | attempts |\n| --- | --- |")
+              for name, attempts in sorted(flaky):
+                  print(f"| `{name}` | {attempts} |")
+              print()
+          if not failed and not flaky:
+              print("Every test passed on its first attempt.")
+          PY
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
