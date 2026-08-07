@@ -120,6 +120,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `7fb79f6` | `ci: harden docs-publish shell-injection sites, drop secrets: inherit (fork #87) (#97)` | **UPSTREAM-WORTHY** — hardens `docs-publish.yml`/`release.yml`, both upstream's own files (hardcoded `ghcr.io/vfarcic/…` tags, `docs:` job gated to `github.repository == 'vfarcic/dot-agent-deck'`); the shell-injection pattern it fixes exists identically upstream |
 | `d4d0fe4` | `test(scheduler): settle the side pane before sampling in manager_016 (fork #81) (#96)` | **UPSTREAM-WORTHY** — generic e2e timing determinism plus a reusable test helper, no fork-specific content |
 | `26d2a75` | `docs(fork-sync): de-stale the upstream-candidates list and drop the brittle row count (#100)` | **PERMANENT** fork-only (doc) |
+| `b907479` | `docs(fork-sync): carry PR #95's 65e46b2 row curation, resolve the duplicate (fork #95)` | **PERMANENT** fork-only (doc) — resolves the `65e46b2` row collision and carries the drift-tracking paragraph from `main` |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
