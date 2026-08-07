@@ -8,7 +8,7 @@ This page covers two different things, and it is worth keeping them apart while 
 
 The first is a **product feature**: the daemon watches every outstanding delegation and, past a timeout, tells the orchestrator that a worker has gone silent. That is all it does. It is an agnostic event — the daemon *reports*, it never notifies anyone, and what happens next is entirely up to the orchestrator's own instructions.
 
-The second is an **example recipe**: how one project (this one) wires its orchestrator's prompt so that those moments — plus the handful of other times a run stops and waits for a human — arrive on the maintainer's phone. Telegram is the worked example, but the channel is yours to pick, and none of it is built into the deck.
+The second is an **example recipe**: a worked example of how you would wire an orchestrator's prompt so that those moments — plus the handful of other times a run stops and waits for a human — arrive on your phone. It is written up here as something to adopt and adapt, not as a description of how this repository is configured — the deck itself ships no notification wiring at all. Telegram is the worked example, but the channel is yours to pick, and none of it is built into the deck.
 
 If you take one thing from this page, take the split: **the deck produces the signal an agent structurally cannot produce about itself; your agent decides what the signal means.**
 
@@ -149,7 +149,7 @@ That switch is independent of the idle-worker detector in both directions: turni
 
 ## Part 2 — An example recipe: turning those moments into messages
 
-> **This part is an example, not a shipped feature.** Nothing here is built into the deck — it is prompt text and MCP configuration in one project's repository, reproduced because it works for us. The idle-worker detector above is tested and behaves as documented; this recipe has not yet been exercised across enough real runs to make promises about, and the [compaction caveat](#what-survives-a-compaction-and-what-does-not) below is a known weakness rather than a solved problem. Treat it as a starting point to adapt, and expect to tune the moments to your own workflow.
+> **This part is an example, not a shipped feature, and not this repository's setup.** Nothing here is built into the deck — it is prompt text and MCP configuration that would live in *your* repository, written up from a setup that was wired for a while and has since been removed from this one. This repository declares no messaging MCP server and carries no notification instructions in its role prompts, so nothing below can be read as "what the deck does". The idle-worker detector above is tested and behaves as documented; this recipe was never exercised across enough real runs to make promises about, and the [compaction caveat](#what-survives-a-compaction-and-what-does-not) below is a known weakness rather than a solved problem. Treat it as a starting point to adapt, and expect to tune the moments to your own workflow.
 
 ### The channel is your choice
 
@@ -167,7 +167,7 @@ There is a practical bonus. Because only the orchestrator sends, only the orches
 
 ### The four moments
 
-Notify when the run stops needing a computer and starts needing you. In this project's workflow that is exactly four moments, and per-step chatter is deliberately absent — a message for every delegation would train you to ignore all of them.
+Notify when the run stops needing a computer and starts needing you. In the workflow this example came from that was exactly four moments, and per-step chatter is deliberately absent — a message for every delegation would train you to ignore all of them.
 
 | Moment | Example message |
 |---|---|
@@ -180,7 +180,7 @@ Notify when the run stops needing a computer and starts needing you. In this pro
 
 The obvious rule is "notify at every pause for a human", and it is the wrong one. The criterion that holds up is **every pause where the human may have walked away.** A gate that fires seconds into a run, while you are still sitting there watching it start, earns nothing — you will have answered it before your phone finishes buzzing, and the message only teaches you that this channel carries things you do not need. A gate that arrives after a long unattended stretch earns a lot, because it is the only thing standing between "waiting on you" and "waiting on you for three hours".
 
-This workflow used to have a fifth moment, and dropping it is the clearest illustration of that rule: an approval gate that fired a few seconds into the run, on a plan the operator was still watching get written. It was removed for being noise, not for being unimportant.
+That workflow used to have a fifth moment, and dropping it is the clearest illustration of that rule: an approval gate that fired a few seconds into the run, on a plan the operator was still watching get written. It was removed for being noise, not for being unimportant.
 
 The honest cost of that removal: if you *do* walk away immediately after starting a run, a plan waiting for approval now has no out-of-band signal at all — and idle-worker detection cannot cover the gap either, because nothing has been delegated yet at that point, so there is no outstanding delegation to time out. The run simply sits at the start until you come back to the terminal. Nothing is lost, but nothing tells you.
 
@@ -200,7 +200,7 @@ The inverse is a trap that looks reasonable: an agent that verifies delivery, or
 
 ### Wiring the MCP server
 
-Say the channel is a Telegram bot exposed through an MCP server. For a client that reads `.mcp.json` natively — Claude Code does — the declaration is:
+Say the channel is a Telegram bot exposed through an MCP server. For a client that reads `.mcp.json` natively — Claude Code does — the declaration you would add to *your* `.mcp.json` is:
 
 ```json
 {
@@ -220,7 +220,7 @@ Say the channel is a Telegram bot exposed through an MCP server. For a client th
 
 This is the strongest practical argument for the orchestrator-only design above. With one notifier, you wire **one** agent's MCP configuration and the other roles' divergent config formats simply stop being your problem.
 
-One more naming trap: **the tool name depends on the client**. Reached through `pi-mcp-adapter` the tool is exposed server-prefixed as `telegram_send_message`; a client that discovers the server natively lists it unprefixed. A live send in this project failed on exactly that mismatch. So write your prompt to describe the tool by role — "the Telegram MCP's send-message tool" — and tell the agent to use whatever name its own client reports, rather than hard-coding `send_message` and hoping.
+One more naming trap: **the tool name depends on the client**. Reached through `pi-mcp-adapter` the tool is exposed server-prefixed as `telegram_send_message`; a client that discovers the server natively lists it unprefixed. A live send in this project once failed on exactly that mismatch, back when the recipe was wired here. So write your prompt to describe the tool by role — "the Telegram MCP's send-message tool" — and tell the agent to use whatever name its own client reports, rather than hard-coding `send_message` and hoping.
 
 ### Security requirements
 
