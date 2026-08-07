@@ -24,6 +24,7 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
@@ -390,6 +391,158 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
          the non-orchestrator worker pane never reached its PTY — expected \
          the command-mode Ctrl+e to have toggled the command-entry lock \
          from its default LOCKED state to unlocked.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Inject a synthetic `AgentEvent` for `pane_id` over the deck's hook socket
+/// — the SAME bare-`AgentEvent`, no-`DaemonMessage`-envelope wire the real
+/// `dot-agent-deck agent-event --type running|waiting|finished` CLI already
+/// rides for Pi's status reporting (`src/main.rs`'s `AgentEvent` command,
+/// `src/daemon.rs::run_hook_loop`'s `serde_json::from_str::<AgentEvent>`
+/// fallback). Stands in for a real extension's status report against a
+/// `cat`-stub role pane, which sends no hooks of its own. Blocks on `sub`
+/// (a subscription opened BEFORE this call) observing the daemon's
+/// broadcast of this exact event, so the caller knows the daemon side has
+/// processed it before proceeding — the client (this attached deck) reads
+/// the identical broadcast fan-out at essentially the same instant, though
+/// its own apply-and-redraw is a further async step the caller must still
+/// account for (see `TuiDeck::send_keys_until_grid_string_within`).
+#[cfg(unix)]
+fn inject_worker_status(
+    deck: &TuiDeck,
+    sub: &common::EventSub,
+    pane_id: &str,
+    session_id: &str,
+    event_type: EventType,
+) {
+    let event = AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::Pi,
+        event_type: event_type.clone(),
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
+    common::write_hook_line(deck.hook_socket_path(), &line)
+        .expect("inject synthetic AgentEvent over hook socket");
+    sub.wait_for(
+        move |e| e.pane_id.as_deref() == Some(pane_id) && e.event_type == event_type,
+        Duration::from_secs(10),
+    );
+}
+
+/// Scenario: PRD #393 M3 (decision 4), the real-PTY proof — deliberately
+/// NOT a real-agent test. The PRD's test plan calls this "the strongest
+/// candidate for a real-agent (Haiku) test", but a real worker self-skips
+/// in CI for missing credentials (see `orchestration/lock/006`, which
+/// "passes" in ~0.1s having executed nothing there) — that would give ZERO
+/// automated coverage of M3's headline behavior on this fork's CI, which is
+/// worse than a stand-in that actually runs. Open a real `orch-deck`
+/// orchestration (LOCKED, the default), focus the non-orchestrator "worker"
+/// role, and confirm a keystroke is dropped as usual (the ordinary
+/// `orchestration/lock/004` baseline). Inject a synthetic `AgentEvent`
+/// reporting the worker's pane `WaitingForInput` over the hook socket — the
+/// same wire the real `agent-event` CLI rides — and confirm the SAME kind
+/// of keystroke now reaches the worker's PTY and echoes on the grid.
+/// Inject `Thinking` (status clears, as if the agent resumed after being
+/// answered), re-focus the worker explicitly (isolating this from PRD
+/// #373/#393 M4's SEPARATE all-clear auto-focus, already covered by
+/// `tabs/orchestration/025`), and confirm a further keystroke is dropped
+/// again — the gate re-engages the instant the carve-out's condition stops
+/// holding.
+#[spec("orchestration/lock/010")]
+#[test]
+fn orchestration_lock_010_waiting_carve_out_on_real_panes() {
+    const WORKER_LOCKED_SENTINEL: &str = "LOCK010_LOCKED_4b7e";
+    const WORKER_WAITING_SENTINEL: &str = "LOCK010_WAITING_9c2f";
+    const WORKER_RELOCKED_SENTINEL: &str = "LOCK010_RELOCKED_e814";
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    let sub = deck.subscribe_events();
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
+
+    let socket = deck.attach_socket_path().to_path_buf();
+    let worker_id = worker_agent_id(&socket);
+    let session_id = format!("{worker_id}-lock010-session");
+
+    // Focus the non-orchestrator "worker" role. The tab is still locked —
+    // nothing has toggled it yet.
+    focus_worker_role(&deck);
+
+    // Baseline: locked, no status ever reported for the worker's pane —
+    // dropped, the ordinary orchestration/lock/004 behavior.
+    deck.send_keys(format!("{WORKER_LOCKED_SENTINEL}\r").as_bytes());
+    let leaked = deck.wait_for_grid_string_within(WORKER_LOCKED_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "a keystroke into the locked worker pane reached its PTY before any \
+         WaitingForInput status was ever reported for it — expected the \
+         ordinary orchestration/lock/004 baseline (dropped).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The worker reports WaitingForInput.
+    inject_worker_status(
+        &deck,
+        &sub,
+        &worker_id,
+        &session_id,
+        EventType::WaitingForInput,
+    );
+
+    // Locked but WaitingForInput: the carve-out opens, and the keystroke
+    // must reach the PTY and echo. `send_keys_until_grid_string_within`
+    // retries the SEND (Decision 21's helper, not a bare sleep) because the
+    // status just arrived over an async daemon round-trip with no
+    // in-process signal this test can await instead of the grid itself —
+    // issue #395's exact race, guarded against rather than reproduced.
+    assert!(
+        deck.send_keys_until_grid_string_within(
+            format!("{WORKER_WAITING_SENTINEL}\r").as_bytes(),
+            WORKER_WAITING_SENTINEL,
+            Duration::from_secs(10),
+        ),
+        "a keystroke into the worker pane never reached its PTY after it \
+         reported WaitingForInput while the orchestration tab's \
+         command-entry lock was engaged — expected PRD #393 decision 4's \
+         carve-out to pass it through.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The status clears (the agent resumes, as if it just got answered) —
+    // the gate must re-engage instantly.
+    inject_worker_status(&deck, &sub, &worker_id, &session_id, EventType::Thinking);
+
+    // Re-focus explicitly: this isolates the LOCK's own re-engagement from
+    // PRD #373/#393 M4's SEPARATE all-clear auto-focus, which may have
+    // already steered focus back to the orchestrator once nothing was left
+    // waiting (already covered by `tabs/orchestration/025`) — this test
+    // must not ride that as an accidental proxy for the lock re-engaging.
+    focus_worker_role(&deck);
+    deck.send_keys(format!("{WORKER_RELOCKED_SENTINEL}\r").as_bytes());
+    let leaked = deck.wait_for_grid_string_within(WORKER_RELOCKED_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "a keystroke into the worker pane reached its PTY after its status \
+         cleared from WaitingForInput back to Thinking — expected the \
+         command-entry lock to re-engage the instant the carve-out's \
+         condition stopped holding.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }

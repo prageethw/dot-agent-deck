@@ -25204,6 +25204,176 @@ mod tests {
         }
     }
 
+    /// Scenario: PRD #393 M3 decision 4 — while a locked non-orchestrator
+    /// pane's live status is `WaitingForInput`, `gate_pane_input_key` must
+    /// pass an `Action::ForwardToPane` through UNCHANGED instead of
+    /// dropping it: the agent has stopped and asked, so a keystroke
+    /// answering it is a response to a request, not an unsolicited
+    /// intrusion into state the orchestrator believes it owns (see the PRD's
+    /// "Why the lock exists at all"). Spawn a real two-role orchestration
+    /// (deck LOCKED, the default) with a focus-echoing pane controller so
+    /// `pane.focused_pane_id()` genuinely reports whichever pane was last
+    /// focused, then walk both edges on the SAME worker pane: no recorded
+    /// status (today's `orchestration/lock/004` baseline: dropped) ->
+    /// `WaitingForInput` (carve-out opens: passes through unchanged) ->
+    /// `Working` (carve-out closes: dropped again, proving the hole doesn't
+    /// outlive the status that opened it). Also pins that the orchestrator
+    /// pane's own input stays unaffected by ANY status on ITS pane, and that
+    /// an unlocked deck ignores `WaitingForInput` entirely (there is nothing
+    /// for M3 to carve a hole out of). RED today: `gate_pane_input_key`
+    /// takes no `pane_status` parameter, so passing one here fails to
+    /// compile.
+    #[spec("orchestration/lock/009")]
+    #[test]
+    fn orchestration_lock_009_waiting_for_input_carve_out() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "lock-waiting".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config("lock-waiting")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        // Focus the worker explicitly rather than relying on incidental
+        // mock behavior — `FocusEchoPC` genuinely echoes it back.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "baseline: a locked worker pane with no recorded status must \
+             still be gated (orchestration/lock/004's behavior), got {gated:?}"
+        );
+
+        let mut waiting_status: HashMap<&str, SessionStatus> = HashMap::new();
+        waiting_status.insert(worker_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a locked worker pane reporting WaitingForInput must pass a \
+                 keystroke through UNCHANGED — the agent stopped and asked, \
+                 so answering it is a response, not an intrusion (PRD #393 \
+                 decision 4)"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged while the \
+                 focused pane is WaitingForInput, got {other:?}"
+            ),
+        }
+
+        // Re-engage: the SAME pane, now Working — the carve-out must not
+        // outlive the status that opened it.
+        let mut working_status: HashMap<&str, SessionStatus> = HashMap::new();
+        working_status.insert(worker_id.as_str(), SessionStatus::Working);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &working_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "the gate must RE-ENGAGE the instant the worker's status clears \
+             from WaitingForInput — got {gated:?} while status was Working"
+        );
+
+        // The orchestrator pane's own input is unaffected either way — never
+        // gated, waiting or not. `orchestration/lock/004` already covers
+        // this with no status map at all; repeated here WITH one attached
+        // (the closest status the carve-out reasons about) to prove the
+        // never-gated rule doesn't get reordered behind the new check.
+        pc.focus_pane(&orchestrator_id)
+            .expect("focus orchestrator pane");
+        let mut orch_waiting: HashMap<&str, SessionStatus> = HashMap::new();
+        orch_waiting.insert(orchestrator_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &orch_waiting,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "the orchestrator pane's own input must never be gated, \
+             regardless of its status, got {gated:?}"
+        );
+
+        // Unlocked deck: WaitingForInput is irrelevant when the lock itself
+        // is off — there is nothing for M3 to carve a hole out of. Dashboard
+        // and Mode tabs staying ungated regardless of lock state is
+        // `orchestration/lock/011`'s job, not duplicated here.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+        ui.command_entry_locked = false;
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "an unlocked deck must pass ForwardToPane through regardless of \
+             WaitingForInput, got {gated:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Bell transition detection tests
     // -----------------------------------------------------------------------

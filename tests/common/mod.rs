@@ -1022,6 +1022,38 @@ impl TuiDeck {
         }
     }
 
+    /// Decision 21: the retry (not just the wait) lives here, not in the
+    /// test body. For a keystroke gated on a status update delivered over a
+    /// SEPARATE async daemon round-trip (a hook-socket injection broadcast
+    /// back to this attached client) there is no in-process signal a test
+    /// can await instead — unlike an in-process state flip (e.g. toggling
+    /// the command-entry lock via `Ctrl+e`, which is synchronous), the
+    /// client may not yet have applied the broadcast the instant after it
+    /// was sent. Repeatedly (re-)sends `bytes` until `needle` lands on the
+    /// rendered grid or `timeout` elapses, so a keystroke sent slightly too
+    /// early is simply retried rather than lost — the same issue #395
+    /// "wait for the needle, don't just snapshot" principle applied to the
+    /// SEND side rather than the read side. Safe to retry against a `cat`
+    /// stub, which just re-echoes; not appropriate where a duplicate
+    /// keystroke would have a side effect.
+    pub fn send_keys_until_grid_string_within(
+        &self,
+        bytes: &[u8],
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send_keys(bytes);
+            if self.wait_for_grid_string_within(needle, Duration::from_millis(300)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
     /// Like [`wait_for_grid_string_within`](Self::wait_for_grid_string_within)
     /// but for a predicate over the whole rendered grid — for the cases a single
     /// substring cannot express (a spatial relationship between two strings, a
