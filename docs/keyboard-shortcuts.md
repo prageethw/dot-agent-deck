@@ -20,7 +20,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
-| `Ctrl+L` | Cycle the sidebar/pane-column split: Default → Narrow (25/75) → Hidden (sidebar gone, pane column full-width) → Default. Scoped per tab — cycling one tab never moves another, including another tab of the same type | **Dashboard and Orchestration tabs** |
+| `Ctrl+L` | Cycle the sidebar/pane-column split: Default → Narrow (25/75) → Hidden (sidebar gone, pane column full-width) → Default. One stage for the whole deck — cycling on any tab moves every other tab too, and a tab you open afterwards adopts the current stage | **Command mode only**, on **Dashboard and Orchestration tabs** |
 | `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame, and the card sidebar and the other panes are not drawn. Press it again to restore the view you had. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 | `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, and only while the `experimental` flag is on |
@@ -34,6 +34,12 @@ Three other things follow the mode:
 - **The cursor.** The focused pane shows a cursor only while you are typing into it. A cursor means, without exception, that what you type lands in that pane.
 - **The focused pane dims, with a banner.** Entering command mode dims the focused pane's content — still perfectly readable, just visibly inert — and overlays a `COMMAND MODE — Ctrl+D to type` banner. The banner clears itself after a moment, or immediately when you press a command-mode key or click a bottom-bar button; a key that isn't bound to anything keeps it up, because that is the moment you most likely thought you were talking to the agent. The dimming stays for as long as you are in command mode.
 - **The selected dashboard card.** It keeps its `▸ ` marker in both modes so you never lose track of the selection, but its highlight is de-emphasised while you are typing in a pane — the deck looks inert exactly when the pane looks live.
+
+### `Ctrl+L` cycles one split for the whole deck, from command mode
+
+`Ctrl+L` is clear-screen in shells, readline, and every agent you run in a pane — Claude Code included. So while you are typing in a pane, `Ctrl+L` is sent straight through to that program as `^L` (byte `0x0c`) and clears its screen; it does not move the split. Press `Ctrl+D` first, and `Ctrl+L` there cycles the split. It is the same trade `Ctrl+W` makes below: one extra keystroke when you meant the deck, in exchange for the chord always reaching the program you are typing into.
+
+The stage is a single deck-wide value, not one per tab. Cycling it on any Dashboard or Orchestration tab moves every other tab as well, and a tab you open afterwards starts at whatever stage is current. What a stage resolves to still depends on the tab type: `Default` is 33/67 on the Dashboard and 34/66 in an Orchestration tab, while `Narrow` (25/75) and `Hidden` look the same everywhere. Mode tabs have no sidebar split, so `Ctrl+L` never cycles anything from one and reaches the pane as ordinary input. The stage resets to `Default` on the next launch rather than persisting.
 
 ### `Ctrl+W` closes only from command mode
 
@@ -230,7 +236,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag; without it the chord is never claimed.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
-| `toggle_orchestration_split` | `Ctrl+l` | Cycle the active tab's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**; scoped per tab, no effect elsewhere |
+| `toggle_orchestration_split` | `Ctrl+l` | Cycle the deck's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**, **command mode only**; one stage shared by every tab, and in a pane the chord is ordinary input (clear-screen) for whatever is running there |
 | `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame, hiding the card sidebar and the other panes; press again to restore. Per-tab, and never saved. **Dashboard and orchestration tabs, command mode only**; in a pane it is still job control for your agent, and in the filter/rename rows and on a Mode tab it is ordinary input |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 

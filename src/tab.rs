@@ -73,6 +73,10 @@ pub enum OrchestrationRoleStatus {
 /// Dashboard tabs. `Default` is each tab type's own fixed ratio
 /// (Orchestration 34/66, Dashboard 33/67); `Narrow` (25/75) and `Hidden`
 /// (0/100, sidebar collapsed) are the same fixed ratios on either tab type.
+///
+/// PRD #387 M2 (decision 2): the *stage* is deck-global — it lives once on
+/// `UiState::split_stage`, not per-tab — while the ratios it resolves to
+/// stay per-tab-type, which is why `Default` still diverges 34/66 vs 33/67.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitStage {
     Default,
@@ -110,12 +114,6 @@ pub enum Tab {
         /// the Dashboard does not silently zoom an orchestration tab you were
         /// supervising, or the reverse.
         zoomed: bool,
-        /// PRD #361 Item 4: this tab's sidebar/pane-column split stage.
-        /// `Default` = the fixed 33/67 ratio. Per-tab so toggling one
-        /// Dashboard tab doesn't affect another (there is normally only
-        /// one Dashboard tab, but the field mirrors Orchestration's
-        /// per-tab isolation for consistency).
-        split_stage: SplitStage,
     },
     Mode {
         id: TabId,
@@ -176,30 +174,26 @@ pub enum Tab {
         /// whole frame, with the sidebar and the non-focused panes not drawn.
         /// `false` = the normal supervisory view.
         ///
-        /// Unlike [`Self::Orchestration::split_stage`] this is **per-tab and
-        /// is itself the source of truth** — there is deliberately no
-        /// `TabManager`-level global mirroring it. tmux zooms a *window*, not a
-        /// session, and the two states answer different questions: the split is
-        /// a standing reading preference, while zoom says "I have stopped
-        /// supervising and am working in *this* agent". A tab the user never
-        /// zoomed must not silently lose its sidebar, which a global would do.
+        /// This is **per-tab and is itself the source of truth** — there is
+        /// deliberately no `TabManager`-level global mirroring it. tmux zooms
+        /// a *window*, not a session, and the two states answer different
+        /// questions: the split is a standing reading preference, while zoom
+        /// says "I have stopped supervising and am working in *this* agent".
+        /// A tab the user never zoomed must not silently lose its sidebar,
+        /// which a global would do.
         ///
         /// Ephemeral in the same way, and more so: not persisted across
         /// launches *and* not written to the saved session, so a detach/reattach
         /// always returns the full supervisory view. It is pure presentation —
         /// nothing about it reaches the daemon.
         zoomed: bool,
-        /// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: this
-        /// tab's sidebar/pane-column split stage. `Default` = the 34/66
-        /// ratio. Per-tab so toggling one orchestration tab doesn't affect
-        /// another.
-        split_stage: SplitStage,
         /// PRD #374 (#361 Item 3): whether direct keystroke entry to
         /// non-orchestrator role panes on this tab is locked. Starts
         /// `true` — only the orchestrator pane accepts direct input until
-        /// `Ctrl+e` unlocks it. Per-tab, following the `split_stage`
-        /// precedent: toggling one orchestration tab's lock never affects
-        /// another open orchestration tab.
+        /// `Ctrl+e` unlocks it. Per-tab: toggling one orchestration tab's
+        /// lock never affects another open orchestration tab. (It used to
+        /// cite `split_stage` as its precedent; PRD #387 M2 made that one
+        /// deck-global, so the lock is now the per-tab case on its own.)
         command_entry_locked: bool,
     },
 }
@@ -233,7 +227,6 @@ impl TabManager {
                 // PRD #313: a fresh deck is never zoomed; zoom is ephemeral and
                 // is not restored from a saved session.
                 zoomed: false,
-                split_stage: SplitStage::Default,
             }],
             active_index: 0,
             next_id: 1,
@@ -966,7 +959,6 @@ impl TabManager {
             // PRD #313: zoom is PER-TAB, so a newly opened tab always starts
             // unzoomed regardless of what any other tab is doing.
             zoomed: false,
-            split_stage: SplitStage::Default,
             command_entry_locked: true,
         });
 
@@ -1108,7 +1100,6 @@ impl TabManager {
             // PRD #313: zoom is ephemeral view state and is never persisted, so
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
-            split_stage: SplitStage::Default,
             command_entry_locked: true,
         });
 
@@ -1758,7 +1749,6 @@ mod tests {
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("s2".to_string()),
             zoomed: false,
-            split_stage: SplitStage::Default,
         };
         // No focused pane: index derives purely from the remembered id.
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
@@ -1807,7 +1797,6 @@ mod tests {
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("gone".to_string()),
             zoomed: false,
-            split_stage: SplitStage::Default,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1837,7 +1826,6 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
-            split_stage: SplitStage::Default,
             command_entry_locked: true,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
@@ -1871,7 +1859,6 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
-            split_stage: SplitStage::Default,
             command_entry_locked: true,
         };
         assert_eq!(
