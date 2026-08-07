@@ -1275,6 +1275,50 @@ mod tests {
         assert!(back.roles.is_empty());
     }
 
+    // Fork #93 review: the no-PROTOCOL_VERSION-bump decision for `unresolved`
+    // rests on wire-compat in both directions. Pin that by assertion instead
+    // of by inspection of the derive attributes alone.
+    #[test]
+    fn delegate_response_missing_unresolved_defaults_to_empty() {
+        // An older daemon's reply shape — no `unresolved` key at all.
+        let json = r#"{"ok":true,"roles":["coder"]}"#;
+        let back: DelegateResponse = serde_json::from_str(json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.roles, vec!["coder"]);
+        assert!(back.unresolved.is_empty());
+    }
+
+    #[test]
+    fn delegate_response_tolerates_unknown_field() {
+        // A newer daemon's reply shape read by an older client — no
+        // `deny_unknown_fields`, so an extra key must not fail to parse.
+        let json = r#"{"ok":true,"roles":["coder"],"some_future_field":"value"}"#;
+        let back: DelegateResponse = serde_json::from_str(json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.roles, vec!["coder"]);
+        assert!(back.unresolved.is_empty());
+    }
+
+    #[test]
+    fn delegate_response_omits_unresolved_when_empty() {
+        // Full resolution: `unresolved` is empty, so it must not appear in
+        // the serialized JSON — keeps the wire identical to the pre-#92 shape.
+        let ok = DelegateResponse::accepted(vec!["coder".into()]);
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(
+            !json.contains("unresolved"),
+            "expected no `unresolved` key in {json}"
+        );
+        // Partial resolution: `unresolved` is non-empty, so it must appear.
+        let partial =
+            DelegateResponse::accepted_partial(vec!["coder".into()], vec!["reviewer".into()]);
+        let json = serde_json::to_string(&partial).unwrap();
+        assert!(
+            json.contains("unresolved"),
+            "expected an `unresolved` key in {json}"
+        );
+    }
+
     #[test]
     fn work_done_signal_defaults() {
         let json = r#"{
