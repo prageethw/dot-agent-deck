@@ -106,15 +106,18 @@ fn nonblank_rows(buffer: &Buffer) -> usize {
 }
 
 fn selected_card_fixture() -> SessionState {
-    // `last_activity` is nudged 30s into the future of `now` (issue #350):
-    // `mode_deck_001_selected_card_styles` pins this fixture's rendered card
-    // into a color/style-aware snapshot, and the bottom border's `Last:` field
-    // is computed by `format_elapsed` (src/ui.rs) from `Utc::now()` at render
-    // time, not at fixture-build time. Seeding it to exactly `now` raced that
-    // computation across a whole second boundary under any scheduling delay.
-    // The forward nudge relies on `format_elapsed`'s existing clamp of a
-    // negative delta to zero (`delta.num_seconds().max(0)`), so the rendered
-    // value holds at `0s` for 30s. Committed snapshot is unchanged.
+    // `last_activity` is nudged 30s into the future of `now` rather than left
+    // equal to it (issue #15): `mode_deck_001_selected_card_accent_tracks_mode`
+    // pins this fixture's rendered card into a color/style-aware `insta`
+    // snapshot, and the bottom border's `Last:` field is computed from
+    // `Utc::now()` at render time (`format_elapsed`, src/ui.rs), not at
+    // fixture build time. Seeding `last_activity == now` raced that
+    // render-time computation across a whole second boundary under any
+    // scheduling delay. A *past* offset (e.g. `now - 500ms`) would only
+    // shrink the safety margin further; nudging forward instead relies on
+    // `format_elapsed`'s existing clamp of a negative elapsed delta to zero
+    // (`delta.num_seconds().max(0)`), so the render-time delta stays negative
+    // (clamped to `0s`) for any render happening within 30s of this instant.
     let now = chrono::Utc::now();
     SessionState {
         session_id: "mode-card".to_string(),
