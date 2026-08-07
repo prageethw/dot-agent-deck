@@ -632,6 +632,47 @@ impl TabManager {
         Some(orchestrator)
     }
 
+    /// The whole lock-governed focus decision for one frame, in the order
+    /// the render loop applies it: steer toward the lowest-order waiting
+    /// pane, and only when there is nothing left to steer toward, take the
+    /// latched all-clear move back to the orchestrator. Intended to be
+    /// called once per frame from `src/ui.rs`, immediately after the
+    /// unconditional `observe_waiting_panes` (which deliberately stays
+    /// OUTSIDE this method — PRD #373 M1 requires it on every locked
+    /// frame regardless of pending input).
+    ///
+    /// `input_pending` is the caller's single `crossterm::event::poll(0ms)`
+    /// peek for the frame, threaded in as a plain `bool` so this stays
+    /// pure and unit-testable. When it is true, BOTH branches are
+    /// deferred: a focus move applied while a keystroke is still queued
+    /// would be applied before the event loop drains that key, and the key
+    /// — aimed at the pane that was focused when it was typed — would then
+    /// be forwarded to the newly focused pane instead. The all-clear
+    /// branch has always been guarded this way; extending the same guard
+    /// to the waiting branch is the fix for the confirmed P1 on PRD #393's
+    /// focus chain (Greptile, upstream PR #404).
+    ///
+    /// The early return skips the calls entirely rather than making them
+    /// and discarding their results, and that distinction matters:
+    /// `auto_focus_waiting_pane` mutates `focused_role_pane_id` as a side
+    /// effect before returning `Some`, so calling it while deferring would
+    /// desync this `TabManager`'s bookkeeping from the pane controller's
+    /// real focus, and `auto_focus_all_clear` would consume its
+    /// `all_clear_pending` latch for a move that never happened. Not
+    /// calling them means the next frame recomputes cleanly — matching the
+    /// existing "no one-shot latch to consume" contract on the waiting
+    /// branch, and preserving the latch on the all-clear one. Deferral,
+    /// not loss, in both cases.
+    pub fn auto_focus_locked(
+        &mut self,
+        pane_status: &HashMap<&str, crate::state::SessionStatus>,
+        input_pending: bool,
+    ) -> Option<String> {
+        let _ = input_pending;
+        self.auto_focus_waiting_pane(pane_status)
+            .or_else(|| self.auto_focus_all_clear())
+    }
+
     pub fn show_tab_bar(&self) -> bool {
         self.tabs.len() > 1
     }
