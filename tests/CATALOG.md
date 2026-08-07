@@ -2304,6 +2304,13 @@ without depending on the config struct API.
 - **Does not assert:** the exact confirmation wording or format; the unresolved-role and self-target cases (`orchestration/delegate/022`/`023`).
 - **Platform coverage:** mac+linux.
 
+##### orchestration/delegate/025 — A partially-resolved delegate (`--to coder --to nonexistent-role`, one role resolves, the sibling does not) must exit successfully but name the unresolved role too, distinguishably from the one that armed, per the fork #92 partial-resolution decision (follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess, invoked with `--to coder --to nonexistent-role`, + an in-process daemon hook socket + real `handle_delegate` + a single `cat`-stub `coder` worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess targets `coder` (resolves to that pane) and a second role with no pane at all (does not)).
+- **Asserts:** the subprocess exits successfully (one pane really did arm, so failing the whole call would make a retry-on-non-zero orchestrator double-delegate the role that DID arm — upstream #330's harm); its combined stdout/stderr names both the armed role and the unresolved role; and the two are not folded into one undifferentiated comma-joined echo of the raw request, which is today's bug and would read exactly like both roles armed.
+- **Does not assert:** the exact confirmation wording, format, or which stream (stdout vs stderr) carries the unresolved role; the zero-resolution cases (`orchestration/delegate/022`/`023`); the duplicate-role case (`orchestration/delegate/024`).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/002 — The full lock-governed focus contract, end to end in a real Orchestration tab: LOCKED by default with focus on the orchestrator; a worker's `WaitingForInput` visibly pulls focus to itself and its resolution visibly returns focus to the orchestrator on the all-clear edge; `Ctrl+d` then `Ctrl+e` unlocks; a manual focus choice on a non-orchestrator role then sticks through both a fresh waiting episode and its all-clear, because unlocked runs no auto-focus branch at all (PRD #393 M5, the CLAUDE.md rule 4 headline test for this PRD). `orchestration_focus_001` — the PRD #373 M2 inactivity snap-back's PTY proof, and this catalog section's only entry before it — was deleted outright at PRD #393 M4 along with the production behavior it covered; `002` re-establishes the section covering the successor behavior M4/M4b/M5 actually shipped.
