@@ -53,6 +53,7 @@ pub mod project_config;
 // selected over the attach socket.
 pub mod project_resolve;
 pub mod prompt_delivery;
+pub mod reconnect;
 pub mod remote;
 pub mod remote_doctor;
 pub mod remote_tunnel;
