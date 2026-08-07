@@ -679,6 +679,43 @@ pub struct DelegateSignal {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Upstream #309/#330: the daemon's reply to a [`DaemonMessage::Delegate`],
+/// written as a single JSON line back on the hook-socket connection so the
+/// `delegate` CLI can tell a rejected delegation from a shipped one instead
+/// of exiting 0 either way. Rides the SAME unversioned hook socket as
+/// [`GetSeedResponse`] and for the identical reason: an OLD daemon that
+/// doesn't write this reply degrades to the pre-existing fire-and-forget
+/// behaviour rather than breaking, so this does NOT move the attach
+/// `PROTOCOL_VERSION` (see the rule-12 note in `docs/develop/versioning.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateResponse {
+    pub ok: bool,
+    /// Why the delegate was rejected — `None` when `ok` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The role(s) the delegate armed — empty when `ok` is false.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+}
+
+impl DelegateResponse {
+    pub fn accepted(roles: Vec<String>) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            roles,
+        }
+    }
+
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(reason.into()),
+            roles: Vec::new(),
+        }
+    }
+}
+
 /// Daemon → attached-TUI broadcast (PRD #76 M2.17). The daemon publishes
 /// one of these per ingested hook event; subscribers receive them as
 /// `KIND_EVENT` frames on the attach socket.
@@ -1191,6 +1228,27 @@ mod tests {
         assert_eq!(json, "{\"seed\":null}");
         let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
         assert!(back.seed.is_none());
+    }
+
+    #[test]
+    fn serialize_deserialize_delegate_response() {
+        // Accepted round-trips with the armed role(s) and no error…
+        let ok = DelegateResponse::accepted(vec!["coder".into()]);
+        let json = serde_json::to_string(&ok).unwrap();
+        let back: DelegateResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.roles, vec!["coder"]);
+        assert!(back.error.is_none());
+        // …rejected carries the reason and no roles.
+        let rejected = DelegateResponse::rejected("pane is not an orchestrator pane");
+        let json = serde_json::to_string(&rejected).unwrap();
+        let back: DelegateResponse = serde_json::from_str(&json).unwrap();
+        assert!(!back.ok);
+        assert_eq!(
+            back.error.as_deref(),
+            Some("pane is not an orchestrator pane")
+        );
+        assert!(back.roles.is_empty());
     }
 
     #[test]
