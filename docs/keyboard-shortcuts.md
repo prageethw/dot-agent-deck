@@ -19,7 +19,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+L` | Cycle the sidebar/pane-column split: Default → Narrow (25/75) → Hidden (sidebar gone, pane column full-width) → Default. One stage for the whole deck — cycling on any tab moves every other tab too, and a tab you open afterwards adopts the current stage | **Command mode only**, on **Dashboard and Orchestration tabs** |
-| `Ctrl+E` | Toggle command-entry lock — while locked, typing on any pane other than the orchestrator's does not reach that pane's PTY | **Orchestration tabs only** |
+| `Ctrl+E` | Toggle command-entry lock — while locked, typing on any pane other than the orchestrator's does not reach that pane's PTY, unless that pane is waiting for input. One lock for the whole deck — toggling it on any Orchestration tab changes every other one too, and a tab you open afterwards adopts the current value | **Command mode only**, on **Orchestration tabs only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 
 ### Which mode you're in
@@ -40,7 +40,15 @@ The stage is a single deck-wide value, not one per tab. Cycling it on any Dashbo
 
 ### `Ctrl+E` locks command entry to the orchestrator pane
 
-In an Orchestration tab, direct keystrokes are locked to the orchestrator pane by default — typing while focused on any other pane in that tab does not reach that pane's PTY, and a status message ("Pane locked — Ctrl+e to unlock") confirms the keystroke was dropped rather than silently swallowed. `Ctrl+e` toggles the lock; while unlocked, every pane in that tab accepts direct input normally, same as before. The lock is per-tab — toggling it in one Orchestration tab never affects another open tab — and the orchestrator pane itself always accepts input regardless of lock state. `Ctrl+e` and every other global chord (`Ctrl+d`, `Ctrl+n`, `Ctrl+t`) keep working from any pane, locked or not — the lock never swallows a global chord. `Ctrl+w` and `Ctrl+l` are command-mode only for their own reasons (see above and below), and the lock changes nothing about that either way. Dashboard and Mode tabs are unaffected — `Ctrl+e` on those falls through as ordinary input (e.g. readline's end-of-line binding).
+In an Orchestration tab, direct keystrokes are locked to the orchestrator pane by default — typing while focused on any other pane in that tab does not reach that pane's PTY, and a status message ("Pane locked — Ctrl+d then Ctrl+e to unlock") confirms the keystroke was dropped rather than silently swallowed. The orchestrator pane itself always accepts input regardless of lock state, and while unlocked every pane in the tab accepts direct input normally.
+
+**`Ctrl+e` toggles the lock from command mode only.** `Ctrl+e` is end-of-line in shells, readline, and every agent you run in a pane. So while you are typing in a pane it is sent straight through to that program as `^E` (byte `0x05`) and moves the cursor to the end of the line; it does not touch the lock. Press `Ctrl+D` first, and `Ctrl+e` there toggles it. It is the same trade `Ctrl+W` and `Ctrl+L` make: one extra keystroke when you meant the deck, in exchange for the chord always reaching the program you are typing into. `Ctrl+d`, `Ctrl+n` and `Ctrl+t` still work from any pane, locked or not — the lock never swallows a global chord.
+
+**The lock is one value for the whole deck, not one per tab.** Toggling it on any Orchestration tab changes it on every other open Orchestration tab as well, and an Orchestration tab you open afterwards adopts whatever the current value is rather than starting locked. It reflects how you are working right now, not which tab you happened to open. The value resets to locked on the next launch rather than persisting.
+
+**A pane that is waiting for input is not locked.** While a non-orchestrator role pane reports `Needs Input` — the agent has stopped and asked you something, and the sidebar and tab label already say so — the lock stops gating that pane entirely and your keystrokes reach it, so you can answer the question where it was asked. The lock re-engages the instant the status clears. The lock's subject is the *unsolicited* interruption: typing at an agent that is working, while the orchestrator believes it owns that state. Answering an agent that explicitly stopped and asked is not one, so it costs no unlock. One consequence worth knowing: status is agent-reported, so an agent that never reports `Needs Input` gets no carve-out and still needs a deliberate unlock, and a pane whose status is stuck on `Needs Input` stays typeable with nothing on screen to distinguish it from a correctly-waiting one.
+
+Dashboard and Mode tabs are unaffected — the lock never applies there, and `Ctrl+e` on those falls through as ordinary input (e.g. readline's end-of-line binding) in both modes.
 
 ### `Ctrl+W` closes only from command mode
 
@@ -188,10 +196,10 @@ help = "F1"                      # open help with F1 instead of ?
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_split` | `Ctrl+l` | Cycle the deck's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**, **command mode only**; one stage shared by every tab, and in a pane the chord is ordinary input (clear-screen) for whatever is running there |
-| `toggle_orchestration_lock` | `Ctrl+e` | Toggle command-entry lock — while locked (the default), only the orchestrator pane accepts direct input — **orchestration tabs only**; falls through as ordinary pane input elsewhere |
+| `toggle_orchestration_lock` | `Ctrl+e` | Toggle command-entry lock — while locked (the default), only the orchestrator pane accepts direct input, plus any pane that is waiting for input — on **orchestration tabs**, and only while you are **not typing into a pane**; one lock shared by every Orchestration tab. In command mode the deck claims the chord even when a pane is focused; once you are typing into a pane it is sent through to whatever is running there as ordinary input (end-of-line), so press `Ctrl+D` first |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
-`close_pane` and `toggle_orchestration_split` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind either to is command-mode only and reaches the pane as ordinary input everywhere else.
+`close_pane`, `toggle_orchestration_split` and `toggle_orchestration_lock` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind any of the three to is command-mode only and reaches the pane as ordinary input everywhere else.
 
 `[dashboard]` (command mode):
 
