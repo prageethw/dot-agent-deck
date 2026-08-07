@@ -157,21 +157,33 @@ fn create_sentinel_directive(sentinel: &str) -> String {
     )
 }
 
+/// The `orch-deck`/`orch-lock-live` fixtures' worker role pane's full daemon
+/// registry record. `AgentRecord.id` (the registry's own monotonic counter)
+/// and `AgentRecord.pane_id_env` (the `DOT_AGENT_DECK_PANE_ID` the pane was
+/// spawned with) are two DISTINCT fields — `spawn_worker_stub` in
+/// `tests/orchestration_delegate.rs` sets them to different values
+/// explicitly to prove the point. Anything that means "the pane" as
+/// `managed_pane_ids` / `role_pane_ids` / `pane.focused_pane_id()` /
+/// `build_pane_status`'s join understand it — i.e. anything routed as an
+/// `AgentEvent.pane_id` — must read `pane_id_env`, never `id`.
+fn worker_agent_record(socket: &std::path::Path) -> dot_agent_deck::agent_pty::AgentRecord {
+    common::agent_records_on(socket)
+        .into_iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { role_name, .. })
+                    if role_name == "worker"
+            )
+        })
+        .expect("orch-lock-live fixture's worker role pane must be registered with the daemon")
+}
+
 /// The `orch-lock-live` fixture's real Claude worker role pane's daemon
 /// registry id, used to inspect its cumulative PTY history independent of
 /// the outer terminal's redraws.
 fn worker_agent_id(socket: &std::path::Path) -> String {
-    common::agent_records_on(socket)
-        .into_iter()
-        .find_map(|r| match r.tab_membership {
-            Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { role_name, .. })
-                if role_name == "worker" =>
-            {
-                Some(r.id)
-            }
-            _ => None,
-        })
-        .expect("orch-lock-live fixture's worker role pane must be registered with the daemon")
+    worker_agent_record(socket).id
 }
 
 /// Scenario: Open a real orchestration tab (`cat` orchestrator, a REAL
@@ -395,27 +407,51 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     );
 }
 
-/// Inject a synthetic `AgentEvent` for `pane_id` over the deck's hook socket
-/// — the SAME bare-`AgentEvent`, no-`DaemonMessage`-envelope wire the real
-/// `dot-agent-deck agent-event --type running|waiting|finished` CLI already
-/// rides for Pi's status reporting (`src/main.rs`'s `AgentEvent` command,
+/// Inject a synthetic `AgentEvent` for the worker's real `(pane_id_env,
+/// agent_id)` pair over the deck's hook socket — the SAME bare-`AgentEvent`,
+/// no-`DaemonMessage`-envelope wire the real `dot-agent-deck agent-event
+/// --type running|waiting|finished` CLI already rides for Pi's status
+/// reporting (`src/main.rs`'s `AgentEvent` command,
 /// `src/daemon.rs::run_hook_loop`'s `serde_json::from_str::<AgentEvent>`
 /// fallback). Stands in for a real extension's status report against a
-/// `cat`-stub role pane, which sends no hooks of its own. Blocks on `sub`
-/// (a subscription opened BEFORE this call) observing the daemon's
-/// broadcast of this exact event, so the caller knows the daemon side has
-/// processed it before proceeding — the client (this attached deck) reads
-/// the identical broadcast fan-out at essentially the same instant, though
-/// its own apply-and-redraw is a further async step the caller must still
-/// account for (see `TuiDeck::send_keys_until_grid_string_within`).
+/// `cat`-stub role pane, which sends no hooks of its own.
+///
+/// PRD #393 issue #395 follow-up: both `pane_id` AND `agent_id` must be the
+/// worker's REAL values (`worker_agent_record`'s `pane_id_env` / `id`).
+/// `pane_id` alone is not enough — `AppState::apply_event`'s same-pane reuse
+/// guard (`src/state.rs`) only updates the pane's existing placeholder
+/// session in place when `session.agent_id == event.agent_id`; an event
+/// carrying `agent_id: None` fails that guard (and the immediately-following
+/// retire block explicitly skips a `None`-agent_id event too, PRD #110's
+/// backward-compat carve-out), so it falls through and creates a SECOND,
+/// disconnected session on the same `pane_id` instead of updating the real
+/// one. `build_pane_status` (`src/ui.rs`) then joins `state.sessions` into a
+/// `pane_id`-keyed `HashMap` with no dedupe, so which of the two sessions'
+/// status "wins" for that pane is UNSPECIFIED — the gate's carve-out check
+/// can silently see the stale placeholder instead of the fresh status.
+///
+/// Blocks not on the daemon's broadcast (which fires whether or not
+/// `apply_event` actually accepted/applied the event onto the right
+/// session — a wrong pane id or a rejected event sails through it exactly
+/// the same as an accepted one) but on `ListAgents`' `AgentRecord.live`
+/// join reporting the expected `SessionStatus` back for the worker's pane —
+/// proof the daemon's OWN state, not just its wire, reflects the change.
 #[cfg(unix)]
 fn inject_worker_status(
     deck: &TuiDeck,
-    sub: &common::EventSub,
+    socket: &std::path::Path,
     pane_id: &str,
+    agent_id: &str,
     session_id: &str,
     event_type: EventType,
 ) {
+    let expected_status = match event_type {
+        EventType::WaitingForInput => dot_agent_deck::state::SessionStatus::WaitingForInput,
+        EventType::Thinking => dot_agent_deck::state::SessionStatus::Thinking,
+        other => {
+            panic!("inject_worker_status: no expected SessionStatus mapping wired up for {other:?}")
+        }
+    };
     let event = AgentEvent {
         session_id: session_id.to_string(),
         agent_type: AgentType::Pi,
@@ -427,7 +463,7 @@ fn inject_worker_status(
         user_prompt: None,
         metadata: std::collections::HashMap::new(),
         pane_id: Some(pane_id.to_string()),
-        agent_id: None,
+        agent_id: Some(agent_id.to_string()),
         agent_version: None,
         schema_version: None,
         live_target: None,
@@ -435,9 +471,20 @@ fn inject_worker_status(
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)
         .expect("inject synthetic AgentEvent over hook socket");
-    sub.wait_for(
-        move |e| e.pane_id.as_deref() == Some(pane_id) && e.event_type == event_type,
-        Duration::from_secs(10),
+
+    let applied = common::wait_until(Duration::from_secs(10), || {
+        common::agent_records_on(socket).into_iter().any(|r| {
+            r.pane_id_env.as_deref() == Some(pane_id)
+                && r.live.as_ref().map(|s| &s.status) == Some(&expected_status)
+        })
+    });
+    assert!(
+        applied,
+        "the daemon's own ListAgents/live-status join never reported {event_type:?} \
+         for the worker pane {pane_id} (agent_id {agent_id}) within 10s — the hook \
+         socket write was accepted (see above), but AppState::apply_event may have \
+         rejected it or applied it to the wrong session; the pane's redraw below \
+         cannot be trusted to reflect it either.",
     );
 }
 
@@ -472,13 +519,16 @@ fn orchestration_lock_010_waiting_carve_out_on_real_panes() {
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
 
-    let sub = deck.subscribe_events();
-
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
 
     let socket = deck.attach_socket_path().to_path_buf();
-    let worker_id = worker_agent_id(&socket);
+    let worker_record = worker_agent_record(&socket);
+    let worker_id = worker_record.id.clone();
+    let worker_pane_id = worker_record
+        .pane_id_env
+        .clone()
+        .expect("worker role pane must have a DOT_AGENT_DECK_PANE_ID recorded");
     let session_id = format!("{worker_id}-lock010-session");
 
     // Focus the non-orchestrator "worker" role. The tab is still locked —
@@ -500,7 +550,8 @@ fn orchestration_lock_010_waiting_carve_out_on_real_panes() {
     // The worker reports WaitingForInput.
     inject_worker_status(
         &deck,
-        &sub,
+        &socket,
+        &worker_pane_id,
         &worker_id,
         &session_id,
         EventType::WaitingForInput,
@@ -527,7 +578,14 @@ fn orchestration_lock_010_waiting_carve_out_on_real_panes() {
 
     // The status clears (the agent resumes, as if it just got answered) —
     // the gate must re-engage instantly.
-    inject_worker_status(&deck, &sub, &worker_id, &session_id, EventType::Thinking);
+    inject_worker_status(
+        &deck,
+        &socket,
+        &worker_pane_id,
+        &worker_id,
+        &session_id,
+        EventType::Thinking,
+    );
 
     // Re-focus explicitly: this isolates the LOCK's own re-engagement from
     // PRD #373/#393 M4's SEPARATE all-clear auto-focus, which may have
