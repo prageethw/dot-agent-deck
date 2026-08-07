@@ -506,22 +506,76 @@ fn resolve_task(
 /// shape: the daemon's own name now carries a per-pane digest suffix (fork
 /// #76), and this check must stay correct if that suffix ever changes again
 /// without knowing what it is.
+///
+/// PR #90 review P1 (b): a check on the SUPPLIED path's own lexical name and
+/// immediate parent is defeated by a symlink — a file symlink whose target
+/// resolves into the namespace (fork #76's `delegate_027`), or an
+/// intermediate directory symlink that aliases into `.dot-agent-deck` itself
+/// (`delegate_028`) — since neither changes what the argument itself looks
+/// like. [`resolve_work_done_candidate`] resolves as much of `task_file` as
+/// the filesystem allows before classification, and where the daemon's own
+/// output directory for this process's cwd is itself knowable (it already
+/// exists on disk), the comparison is against that directory's canonical
+/// path rather than a bare `".dot-agent-deck"` name match — immune to a
+/// same-named decoy directory elsewhere. When nothing on disk can be
+/// resolved (the target file doesn't exist yet, or — as in this module's own
+/// unit tests — the path is a pure string exercising the glob shape with no
+/// backing filesystem state at all), this falls back to the original lexical
+/// check so that shape stays pinned independent of resolution.
 fn is_work_done_output_path(task_file: &str) -> bool {
     if task_file == "-" {
         return false;
     }
     let path = std::path::Path::new(task_file);
-    let is_work_done_name = path
+    let (resolved, was_resolved) = resolve_work_done_candidate(path);
+
+    let is_work_done_name = resolved
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.starts_with("work-done-") && name.ends_with(".md"));
     if !is_work_done_name {
         return false;
     }
-    path.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        == Some(".dot-agent-deck")
+    let Some(resolved_parent) = resolved.parent() else {
+        return false;
+    };
+
+    if was_resolved
+        && let Ok(cwd) = std::env::current_dir()
+        && let Ok(namespace_dir) = cwd.join(".dot-agent-deck").canonicalize()
+    {
+        return resolved_parent == namespace_dir;
+    }
+    resolved_parent.file_name().and_then(|n| n.to_str()) == Some(".dot-agent-deck")
+}
+
+/// Resolve `path` as far as the real filesystem allows, following every
+/// symlink along the way, and report whether any resolution actually
+/// happened.
+///
+/// Tries the full path first (handles both a symlinked file and a path
+/// reached through a symlinked intermediate directory, since
+/// [`std::path::Path::canonicalize`] follows symlinks in every component
+/// including the last). Falls back to resolving just the parent when the
+/// final component doesn't exist yet — a legitimate not-yet-written
+/// `--task-file` reached through an aliased directory must still resolve
+/// against the real directory, not the symlink's own name. Returns the
+/// original, unresolved path with `false` when neither resolves (nothing on
+/// disk backs any part of it), so callers can tell "genuinely outside the
+/// namespace" apart from "not on disk to check" and choose a lexical
+/// fallback instead of misclassifying the latter as a resolution failure.
+fn resolve_work_done_candidate(path: &std::path::Path) -> (std::path::PathBuf, bool) {
+    if let Ok(resolved) = path.canonicalize() {
+        return (resolved, true);
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(resolved_parent) = parent.canonicalize()
+        && let Some(name) = path.file_name()
+    {
+        return (resolved_parent.join(name), true);
+    }
+    (path.to_path_buf(), false)
 }
 
 /// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
