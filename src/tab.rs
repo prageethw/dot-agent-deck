@@ -73,6 +73,10 @@ pub enum OrchestrationRoleStatus {
 /// Dashboard tabs. `Default` is each tab type's own fixed ratio
 /// (Orchestration 34/66, Dashboard 33/67); `Narrow` (25/75) and `Hidden`
 /// (0/100, sidebar collapsed) are the same fixed ratios on either tab type.
+///
+/// PRD #387 M2 (decision 2): the *stage* is deck-global — it lives once on
+/// `UiState::split_stage`, not per-tab — while the ratios it resolves to
+/// stay per-tab-type, which is why `Default` still diverges 34/66 vs 33/67.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitStage {
     Default,
@@ -103,12 +107,6 @@ pub enum Tab {
         /// selection to the wrong card. `UiState.selected_index` is
         /// derived from this each frame.
         selected_session_id: Option<String>,
-        /// PRD #361 Item 4: this tab's sidebar/pane-column split stage.
-        /// `Default` = the fixed 33/67 ratio. Per-tab so toggling one
-        /// Dashboard tab doesn't affect another (there is normally only
-        /// one Dashboard tab, but the field mirrors Orchestration's
-        /// per-tab isolation for consistency).
-        split_stage: SplitStage,
     },
     Mode {
         id: TabId,
@@ -145,11 +143,6 @@ pub enum Tab {
         config: OrchestrationConfig,
         /// Tracks whether the orchestration is waiting, delegated, or completed.
         status: OrchestrationStatus,
-        /// PRD #336, extended to a 3-stage cycle by PRD #361 Item 4: this
-        /// tab's sidebar/pane-column split stage. `Default` = the 34/66
-        /// ratio. Per-tab so toggling one orchestration tab doesn't affect
-        /// another.
-        split_stage: SplitStage,
         /// PRD #373 M1: edge-trigger state for the all-clear focus move —
         /// whether any role pane in this tab was `WaitingForInput` as of
         /// the last [`TabManager::observe_waiting_panes`] call. That
@@ -185,9 +178,10 @@ pub enum Tab {
         /// PRD #374 (#361 Item 3): whether direct keystroke entry to
         /// non-orchestrator role panes on this tab is locked. Starts
         /// `true` — only the orchestrator pane accepts direct input until
-        /// `Ctrl+e` unlocks it. Per-tab, following the `split_stage`
-        /// precedent: toggling one orchestration tab's lock never affects
-        /// another open orchestration tab.
+        /// `Ctrl+e` unlocks it. Per-tab: toggling one orchestration tab's
+        /// lock never affects another open orchestration tab. (It used to
+        /// cite `split_stage` as its precedent; PRD #387 M2 made that one
+        /// deck-global, so the lock is now the per-tab case on its own.)
         command_entry_locked: bool,
     },
 }
@@ -218,7 +212,6 @@ impl TabManager {
         Self {
             tabs: vec![Tab::Dashboard {
                 selected_session_id: None,
-                split_stage: SplitStage::Default,
             }],
             active_index: 0,
             next_id: 1,
@@ -940,7 +933,6 @@ impl TabManager {
             },
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_stage: SplitStage::Default,
             had_waiting_pane: false,
             all_clear_pending: false,
             last_role_pane_activity_at: None,
@@ -1078,7 +1070,6 @@ impl TabManager {
             orchestrator_prompt: None,
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_stage: SplitStage::Default,
             had_waiting_pane: false,
             all_clear_pending: false,
             last_role_pane_activity_at: None,
@@ -1761,7 +1752,6 @@ mod tests {
 
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("s2".to_string()),
-            split_stage: SplitStage::Default,
         };
         // No focused pane: index derives purely from the remembered id.
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
@@ -1809,7 +1799,6 @@ mod tests {
         let filtered: &[(&str, Option<&str>)] = &[("s1", Some("p1")), ("s2", Some("p2"))];
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("gone".to_string()),
-            split_stage: SplitStage::Default,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1836,7 +1825,6 @@ mod tests {
             orchestrator_prompt: None,
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_stage: SplitStage::Default,
             had_waiting_pane: false,
             all_clear_pending: false,
             last_role_pane_activity_at: None,
@@ -1870,7 +1858,6 @@ mod tests {
             orchestrator_prompt: None,
             config: orch_config("orch"),
             status: OrchestrationStatus::WaitingForOrchestrator,
-            split_stage: SplitStage::Default,
             had_waiting_pane: false,
             all_clear_pending: false,
             last_role_pane_activity_at: None,

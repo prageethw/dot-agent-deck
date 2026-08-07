@@ -40,13 +40,18 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
 /// Scenario: Extends the Ctrl+l split-toggle to Dashboard tabs — launch with
 /// a live Dashboard pane, Ctrl+l cycle through Default (33%) -> Narrow (25%)
 /// -> Hidden (0%) -> Default, asserting the pane column's left edge at each
-/// stage. Open a second Orchestration tab and confirm its own 34% default and
-/// toggle are unaffected by the Dashboard tab's stage, proving cross-tab-type
-/// isolation. RED today: Dashboard tabs have no split-toggle at all, so every
-/// wait below times out.
+/// stage. PRD #387 decision 2: the split stage is ONE deck-global value —
+/// open a second Orchestration tab and confirm it adopts the Dashboard tab's
+/// CURRENT (Narrow) stage rather than its own untoggled Default, then prove
+/// sharing in both directions: cycling the Orchestration tab moves the
+/// Dashboard tab, and cycling back on the Dashboard tab moves the
+/// Orchestration tab right back. PRD #387 M1 scopes Ctrl+l to command mode
+/// on every tab type; opening the Orchestration tab lands the deck back in
+/// PaneInput mode on its start-role pane, so a Ctrl+D precedes that tab's
+/// own toggle press.
 #[spec("tabs/dashboard/001")]
 #[test]
-fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration() {
+fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration() {
     const DASH_PANE: &str = "dash-layout-cycle";
 
     let deck = TuiDeck::builder()
@@ -109,9 +114,24 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
         deck.snapshot_grid()
     );
 
-    // Cross-tab-type isolation: open a SECOND, real Orchestration tab in the
-    // same directory (Ctrl+n new-pane flow) and confirm it starts at ITS OWN
-    // default 34/66 split.
+    // Toggle the Dashboard tab back to Narrow, setting up the shared-stage
+    // precondition the Orchestration tab must adopt below.
+    deck.send_bytes(b"\x0c");
+    let narrowed_again = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        pane_box_left_edge(grid, DASH_PANE) == 25
+    });
+    assert!(
+        narrowed_again,
+        "Ctrl+l did not narrow the Dashboard sidebar to the 25/75 split \
+         within 3s (second time) — pane-column edge stayed at {}\nGrid:\n{}",
+        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+        deck.snapshot_grid()
+    );
+
+    // Open a SECOND, real Orchestration tab in the same directory (Ctrl+n
+    // new-pane flow). PRD #387 decision 2: it must ADOPT the deck-global
+    // Narrow stage the Dashboard tab was just toggled to, not its own
+    // untoggled Default (34/66).
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused
@@ -120,37 +140,46 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
     deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
     deck.wait_for_absence("New Agent"); // new-pane form closed -> the orchestration tab is up
 
-    let orch_default_edge = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
+    let orch_narrow_edge = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert_eq!(
-        orch_default_edge,
-        34,
-        "a brand-new Orchestration tab must open at its OWN default 34/66 \
-         split regardless of the Dashboard tab's stage, got {orch_default_edge}\
-         \nGrid:\n{}",
+        orch_narrow_edge,
+        25,
+        "a brand-new Orchestration tab must open AT the deck-global Narrow \
+         stage the Dashboard tab was just toggled to, not its own untoggled \
+         Default, got {orch_narrow_edge}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
-    // Toggle the Orchestration tab to Narrow.
+    // Continue the SHARED cycle from the Orchestration tab: Narrow -> Hidden.
+    // Opening it (Ctrl+n new-pane flow) left the deck in PaneInput mode,
+    // focused on its start-role pane — PRD #387 M1 scopes Ctrl+l to command
+    // mode on every tab type, so Ctrl+D must enter Normal mode first or the
+    // byte forwards straight to the pane instead of cycling the split.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
-    let orch_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, "orchestrator") == 25
+    let orch_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        pane_box_left_edge(grid, "orchestrator") == 0
     });
     assert!(
-        orch_narrowed,
-        "Ctrl+l did not narrow the Orchestration tab's sidebar within 3s\n\
-         Grid:\n{}",
+        orch_hidden,
+        "Ctrl+l did not collapse the Orchestration tab's sidebar to the \
+         Hidden stage within 3s\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
-    // Switch back to the Dashboard tab (Shift+Tab -> previous tab) and
-    // confirm ITS split is still Default (33/67) — untouched by the
-    // Orchestration tab's toggle, even though both tabs were just driven
-    // through the exact same Ctrl+l chord. The freshly opened Orchestration
-    // tab's start-role pane is live-focused in PaneInput mode, and
-    // `cycle_tab_action` only responds to Shift+Tab in Normal mode —
-    // otherwise the bytes forward straight to the pane — so return to Normal
-    // mode first.
-    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    // Switch back to the Dashboard tab (Shift+Tab -> previous tab). Shared-
+    // stage proof (PRD #387 decision 2): the Dashboard tab must NOW ALSO
+    // read Hidden — toggling on the Orchestration tab moved the SAME
+    // deck-global stage the Dashboard tab reads, even though the Dashboard
+    // tab itself was never touched after its own Default -> Narrow press
+    // above. The deck is ALREADY in Normal mode here (from the Ctrl+D sent
+    // before the Orchestration tab's own toggle above), which
+    // `cycle_tab_action` requires for Shift+Tab to switch tabs rather than
+    // forward the bytes to the pane — so no further Ctrl+D is needed.
+    // Sending one anyway would be actively harmful: Ctrl+D TOGGLES, and
+    // since the Orchestration tab's start-role pane is still the deck's
+    // resume target from Normal mode, a second press here would re-enter
+    // PaneInput on that tab and break the Shift+Tab below.
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> Dashboard
     // Confirm the tab switch itself landed (DASH_PANE's title is only ever
     // drawn on the Dashboard tab) before polling for its exact edge — a
@@ -160,15 +189,57 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_isolated_from_orchestration
     // Orchestration tab (DASH_PANE genuinely absent, not just moved) in the
     // brief window before the switch renders.
     deck.wait_for_string(DASH_PANE);
-    let dash_still_default = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+    let dash_also_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        pane_box_left_edge(grid, DASH_PANE) == 0
+    });
+    assert!(
+        dash_also_hidden,
+        "toggling the Orchestration tab's split must move the Dashboard \
+         tab's split too — expected the Dashboard tab ALSO Hidden (edge 0) \
+         after switching back, got {}\nGrid:\n{}",
+        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+        deck.snapshot_grid()
+    );
+
+    // Finish the shared cycle from the Dashboard tab: Hidden -> Default. No
+    // Ctrl+D needed: switching tabs (`switch_tab_with_focus`) never touches
+    // `UiMode`, so the deck is still in Normal mode from above.
+    deck.send_bytes(b"\x0c");
+    let dash_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         pane_box_left_edge(grid, DASH_PANE) == 33
     });
     assert!(
-        dash_still_default,
-        "toggling the Orchestration tab's split must not move the Dashboard \
-         tab's split — expected the Dashboard tab still at its 33/67 \
-         default after switching back, got {}\nGrid:\n{}",
+        dash_restored,
+        "Ctrl+l did not restore the Dashboard tab's 33/67 default split \
+         within 3s — pane-column edge stayed at {}\nGrid:\n{}",
         pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+        deck.snapshot_grid()
+    );
+
+    // Switch to the Orchestration tab one last time (Right -> CycleTabNext,
+    // the established forward tab-cycle chord — see
+    // `e2e_dashboard_selection.rs`'s SC1 round-trip) and confirm IT is ALSO
+    // back at its OWN Default (34/66) — completing the loop in both
+    // directions: the Dashboard tab's final toggle propagated to the
+    // Orchestration tab just as the Orchestration tab's earlier toggle
+    // propagated to the Dashboard tab.
+    deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Orchestration
+    // Same hazard as the Shift+Tab switch above (see the comment at line
+    // 184-190): confirm the tab switch itself landed before polling for the
+    // exact edge, so a panicking `pane_box_left_edge` isn't used directly as
+    // a predicate against a first-sampled grid that can still show the
+    // Dashboard tab ("orchestrator" genuinely absent, not just moved).
+    deck.wait_for_string("orchestrator");
+    let orch_also_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        pane_box_left_edge(grid, "orchestrator") == 34
+    });
+    assert!(
+        orch_also_restored,
+        "toggling the Dashboard tab's split back to Default must move the \
+         Orchestration tab's split too — expected the Orchestration tab \
+         ALSO at its own 34/66 Default after switching to it, got {}\
+         \nGrid:\n{}",
+        pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 }
