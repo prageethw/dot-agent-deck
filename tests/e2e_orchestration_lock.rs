@@ -322,32 +322,44 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     // pane (never gated by the lock, so this isolates the assertion from
     // lock state entirely). ---
 
-    // Baseline captured BEFORE typing starts, so the first cursor read below
-    // has something to diverge from (see
-    // `TuiDeck::wait_for_terminal_cursor_change_then_settle`'s doc comment
-    // for why a divergence check, not just a stability check, is required).
-    let pre_type = deck.terminal_cursor_snapshot();
-
     deck.send_keys(PARTIAL_LINE.as_bytes()); // no trailing \r -- never submitted
-    assert!(
-        deck.wait_for_grid_string_within(PARTIAL_LINE, Duration::from_secs(3)),
-        "the partial line never appeared on the rendered grid\nGrid:\n{}",
+
+    // Locate the echoed line ON THE GRID and derive the cell readline's
+    // cursor must end up in — one past its last character — then wait for the
+    // hardware cursor to actually be there. Fork #81: waiting for a KNOWN
+    // destination replaces the old "diverge from a pre-typing baseline, then
+    // hold still for ~60 ms" proxy, which could settle on an intermediate
+    // frame (the deck repaints its own block-cursor overlay a frame after the
+    // PTY echo) and hand a half-typed position to every comparison below.
+    // The two chords that follow are asserted against this cell, so capturing
+    // it early is what made the later `Ctrl+a` control check fail on a loaded
+    // runner even though `Ctrl+a` had done its job.
+    let (line_col, line_row) = deck.wait_for_in_grid(PARTIAL_LINE);
+    let expected_end_col = line_col + PARTIAL_LINE.len() as u16;
+    let end_of_line = deck
+        .wait_for_terminal_cursor_position_within(common::OBSERVATION_BUDGET, |row, col| {
+            (row, col) == (line_row, expected_end_col)
+        });
+    assert_eq!(
+        (end_of_line.row, end_of_line.col),
+        (line_row, expected_end_col),
+        "the terminal cursor never reached the end of the echoed partial line \
+         (expected row {line_row}, col {expected_end_col}; settled at \
+         {end_of_line:?}) — the orchestrator pane never finished echoing the \
+         typed bytes, so the chord assertions below would not be \
+         trustworthy.\nGrid:\n{}",
         deck.snapshot_grid()
     );
-    // Not a plain `terminal_cursor_snapshot()`: the substring landing on the
-    // grid only proves those bytes were applied, not that the deck has
-    // finished echoing (more may be in flight) or repainted its own
-    // block-cursor overlay at the final position (PRD #393 flake).
-    let end_of_line =
-        deck.wait_for_terminal_cursor_change_then_settle(pre_type, Duration::from_secs(3));
 
     // Ctrl+a (0x01) == readline's beginning-of-line. The deck binds no
     // action to this chord, so it is a safe control: if the cursor does not
     // move here, the harness's cursor-observation technique itself is
     // broken, independent of anything Ctrl+e does.
     deck.send_bytes(b"\x01");
-    let start_of_line =
-        deck.wait_for_terminal_cursor_change_then_settle(end_of_line, Duration::from_secs(3));
+    let start_of_line = deck
+        .wait_for_terminal_cursor_position_within(common::OBSERVATION_BUDGET, |row, col| {
+            row == end_of_line.row && col < end_of_line.col
+        });
     assert!(
         (start_of_line.row, start_of_line.col) != (end_of_line.row, end_of_line.col),
         "control check failed: Ctrl+a (readline beginning-of-line) never \
@@ -373,8 +385,10 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     // of mode (PRD #374), so the byte never reaches the PTY and the cursor
     // never moves back.
     deck.send_bytes(b"\x05");
-    let after_ctrl_e =
-        deck.wait_for_terminal_cursor_change_then_settle(start_of_line, Duration::from_secs(3));
+    let after_ctrl_e = deck
+        .wait_for_terminal_cursor_position_within(common::OBSERVATION_BUDGET, |row, col| {
+            (row, col) == (end_of_line.row, end_of_line.col)
+        });
     assert!(
         (after_ctrl_e.row, after_ctrl_e.col) == (end_of_line.row, end_of_line.col),
         "Ctrl+e did not reach the focused orchestrator role pane's PTY — \
@@ -398,7 +412,7 @@ fn orchestration_lock_008_ctrl_e_scoped_to_command_mode_on_real_panes() {
     focus_worker_role(&deck);
     deck.send_keys(format!("{WORKER_UNLOCKED_SENTINEL}\r").as_bytes());
     assert!(
-        deck.wait_for_grid_string_within(WORKER_UNLOCKED_SENTINEL, Duration::from_secs(3)),
+        deck.wait_for_grid_string_within(WORKER_UNLOCKED_SENTINEL, common::OBSERVATION_BUDGET),
         "after Ctrl+d then Ctrl+e from command mode, a keystroke typed into \
          the non-orchestrator worker pane never reached its PTY — expected \
          the command-mode Ctrl+e to have toggled the command-entry lock \
