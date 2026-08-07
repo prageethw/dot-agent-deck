@@ -438,8 +438,16 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
 }
 
 pub fn send_to_socket(json: &str) -> Option<()> {
-    let path = socket_path();
-    let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
+    send_to_socket_at(&socket_path(), json)
+}
+
+/// [`send_to_socket`] against an explicit endpoint, rather than one resolved
+/// from the environment. Lets the fork-issue-#102 socket tests exercise
+/// "no daemon listening at this path" by passing a temp-dir path directly,
+/// instead of mutating the process-global `DOT_AGENT_DECK_SOCKET` env var
+/// that production `socket_path()` reads.
+fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
+    let mut stream = crate::platform::ipc::IpcClient::connect(path).ok()?;
     let msg = format!("{json}\n");
     stream.write_all(msg.as_bytes()).ok()?;
     stream.flush().ok()?;
@@ -538,8 +546,23 @@ pub fn request_from_socket_with_deadline(json: &str, timeout: std::time::Duratio
 }
 
 fn request_from_socket_inner(json: &str, timeout: Option<std::time::Duration>) -> SocketReply {
-    let path = socket_path();
-    let mut stream = match crate::platform::ipc::IpcClient::connect(&path) {
+    request_from_socket_at(&socket_path(), json, timeout)
+}
+
+/// [`request_from_socket_inner`] against an explicit endpoint, rather than one
+/// resolved from the environment. Fork issue #102: the socket tests need to
+/// point a request at a temp-dir stub-daemon socket without mutating the
+/// process-global `DOT_AGENT_DECK_SOCKET` env var that production
+/// `request_from_socket_inner` reads via `socket_path()` — `set_var`/`get_var`
+/// races on that var are unsound under a multithreaded test binary regardless
+/// of the project's own `STATE_DIR_ENV_LOCK` convention, since production
+/// `socket_path()` reads it without taking that lock.
+fn request_from_socket_at(
+    path: &std::path::Path,
+    json: &str,
+    timeout: Option<std::time::Duration>,
+) -> SocketReply {
+    let mut stream = match crate::platform::ipc::IpcClient::connect(path) {
         Ok(stream) => stream,
         Err(_) => return SocketReply::Unreachable,
     };
@@ -842,25 +865,10 @@ mod tests {
     #[test]
     fn send_to_missing_socket_returns_none() {
         // With no daemon running, send should silently fail
-        let _guard = crate::config::STATE_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
-
-        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
-        // the previous value is restored below before the lock is dropped.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_SOCKET", "/tmp/nonexistent-test-socket.sock");
-        }
-        let result = send_to_socket(r#"{"test": true}"#);
-
-        // SAFETY: same lock still held; restoring the previous value.
-        unsafe {
-            match prev_socket {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
-            }
-        }
+        let result = send_to_socket_at(
+            std::path::Path::new("/tmp/nonexistent-test-socket.sock"),
+            r#"{"test": true}"#,
+        );
 
         assert!(result.is_none());
     }
@@ -879,11 +887,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn socket_003_unbounded_daemon_does_not_hang_forever() {
-        let _guard = crate::config::STATE_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
-
         let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
         let socket_path = _tmp.path().join("s.sock");
         let listener =
@@ -901,27 +904,20 @@ mod tests {
             }
         });
 
-        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
-        // the previous value is restored below before the lock is dropped.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
-        }
-
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = request_from_socket(r#"{"type":"get-seed"}"#);
+            let result = match request_from_socket_at(
+                &socket_path,
+                r#"{"type":"get-seed"}"#,
+                Some(GET_SEED_REQUEST_TIMEOUT),
+            ) {
+                SocketReply::Line(line) => Some(line),
+                SocketReply::NoReply | SocketReply::Unreachable => None,
+            };
             let _ = tx.send(result);
         });
 
         let outcome = rx.recv_timeout(std::time::Duration::from_secs(15));
-
-        // SAFETY: same lock still held; restoring the previous value.
-        unsafe {
-            match prev_socket {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
-            }
-        }
 
         match outcome {
             Ok(value) => assert_eq!(
@@ -954,11 +950,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn socket_004_slow_but_replying_daemon_still_returns_the_reply() {
-        let _guard = crate::config::STATE_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
-
         let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
         let socket_path = _tmp.path().join("s.sock");
         let listener =
@@ -978,21 +969,15 @@ mod tests {
             }
         });
 
-        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
-        // the previous value is restored below before the lock is dropped.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
-        }
+        let result = match request_from_socket_at(
+            &socket_path,
+            r#"{"type":"get-seed"}"#,
+            Some(GET_SEED_REQUEST_TIMEOUT),
+        ) {
+            SocketReply::Line(line) => Some(line),
+            SocketReply::NoReply | SocketReply::Unreachable => None,
+        };
 
-        let result = request_from_socket(r#"{"type":"get-seed"}"#);
-
-        // SAFETY: same lock still held; restoring the previous value.
-        unsafe {
-            match prev_socket {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
-            }
-        }
         let _ = daemon_thread.join();
 
         assert_eq!(
@@ -1019,11 +1004,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn socket_005_slow_drip_daemon_does_not_hang_forever() {
-        let _guard = crate::config::STATE_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
-
         let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
         let socket_path = _tmp.path().join("s.sock");
         let listener =
@@ -1061,15 +1041,16 @@ mod tests {
             }
         });
 
-        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
-        // the previous value is restored below before the lock is dropped.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
-        }
-
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = request_from_socket(r#"{"type":"get-seed"}"#);
+            let result = match request_from_socket_at(
+                &socket_path,
+                r#"{"type":"get-seed"}"#,
+                Some(GET_SEED_REQUEST_TIMEOUT),
+            ) {
+                SocketReply::Line(line) => Some(line),
+                SocketReply::NoReply | SocketReply::Unreachable => None,
+            };
             let _ = tx.send(result);
         });
 
@@ -1080,14 +1061,6 @@ mod tests {
         // per-test timeout.
         const ASSERT_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
         let outcome = rx.recv_timeout(ASSERT_CEILING);
-
-        // SAFETY: same lock still held; restoring the previous value.
-        unsafe {
-            match prev_socket {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
-            }
-        }
 
         match outcome {
             // Any return within the ceiling proves the operation is bounded
