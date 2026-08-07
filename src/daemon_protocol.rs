@@ -17,12 +17,17 @@
 //! **desktop** client, which refuses to connect unless the daemon reports
 //! exactly this [`PROTOCOL_VERSION`] (`desktop/src-tauri/src/daemon_bridge.rs`,
 //! `classify_handshake`) — that check runs before the build-stamp comparison
-//! and its session-scoped bypass cannot reach it. No other client refuses on a
-//! version *difference*: `72527b9` removed the laptop-side `connect`
-//! comparison this note used to name (issue #491 — it compared two constants
-//! that never shared a wire), leaving only a presence floor there, and the
-//! local TUI attach path never had one (issue #405). Single-binary in-process
-//! call sites match versions by construction.
+//! and its session-scoped bypass cannot reach it. `72527b9` removed the
+//! laptop-side `connect` comparison this note used to name (issue #491 — it
+//! compared two constants that never shared a wire), leaving only a presence
+//! floor there. **Fork issue #17 adds the local same-machine attach path**
+//! ([`crate::build_version_handshake::ensure_compatible_daemon_or_die`]) to
+//! the set of enforcers: an installed upgrade routinely leaves an older
+//! daemon running under a newer TUI, and before this fix the local path
+//! compared build-ids only, letting a protocol-skewed daemon attach and the
+//! TUI silently drop every event it could not decode. Genuinely in-process
+//! call sites still match versions by construction and need no check.
+
 //!
 //! # Wire format
 //!
@@ -343,6 +348,15 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// makes a skew *nameable* — it is the number the handshake reports, what
 /// `daemon hello` prints, and the input any future compatibility gate will
 /// read; #405 is what will make it *refused*.
+///
+/// Fork issue #17: the "no call site refuses on it today" note above used to
+/// describe only the REMOTE path, which is what running rule 12's
+/// cross-version test against a local 6/7 pair exposed — the local attach
+/// compared build-ids and never looked at `server_version`, so the old TUI
+/// attached and quietly dropped every `ShellBusy`/`ShellIdle` frame.
+/// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`] now
+/// enforces this constant on the local path too, so a bump refuses BOTH
+/// pairings rather than only the SSH one.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
