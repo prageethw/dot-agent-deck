@@ -2185,7 +2185,6 @@ async fn delegate_018_successful_delegate_confirms_itself_on_stdout_inner() {
     daemon.registry.shutdown_all();
 }
 
-
 // ---------------------------------------------------------------------
 // upstream #331 / fork #76 — the work-done output path collision.
 //
