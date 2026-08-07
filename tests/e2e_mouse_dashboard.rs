@@ -69,14 +69,10 @@ fn dashboard_001_click_selects_double_click_focuses() {
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
     deck.wait_for_string("[New Pane Ctrl+N]");
     // The realpane card's body shows "Launch an agent..." (a No-agent pane).
-    // Locate the card by that text — find_in_grid("realpane") would hit the
-    // focused-pane preview's title bar on the right, not the card.
-    deck.wait_for_string("Launch an agent");
-
-    // Double-click the realpane card → focus its pane (PaneInput mode).
-    let (col, row) = deck
-        .find_in_grid("Launch an agent")
-        .expect("realpane card body should be on the dashboard");
+    // Wait for the card by that text and double-click it → focus its pane
+    // (PaneInput mode). Locating "realpane" instead would hit the focused-pane
+    // preview's title bar on the right, not the card.
+    let (col, row) = deck.wait_for_in_grid("Launch an agent");
     deck.click(col, row);
     deck.click(col, row); // second click within the double-click window
     deck.wait_for_string("PaneInput mode");

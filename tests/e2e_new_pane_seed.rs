@@ -388,6 +388,7 @@ fn new_pane_015_registry_defaults_and_codex_launches_wrapped() {
     open_new_pane_form(&deck);
     // `wait_for_in_grid` dumps the grid itself on timeout, so the form
     // snapshot this used to keep for its panic message is no longer needed.
+    // The actual new-pane UI must expose an Agent selector.
     let (agent_x, agent_y) = deck.wait_for_in_grid("Agent:");
     deck.click(agent_x, agent_y);
 

@@ -62,9 +62,7 @@ fn tabstrip_001_click_header_switches_tab() {
 
     // The Dashboard header sits in the top strip and is currently inactive
     // (the freshly-opened Mode tab is active). Click it.
-    let (col, row) = deck
-        .find_in_grid("Dashboard")
-        .expect("tab strip should render a Dashboard header");
+    let (col, row) = deck.wait_for_in_grid("Dashboard");
     deck.click(col + 1, row);
 
     // Switching to the Dashboard tab shows the dashboard's session-count title

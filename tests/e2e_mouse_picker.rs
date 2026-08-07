@@ -44,9 +44,7 @@ fn picker_001_single_click_selects_row() {
     let deck = TuiDeck::launch_with_fixture("picker");
     open_picker(&deck);
 
-    let (col, row) = deck
-        .find_in_grid("childdir")
-        .expect("childdir row should be listed");
+    let (col, row) = deck.wait_for_in_grid("childdir");
     deck.click(col, row);
     // Deterministic wait IS the assertion: the childdir row gains the "> "
     // selection marker.
@@ -65,9 +63,7 @@ fn picker_001_double_click_enters_dir() {
     let deck = TuiDeck::launch_with_fixture("picker");
     open_picker(&deck);
 
-    let (col, row) = deck
-        .find_in_grid("childdir")
-        .expect("childdir row should be listed");
+    let (col, row) = deck.wait_for_in_grid("childdir");
     deck.click(col, row);
     deck.click(col, row); // second click within the double-click window
 
