@@ -43,6 +43,7 @@ pub mod pane_screen_text;
 pub mod platform;
 pub mod project_config;
 pub mod prompt_delivery;
+pub mod reconnect;
 pub mod remote;
 pub mod remote_doctor;
 pub mod schedule_cli;
