@@ -2283,6 +2283,27 @@ without depending on the config struct API.
 - **Does not assert:** the duplicate-delegation distinguishability itself (upstream #330's actual knock-on harm — too slow/indirect to pin without the idle-worker detector firing, see the tester's `work-done` report); the pane-delivery contract already covered by `orchestration/delegate/001`/`005`.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/delegate/022 — An unresolved role must not be confirmed as delegated: `delegate_targets` drops a role with no registered pane, but `handle_delegate` still echoes it back as armed (fork #92 P1, follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket + real `handle_delegate` + a `cat`-stub worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess targets a THIRD role with no pane at all).
+- **Asserts:** the subprocess's exit status is not success. Deliberately does not pin the exit-code value, stderr wording, or `DelegateResponse` field shape — the fix's exact reply shape for zero-resolution is not settled, only that it must not read as success.
+- **Does not assert:** partial resolution (one requested role resolves, a sibling does not) — the tester's `work-done` report flags this as needing a design decision before it can be pinned; the self-target sibling case (`orchestration/delegate/023`); the duplicate-role case (`orchestration/delegate/024`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/023 — A self-targeted delegate (the orchestrator naming its own role) must not be confirmed as delegated: `delegate_targets` excludes the orchestrator's own pane from role resolution regardless of role-name match (fork #92 P1, follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket + real `handle_delegate` + a `cat`-stub worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess is invoked from the orchestrator pane targeting its own role name, `"orchestrator"`).
+- **Asserts:** the subprocess's exit status is not success, for the same reason as `orchestration/delegate/022`.
+- **Does not assert:** the exit-code value, stderr wording, or `DelegateResponse` field shape; the unresolved-role sibling case (`orchestration/delegate/022`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/024 — A duplicated target role (`--to coder --to coder`) must be confirmed as armed exactly once, matching the single pane `delegate_targets` actually dispatches to after de-duplication (fork #92 P2, follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess, invoked with two `--to coder` flags, + an in-process daemon hook socket + real `handle_delegate` + a single `cat`-stub worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and one `cat`-stub `coder` worker pane registered in the same orchestration).
+- **Asserts:** the subprocess exits successfully (one pane really is armed) and its stdout names the role exactly once — not once per duplicated request — so the caller cannot mistake an echoed duplicate for a second worker having been armed.
+- **Does not assert:** the exact confirmation wording or format; the unresolved-role and self-target cases (`orchestration/delegate/022`/`023`).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/002 — The full lock-governed focus contract, end to end in a real Orchestration tab: LOCKED by default with focus on the orchestrator; a worker's `WaitingForInput` visibly pulls focus to itself and its resolution visibly returns focus to the orchestrator on the all-clear edge; `Ctrl+d` then `Ctrl+e` unlocks; a manual focus choice on a non-orchestrator role then sticks through both a fresh waiting episode and its all-clear, because unlocked runs no auto-focus branch at all (PRD #393 M5, the CLAUDE.md rule 4 headline test for this PRD). `orchestration_focus_001` — the PRD #373 M2 inactivity snap-back's PTY proof, and this catalog section's only entry before it — was deleted outright at PRD #393 M4 along with the production behavior it covered; `002` re-establishes the section covering the successor behavior M4/M4b/M5 actually shipped.
