@@ -821,11 +821,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
 
-        let socket_path = std::env::temp_dir().join(format!(
-            "dot-agent-deck-test-error-socket-003-{}.sock",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
         let listener =
             std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
 
@@ -862,7 +859,6 @@ mod tests {
                 None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
             }
         }
-        let _ = std::fs::remove_file(&socket_path);
 
         match outcome {
             Ok(value) => assert_eq!(
@@ -900,11 +896,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
 
-        let socket_path = std::env::temp_dir().join(format!(
-            "dot-agent-deck-test-error-socket-004-{}.sock",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
         let listener =
             std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
 
@@ -938,7 +931,6 @@ mod tests {
             }
         }
         let _ = daemon_thread.join();
-        let _ = std::fs::remove_file(&socket_path);
 
         assert_eq!(
             result,
