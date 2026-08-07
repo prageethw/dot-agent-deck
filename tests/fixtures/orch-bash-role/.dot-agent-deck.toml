@@ -1,0 +1,13 @@
+# Fixture for the L2 real-pane proof that Ctrl+l reaches a focused
+# orchestration role pane's PTY (tabs/orchestration/024, PRD #387 M1b). A
+# single-role orchestration whose orchestrator (start) role runs a real
+# interactive bash/readline shell instead of a `cat` stub, so readline's
+# clear-screen binding can actually run when Ctrl+l is forwarded. No real
+# LLM tokens spent.
+[[orchestrations]]
+name = "bash-role"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "env PS1='CTRLL> ' bash --noprofile --norc -i"
+start = true

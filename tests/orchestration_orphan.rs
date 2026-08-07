@@ -118,6 +118,7 @@ fn card(orphaned: bool) -> SessionState {
         pane_id: Some(ORCHESTRATOR_PANE.to_string()),
         agent_id: Some("1".to_string()),
         display_name: Some("orchestrator".to_string()),
+        pending_permission_tool: None,
         shell_synthetic_working: false,
         orchestration_orphaned: orphaned,
     }

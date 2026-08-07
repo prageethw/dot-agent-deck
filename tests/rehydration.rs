@@ -3146,6 +3146,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         pane_id: Some("pane-hostile".to_string()),
         agent_id: Some("hostile-live-7".to_string()),
         display_name: None,
+        pending_permission_tool: None,
         shell_synthetic_working: false,
         orchestration_orphaned: false,
     };

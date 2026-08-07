@@ -61,7 +61,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | SHA | Commit | Status |
 | --- | --- | --- |
 | `9ca7de1` | `docs(claude): correct rule 8's required-status-check claim` | **base** (upstream commit) |
-| `ab71a28` | `fix(prd-336): toggle orchestration pane-column split ratio [CI shadow] (#2)` | **PERMANENT** fork-only |
+| `ab71a28` | `fix(prd-336): toggle orchestration pane-column split ratio [CI shadow] (#2)` | **PERMANENT** fork-only, but **as an ancestor only** — superseded by `30c5f79`, see note below |
 | `ac43b4e` | `feat(prd-333): color orchestration tab labels by highest-priority pane status (#3)` | **TEMPORARY** — see watch-item below |
 | `349e895` | `fork-only: remove agent-type badge from cards, rename title to worker-deck (#4)` | **PERMANENT** fork-only |
 | `bbad18a` | `fork-only: auto-focus active orchestration tab on WaitingForInput pane (#5)` | **PERMANENT** fork-only |
@@ -70,7 +70,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `e42b288` | `fork-only: add devbox.json/.dot-agent-deck.toml backups + restore doc (#8)` | **PERMANENT** fork-only |
 | `e034c45` | `fork-only: carry the sync-workflow doc onto this branch too` | **PERMANENT** fork-only (this doc) |
 | `86d13e2` | `fork-only: document the active-config check before delegating` | **PERMANENT** fork-only (this doc) |
-| `30c5f79` | `feat(prd-371): three-stage Ctrl+l pane-split toggle (Default/Narrow/Hidden) (#10)` | **PERMANENT** fork-only |
+| `30c5f79` | `feat(prd-371): three-stage Ctrl+l pane-split toggle (Default/Narrow/Hidden) (#10)` | **PERMANENT** fork-only — supersedes `ab71a28`'s mechanism, see note below |
 | `8c07d10` | `fix(prd-372): clear WaitingForInput on the approved tool's own ToolStart (#11)` | **PERMANENT** fork-only |
 | `26255e8` | `feat(prd-374): lock command entry to the orchestrator pane, Ctrl+e to unlock (#12)` | **PERMANENT** fork-only |
 | `35780ef` | `fork-only: reassign orchestrator/coder to opus, release to haiku (#13)` | **PERMANENT** fork-only |
@@ -80,6 +80,16 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `08a9402` | `fork-only: run the L2 e2e tier in CI as an informational, non-blocking job` | **PERMANENT** fork-only |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of this sync (2026-08-05). Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`. This sync also picked up 7 commits (`30c5f79` through `d6e1d21`) that had landed directly on `main` since the previous sync without ever being added to `fork-only` — a reminder that `fork-only` needs to be kept current as fork-specific work lands on `main`, not just rebuilt at sync time. Consider re-curating it (or running the sync procedure) more often than "whenever it's badly out of date" to keep this drift small.
+
+### Supersession: PRD #371's `SplitStage` replaces PRD #336's `split_narrow`
+
+`ab71a28` (PRD #336) and `30c5f79` (PRD #371) are **not** two parallel fork features that happen to overlap — they are two generations of one feature. #336 introduced a two-stage `split_narrow: bool` on `Tab::Orchestration`; #371 replaced it with a three-stage `SplitStage` enum carried by both `Tab::Dashboard` and `Tab::Orchestration`. Verified on `main`: `split_narrow` has **zero** occurrences anywhere under `src/`, while `SplitStage` has 14 hits in `src/tab.rs` and 44 in `src/ui.rs`. So `ab71a28` is no longer *independently* PERMANENT — nothing it added survives on the fork in its own right. It stays in the stack because `30c5f79` is written on top of it: it is a required ancestor, not a feature to preserve on its own terms.
+
+This matters at sync time because upstream PR #342 is #336's mechanism continued upstream, and it has evolved past `ab71a28` — on that branch the split became global and gained a `scope_orchestration_split` helper in `src/ui.rs`, neither of which exists on the fork. **When #342 merges,** `upstream/main` gains `split_narrow: bool` plus `scope_orchestration_split`, and the next `git rebase upstream/main` will surface both against the fork's `SplitStage`. **Resolve that as a supersession, not a merge** — a mechanical three-way merge would happily leave *both* `split_narrow` and `SplitStage` alive:
+
+- **Take the fork's `SplitStage`**, and drop upstream's `split_narrow` field and all of its call sites entirely. A `bool` and a three-variant enum are the same feature at two granularities, and the enum is strictly the later generation.
+- **Take upstream's `scope_orchestration_split` as the seed**, rather than reinventing it — it is the reviewed artefact, and the one genuinely still-wanted thing to come out of #336/#342. PRD #387 generalises it into `scope_split_stage`.
+- **Update this table in the same pass:** once `split_narrow` is gone from the merged tree, `ab71a28`'s row is purely historical.
 
 ### Watch-item: PRD #333 is temporary
 
