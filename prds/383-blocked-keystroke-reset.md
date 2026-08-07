@@ -1,6 +1,8 @@
 # PRD #383: Blocked-keystroke reset for the Orchestration inactivity timer (Orchestration tabs only)
 
-**Status**: Not started
+> **Delivered via PRD [#373](https://github.com/vfarcic/dot-agent-deck/issues/373), not as a separate PR.** This PRD was carved out of #373's M3 while #374 was still in flight. Once #374's command-entry lock landed (`936a603`), the user decided the blocked-keystroke reset should ship in #373's own PR rather than separately, so it was folded back in as #373's M3: the lock's drop site in `handle_key_event`'s `UiMode::PaneInput` arm stamps `Tab::Orchestration::last_role_pane_activity_at` before returning `Action::Continue`, pinned by `tabs/orchestration/019`. See `prds/373-auto-return-focus.md` (M3) for what shipped. Everything below is retained as the original design record; no separate implementation work remains here.
+
+**Status**: Delivered via PRD #373 (see the note above) — no separate work remains
 **Priority**: Medium
 **Created**: 2026-08-05
 **GitHub Issue**: [#383](https://github.com/vfarcic/dot-agent-deck/issues/383) (closed upstream as not-planned; this fork continues the work independently)
