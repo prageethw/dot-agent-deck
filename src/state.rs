@@ -637,6 +637,120 @@ fn role_path_slug(role: &str) -> String {
     format!("{readable}-{}", role_digest_hex(role))
 }
 
+/// Hex characters of the digest [`work_done_file_name`] appends for the
+/// reporting `pane_id`. Deliberately wider than [`ROLE_SLUG_DIGEST_HEX`]'s 32
+/// bits (PR #90 pre-merge review, P2): that width is justified there by a
+/// low, roughly-fixed cardinality (a handful of configured role names per
+/// deck) and an operator who already controls both colliding names. Neither
+/// holds for `pane_id` — it's task-name-derived and unbounded for scheduled
+/// panes — and a collision here has a materially worse failure shape than a
+/// role-name collision. The archive rework above ([`archive_existing_report`])
+/// makes a collision on the SAME pane's own path fail loudly, but it can't
+/// help two DIFFERENT panes colliding on the same digest: orchestrator A's
+/// feedback, already written into its pane pointing at the shared path
+/// before orchestrator B's worker ever collides with it, has no way to be
+/// retroactively amended with a warning — the archive announces the second
+/// collision to orchestrator B, not the silent staleness that then hits
+/// orchestrator A. 16 hex characters is the full, untruncated 64-bit FNV-1a
+/// output (vs. [`role_digest_hex`]'s 32-bit truncation): the birthday bound
+/// on a collision at that width is far beyond any realistic number of live
+/// panes in one deck.
+const PANE_DIGEST_HEX: usize = 16;
+
+/// FNV-1a over the reporting pane's `pane_id`, at the full untruncated width
+/// documented on [`PANE_DIGEST_HEX`]. Same constants and algorithm as
+/// [`role_digest_hex`] — deliberately not `DefaultHasher`, whose output is
+/// only guaranteed stable within one toolchain build and this value is baked
+/// into on-disk filenames and pinned e2e test expectations — kept as a
+/// separate function rather than a width parameter on `role_digest_hex` so
+/// each call site's width stays a fixed, grep-able constant instead of a
+/// value threaded through at every call.
+fn pane_digest_hex(pane_id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in pane_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:0width$x}", width = PANE_DIGEST_HEX)
+}
+
+/// The daemon's work-done output filename for `role`, keyed on the reporting
+/// pane's `pane_id` (upstream #331 + fork #76). Two panes running the same
+/// role in the same cwd — two live orchestrations, or one worker re-delegated
+/// within the same run — are still two different `pane_id`s, so this stays
+/// unique per pane instead of colliding on role name alone.
+///
+/// Public so [`Self::handle_work_done`] (the write site) and e2e tests that
+/// need to assert against the exact on-disk path compute the same name
+/// instead of each guessing at the format independently.
+pub fn work_done_file_name(role: &str, pane_id: &str) -> String {
+    let safe_name = sanitize_role_name(role);
+    format!("work-done-{safe_name}-{}.md", pane_digest_hex(pane_id))
+}
+
+/// Bounded attempts to claim a fresh, unique archive slot in
+/// [`archive_existing_report`] before giving up. Generous relative to any
+/// realistic collision count on one pane's output path — running out means
+/// the directory itself is in trouble (permissions, a full filesystem),
+/// not that collisions are common.
+const ARCHIVE_ATTEMPT_LIMIT: u32 = 1000;
+
+/// Move the report already sitting at `dir/{file_name}` aside to a fresh,
+/// uniquely-named archive slot, and return that slot's file name (not full
+/// path) on success.
+///
+/// PR #90 pre-merge review, P1 (a): the previous fix archived every
+/// collision to the same fixed `{file_name}.prev.md` destination via
+/// `std::fs::rename`, which replaces its destination atomically on both
+/// platforms this project ships for (`rename(2)` on Unix; `MoveFileEx` with
+/// `MOVEFILE_REPLACE_EXISTING` on Windows, which is what
+/// [`std::fs::rename`]'s own docs say it uses). A second collision archived
+/// fine; a THIRD collision then replaced that same fixed slot, silently
+/// destroying the first archived report one collision later —
+/// `delegate_026_third_collision_destroys_the_first_archived_report` proves
+/// it with three real `handle_work_done` calls.
+///
+/// Each candidate name (`{file_name}.prev.md`, then `.prev-2.md`,
+/// `.prev-3.md`, …) is claimed with [`std::fs::OpenOptions::create_new`]
+/// before use — atomic and no-replace on both platforms, unlike `rename` —
+/// so a slot already taken by an earlier collision is never handed out
+/// again. The final `rename` onto that just-claimed (empty) placeholder is
+/// safe: nothing of value is lost when our own empty file is replaced.
+fn archive_existing_report(dir: &std::path::Path, file_name: &str) -> std::io::Result<String> {
+    let current_path = dir.join(file_name);
+    for attempt in 1..=ARCHIVE_ATTEMPT_LIMIT {
+        // Every candidate ends in the literal `.prev.md` suffix (only an
+        // infix distinguishes retries) so `tests/common/mod.rs`'s
+        // `find_work_done_file` helper — which tells the CURRENT report
+        // apart from an archived one solely by that trailing suffix, and
+        // which this task's instructions forbid editing — keeps excluding
+        // every archive slot this produces, not just the first.
+        let archive_name = if attempt == 1 {
+            format!("{file_name}.prev.md")
+        } else {
+            format!("{file_name}.{attempt}.prev.md")
+        };
+        let archive_path = dir.join(&archive_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&archive_path)
+        {
+            Ok(placeholder) => {
+                drop(placeholder);
+                std::fs::rename(&current_path, &archive_path)?;
+                return Ok(archive_name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "no free archive slot under {} after {ARCHIVE_ATTEMPT_LIMIT} attempts",
+        dir.display()
+    )))
+}
+
 /// Assert that the inline `--task` allowlist condition on a generated surface
 /// names every character that surface's own prose calls excluded.
 ///
@@ -748,10 +862,11 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
 ///
 /// The suggested path is role-interpolated and deliberately outside the
 /// `work-done-*` namespace: the daemon writes its own summary to
-/// `.dot-agent-deck/work-done-<role>.md` (see `handle_work_done`), so a worker
-/// that parked its report there would have it silently overwritten (#331), and
-/// a shared fixed filename would let parallel workers in one cwd clobber each
-/// other (reviewer finding 1). The role component is reduced by
+/// `.dot-agent-deck/work-done-<role>-<pane digest>.md` (see [`work_done_file_name`],
+/// [`Self::handle_work_done`]), so a worker that parked its report there would
+/// have it silently overwritten (#331), and a shared fixed filename would let
+/// parallel workers in one cwd clobber each other (reviewer finding 1). The
+/// role component is reduced by
 /// [`role_path_slug`], whose digest is what keeps two distinct configured roles
 /// apart. That is collision *resistance*, not injectivity — two roles whose
 /// original bytes hash to the same 32 bits would still share a path — but the
@@ -790,7 +905,7 @@ fn work_done_footer(role: &str) -> String {
          `<summary-slug>` with a short name you invent from `[a-z0-9][a-z0-9-]*`, at most 40 \
          characters, containing no `/` and no `..`, and keep the whole path single-quoted. Do not \
          give the file a `work-done-*` name: the deck writes its own summary to \
-         `.dot-agent-deck/work-done-<your-role>.md`, so a report parked there is overwritten and \
+         `.dot-agent-deck/work-done-<your-role>-*.md`, so a report parked there is overwritten and \
          lost.\n\n\
          The file stays on disk after the handoff. Keep credentials, customer data, and other \
          secrets out of it, pick a path that does not already exist, and delete exactly that path \
@@ -3288,16 +3403,87 @@ impl AppState {
             return;
         }
 
-        // Write summary to .dot-agent-deck/work-done-{role}.md
+        // Write summary to .dot-agent-deck/work-done-{role}-{pane digest}.md.
+        // The filename is computed ONCE here and reused for the orchestrator
+        // pointer sentence below (§7 of the design writeup: two independently
+        // written `format!` calls that both encode the same name is exactly
+        // the kind of drift that reintroduces an unreadable pointer while
+        // "fixing" this).
         let safe_name = sanitize_role_name(&role_name);
+        let file_name = work_done_file_name(&role_name, &signal.pane_id);
+        // Upstream #331: a report already at this path is archived aside
+        // rather than clobbered, and the archive is announced in the
+        // feedback composed below — silence is the defining property of both
+        // bugs this closes, so surviving on disk isn't enough on its own.
+        let mut collision_note = String::new();
         if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
             let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 warn!(dir = %dir.display(), role = %role_name, error = %e, "failed to create work-done directory");
             }
-            let file_path = dir.join(format!("work-done-{safe_name}.md"));
-            if let Err(e) = std::fs::write(&file_path, &signal.task) {
-                warn!(path = %file_path.display(), role = %role_name, error = %e, "failed to write work-done summary");
+            let file_path = dir.join(&file_name);
+            // PR #90 review P1 (a): archiving to a fixed destination gets
+            // silently replaced by the NEXT collision one collision later
+            // (delegate_026). `archive_existing_report` claims a fresh,
+            // unique slot instead. If that also fails — the archive-failure
+            // fallback used to overwrite the current report directly, which
+            // just recreates the same silent-loss class in a different,
+            // predictable spot (rejected in review) — this report is NOT
+            // written; the existing file at `file_path` is left exactly as
+            // it was, and the orchestrator is told so explicitly below
+            // rather than being pointed at a report that silently isn't
+            // this worker's.
+            let mut skip_write = false;
+            if file_path.exists() {
+                match archive_existing_report(&dir, &file_name) {
+                    Ok(archive_name) => {
+                        warn!(
+                            path = %file_path.display(),
+                            archived_to = %dir.join(&archive_name).display(),
+                            role = %role_name,
+                            "work-done: a report already existed at this path; archived it \
+                             instead of overwriting"
+                        );
+                        collision_note = format!(
+                            " A previous report already existed at this path and was archived \
+                             to .dot-agent-deck/{archive_name} instead of being overwritten."
+                        );
+                    }
+                    Err(e) => {
+                        skip_write = true;
+                        tracing::error!(
+                            path = %file_path.display(),
+                            role = %role_name,
+                            error = %e,
+                            "work-done: failed to archive the existing report aside; refusing \
+                             to overwrite it — this report was NOT written"
+                        );
+                        collision_note = format!(
+                            " A previous report already existed at this path and could not be \
+                             archived aside ({e}); to avoid silently destroying it, THIS \
+                             report was NOT written — .dot-agent-deck/{file_name} still holds \
+                             the PREVIOUS report, not this one."
+                        );
+                    }
+                }
+            }
+            if !skip_write {
+                match std::fs::write(&file_path, &signal.task) {
+                    Ok(()) => {
+                        // docs/orchestration.md documents that the exact
+                        // filename is named in the daemon log line for the
+                        // write — this is that line, for the ordinary
+                        // (no-collision or successfully-archived) case.
+                        tracing::info!(
+                            path = %file_path.display(),
+                            role = %role_name,
+                            "work-done: wrote worker summary"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(path = %file_path.display(), role = %role_name, error = %e, "failed to write work-done summary");
+                    }
+                }
             }
         }
 
@@ -3327,7 +3513,7 @@ impl AppState {
 
         let feedback = format!(
             "Worker {safe_name} has completed their task. \
-             Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
+             Read .dot-agent-deck/{file_name} for their full report.{collision_note}"
         );
         if let Err(e) = registry
             .write_to_pane_and_submit(&orch_pane_id, &feedback)

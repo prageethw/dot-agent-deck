@@ -426,7 +426,7 @@ If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.
 
 Opening a second orchestration in a directory that already runs one is allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:
 
-- **The coordination files.** `.dot-agent-deck/worker-task-<role>.md` and `.dot-agent-deck/work-done-<role>.md` are keyed by role name within the directory. Two orchestrations that both have a `coder` role write the same two files, so the second brief overwrites the first before the first worker has necessarily read it.
+- **The coordination files.** `.dot-agent-deck/worker-task-<role>.md` is keyed by role name within the directory. Two orchestrations that both have a `coder` role write the same file, so the second brief overwrites the first before the first worker has necessarily read it. (`.dot-agent-deck/work-done-<role>-<pane digest>.md` is additionally keyed on the reporting pane, so two orchestrations' `coder` roles no longer clobber each other's report — a stale one is archived alongside the new report rather than silently overwritten, and the archive is announced in the orchestrator's feedback.)
 - **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it.
 
 So when you select an orchestration whose directory already hosts a live one, the new-pane form shows a warning:
@@ -455,7 +455,7 @@ The role name in `--to` must match the `name` field in the config exactly (case-
 
 ### Orchestrator receives no work-done feedback
 
-The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>.md` file is still written and can be read manually.
+The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>-<pane digest>.md` file is still written and can be read manually — the exact filename is also named in the daemon log line for the write.
 
 ### Prompt template is not being applied
 
