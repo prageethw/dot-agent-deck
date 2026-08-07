@@ -11909,6 +11909,7 @@ mod spawn_tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                shell_synthetic_working: false,
             }),
             spawned_at_ms: None,
             cli_name: None,
