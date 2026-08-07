@@ -532,6 +532,7 @@ fn request_from_socket_inner(json: &str, timeout: Option<std::time::Duration>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[test]
     fn map_session_start() {
@@ -751,6 +752,150 @@ mod tests {
         }
         let result = send_to_socket(r#"{"test": true}"#);
         assert!(result.is_none());
+    }
+
+    /// Scenario: A stub daemon accepts one connection, reads the request
+    /// line, then deliberately holds the connection open forever without
+    /// replying and without closing — simulating a wedged daemon. Fork issue
+    /// #89: `request_from_socket` relies entirely on the daemon closing the
+    /// connection and has no read/write bound of its own, so against this
+    /// daemon it hangs forever. Run it on a worker thread and bound the wait
+    /// with `recv_timeout` well above the production timeout the fix will add
+    /// (5s), so a still-unbounded `request_from_socket` fails fast with a
+    /// clear panic instead of hanging the CI runner until nextest's own
+    /// timeout.
+    #[spec("error/socket/003")]
+    #[test]
+    fn socket_003_unbounded_daemon_does_not_hang_forever() {
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "dot-agent-deck-test-error-socket-003-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Stub daemon: read the one request line, then go silent forever —
+        // never replies, never closes.
+        let _daemon_thread = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                drop(stream);
+            }
+        });
+
+        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
+        // the previous value is restored below before the lock is dropped.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = request_from_socket(r#"{"type":"get-seed"}"#);
+            let _ = tx.send(result);
+        });
+
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(15));
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_socket {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+        }
+        let _ = std::fs::remove_file(&socket_path);
+
+        match outcome {
+            Ok(value) => assert_eq!(
+                value, None,
+                "request_from_socket must fold a timed-out/unbounded daemon into None \
+                 (\"no seed\"), identical to a daemon that replies with nothing — got {value:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "request_from_socket did not return within 15s against a daemon that reads \
+                 the request and then never replies and never closes — it has no read/write \
+                 bound of its own (fork issue #89)"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the worker thread running request_from_socket dropped its channel without \
+                 sending a result"
+            ),
+        }
+    }
+
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, waits a short delay well inside the coming timeout bound, then
+    /// writes one JSON reply line. `request_from_socket` must still return
+    /// that line as `Some(...)`. This guards against the specific way the
+    /// fix for fork issue #89 could make things worse: a bound that fires too
+    /// eagerly would mistake a merely-slow daemon for an absent one and
+    /// silently fall back to PTY injection. This test is a correctness
+    /// control, not a timing measurement, and is expected to pass both before
+    /// and after the fix.
+    #[spec("error/socket/004")]
+    #[test]
+    fn socket_004_slow_but_replying_daemon_still_returns_the_reply() {
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "dot-agent-deck-test-error-socket-004-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Stub daemon: read the request line, wait a short delay comfortably
+        // inside the 5s bound the fix will add, then reply with one line.
+        let daemon_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = std::io::Write::write_all(&mut stream, br#"{"seed":"abc123"}"#);
+                let _ = std::io::Write::write_all(&mut stream, b"\n");
+                let _ = std::io::Write::flush(&mut stream);
+            }
+        });
+
+        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
+        // the previous value is restored below before the lock is dropped.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
+        }
+
+        let result = request_from_socket(r#"{"type":"get-seed"}"#);
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_socket {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+        }
+        let _ = daemon_thread.join();
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert_eq!(
+            result,
+            Some(r#"{"seed":"abc123"}"#.to_string()),
+            "a daemon that replies well inside the timeout bound must not be mistaken for \
+             an absent one"
+        );
     }
 
     #[test]
