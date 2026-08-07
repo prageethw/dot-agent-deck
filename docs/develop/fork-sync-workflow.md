@@ -115,7 +115,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `aed6343` | `feat(delegate): make daemon rejections and confirmations visible to the caller (#84)` | **UPSTREAM-WORTHY** — `delegate` is upstream functionality; the touched surfaces (`handle_delegate`, the hook socket reply, the CLI) carry no fork-only symbols |
 | `7441b0f` | `ci: add a Semgrep CE scan publishing SARIF to GitHub code scanning (#85, #86)` | **PERMANENT** fork-only (CI) |
 | `a9ef53e` | `ci: add SonarQube Cloud analysis, gated on the SONAR_TOKEN secret (#88)` | **PERMANENT** fork-only (CI) |
-| `65e46b2` | `fork-only: mirror the e2e failed/flaky summary to the job log (fork #32, #91)` | **PERMANENT** fork-only (CI) |
+| `65e46b2` | `fork-only: mirror the e2e failed/flaky summary to the job log (fork #32)` | **PERMANENT** fork-only (CI) — mirrors the fork-only `e2e:` job's own summary; that job does not exist upstream, so there is nothing there for this to apply to |
 | `d2ae7f4` | `ci: bump codeql-action/upload-sarif to v4, SHA-pinned (#94)` | **PERMANENT** fork-only (CI) |
 | `7fb79f6` | `ci: harden docs-publish shell-injection sites, drop secrets: inherit (fork #87) (#97)` | **UPSTREAM-WORTHY** — hardens `docs-publish.yml`/`release.yml`, both upstream's own files (hardcoded `ghcr.io/vfarcic/…` tags, `docs:` job gated to `github.repository == 'vfarcic/dot-agent-deck'`); the shell-injection pattern it fixes exists identically upstream |
 | `d4d0fe4` | `test(scheduler): settle the side pane before sampling in manager_016 (fork #81) (#96)` | **UPSTREAM-WORTHY** — generic e2e timing determinism plus a reusable test helper, no fork-specific content |
@@ -126,6 +126,8 @@ The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sy
 **Re-curated 2026-08-07.** The 2026-08-05 sync closed with `main` reset to `fork-only`; two days later `main` was **184 commits ahead** and running the documented `git reset --hard fork-only` would have discarded every one of them. Rows `0451799` onward are that re-curation: the 184 commits squashed into 22 logically-grouped commits, in `main`'s own topological order, each one's tree taken verbatim from `main` at a PR-merge boundary. Because `main` never takes upstream changes directly, the re-curation is verifiable by a single check — `git diff fork-only origin/main` must be **empty** apart from this file's own table update. It was, at `665ed77`.
 
 **Keep it current.** This is the second time the drift has been discovered rather than prevented (the 2026-08-05 sync picked up 7 uncurated commits; this one picked up 184). Re-curate whenever a PR merges to `main`, or at minimum on a fixed cadence — not "whenever it's badly out of date". Every re-curation that waits makes the squash grouping coarser and the next upstream rebase harder to reason about.
+
+**`65e46b2` (fork #32) landed on `main` via PR #91 after the 2026-08-07 re-curation above closed**, so it is exactly the kind of drift this section warns about: recorded here so it is not missed, but it still needs to be actually picked into `fork-only`'s own commit stack at the next sync — this row does not by itself mean it is there yet.
 
 ### Upstream candidates: what is on this stack that is not a fork customisation
 
