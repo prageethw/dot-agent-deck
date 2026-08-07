@@ -13,9 +13,16 @@
 //!   forward-compatible by design (older peer ignores the field, newer peer
 //!   tolerates its absence).
 //!
-//! The handshake itself ([`AttachRequest::Hello`]) is enforced only by the
-//! laptop-side `connect` flow — single-binary in-process call sites already
-//! match versions by construction and don't need the check.
+//! The handshake itself ([`AttachRequest::Hello`]) is enforced on BOTH attach
+//! paths: the laptop-side `connect` flow ([`crate::connect::probe_remote_protocol`],
+//! for SSH remotes) and the local same-machine attach
+//! ([`crate::build_version_handshake::ensure_compatible_daemon_or_die`]). Only
+//! genuinely in-process call sites match by construction and skip the check —
+//! the local TUI↔daemon pair does NOT, since an installed upgrade routinely
+//! leaves an older daemon running under a newer TUI (fork issue #17; before it,
+//! the local path compared build-ids only and let a protocol-skewed daemon
+//! attach, after which the TUI silently dropped every event it could not
+//! decode).
 //!
 //! # Wire format
 //!
@@ -203,6 +210,14 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// of a mid-session crash. `EventType` now also carries `#[serde(other)]`
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
+///
+/// Fork issue #17: that last paragraph described only the REMOTE path, which is
+/// what running rule 12's cross-version test against a local 6/7 pair exposed —
+/// the local attach compared build-ids and never looked at `server_version`, so
+/// the old TUI attached and quietly dropped every `ShellBusy`/`ShellIdle` frame.
+/// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`] now
+/// enforces this constant on the local path too, so a bump refuses BOTH
+/// pairings rather than only the SSH one.
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious

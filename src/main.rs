@@ -1382,6 +1382,11 @@ async fn run_tui_session() -> ExitCode {
     //     non-zero (the only non-zero-exit path).
     // Errors are already user-visible inside the helper, so we render no
     // further message here.
+    //
+    // Fork issue #17: the helper ALSO enforces `PROTOCOL_VERSION` before any of
+    // that, and a skew returns `HandshakeError::ProtocolMismatch`. That variant
+    // carries its whole (multi-line, actionable) message in `Display`, so the
+    // catch-all `Err(e)` arm below is what renders it — no special-casing here.
     let handshake_outcome =
         match build_version_handshake::ensure_compatible_daemon_or_die(&attach_path).await {
             Ok(outcome) => outcome,
