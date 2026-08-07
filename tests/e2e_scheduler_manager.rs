@@ -889,9 +889,17 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         "precondition: the mode side pane must visibly contain synthetic scrollback"
     );
     deck.scroll_n(100, 10, false, 8);
+    // `scroll_n` queues all 8 notches with no gap between them; the deck
+    // repaints after each one it processes. This first wait only proves the
+    // FIRST notch's repaint landed — under CI contention the remaining ~7
+    // can still be draining. Settling on the debounced value (not merely a
+    // changed one) before moving on means none of the initial scroll's
+    // notches can still be in flight to land after `before` is sampled
+    // below and read as a dialog-wheel leak that never happened (fork #81).
     deck.wait_until_grid("side pane scrolled into its history", |grid| {
         visible_side_scroll_markers(grid) != bottom_markers
     });
+    deck.wait_for_settled_grid_value(common::OBSERVATION_BUDGET, visible_side_scroll_markers);
 
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
