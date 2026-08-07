@@ -48,9 +48,48 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 /// has settled, short enough that test runtime stays bounded.
 pub const QUIESCENT_IDLE_MS: u64 = 50;
 
+/// Ceiling for every harness wait that polls for a POSITIVE observation of
+/// the deck: a string reaching the rendered grid, a widget's cell
+/// coordinates, the terminal cursor arriving somewhere, a spawned agent's
+/// recorder file filling in.
+///
+/// Fork issue #81: the previous 10-second ceiling — and the 2-15 second
+/// budgets tests passed to the `wait_*_within` family — encoded an
+/// assumption about how promptly the OBSERVED process gets scheduled, and on
+/// a contended runner that assumption is simply false. Measured on this
+/// fork's informational `e2e:` job on 2026-08-07: the tries that failed took
+/// 40-120s of wall clock while the retry that passed took 1-3s
+/// (`orchestration_lock_008` 56.8s FAIL then 2.9s PASS; `pane_003` 78.1s and
+/// 104.5s FAIL then 1.3s PASS). A logic regression cannot pass in 1.1s — the
+/// observed deck's render loop was descheduled past the budget and the poll
+/// expired having never seen the change. `.config/nextest.toml` already caps
+/// concurrent PTY tests at 2 for the same reason (issue #33), and its
+/// comment names this constant as the fragile assumption that survived that
+/// fix.
+///
+/// A poll-until-true wait costs nothing extra when the observation lands
+/// early, so this is priced for the worst case rather than the median: only
+/// a run that was going to fail anyway pays the full ceiling. It stays
+/// bounded on purpose — every wait still panics (or returns `false` into the
+/// caller's assertion) at the deadline, and `.config/nextest.toml`'s
+/// `terminate-after` kills a wedged test at 180s, which one burned budget
+/// plus a slow launch stays comfortably inside.
+///
+/// Widening a timeout is normally the move most likely to hide a real bug —
+/// fork #64's `delegate_011` looked like unfixable load-sensitivity and was
+/// a genuine tokio timer-wheel defect a wider window would have masked — so
+/// it is deliberately not the first tool. Where a test can wait on a
+/// stronger signal instead (the rendered needle itself via
+/// [`TuiDeck::wait_for_in_grid`], the exact cursor cell it expects via
+/// [`TuiDeck::wait_for_terminal_cursor_position_within`]), issue #81's sweep
+/// did that first; this budget only backs the waits where the thing being
+/// waited for already IS the signal.
+pub const OBSERVATION_BUDGET: Duration = Duration::from_secs(30);
+
 /// Default ceiling on quiescence / signal waits. Tests do not pass a
 /// budget — quiescence and string-signal waits are bounded internally.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Same value, and the same rationale, as [`OBSERVATION_BUDGET`].
+const WAIT_TIMEOUT: Duration = OBSERVATION_BUDGET;
 
 /// Max-lifetime cap for tests that spawn `dot-agent-deck wrap` DIRECTLY (rather
 /// than through [`TuiDeck`] / `DaemonProc`, which inject their own cap), so a
@@ -1434,10 +1473,20 @@ impl TuiDeck {
     /// for the real change. Requiring an actual `(row, col)` change from a
     /// known `from` baseline before settling closes that gap.
     ///
-    /// If the cursor never diverges from `from` within `timeout`, returns the
-    /// last (still-`from`-equal) snapshot observed — the caller's own assertion
-    /// on the returned value produces the diagnostic, exactly as it would for a
-    /// real product regression.
+    /// If the cursor never diverges from `from` within `timeout`, returns
+    /// the last (still-`from`-equal) snapshot observed — the caller's own
+    /// assertion on the returned value produces the diagnostic, exactly as
+    /// it would for a real product regression.
+    ///
+    /// Fork issue #81 left this with no callers, and it should stay that way
+    /// unless a test genuinely cannot name where the cursor is going: "moved,
+    /// then held still" is a proxy for "arrived", and it settles on whichever
+    /// frame happens to be steady when it looks. Reach for
+    /// [`wait_for_terminal_cursor_position_within`](Self::wait_for_terminal_cursor_position_within)
+    /// first — polling for the destination itself makes the wait and the
+    /// assertion the same predicate. Kept (with its history) because the
+    /// PRD #393 trap it documents is still a live one for the stability-only
+    /// primitive above.
     pub fn wait_for_terminal_cursor_change_then_settle(
         &self,
         from: TerminalCursorSnapshot,
@@ -1452,6 +1501,39 @@ impl TuiDeck {
                 return self.wait_for_settled_terminal_cursor(remaining);
             }
             if Instant::now() >= deadline {
+                return snap;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Poll the real terminal's hardware cursor until its `(row, col)`
+    /// satisfies `pred`, or `timeout` elapses; either way return the last
+    /// snapshot observed, so the caller's own assertion produces the
+    /// diagnostic — the same contract as
+    /// [`wait_for_terminal_cursor_change_then_settle`](Self::wait_for_terminal_cursor_change_then_settle).
+    ///
+    /// Prefer this over that helper whenever the test knows WHERE the cursor
+    /// is supposed to end up. "Diverged from a baseline, then held still for
+    /// ~60 ms" is only a proxy for "arrived": it can settle on an
+    /// intermediate frame — the deck repaints its own synthetic block cursor
+    /// (`src/terminal_widget.rs`) a frame after the PTY's echo — and hand
+    /// back a position the caller then asserts on, so a run where the cursor
+    /// DID reach its destination can still fail. Polling for the destination
+    /// itself cannot do that: it returns the instant the asserted property
+    /// holds and never before (fork issue #81). It is also the stronger
+    /// diagnostic, because the wait and the assertion are then the same
+    /// predicate rather than a proxy and a check that can disagree.
+    pub fn wait_for_terminal_cursor_position_within(
+        &self,
+        timeout: Duration,
+        pred: impl Fn(u16, u16) -> bool,
+    ) -> TerminalCursorSnapshot {
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snap = self.terminal_cursor_snapshot();
+            if pred(snap.row, snap.col) || Instant::now() >= deadline {
                 return snap;
             }
             std::thread::sleep(POLL_INTERVAL);
