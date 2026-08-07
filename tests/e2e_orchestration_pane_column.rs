@@ -152,12 +152,12 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // sufficient — it does not rule out sidebar content still being drawn
     // (e.g. a stray card fragment) that this substring search never looks
     // for. Directly assert NEITHER role's sidebar card marker
-    // ("\u{00b7} <role>", the same needle `has_role_status` below uses to
+    // (`" <role> "`, the same bounded needle `has_role_status` below uses to
     // find a sidebar deck card's title row) is present anywhere on the
     // settled grid, so Hidden is proven to render NO sidebar at all.
     let hidden_grid = deck.snapshot_grid();
     assert!(
-        !hidden_grid.contains("\u{00b7} orchestrator") && !hidden_grid.contains("\u{00b7} worker"),
+        !hidden_grid.contains(" orchestrator ") && !hidden_grid.contains(" worker "),
         "Hidden must render NO sidebar content at all — found a sidebar \
          role-card marker on the grid even though the pane column's left \
          edge reported column 0\nGrid:\n{hidden_grid}"
@@ -314,8 +314,8 @@ fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane()
 /// grid that row, after trimming ONLY the leading blank columns (the sidebar
 /// area to its left), reads exactly `"<role> ─..."` — the title text directly
 /// followed by the border-fill dashes, nothing else. A sidebar deck card's
-/// title line ("│ N status · role ─── status │") can never match: after
-/// trimming leading whitespace it starts with the card's own border glyph
+/// title line ("┌ N role ──── ● status ┐") can never match: after trimming
+/// leading whitespace it starts with the card's own border glyph
 /// (`┌`/`┏`/`│`), not the bare role name. This is what makes the check
 /// specific to the collapsed PANE-COLUMN frame rather than any other on-screen
 /// occurrence of the role name.
@@ -327,13 +327,18 @@ fn has_collapsed_frame(grid: &str, role: &str) -> bool {
 
 /// A sidebar deck card's title row (`render_session_card` in `src/ui.rs`)
 /// carries the role's display name and its live status word on the SAME
-/// rendered line, joined by the card's `\u{00b7}` separator (`" \u{00b7} {name} "`
-/// on the left, `" {dot} {status} "` on the right of the same `Block`). Search
-/// for `"\u{00b7} {role}"` plus `status` together on one line so the check is
-/// scoped to `role`'s own card rather than any occurrence of `status`
-/// anywhere on the settled grid (e.g. another role's card, or pane content).
+/// rendered line: the identity segment (` {num} {name} ` — no agent-type
+/// badge or `\u{00b7}` separator since the fork-only `349e895` removed both)
+/// sits left-aligned in the card's top border, the status segment
+/// (` {dot} {status} `) right-aligned on the same `Block::title`. The
+/// identity segment always carries a space immediately before AND after the
+/// role name (the numeric shortcut prefix ends in one, `identity_text` ends
+/// in the other), so `" {role} "` is a safe bounded needle. Search for it
+/// plus `status` together on one line so the check is scoped to `role`'s own
+/// card rather than any occurrence of `status` anywhere on the settled grid
+/// (e.g. another role's card, or pane content).
 fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
-    let role_needle = format!("\u{00b7} {role}");
+    let role_needle = format!(" {role} ");
     grid.lines()
         .any(|line| line.contains(&role_needle) && line.contains(status))
 }
