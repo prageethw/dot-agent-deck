@@ -494,6 +494,97 @@ fn resolve_task(
     }
 }
 
+/// Does `task_file` resolve into the daemon's own `.dot-agent-deck/work-done-*.md`
+/// output namespace ([`dot_agent_deck::state::work_done_file_name`])?
+///
+/// Upstream #331's own proposed fix: a `work-done --task-file <path>` whose
+/// path already sits where `handle_work_done` is about to write its own
+/// summary is a literal, mechanically-preventable setup for that summary to
+/// clobber the very file being reported — refused client-side, before ever
+/// reading the file or contacting the daemon. A glob on the immediate parent
+/// directory + filename prefix, not an exact match against today's filename
+/// shape: the daemon's own name now carries a per-pane digest suffix (fork
+/// #76), and this check must stay correct if that suffix ever changes again
+/// without knowing what it is.
+///
+/// PR #90 review P1 (b): a check on the SUPPLIED path's own lexical name and
+/// immediate parent is defeated by a symlink — a file symlink whose target
+/// resolves into the namespace (fork #76's `delegate_027`), or an
+/// intermediate directory symlink that aliases into `.dot-agent-deck` itself
+/// (`delegate_028`) — since neither changes what the argument itself looks
+/// like. [`resolve_work_done_candidate`] resolves as much of `task_file` as
+/// the filesystem allows before classification.
+///
+/// PR #90 re-review: comparing the resolved parent against
+/// `current_dir()/.dot-agent-deck` is itself wrong, because that compares
+/// against the CLI process's own cwd, not the pane's cwd the daemon actually
+/// writes under (`handle_work_done` keys off `pane_cwd_map[pane_id]`,
+/// captured at `StartAgent` time, which the client can never see). A worker
+/// that `cd`s before invoking the CLI makes that comparison diverge from the
+/// real output file in both directions — so there is no cwd this check can
+/// anchor to. The rule below anchors to nothing: it refuses whenever the
+/// resolved parent directory is literally named `.dot-agent-deck` and the
+/// filename matches the `work-done-*.md` glob, anywhere on disk, regardless
+/// of which cwd produced it. The accepted trade is a same-named decoy
+/// `.dot-agent-deck/work-done-*.md` elsewhere also being refused (a harmless
+/// false positive — rename the file) in exchange for never missing the real
+/// output file (the false negative that silently destroys a report). When
+/// nothing on disk can be resolved (the target file doesn't exist yet, or —
+/// as in this module's own unit tests — the path is a pure string exercising
+/// the glob shape with no backing filesystem state at all),
+/// [`resolve_work_done_candidate`] returns the original unresolved path and
+/// the same parent-name check applies to it directly, pinning that shape
+/// independent of resolution.
+fn is_work_done_output_path(task_file: &str) -> bool {
+    if task_file == "-" {
+        return false;
+    }
+    let path = std::path::Path::new(task_file);
+    let (resolved, _was_resolved) = resolve_work_done_candidate(path);
+
+    let is_work_done_name = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with("work-done-") && name.ends_with(".md"));
+    if !is_work_done_name {
+        return false;
+    }
+    let Some(resolved_parent) = resolved.parent() else {
+        return false;
+    };
+
+    resolved_parent.file_name().and_then(|n| n.to_str()) == Some(".dot-agent-deck")
+}
+
+/// Resolve `path` as far as the real filesystem allows, following every
+/// symlink along the way, and report whether any resolution actually
+/// happened.
+///
+/// Tries the full path first (handles both a symlinked file and a path
+/// reached through a symlinked intermediate directory, since
+/// [`std::path::Path::canonicalize`] follows symlinks in every component
+/// including the last). Falls back to resolving just the parent when the
+/// final component doesn't exist yet — a legitimate not-yet-written
+/// `--task-file` reached through an aliased directory must still resolve
+/// against the real directory, not the symlink's own name. Returns the
+/// original, unresolved path with `false` when neither resolves (nothing on
+/// disk backs any part of it), so callers can tell "genuinely outside the
+/// namespace" apart from "not on disk to check" and choose a lexical
+/// fallback instead of misclassifying the latter as a resolution failure.
+fn resolve_work_done_candidate(path: &std::path::Path) -> (std::path::PathBuf, bool) {
+    if let Ok(resolved) = path.canonicalize() {
+        return (resolved, true);
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(resolved_parent) = parent.canonicalize()
+        && let Some(name) = path.file_name()
+    {
+        return (resolved_parent.join(name), true);
+    }
+    (path.to_path_buf(), false)
+}
+
 /// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
 fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
     if path == "-" {
@@ -747,6 +838,19 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            if let Some(ref path) = task_file
+                && is_work_done_output_path(path)
+            {
+                eprintln!(
+                    "Error: --task-file {path:?} resolves into dot-agent-deck's own \
+                     work-done output namespace (.dot-agent-deck/work-done-*.md). Sending \
+                     it back to `work-done` would let the daemon overwrite this exact file \
+                     with this call's own summary. Write your report somewhere else (e.g. \
+                     .dot-agent-deck/report-<role>-<summary-slug>.md) and pass that path \
+                     instead."
+                );
+                return ExitCode::FAILURE;
+            }
             let task = match resolve_task(task, task_file, std::io::stdin().lock()) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1879,6 +1983,41 @@ mod tests {
             err.contains("--task") && err.contains("--task-file"),
             "neither-given error should mention both flags: {err}"
         );
+    }
+
+    // `is_work_done_output_path` is the pure seam under the client-side
+    // refusal in the `work-done` CLI arm (upstream #331's own proposed fix),
+    // tested directly here so the glob shape (parent `.dot-agent-deck/` +
+    // `work-done-*.md` filename, not an exact match on today's filename) is
+    // pinned independent of the daemon-side digest suffix.
+
+    #[test]
+    fn work_done_output_path_matches_own_namespace() {
+        assert!(is_work_done_output_path(
+            ".dot-agent-deck/work-done-coder.md"
+        ));
+        assert!(is_work_done_output_path(
+            ".dot-agent-deck/work-done-coder-1a2b3c4d.md"
+        ));
+        assert!(is_work_done_output_path(
+            "sub/dir/.dot-agent-deck/work-done-reviewer-deadbeef.md"
+        ));
+    }
+
+    #[test]
+    fn work_done_output_path_rejects_files_outside_the_namespace() {
+        // Wrong directory.
+        assert!(!is_work_done_output_path("work-done-coder.md"));
+        assert!(!is_work_done_output_path("other-dir/work-done-coder.md"));
+        // Right directory, wrong filename shape.
+        assert!(!is_work_done_output_path(
+            ".dot-agent-deck/report-coder-abc123-my-summary.md"
+        ));
+        assert!(!is_work_done_output_path(
+            ".dot-agent-deck/worker-task-coder.md"
+        ));
+        // stdin sentinel must never be treated as a path.
+        assert!(!is_work_done_output_path("-"));
     }
 
     #[test]
