@@ -513,21 +513,34 @@ fn resolve_task(
 /// intermediate directory symlink that aliases into `.dot-agent-deck` itself
 /// (`delegate_028`) — since neither changes what the argument itself looks
 /// like. [`resolve_work_done_candidate`] resolves as much of `task_file` as
-/// the filesystem allows before classification, and where the daemon's own
-/// output directory for this process's cwd is itself knowable (it already
-/// exists on disk), the comparison is against that directory's canonical
-/// path rather than a bare `".dot-agent-deck"` name match — immune to a
-/// same-named decoy directory elsewhere. When nothing on disk can be
-/// resolved (the target file doesn't exist yet, or — as in this module's own
-/// unit tests — the path is a pure string exercising the glob shape with no
-/// backing filesystem state at all), this falls back to the original lexical
-/// check so that shape stays pinned independent of resolution.
+/// the filesystem allows before classification.
+///
+/// PR #90 re-review: comparing the resolved parent against
+/// `current_dir()/.dot-agent-deck` is itself wrong, because that compares
+/// against the CLI process's own cwd, not the pane's cwd the daemon actually
+/// writes under (`handle_work_done` keys off `pane_cwd_map[pane_id]`,
+/// captured at `StartAgent` time, which the client can never see). A worker
+/// that `cd`s before invoking the CLI makes that comparison diverge from the
+/// real output file in both directions — so there is no cwd this check can
+/// anchor to. The rule below anchors to nothing: it refuses whenever the
+/// resolved parent directory is literally named `.dot-agent-deck` and the
+/// filename matches the `work-done-*.md` glob, anywhere on disk, regardless
+/// of which cwd produced it. The accepted trade is a same-named decoy
+/// `.dot-agent-deck/work-done-*.md` elsewhere also being refused (a harmless
+/// false positive — rename the file) in exchange for never missing the real
+/// output file (the false negative that silently destroys a report). When
+/// nothing on disk can be resolved (the target file doesn't exist yet, or —
+/// as in this module's own unit tests — the path is a pure string exercising
+/// the glob shape with no backing filesystem state at all),
+/// [`resolve_work_done_candidate`] returns the original unresolved path and
+/// the same parent-name check applies to it directly, pinning that shape
+/// independent of resolution.
 fn is_work_done_output_path(task_file: &str) -> bool {
     if task_file == "-" {
         return false;
     }
     let path = std::path::Path::new(task_file);
-    let (resolved, was_resolved) = resolve_work_done_candidate(path);
+    let (resolved, _was_resolved) = resolve_work_done_candidate(path);
 
     let is_work_done_name = resolved
         .file_name()
@@ -540,12 +553,6 @@ fn is_work_done_output_path(task_file: &str) -> bool {
         return false;
     };
 
-    if was_resolved
-        && let Ok(cwd) = std::env::current_dir()
-        && let Ok(namespace_dir) = cwd.join(".dot-agent-deck").canonicalize()
-    {
-        return resolved_parent == namespace_dir;
-    }
     resolved_parent.file_name().and_then(|n| n.to_str()) == Some(".dot-agent-deck")
 }
 
