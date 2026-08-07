@@ -122,6 +122,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `26d2a75` | `docs(fork-sync): de-stale the upstream-candidates list and drop the brittle row count (#100)` | **PERMANENT** fork-only (doc) |
 | `b907479` | `docs(fork-sync): carry PR #95's 65e46b2 row curation, resolve the duplicate (fork #95)` | **PERMANENT** fork-only (doc) — resolves the `65e46b2` row collision and carries the drift-tracking paragraph from `main` |
 | `8641f52` | `docs(develop): record the "red for one reason" TDD lesson (fork #98)` | **PERMANENT** fork-only (doc) — maintainer-facing process documentation about this fork's own CI-driven TDD loop (CLAUDE.md rule 5), no upstream analogue |
+| `9ed01ae` | `fix(hook): bound get-seed's socket read/write at 5s (fork #99, #89)` | **UPSTREAM-WORTHY** — `request_from_socket` is upstream's own hook-socket plumbing; an unbounded blocking read/write against a silent daemon is a defect there too, not a fork customisation |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
@@ -146,6 +147,7 @@ The rows above marked **UPSTREAM-WORTHY** or **MIXED** are on `fork-only` becaus
 - `aed6343` — `delegate` never surfaced daemon rejections or confirmations back to the caller (fork #84).
 - `7fb79f6` — `docs-publish.yml` splices `${{ … }}` into `run:` blocks; `release.yml`'s `docs:` job passes `secrets: inherit` unnecessarily (fork #87) — now open upstream as PR #410 (https://github.com/vfarcic/dot-agent-deck/pull/410, opened 2026-08-07).
 - `d4d0fe4` — `manager_016` samples the side pane before an 8-notch scroll has drained (fork #81).
+- `9ed01ae` — `request_from_socket` has no read/write bound of its own and hangs forever against a daemon that accepts the connection and then goes silent (fork #99, #89).
 
 **Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
