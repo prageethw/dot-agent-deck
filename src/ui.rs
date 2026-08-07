@@ -1575,6 +1575,22 @@ struct UiState {
     /// is likewise driven by a single global chord (`Ctrl+t`). Not
     /// persisted: every deck starts at `Default` on launch.
     split_stage: SplitStage,
+    /// PRD #393 M2 (decision 2): the deck-global command-entry lock toggled
+    /// by `Ctrl+e`. One value for the whole deck — every Orchestration tab
+    /// reads it, so toggling on any of them changes it on all of them and a
+    /// newly opened Orchestration tab adopts the current value. Replaces the
+    /// per-tab `Tab::Orchestration::command_entry_locked` field PRD #374
+    /// added; the lock reflects how someone is working right now, not which
+    /// tab they happened to open. Same shape, lifetime and "deck-global UI
+    /// preference" semantics as `pane_layout` / `split_stage` above.
+    ///
+    /// Deck-global is about WHERE the value lives, not how far the gate
+    /// reaches (decision 3): `gate_pane_input_key` still only ever gates
+    /// `Tab::Orchestration`, and `scope_command_entry_lock` still only ever
+    /// claims the chord there, in `UiMode::Normal`. Starts `true` — only the
+    /// orchestrator pane accepts direct input until `Ctrl+e` unlocks it.
+    /// Not persisted: every deck starts locked on launch.
+    command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -1868,6 +1884,9 @@ impl UiState {
             update_available: None,
             pane_layout: PaneLayout::Stacked,
             split_stage: SplitStage::Default,
+            // PRD #393 M2: every deck starts LOCKED (PRD #374's default,
+            // now held once for the whole deck).
+            command_entry_locked: true,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             selection: None,
@@ -4283,28 +4302,69 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 /// because the active orchestration tab's command-entry lock is engaged.
 /// Follows this codebase's existing no-op-with-feedback convention (e.g.
 /// `RequestConfigGen`'s "No active agent session to send prompt to.").
-const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+e to unlock";
+///
+/// PRD #393 M6: the wording now names `Ctrl+d` first. This message is only
+/// ever shown from `UiMode::PaneInput` — which, after M1 scoped
+/// `ToggleOrchestrationLock` to `UiMode::Normal`, is precisely the mode where
+/// `Ctrl+e` alone does nothing. Naming only the unlock chord instructed the
+/// user to press a chord that provably cannot work from where they stand.
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
 
 /// PRD #374 (#361 Item 3): gate the PTY-forward fallback [`handle_pane_input_key`]
-/// produces against the active orchestration tab's command-entry lock. When
-/// the active tab is `Tab::Orchestration`, its lock is engaged, and the
-/// currently focused pane is not the orchestrator
-/// (`role_pane_ids[start_role_index]`), a would-be `Action::ForwardToPane` is
-/// dropped (returned as `Action::Continue`) before it ever reaches the
-/// pane's PTY. The orchestrator pane's own input is never gated, and
-/// non-orchestration tabs (Dashboard/Mode) are unaffected — this is the sole
-/// gate site, so global chords resolved earlier by `global_action_for_mode`
-/// are never touched by it.
+/// produces against the command-entry lock. When the active tab is
+/// `Tab::Orchestration`, the lock is engaged, and the currently focused pane
+/// is not the orchestrator (`role_pane_ids[start_role_index]`), a would-be
+/// `Action::ForwardToPane` is dropped (returned as `Action::Continue`) before
+/// it ever reaches the pane's PTY. The orchestrator pane's own input is never
+/// gated, and non-orchestration tabs (Dashboard/Mode) are unaffected — this is
+/// the sole gate site, so global chords resolved earlier by
+/// `global_action_for_mode` are never touched by it.
+///
+/// PRD #393 M2: the lock itself is read from the deck-global
+/// [`UiState::command_entry_locked`] rather than a per-tab field. Only WHERE
+/// the value lives changed — the tab-kind match below is what bounds the
+/// gate's reach to Orchestration tabs (decision 3), and it is unchanged.
+/// `ui` is taken whole rather than as a bare `bool` because the lock is a
+/// `UiState` concern and the gate reads it from that seam — *not* because
+/// `UiState` can also answer "what is this pane's status right now". It
+/// cannot: nothing in `UiState` caches per-pane [`SessionStatus`], so M3's
+/// carve-out takes the pane-status join as its own parameter below. (An
+/// earlier version of this comment claimed the opposite; it was wrong.)
+///
+/// PRD #393 M3 (decision 4): while the focused non-orchestrator role pane
+/// reports [`SessionStatus::WaitingForInput`], the lock stops gating that pane
+/// and the keystroke passes through untouched. The lock's subject is the
+/// *unsolicited* interruption of a working agent; an agent that has stopped and
+/// asked is already blocked on a human, so answering it is a response to a
+/// request rather than an intrusion into state the orchestrator believes it
+/// owns (see the PRD's "Why the lock exists at all"). The exemption is a pure
+/// read of live status with nothing latched anywhere, so the gate re-engages on
+/// the very next keystroke once the status clears.
+///
+/// `pane_status` is the `pane_id -> SessionStatus` join
+/// [`build_pane_status_for_gate`] returns, handed straight over by the call
+/// site. That producer — not this consumer — is where ambiguity is resolved: it
+/// omits any `pane_id` claimed by more than one session, and the `Some(...)`
+/// match below then denies the exemption for a missing key without needing to
+/// know why it is missing. See its docs for why the guard cannot live here.
+/// **Accepted limitation** (decision 4, stated in the PRD): an agent that never
+/// reports `WaitingForInput` gets no carve-out and still needs a deliberate
+/// `Ctrl+e` — the same blind spot `auto_focus_waiting_pane` and PRD #333's tab
+/// coloring already carry, so it adds no new class of one.
 fn gate_pane_input_key(
     action: Action,
+    ui: &UiState,
     tab_manager: &TabManager,
     pane: &dyn PaneController,
+    pane_status: &HashMap<&str, SessionStatus>,
 ) -> Action {
     if !matches!(action, Action::ForwardToPane(_)) {
         return action;
     }
+    if !ui.command_entry_locked {
+        return action;
+    }
     let Tab::Orchestration {
-        command_entry_locked: true,
         role_pane_ids,
         start_role_index,
         ..
@@ -4313,7 +4373,20 @@ fn gate_pane_input_key(
         return action;
     };
     let orchestrator_pane_id = role_pane_ids.get(*start_role_index).map(String::as_str);
-    if pane.focused_pane_id().as_deref() == orchestrator_pane_id {
+    let focused_pane_id = pane.focused_pane_id();
+    if focused_pane_id.as_deref() == orchestrator_pane_id {
+        return action;
+    }
+    // PRD #393 M3 (decision 4): the carve-out, checked LAST so it can only ever
+    // widen what gets through — the orchestrator's never-gated rule above and
+    // the tab-kind/lock guards before it keep their existing meaning whatever
+    // status happens to be attached to a pane.
+    if let Some(pane_id) = focused_pane_id.as_deref()
+        && matches!(
+            pane_status.get(pane_id),
+            Some(SessionStatus::WaitingForInput)
+        )
+    {
         return action;
     }
     Action::Continue
@@ -5079,10 +5152,12 @@ fn focus_deck(
                         ),
                         std::time::Instant::now(),
                     ));
-                    // PRD #373 M2: a digit-jump (`Action::FocusCard`) that lands
-                    // on a new pane counts as activity — see
+                    // PRD #76 M2.20: a digit-jump (`Action::FocusCard`) that
+                    // lands on a new pane starts the submit-debounce clock, so
+                    // an Enter arriving straight after the jump is still
+                    // separated from whatever preceded it. See
                     // `mirror_selection_into_focus`'s stamp for the cycling-key
-                    // counterpart and why the 30s inactivity timer needs both.
+                    // counterpart.
                     ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                     // PRD #84 M4: focusing a pane just updates focus state; the
                     // per-frame `resize_panes_to_layout` pass sizes the (now
@@ -5134,11 +5209,10 @@ fn mirror_selection_into_focus(
         && let Some(pane_id) = session.pane_id.as_ref()
     {
         let _ = pane.focus_pane(pane_id);
-        // PRD #373 M2: a manual selection move (arrow/Tab/j-k cycling, card
-        // click) that lands on a new pane counts as activity, same as a
-        // forwarded keystroke — the 30s inactivity timer
-        // (`TabManager::auto_focus_after_inactivity`) must start from the
-        // moment focus lands, not only from a later keystroke into the pane.
+        // PRD #76 M2.20: a manual selection move (arrow/Tab/j-k cycling, card
+        // click) that lands on a new pane starts the submit-debounce clock,
+        // same as a forwarded keystroke — see `focus_deck`'s digit-jump stamp
+        // for the counterpart.
         ui.last_pane_keystroke_at = Some(std::time::Instant::now());
     }
 }
@@ -5152,6 +5226,12 @@ fn mirror_selection_into_focus(
 /// silently regressing the feature. Inlining either step back into
 /// `run_tui` would defeat that — keep the call site in `run_tui` a
 /// one-liner to this helper.
+///
+/// `_tab_manager` is unused as of PRD #393 M4: it existed only to stamp
+/// `Tab::Orchestration::last_role_pane_activity_at` for the deleted
+/// inactivity snap-back. Kept in the signature so both call sites stay
+/// untouched by that deletion; drop it whenever the signature is next
+/// revisited.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_normal_mode_key(
     key: KeyEvent,
@@ -5161,26 +5241,11 @@ fn dispatch_normal_mode_key(
     filtered: &[(&String, &SessionState)],
     pane: &dyn PaneController,
     kb: &KeybindingConfig,
-    tab_manager: &mut TabManager,
+    _tab_manager: &mut TabManager,
 ) -> Action {
     let prev_selected_index = ui.selected_index;
     let result = handle_normal_key(key, ui, total, selected_status, kb);
     mirror_selection_into_focus(prev_selected_index, ui, filtered, pane);
-    // PRD #373 M2 fix: stamp this Orchestration tab's OWN activity clock —
-    // j/k/arrow/Tab role-pane cycling is active engagement and must not be
-    // mistaken for inactivity by the 30s snap-back (see
-    // `Tab::Orchestration::last_role_pane_activity_at`). Gated on the SAME
-    // condition `mirror_selection_into_focus` checks internally — the key
-    // actually moved `ui.selected_index` — so an unbound/no-op key doesn't
-    // refresh the clock and indefinitely defer a legitimate snap-back.
-    if prev_selected_index != ui.selected_index
-        && let Tab::Orchestration {
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-    {
-        *last_role_pane_activity_at = Some(std::time::Instant::now());
-    }
     result
 }
 
@@ -5570,23 +5635,6 @@ fn switch_tab_with_focus(
         // The pane focus is restored to on switch-in becomes the new focus
         // baseline (see the PR #151 pre-seed below).
         let mut restored_focus = tab_manager.restore_focus_on_switch_in();
-        // PRD #373 M2 (review fix): deliberately returning to an Orchestration
-        // tab is activity, so the restored role pane gets the full grace
-        // interval. Without this stamp the tab comes back carrying whatever
-        // `last_role_pane_activity_at` it had when the user left — typically
-        // already older than the timeout — and the very next frame's
-        // inactivity branch snaps focus straight off the worker role the user
-        // came back to inspect. Gated on a real tab move that actually
-        // restored a role pane; Dashboard/Mode tabs have no such clock.
-        if will_move
-            && restored_focus.is_some()
-            && let Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } = tab_manager.active_tab_mut()
-        {
-            *last_role_pane_activity_at = Some(std::time::Instant::now());
-        }
         // PRD #113 finding 1 + revision Change 1: entering a deck (Dashboard OR
         // Orchestration) via a real tab move starts the selection INACTIVE —
         // symmetric to the leave-deactivation above and across both decks. The
@@ -6654,6 +6702,45 @@ fn scope_split_stage(
     }
 }
 
+/// PRD #393 M1 (L1 `orchestration/lock/007`, L2 `orchestration/lock/008`):
+/// un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode.
+///
+/// Mirrors [`scope_split_stage`] above for the command-entry lock, for the same
+/// conflict class: `Ctrl+E` is `0x05`, readline's `end-of-line`. #374 claimed
+/// the chord on an Orchestration tab from *any* mode, so a focused pane's PTY
+/// never received the byte and the user could not move to the end of a line
+/// they were typing. Scoping the claim to `UiMode::Normal` lets `PaneInput`
+/// fall through to `handle_pane_input_key` → `keyevent_to_bytes` → `0x05` on
+/// the PTY instead; the user presses `Ctrl+D` first to toggle the lock, exactly
+/// as `Ctrl+W` (#241 M1 / #218) and `Ctrl+L` (#387 M1) already require.
+///
+/// `is_orchestration_tab` is true **only** for `Tab::Orchestration`, whose
+/// `role_pane_ids[start_role_index]` gives the chord something to mean — it is
+/// deliberately *not* `scope_split_stage`'s `has_split_sidebar`, which is also
+/// true for Dashboard tabs. PRD #393 decision 3 keeps the lock's reach
+/// unchanged: what goes deck-global at M2 is the state, not the reach.
+///
+/// This *replaces* #374's inline un-resolution rather than adding a second
+/// mechanism — the mode term is the only new condition. Kept a standalone pure
+/// function for #342/#387's stated reason: it is unit-testable without a PTY,
+/// whereas an inline `if` at the call site is only reachable through the full
+/// event loop.
+fn scope_command_entry_lock(
+    action: Option<Action>,
+    is_orchestration_tab: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::ToggleOrchestrationLock)
+            if !is_orchestration_tab || mode != UiMode::Normal =>
+        {
+            None
+        }
+        other => other,
+    }
+}
+
 /// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
 /// resolve a key the way the live loop does for a given mode.
 ///
@@ -7050,19 +7137,6 @@ fn send_config_gen_prompt(
                 // pre-draw `resize_panes_to_layout` on the next frame.
             }
             let _ = pane.focus_pane(pane_id);
-            // PRD #373 M2 fix: landing focus on a role pane through this
-            // path is active engagement too — stamp the tab's OWN activity
-            // clock, same as the SelectCard/FocusCard/Focus/ForwardToPane/
-            // paste/`dispatch_normal_mode_key` sites do, so the pane the
-            // user was just sent to doesn't inherit a stale (or `None`)
-            // timestamp and get snapped away on the next frame's 30s check.
-            if let Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                *last_role_pane_activity_at = Some(std::time::Instant::now());
-            }
             ui.mode = UiMode::PaneInput;
             ui.status_message = Some((
                 "Config prompt sent — press Enter to execute.".to_string(),
@@ -7200,25 +7274,39 @@ fn dispatch_action(
                     Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
             }
         }
-        // Ctrl+e: toggle the active orchestration tab's command-entry lock
-        // (PRD #374 / #361 Item 3). No-op outside an orchestration tab.
+        // Ctrl+e: toggle the deck-global command-entry lock (PRD #374 /
+        // #361 Item 3; moved onto `UiState` by PRD #393 M2). The action
+        // only ever reaches here from an Orchestration tab in command mode
+        // — `scope_command_entry_lock` un-resolves it everywhere else — so
+        // there is no per-tab guard left to apply, exactly as PRD #387 M2
+        // left `Ctrl+l`'s handler a single `ui.split_stage` assignment.
         Action::ToggleOrchestrationLock => {
-            if let Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } = tab_manager.active_tab_mut()
-            {
-                *command_entry_locked = !*command_entry_locked;
-                let lock_name = if *command_entry_locked {
-                    "locked"
-                } else {
-                    "unlocked"
-                };
-                ui.status_message = Some((
-                    format!("Pane entry: {lock_name}"),
-                    std::time::Instant::now(),
-                ));
+            ui.command_entry_locked = !ui.command_entry_locked;
+            // PRD #393 M4b — on the locked→unlocked half ONLY, drop the
+            // waiting-episode latch on EVERY Orchestration tab: the lock
+            // is deck-global, so unlocking stops observation everywhere at
+            // once and any tab can be left holding a frozen latch, not
+            // just the one active right now. From this frame on the
+            // render loop stops calling `observe_waiting_panes`, so a
+            // latch left standing here would freeze at its current value
+            // and be misread on re-lock as a fresh all-clear edge for an
+            // episode the human already dealt with by hand. Clearing on
+            // the unlocked→locked half instead would be wrong: that half
+            // is followed by frames that observe, so it has nothing to
+            // compensate for, and it would discard an edge the deck is
+            // about to act on legitimately.
+            if !ui.command_entry_locked {
+                tab_manager.clear_waiting_pane_latch();
             }
+            let lock_name = if ui.command_entry_locked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            ui.status_message = Some((
+                format!("Pane entry: {lock_name}"),
+                std::time::Instant::now(),
+            ));
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
@@ -7494,26 +7582,6 @@ fn dispatch_action(
                     *selected_session_id = Some(filtered[idx].0.clone());
                 }
                 mirror_selection_into_focus(prev, ui, filtered, pane);
-                // PRD #373 M2 fix: stamp this Orchestration tab's OWN
-                // activity clock ONLY when it's the active tab — a
-                // Dashboard-tab card click must not touch any Orchestration
-                // tab's clock (see `Tab::Orchestration::last_role_pane_activity_at`).
-                //
-                // Review fix: also gated on the selection actually MOVING,
-                // the same condition `mirror_selection_into_focus` checks
-                // internally (and the same gate `dispatch_normal_mode_key`
-                // got for unbound keys — orchestration_018). Re-clicking the
-                // card that is already selected focuses nothing, so counting
-                // it as activity would let repeated clicks on one card defer
-                // a legitimate snap-back indefinitely.
-                if prev != ui.selected_index
-                    && let Tab::Orchestration {
-                        last_role_pane_activity_at,
-                        ..
-                    } = tab_manager.active_tab_mut()
-                {
-                    *last_role_pane_activity_at = Some(std::time::Instant::now());
-                }
             }
         }
         // PRD #80 M4: `/` key or [Filter /] button → filter mode.
@@ -7537,20 +7605,9 @@ fn dispatch_action(
             {
                 entry.dismissed = true;
             }
-            let focused = focus_deck(idx, ui, filtered, snapshot, state, pane);
+            let _ = focus_deck(idx, ui, filtered, snapshot, state, pane);
             // PRD #84 M4: focusing a card can change which Stacked pane expands;
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
-            // PRD #373 M2 fix: stamp this Orchestration tab's OWN activity
-            // clock ONLY when it's the active tab (see
-            // `Tab::Orchestration::last_role_pane_activity_at`).
-            if focused
-                && let Tab::Orchestration {
-                    last_role_pane_activity_at,
-                    ..
-                } = tab_manager.active_tab_mut()
-            {
-                *last_role_pane_activity_at = Some(std::time::Instant::now());
-            }
         }
         // Mode tab in-tab navigation (j/Down): move side-pane focus down.
         // PRD #83: focus is tracked by stable pane id (`focused_pane_id`), so
@@ -7780,20 +7837,11 @@ fn dispatch_action(
                                 ),
                                 std::time::Instant::now(),
                             ));
-                            // PRD #373 M2: Enter-on-card (`Action::Focus`) landing
-                            // on a new pane counts as activity — same as the
-                            // digit-jump path in `focus_deck`.
+                            // PRD #76 M2.20: Enter-on-card (`Action::Focus`)
+                            // landing on a new pane starts the submit-debounce
+                            // clock — same as the digit-jump path in
+                            // `focus_deck`.
                             ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                            // PRD #373 M2 fix: also stamp this Orchestration
-                            // tab's OWN activity clock — see
-                            // `Tab::Orchestration::last_role_pane_activity_at`.
-                            if let Tab::Orchestration {
-                                last_role_pane_activity_at,
-                                ..
-                            } = tab_manager.active_tab_mut()
-                            {
-                                *last_role_pane_activity_at = Some(std::time::Instant::now());
-                            }
                         }
                         Err(PaneError::CommandFailed(ref msg)) => {
                             state.blocking_write().sessions.remove(sid);
@@ -8610,17 +8658,6 @@ fn dispatch_action(
                     ui.status_message = Some((e.to_string(), std::time::Instant::now()));
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                // PRD #373 M2 fix: also stamp this Orchestration tab's OWN
-                // activity clock, scoped so an unrelated Dashboard/Mode-tab
-                // keystroke can never suppress this tab's inactivity
-                // snap-back (see `Tab::Orchestration::last_role_pane_activity_at`).
-                if let Tab::Orchestration {
-                    last_role_pane_activity_at,
-                    ..
-                } = tab_manager.active_tab_mut()
-                {
-                    *last_role_pane_activity_at = Some(std::time::Instant::now());
-                }
             }
         }
         // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
@@ -9131,16 +9168,17 @@ fn handle_key_event(
             Tab::Mode { .. } => false,
         };
         action = scope_split_stage(action, has_split_sidebar, ui.mode);
-        // PRD #374 (#361 Item 3): same reasoning as ToggleOrchestrationSplit
-        // above — Ctrl+e is scoped to orchestration tabs. On a Dashboard/
-        // Mode-tab pane, un-resolve it so the key falls through to the
-        // normal PaneInput forwarding path instead of being silently
-        // swallowed here.
-        if matches!(action, Some(Action::ToggleOrchestrationLock))
-            && !matches!(tab_manager.active_tab(), Tab::Orchestration { .. })
-        {
-            action = None;
-        }
+        // PRD #374 (#361 Item 3), re-scoped by PRD #393 M1: same reasoning as
+        // CycleSplitStage above — Ctrl+e is claimed only on an Orchestration
+        // tab, and now only in command mode. On a Dashboard/Mode-tab pane, or
+        // inside a focused pane, un-resolve it so the key falls through to the
+        // normal PaneInput forwarding path (readline's end-of-line, 0x05)
+        // instead of being silently swallowed here. Note this is a FRESH
+        // Tab::Orchestration test, not `has_split_sidebar` above — that is
+        // also true for Dashboard tabs, whose gate reach is unchanged
+        // (#393 decision 3).
+        let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
+        action = scope_command_entry_lock(action, is_orchestration_tab, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -9226,7 +9264,22 @@ fn handle_key_event(
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
             UiMode::PaneInput => {
                 let candidate = handle_pane_input_key(key);
-                let gated = gate_pane_input_key(candidate.clone(), tab_manager, pane);
+                // PRD #393 M3: the gate needs live per-pane status for
+                // decision 4's `WaitingForInput` carve-out, and `UiState`
+                // caches none — so build the join from the `snapshot`
+                // already in scope here and hand it over. Deliberately
+                // `build_pane_status_for_gate`, not the plain
+                // `build_pane_status` the deck cards and pane borders read:
+                // it omits any `pane_id` claimed by more than one session,
+                // so an ambiguous pane can never earn the carve-out (review
+                // blocker 2 — see that function's docs).
+                let gated = gate_pane_input_key(
+                    candidate.clone(),
+                    ui,
+                    tab_manager,
+                    pane,
+                    &build_pane_status_for_gate(snapshot),
+                );
                 if matches!(candidate, Action::ForwardToPane(_))
                     && matches!(gated, Action::Continue)
                 {
@@ -9234,29 +9287,6 @@ fn handle_key_event(
                         ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
                         std::time::Instant::now(),
                     ));
-                    // PRD #373 M3: a keystroke DROPPED by #374's
-                    // command-entry lock still counts as activity. The
-                    // human is plainly engaged with this role pane even
-                    // though nothing reached its PTY, so the 30s
-                    // inactivity snap-back has to be deferred exactly as
-                    // a forwarded keystroke defers it — otherwise typing
-                    // at a locked pane looks idle, focus is yanked to
-                    // the (always-unlocked) orchestrator mid-typing, and
-                    // the NEXT keystrokes land there instead of being
-                    // dropped. Stamped here, at the drop site, rather
-                    // than inside `gate_pane_input_key`: the gate stays
-                    // a pure `&TabManager` predicate, and this branch is
-                    // already the exact "was forwardable, got blocked"
-                    // condition. Only reachable on an Orchestration tab
-                    // (the gate returns the action untouched for every
-                    // other tab type), so the match below always hits.
-                    if let Tab::Orchestration {
-                        last_role_pane_activity_at,
-                        ..
-                    } = tab_manager.active_tab_mut()
-                    {
-                        *last_role_pane_activity_at = Some(std::time::Instant::now());
-                    }
                 }
                 gated
             }
@@ -10663,108 +10693,47 @@ pub fn run_tui(
         // nothing is waiting) meant the frame a role first went
         // `WaitingForInput` — the frame the first branch consumes — never
         // recorded that it was waiting, so the all-clear edge for a
-        // single-frame waiting episode was lost. It also made the
-        // `had_waiting_pane` flag M2 gates itself on correct only by
-        // accident of this chain's shape; observing here makes it a
-        // property of the state instead.
-        tab_manager.observe_waiting_panes(&pane_status_for_tabs);
-        if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&pane_status_for_tabs) {
-            let _ = pane.focus_pane(&new_id);
-        } else if !crossterm::event::poll(std::time::Duration::from_millis(0))?
-            && let Some(new_id) = tab_manager.auto_focus_all_clear()
-        {
-            // PRD #373 M1 — only reached when the branch above found
-            // nothing left to steer toward this frame (see
-            // `TabManager::auto_focus_all_clear`'s doc comment for why
-            // that gate matters): the edge-triggered all-clear move to
-            // the orchestrator role.
-            //
-            // The `poll(0ms)` peek is the same pending-input guard the M2
-            // branch below carries, and matters here for the same reason:
-            // this move fires exactly when the user has just answered the
-            // last prompt and is likely still typing, and a key read after
-            // focus moved is forwarded to the ORCHESTRATOR's PTY — which
-            // #374's command-entry lock deliberately does not gate. Unlike
-            // M2's, this branch's skip costs nothing: the edge is latched
-            // in `all_clear_pending` and survives until consumed, so the
-            // move simply happens on a later frame, after the queued input
-            // has been dispatched to the pane it was aimed at.
-            let _ = pane.focus_pane(&new_id);
-        } else if let Some(last_activity_at) = (match tab_manager.active_tab() {
-            // PRD #373 M2 fix (post-#374): only the LOCKED (default) state
-            // ever arms this timer. #374 locks command entry to the
-            // orchestrator by default, so genuinely continuous typing on a
-            // role pane is only possible after a deliberate Ctrl+e unlock —
-            // and a wall-clock "time since last stamp" check is inherently
-            // racy against render-loop stalls (a frame that takes even a
-            // few hundred ms to get around to draining queued keystrokes
-            // makes the last stamp look stale even though the user never
-            // stopped typing). Gating on `command_entry_locked` sidesteps
-            // that race entirely for the unlocked case: while unlocked,
-            // this branch is skipped outright, no timer runs, so there's no
-            // stale timestamp to misread. Re-locking (or leaving the tab)
-            // resumes normal inactivity tracking.
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                command_entry_locked,
-                ..
-            } if *command_entry_locked => *last_role_pane_activity_at,
-            _ => None,
-        }) && !crossterm::event::poll(std::time::Duration::from_millis(0))?
-            && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-                std::time::Instant::now(),
-                last_activity_at,
-                // Normally `TabManager::INACTIVITY_TIMEOUT`; shortened only
-                // by the `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS` test seam
-                // so a PTY-attached e2e can observe the snap-back in a
-                // spawned process without waiting 30 real seconds.
-                TabManager::inactivity_timeout_from_env(),
-            )
-        {
-            // PRD #373 M2 — only reached when neither branch above moved
-            // focus this frame: 30 seconds with no pane-forwarded activity
-            // ON THIS TAB, while the tab is still command-entry LOCKED,
-            // snaps focus back to the orchestrator role. Reads the ACTIVE
-            // tab's own `last_role_pane_activity_at` rather than the global
-            // `ui.last_pane_keystroke_at` — a global timestamp let
-            // unrelated Dashboard/Mode-tab activity reset an Orchestration
-            // tab's clock (PRD #373 M2 scope-leak fix). Skipped entirely
-            // while it's still `None` (nothing has happened yet on this
-            // tab) rather than fabricating a start time for the timer.
-            // Also skipped while ANY role pane on this tab is still
-            // `WaitingForInput` — `auto_focus_after_inactivity` gates
-            // itself on the `had_waiting_pane` flag `observe_waiting_panes`
-            // refreshes from `pane_status_for_tabs` before the chain on
-            // every frame, so this branch can't fight
-            // `auto_focus_waiting_pane` by yanking focus off a role that's
-            // still asking the human a question.
-            //
-            // The `poll(0ms)` peek above closes an event-ordering race: this
-            // chain runs once per outer-loop iteration BEFORE that same
-            // iteration's `poll(16ms)`/`read()` further down, so a keystroke
-            // already sitting in the OS input buffer hasn't yet had a chance
-            // to refresh `last_role_pane_activity_at`. Without the peek, the
-            // chain could decide "30+ seconds elapsed" off a stale timestamp,
-            // snap focus back to the orchestrator, and then dispatch that
-            // already-queued keystroke — aimed at the role pane — into the
-            // orchestrator instead. Peeking (never *consuming*) and skipping
-            // this branch for the iteration defers the decision: the pending
-            // event is read and dispatched normally below, stamping the clock
-            // if it's a relevant keystroke, and the next iteration's chain
-            // sees the fresh timestamp. The guard is deliberately specific to
-            // this branch — the two above steer focus toward something the
-            // user needs to see, while this one yanks focus away.
-            //
-            // This behavior has no regression test: the race needs a real
-            // OS-level keystroke to land in a few-microsecond window relative
-            // to our own `crossterm::event::poll` call, at the exact moment
-            // the 30s threshold is crossed. crossterm's event source is a raw
-            // terminal/OS call, not routed through `PaneController` or any
-            // other injectable seam, so "a key is already queued in the OS
-            // buffer right now" can't be simulated deterministically at L1 or
-            // L2. Fixing it untested (rather than leaving it a documented
-            // known limitation) was an explicit call.
-            let _ = pane.focus_pane(&new_id);
+        // single-frame waiting episode was lost. It also made
+        // `had_waiting_pane` correct only by accident of this chain's
+        // shape; observing here makes it a property of the state instead.
+        //
+        // PRD #393 M4b — the WHOLE chain, observation included, runs only
+        // while the deck-global command-entry lock is engaged. While
+        // unlocked the deck makes no focus decision at all, so there is
+        // nothing for the human's manual focus choice to fight. The gate
+        // lives here, at the call site, rather than inside `TabManager`:
+        // after M2 the lock is a `UiState` concern and nothing in
+        // `src/tab.rs` knows it exists, which is the same seam
+        // `gate_pane_input_key` reads it from. Skipping
+        // `observe_waiting_panes` means a latch set before an unlock could
+        // otherwise survive across it — the toggle handler calls
+        // `clear_waiting_pane_latch` on the locked→unlocked half to
+        // compensate (see that method's doc comment for the straddling
+        // trace this protects).
+        if ui.command_entry_locked {
+            tab_manager.observe_waiting_panes(&pane_status_for_tabs);
+            if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&pane_status_for_tabs) {
+                let _ = pane.focus_pane(&new_id);
+            } else if !crossterm::event::poll(std::time::Duration::from_millis(0))?
+                && let Some(new_id) = tab_manager.auto_focus_all_clear()
+            {
+                // PRD #373 M1 — only reached when the branch above found
+                // nothing left to steer toward this frame (see
+                // `TabManager::auto_focus_all_clear`'s doc comment for why
+                // that gate matters): the edge-triggered all-clear move to
+                // the orchestrator role.
+                //
+                // The `poll(0ms)` peek is a pending-input guard: this move
+                // fires exactly when the user has just answered the last
+                // prompt and is likely still typing, and a key read after
+                // focus moved is forwarded to the ORCHESTRATOR's PTY — which
+                // #374's command-entry lock deliberately does not gate. The
+                // skip costs nothing: the edge is latched in
+                // `all_clear_pending` and survives until consumed, so the
+                // move simply happens on a later frame, after the queued input
+                // has been dispatched to the pane it was aimed at.
+                let _ = pane.focus_pane(&new_id);
+            }
         }
         let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
             .tabs()
@@ -11801,16 +11770,6 @@ pub fn run_tui(
                     // arrives at the agent as a standalone submit, not fused
                     // with the paste tail.
                     ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                    // PRD #373 M2 fix: also stamp this Orchestration tab's
-                    // OWN activity clock — see `ForwardToPane`'s matching
-                    // stamp and `Tab::Orchestration::last_role_pane_activity_at`.
-                    if let Tab::Orchestration {
-                        last_role_pane_activity_at,
-                        ..
-                    } = tab_manager.active_tab_mut()
-                    {
-                        *last_role_pane_activity_at = Some(std::time::Instant::now());
-                    }
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -12423,6 +12382,61 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
         .sessions
         .values()
         .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect()
+}
+
+/// PRD #393 review blocker 2 (PR #51) — the same `pane_id -> SessionStatus`
+/// join as [`build_pane_status`], but **fail-closed on ambiguity**: a `pane_id`
+/// claimed by more than one session is OMITTED from the result entirely,
+/// whatever those sessions' statuses say.
+///
+/// Only [`gate_pane_input_key`] (M3 decision 4's `WaitingForInput` carve-out)
+/// reads this. **Omission means "deny"**: the gate tests
+/// `matches!(pane_status.get(pane_id), Some(SessionStatus::WaitingForInput))`,
+/// which is false for a missing key, so leaving an ambiguous pane out of the
+/// map is exactly what makes the carve-out refuse to widen the lock. A single,
+/// unambiguous session behaves identically to [`build_pane_status`].
+///
+/// **Why this is a separate function, and why it must be the producer** — do
+/// not merge it back into [`build_pane_status`], and do not try to move the
+/// check into the gate instead:
+///
+/// - [`build_pane_status`] is deliberately left as-is. Its no-dedupe /
+///   iteration-order behaviour on colliding `pane_id`s is issue **#398**, which
+///   is out of scope here; PRD #333's tab colouring and PRD #373's focus
+///   steering both consume it and must keep today's behaviour. A colour or a
+///   focus hint being wrong on a collision is cosmetic; the lock being wrong is
+///   the security-shaped one, so only the lock's feed hardens.
+/// - `HashMap<&str, SessionStatus>` is one key, one value by construction, so a
+///   collision cannot be *represented* in the join's output at all — by the time
+///   the gate reads the map the ambiguity has already been discarded and no
+///   consumer-side check, however clever, can recover it. Only the raw
+///   `state.sessions` collection still knows, which is why the guard has to live
+///   here, on the producing side.
+/// - The rule is "any duplicate", not "any *disagreeing* duplicate". Permitting
+///   agreeing duplicates would hand the #401 scenario precisely what it wants: a
+///   second session that also claims `WaitingForInput` would sail through.
+///   "Closed only when the duplicates happen to disagree" is not fail-closed.
+///
+/// Reachable without an adversary: PRD #110 preserves `agent_id: None` for
+/// pre-F9 hooks, and that shape produces a duplicate session for an
+/// already-tracked pane (#398).
+pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, SessionStatus> {
+    // `None` marks a pane_id seen more than once; it is dropped below rather
+    // than resolved, since there is no defensible way to pick a winner.
+    let mut joined: HashMap<&str, Option<SessionStatus>> = HashMap::new();
+    for session in state.sessions.values() {
+        let Some(pane_id) = session.pane_id.as_deref() else {
+            continue;
+        };
+        joined
+            .entry(pane_id)
+            .and_modify(|slot| *slot = None)
+            .or_insert_with(|| Some(session.status.clone()));
+    }
+    joined
+        .into_iter()
+        .filter_map(|(pane_id, status)| status.map(|status| (pane_id, status)))
         .collect()
 }
 
@@ -23306,884 +23320,6 @@ mod tests {
         );
     }
 
-    /// Scenario: closes the M2 render-loop wiring gap flagged after
-    /// `tabs/orchestration/013` (which only drove
-    /// `TabManager::auto_focus_after_inactivity` in isolation), mirroring
-    /// `orchestration_011`'s technique of calling the REAL production
-    /// functions/call-site logic on a mock `PaneController` rather than
-    /// reimplementing them. Three things, against real `src/ui.rs` code:
-    /// (1) landing focus on a non-orchestrator role via the real
-    /// `mirror_selection_into_focus` — with no `Action::ForwardToPane`
-    /// ever having run — stamps `ui.last_pane_keystroke_at` on its own,
-    /// same as the digit-jump/Enter-on-card stamp sites; (2) the real
-    /// per-frame `else if` chain (`src/ui.rs:10377-10398`), mirrored line
-    /// for line as `orchestration_011` mirrors its `auto_focus_waiting_pane`
-    /// -only predecessor, applies the 30s snap-back through the pane
-    /// controller by reading the active tab's OWN
-    /// `Tab::Orchestration::last_role_pane_activity_at` field, exactly as
-    /// production now does; and (3) a scoping check: `Action::SelectCard`
-    /// (`src/ui.rs:7265-7278`) calls `mirror_selection_into_focus`
-    /// unconditionally — only the `selected_session_id` write is gated on
-    /// `Tab::Dashboard` — so a plain Dashboard-tab card click also stamps
-    /// the GLOBAL `ui.last_pane_keystroke_at`, but the M2 cross-tab
-    /// scope-leak fix (`441f043`) left the Orchestration tab's OWN
-    /// `last_role_pane_activity_at` untouched by that click. Part 3 pins
-    /// this REQUIRED behavior: with `coder`'s own `last_role_pane_activity_at`
-    /// genuinely 31s+ stale, an unrelated Dashboard-tab click (which only
-    /// resets the global field) must not suppress the snap-back — the
-    /// per-frame chain reads the per-tab field, not the global one, so the
-    /// snap-back still fires.
-    #[spec("tabs/orchestration/014")]
-    #[test]
-    fn orchestration_014_render_loop_wiring_applies_inactivity_snap_back() {
-        use std::time::{Duration, Instant};
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let orchestrator = role_ids[0].clone();
-        let coder = role_ids[1].clone();
-
-        let mut ui = default_ui();
-        assert!(
-            ui.last_pane_keystroke_at.is_none(),
-            "a fresh UiState has no recorded activity yet"
-        );
-
-        // --- Part 1: focus LANDING alone (no forwarded keystroke) stamps
-        // the timer, via the REAL `mirror_selection_into_focus`
-        // (src/ui.rs:5037) — the cycling-key/click counterpart to
-        // `focus_deck`'s digit-jump stamp.
-        let mut snapshot = AppState::default();
-        let mut sess = make_session(SessionStatus::Idle);
-        sess.session_id = "role-select".to_string();
-        sess.pane_id = Some(coder.clone());
-        snapshot.sessions.insert("role-select".to_string(), sess);
-        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-
-        ui.selected_index = Some(0);
-        mirror_selection_into_focus(None, &mut ui, &filtered, pc.as_ref());
-
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(coder.as_str()),
-            "mirror_selection_into_focus must focus the landed-on pane"
-        );
-        assert!(
-            ui.last_pane_keystroke_at.is_some(),
-            "landing focus alone — no Action::ForwardToPane ever ran in \
-             this test — must stamp last_pane_keystroke_at, exactly as a \
-             forwarded keystroke would"
-        );
-
-        // Reflect the landing in the tab's own bookkeeping — same direct
-        // assignment pattern `orchestration_012`/`013` use to simulate
-        // "the user is now looking at `coder`".
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-        } else {
-            panic!("expected an active Orchestration tab");
-        }
-
-        // --- Part 2: the real per-frame chain (src/ui.rs:10325-10348),
-        // mirrored line for line, applies the snap-back through the SAME
-        // pane controller `mirror_selection_into_focus` just focused,
-        // once 30s of synthetic inactivity have elapsed.
-        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
-        status.insert(orchestrator.as_str(), SessionStatus::Idle);
-        status.insert(coder.as_str(), SessionStatus::Idle);
-        ui.last_pane_keystroke_at = Some(Instant::now() - Duration::from_secs(31));
-
-        tab_manager.observe_waiting_panes(&status);
-        if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&status) {
-            let _ = pc.focus_pane(&new_id);
-        } else if let Some(new_id) = tab_manager.auto_focus_all_clear() {
-            let _ = pc.focus_pane(&new_id);
-        } else if let Some(last_activity_at) = ui.last_pane_keystroke_at
-            && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-                Instant::now(),
-                last_activity_at,
-                TabManager::INACTIVITY_TIMEOUT,
-            )
-        {
-            let _ = pc.focus_pane(&new_id);
-        }
-
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(orchestrator.as_str()),
-            "the mirrored per-frame chain must apply the 30s snap-back \
-             through the SAME pane controller `mirror_selection_into_focus` \
-             focused `coder` on"
-        );
-        assert!(
-            matches!(
-                tab_manager.active_tab(),
-                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == &orchestrator
-            ),
-            "the tab's own bookkeeping must agree with the pane controller"
-        );
-
-        // --- Part 3: scoping check. `Action::SelectCard` (src/ui.rs:7265)
-        // calls `mirror_selection_into_focus` unconditionally regardless of
-        // active-tab kind — only the `selected_session_id` write is gated
-        // on `Tab::Dashboard` — so a Dashboard-tab card click stamps the
-        // SAME global `last_pane_keystroke_at` an Orchestration-tab
-        // snap-back reads.
-        //
-        // Re-arm: the user looks at `coder` again, and this focus is
-        // genuinely 31s+ stale by the time the Dashboard click below
-        // happens. Also re-focus `coder` on the pane controller directly
-        // (every real focus-change call site keeps `pc` and the tab's
-        // bookkeeping in sync) so the upcoming switch-out capture doesn't
-        // see stale data. Stamp THIS tab's own `last_role_pane_activity_at`
-        // stale too — the field the fixed per-frame chain now reads — since
-        // nothing else in this test (`mirror_selection_into_focus` alone
-        // never touches it) has set it.
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-            *last_role_pane_activity_at = Some(Instant::now() - Duration::from_secs(31));
-        }
-        let _ = pc.focus_pane(&coder);
-        ui.last_pane_keystroke_at = Some(Instant::now() - Duration::from_secs(31));
-
-        tab_manager.switch_to(0);
-        // Mirror `switch_tab_with_focus`'s real call: Dashboard's
-        // switch-in restore is a no-op (its selection is keyed by session
-        // id, not a pane id — see `restore_focus_on_switch_in`'s doc
-        // comment), so `pc`'s focus is untouched by this call, but it must
-        // still run to match the real per-switch call sequence.
-        tab_manager.restore_focus_on_switch_in();
-        assert!(matches!(tab_manager.active_tab(), Tab::Dashboard { .. }));
-
-        // A genuinely new selection event on the Dashboard tab (standing in
-        // for what `sync_and_derive_selection` would have set
-        // `ui.selected_index` to on switch-in — out of scope to reproduce
-        // here) so `mirror_selection_into_focus`'s change-guard doesn't
-        // treat this as a no-op.
-        ui.selected_index = None;
-        let prev = ui.selected_index;
-        let dash_snapshot = dashboard_snapshot(1);
-        let dash_filtered: Vec<(&String, &SessionState)> = dash_snapshot.sessions.iter().collect();
-        ui.selected_index = Some(0);
-        mirror_selection_into_focus(prev, &mut ui, &dash_filtered, pc.as_ref());
-
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some("p0"),
-            "the Dashboard click must focus the Dashboard card's pane"
-        );
-        assert!(
-            ui.last_pane_keystroke_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
-            "the Dashboard click must have just reset the GLOBAL timestamp"
-        );
-
-        tab_manager.switch_to(orch_idx);
-        // Mirror `switch_tab_with_focus`'s real call: switching INTO an
-        // Orchestration tab restores its remembered role focus onto the
-        // pane controller (`TabManager::restore_focus_on_switch_in`,
-        // src/tab.rs:352-403) — so `pc`'s live focus goes back to `coder`
-        // here, exactly as it would in production, even though the
-        // Dashboard click above last called `pc.focus_pane` with a
-        // different pane.
-        let restored = tab_manager.restore_focus_on_switch_in();
-        assert_eq!(
-            restored.as_deref(),
-            Some(coder.as_str()),
-            "switch-in must restore this tab's remembered role (`coder`)"
-        );
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(coder.as_str()),
-            "switch-in restore must bring the pane controller's live focus \
-             back to `coder`, not leave it on the Dashboard's `p0`"
-        );
-        assert!(matches!(
-            tab_manager.active_tab(),
-            Tab::Orchestration { .. }
-        ));
-
-        // Run the SAME mirrored per-frame chain again on the now-active
-        // Orchestration tab. `coder`'s own focus is genuinely 31s+ stale,
-        // but the global timestamp the chain reads is the just-now
-        // Dashboard click, not that staleness.
-        tab_manager.observe_waiting_panes(&status);
-        if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&status) {
-            let _ = pc.focus_pane(&new_id);
-        } else if let Some(new_id) = tab_manager.auto_focus_all_clear() {
-            let _ = pc.focus_pane(&new_id);
-        } else if let Some(last_activity_at) = (match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        }) && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-            Instant::now(),
-            last_activity_at,
-            TabManager::INACTIVITY_TIMEOUT,
-        ) {
-            let _ = pc.focus_pane(&new_id);
-        }
-
-        // Invariant this pins: Orchestration-tab inactivity tracking must
-        // be per-tab, not derived from a global last-keystroke timestamp
-        // shared with Dashboard/Mode tabs.
-        //
-        // `coder`'s own focus on THIS Orchestration tab is genuinely 31s+
-        // stale — the just-now Dashboard-tab click is unrelated activity
-        // on a different tab and must not be able to reset this tab's own
-        // 30-second clock. So the snap-back must still fire this frame.
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(orchestrator.as_str()),
-            "an unrelated Dashboard-tab click must not suppress this \
-             Orchestration tab's own overdue snap-back — `coder`'s focus \
-             here is genuinely 31s+ stale regardless of Dashboard activity"
-        );
-        assert!(
-            matches!(
-                tab_manager.active_tab(),
-                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if p == &orchestrator
-            ),
-            "the tab's own bookkeeping must reflect the snap-back firing"
-        );
-    }
-
-    /// Scenario: gap `coder` flagged after `441f043` — `dispatch_normal_mode_key`
-    /// (`src/ui.rs:5067-5080`, invoked from `run_tui`'s Normal-mode arm at
-    /// `src/ui.rs:8951`) is a FOURTH caller of `mirror_selection_into_focus`
-    /// beyond the three `Action::SelectCard`/`FocusCard`/`Focus` call sites the
-    /// M2 wiring fix stamps `last_role_pane_activity_at` at. With a real
-    /// `TabManager`-opened 2-role Orchestration tab, focus manually landed on
-    /// the non-orchestrator `coder` role and its `last_role_pane_activity_at`
-    /// set to a synthetic 31-second-stale `Instant`, drives the REAL
-    /// `dispatch_normal_mode_key` with a `k` keypress over a `filtered` list
-    /// whose pane ids match the tab's role panes (mirroring
-    /// `jk_navigation_mirrors_selection_into_focus`'s technique) to cycle focus
-    /// from `coder` onto the orchestrator role's pane. Confirms the cycling
-    /// itself reaches the pane controller, then asserts
-    /// `last_role_pane_activity_at` is fresh as a result of that single call —
-    /// which fails today (RED) because this call site isn't gated/stamped.
-    #[spec("tabs/orchestration/015")]
-    #[test]
-    fn orchestration_015_role_pane_cycling_stamps_activity_clock() {
-        use std::time::{Duration, Instant};
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let orchestrator = role_ids[0].clone();
-        let coder = role_ids[1].clone();
-
-        // Land focus on the non-orchestrator `coder` role, with its own
-        // activity clock already 31s+ stale — the same starting state
-        // `orchestration_013`/`014` use for the snap-back scenario.
-        let _ = pc.focus_pane(&coder);
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-            *last_role_pane_activity_at = Some(Instant::now() - Duration::from_secs(31));
-        } else {
-            panic!("expected an active Orchestration tab");
-        }
-
-        // A `filtered` session list whose pane ids match the tab's role
-        // panes, sorted so `coder` sits at index 1 — the same shape
-        // `jk_navigation_mirrors_selection_into_focus` drives, just keyed to
-        // this tab's real role pane ids instead of synthetic `p0`/`p1`/`p2`.
-        let mut snapshot = AppState::default();
-        let mut orch_sess = make_session(SessionStatus::Idle);
-        orch_sess.session_id = "role-0-orchestrator".to_string();
-        orch_sess.pane_id = Some(orchestrator.clone());
-        snapshot
-            .sessions
-            .insert("role-0-orchestrator".to_string(), orch_sess);
-        let mut coder_sess = make_session(SessionStatus::Idle);
-        coder_sess.session_id = "role-1-coder".to_string();
-        coder_sess.pane_id = Some(coder.clone());
-        snapshot
-            .sessions
-            .insert("role-1-coder".to_string(), coder_sess);
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-        let total = filtered.len();
-
-        let mut ui = default_ui();
-        ui.selected_index = Some(1); // currently on `coder` (role-1-coder)
-        let kb = KeybindingConfig::default();
-
-        // Drive the REAL production dispatch path: `k` cycles up, from
-        // `coder` (index 1) to the orchestrator role (index 0).
-        dispatch_normal_mode_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
-            &mut ui,
-            total,
-            None,
-            &filtered,
-            pc.as_ref(),
-            &kb,
-            &mut tab_manager,
-        );
-
-        assert_eq!(
-            ui.selected_index,
-            Some(0),
-            "k must cycle selection up from `coder` to the orchestrator role"
-        );
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(orchestrator.as_str()),
-            "dispatch_normal_mode_key's mirror_selection_into_focus call must \
-             land real pane-controller focus on the orchestrator role"
-        );
-
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert!(
-            last_activity_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
-            "cycling to a different role pane via dispatch_normal_mode_key must \
-             stamp this Orchestration tab's last_role_pane_activity_at, same as \
-             the SelectCard/FocusCard/Focus/ForwardToPane stamp sites do — a \
-             user actively j/k-cycling through role panes must not have their \
-             engagement mistaken for inactivity by the 30s snap-back"
-        );
-    }
-
-    /// Scenario: with a real `TabManager`-opened 2-role Orchestration tab,
-    /// drives the REAL `send_config_gen_prompt` targeting the
-    /// non-orchestrator `coder` role pane and confirms it focuses that pane
-    /// on the real pane controller. Asserts the tab's own
-    /// `last_role_pane_activity_at` ends up `Some` and fresh, so this path
-    /// stamps the clock like the other gated call sites
-    /// (`Action::SelectCard`/`FocusCard`/`Focus`/`ForwardToPane`, paste,
-    /// `dispatch_normal_mode_key`) — a role pane reached this way must not
-    /// inherit a stale (or `None`) timestamp and misbehave on the very next
-    /// frame's 30s inactivity check.
-    #[spec("tabs/orchestration/017")]
-    #[test]
-    fn orchestration_017_send_config_gen_prompt_stamps_activity() {
-        use std::time::Duration;
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let coder = role_ids[1].clone();
-
-        let mut ui = default_ui();
-
-        send_config_gen_prompt(&coder, "/work", &mut ui, pc.as_ref(), &mut tab_manager);
-
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(coder.as_str()),
-            "send_config_gen_prompt must focus the target role pane on success"
-        );
-
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert!(
-            last_activity_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
-            "send_config_gen_prompt landing focus on a role pane must stamp \
-             this Orchestration tab's last_role_pane_activity_at, same as the \
-             SelectCard/FocusCard/Focus/ForwardToPane/dispatch_normal_mode_key \
-             stamp sites do — otherwise a role pane reached via this path can \
-             inherit a stale (or None) timestamp and misbehave on the very \
-             next frame's 30s inactivity check"
-        );
-    }
-
-    /// Scenario: with a real `TabManager`-opened 2-role Orchestration tab,
-    /// focus manually landed on the non-orchestrator `coder` role and its
-    /// `last_role_pane_activity_at` set to a known stale `Instant`, drives
-    /// the REAL `dispatch_normal_mode_key` with `z` — not bound to any
-    /// Normal-mode action by default, verified against every `default:`
-    /// binding in `src/keybindings.rs` — so `handle_normal_key` falls
-    /// through to `Action::Continue` without touching `ui.selected_index`
-    /// at all. Confirms the selection genuinely didn't move, then asserts
-    /// `last_role_pane_activity_at` is UNCHANGED (still the original stale
-    /// `Instant`): the stamp is gated on the selection actually moving, so
-    /// a no-op key can't refresh the clock and indefinitely defer a
-    /// legitimate 30s snap-back.
-    #[spec("tabs/orchestration/018")]
-    #[test]
-    fn orchestration_018_unbound_key_does_not_stamp_activity() {
-        use std::time::{Duration, Instant};
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let orchestrator = role_ids[0].clone();
-        let coder = role_ids[1].clone();
-
-        // Land focus on the non-orchestrator `coder` role, with its own
-        // activity clock set to a known stale `Instant` — the same starting
-        // state `orchestration_013`/`014`/`015` use.
-        let stale = Instant::now() - Duration::from_secs(31);
-        let _ = pc.focus_pane(&coder);
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-            *last_role_pane_activity_at = Some(stale);
-        } else {
-            panic!("expected an active Orchestration tab");
-        }
-
-        // A `filtered` session list whose pane ids match the tab's role
-        // panes, sorted so `coder` sits at index 1 — same shape
-        // `orchestration_015` drives.
-        let mut snapshot = AppState::default();
-        let mut orch_sess = make_session(SessionStatus::Idle);
-        orch_sess.session_id = "role-0-orchestrator".to_string();
-        orch_sess.pane_id = Some(orchestrator.clone());
-        snapshot
-            .sessions
-            .insert("role-0-orchestrator".to_string(), orch_sess);
-        let mut coder_sess = make_session(SessionStatus::Idle);
-        coder_sess.session_id = "role-1-coder".to_string();
-        coder_sess.pane_id = Some(coder.clone());
-        snapshot
-            .sessions
-            .insert("role-1-coder".to_string(), coder_sess);
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-        let total = filtered.len();
-
-        let mut ui = default_ui();
-        ui.selected_index = Some(1); // currently on `coder` (role-1-coder)
-        let kb = KeybindingConfig::default();
-
-        dispatch_normal_mode_key(
-            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
-            &mut ui,
-            total,
-            None,
-            &filtered,
-            pc.as_ref(),
-            &kb,
-            &mut tab_manager,
-        );
-
-        assert_eq!(
-            ui.selected_index,
-            Some(1),
-            "an unbound key must not move role-pane selection at all — if \
-             this fails, `z` is no longer a safe unbound-key fixture and \
-             the test needs a different key"
-        );
-
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert_eq!(
-            last_activity_at,
-            Some(stale),
-            "an unbound Normal-mode key that doesn't move role focus must \
-             leave last_role_pane_activity_at UNCHANGED — \
-             dispatch_normal_mode_key stamps it unconditionally today, \
-             outside mirror_selection_into_focus's own \
-             selected_index-changed gate, so even a no-op key refreshes \
-             the clock and indefinitely defers a legitimate 30s snap-back"
-        );
-    }
-
-    /// Scenario: PRD #373 M3, the combined interaction with #374's
-    /// command-entry lock. With a real `TabManager`-opened Orchestration tab
-    /// (locked by default), focus manually landed on the non-orchestrator
-    /// `coder` role and that tab's `last_role_pane_activity_at` set to a
-    /// stale `Instant` 31 seconds ago, drives the REAL `handle_key_event`
-    /// with a plain `x` in `UiMode::PaneInput` — the keystroke #374's lock
-    /// drops before it reaches the PTY. Confirms the drop actually happened
-    /// (the lock status message is up), then asserts the tab's activity
-    /// clock was refreshed anyway and that `auto_focus_after_inactivity` no
-    /// longer fires: a human typing at a locked pane is engaged, not idle,
-    /// so the blocked keystroke must reset the 30s snap-back timer.
-    #[spec("tabs/orchestration/019")]
-    #[test]
-    fn orchestration_019_blocked_keystroke_resets_inactivity_timer() {
-        use std::time::{Duration, Instant};
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let coder = role_ids[1].clone();
-
-        // The tab must start LOCKED for this to be the blocked-keystroke
-        // path at all (`orchestration/lock/001` pins that default; asserted
-        // here so this test can never silently become the FORWARDED case).
-        match tab_manager.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "a freshly opened orchestration tab must start locked"
-            ),
-            _ => panic!("expected an active Orchestration tab"),
-        }
-
-        // Land focus on the non-orchestrator `coder` role — the only place
-        // the lock drops keystrokes — with its own activity clock set to a
-        // known stale `Instant`, the same starting state
-        // `orchestration_013`/`014`/`015`/`018` use.
-        let stale = Instant::now() - Duration::from_secs(31);
-        let _ = pc.focus_pane(&coder);
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-            *last_role_pane_activity_at = Some(stale);
-        } else {
-            panic!("expected an active Orchestration tab");
-        }
-
-        let snapshot = AppState::default();
-        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
-        let filtered: Vec<(&String, &SessionState)> = Vec::new();
-        let mut ui = default_ui();
-        // The mode a focused (possibly locked) pane is actually in — where
-        // `gate_pane_input_key` runs.
-        ui.mode = UiMode::PaneInput;
-
-        handle_key_event(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            &mut ui,
-            pc.as_ref(),
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        // The lock's own feedback is the proof this WAS the blocked path and
-        // not an ordinary forward.
-        assert_eq!(
-            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
-            Some(ORCHESTRATION_LOCK_STATUS_MESSAGE),
-            "the keystroke must have been dropped by #374's command-entry \
-             lock — without that, this test isn't exercising the \
-             blocked-keystroke path at all"
-        );
-
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert!(
-            last_activity_at.is_some_and(|t| t > stale && t.elapsed() < Duration::from_secs(1)),
-            "a keystroke BLOCKED by the command-entry lock must still stamp \
-             this Orchestration tab's last_role_pane_activity_at — the human \
-             is plainly engaged with the pane even though nothing reached \
-             the PTY (PRD #373's resolved activity definition), so the 30s \
-             clock has to reset just as it does for a forwarded keystroke"
-        );
-
-        // The outcome that actually matters: with the clock reset, the
-        // snap-back that was due a moment ago must no longer fire.
-        assert_eq!(
-            tab_manager.auto_focus_after_inactivity(
-                Instant::now(),
-                last_activity_at.expect("stamped above"),
-                TabManager::INACTIVITY_TIMEOUT,
-            ),
-            None,
-            "after a blocked keystroke the inactivity snap-back must be \
-             deferred — otherwise a user typing at a locked role pane gets \
-             yanked to the orchestrator mid-typing and their next \
-             keystrokes land there instead"
-        );
-    }
-
-    /// Scenario: with a real `TabManager`-opened 2-role Orchestration tab
-    /// whose remembered focus is the non-orchestrator `coder` role and
-    /// whose activity clock has gone 31 seconds stale while the user was
-    /// away on the Dashboard, drives the REAL `switch_tab_with_focus`
-    /// there and back. Switching in restores `coder` on the pane
-    /// controller, and the return must count as activity: the tab's own
-    /// `last_role_pane_activity_at` is refreshed, so replaying the real
-    /// per-frame chain immediately afterwards leaves focus on `coder`
-    /// instead of snapping it to the orchestrator on the very first frame
-    /// back.
-    #[spec("tabs/orchestration/022")]
-    #[test]
-    fn orchestration_022_switching_back_refreshes_the_grace_interval() {
-        use std::time::{Duration, Instant};
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let orchestrator = role_ids[0].clone();
-        let coder = role_ids[1].clone();
-
-        // The user is looking at `coder`, with a clock that will be stale
-        // by the time they come back to it.
-        let stale = Instant::now() - Duration::from_secs(31);
-        let _ = pc.focus_pane(&coder);
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-            *last_role_pane_activity_at = Some(stale);
-        } else {
-            panic!("expected an active Orchestration tab");
-        }
-
-        let snapshot = AppState::default();
-        let mut ui = default_ui();
-
-        // Away to the Dashboard, then deliberately back — both legs
-        // through the REAL tab-switch path, not a raw `switch_to`.
-        assert!(switch_tab_with_focus(
-            &mut tab_manager,
-            0,
-            &*pc,
-            &snapshot,
-            &mut ui
-        ));
-        assert!(matches!(tab_manager.active_tab(), Tab::Dashboard { .. }));
-        assert!(switch_tab_with_focus(
-            &mut tab_manager,
-            orch_idx,
-            &*pc,
-            &snapshot,
-            &mut ui
-        ));
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(coder.as_str()),
-            "switching back must restore this tab's remembered role pane"
-        );
-
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert!(
-            last_activity_at.is_some_and(|t| t > stale && t.elapsed() < Duration::from_secs(1)),
-            "deliberately switching back to an Orchestration tab must \
-             refresh its activity clock — the restored role pane is what \
-             the user came back to look at"
-        );
-
-        // The outcome that matters: the real per-frame chain, run on the
-        // first frame after the switch, must leave `coder` alone.
-        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
-        status.insert(orchestrator.as_str(), SessionStatus::Idle);
-        status.insert(coder.as_str(), SessionStatus::Idle);
-        tab_manager.observe_waiting_panes(&status);
-        if let Some(new_id) = tab_manager.auto_focus_waiting_pane(&status) {
-            let _ = pc.focus_pane(&new_id);
-        } else if let Some(new_id) = tab_manager.auto_focus_all_clear() {
-            let _ = pc.focus_pane(&new_id);
-        } else if let Some(last) = (match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        }) && let Some(new_id) = tab_manager.auto_focus_after_inactivity(
-            Instant::now(),
-            last,
-            TabManager::INACTIVITY_TIMEOUT,
-        ) {
-            let _ = pc.focus_pane(&new_id);
-        }
-
-        assert_eq!(
-            pc.focused_pane_id().as_deref(),
-            Some(coder.as_str()),
-            "returning to a tab must not be immediately undone by the \
-             inactivity snap-back — the user gets the full grace interval \
-             on the role pane they came back to inspect"
-        );
-    }
-
-    /// Scenario: with a real `TabManager`-opened 2-role Orchestration tab
-    /// and a stale activity clock, drives the REAL `dispatch_action` with
-    /// `Action::SelectCard` for the card that is ALREADY selected. The
-    /// click moves no selection and `mirror_selection_into_focus` no-ops,
-    /// so the clock must be left untouched — otherwise repeated clicks on
-    /// one card defer a legitimate snap-back indefinitely, the same
-    /// over-broad accounting `tabs/orchestration/018` fixed for unbound
-    /// keys. A follow-up click on a DIFFERENT card is the positive control:
-    /// that one does stamp.
-    #[spec("tabs/orchestration/023")]
-    #[test]
-    fn orchestration_023_same_card_click_does_not_stamp_activity() {
-        use std::time::{Duration, Instant};
-        use tokio::sync::RwLock;
-
-        let pc = Arc::new(OpenTabPC::new());
-        let mut tab_manager = TabManager::new(pc.clone());
-        let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
-            .expect("open orchestration tab");
-        assert_eq!(tab_manager.active_index(), orch_idx);
-        let orchestrator = role_ids[0].clone();
-        let coder = role_ids[1].clone();
-
-        let stale = Instant::now() - Duration::from_secs(31);
-        let _ = pc.focus_pane(&coder);
-        if let Tab::Orchestration {
-            focused_role_pane_id,
-            last_role_pane_activity_at,
-            ..
-        } = tab_manager.active_tab_mut()
-        {
-            *focused_role_pane_id = Some(coder.clone());
-            *last_role_pane_activity_at = Some(stale);
-        } else {
-            panic!("expected an active Orchestration tab");
-        }
-
-        // A `filtered` list whose pane ids are the tab's role panes, sorted
-        // so `coder` sits at index 1 — the same shape `orchestration_018`
-        // builds.
-        let mut snapshot = AppState::default();
-        let mut orch_sess = make_session(SessionStatus::Idle);
-        orch_sess.session_id = "role-0-orchestrator".to_string();
-        orch_sess.pane_id = Some(orchestrator.clone());
-        snapshot
-            .sessions
-            .insert("role-0-orchestrator".to_string(), orch_sess);
-        let mut coder_sess = make_session(SessionStatus::Idle);
-        coder_sess.session_id = "role-1-coder".to_string();
-        coder_sess.pane_id = Some(coder.clone());
-        snapshot
-            .sessions
-            .insert("role-1-coder".to_string(), coder_sess);
-        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
-        filtered.sort_by(|a, b| a.0.cmp(b.0));
-
-        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
-        let mut ui = default_ui();
-        ui.selected_index = Some(1); // already on `coder`
-
-        dispatch_action(
-            Action::SelectCard(1),
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-
-        assert_eq!(
-            ui.selected_index,
-            Some(1),
-            "clicking the already-selected card must leave the selection \
-             exactly where it was"
-        );
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert_eq!(
-            last_activity_at,
-            Some(stale),
-            "re-clicking the card that is already selected moves no focus, \
-             so it must leave last_role_pane_activity_at UNCHANGED — an \
-             ungated stamp here lets repeated clicks on one card defer a \
-             legitimate 30s snap-back forever"
-        );
-
-        // Positive control: a click that DOES move the selection is real
-        // activity and must stamp, so the gate above isn't over-tight.
-        dispatch_action(
-            Action::SelectCard(0),
-            &mut ui,
-            &*pc,
-            &state,
-            &mut tab_manager,
-            &snapshot,
-            &filtered,
-            None,
-            Rect::new(0, 0, 80, 24),
-        );
-        let last_activity_at = match tab_manager.active_tab() {
-            Tab::Orchestration {
-                last_role_pane_activity_at,
-                ..
-            } => *last_role_pane_activity_at,
-            _ => None,
-        };
-        assert!(
-            last_activity_at.is_some_and(|t| t > stale && t.elapsed() < Duration::from_secs(1)),
-            "a click that genuinely moves the selection onto another role \
-             pane is activity and must still stamp the clock"
-        );
-    }
-
     /// Scenario: PR #151 e2e regression (e2e_render_contract::layout_002) — the
     /// inactive-selection close no-op (selection_012) must NOT suppress closing a
     /// Mode/Orchestration TAB via Ctrl+W. With a Mode tab active and
@@ -25472,6 +24608,79 @@ mod tests {
         }
     }
 
+    /// Scenario: Table-driven unit test of the pure `scope_command_entry_lock`
+    /// function (PRD #393 M1) over the full cross product of
+    /// `is_orchestration_tab` (true/false) x every `UiMode` variant x the
+    /// action being `ToggleOrchestrationLock`, some other action (`Quit`),
+    /// or `None`. Mirrors `layout_005`'s structure exactly. Confirms
+    /// `ToggleOrchestrationLock` survives ONLY at
+    /// `(is_orchestration_tab = true, UiMode::Normal)`, that every other
+    /// action passes through completely untouched in every cell (including
+    /// `(false, non-Normal)`, ruling out a blanket "drop the action"
+    /// implementation), and that `None` in always yields `None` out. This
+    /// is a mechanism test only — it proves nothing about a real pane on
+    /// its own; that real-pane proof is `orchestration/lock/008`'s job.
+    /// RED today: `scope_command_entry_lock` does not exist on this branch
+    /// yet, so this test fails to COMPILE rather than fails an assertion —
+    /// the crate will build again once the coder adds the function per the
+    /// PRD's Solution Overview, replacing #374's inline un-resolution.
+    #[spec("orchestration/lock/007")]
+    #[test]
+    fn orchestration_lock_007_scope_command_entry_lock_claims_only_when_orchestration_and_normal_mode()
+     {
+        let modes = all_ui_modes();
+
+        for is_orchestration_tab in [true, false] {
+            for &mode in &modes {
+                let claims = is_orchestration_tab && mode == UiMode::Normal;
+
+                let lock_result = scope_command_entry_lock(
+                    Some(Action::ToggleOrchestrationLock),
+                    is_orchestration_tab,
+                    mode,
+                );
+                if claims {
+                    assert!(
+                        matches!(lock_result, Some(Action::ToggleOrchestrationLock)),
+                        "ToggleOrchestrationLock should survive at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                } else {
+                    assert!(
+                        lock_result.is_none(),
+                        "ToggleOrchestrationLock should be un-resolved (None) at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                }
+
+                // Every OTHER action must pass through completely untouched
+                // in EVERY cell, including (false, non-Normal) — this is
+                // the assertion that rules out implementing the fix as a
+                // blanket "drop the action" rather than one scoped
+                // specifically to ToggleOrchestrationLock.
+                let other_result =
+                    scope_command_entry_lock(Some(Action::Quit), is_orchestration_tab, mode);
+                assert!(
+                    matches!(other_result, Some(Action::Quit)),
+                    "a non-ToggleOrchestrationLock action must pass through \
+                     untouched at (is_orchestration_tab={is_orchestration_tab}, \
+                     mode={mode:?}), got {other_result:?}"
+                );
+
+                // None in, None out, in every cell.
+                let none_result = scope_command_entry_lock(None, is_orchestration_tab, mode);
+                assert!(
+                    none_result.is_none(),
+                    "None must pass through as None at \
+                     (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                     got {none_result:?}"
+                );
+            }
+        }
+    }
+
     /// Scenario: PRD #387 M2/M3 — with both a Dashboard tab and a real
     /// Orchestration tab open, dispatch `Action::CycleSplitStage` while the
     /// Orchestration tab is active and assert BOTH tab types resolve their
@@ -25790,13 +24999,14 @@ mod tests {
         );
     }
 
-    /// Scenario: PRD #361 Item 3 locks direct keystroke entry to the
-    /// orchestrator pane by default on every Orchestration tab. Dispatch a
-    /// real `Action::SpawnPane` opening a fresh orchestration and assert the
-    /// new tab's per-tab lock field starts engaged (locked) — mirroring the
-    /// `split_stage` per-tab-field precedent `orchestration/layout/003`
-    /// establishes for Item 4. RED today: `Tab::Orchestration` has no lock
-    /// field at all, so this fails to compile.
+    /// Scenario: PRD #393 M2 (decision 2) moves the command-entry lock from a
+    /// per-tab `Tab::Orchestration` field to one deck-global `UiState` field.
+    /// Dispatch a real `Action::SpawnPane` opening a fresh orchestration and
+    /// assert the DECK-GLOBAL value starts LOCKED — the same default #374
+    /// established, now read from its new home. Mirrors the deck-global-field
+    /// precedent PRD #387 M2 set for `split_stage`. RED today:
+    /// `UiState::command_entry_locked` does not exist yet, so this fails to
+    /// compile.
     #[spec("orchestration/lock/001")]
     #[test]
     fn orchestration_lock_001_new_orchestration_tab_starts_locked() {
@@ -25819,31 +25029,29 @@ mod tests {
             "lock-default",
         );
 
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "a freshly opened orchestration tab must start with \
-                 command-entry LOCKED — only the orchestrator pane accepts \
-                 direct input until Ctrl+e unlocks it"
-            ),
-            _ => panic!("expected a real orchestration tab to be active"),
-        }
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "expected a real orchestration tab to be active"
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must observe the deck-global \
+             command-entry lock LOCKED — only the orchestrator pane accepts \
+             direct input until Ctrl+e unlocks it"
+        );
     }
 
-    /// Scenario: PRD #361 Item 3 adds `Ctrl+e` (default chord, confirmed
-    /// free during PRD investigation) as the toggle for the command-entry
-    /// lock. First confirm the chord resolves to the new
+    /// Scenario: PRD #393 M2 retargets the command-entry lock's toggle at the
+    /// deck-global `UiState` field. First confirm `Ctrl+e` still resolves to
     /// `Action::ToggleOrchestrationLock` through `key_action_for_mode` — the
     /// same production `KeyEvent -> Action` seam `orchestration/layout/002`
-    /// used to pin `Ctrl+l` — from `UiMode::PaneInput` specifically (the mode
-    /// a focused, possibly-locked pane is actually in, and where the lock
-    /// matters), then dispatch the action twice against a real orchestration
-    /// tab and confirm the per-tab field flips locked -> unlocked -> locked.
-    /// RED today: neither `Action::ToggleOrchestrationLock` nor the `Ctrl+e`
-    /// binding exist, so this fails to compile.
+    /// used to pin `Ctrl+l` — from `UiMode::Normal` (command mode, the only
+    /// mode M1 left the chord claimed in; the full `is_orchestration_tab x
+    /// mode` matrix is `orchestration/lock/007`'s job, not this test's), then
+    /// dispatch the action twice against a real orchestration tab and confirm
+    /// the DECK-GLOBAL `ui.command_entry_locked` flips locked -> unlocked ->
+    /// locked. RED today: `UiState::command_entry_locked` does not exist yet,
+    /// so this fails to compile.
     #[spec("orchestration/lock/002")]
     #[test]
     fn orchestration_lock_002_ctrl_e_toggles_the_lock() {
@@ -25866,16 +25074,20 @@ mod tests {
             "lock-toggle",
         );
 
-        // Ctrl+e must resolve to the toggle action from PaneInput mode using
-        // the DEFAULT keybinding config (no user remap involved).
+        // Ctrl+e must resolve to the toggle action from Normal (command)
+        // mode using the DEFAULT keybinding config (no user remap involved).
+        // PRD #393 M1 already scoped the live resolution chain
+        // (`handle_key_event`, via `scope_command_entry_lock`) to command
+        // mode only — `orchestration/lock/007`/`008` pin that exhaustively;
+        // this test only needs the toggle to still resolve from the mode it
+        // is actually claimed in.
         let kb = KeybindingConfig::default();
         let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
-        let resolved = key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_e);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_e);
         assert!(
             matches!(resolved, Some(Action::ToggleOrchestrationLock)),
             "Ctrl+e must resolve to Action::ToggleOrchestrationLock from \
-             PaneInput mode so it works while a (possibly locked) pane is \
-             focused, not just from Normal mode"
+             Normal (command) mode"
         );
 
         let _ = dispatch_action(
@@ -25889,16 +25101,10 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                !*command_entry_locked,
-                "the first Ctrl+e toggle should UNLOCK the tab"
-            ),
-            _ => panic!("expected orchestration tab to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "the first Ctrl+e toggle should UNLOCK the deck-global lock"
+        );
 
         let _ = dispatch_action(
             Action::ToggleOrchestrationLock,
@@ -25911,33 +25117,32 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "the second Ctrl+e toggle should RE-LOCK the tab"
-            ),
-            _ => panic!("expected orchestration tab to be active"),
-        }
+        assert!(
+            ui.command_entry_locked,
+            "the second Ctrl+e toggle should RE-LOCK the deck-global lock"
+        );
     }
 
-    /// Scenario: PRD #361 Item 3's resolved decision: the command-entry lock
-    /// is per-orchestration-tab, not global. Spawn orchestration tab A,
-    /// unlock it (one Ctrl+e-equivalent dispatch), then spawn a brand-new
-    /// orchestration tab B and confirm B starts locked regardless of A's now-
-    /// unlocked state; switch back to A and confirm A is STILL unlocked
-    /// (untouched by B's spawn); toggle B's own lock and confirm A remains
-    /// unaffected by that too. Borrows `orchestration/layout/003`'s
-    /// two-tab spawn-and-compare technique — though not its expectation:
-    /// PRD #387 M2 made `split_stage` deck-global, so `layout/003` now
-    /// demonstrates ADOPTION across tabs while the lock stays the per-tab
-    /// case. RED today: same compile failure as
-    /// `orchestration/lock/001`/`002` (no lock field/action yet).
+    /// Scenario: PRD #393 M2 decision 2 reverses what this test used to pin.
+    /// Renamed from `orchestration_lock_003_per_tab_isolation`, which
+    /// asserted per-tab isolation — the opposite of what this test now
+    /// checks; a stale name on an inverted test would be actively
+    /// misleading. Spawn orchestration tab A, toggle the lock (one
+    /// Ctrl+e-equivalent dispatch) while A is active, then spawn a brand-new
+    /// orchestration tab B and confirm B observes the SAME now-unlocked
+    /// deck-global value rather than defaulting back to locked (the "new tab
+    /// adopts the current value" half PRD #387's `layout_003` rewrite treats
+    /// as the part most likely to regress, so this test does the same).
+    /// Switch back to A and confirm it observes the same unlocked value too
+    /// — unaffected by which tab happens to be active. Then toggle FROM tab
+    /// B and confirm tab A observes THAT change as well: under the old
+    /// per-tab design this exact sequence proved A was UNAFFECTED by B's
+    /// toggle; under deck-global storage it must prove the opposite. RED
+    /// today: `UiState::command_entry_locked` does not exist yet, so this
+    /// fails to compile.
     #[spec("orchestration/lock/003")]
     #[test]
-    fn orchestration_lock_003_per_tab_isolation() {
+    fn orchestration_lock_003_toggle_is_deck_global_across_orchestration_tabs() {
         let frame_area = Rect::new(0, 0, 200, 50);
         let tmp = tempdir().expect("tempdir");
         let pc = Arc::new(CapturingPaneController::new());
@@ -25946,7 +25151,8 @@ mod tests {
         let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
         let snapshot = AppState::default();
 
-        // Tab A: spawn, then unlock via the toggle action.
+        // Tab A: spawn (starts LOCKED, the deck-global default), then toggle
+        // it via the real toggle action.
         spawn_lock_test_orchestration(
             &mut tm,
             pc.as_ref(),
@@ -25955,9 +25161,13 @@ mod tests {
             &snapshot,
             frame_area,
             tmp.path(),
-            "lock-iso-a",
+            "lock-shared-a",
         );
         let idx_a = tm.active_index();
+        assert!(
+            ui.command_entry_locked,
+            "tab A must start locked — the deck-global default"
+        );
         let _ = dispatch_action(
             Action::ToggleOrchestrationLock,
             &mut ui,
@@ -25969,16 +25179,14 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(!*command_entry_locked, "tab A should be unlocked here"),
-            _ => panic!("expected orchestration tab A to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "toggling on tab A should unlock the deck-global lock"
+        );
 
-        // Tab B: a brand-new orchestration must start LOCKED regardless of
-        // A's now-unlocked state.
+        // Tab B: a brand-new orchestration tab must ADOPT the current
+        // deck-global value (unlocked) rather than resetting to locked —
+        // there is no per-tab field left for it to default from.
         spawn_lock_test_orchestration(
             &mut tm,
             pc.as_ref(),
@@ -25987,38 +25195,30 @@ mod tests {
             &snapshot,
             frame_area,
             tmp.path(),
-            "lock-iso-b",
+            "lock-shared-b",
         );
         let idx_b = tm.active_index();
         assert_ne!(idx_a, idx_b, "tab B must be a distinct tab from tab A");
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                *command_entry_locked,
-                "tab B must start LOCKED — its own default — regardless of \
-                 tab A's toggled-unlocked state"
-            ),
-            _ => panic!("expected orchestration tab B to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "a newly opened orchestration tab must ADOPT the current \
+             deck-global value (unlocked, set by tab A's toggle) rather \
+             than defaulting back to locked"
+        );
 
-        // Switch back to A: still unlocked, untouched by B's spawn.
+        // Switch back to A: still unlocked — one shared value, unaffected by
+        // which tab happens to be active.
         assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                !*command_entry_locked,
-                "tab A must remain unlocked after spawning tab B — spawning \
-                 a second orchestration tab must not reset an unrelated \
-                 tab's lock state"
-            ),
-            _ => panic!("expected orchestration tab A to be active"),
-        }
+        assert!(
+            !ui.command_entry_locked,
+            "tab A must observe the same unlocked deck-global value after \
+             spawning tab B — there is no per-tab state left to diverge"
+        );
 
-        // Toggle B's own lock; A must still be unaffected by B's toggle.
+        // Toggle FROM tab B, then switch back to A: A must observe the
+        // change too. This is the inversion — under the old per-tab design
+        // this exact sequence proved A was UNAFFECTED by B's toggle; under
+        // the deck-global design it must prove the opposite.
         assert!(tm.switch_to(idx_b), "switching to tab B must succeed");
         let _ = dispatch_action(
             Action::ToggleOrchestrationLock,
@@ -26031,24 +25231,452 @@ mod tests {
             None,
             frame_area,
         );
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(!*command_entry_locked, "tab B should now be unlocked"),
-            _ => panic!("expected orchestration tab B to be active"),
-        }
+        assert!(
+            ui.command_entry_locked,
+            "toggling on tab B should re-lock the deck-global lock"
+        );
         assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
-        match tm.active_tab() {
-            Tab::Orchestration {
-                command_entry_locked,
-                ..
-            } => assert!(
-                !*command_entry_locked,
-                "tab A's lock state must be untouched by toggling tab B's \
-                 lock — per-tab isolation must hold in both directions"
+        assert!(
+            ui.command_entry_locked,
+            "tab A must observe tab B's toggle — toggling on ANY \
+             Orchestration tab must change what every Orchestration tab \
+             observes, per PRD #393 decision 2"
+        );
+    }
+
+    /// Scenario: PRD #393 decision 3 — deck-global storage moves WHERE the
+    /// lock value lives, not WHERE it reaches. Set the deck-global lock
+    /// ENGAGED (the strongest case) and confirm `gate_pane_input_key` passes
+    /// an `Action::ForwardToPane` through UNCHANGED on the always-present
+    /// Dashboard tab and on a freshly opened Mode tab — the gate must still
+    /// match only `Tab::Orchestration`, never widening onto other tab types
+    /// now that the lock it reads is deck-global. RED today:
+    /// `gate_pane_input_key` has no way to read a deck-global lock — neither
+    /// the field nor a parameter to receive it exist yet — so this fails to
+    /// compile.
+    #[spec("orchestration/lock/011")]
+    #[test]
+    fn orchestration_lock_011_dashboard_and_mode_tabs_stay_ungated_when_deck_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // The strongest case: the deck-global lock is engaged.
+        ui.command_entry_locked = true;
+
+        // M3 gave `gate_pane_input_key` a pane-status parameter after this
+        // test was written; an EMPTY map is the neutral value for it. No pane
+        // reports `WaitingForInput`, so decision 4's carve-out cannot fire and
+        // the pass-through asserted below can only come from the tab-kind
+        // match — which is exactly this test's claim, unweakened.
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "expected the always-present Dashboard tab to be active"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Dashboard tab must never gate ForwardToPane, even while \
+                 the deck-global lock is engaged"
             ),
-            _ => panic!("expected orchestration tab A to be active"),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a \
+                 Dashboard tab, got {other:?}"
+            ),
+        }
+
+        // Open a Mode tab and repeat: same never-gated guarantee.
+        let req = mode_card_request(
+            tmp.path().to_str().expect("utf8 tmp path"),
+            "cat",
+            mode_config_local("lock-mode", 1),
+        );
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Mode { .. }),
+            "expected the Mode tab to be active after spawning it"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Mode tab must never gate ForwardToPane, even while the \
+                 deck-global lock is engaged"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a Mode \
+                 tab, got {other:?}"
+            ),
+        }
+    }
+
+    /// Scenario: PRD #393 M3 decision 4 — while a locked non-orchestrator
+    /// pane's live status is `WaitingForInput`, `gate_pane_input_key` must
+    /// pass an `Action::ForwardToPane` through UNCHANGED instead of
+    /// dropping it: the agent has stopped and asked, so a keystroke
+    /// answering it is a response to a request, not an unsolicited
+    /// intrusion into state the orchestrator believes it owns (see the PRD's
+    /// "Why the lock exists at all"). Spawn a real two-role orchestration
+    /// (deck LOCKED, the default) with a focus-echoing pane controller so
+    /// `pane.focused_pane_id()` genuinely reports whichever pane was last
+    /// focused, then walk both edges on the SAME worker pane: no recorded
+    /// status (today's `orchestration/lock/004` baseline: dropped) ->
+    /// `WaitingForInput` (carve-out opens: passes through unchanged) ->
+    /// `Working` (carve-out closes: dropped again, proving the hole doesn't
+    /// outlive the status that opened it). Also pins that the orchestrator
+    /// pane's own input stays unaffected by ANY status on ITS pane, and that
+    /// an unlocked deck ignores `WaitingForInput` entirely (there is nothing
+    /// for M3 to carve a hole out of). RED today: `gate_pane_input_key`
+    /// takes no `pane_status` parameter, so passing one here fails to
+    /// compile.
+    #[spec("orchestration/lock/009")]
+    #[test]
+    fn orchestration_lock_009_waiting_for_input_carve_out() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "lock-waiting".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config("lock-waiting")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        // Focus the worker explicitly rather than relying on incidental
+        // mock behavior — `FocusEchoPC` genuinely echoes it back.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "baseline: a locked worker pane with no recorded status must \
+             still be gated (orchestration/lock/004's behavior), got {gated:?}"
+        );
+
+        let mut waiting_status: HashMap<&str, SessionStatus> = HashMap::new();
+        waiting_status.insert(worker_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a locked worker pane reporting WaitingForInput must pass a \
+                 keystroke through UNCHANGED — the agent stopped and asked, \
+                 so answering it is a response, not an intrusion (PRD #393 \
+                 decision 4)"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged while the \
+                 focused pane is WaitingForInput, got {other:?}"
+            ),
+        }
+
+        // Re-engage: the SAME pane, now Working — the carve-out must not
+        // outlive the status that opened it.
+        let mut working_status: HashMap<&str, SessionStatus> = HashMap::new();
+        working_status.insert(worker_id.as_str(), SessionStatus::Working);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &working_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "the gate must RE-ENGAGE the instant the worker's status clears \
+             from WaitingForInput — got {gated:?} while status was Working"
+        );
+
+        // The orchestrator pane's own input is unaffected either way — never
+        // gated, waiting or not. `orchestration/lock/004` already covers
+        // this with no status map at all; repeated here WITH one attached
+        // (the closest status the carve-out reasons about) to prove the
+        // never-gated rule doesn't get reordered behind the new check.
+        pc.focus_pane(&orchestrator_id)
+            .expect("focus orchestrator pane");
+        let mut orch_waiting: HashMap<&str, SessionStatus> = HashMap::new();
+        orch_waiting.insert(orchestrator_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &orch_waiting,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "the orchestrator pane's own input must never be gated, \
+             regardless of its status, got {gated:?}"
+        );
+
+        // Unlocked deck: WaitingForInput is irrelevant when the lock itself
+        // is off — there is nothing for M3 to carve a hole out of. Dashboard
+        // and Mode tabs staying ungated regardless of lock state is
+        // `orchestration/lock/011`'s job, not duplicated here.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+        ui.command_entry_locked = false;
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "an unlocked deck must pass ForwardToPane through regardless of \
+             WaitingForInput, got {gated:?}"
+        );
+    }
+
+    /// Scenario: PRD #393 review blocker 2 (PR #51, `src/ui.rs:4380-4387` /
+    /// `src/ui.rs:12369-12374`) — `build_pane_status` joins session values
+    /// into a `pane_id`-keyed `HashMap<&str, SessionStatus>` with NO dedupe,
+    /// so when two sessions share a `pane_id` the surviving value is
+    /// whichever `HashMap` iteration order reaches last: unspecified (#398).
+    /// A `HashMap<&str, SessionStatus>` cannot even REPRESENT that
+    /// collision — one key, one value — so it has already thrown the
+    /// ambiguity away by the time `gate_pane_input_key`'s decision-4
+    /// carve-out reads it. This is reachable without an adversary: PRD #110
+    /// deliberately preserves `agent_id: None` for pre-F9 hooks, and that
+    /// shape creates a duplicate session for an already-tracked pane (#398),
+    /// which is exactly how `orchestration/lock/010` failed earlier on this
+    /// branch, by accident, and how a security audit (#401) reached the
+    /// same place independently. The user's decision is fail-closed: an
+    /// ambiguous or duplicated pane session must DENY the exemption, not
+    /// grant it. Spawns a real locked orchestration tab and focuses its
+    /// worker pane (mirrors `orchestration/lock/009`'s setup, so the
+    /// tab-kind and lock guards ahead of the carve-out are exercised for
+    /// real), then builds two synthetic `AppState`s standing in for the
+    /// real daemon-observed collision — one with a SINGLE session
+    /// (`WaitingForInput`) on the worker's `pane_id`, one with TWO sessions
+    /// sharing it (`Working` and `WaitingForInput`) — and resolves each
+    /// through a NEW `build_pane_status_for_gate` join before handing the
+    /// result to the UNCHANGED `gate_pane_input_key`. Deliberately a
+    /// separate function from `build_pane_status` itself (left exactly as
+    /// buggy/unspecified as today — #398 stays out of scope for this PRD;
+    /// this is "a consumer-side guard, not a fix to the join"): the two
+    /// sessions collide is a fact only the raw `AppState.sessions`
+    /// collection still carries, since `build_pane_status`'s plain
+    /// `HashMap<&str, SessionStatus>` output has already discarded it — so
+    /// there is nothing for `gate_pane_input_key` to inspect in the
+    /// EXISTING join's result no matter how its own logic changes. Pins the
+    /// outcome (ambiguous → denied, unambiguous → still exempted, matching
+    /// `orchestration/lock/009`) rather than the resolution's exact
+    /// internal mechanism. RED today: `build_pane_status_for_gate` does not
+    /// exist, so this fails to compile.
+    #[spec("orchestration/lock/012")]
+    #[test]
+    fn orchestration_lock_012_ambiguous_status_fails_closed() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "lock-ambiguous".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config("lock-ambiguous")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // Two sessions collide on the SAME pane_id, disagreeing on
+        // WaitingForInput-ness -- exactly the reviewer's trace: the
+        // locked, focused worker's real session is Working, while a
+        // colliding session (e.g. a pre-F9 hook's `agent_id: None`
+        // duplicate, #398) says WaitingForInput.
+        let mut real = make_session(SessionStatus::Working);
+        real.session_id = "sess-real-working".into();
+        real.pane_id = Some(worker_id.clone());
+
+        let mut duplicate = make_session(SessionStatus::WaitingForInput);
+        duplicate.session_id = "sess-duplicate-waiting".into();
+        duplicate.pane_id = Some(worker_id.clone());
+
+        let mut collision_state = AppState::default();
+        collision_state
+            .sessions
+            .insert(real.session_id.clone(), real);
+        collision_state
+            .sessions
+            .insert(duplicate.session_id.clone(), duplicate);
+
+        let ambiguous_status = build_pane_status_for_gate(&collision_state);
+        assert_ne!(
+            ambiguous_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a pane_id with two disagreeing sessions must not resolve to \
+             WaitingForInput for the gate -- that is the fact the carve-out \
+             needs in order to fail closed"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &ambiguous_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "an ambiguous pane_id (colliding sessions disagreeing on \
+             WaitingForInput) must DENY the exemption and drop the \
+             keystroke -- fail closed, not fail open -- got {gated:?}"
+        );
+
+        // The unambiguous case must still work, through the SAME resolver:
+        // a single clean WaitingForInput session still earns the
+        // carve-out (orchestration/lock/009's claim), so fixing the
+        // ambiguous case above can't buy fail-closed by breaking this one.
+        let mut clean = make_session(SessionStatus::WaitingForInput);
+        clean.session_id = "sess-clean-waiting".into();
+        clean.pane_id = Some(worker_id.clone());
+        let mut clean_state = AppState::default();
+        clean_state.sessions.insert(clean.session_id.clone(), clean);
+
+        let single_status = build_pane_status_for_gate(&clean_state);
+        assert_eq!(
+            single_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a single, unambiguous WaitingForInput session must still \
+             resolve to WaitingForInput for the gate"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &single_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a single, unambiguous WaitingForInput session must still \
+                 pass the keystroke through unchanged (orchestration/lock/009)"
+            ),
+            other => panic!(
+                "expected the unambiguous WaitingForInput carve-out to still \
+                 pass ForwardToPane through unchanged, got {other:?}"
+            ),
         }
     }
 
