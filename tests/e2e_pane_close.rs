@@ -56,6 +56,16 @@ fn pane_003_empty_dashboard_never_opens_close_confirmation() {
     deck.send_keys(b"\x17");
     deck.send_keys(b"?");
     deck.wait_for_string("Create new pane");
+    // `Create new pane` is a Help-overlay row, and the deck's frame reaches
+    // the vt100 parser in `read()`-sized chunks, so a frame carrying the
+    // overlay can be parsed while the tab-bar row above it still shows the
+    // previous screen (`wait_for_in_grid`'s doc comment describes that torn
+    // window). Waiting for the tab label too — rather than snapshotting once
+    // and asserting on it — is what makes the snapshot below whole. Fork #81:
+    // this exact race is why `pane_003` failed seven times on 2026-08-07 CI,
+    // every time on the `Dashboard` assertion, with the overlay and footer
+    // painted and the tab row blank.
+    deck.wait_for_string("Dashboard");
 
     let grid = deck.snapshot_grid();
     assert!(grid.contains("Dashboard"), "{grid}");
