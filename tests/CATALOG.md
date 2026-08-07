@@ -2304,6 +2304,27 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side archive/no-clobber behavior for a NON-`--task-file`-sourced collision (covered by `orchestration/delegate/020`); the exact refusal wording (stderr is not inspected — only the exit code).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+##### orchestration/delegate/026 — A THIRD `work-done` collision from the same pane must not destroy the report a SECOND collision already archived (PR #90 pre-merge review P1).
+- **Layer:** fast/pure-ish state (real `AppState::handle_work_done` against one hand-registered pane, three calls in a row; no PTY spawn — same technique as `orchestration/delegate/019`).
+- **Agent:** none.
+- **Asserts:** one worker pane calls `handle_work_done` three times back to back with three distinctly marked reports (A, B, C). All three markers must remain discoverable somewhere under `.dot-agent-deck/` — a recursive scan of the directory's file contents, not a check on a specific filename. Currently RED: `src/state.rs` archives a collision to the FIXED name `<file_name>.prev.md`, reused on every collision — the second call archives A there and writes B as current, and the third call's archive rename REPLACES that same archive file (Unix `rename` overwrites an existing destination atomically), destroying A. The `020`/`021` fix stops a report being lost on the collision that discovers it, but not on the next one.
+- **Does not assert:** the archive path/naming scheme a real fix picks (a uniquely-allocated path is one direction the review suggests, not a contract); the platform-specific case where `rename` refuses (rather than replaces) an existing destination — not expressible on Unix without inducing a categorically broader failure (see the tester's `work-done` report for why that was intentionally left unwritten rather than approximated).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/027 — `work-done --task-file` must be refused when the argument is a SYMLINK whose target resolves inside the daemon's own output namespace, even though the argument's own name does not match `work-done-*.md` (PR #90 pre-merge review P1).
+- **Layer:** fast real-binary-subprocess integration (same technique as `orchestration/delegate/021` — a real spawned daemon reachable over its hook socket, and the actual `dot-agent-deck` binary run as a subprocess).
+- **Agent:** none.
+- **Asserts:** with a real, reachable daemon, a real file `work-done-coder.md` sits inside `.dot-agent-deck`, and a symlink at `external-report.md` (a name that does NOT match `work-done-*.md`, and does not live in `.dot-agent-deck`) points at it. `work-done --task-file external-report.md` must exit NON-ZERO — told apart from "daemon unreachable" the same way `021` is. A second, otherwise-identical call with no symlink at all must still exit 0. Currently RED: `src/main.rs`'s `is_work_done_output_path` checks only the SUPPLIED path's own lexical file name and immediate parent, so a symlink whose own name/location sit outside the namespace passes unexamined.
+- **Does not assert:** the exact refusal wording (stderr is not inspected — only the exit code); the intermediate-directory-symlink variant (covered by `orchestration/delegate/028`).
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess; symlinks).
+
+##### orchestration/delegate/028 — `work-done --task-file` must be refused when reached through an INTERMEDIATE DIRECTORY SYMLINK that aliases into `.dot-agent-deck`, even though the argument's own literal parent segment is not named `.dot-agent-deck` (PR #90 pre-merge review P1).
+- **Layer:** fast real-binary-subprocess integration (same technique as `orchestration/delegate/021`/`027`).
+- **Agent:** none.
+- **Asserts:** with a real, reachable daemon, a real file `work-done-coder.md` sits inside `.dot-agent-deck`, and a directory symlink `alias` points AT `.dot-agent-deck` itself. `work-done --task-file alias/work-done-coder.md` must exit NON-ZERO, told apart from "daemon unreachable" the same way `021`/`027` are. A second, otherwise-identical call with no symlink at all must still exit 0. Currently RED for the same root cause as `027`: the check inspects only the literal parent path segment ("alias"), never what it resolves to.
+- **Does not assert:** the exact refusal wording; the file-symlink variant (covered by `orchestration/delegate/027`).
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess; symlinks).
+
 #### orchestration/focus
 
 ##### orchestration/focus/002 — The full lock-governed focus contract, end to end in a real Orchestration tab: LOCKED by default with focus on the orchestrator; a worker's `WaitingForInput` visibly pulls focus to itself and its resolution visibly returns focus to the orchestrator on the all-clear edge; `Ctrl+d` then `Ctrl+e` unlocks; a manual focus choice on a non-orchestrator role then sticks through both a fresh waiting episode and its all-clear, because unlocked runs no auto-focus branch at all (PRD #393 M5, the CLAUDE.md rule 4 headline test for this PRD). `orchestration_focus_001` — the PRD #373 M2 inactivity snap-back's PTY proof, and this catalog section's only entry before it — was deleted outright at PRD #393 M4 along with the production behavior it covered; `002` re-establishes the section covering the successor behavior M4/M4b/M5 actually shipped.

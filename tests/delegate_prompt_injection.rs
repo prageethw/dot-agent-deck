@@ -2479,3 +2479,81 @@ fn delegate_020_existing_report_survives_and_collision_is_announced() {
             );
         });
 }
+
+/// Scenario: Drive THREE real `handle_work_done` calls from the SAME worker
+/// pane, back to back, each with a distinct marked report and nothing else
+/// in between. The fix's archive destination for a collision is the FIXED
+/// name `<file_name>.prev.md` (`src/state.rs`), reused on every collision:
+/// the second call archives the first report there, and the third call's
+/// archive rename replaces that same archive file — Unix `rename` overwrites
+/// an existing destination atomically — destroying the first report one
+/// collision later instead of preventing that loss. All three distinct
+/// markers must remain discoverable somewhere under `.dot-agent-deck/`.
+#[cfg(unix)]
+#[spec("orchestration/delegate/026")]
+#[test]
+fn delegate_026_third_collision_destroys_the_first_archived_report() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build third-collision runtime")
+        .block_on(async {
+            common::init_test_env();
+            let cwd = common::race_safe_tempdir();
+            let cwd_str = cwd.path().to_string_lossy().into_owned();
+
+            let mut state = AppState::default();
+            state.register_pane("triple-coder".to_string());
+            state
+                .pane_role_map
+                .insert("triple-coder".to_string(), "coder".to_string());
+            state
+                .pane_cwd_map
+                .insert("triple-coder".to_string(), cwd_str.clone());
+
+            let registry = AgentPtyRegistry::new();
+
+            const REPORT_A: &str = "REPORT-A-FIRST-CURRENT-3f8b2a";
+            const REPORT_B: &str = "REPORT-B-SECOND-ARCHIVED-6d1c9e";
+            const REPORT_C: &str = "REPORT-C-THIRD-CURRENT-a47f52";
+
+            for report in [REPORT_A, REPORT_B, REPORT_C] {
+                state
+                    .handle_work_done(
+                        WorkDoneSignal {
+                            pane_id: "triple-coder".to_string(),
+                            task: report.to_string(),
+                            done: false,
+                            timestamp: chrono::Utc::now(),
+                        },
+                        &registry,
+                    )
+                    .await;
+            }
+
+            let combined = all_dot_agent_deck_text(&cwd.path().join(".dot-agent-deck"));
+            assert!(
+                combined.contains(REPORT_A),
+                "the FIRST report is gone after a THIRD collision: the fixed \
+                 `<file_name>.prev.md` archive destination is reused on every collision, \
+                 so collision C's archive rename replaced collision B's archive (which \
+                 held A) instead of preserving it — the exact data loss this fix exists \
+                 to prevent, one collision later. Combined .dot-agent-deck \
+                 contents:\n{combined}"
+            );
+            assert!(
+                combined.contains(REPORT_B),
+                "the SECOND report never survived long enough to be replaced by the \
+                 third (a test-setup problem, not the defect under test — investigate \
+                 before trusting the REPORT_A failure above). Combined .dot-agent-deck \
+                 contents:\n{combined}"
+            );
+            assert!(
+                combined.contains(REPORT_C),
+                "the THIRD (most recent) report never made it to disk at all (a \
+                 test-setup problem, not the defect under test). Combined \
+                 .dot-agent-deck contents:\n{combined}"
+            );
+        });
+}

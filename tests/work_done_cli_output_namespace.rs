@@ -113,3 +113,125 @@ fn delegate_021_work_done_refuses_task_file_inside_own_output_namespace() {
         String::from_utf8_lossy(&allowed.stderr),
     );
 }
+
+/// Scenario: Start a real daemon, then seed a real file matching the
+/// `work-done-*.md` pattern INSIDE `.dot-agent-deck`, and a SYMLINK at a
+/// path outside the namespace (a name that does not itself match
+/// `work-done-*.md`) pointing at that real file. Run `dot-agent-deck
+/// work-done --task-file` against the symlink's own (outside) path. The CLI
+/// must still refuse, because the argument RESOLVES into the namespace, not
+/// because of what it is lexically named; a second, otherwise-identical call
+/// with no symlink involved at all must still succeed.
+#[cfg(unix)]
+#[spec("orchestration/delegate/027")]
+#[test]
+fn delegate_027_work_done_refuses_file_symlink_resolving_into_output_namespace() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let cwd = common::race_safe_tempdir();
+    let home = cwd.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
+    let dot_dir = cwd.path().join(".dot-agent-deck");
+    std::fs::create_dir_all(&dot_dir).expect("create .dot-agent-deck");
+
+    // The real file sits INSIDE the namespace, matching the work-done-*.md
+    // glob the daemon's own output uses.
+    let real_target = dot_dir.join("work-done-coder.md");
+    std::fs::write(&real_target, "some report content").expect("seed real namespace file");
+
+    // The --task-file argument's OWN path/name lies OUTSIDE the namespace
+    // (so a lexical-only check sees nothing to refuse), but it is a symlink
+    // whose target RESOLVES straight into it.
+    let symlink_path = cwd.path().join("external-report.md");
+    std::os::unix::fs::symlink(&real_target, &symlink_path)
+        .expect("create file symlink into the output namespace");
+
+    let bypassed = run_work_done_task_file(&daemon, cwd.path(), &home, "external-report.md");
+    assert!(
+        !bypassed.status.success(),
+        "`work-done --task-file external-report.md`, a symlink whose target resolves \
+         inside the daemon's own `.dot-agent-deck/work-done-*.md` output namespace, \
+         exited successfully instead of being refused — a check on the SUPPLIED path's \
+         own lexical name/parent does not see through the symlink, so this file is read \
+         by the CLI and then silently overwritten by the daemon's own next write to the \
+         same target.\nstdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&bypassed.stdout),
+        String::from_utf8_lossy(&bypassed.stderr),
+    );
+
+    // Control: a legitimate --task-file outside the namespace, with no
+    // symlink involved at all, must still be accepted.
+    std::fs::write(
+        cwd.path().join("worker-report.md"),
+        "an ordinary worker report",
+    )
+    .expect("seed non-collision file");
+    let allowed = run_work_done_task_file(&daemon, cwd.path(), &home, "worker-report.md");
+    assert!(
+        allowed.status.success(),
+        "a plain --task-file OUTSIDE the daemon's own output namespace, with no symlink \
+         involved, must still be accepted; the refusal must be scoped to the collision \
+         path, not a blanket rejection of --task-file.\nstdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr),
+    );
+}
+
+/// Scenario: Start a real daemon, then seed a real file matching
+/// `work-done-*.md` INSIDE `.dot-agent-deck`, and an INTERMEDIATE DIRECTORY
+/// SYMLINK ("alias") that aliases straight into `.dot-agent-deck` itself.
+/// Run `dot-agent-deck work-done --task-file alias/work-done-coder.md` — the
+/// filename segment already matches the glob, but the PARENT segment is
+/// "alias", not ".dot-agent-deck", so a lexical-only check on that parent
+/// segment sees nothing to refuse even though the path resolves straight
+/// into the namespace. The CLI must still refuse; a second, otherwise-
+/// identical call with no symlink involved at all must still succeed.
+#[cfg(unix)]
+#[spec("orchestration/delegate/028")]
+#[test]
+fn delegate_028_work_done_refuses_task_file_through_aliased_output_dir() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let cwd = common::race_safe_tempdir();
+    let home = cwd.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
+    let dot_dir = cwd.path().join(".dot-agent-deck");
+    std::fs::create_dir_all(&dot_dir).expect("create .dot-agent-deck");
+    std::fs::write(dot_dir.join("work-done-coder.md"), "some report content")
+        .expect("seed real namespace file");
+
+    // An intermediate directory symlink that ALIASES straight into
+    // `.dot-agent-deck`.
+    let alias_dir = cwd.path().join("alias");
+    std::os::unix::fs::symlink(&dot_dir, &alias_dir)
+        .expect("create intermediate directory symlink aliasing into .dot-agent-deck");
+
+    let bypassed = run_work_done_task_file(&daemon, cwd.path(), &home, "alias/work-done-coder.md");
+    assert!(
+        !bypassed.status.success(),
+        "`work-done --task-file alias/work-done-coder.md`, reached through an \
+         intermediate directory symlink that aliases into `.dot-agent-deck`, exited \
+         successfully instead of being refused — a check on the SUPPLIED path's own \
+         literal parent segment name ('alias') does not see that it resolves into the \
+         namespace, so this file is read by the CLI and then silently overwritten by \
+         the daemon's own next write to the same target.\nstdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&bypassed.stdout),
+        String::from_utf8_lossy(&bypassed.stderr),
+    );
+
+    // Control: a legitimate --task-file outside the namespace, reached
+    // through no symlink at all, must still be accepted.
+    std::fs::write(
+        cwd.path().join("worker-report.md"),
+        "an ordinary worker report",
+    )
+    .expect("seed non-collision file");
+    let allowed = run_work_done_task_file(&daemon, cwd.path(), &home, "worker-report.md");
+    assert!(
+        allowed.status.success(),
+        "a plain --task-file OUTSIDE the daemon's own output namespace, reached through \
+         no symlink, must still be accepted; the refusal must be scoped to the \
+         collision path, not a blanket rejection of --task-file.\nstdout: {:?}\nstderr: \
+         {:?}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr),
+    );
+}
