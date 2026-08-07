@@ -6,7 +6,21 @@
 //! [`crate::daemon_protocol::AttachRequest::Hello`] carrying its own
 //! `client_build_version`. The daemon replies with its compiled-in
 //! `build_version` plus a `running_agents` summary (count + display
-//! names; PRD #161 M1.1). If the two build-ids differ — or the daemon
+//! names; PRD #161 M1.1).
+//!
+//! **Fork issue #17 — the attach protocol is checked first.** The reply also
+//! carries the daemon's [`crate::daemon_protocol::PROTOCOL_VERSION`
+//! ](crate::daemon_protocol::PROTOCOL_VERSION) as `server_version`, and it is
+//! compared against this binary's compiled-in constant BEFORE any build-version
+//! branching. Any difference (including an absent field, i.e. a daemon
+//! predating the version handshake) refuses the attach with
+//! [`HandshakeError::ProtocolMismatch`] — the local counterpart of what
+//! [`crate::connect::probe_remote_protocol`] has always done on the SSH path.
+//! Before this check the local path compared build-ids ONLY, so a protocol-
+//! skewed daemon attached successfully and the TUI then dropped every event it
+//! could not decode while its subscription reconnect-looped invisibly.
+//!
+//! If the two build-ids differ — or the daemon
 //! omits the field entirely (a pre-PRD-103 binary) — PRD #161 D2's
 //! consent-based always-restart (option A) takes over. The decision is
 //! driven by whether agents are running and whether stdout is a TTY:
@@ -87,8 +101,31 @@ pub enum HandshakeOutcome {
 /// `MismatchAborted` variant, and the interactive `Quit` path is also
 /// already user-visible — callers translate any error into
 /// [`std::process::ExitCode::FAILURE`] without rendering anything else.
+/// Every other variant carries its whole user-facing message in
+/// [`Display`](std::fmt::Display), which `main`'s catch-all `Err` arm prints.
 #[derive(Debug)]
 pub enum HandshakeError {
+    /// Fork issue #17 — the running daemon's advertised attach
+    /// [`PROTOCOL_VERSION`] is not the one this binary was compiled against
+    /// (or it advertised none at all, i.e. it predates the version field).
+    /// This is a STRUCTURAL precondition, checked before any build-version
+    /// comparison, and it mirrors what
+    /// [`crate::connect::probe_remote_protocol`] has always done on the SSH
+    /// path with `RemoteConnectError::ProtocolMismatch`. Refusing is the only
+    /// safe answer: attaching across a protocol skew leaves the dashboard
+    /// looking perfectly normal while every event the client cannot decode is
+    /// dropped and the event subscription silently reconnect-loops.
+    ///
+    /// `daemon_build` is the build id from the same hello reply (daemon-supplied,
+    /// so it is sanitized at the render seam) and `running_agents` the count from
+    /// its `running_agents` summary when present — both exist so the message can
+    /// state what stopping the daemon costs and how to avoid paying it (D4).
+    ProtocolMismatch {
+        daemon_version: Option<u32>,
+        local_version: u32,
+        daemon_build: Option<String>,
+        running_agents: Option<usize>,
+    },
     /// `UnixStream::connect` or the Hello round-trip failed. Indicates
     /// the daemon socket is reachable (it exists per
     /// `ensure_external_daemon_or_die`) but the daemon itself is not
@@ -120,6 +157,23 @@ pub enum HandshakeError {
 impl std::fmt::Display for HandshakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ProtocolMismatch {
+                daemon_version,
+                local_version,
+                daemon_build,
+                running_agents,
+            } => {
+                // The renderer ends its last line with `\n` (like
+                // `render_non_tty_error`); `main` prints this through
+                // `eprintln!`, so trim it rather than emitting a blank line.
+                let msg = render_protocol_mismatch_error(
+                    *daemon_version,
+                    *local_version,
+                    daemon_build.as_deref(),
+                    *running_agents,
+                );
+                f.write_str(msg.trim_end_matches('\n'))
+            }
             Self::Probe(e) => write!(f, "build-version handshake probe failed: {e}"),
             Self::PeerPid(e) => write!(f, "build-version handshake peer-pid lookup failed: {e}"),
             Self::MismatchAborted => write!(f, "build-version handshake aborted by user"),
@@ -140,9 +194,11 @@ impl std::error::Error for HandshakeError {}
 /// mismatch, returning once the laptop can safely attach — either to a
 /// freshly-restarted daemon ([`HandshakeOutcome::Recovered`]) or to the
 /// existing one when the user declined the restart
-/// ([`HandshakeOutcome::ProceedOnExisting`]). The only `Err` return is the
-/// agents-running non-TTY mandatory-restart path
-/// ([`HandshakeError::MismatchAborted`], after a stderr hint) and genuine
+/// ([`HandshakeOutcome::ProceedOnExisting`]). The `Err` returns are the
+/// attach-protocol refusal (fork issue #17,
+/// [`HandshakeError::ProtocolMismatch`] — checked first, before any
+/// build-version branching), the agents-running non-TTY mandatory-restart path
+/// ([`HandshakeError::MismatchAborted`], after a stderr hint), and genuine
 /// pre-flight failures (probe / peer-pid / SIGTERM).
 ///
 /// PRD M2.3 — runs unconditionally, even when
@@ -162,6 +218,42 @@ pub async fn ensure_compatible_daemon_or_die(
     // simulate skew without rebuilding the binary.
     let local_build = local_build_id();
     let probe = probe_daemon(attach_path).await?;
+
+    // Fork issue #17 — the STRUCTURAL protocol floor, checked unconditionally
+    // and BEFORE any build-version branching. `server_version` is a property
+    // of the peer's wire shape, independent of every other comparison, exactly
+    // as `connect::probe_remote_protocol` treats it on the SSH path; local
+    // attach gets parity here. Placement matters twice over:
+    //
+    //   1. None of the build-version branches below is a safe place to hide
+    //      this. `Match` and `SilentRestart` never trip it in practice (same
+    //      binary / fresh daemon), but `ProceedOnExisting` — the user declining
+    //      a restart to keep live agents, i.e. the most common upgrade sequence
+    //      there is — is precisely the path #17 reproduced: the TUI attaches,
+    //      the dashboard looks normal, and every event it cannot decode is
+    //      dropped while the subscription reconnect-loops invisibly.
+    //   2. It runs before anything that could reach `terminate_and_recover`, so
+    //      a protocol-skewed daemon is never SIGTERM'd on the way to being
+    //      refused — we report and let the user choose.
+    //
+    // A daemon that omits the field entirely (pre-M2.21, predating the version
+    // handshake) is refused the same way, matching how the remote probe reads
+    // an unparseable/absent `server_version` as "too old".
+    if probe.response.server_version != Some(PROTOCOL_VERSION) {
+        tracing::warn!(
+            target: "build_version_handshake",
+            daemon_protocol = ?probe.response.server_version,
+            local_protocol = PROTOCOL_VERSION,
+            daemon_build = ?probe.response.build_version,
+            "local daemon attach protocol mismatch — refusing to attach"
+        );
+        return Err(HandshakeError::ProtocolMismatch {
+            daemon_version: probe.response.server_version,
+            local_version: PROTOCOL_VERSION,
+            daemon_build: probe.response.build_version.clone(),
+            running_agents: probe.response.running_agents.as_ref().map(|s| s.count),
+        });
+    }
 
     let daemon_build = probe.response.build_version.clone();
     if daemon_build.as_deref() == Some(local_build.as_str()) {
@@ -674,6 +766,79 @@ fn render_non_tty_error(daemon_build: Option<&str>, local_build: &str) -> String
     )
 }
 
+/// Fork issue #17 — render the attach-protocol refusal. Printed to stderr by
+/// `main`'s catch-all `Err` arm (via [`HandshakeError`]'s `Display`) just
+/// before the process exits non-zero, so it lands in a normal terminal with no
+/// TUI up.
+///
+/// The register deliberately mirrors the two neighbouring surfaces: the
+/// `running daemon:` line from [`render_mismatch_prompt`] and the `error:` /
+/// `recover with:` framing from [`render_non_tty_error`]. What it
+/// adds is a WAY OUT that does not cost the user their agents — refusing to
+/// attach necessarily strands them from a skewed daemon (attaching would lose
+/// events silently, which is worse), but D4 says we must not strand them
+/// without telling them how to recover, so the message names both directions:
+/// stop the daemon and come back on this build, or relaunch on the daemon's
+/// own build and keep the agents.
+///
+/// `daemon_build` arrives over the wire, so it goes through
+/// [`sanitize_for_prompt`] exactly like every other daemon-supplied string that
+/// reaches a terminal. The two version numbers are `u32`s and need no
+/// sanitizing.
+fn render_protocol_mismatch_error(
+    daemon_version: Option<u32>,
+    local_version: u32,
+    daemon_build: Option<&str>,
+    running_agents: Option<usize>,
+) -> String {
+    let build_display = sanitize_for_prompt(daemon_build.unwrap_or("<unknown>"), false);
+    let mut out = String::new();
+    match daemon_version {
+        Some(v) => out.push_str(&format!(
+            "error: local daemon speaks attach protocol v{v} but this binary speaks \
+             v{local_version}\n"
+        )),
+        // Pre-M2.21 daemon: it predates the version field entirely, so there is
+        // no number to compare — which is itself conclusive skew.
+        None => out.push_str(&format!(
+            "error: local daemon reports no attach protocol version (it predates the \
+             handshake); this binary speaks v{local_version}\n"
+        )),
+    }
+    out.push_str(&format!("   running daemon:  {build_display}\n"));
+    out.push('\n');
+    out.push_str(
+        "   Refusing to attach. Across a protocol skew the dashboard still looks\n\
+         \x20  normal while every event this binary cannot decode is silently dropped.\n",
+    );
+    match running_agents {
+        Some(0) => {
+            out.push_str("   No agents are running under it, so restarting costs nothing.\n")
+        }
+        Some(n) => out.push_str(&format!("   {n} agent(s) are running under it.\n")),
+        None => {}
+    }
+    out.push('\n');
+    out.push_str(
+        "recover with: dot-agent-deck daemon stop   (stops the daemon and any agents\n\
+         \x20  under it), then relaunch — the next launch starts a fresh daemon at this\n\
+         \x20  binary's protocol version.\n",
+    );
+    if running_agents != Some(0) {
+        match daemon_build {
+            Some(_) => out.push_str(&format!(
+                "   To keep those agents instead, relaunch using the daemon's own build\n\
+                 \x20  ({build_display}) rather than stopping it.\n"
+            )),
+            None => out.push_str(
+                "   To keep those agents instead, relaunch using the build that daemon was\n\
+                 \x20  started from rather than stopping it.\n",
+            ),
+        }
+    }
+    out
+}
+
 /// Render the interactive mismatch prompt as plain newline-separated
 /// text. Raw-mode display converts `\n` to `\r\n` at write time so
 /// tests can assert on the canonical form. Trailing newline omitted so
@@ -911,6 +1076,109 @@ mod tests {
             2,
             "a newline in a build id must not add lines to a two-line message: {msg:?}"
         );
+    }
+
+    #[test]
+    fn protocol_mismatch_error_names_both_versions_and_two_recoveries() {
+        // Fork issue #17: the refusal has to be ACTIONABLE. It must name what
+        // was found (both protocol versions + the daemon's build), say what
+        // stopping the daemon costs (the live agent count), and offer BOTH
+        // ways out — stop the daemon, or come back on the daemon's own build
+        // and keep the agents (D4: refusing may strand, refusing silently
+        // must not).
+        //
+        // Pinned verbatim, like the neighbouring prompt/stderr renderers: this
+        // string IS the user experience the fix delivers, so a reword should be
+        // a deliberate edit here rather than silent drift.
+        let msg = render_protocol_mismatch_error(Some(8), 7, Some("0.36.0-g1111new"), Some(2));
+        let expected = "error: local daemon speaks attach protocol v8 but this binary speaks v7\n\
+             \x20  running daemon:  0.36.0-g1111new\n\
+             \n\
+             \x20  Refusing to attach. Across a protocol skew the dashboard still looks\n\
+             \x20  normal while every event this binary cannot decode is silently dropped.\n\
+             \x20  2 agent(s) are running under it.\n\
+             \n\
+             recover with: dot-agent-deck daemon stop   (stops the daemon and any agents\n\
+             \x20  under it), then relaunch — the next launch starts a fresh daemon at this\n\
+             \x20  binary's protocol version.\n\
+             \x20  To keep those agents instead, relaunch using the daemon's own build\n\
+             \x20  (0.36.0-g1111new) rather than stopping it.\n";
+        assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn protocol_mismatch_error_handles_zero_agents_and_an_absent_version() {
+        // No agents: say so (restarting is free) and drop the keep-your-agents
+        // line, which would be nonsense with nothing to keep.
+        let zero = render_protocol_mismatch_error(Some(6), 7, Some("0.35.5-g0000old"), Some(0));
+        assert!(
+            zero.contains("No agents are running under it"),
+            "zero agents must be stated positively, got: {zero:?}"
+        );
+        assert!(
+            !zero.contains("To keep those agents"),
+            "with no agents there is nothing to keep, got: {zero:?}"
+        );
+
+        // A pre-M2.21 daemon omits `server_version` and (pre-#103) its build
+        // id: there is no number to compare, which is itself conclusive skew.
+        // The message must still be complete rather than showing empty spans.
+        let ancient = render_protocol_mismatch_error(None, 7, None, None);
+        assert!(
+            ancient.starts_with("error: local daemon reports no attach protocol version"),
+            "an absent version needs its own lead line, got: {ancient:?}"
+        );
+        assert!(
+            ancient.contains("running daemon:  <unknown>"),
+            "a missing build id must surface the <unknown> placeholder, got: {ancient:?}"
+        );
+        assert!(
+            ancient.contains("relaunch using the build that daemon was"),
+            "unknown build still gets the keep-your-agents recovery, got: {ancient:?}"
+        );
+    }
+
+    #[test]
+    fn protocol_mismatch_error_sanitizes_the_daemon_build_id() {
+        // Same render-seam rule as every other daemon-supplied string that
+        // reaches a terminal (PRD #161 FIX 4 / issue #250 finding 2): the build
+        // id comes over the wire, so an ESC or bidi codepoint in it must not be
+        // able to clear or spoof the terminal this refusal lands in.
+        let msg = render_protocol_mismatch_error(
+            Some(8),
+            7,
+            Some("0.36.0-g\u{1b}[2Jabc\u{202e}1234\nEXTRA"),
+            Some(1),
+        );
+        assert!(
+            msg.contains("running daemon:  0.36.0-g[2Jabc1234EXTRA"),
+            "control / bidi / newline codepoints must be stripped, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains('\u{1b}') && !msg.contains('\u{202e}'),
+            "no escape or bidi codepoint may survive into the message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn protocol_mismatch_error_is_what_the_user_sees() {
+        // `main` renders this variant through the catch-all `Err(e) =>
+        // eprintln!("{e}")` arm, so `Display` IS the user-facing surface. Pin
+        // that it carries the whole message (not a one-line summary) and does
+        // not end in a newline that `eprintln!` would double into a blank line.
+        let shown = HandshakeError::ProtocolMismatch {
+            daemon_version: Some(8),
+            local_version: 7,
+            daemon_build: Some("0.36.0-g1111new".into()),
+            running_agents: Some(2),
+        }
+        .to_string();
+        assert_eq!(
+            shown,
+            render_protocol_mismatch_error(Some(8), 7, Some("0.36.0-g1111new"), Some(2))
+                .trim_end_matches('\n')
+        );
+        assert!(!shown.ends_with('\n'), "eprintln! adds the final newline");
     }
 
     #[test]

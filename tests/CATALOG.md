@@ -1922,6 +1922,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/008 — The local (same-machine) daemon↔TUI attach refuses cleanly when the daemon's `server_version` does not match the TUI's compiled-in `PROTOCOL_VERSION`, instead of proceeding into a dashboard that silently drops every event it cannot decode (fork issue #17).
+- **Layer:** L1 client/wire integration — the real production `build_version_handshake::ensure_compatible_daemon_or_die` driven against a mock daemon over a real Unix socket.
+- **Agent:** none (a mock daemon answering exactly one `Hello`; no PTY, no LLM).
+- **Asserts:** with the mock daemon's `Hello` reply carrying the SAME `build_version` the test process reports for itself (so today's build-id comparison matches) but a `server_version` one higher than the compiled-in `PROTOCOL_VERSION` — mirroring the issue's verified newer-daemon/older-TUI direction — `ensure_compatible_daemon_or_die` must return an `Err` rather than `Ok(HandshakeOutcome::Match)`. RED today: the local-attach handshake compares only `build_version`; `server_version` is never inspected, so the call returns `Ok(Match)` regardless of protocol skew (unlike `connect::probe_remote_protocol`, which refuses the equivalent remote pairing with `ProtocolMismatch`).
+- **Does not assert:** the interactive-TTY `ProceedOnExisting` decline path from a build-id mismatch (`lifecycle/handshake/006`) — a real keypress cannot be driven headlessly, and this test isolates the missing protocol check via the build-id-matching fast path instead, which reaches the same unchecked `server_version` field; the exact refusal error type or user-facing message (not yet designed); the remote/SSH path (already covered by `connect::probe_remote_protocol`'s own tests).
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
