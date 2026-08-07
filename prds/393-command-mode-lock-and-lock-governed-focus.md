@@ -280,6 +280,22 @@ The full table, with catalog IDs, is the artefact under review. IDs marked **new
 - **The latch-clearing rule is the one piece of genuinely new logic** and has no precedent to copy. `tabs/orchestration/026` exists specifically to pin it. Getting it wrong is not catastrophic — a spurious one-time focus move on re-lock — but it is exactly the class of bug #373's review found four times.
 - **~~Sequencing against #387.~~ Resolved before implementation started.** Both PRDs edit the same resolver seam and both add a `scope_*` function beside the other, so this PRD wanted to land after #387. Verified at worktree-creation time that **#387 is already merged into `origin/main`** (`scope_split_stage` present in `src/ui.rs`, `ACTIVE_SPLIT_STAGE` present, per-tab `split_stage` gone from the `Tab` variants). This branch is cut from `origin/main` at `7747e6a`, so `scope_command_entry_lock` is written next to a merged `scope_split_stage` exactly as intended. No sequencing constraint remains.
 
+## CLAUDE.md rule 8 — Greptile did not review this PR, and the gate was waived
+
+Recorded because rule 8 makes reading Greptile's inline comments a precondition for merge, and that did not happen here — not "it reviewed and found nothing", but **it never ran**.
+
+Every one of the ten review objects `greptile-apps` posted on PR #51 carries the same body: *"`prageethw` has reached the 50-credit limit for trial accounts. To continue receiving code reviews, upgrade your plan."* `gh api repos/prageethw/dot-agent-deck/pulls/51/comments` returns **zero** inline comments — and rule 8 is explicit that the findings live in the inline comments, not the check-run or the summary. So there is nothing to read.
+
+**The user waived it deliberately**, on the basis that the human-directed review substitutes for it. That substitution is reasonably strong on this branch rather than nominal:
+
+- The **reviewer** found two genuine blockers that CI could not have caught — the deck-global unlock clearing only the active tab's latch, and the carve-out treating an ambiguous status join as authorisation. Both were fixed and pinned (`tabs/orchestration/027`, `orchestration/lock/012`).
+- The **auditor** independently reached the same weak point from the security side and produced issue #401.
+- Both blockers had regression tests written before the fix, and both passed on their first real execution.
+
+**What is genuinely unverified** is whatever Greptile would have caught that neither reviewer looked for. That is unknowable by construction; it is named here so a later reader does not assume the automated gate passed.
+
+If Greptile is restored later, re-running it against this PR's merge commit is cheap and worth doing.
+
 ## CLAUDE.md rule 12 — cross-version contract
 
 **Does this change the TUI↔daemon contract? No — confirmed at M6, and the confirmation is stronger than "expected".** The production diff against `origin/main` is confined to exactly three files: `src/ui.rs`, `src/tab.rs`, `src/agent_pty.rs`. **No daemon, protocol or hook file is touched at all** — `git diff --name-only origin/main..HEAD` matches nothing against `daemon`, `protocol` or `hook`, so there is no wire field added, no `EventType` changed and no handler altered, by construction rather than by inspection. `Tab` is not serialized to the daemon and neither the lock nor the focus state is persisted. **No `PROTOCOL_VERSION` bump.**
