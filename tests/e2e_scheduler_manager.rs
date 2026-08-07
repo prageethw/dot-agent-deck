@@ -165,7 +165,9 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     // Both interpolated paths are POSIX single-quoted (issue #57): `bin` follows
     // the cargo target dir and `record` follows `TMPDIR`, so a `"`, `$`,
     // backtick, `\` or newline in either would otherwise terminate or expand
-    // inside the generated script — see `common::sh_quote`.
+    // inside the generated script — see `common::sh_quote`. The record path goes
+    // through `sh_quote_path`, which additionally panics rather than lossily
+    // rewriting a non-UTF-8 pathname into one the shim would never write to.
     let bin = common::sh_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let shim_dir = scratch.path().join("shim");
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
@@ -178,7 +180,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
                  printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
                  | {bin} hook claude-code >/dev/null 2>&1\n\
                  while IFS= read -r l; do printf '%s\\n' \"$l\" >> {rec}; done\n",
-                rec = common::sh_quote(&record.to_string_lossy())
+                rec = common::sh_quote_path(record)
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -208,7 +210,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
 
     let path_env = format!(
         "{}:{}",
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         std::env::var("PATH").unwrap_or_default()
     );
 
@@ -575,9 +577,11 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
     // Both interpolated paths are POSIX single-quoted (issue #57): `bin` follows
     // the cargo target dir and `record` follows `TMPDIR`, so a `"`, `$`,
     // backtick, `\` or newline in either would otherwise terminate or expand
-    // inside the generated script — see `common::sh_quote`.
+    // inside the generated script — see `common::sh_quote`. The record path goes
+    // through `sh_quote_path`, which additionally panics rather than lossily
+    // rewriting a non-UTF-8 pathname into one the shim would never write to.
     let bin = common::sh_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
-    let rec = common::sh_quote(&record.to_string_lossy());
+    let rec = common::sh_quote_path(record);
     let path = shim_dir.join(name);
     std::fs::write(
         &path,
@@ -706,7 +710,7 @@ fn login_shell_fixture_survives_shell_metacharacters_in_the_shim_path() {
     let path = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         path.split(':').next().unwrap_or_default(),
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         "a shim dir containing shell metacharacters must still be pinned first \
          on PATH verbatim.\nPATH: {path}\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
@@ -760,7 +764,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
 
     let path_env = format!(
         "{}:{}",
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         std::env::var("PATH").unwrap_or_default()
     );
     // The daemon rebuilds its PATH from `$SHELL -ilc` at startup (PRD #170), so
@@ -1042,7 +1046,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
 
     let path_env = format!(
         "{}:{}",
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         std::env::var("PATH").unwrap_or_default()
     );
 
@@ -1152,7 +1156,7 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
 
     let path_env = format!(
         "{}:{}",
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         std::env::var("PATH").unwrap_or_default()
     );
 
@@ -1461,7 +1465,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
 
     let path_env = format!(
         "{}:{}",
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         std::env::var("PATH").unwrap_or_default()
     );
 
@@ -1589,7 +1593,7 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
 
     let path_env = format!(
         "{}:{}",
-        shim_dir.to_string_lossy(),
+        common::require_utf8_path(&shim_dir),
         std::env::var("PATH").unwrap_or_default()
     );
 

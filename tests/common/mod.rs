@@ -3193,12 +3193,21 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
 /// Inside `'…'` the shell performs no expansion whatsoever, so the only
 /// character needing care is `'` itself: close the quote, emit an escaped
 /// `\'`, and reopen (`'\''`). The result is always fully quoted, which also
-/// makes it safe in argument position where a leading `-` would otherwise be
-/// read as a flag, and safe to place adjacent to other quoted runs
+/// makes it safe to place adjacent to other quoted runs
 /// (`export PATH='/a b'":$PATH"`).
 ///
+/// What this deliberately does NOT do: quoting governs how the SHELL splits a
+/// line into words, not how the command receiving that word interprets it. A
+/// value beginning with `-` still arrives in the consumer's argv as `-rf` and
+/// is still parsed as an option — `rm '-rf' dir` recurses. Every call site here
+/// is a command name or a redirection target, where that cannot bite; a future
+/// fixture that passes an untrusted value as an OPERAND needs `--` before it at
+/// the call site, which is a different mechanism from quoting.
+///
 /// Prefer the environment route (mechanism 1 above) when the fixture allows it;
-/// reach for this when the value must appear in the script's text.
+/// reach for this when the value must appear in the script's text. For a
+/// `Path`, use [`sh_quote_path`] so a non-UTF-8 pathname fails loudly instead of
+/// being rewritten.
 pub fn sh_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -3212,6 +3221,52 @@ pub fn sh_quote(value: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Render `path` as a `&str`, PANICKING if it is not valid UTF-8.
+///
+/// Every fixture path here descends from a DEVELOPER-controlled root (`TMPDIR`
+/// via `tempfile::tempdir()`, the cargo target dir), and on Unix a pathname is
+/// a byte string that need not be valid UTF-8. The obvious `to_string_lossy()`
+/// replaces each invalid byte with U+FFFD, which yields a DIFFERENT, normally
+/// non-existent pathname — so a generated shim, a `PATH` entry or a recorder
+/// target silently points somewhere else.
+///
+/// That is the same class of silent degradation as issue #57 itself, and it is
+/// equally self-concealing: a fixture that compares the PATH it captured against
+/// the same lossy string it supplied passes while pinning a directory that does
+/// not exist, so `manager_010`'s `claude` neutralizer becomes unreachable while
+/// the inherited PATH still holds a real Homebrew `claude` — the test launches
+/// the REAL agent and the (also lossy) recorder path hides it.
+///
+/// No fixture here needs to *support* non-UTF-8 paths; they need to not lie
+/// about them. So this fails closed: a loud panic naming the offending path,
+/// raised at fixture-construction time before anything is spawned. (Preserving
+/// bytes end to end — `OsStr`/`OsString` through the harness env surface plus a
+/// byte-oriented POSIX quoter — is strictly better and a much larger change to
+/// the harness API; it is not needed to make these fixtures honest.)
+pub fn require_utf8_path(path: &Path) -> &str {
+    path.to_str().unwrap_or_else(|| {
+        panic!(
+            "fixture path is not valid UTF-8, and must not be silently rewritten: \
+             {path:?}\nThis path is about to become generated shell source, a \
+             `PATH` entry or an env value. `to_string_lossy()` would replace the \
+             invalid bytes with U+FFFD and target a DIFFERENT pathname, so the \
+             fixture would keep passing while pinning (or writing to) the wrong \
+             place. Point `TMPDIR` and the cargo target dir at valid-UTF-8 \
+             locations."
+        )
+    })
+}
+
+/// [`sh_quote`] a `Path`, failing closed on non-UTF-8 via [`require_utf8_path`].
+///
+/// Prefer this to `sh_quote(&path.to_string_lossy())` at every call site that
+/// splices a path into generated shell source: the lossy form quotes a pathname
+/// the script will never find, which is a silent wrong-target rather than a
+/// failure.
+pub fn sh_quote_path(path: &Path) -> String {
+    sh_quote(require_utf8_path(path))
 }
 
 /// Env var through which [`write_login_shell_pinning_dir`]'s generated login
@@ -3231,10 +3286,17 @@ pub const LOGIN_SHELL_KEEP_DIR_ENV: &str = "DOT_AGENT_DECK_TEST_SHIM_DIR";
 /// return the env pairs that arm it — `SHELL` pointing at the script plus
 /// [`LOGIN_SHELL_KEEP_DIR_ENV`] carrying `keep_dir`.
 ///
-/// Both pairs are returned together on purpose: the script is inert without the
-/// keep-dir variable (it exits non-zero rather than silently prepending an
-/// empty component), so handing back only the `SHELL` path would let a caller
-/// arm half the fixture and lose the PATH pin without noticing.
+/// Both pairs are returned together as a CONVENTION, not as a guarantee the
+/// type system enforces — the array can be destructured, so nothing stops a
+/// caller applying only `SHELL`. Apply both. Half-arming it is not harmless:
+/// the script is inert without the keep-dir variable (it exits non-zero rather
+/// than silently prepending an empty component), so the daemon's capture fails
+/// and it falls back to its inherited PATH — precisely the lost pin this fixture
+/// exists to prevent.
+///
+/// Panics if `dir` or `keep_dir` is not valid UTF-8, before anything is written
+/// or spawned — see [`require_utf8_path`] for why lossy conversion here is a
+/// silent wrong-directory pin rather than a cosmetic issue.
 ///
 /// Needed by any test that puts a command SHIM on `PATH` and then lets the
 /// daemon start. PRD #170's `apply_login_shell_path` runs
@@ -3257,7 +3319,14 @@ pub const LOGIN_SHELL_KEEP_DIR_ENV: &str = "DOT_AGENT_DECK_TEST_SHIM_DIR";
 pub fn write_login_shell_pinning_dir(dir: &Path, keep_dir: &Path) -> [(&'static str, String); 2] {
     use std::os::unix::fs::PermissionsExt;
 
+    // Fail closed BEFORE writing or spawning anything: a lossy conversion here
+    // would arm the fixture with a U+FFFD directory that does not exist, and
+    // `assert_login_shell_keeps_dir_first` would then compare the captured PATH
+    // against that same lossy string and pass while pinning nothing real.
     let shell = dir.join("login-shell.sh");
+    let shell_path = require_utf8_path(&shell).to_owned();
+    let keep = require_utf8_path(keep_dir).to_owned();
+
     // No path interpolation: the keep dir arrives in the environment, so
     // nothing in this program is derived from a path the test does not control.
     std::fs::write(
@@ -3285,12 +3354,8 @@ pub fn write_login_shell_pinning_dir(dir: &Path, keep_dir: &Path) -> [(&'static 
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
         .unwrap_or_else(|e| panic!("chmod fake login shell: {e}"));
 
-    let keep = keep_dir.to_string_lossy().into_owned();
     assert_login_shell_keeps_dir_first(&shell, &keep);
-    [
-        ("SHELL", shell.to_string_lossy().into_owned()),
-        (LOGIN_SHELL_KEEP_DIR_ENV, keep),
-    ]
+    [("SHELL", shell_path), (LOGIN_SHELL_KEEP_DIR_ENV, keep)]
 }
 
 /// Probe `shell` the way PRD #170's `apply_login_shell_path` does — `-ilc` with

@@ -118,13 +118,15 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 /// `tempfile::tempdir()`, i.e. `TMPDIR`, so a `"`, `$`, backtick, `\` or newline
 /// in it would otherwise terminate or expand inside the redirection, and the
 /// marker this whole file asserts on would be written somewhere else (or a
-/// substitution executed) rather than failing loudly.
+/// substitution executed) rather than failing loudly. `sh_quote_path` also
+/// panics on a non-UTF-8 marker path rather than lossily rewriting it into a
+/// pathname the stub would never create.
 fn write_marker_stub(stub: &std::path::Path, marker: &std::path::Path) {
     std::fs::write(
         stub,
         format!(
             "#!/bin/sh\n: > {marker}\nexec sleep 30\n",
-            marker = common::sh_quote(&marker.to_string_lossy())
+            marker = common::sh_quote_path(marker)
         ),
     )
     .expect("write stub command");
