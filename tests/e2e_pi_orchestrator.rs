@@ -74,6 +74,7 @@ use tempfile::TempDir;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{AgentType, EventType};
+use dot_agent_deck::state::work_done_file_name;
 
 mod common;
 
@@ -212,8 +213,8 @@ fn path_with_binary_dir() -> String {
 /// uniquely-named sentinel `pi_orch_sentinel_7c3f.txt` (contents
 /// `PI_ORCH_SENTINEL_OK`). Assert the FULL chain: the sentinel file exists with
 /// the expected contents (the real worker ran the delegated task via the daemon
-/// route), the daemon wrote `.dot-agent-deck/work-done-coder.md` (work-done
-/// returned to the orchestrator), a `Pi`-typed `AgentEvent` for the orchestrator
+/// route), the daemon wrote `.dot-agent-deck/work-done-coder-<pane digest>.md`
+/// (work-done returned to the orchestrator), a `Pi`-typed `AgentEvent` for the orchestrator
 /// pane was observed on the daemon's broadcast (status via the extension's
 /// `agent-event` path, NO hook), AND the daemon recorded that the seed was
 /// delivered NATIVELY via the `get-seed` pull (proving the native path ran, not
@@ -438,7 +439,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     let work_done = cwd
         .path()
         .join(".dot-agent-deck")
-        .join(format!("work-done-{WORKER_ROLE}.md"));
+        .join(work_done_file_name(WORKER_ROLE, WORKER_PANE));
     let work_done_ok = common::wait_for_path_async(&work_done, Duration::from_secs(120)).await;
     assert!(
         work_done_ok,

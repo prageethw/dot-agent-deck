@@ -409,7 +409,7 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
 /// assert the user-visible reality on the rendered grid (the delegate pointer
 /// `worker-task-coder` rendered live in the worker pane) and confirm the full
 /// chain landed: the worker created the sentinel (contents `PI_INJECT_ORCH_OK`)
-/// and signalled work-done (`.dot-agent-deck/work-done-coder.md`). PTY-attached,
+/// and signalled work-done (`.dot-agent-deck/work-done-coder-<pane digest>.md`). PTY-attached,
 /// so it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
 /// (real LLM) — run once, not looped.
 #[spec("pi/live/002")]
@@ -616,14 +616,17 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     // Full chain — work-done returned to the orchestrator: the daemon wrote the
     // per-role summary file (`handle_work_done`), proving the worker ran
     // `dot-agent-deck work-done` from its task-file footer and the daemon
-    // ingested it over the socket.
-    let work_done = project_dir
-        .join(".dot-agent-deck")
-        .join(format!("work-done-{ORCH_WORKER_ROLE}.md"));
+    // ingested it over the socket. The worker pane's `pane_id` is assigned by
+    // the real daemon spawn (not a literal this test controls), so the exact
+    // digest-suffixed filename can't be predicted — glob for it instead.
+    let work_done_dir = project_dir.join(".dot-agent-deck");
+    let work_done =
+        common::find_work_done_file(&work_done_dir, ORCH_WORKER_ROLE, Duration::from_secs(60));
     assert!(
-        common::wait_for_path(&work_done, Duration::from_secs(60)),
-        "the worker never signalled work-done (no {work_done:?}). The sentinel was created, so \
-         the worker ran, but the work-done CLI did not reach the daemon.\nFinal grid:\n{}",
+        work_done.is_some(),
+        "the worker never signalled work-done (no work-done-{ORCH_WORKER_ROLE}-*.md under \
+         {work_done_dir:?}). The sentinel was created, so the worker ran, but the work-done CLI \
+         did not reach the daemon.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 
