@@ -10760,6 +10760,17 @@ pub fn run_tui(
             }
         }
 
+        // Fork issue #36: every hydrated pane is now registered and seeded, so
+        // events the subscriber held back during the snapshot/attach window can
+        // land on real cards. Released HERE — not after the tab rebuild below —
+        // because `apply_event` only needs `register_pane` + the seeded card,
+        // and the buffered window should be as short as possible. Runs even
+        // when `hydrated` is empty (nothing to seed still means nothing to wait
+        // for), and is a no-op when no gate is attached.
+        if let Some(gate) = embedded.hydration_gate() {
+            gate.mark_seeded();
+        }
+
         // PRD #76 M2.12: partition hydrated panes by tab_membership and
         // rebuild mode/orchestration tabs from the project config. Panes
         // claiming a mode/orchestration that the cwd's project config
