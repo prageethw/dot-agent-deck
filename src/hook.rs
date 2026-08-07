@@ -447,16 +447,31 @@ pub fn send_to_socket(json: &str) -> Option<()> {
     Some(())
 }
 
+/// Fork issue #89: bounds how long `get-seed` waits for the daemon's reply
+/// before folding into "no seed" (see [`request_from_socket`]). The daemon's
+/// `GetSeed` handler never touches the `state` lock that `delegate`'s reply
+/// path contends on — it only reads/clears an in-memory entry in
+/// `pty_registry` — so it is strictly cheaper than the `delegate` reply
+/// already bounded at `DELEGATE_REPLY_TIMEOUT` (5s, `src/main.rs`). Matching
+/// that value therefore gives get-seed at least as much headroom as delegate
+/// has, without inventing a smaller number that could fire against a merely
+/// busy (not wedged) daemon and needlessly downgrade a working socket
+/// delivery to the PTY-injection fallback.
+const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// PRD #201: send a line to the daemon hook socket and read ONE line of reply
 /// back on the same connection. Used by the read-only `get-seed` verb, the one
 /// hook-socket message that expects a response (the delegate / work-done /
 /// agent-event senders are fire-and-forget). Returns `None` if the socket is
-/// absent/unreadable — the caller (get-seed) treats that as "no seed", so an
-/// older daemon that never replies, or no daemon at all, degrades to the
-/// PTY-injection safety net rather than hanging or erroring. A blank reply
-/// line is returned as `Some(String::new())`.
+/// absent/unreadable, or if no reply arrives within
+/// [`GET_SEED_REQUEST_TIMEOUT`] (fork issue #89) — the caller (get-seed)
+/// treats all three identically as "no seed", so an older daemon that never
+/// replies, a daemon that never even accepts the connection, or one that
+/// accepts but goes silent, all degrade to the PTY-injection safety net
+/// rather than hanging or erroring. A blank reply line is returned as
+/// `Some(String::new())`.
 pub fn request_from_socket(json: &str) -> Option<String> {
-    match request_from_socket_inner(json, None) {
+    match request_from_socket_inner(json, Some(GET_SEED_REQUEST_TIMEOUT)) {
         SocketReply::Line(line) => Some(line),
         SocketReply::NoReply | SocketReply::Unreachable => None,
     }
