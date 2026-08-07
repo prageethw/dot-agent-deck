@@ -1379,6 +1379,41 @@ impl TuiDeck {
         }
         None
     }
+
+    /// Like [`find_in_grid`](Self::find_in_grid) but WAITS for `needle` to
+    /// appear, returning its 0-based `(col, row)` start cell or panicking with
+    /// the final grid after [`WAIT_TIMEOUT`].
+    ///
+    /// Use this — not `wait_for_string(<some other text>)` followed by a bare
+    /// `find_in_grid(needle).expect(…)` — whenever a test needs a widget's
+    /// coordinates in order to click it. The deck writes one rendered frame as
+    /// a single burst, but the reader thread feeds the vt100 parser in
+    /// `read()`-sized chunks (≤4 KiB, and as little as ~1 KiB on macOS PTYs), so
+    /// a frame taller than one chunk lands in the parser in pieces. Between two
+    /// of those pieces the grid is a legitimate but TORN view of the frame: the
+    /// rows written by the earlier chunk are already painted while the later
+    /// rows still show the previous screen. A `wait_for_string` on a proxy
+    /// string that happens to sit in an earlier chunk therefore returns while
+    /// the widget the test actually wants has not been parsed yet, and the
+    /// immediately-following `find_in_grid` legitimately misses it. Polling for
+    /// the needle itself closes that window: the wait ends only once the chunk
+    /// carrying it has been processed.
+    pub fn wait_for_in_grid(&self, needle: &str) -> (u16, u16) {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            if let Some(pos) = self.find_in_grid(needle) {
+                return pos;
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                panic!(
+                    "did not find {needle:?} in the grid within {WAIT_TIMEOUT:?}.\n\
+                     Final grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for TuiDeck {

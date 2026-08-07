@@ -590,6 +590,54 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
     }
 }
 
+/// Write a fake login shell into `dir` that prepends `keep_dir` to `PATH` and
+/// then runs whatever command it was asked to run, and return its path (for
+/// `.with_env("SHELL", …)`).
+///
+/// Needed by any `TuiDeck` test that puts a command SHIM on `PATH`. The deck
+/// lazy-spawns its daemon, and PRD #170's `apply_login_shell_path` runs
+/// `$SHELL -ilc 'printf %s "$PATH"'` at daemon startup and REPLACES the
+/// inherited PATH with whatever the login shell prints. The harness pins
+/// `SHELL=/bin/sh`, so on a host whose login profile rewrites `PATH` the shim
+/// dir the test prepended is reordered or dropped and the daemon resolves the
+/// REAL binary instead — on macOS `/etc/profile`'s `path_helper` moves
+/// `/opt/homebrew/bin` ahead of it, so a `claude` shim silently loses to a real
+/// Homebrew `claude`. Pointing `$SHELL` at this script makes the captured PATH
+/// deterministic (shim first) on every host. Mirrors the fixtures in
+/// `tests/e2e_login_path.rs` and `tests/e2e_issue_dispatch_live.rs`.
+fn write_shim_preserving_login_shell(
+    dir: &std::path::Path,
+    keep_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    let shell = dir.join("login-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\n\
+             export PATH=\"{keep}:$PATH\"\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             -*) shift ;;\n\
+             *) break ;;\n\
+             esac\n\
+             done\n\
+             if [ \"$#\" -gt 0 ]; then\n\
+             exec /bin/sh -c \"$1\"\n\
+             fi\n\
+             exec /bin/sh\n",
+            keep = keep_dir.to_string_lossy()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("write fake login shell: {e}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("chmod fake login shell: {e}"));
+    }
+    shell
+}
+
 /// Scenario: With a fixture task (`placeholder`, so the manager opens) and
 /// `default_command` EMPTY/unset (the unconfigured-user case), put a `claude`
 /// recorder shim on PATH, open the manager and press `a` to ADD. Adding reuses
@@ -600,9 +648,9 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
 /// Submit via `[Submit]` and assert the spawned authoring agent runs `claude`
 /// (its recorder receives the base authoring seed — `throwaway authoring
 /// session`) — the R1 fallback: a blank `default_command` must resolve to
-/// `claude`, NOT spawn a bare `$SHELL` that cannot act on the seed. RED until the
-/// new flow exists: today `a` opens the deleted pick-agent modal, so the dir
-/// picker never appears and the ` Select Directory ` wait times out.
+/// `claude`, NOT spawn a bare `$SHELL` that cannot act on the seed. `$SHELL` is
+/// pinned to a fake login shell that keeps the shim dir first on PATH, so the
+/// daemon's login-shell PATH capture cannot hand the spawn a real `claude`.
 #[spec("scheduler/manager/010")]
 #[test]
 fn manager_010_blank_default_command_falls_back_to_claude() {
@@ -633,11 +681,16 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
         shim_dir.to_string_lossy(),
         std::env::var("PATH").unwrap_or_default()
     );
+    // The daemon rebuilds its PATH from `$SHELL -ilc` at startup (PRD #170), so
+    // `PATH` alone does not pin which `claude` the spawned agent resolves — a
+    // host login profile that reorders PATH would hand it the REAL `claude`.
+    let login_shell = write_shim_preserving_login_shell(scratch.path(), &shim_dir);
 
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_env("PATH", path_env)
+        .with_env("SHELL", login_shell.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
@@ -651,9 +704,12 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm the dir → locked schedule form
     deck.wait_for_string("New Schedule"); // the mode-locked Add form is up
-    let (scol, srow) = deck
-        .find_in_grid("[Submit]")
-        .expect("the mode-locked schedule form must render a [Submit] button");
+    // Wait for `[Submit]` ITSELF rather than snapshotting the grid the instant
+    // the title appears. One rendered frame reaches the harness's vt100 parser
+    // in `read()`-sized chunks, and this form's frame splits between the title
+    // row and the button row — so a snapshot taken between those two chunks
+    // legitimately shows ` New Schedule ` with no `[Submit]` yet.
+    let (scol, srow) = deck.wait_for_in_grid("[Submit]");
     deck.click(scol, srow); // submit → spawn the seeded authoring agent
 
     // R1 fallback: a blank `default_command` must resolve to `claude`
