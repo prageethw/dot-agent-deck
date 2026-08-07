@@ -207,14 +207,6 @@ pub enum Tab {
         /// `(cwd, name)` tuple that cannot tell two same-named, same-cwd
         /// orchestration instances apart.
         orchestration_id: Option<String>,
-        /// PRD #374 (#361 Item 3): whether direct keystroke entry to
-        /// non-orchestrator role panes on this tab is locked. Starts
-        /// `true` — only the orchestrator pane accepts direct input until
-        /// `Ctrl+e` unlocks it. Per-tab: toggling one orchestration tab's
-        /// lock never affects another open orchestration tab. (It used to
-        /// cite `split_stage` as its precedent; PRD #387 M2 made that one
-        /// deck-global, so the lock is now the per-tab case on its own.)
-        command_entry_locked: bool,
     },
 }
 
@@ -1120,7 +1112,6 @@ impl TabManager {
             // than minting a second one — this tab's identity and its role
             // panes' daemon-side identity must be the same token.
             orchestration_id: Some(orchestration_id.clone()),
-            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -1271,7 +1262,6 @@ impl TabManager {
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
             orchestration_id: orchestration_id.map(str::to_string),
-            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -2135,7 +2125,6 @@ mod tests {
             all_clear_pending: false,
             zoomed: false,
             orchestration_id: None,
-            command_entry_locked: true,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -2169,7 +2158,6 @@ mod tests {
             all_clear_pending: false,
             zoomed: false,
             orchestration_id: None,
-            command_entry_locked: true,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
