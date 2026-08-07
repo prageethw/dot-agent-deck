@@ -1084,8 +1084,47 @@ async fn ingest_event(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     event: AgentEvent,
 ) {
+    ingest_event_with_hook(state, event_tx, event, || async {}).await;
+}
+
+/// Fork issue #31: the body of [`ingest_event`], with one injected hook
+/// awaited **between the broadcast and the apply** — the exact boundary the
+/// fix above created. Before the fix those two lines sat in separate
+/// lock-acquisition scopes; now they sit inside one guard with no yield point
+/// between them, and a test that parks a producer *here* can prove a second
+/// concurrent producer cannot get in (`status/shell-activity/008`).
+///
+/// The hook is a generic type parameter rather than `#[cfg(test)]` state,
+/// for two reasons. Production `ingest_event` has to call this
+/// unconditionally, so it cannot be compiled out; and a `#[cfg(test)]`
+/// global/thread-local hook would share mutable state across every test in
+/// the binary (`cargo test`, unlike nextest, runs them in one process) —
+/// this file has already been bitten by exactly that class of interference,
+/// see the umask comment in `run_hook_loop_persists_agent_type_into_registry`.
+/// A generic is inert instead by monomorphization: production instantiates it
+/// with `|| async {}`, an immediately-ready empty future that inlines to
+/// nothing, matching the always-compiled-generic style `sample_table` already
+/// uses in `platform::proc::unix`.
+///
+/// **Scope limit, so the seam is not over-trusted.** It guards this
+/// function's internals only — that the guard is held across broadcast and
+/// apply. It cannot catch a *future producer that bypasses the helper*: a new
+/// call site that goes back to `event_tx.send(...)` plus a separate
+/// `state.write().await`, or a refactor that re-inlines this body, reopens
+/// the original window and no test here will notice. That is a visible,
+/// small-diff change for a reviewer to catch, not something this seam covers.
+async fn ingest_event_with_hook<H, F>(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    event: AgentEvent,
+    between_broadcast_and_apply: H,
+) where
+    H: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
     let mut state = state.write().await;
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+    between_broadcast_and_apply().await;
     state.apply_event(event);
 }
 
@@ -2101,6 +2140,160 @@ mod orphan_watchdog_tests {
         // TuiDeck daemons — only the harness's non-detached daemons enable it.
         assert!(should_exit_orphaned(1, 1));
     }
+}
+
+// Fork issue #31: the regression test for `ingest_event`'s ordering
+// guarantee. Deliberately NOT gated to Unix like `hook_ingestion_tests`
+// below — it binds no socket, spawns no process and touches no PTY, so the
+// guarantee is checked on Windows too.
+#[cfg(test)]
+mod ingest_event_ordering_tests {
+    use super::*;
+    use crate::event::{AgentType, EventType};
+    use crate::state::SessionStatus;
+    use spec::spec;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    use tokio::sync::oneshot;
+
+    const PANE: &str = "pane-31";
+    const AGENT: &str = "agent-31";
+    const SESSION: &str = "sess-31";
+
+    fn event(event_type: EventType) -> AgentEvent {
+        AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: Some(AGENT.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// Scenario: Two daemon producers ingest events for the same pane at once.
+    /// The first is parked inside `ingest_event`, at the boundary between its
+    /// broadcast and its apply, while the second calls the plain production
+    /// `ingest_event` for that pane. The second must stay blocked on the write
+    /// lock for as long as the first is parked, and once the first is released
+    /// both must land with the applied order matching the broadcast order —
+    /// `ShellBusy` then `Idle`, leaving the card `Idle`, not the `Working` the
+    /// pre-fix interleaving produced.
+    #[spec("status/shell-activity/008")]
+    #[test]
+    fn shell_activity_008_ingest_event_is_atomic_across_broadcast_and_apply() {
+        // Current-thread on purpose: a single-threaded runtime removes every
+        // "did it happen to interleave this run" degree of freedom, and the
+        // second producer is polled by hand, so nothing here rests on timing.
+        // No sleeps, no retries — the assertion is deterministic.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build ingest-ordering runtime")
+            .block_on(shell_activity_008_ingest_event_is_atomic_across_broadcast_and_apply_inner());
+    }
+
+    async fn shell_activity_008_ingest_event_is_atomic_across_broadcast_and_apply_inner() {
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        // One managed session for both producers to land on. Applied directly
+        // rather than ingested, so the receiver above observes ONLY the two
+        // racing events and their order needs no filtering.
+        state
+            .write()
+            .await
+            .apply_event(event(EventType::SessionStart));
+
+        // Producer 1 — the shell-activity monitor's `ShellBusy`. It parks
+        // inside the helper at the broadcast→apply boundary and holds the
+        // write guard there.
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let first = tokio::spawn({
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            async move {
+                ingest_event_with_hook(
+                    &state,
+                    &event_tx,
+                    event(EventType::ShellBusy),
+                    move || async move {
+                        entered_tx.send(()).expect("test awaits the hook entry");
+                        release_rx.await.expect("release signal arrives");
+                    },
+                )
+                .await;
+            }
+        });
+        entered_rx
+            .await
+            .expect("first producer reaches the hook between broadcast and apply");
+
+        // Producer 2 — a hook connection's `Idle` for the same pane, through
+        // the UNMODIFIED production entry point. Driven by hand instead of
+        // spawned so its readiness can be observed directly rather than
+        // inferred from elapsed time.
+        let mut second = Box::pin(ingest_event(&state, &event_tx, event(EventType::Idle)));
+        let mut cx = Context::from_waker(Waker::noop());
+        for attempt in 0..5 {
+            assert!(
+                second.as_mut().poll(&mut cx).is_pending(),
+                "attempt {attempt}: the second producer must still be blocked on \
+                 the write lock while the first is paused between broadcast and \
+                 apply — getting past `state.write().await` here is precisely the \
+                 pre-fix shape, where the two lines sat in separate lock scopes"
+            );
+            // Give the runtime every chance to advance the parked producer.
+            // It cannot: the guard is held across the hook by construction.
+            tokio::task::yield_now().await;
+        }
+
+        release_tx.send(()).expect("first producer still parked");
+        first.await.expect("first producer completes");
+        second.await;
+
+        let mut broadcast_order = Vec::new();
+        while let Ok(BroadcastMsg::Event(broadcast)) = rx.try_recv() {
+            broadcast_order.push(broadcast.event_type);
+        }
+        assert_eq!(
+            broadcast_order,
+            vec![EventType::ShellBusy, EventType::Idle],
+            "every attached client sees `ShellBusy` then `Idle`"
+        );
+
+        let guard = state.read().await;
+        let session = guard
+            .sessions
+            .get(SESSION)
+            .expect("the managed session survives both events");
+        assert_eq!(
+            session.status,
+            SessionStatus::Idle,
+            "the daemon must APPLY the same order it broadcast, ending `Idle`. \
+             `Working` here is the fork #31 bug: `Idle` applied first (clearing \
+             the synthetic marker), then `ShellBusy` promoting the session back \
+             to `Working`, while every attached TUI rendered `Idle` from the \
+             opposite broadcast order — and nothing afterwards corrects it"
+        );
+    }
+
+    // Scope limit — see `ingest_event_with_hook`'s doc comment. This test
+    // covers that helper's internals only. A future producer that bypasses it
+    // (a new call site doing `event_tx.send(...)` plus its own
+    // `state.write().await`, or a refactor that re-inlines the body) reopens
+    // the identical window and this test stays green. Guard that at review
+    // time, not by over-trusting this seam.
 }
 
 // PRD #42 M2/review: these tests bind a real Unix socket, chmod it via
