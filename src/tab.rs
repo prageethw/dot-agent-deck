@@ -2832,4 +2832,112 @@ mod tests {
              a stale latch surviving on a background tab"
         );
     }
+
+    /// Scenario: Greptile's confirmed P1 on PRD #393's lock-governed focus
+    /// chain (`.dot-agent-deck/waiting-focus-race-findings.md`) — the
+    /// waiting-focus branch has no pending-input guard, unlike its
+    /// all-clear sibling right below it in `src/ui.rs`. Within a locked
+    /// orchestration tab (roles `orchestrator` < `alpha` < `beta`), `beta`
+    /// (higher role order) is already focused and `WaitingForInput` — the
+    /// human is mid-answer, so a keystroke is still queued for it. `alpha`
+    /// (LOWER role order) then also goes `WaitingForInput`, which would
+    /// normally steal focus per `orchestration_010`'s lowest-order rule. On
+    /// the frame where `input_pending` is true, that steal must be
+    /// DEFERRED, not applied, so the queued keystroke still lands on
+    /// `beta` rather than being misrouted to `alpha`. Once `input_pending`
+    /// clears on a later frame, the deferred steer to `alpha` must still
+    /// fire — proving the guard defers the move rather than dropping it,
+    /// mirroring `TabManager::auto_focus_all_clear`'s existing "no
+    /// one-shot latch" contract. Drives the not-yet-existing
+    /// `TabManager::auto_focus_locked` — the seam this test asks the coder
+    /// to add, folding both `auto_focus_waiting_pane` and
+    /// `auto_focus_all_clear` behind ONE `input_pending` guard shared by
+    /// both branches, mirroring the real per-frame call site's shape.
+    #[spec("tabs/orchestration/028")]
+    #[test]
+    fn orchestration_028_waiting_focus_defers_while_input_pending() {
+        use crate::state::SessionStatus;
+
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (orch_idx, role_ids) = tm
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab");
+        assert_eq!(tm.active_index(), orch_idx);
+        let orchestrator = role_ids[0].clone();
+        let alpha = role_ids[1].clone();
+        let beta = role_ids[2].clone();
+
+        // Mirrors the per-frame call site `src/ui.rs` SHOULD have: both
+        // branches gated on the SAME `input_pending` guard, computed once
+        // per frame in production from
+        // `!crossterm::event::poll(Duration::from_millis(0))`.
+        fn frame(
+            tm: &mut TabManager,
+            status: &HashMap<&str, SessionStatus>,
+            input_pending: bool,
+        ) -> Option<String> {
+            tm.observe_waiting_panes(status);
+            tm.auto_focus_locked(status, input_pending)
+        }
+
+        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
+        status.insert(orchestrator.as_str(), SessionStatus::Idle);
+        status.insert(alpha.as_str(), SessionStatus::Idle);
+        status.insert(beta.as_str(), SessionStatus::Idle);
+
+        // `beta` (higher role order) goes WaitingForInput and steals focus
+        // -- no input pending yet, so the move applies immediately, exactly
+        // as `orchestration_010` pins.
+        status.insert(beta.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(
+            frame(&mut tm, &status, false).as_deref(),
+            Some(beta.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
+        ));
+
+        // The human is mid-answer to `beta` -- a keystroke is queued. On
+        // THIS frame, `alpha` (LOWER role order than `beta`) ALSO goes
+        // WaitingForInput, which would normally steal focus per
+        // `orchestration_010`'s lowest-order rule. Because input is
+        // pending, the steal must be DEFERRED: focus stays on `beta` so the
+        // queued keystroke is not misrouted to `alpha`.
+        status.insert(alpha.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(
+            frame(&mut tm, &status, true),
+            None,
+            "a waiting-focus steal must be deferred, not applied, while a \
+             keystroke is still queued for the currently-focused waiting \
+             pane -- this is the Greptile P1 on PRD #393's lock-governed \
+             focus chain: the waiting branch had no pending-input guard"
+        );
+        assert!(
+            matches!(
+                &tm.tabs[orch_idx],
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
+            ),
+            "focus must still be on beta -- the queued keystroke's target \
+             -- while input is pending, not yanked to alpha"
+        );
+
+        // The queued keystroke has now been drained (input no longer
+        // pending). `alpha` is still WaitingForInput and still lower-order
+        // than `beta`, so the deferred steer must fire NOW -- proving the
+        // guard defers the move rather than dropping it, exactly as
+        // `auto_focus_all_clear`'s existing pending-input guard already
+        // behaves for its own branch.
+        assert_eq!(
+            frame(&mut tm, &status, false).as_deref(),
+            Some(alpha.as_str()),
+            "the deferred steer to alpha must still fire once input is no \
+             longer pending -- deferred, not lost"
+        );
+        assert!(matches!(
+            &tm.tabs[orch_idx],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+        ));
+    }
 }
