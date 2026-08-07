@@ -4325,20 +4325,28 @@ const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+e to unloc
 /// carve-out takes the pane-status join as its own parameter below. (An
 /// earlier version of this comment claimed the opposite; it was wrong.)
 ///
-/// PRD #393 M3 (decision 4), **first of two commits**: `pane_status` — the
-/// same `pane_id -> SessionStatus` join [`build_pane_status`] returns, passed
-/// straight from the call site — is threaded in here but deliberately NOT yet
-/// consulted, so this commit changes no gating behavior at all. The split
-/// exists to see `orchestration/lock/009` and `010` fail at *runtime* on their
-/// carve-out assertions rather than only failing to compile: a test that has
-/// only ever been observed green is indistinguishable from one that passes for
-/// the wrong reason. The exemption itself lands in the follow-up commit.
+/// PRD #393 M3 (decision 4): while the focused non-orchestrator role pane
+/// reports [`SessionStatus::WaitingForInput`], the lock stops gating that pane
+/// and the keystroke passes through untouched. The lock's subject is the
+/// *unsolicited* interruption of a working agent; an agent that has stopped and
+/// asked is already blocked on a human, so answering it is a response to a
+/// request rather than an intrusion into state the orchestrator believes it
+/// owns (see the PRD's "Why the lock exists at all"). The exemption is a pure
+/// read of live status with nothing latched anywhere, so the gate re-engages on
+/// the very next keystroke once the status clears.
+///
+/// `pane_status` is the same `pane_id -> SessionStatus` join
+/// [`build_pane_status`] returns, handed straight over by the call site.
+/// **Accepted limitation** (decision 4, stated in the PRD): an agent that never
+/// reports `WaitingForInput` gets no carve-out and still needs a deliberate
+/// `Ctrl+e` — the same blind spot `auto_focus_waiting_pane` and PRD #333's tab
+/// coloring already carry, so it adds no new class of one.
 fn gate_pane_input_key(
     action: Action,
     ui: &UiState,
     tab_manager: &TabManager,
     pane: &dyn PaneController,
-    _pane_status: &HashMap<&str, SessionStatus>,
+    pane_status: &HashMap<&str, SessionStatus>,
 ) -> Action {
     if !matches!(action, Action::ForwardToPane(_)) {
         return action;
@@ -4355,7 +4363,20 @@ fn gate_pane_input_key(
         return action;
     };
     let orchestrator_pane_id = role_pane_ids.get(*start_role_index).map(String::as_str);
-    if pane.focused_pane_id().as_deref() == orchestrator_pane_id {
+    let focused_pane_id = pane.focused_pane_id();
+    if focused_pane_id.as_deref() == orchestrator_pane_id {
+        return action;
+    }
+    // PRD #393 M3 (decision 4): the carve-out, checked LAST so it can only ever
+    // widen what gets through — the orchestrator's never-gated rule above and
+    // the tab-kind/lock guards before it keep their existing meaning whatever
+    // status happens to be attached to a pane.
+    if let Some(pane_id) = focused_pane_id.as_deref()
+        && matches!(
+            pane_status.get(pane_id),
+            Some(SessionStatus::WaitingForInput)
+        )
+    {
         return action;
     }
     Action::Continue
