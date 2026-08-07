@@ -613,6 +613,23 @@ fn role_path_slug(role: &str) -> String {
     format!("{readable}-{}", role_digest_hex(role))
 }
 
+/// The daemon's work-done output filename for `role`, keyed on the reporting
+/// pane's `pane_id` (upstream #331 + fork #76). Two panes running the same
+/// role in the same cwd — two live orchestrations, or one worker re-delegated
+/// within the same run — are still two different `pane_id`s, so this stays
+/// unique per pane instead of colliding on role name alone. Reuses
+/// [`role_digest_hex`]'s bounded-digest shape against a different input
+/// (`pane_id` length is unbounded — task-name-derived for scheduled panes)
+/// rather than a new hashing scheme.
+///
+/// Public so [`Self::handle_work_done`] (the write site) and e2e tests that
+/// need to assert against the exact on-disk path compute the same name
+/// instead of each guessing at the format independently.
+pub fn work_done_file_name(role: &str, pane_id: &str) -> String {
+    let safe_name = sanitize_role_name(role);
+    format!("work-done-{safe_name}-{}.md", role_digest_hex(pane_id))
+}
+
 /// Assert that the inline `--task` allowlist condition on a generated surface
 /// names every character that surface's own prose calls excluded.
 ///
@@ -724,10 +741,11 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
 ///
 /// The suggested path is role-interpolated and deliberately outside the
 /// `work-done-*` namespace: the daemon writes its own summary to
-/// `.dot-agent-deck/work-done-<role>.md` (see `handle_work_done`), so a worker
-/// that parked its report there would have it silently overwritten (#331), and
-/// a shared fixed filename would let parallel workers in one cwd clobber each
-/// other (reviewer finding 1). The role component is reduced by
+/// `.dot-agent-deck/work-done-<role>-<pane digest>.md` (see [`work_done_file_name`],
+/// [`Self::handle_work_done`]), so a worker that parked its report there would
+/// have it silently overwritten (#331), and a shared fixed filename would let
+/// parallel workers in one cwd clobber each other (reviewer finding 1). The
+/// role component is reduced by
 /// [`role_path_slug`], whose digest is what keeps two distinct configured roles
 /// apart. That is collision *resistance*, not injectivity — two roles whose
 /// original bytes hash to the same 32 bits would still share a path — but the
@@ -766,7 +784,7 @@ fn work_done_footer(role: &str) -> String {
          `<summary-slug>` with a short name you invent from `[a-z0-9][a-z0-9-]*`, at most 40 \
          characters, containing no `/` and no `..`, and keep the whole path single-quoted. Do not \
          give the file a `work-done-*` name: the deck writes its own summary to \
-         `.dot-agent-deck/work-done-<your-role>.md`, so a report parked there is overwritten and \
+         `.dot-agent-deck/work-done-<your-role>-*.md`, so a report parked there is overwritten and \
          lost.\n\n\
          The file stays on disk after the handoff. Keep credentials, customer data, and other \
          secrets out of it, pick a path that does not already exist, and delete exactly that path \
@@ -3234,14 +3252,54 @@ impl AppState {
             return;
         }
 
-        // Write summary to .dot-agent-deck/work-done-{role}.md
+        // Write summary to .dot-agent-deck/work-done-{role}-{pane digest}.md.
+        // The filename is computed ONCE here and reused for the orchestrator
+        // pointer sentence below (§7 of the design writeup: two independently
+        // written `format!` calls that both encode the same name is exactly
+        // the kind of drift that reintroduces an unreadable pointer while
+        // "fixing" this).
         let safe_name = sanitize_role_name(&role_name);
+        let file_name = work_done_file_name(&role_name, &signal.pane_id);
+        // Upstream #331: a report already at this path is archived aside
+        // rather than clobbered, and the archive is announced in the
+        // feedback composed below — silence is the defining property of both
+        // bugs this closes, so surviving on disk isn't enough on its own.
+        let mut collision_note = String::new();
         if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
             let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 warn!(dir = %dir.display(), role = %role_name, error = %e, "failed to create work-done directory");
             }
-            let file_path = dir.join(format!("work-done-{safe_name}.md"));
+            let file_path = dir.join(&file_name);
+            if file_path.exists() {
+                let archive_name = format!("{file_name}.prev.md");
+                let archive_path = dir.join(&archive_name);
+                match std::fs::rename(&file_path, &archive_path) {
+                    Ok(()) => {
+                        warn!(
+                            path = %file_path.display(),
+                            archived_to = %archive_path.display(),
+                            role = %role_name,
+                            "work-done: a report already existed at this path; archived it \
+                             instead of overwriting"
+                        );
+                        collision_note = format!(
+                            " A previous report already existed at this path and was archived \
+                             to .dot-agent-deck/{archive_name} instead of being overwritten."
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %file_path.display(),
+                            archive_to = %archive_path.display(),
+                            role = %role_name,
+                            error = %e,
+                            "work-done: failed to archive the existing report aside; it will be \
+                             overwritten"
+                        );
+                    }
+                }
+            }
             if let Err(e) = std::fs::write(&file_path, &signal.task) {
                 warn!(path = %file_path.display(), role = %role_name, error = %e, "failed to write work-done summary");
             }
@@ -3273,7 +3331,7 @@ impl AppState {
 
         let feedback = format!(
             "Worker {safe_name} has completed their task. \
-             Read .dot-agent-deck/work-done-{safe_name}.md for their full report."
+             Read .dot-agent-deck/{file_name} for their full report.{collision_note}"
         );
         if let Err(e) = registry
             .write_to_pane_and_submit(&orch_pane_id, &feedback)

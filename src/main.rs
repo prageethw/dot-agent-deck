@@ -494,6 +494,36 @@ fn resolve_task(
     }
 }
 
+/// Does `task_file` resolve into the daemon's own `.dot-agent-deck/work-done-*.md`
+/// output namespace ([`dot_agent_deck::state::work_done_file_name`])?
+///
+/// Upstream #331's own proposed fix: a `work-done --task-file <path>` whose
+/// path already sits where `handle_work_done` is about to write its own
+/// summary is a literal, mechanically-preventable setup for that summary to
+/// clobber the very file being reported — refused client-side, before ever
+/// reading the file or contacting the daemon. A glob on the immediate parent
+/// directory + filename prefix, not an exact match against today's filename
+/// shape: the daemon's own name now carries a per-pane digest suffix (fork
+/// #76), and this check must stay correct if that suffix ever changes again
+/// without knowing what it is.
+fn is_work_done_output_path(task_file: &str) -> bool {
+    if task_file == "-" {
+        return false;
+    }
+    let path = std::path::Path::new(task_file);
+    let is_work_done_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with("work-done-") && name.ends_with(".md"));
+    if !is_work_done_name {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some(".dot-agent-deck")
+}
+
 /// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
 fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
     if path == "-" {
@@ -747,6 +777,19 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            if let Some(ref path) = task_file
+                && is_work_done_output_path(path)
+            {
+                eprintln!(
+                    "Error: --task-file {path:?} resolves into dot-agent-deck's own \
+                     work-done output namespace (.dot-agent-deck/work-done-*.md). Sending \
+                     it back to `work-done` would let the daemon overwrite this exact file \
+                     with this call's own summary. Write your report somewhere else (e.g. \
+                     .dot-agent-deck/report-<role>-<summary-slug>.md) and pass that path \
+                     instead."
+                );
+                return ExitCode::FAILURE;
+            }
             let task = match resolve_task(task, task_file, std::io::stdin().lock()) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1879,6 +1922,41 @@ mod tests {
             err.contains("--task") && err.contains("--task-file"),
             "neither-given error should mention both flags: {err}"
         );
+    }
+
+    // `is_work_done_output_path` is the pure seam under the client-side
+    // refusal in the `work-done` CLI arm (upstream #331's own proposed fix),
+    // tested directly here so the glob shape (parent `.dot-agent-deck/` +
+    // `work-done-*.md` filename, not an exact match on today's filename) is
+    // pinned independent of the daemon-side digest suffix.
+
+    #[test]
+    fn work_done_output_path_matches_own_namespace() {
+        assert!(is_work_done_output_path(
+            ".dot-agent-deck/work-done-coder.md"
+        ));
+        assert!(is_work_done_output_path(
+            ".dot-agent-deck/work-done-coder-1a2b3c4d.md"
+        ));
+        assert!(is_work_done_output_path(
+            "sub/dir/.dot-agent-deck/work-done-reviewer-deadbeef.md"
+        ));
+    }
+
+    #[test]
+    fn work_done_output_path_rejects_files_outside_the_namespace() {
+        // Wrong directory.
+        assert!(!is_work_done_output_path("work-done-coder.md"));
+        assert!(!is_work_done_output_path("other-dir/work-done-coder.md"));
+        // Right directory, wrong filename shape.
+        assert!(!is_work_done_output_path(
+            ".dot-agent-deck/report-coder-abc123-my-summary.md"
+        ));
+        assert!(!is_work_done_output_path(
+            ".dot-agent-deck/worker-task-coder.md"
+        ));
+        // stdin sentinel must never be treated as a path.
+        assert!(!is_work_done_output_path("-"));
     }
 
     #[test]
