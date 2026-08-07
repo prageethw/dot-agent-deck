@@ -189,13 +189,17 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         .expect("inject Delegate over hook socket");
 
     assert!(
-        wait_for_wrapped_grid_string(&deck, IDLE_DAEMON_CLAUSE, Duration::from_secs(20)),
+        wait_for_wrapped_grid_string(&deck, IDLE_DAEMON_CLAUSE, common::OBSERVATION_BUDGET),
         "the daemon-authored idle prompt never became visible in the attached orchestration \
          pane\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        wait_for_wrapped_grid_string(&deck, &idle_role_label("worker"), Duration::from_secs(20)),
+        wait_for_wrapped_grid_string(
+            &deck,
+            &idle_role_label("worker"),
+            common::OBSERVATION_BUDGET
+        ),
         "the idle prompt did not carry the silent role inside its untrusted-role-label \
          markers\nFinal grid:\n{}",
         deck.snapshot_grid()
