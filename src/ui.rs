@@ -25445,6 +25445,175 @@ mod tests {
         );
     }
 
+    /// Scenario: PRD #393 review blocker 2 (PR #51, `src/ui.rs:4380-4387` /
+    /// `src/ui.rs:12369-12374`) — `build_pane_status` joins session values
+    /// into a `pane_id`-keyed `HashMap<&str, SessionStatus>` with NO dedupe,
+    /// so when two sessions share a `pane_id` the surviving value is
+    /// whichever `HashMap` iteration order reaches last: unspecified (#398).
+    /// A `HashMap<&str, SessionStatus>` cannot even REPRESENT that
+    /// collision — one key, one value — so it has already thrown the
+    /// ambiguity away by the time `gate_pane_input_key`'s decision-4
+    /// carve-out reads it. This is reachable without an adversary: PRD #110
+    /// deliberately preserves `agent_id: None` for pre-F9 hooks, and that
+    /// shape creates a duplicate session for an already-tracked pane (#398),
+    /// which is exactly how `orchestration/lock/010` failed earlier on this
+    /// branch, by accident, and how a security audit (#401) reached the
+    /// same place independently. The user's decision is fail-closed: an
+    /// ambiguous or duplicated pane session must DENY the exemption, not
+    /// grant it. Spawns a real locked orchestration tab and focuses its
+    /// worker pane (mirrors `orchestration/lock/009`'s setup, so the
+    /// tab-kind and lock guards ahead of the carve-out are exercised for
+    /// real), then builds two synthetic `AppState`s standing in for the
+    /// real daemon-observed collision — one with a SINGLE session
+    /// (`WaitingForInput`) on the worker's `pane_id`, one with TWO sessions
+    /// sharing it (`Working` and `WaitingForInput`) — and resolves each
+    /// through a NEW `build_pane_status_for_gate` join before handing the
+    /// result to the UNCHANGED `gate_pane_input_key`. Deliberately a
+    /// separate function from `build_pane_status` itself (left exactly as
+    /// buggy/unspecified as today — #398 stays out of scope for this PRD;
+    /// this is "a consumer-side guard, not a fix to the join"): the two
+    /// sessions collide is a fact only the raw `AppState.sessions`
+    /// collection still carries, since `build_pane_status`'s plain
+    /// `HashMap<&str, SessionStatus>` output has already discarded it — so
+    /// there is nothing for `gate_pane_input_key` to inspect in the
+    /// EXISTING join's result no matter how its own logic changes. Pins the
+    /// outcome (ambiguous → denied, unambiguous → still exempted, matching
+    /// `orchestration/lock/009`) rather than the resolution's exact
+    /// internal mechanism. RED today: `build_pane_status_for_gate` does not
+    /// exist, so this fails to compile.
+    #[spec("orchestration/lock/012")]
+    #[test]
+    fn orchestration_lock_012_ambiguous_status_fails_closed() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "lock-ambiguous".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config("lock-ambiguous")),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // Two sessions collide on the SAME pane_id, disagreeing on
+        // WaitingForInput-ness -- exactly the reviewer's trace: the
+        // locked, focused worker's real session is Working, while a
+        // colliding session (e.g. a pre-F9 hook's `agent_id: None`
+        // duplicate, #398) says WaitingForInput.
+        let mut real = make_session(SessionStatus::Working);
+        real.session_id = "sess-real-working".into();
+        real.pane_id = Some(worker_id.clone());
+
+        let mut duplicate = make_session(SessionStatus::WaitingForInput);
+        duplicate.session_id = "sess-duplicate-waiting".into();
+        duplicate.pane_id = Some(worker_id.clone());
+
+        let mut collision_state = AppState::default();
+        collision_state
+            .sessions
+            .insert(real.session_id.clone(), real);
+        collision_state
+            .sessions
+            .insert(duplicate.session_id.clone(), duplicate);
+
+        let ambiguous_status = build_pane_status_for_gate(&collision_state);
+        assert_ne!(
+            ambiguous_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a pane_id with two disagreeing sessions must not resolve to \
+             WaitingForInput for the gate -- that is the fact the carve-out \
+             needs in order to fail closed"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &ambiguous_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "an ambiguous pane_id (colliding sessions disagreeing on \
+             WaitingForInput) must DENY the exemption and drop the \
+             keystroke -- fail closed, not fail open -- got {gated:?}"
+        );
+
+        // The unambiguous case must still work, through the SAME resolver:
+        // a single clean WaitingForInput session still earns the
+        // carve-out (orchestration/lock/009's claim), so fixing the
+        // ambiguous case above can't buy fail-closed by breaking this one.
+        let mut clean = make_session(SessionStatus::WaitingForInput);
+        clean.session_id = "sess-clean-waiting".into();
+        clean.pane_id = Some(worker_id.clone());
+        let mut clean_state = AppState::default();
+        clean_state.sessions.insert(clean.session_id.clone(), clean);
+
+        let single_status = build_pane_status_for_gate(&clean_state);
+        assert_eq!(
+            single_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a single, unambiguous WaitingForInput session must still \
+             resolve to WaitingForInput for the gate"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &single_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a single, unambiguous WaitingForInput session must still \
+                 pass the keystroke through unchanged (orchestration/lock/009)"
+            ),
+            other => panic!(
+                "expected the unambiguous WaitingForInput carve-out to still \
+                 pass ForwardToPane through unchanged, got {other:?}"
+            ),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Bell transition detection tests
     // -----------------------------------------------------------------------

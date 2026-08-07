@@ -2706,4 +2706,117 @@ mod tests {
             "re-locking must resume all-clear pinning back to the orchestrator"
         );
     }
+
+    /// Scenario: PRD #393 review blocker 1 (PR #51, `src/ui.rs:7291-7293` /
+    /// `src/tab.rs:560-570`) — the command-entry lock is deck-global, but
+    /// `clear_waiting_pane_latch` was written to reset only the ACTIVE
+    /// tab's waiting-episode edge state. Two Orchestration tabs (`A`, `B`):
+    /// `A`'s `alpha` role goes `WaitingForInput` while `A` is active and
+    /// locked, latching `A`'s `had_waiting_pane = true` and stealing focus
+    /// onto `alpha`, exactly as `orchestration_010` pins. The user then
+    /// switches to `B` and unlocks — the deck-global toggle's
+    /// latch-clearing call fires with `B`, not `A`, active. While unlocked,
+    /// `A`'s worker resolves unobserved (the chain never runs against a
+    /// background tab, and wouldn't run at all while unlocked even if `A`
+    /// were active). The user re-locks and returns to `A`. `A`'s first
+    /// locked frame back must treat the already-resolved `alpha` as old
+    /// news, not a fresh `true` -> `false` edge, so focus stays on `alpha`
+    /// rather than being yanked to the orchestrator role. This is the exact
+    /// bug the latch rule exists to prevent (per `orchestration_026`),
+    /// reappearing across tabs because the clearing call was scoped to the
+    /// active tab instead of the deck-global lock it compensates for. Pins
+    /// the outcome — every Orchestration tab's edge state must be reset on
+    /// the locked->unlocked transition — not the mechanism the coder
+    /// chooses to reach it.
+    #[spec("tabs/orchestration/027")]
+    #[test]
+    fn orchestration_027_lock_toggle_clears_latch_on_every_tab_not_just_active() {
+        use crate::state::SessionStatus;
+
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+
+        let (idx_a, roles_a) = tm
+            .open_orchestration_tab(&orch_config_3("orchA"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab A");
+        let orchestrator_a = roles_a[0].clone();
+        let alpha_a = roles_a[1].clone();
+
+        let (idx_b, _roles_b) = tm
+            .open_orchestration_tab(&orch_config_3("orchB"), "/work", None, None, (24, 80))
+            .expect("open orchestration tab B");
+        assert_eq!(tm.active_index(), idx_b);
+
+        // Mirrors the real per-frame call site: the whole chain is skipped
+        // while unlocked, exactly as `orchestration_026` models.
+        fn frame(
+            tm: &mut TabManager,
+            status: &HashMap<&str, SessionStatus>,
+            locked: bool,
+        ) -> Option<String> {
+            if !locked {
+                return None;
+            }
+            tm.observe_waiting_panes(status);
+            tm.auto_focus_waiting_pane(status)
+                .or_else(|| tm.auto_focus_all_clear())
+        }
+
+        let mut status: HashMap<&str, SessionStatus> = HashMap::new();
+        status.insert(orchestrator_a.as_str(), SessionStatus::Idle);
+        status.insert(alpha_a.as_str(), SessionStatus::Idle);
+
+        // 1. Tab A is active and locked; `alpha` goes WaitingForInput,
+        // latching `had_waiting_pane = true` on A and stealing focus, as
+        // `orchestration_010` pins.
+        assert!(tm.switch_to(idx_a));
+        status.insert(alpha_a.as_str(), SessionStatus::WaitingForInput);
+        assert_eq!(
+            frame(&mut tm, &status, true).as_deref(),
+            Some(alpha_a.as_str())
+        );
+        assert!(matches!(
+            &tm.tabs[idx_a],
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha_a
+        ));
+
+        // 2. User switches to tab B and unlocks. The deck-global lock
+        // toggle's latch-clearing call fires here — against whichever tab
+        // is active at the moment, which is now B, not A.
+        assert!(tm.switch_to(idx_b));
+        tm.clear_waiting_pane_latch();
+
+        // 3. While unlocked, A's worker resolves — unobserved, since the
+        // chain doesn't run for a background tab, and wouldn't run at all
+        // while unlocked even if A were active.
+        status.insert(alpha_a.as_str(), SessionStatus::Idle);
+
+        // 4. User re-locks and returns to A.
+        assert!(tm.switch_to(idx_a));
+
+        // 5. A's first locked frame back: if A's latch was actually cleared
+        // in step 2 (deck-global, not active-tab-only), this is a no-op —
+        // nothing new resolved from A's perspective, so there is no edge to
+        // fire. If the latch survived (today's bug — `clear_waiting_pane_latch`
+        // only touched the then-active tab B), this reads as a stale
+        // `true` -> `false` edge and yanks focus to the orchestrator,
+        // overriding where the user left it.
+        assert_eq!(
+            frame(&mut tm, &status, true),
+            None,
+            "the locked->unlocked toggle must clear EVERY orchestration \
+             tab's waiting-episode latch, not just the tab active at the \
+             moment of the toggle — a background tab's already-resolved \
+             episode must not be replayed as a fresh all-clear edge on \
+             return"
+        );
+        assert!(
+            matches!(
+                &tm.tabs[idx_a],
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha_a
+            ),
+            "focus must stay on alpha, not be yanked to the orchestrator by \
+             a stale latch surviving on a background tab"
+        );
+    }
 }
