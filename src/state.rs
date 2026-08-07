@@ -3038,6 +3038,43 @@ impl AppState {
         // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
         let targets = self.delegate_targets(&signal.pane_id, &signal.to);
 
+        // Fork #92: capture what actually resolved BEFORE the fan-out loop
+        // below drains `targets` by value. `resolved_roles` is deduped (a
+        // role can have multiple panes, but `delegate_targets` already
+        // dedupes the outer request, so this only guards against the same
+        // role appearing via more than one pane) and keeps request order,
+        // which is what makes the zero/partial-resolution checks below
+        // meaningful — `signal.to` itself must NOT be used for the reply,
+        // that's the bug this fixes.
+        let mut resolved_roles: Vec<String> = Vec::new();
+        let mut seen_resolved: HashSet<&str> = HashSet::new();
+        for (target_role, _) in &targets {
+            if seen_resolved.insert(target_role.as_str()) {
+                resolved_roles.push(target_role.clone());
+            }
+        }
+        if resolved_roles.is_empty() {
+            warn!(
+                pane_id = %signal.pane_id,
+                requested = ?signal.to,
+                "delegate resolved to zero targets; rejecting"
+            );
+            return DelegateResponse::rejected(format!(
+                "none of the requested role(s) {:?} resolved to a worker pane in this \
+                 orchestration (unknown role name, or a self-targeted delegate to the \
+                 orchestrator's own role) — nothing was armed",
+                signal.to
+            ));
+        }
+        let mut seen_requested: HashSet<&str> = HashSet::new();
+        let unresolved_roles: Vec<String> = signal
+            .to
+            .iter()
+            .filter(|role| seen_requested.insert(role.as_str()))
+            .filter(|role| !seen_resolved.contains(role.as_str()))
+            .cloned()
+            .collect();
+
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
         // delegate CLI on the other end of the hook socket) returns
@@ -3129,8 +3166,14 @@ impl AppState {
         // tell a first success apart from a duplicate one instead of
         // re-running the delegate "to check" — the fan-out above is already
         // queued by this point, so this reply doesn't wait on any dispatch
-        // task to finish.
-        DelegateResponse::accepted(signal.to)
+        // task to finish. Fork #92: built from `resolved_roles`/
+        // `unresolved_roles`, not `signal.to` — the reply must reflect what
+        // actually armed, not what was asked for.
+        if unresolved_roles.is_empty() {
+            DelegateResponse::accepted(resolved_roles)
+        } else {
+            DelegateResponse::accepted_partial(resolved_roles, unresolved_roles)
+        }
     }
 
     /// Handle a worker's work-done signal: write the per-role summary file

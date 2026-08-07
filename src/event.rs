@@ -696,6 +696,14 @@ pub struct DelegateResponse {
     /// The role(s) the delegate armed — empty when `ok` is false.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// Fork #92: requested role(s) that did NOT resolve to any pane —
+    /// unknown role names, or the orchestrator targeting its own role.
+    /// Populated alongside `ok: true` only on partial resolution (some
+    /// requested roles armed, others didn't); empty on full resolution and
+    /// on rejection (where `roles` itself is empty, so there's nothing to
+    /// contrast it against).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
 }
 
 impl DelegateResponse {
@@ -704,6 +712,21 @@ impl DelegateResponse {
             ok: true,
             error: None,
             roles,
+            unresolved: Vec::new(),
+        }
+    }
+
+    /// Fork #92: some requested roles armed a pane, others didn't. Still an
+    /// accepted delegate — something really did happen — but `unresolved`
+    /// lets the caller distinguish "this role armed" from "this role was
+    /// requested but nothing exists for it", which a plain merged echo of
+    /// `roles` alone cannot do.
+    pub fn accepted_partial(roles: Vec<String>, unresolved: Vec<String>) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            roles,
+            unresolved,
         }
     }
 
@@ -712,6 +735,7 @@ impl DelegateResponse {
             ok: false,
             error: Some(reason.into()),
             roles: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 }
