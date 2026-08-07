@@ -247,7 +247,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             &authoring_record,
             "DIGESTPROMPTMARKER",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "editing a schedule must open the dir picker → mode-locked Edit Schedule form, then on \
          submit spawn the seeded authoring agent running the CONFIGURED `default_command` \
@@ -648,7 +648,7 @@ fn recorder_shim_survives_shell_metacharacters_in_the_record_path() {
     // Close stdin so the shim's delivery loop ends; `pwd >> <record>` is its
     // FIRST line, so the record appears whatever the later hook call does.
     drop(child.stdin.take());
-    let appeared = common::wait_for_path(&record, Duration::from_secs(15));
+    let appeared = common::wait_for_path(&record, common::OBSERVATION_BUDGET);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -821,7 +821,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
             &claude_record,
             "throwaway authoring session",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "an unset/blank `default_command` must fall back to `claude` (not spawn a bare \
          `$SHELL`): the authoring agent must run `claude` and deliver the base authoring \
@@ -936,9 +936,13 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
     // `NEXT FIRE` is the dialog's HEADER, so it appears before the overlay's
-    // interior is drawn. Wait for the initial selection marker too, then let
-    // the marker set settle -- the baseline this test compares everything
-    // against must come from a fully painted frame.
+    // interior is drawn, and the side-pane rows behind it may still be
+    // mid-repaint when it lands, because the deck's frame reaches the vt100
+    // parser in `read()`-sized chunks (fork #81). Wait for the initial
+    // selection marker too, then let the marker set settle -- the baseline
+    // this test compares everything against must come from a fully painted
+    // frame, not a torn one that would make the `assert_eq!`s below report a
+    // scrollback leak that never happened.
     deck.wait_for_string("\u{25b6} alpha");
     let before =
         settled_side_scroll_markers(&deck, "the Scheduled Tasks overlay to finish painting");
@@ -959,7 +963,7 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
 
     deck.scroll(wheel_col, dialog_row, true);
     let selection_moved_down = deck
-        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+        .wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
             grid.contains("\u{25b6} bravo")
         });
     assert!(
@@ -971,9 +975,10 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     let after_down_grid = deck.snapshot_grid();
 
     deck.scroll(wheel_col, dialog_row, false);
-    let selection_moved_up = deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
-        grid.contains("\u{25b6} alpha")
-    });
+    let selection_moved_up = deck
+        .wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
+            grid.contains("\u{25b6} alpha")
+        });
     assert!(
         selection_moved_up,
         "wheel-up over the Scheduled Tasks dialog must move the selection from `bravo` back to `alpha`.\nGrid after wheel-up:\n{}",
@@ -1138,7 +1143,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
             &authoring_record,
             "throwaway authoring session",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "adding a schedule must open the dir picker → mode-locked New Schedule form, then on \
          submit spawn the seeded authoring agent running the configured `default_command` \
@@ -1240,7 +1245,7 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
             &authoring_record,
             "EDITPROMPTMARKER",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "editing a schedule must pre-fill the authoring seed with the existing schedule's \
          values — the recorder never received the row's `EDITPROMPTMARKER` prompt"
@@ -1555,7 +1560,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
             &authoring_record,
             "EDITPROMPTF3",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "editing must spawn the seeded authoring agent pre-filled from the row — the recorder \
          never received the row's `EDITPROMPTF3` prompt"
@@ -1675,7 +1680,7 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
             &authoring_record,
             "schedule add --repo",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "selecting `schedule: issues` must seed the authoring agent with issue-dispatch \
          instructions calling `dot-agent-deck schedule add --repo …` (DISTINCT from the plain \
