@@ -62,12 +62,36 @@
 //! already reflects is therefore a redundant re-application of the same
 //! transition, never a regression to an older one.
 //!
-//! # What this does NOT close
+//! # The same hazard later in the connection's life (issues #49 / #28)
 //!
-//! Only the *bootstrap* gap. If the subscription later dies (daemon restart, a
-//! `KIND_STREAM_END "lagged"` tear-down) the reconnect loop below re-subscribes
-//! but the TUI does not re-hydrate, so events broadcast during that outage are
-//! still lost. That is pre-existing behaviour and out of scope for issue #36.
+//! Everything above is about *bootstrap*. The identical loss happens whenever
+//! the subscription dies mid-session — a daemon restart, a dead socket, or the
+//! `KIND_STREAM_END "lagged"` tear-down `handle_subscribe_events` performs for
+//! a receiver that falls behind. The reconnect loop below re-subscribed and
+//! resumed applying events, but nothing re-read the daemon's state, so every
+//! event broadcast during the outage was gone for good and the card sat on its
+//! pre-outage status indefinitely. `handle_subscribe_events`'s own doc comment
+//! already stated the intended contract — the client is expected to "drain a
+//! `list_agents` snapshot to recover" — and the client did not.
+//!
+//! [`run_event_subscriber`] now does exactly that: **every re-subscribe after
+//! the first** captures a fresh `ListAgents` snapshot and reconciles it onto
+//! the cards that already exist ([`crate::state::AppState::resync_hydrated_sessions`]).
+//! It is deliberately unconditional rather than triggered by the tear-down
+//! reason: a bare transport drop loses precisely as much as a `"lagged"` one,
+//! and reason-string matching would recover only the case that bothered to
+//! announce itself.
+//!
+//! The ordering that makes bootstrap correct makes this correct too, for the
+//! same reason and in the same shape. The resync runs *after* the new
+//! subscription is confirmed and *before* the first event is read off it, so
+//! the snapshot is strictly newer than the stream and every event the stream
+//! carries is applied on top of it — never underneath.
+//!
+//! The first subscribe deliberately does NOT resync: bootstrap hydration is
+//! the pass that owns it, and it does more (it attaches a PTY and mints a card
+//! per agent). The resync is the narrow mid-session counterpart — it updates
+//! cards in place and creates nothing.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -104,6 +128,15 @@ pub const SUBSCRIBE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// buffered window's purpose is to land the deck on the daemon's *current*
 /// state, and the newest events are the ones that carry it.
 pub const HYDRATION_BUFFER_CAP: usize = 1024;
+
+/// Bound on the `ListAgents` round-trip the reconnect resync makes (issues
+/// #49 / #28). Matches `embedded_pane`'s `HYDRATE_LIST_TIMEOUT`, the bound on
+/// the equivalent call at bootstrap.
+///
+/// Expiry is a **degradation, never a hang**: the resync is abandoned for this
+/// reconnect and the subscriber goes straight to reading events, exactly as it
+/// behaved before the resync existed. The next reconnect tries again.
+pub const RESYNC_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Coordination handle between the event subscriber and reconnect hydration.
 ///
@@ -232,6 +265,11 @@ impl Default for HydrationGate {
 /// Reconnects with a small backoff on transport errors so a daemon restart or a
 /// `KIND_STREAM_END "lagged"` tear-down recovers automatically.
 ///
+/// Fork issues #49/#28: recovery is not just re-subscribing. Every re-subscribe
+/// after the first also drains a fresh `ListAgents` snapshot and reconciles it
+/// onto the existing cards, because nothing replays what the daemon broadcast
+/// while the stream was down. See the module docs for the ordering.
+///
 /// Fork issue #36: `gate` orders this subscription against reconnect
 /// hydration. Pass [`HydrationGate::armed`] when a `hydrate_from_daemon` pass
 /// will follow (the TUI bootstrap), or [`HydrationGate::open`] when it will
@@ -253,6 +291,10 @@ pub async fn run_event_subscriber(attach_path: PathBuf, state: SharedState, gate
     let mut delay = Duration::from_millis(500);
     let max_delay = Duration::from_secs(5);
     let client = DaemonClient::new(attach_path);
+    // Fork issues #49/#28: the first subscribe is bootstrap's, and bootstrap
+    // hydration owns the snapshot for it. Every LATER one is a reconnect, and
+    // has an outage behind it whose events nothing else will ever deliver.
+    let mut subscribed_before = false;
     loop {
         match client.subscribe_events().await {
             Ok(mut sub) => {
@@ -264,6 +306,17 @@ pub async fn run_event_subscriber(attach_path: PathBuf, state: SharedState, gate
                 // makes the `ListAgents` snapshot strictly newer than this
                 // subscription.
                 gate.mark_subscribed();
+
+                // Fork issues #49/#28. Placed HERE — after the subscription is
+                // confirmed, before a single event is read off `sub` — for the
+                // ordering, not for convenience: the snapshot is therefore
+                // newer than the stream, and the events that arrive during the
+                // round-trip wait in the socket and land on top of it rather
+                // than being overwritten by it.
+                if subscribed_before {
+                    resync_after_reconnect(&client, &state, &gate).await;
+                }
+                subscribed_before = true;
 
                 // Events received before hydration finished seeding its cards.
                 // Held here rather than applied because `apply_event` drops any
@@ -337,6 +390,65 @@ pub async fn run_event_subscriber(attach_path: PathBuf, state: SharedState, gate
         }
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, max_delay);
+    }
+}
+
+/// Fork issues #49 / #28: re-read the daemon's state after a mid-session
+/// subscription loss and reconcile it onto the cards that already exist.
+///
+/// Narrow by construction — see
+/// [`crate::state::AppState::resync_hydrated_sessions`] for why it updates in
+/// place and mints nothing, and why reusing bootstrap's
+/// `EmbeddedPaneController::hydrate_from_daemon` would be wrong here (that one
+/// re-attaches a PTY and creates a pane per agent, which is right for a cold
+/// attach and duplicate work for panes that are already live).
+///
+/// Every failure mode is a no-op that leaves the subscriber to carry on with
+/// live events. Reconnect-storm safety comes from three properties together:
+/// the caller only reaches this after a *successful* subscribe, and every loop
+/// iteration ends in a `sleep` of at least 500 ms — so a flapping daemon costs
+/// at most one extra `ListAgents` per reconnect attempt, at the rate the
+/// reconnect loop was already running; the call is bounded by
+/// [`RESYNC_LIST_TIMEOUT`]; and it retries nothing internally, so a daemon
+/// that answers slowly or not at all cannot turn this into a spin.
+async fn resync_after_reconnect(client: &DaemonClient, state: &SharedState, gate: &HydrationGate) {
+    // Bootstrap hydration has not finished seeding its cards yet, so there is
+    // nothing to reconcile and it is still the pass that owns the snapshot.
+    // (Its own buffered-event path covers this window — see the module docs.)
+    if !gate.is_seeded() {
+        return;
+    }
+    // Nothing on screen to correct. Skipping the round-trip entirely keeps a
+    // flapping daemon from being probed by a TUI with no cards at all.
+    if state.read().await.sessions.is_empty() {
+        return;
+    }
+
+    let records = match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                error = %e,
+                "reconnect resync: list_agents failed; leaving cards as they are"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_ms = RESYNC_LIST_TIMEOUT.as_millis() as u64,
+                "reconnect resync: list_agents timed out; leaving cards as they are"
+            );
+            return;
+        }
+    };
+
+    let recovered = state.write().await.resync_hydrated_sessions(&records);
+    if recovered > 0 {
+        tracing::info!(
+            recovered,
+            agents = records.len(),
+            "reconnect resync: recovered session statuses missed while the event stream was down"
+        );
     }
 }
 
