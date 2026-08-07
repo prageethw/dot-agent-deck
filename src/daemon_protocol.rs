@@ -3892,6 +3892,7 @@ mod tests {
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
                 last_activity_ms: None,
+                shell_synthetic_working: false,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -3927,6 +3928,7 @@ mod tests {
                 last_user_prompt: None,
                 live_target: None,
                 last_activity_ms: None,
+                shell_synthetic_working: false,
             }),
             spawned_at_ms: None,
         };

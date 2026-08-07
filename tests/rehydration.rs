@@ -2399,6 +2399,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_user_prompt: Some("build the feature".into()),
         live_target: None,
         last_activity_ms: None,
+        shell_synthetic_working: false,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -2532,6 +2533,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         )),
                         live_target: None,
                         last_activity_ms: None,
+                        shell_synthetic_working: false,
                     }),
                     spawned_at_ms: None,
                 };
@@ -2864,4 +2866,205 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     );
 
     drop(controller);
+}
+
+/// Scenario: A pane is promoted to `Working` by the daemon's synthesized
+/// `ShellBusy` (PRD #370 — a foreground shell command with no agent event in
+/// between), then the TUI reconnects and rehydrates that card from the daemon's
+/// `SessionSnapshot`. When the command finishes and the daemon broadcasts the
+/// paired `ShellIdle`, the rehydrated card must return to `Idle` — the
+/// promotion's synthetic provenance has to survive the reconnect, or the
+/// dashboard shows `Working` forever (fork issue #21). The shell pane has also
+/// been through a same-agent `/clear` restart first, so the synthesized events
+/// are built while its hook generation and its stable card id disagree. A
+/// second pane whose `Working` came from a REAL agent event must NOT be
+/// reverted by the same `ShellIdle`.
+#[spec("session/live/015")]
+#[test]
+fn live_015_rehydration_preserves_shell_synthetic_working() {
+    /// A real, agent-emitted hook event (carries the spawn's `agent_id`).
+    fn hook_event(pane_id: &str, event_type: EventType, tool_name: Option<&str>) -> AgentEvent {
+        AgentEvent {
+            session_id: format!("sess-{pane_id}"),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: tool_name.map(str::to_string),
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(format!("agent-{pane_id}")),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// A same-agent `/clear` / thread restart: a fresh hook `SessionStart`
+    /// under a NEW session id but the SAME `agent_id`. `apply_event`'s reuse
+    /// guard remaps it back onto the stable card while the pane's hook
+    /// GENERATION rolls forward, so afterwards the pane's hook session id is no
+    /// longer a key into `sessions`.
+    fn rollover_event(pane_id: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: format!("sess-{pane_id}-gen2"),
+            ..hook_event(pane_id, EventType::SessionStart, None)
+        }
+    }
+
+    /// The shell-activity monitor's synthesized event, built the way
+    /// `run_shell_activity_monitor` in `src/daemon.rs` builds it: the session
+    /// id and the owning agent id are resolved off the DAEMON's state
+    /// INDEPENDENTLY — the authoritative hook generation for `session_id`, and
+    /// the agent id from the pane's current CARD (`pane_session_id`), because
+    /// after a rollover the generation is not a key into `sessions`. The agent
+    /// type is left neutral. That production seam is pinned directly by
+    /// `shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover`
+    /// in `src/daemon.rs`; this mirrors its output shape.
+    fn shell_event(state: &AppState, pane_id: &str, event_type: EventType) -> AgentEvent {
+        let session_id = state
+            .pane_hook_session_id(pane_id)
+            .expect("the pane has a known hook session");
+        let agent_id = state
+            .pane_session_id(pane_id)
+            .and_then(|card_id| state.sessions.get(&card_id))
+            .and_then(|card| card.agent_id.clone());
+        AgentEvent {
+            session_id,
+            agent_type: AgentType::None,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    const SHELL: &str = "pane-shell";
+    const REAL: &str = "pane-real";
+
+    // --- daemon side -------------------------------------------------------
+    // `pane-shell`: idle agent, then a foreground shell command promotes it to
+    // a SYNTHETIC Working. `pane-real`: the agent itself is working (ToolStart),
+    // which must never be revertible by a shell signal.
+    let mut daemon = AppState::default();
+    for pane in [SHELL, REAL] {
+        daemon.register_pane(pane.to_string());
+        daemon.apply_event(hook_event(pane, EventType::SessionStart, None));
+    }
+    // `pane-shell` additionally survives a same-agent restart BEFORE the shell
+    // command starts, so the synthesized events below are built while the
+    // pane's hook generation and its stable card id DISAGREE — the divergence
+    // that made a `sessions[hook_generation]` agent lookup miss and re-emit
+    // `agent_id: None`.
+    daemon.apply_event(rollover_event(SHELL));
+    assert_ne!(
+        daemon.pane_hook_session_id(SHELL).as_deref(),
+        Some(format!("sess-{SHELL}").as_str()),
+        "precondition: the same-agent restart rolls the hook generation past \
+         the stable card id"
+    );
+    assert!(
+        !daemon
+            .sessions
+            .contains_key(&daemon.pane_hook_session_id(SHELL).unwrap()),
+        "precondition: after the rollover the hook generation is NOT a key \
+         into `sessions`, so the agent id must come from the pane's card"
+    );
+
+    let busy = shell_event(&daemon, SHELL, EventType::ShellBusy);
+    assert_eq!(
+        busy.agent_id.as_deref(),
+        Some(format!("agent-{SHELL}").as_str()),
+        "the synthesized event must still carry the owning agent id after a \
+         rollover — an unstamped one cannot reach a hydrated card"
+    );
+    daemon.apply_event(busy);
+    daemon.apply_event(hook_event(REAL, EventType::ToolStart, Some("Bash")));
+    for pane in [SHELL, REAL] {
+        assert_eq!(
+            daemon.sessions[&format!("sess-{pane}")].status,
+            SessionStatus::Working,
+            "precondition: {pane} is Working on the daemon before the reconnect"
+        );
+    }
+
+    // --- reconnect: the daemon's snapshot crosses the wire and seeds the TUI --
+    let mut tui = AppState::default();
+    for pane in [SHELL, REAL] {
+        let snapshot = daemon.sessions[&format!("sess-{pane}")].live_snapshot();
+        let json = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+        let snapshot: SessionSnapshot =
+            serde_json::from_str(&json).expect("the snapshot deserializes");
+        tui.register_pane(pane.to_string());
+        tui.seed_hydrated_session(
+            pane.to_string(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some(format!("agent-{pane}")),
+            Some(&snapshot),
+        );
+    }
+
+    // --- the foreground command finishes: ShellIdle fans out to both -------
+    for pane in [SHELL, REAL] {
+        let idle = shell_event(&daemon, pane, EventType::ShellIdle);
+        daemon.apply_event(idle.clone());
+        tui.apply_event(idle);
+    }
+
+    // The synthesized event has to LAND on the rehydrated card, not mint a
+    // second one beside it. The hydration-minted card is keyed
+    // `pane-{pane_id}` while the event still reports under the daemon's hook
+    // session id, so only `apply_event`'s same-pane reuse guard — which
+    // matches on `agent_id` — can bring the two together.
+    for pane in [SHELL, REAL] {
+        let cards: Vec<&str> = tui
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.pane_id.as_deref() == Some(pane))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            cards.len(),
+            1,
+            "a synthesized shell event must remap onto the rehydrated card for \
+             {pane}, not spawn a phantom second one; got {cards:?}"
+        );
+    }
+
+    // The synthetic promotion must be revertible on BOTH sides — the whole
+    // point of issue #21 is that the rehydrated TUI disagreed with the daemon.
+    assert_eq!(
+        daemon.sessions[&format!("sess-{SHELL}")].status,
+        SessionStatus::Idle,
+        "daemon control: the paired ShellIdle reverts its own synthetic promotion"
+    );
+    assert_eq!(
+        tui.sessions[&format!("pane-{SHELL}")].status,
+        SessionStatus::Idle,
+        "a card rehydrated mid-ShellBusy must still be revertible by the paired \
+         ShellIdle — otherwise it reads Working forever (fork issue #21)"
+    );
+
+    // ...and the real, agent-emitted Working must survive it untouched.
+    assert_eq!(
+        daemon.sessions[&format!("sess-{REAL}")].status,
+        SessionStatus::Working,
+        "daemon control: a stale ShellIdle must not revert a real agent Working"
+    );
+    assert_eq!(
+        tui.sessions[&format!("pane-{REAL}")].status,
+        SessionStatus::Working,
+        "rehydration must not make a real, agent-emitted Working clearable by ShellIdle"
+    );
 }
