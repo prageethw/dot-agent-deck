@@ -162,7 +162,11 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
     // observable. Used for BOTH the configured stub command and a `claude`
     // neutralizer (the latter so the host's real `claude` never runs and so the
     // hardcoded-`claude` regression is observable).
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    // Both interpolated paths are POSIX single-quoted (issue #57): `bin` follows
+    // the cargo target dir and `record` follows `TMPDIR`, so a `"`, `$`,
+    // backtick, `\` or newline in either would otherwise terminate or expand
+    // inside the generated script — see `common::sh_quote`.
+    let bin = common::sh_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
     let shim_dir = scratch.path().join("shim");
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
     let write_recorder = |name: &str, record: &std::path::Path| {
@@ -172,9 +176,9 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             format!(
                 "#!/bin/sh\n\
                  printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-                 | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
-                 while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-                rec = record.to_string_lossy()
+                 | {bin} hook claude-code >/dev/null 2>&1\n\
+                 while IFS= read -r l; do printf '%s\\n' \"$l\" >> {rec}; done\n",
+                rec = common::sh_quote(&record.to_string_lossy())
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -568,17 +572,21 @@ fn manager_007_dialog_content_sized_unclipped_at_both_widths() {
 /// `pwd` lets a test assert the agent spawned in the PICKED directory. Mirrors
 /// the inline recorder in `manager_002`.
 fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::path::Path) {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    // Both interpolated paths are POSIX single-quoted (issue #57): `bin` follows
+    // the cargo target dir and `record` follows `TMPDIR`, so a `"`, `$`,
+    // backtick, `\` or newline in either would otherwise terminate or expand
+    // inside the generated script — see `common::sh_quote`.
+    let bin = common::sh_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    let rec = common::sh_quote(&record.to_string_lossy());
     let path = shim_dir.join(name);
     std::fs::write(
         &path,
         format!(
             "#!/bin/sh\n\
-             pwd >> \"{rec}\"\n\
+             pwd >> {rec}\n\
              printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-             | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
-             while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-            rec = record.to_string_lossy()
+             | {bin} hook claude-code >/dev/null 2>&1\n\
+             while IFS= read -r l; do printf '%s\\n' \"$l\" >> {rec}; done\n"
         ),
     )
     .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -590,124 +598,88 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
     }
 }
 
-/// Env var through which [`shim_preserving_login_shell_env`]'s generated login
-/// shell learns which directory to keep first on `PATH`.
+/// Regression guard for [`write_recorder_shim`] (issue #57): a record path
+/// carrying shell metacharacters must be written to VERBATIM, and none of it
+/// may be EXECUTED.
 ///
-/// The path travels as DATA (an `execve` environment entry the script reads with
-/// `"$…"`), never as generated shell SOURCE. Interpolating it into the script
-/// body instead would make a `"`, `$`, backtick, `\` or newline anywhere in the
-/// path terminate or expand inside the assignment — and `tempfile::tempdir()`
-/// derives its root from `TMPDIR`, so a developer or CI wrapper with an unusual
-/// `TMPDIR` is all it takes. The worse half of that is not the command execution
-/// but the SILENT degradation: a malformed script fails, the daemon keeps its
-/// inherited PATH, and this fixture quietly stops pinning the shim — the exact
-/// failure it exists to prevent.
-const SHIM_DIR_ENV: &str = "DOT_AGENT_DECK_TEST_SHIM_DIR";
+/// The record path descends from `tempfile::tempdir()`, i.e. `TMPDIR`, so this
+/// is reachable by a developer or CI wrapper with an unusual temp root.
+/// Reintroducing the old `pwd >> "{rec}"` interpolation fails this immediately:
+/// the embedded `"` rebalances the redirection's quoting, the `$(…)` runs, and
+/// the recorder writes somewhere else entirely.
+///
+/// Also covers `manager_002`'s inline recorder, which is quoted the same way.
+#[test]
+fn recorder_shim_survives_shell_metacharacters_in_the_record_path() {
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
 
-/// Write a fake login shell into `dir` that keeps `keep_dir` first on `PATH` and
-/// then runs whatever command it was asked to run, and return the `TuiDeck` env
-/// pairs that arm it — `SHELL` pointing at the script plus [`SHIM_DIR_ENV`]
-/// carrying `keep_dir`.
-///
-/// Both pairs are returned together on purpose: the script is inert without the
-/// shim-dir variable (it exits non-zero rather than silently prepending an empty
-/// component), so handing back only the `SHELL` path would let a caller arm half
-/// the fixture and lose the PATH pin without noticing.
-///
-/// Needed by any `TuiDeck` test that puts a command SHIM on `PATH`. The deck
-/// lazy-spawns its daemon, and PRD #170's `apply_login_shell_path` runs
-/// `$SHELL -ilc 'printf %s "$PATH"'` at daemon startup and REPLACES the
-/// inherited PATH with whatever the login shell prints. The harness pins
-/// `SHELL=/bin/sh`, so on a host whose login profile rewrites `PATH` the shim
-/// dir the test prepended is reordered or dropped and the daemon resolves the
-/// REAL binary instead — on macOS `/etc/profile`'s `path_helper` moves
-/// `/opt/homebrew/bin` ahead of it, so a `claude` shim silently loses to a real
-/// Homebrew `claude`. Pointing `$SHELL` at this script makes the captured PATH
-/// deterministic (shim first) on every host. The daemon inherits the deck's env
-/// and `Command::new(shell)` inherits the daemon's, so [`SHIM_DIR_ENV`] reaches
-/// the script unmodified. Mirrors the fixtures in `tests/e2e_login_path.rs` and
-/// `tests/e2e_issue_dispatch_live.rs`.
-///
-/// Panics if the generated shell does not actually put `keep_dir` first when
-/// probed exactly the way the daemon probes it — turning any future regression
-/// here into a loud failure instead of a test that passes while asserting
-/// nothing.
-fn shim_preserving_login_shell_env(
-    dir: &std::path::Path,
-    keep_dir: &std::path::Path,
-) -> [(&'static str, String); 2] {
-    let shell = dir.join("login-shell.sh");
-    // No interpolation: the shim dir arrives in the environment, so nothing in
-    // this program is derived from a path the test does not control.
-    std::fs::write(
-        &shell,
-        format!(
-            "#!/bin/sh\n\
-             if [ -z \"${SHIM_DIR_ENV}\" ]; then\n\
-             echo \"fake login shell: {SHIM_DIR_ENV} is unset\" >&2\n\
-             exit 1\n\
-             fi\n\
-             export PATH=\"${SHIM_DIR_ENV}:$PATH\"\n\
-             while [ \"$#\" -gt 0 ]; do\n\
-             case \"$1\" in\n\
-             -*) shift ;;\n\
-             *) break ;;\n\
-             esac\n\
-             done\n\
-             if [ \"$#\" -gt 0 ]; then\n\
-             exec /bin/sh -c \"$1\"\n\
-             fi\n\
-             exec /bin/sh\n"
-        ),
-    )
-    .unwrap_or_else(|e| panic!("write fake login shell: {e}"));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("chmod fake login shell: {e}"));
-    }
+    // Every character the double-quoted-interpolation bug is sensitive to:
+    // a quote, a command substitution, a backtick and a backslash.
+    let record_dir = scratch
+        .path()
+        .join(r#"rec "$(touch pwned)" `touch pwned` \x"#);
+    std::fs::create_dir_all(&record_dir).expect("create metacharacter record dir");
+    let record = record_dir.join("record.log");
 
-    let keep = keep_dir.to_string_lossy().into_owned();
-    assert_login_shell_keeps_dir_first(&shell, &keep);
-    [
-        ("SHELL", shell.to_string_lossy().into_owned()),
-        (SHIM_DIR_ENV, keep),
-    ]
-}
+    // Spawn the shim from its own dir so a substitution that escaped the quoting
+    // lands its marker somewhere the assertion below can see it. The distinctive
+    // basename also makes the recorded `pwd` unambiguous on macOS, where the
+    // temp root is reached through a `/var` → `/private/var` symlink.
+    let spawn_cwd = scratch.path().join("spawn-cwd");
+    std::fs::create_dir_all(&spawn_cwd).expect("create spawn cwd");
 
-/// Probe `shell` the way PRD #170's `apply_login_shell_path` does — `-ilc` with
-/// the marker-free form of its `printf` probe — and assert the first `PATH`
-/// entry is exactly `keep`.
-///
-/// This is the fixture's self-check. Without it, a login shell that fails to
-/// parse (or forgets the shim dir) degrades silently: the daemon keeps its
-/// inherited PATH, which on most hosts still starts with the shim dir, so the
-/// test passes while no longer pinning anything.
-fn assert_login_shell_keeps_dir_first(shell: &std::path::Path, keep: &str) {
-    let out = std::process::Command::new(shell)
-        .arg("-ilc")
-        .arg(r#"printf '%s' "$PATH""#)
-        .env(SHIM_DIR_ENV, keep)
-        .output()
-        .unwrap_or_else(|e| panic!("probe fake login shell: {e}"));
-    let path = String::from_utf8_lossy(&out.stdout).into_owned();
-    let first = path.split(':').next().unwrap_or_default();
+    write_recorder_shim(&shim_dir, "recorder", &record);
+
+    let mut child = std::process::Command::new(shim_dir.join("recorder"))
+        .current_dir(&spawn_cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn recorder shim");
+    // Close stdin so the shim's delivery loop ends; `pwd >> <record>` is its
+    // FIRST line, so the record appears whatever the later hook call does.
+    drop(child.stdin.take());
+    let appeared = common::wait_for_path(&record, Duration::from_secs(15));
+    let _ = child.kill();
+    let _ = child.wait();
+
     assert!(
-        out.status.success() && first == keep,
-        "the fake login shell must print a PATH whose FIRST entry is the shim \
-         dir `{keep}` — it is what pins the shim ahead of any real binary. Got \
-         status {status}, PATH `{path}`, stderr `{stderr}`.",
-        status = out.status,
-        stderr = String::from_utf8_lossy(&out.stderr)
+        appeared,
+        "the recorder shim must write to its record path VERBATIM — nothing \
+         appeared at `{}`, which means the metacharacters in the path broke the \
+         generated redirection",
+        record.display()
+    );
+    let body = std::fs::read_to_string(&record).expect("read recorder record");
+    assert!(
+        body.lines()
+            .next()
+            .unwrap_or_default()
+            .ends_with("spawn-cwd"),
+        "the shim's first recorded line must be the dir it was spawned in.\n\
+         Record:\n{body}"
+    );
+    assert!(
+        !spawn_cwd.join("pwned").exists() && !scratch.path().join("pwned").exists(),
+        "the record path must reach the shim as DATA — a `pwned` marker means \
+         the `$(…)` in the path was parsed as shell syntax and EXECUTED, i.e. \
+         the path is being interpolated into the script source unquoted"
     );
 }
 
-/// Regression guard for the fixture above: a shim directory whose name carries
-/// shell metacharacters must still be pinned first on `PATH`, and must not be
-/// EXECUTED. Reintroducing the old `format!("export PATH=\"{keep}:$PATH\"")`
-/// interpolation fails this immediately — the embedded `"` breaks the
-/// assignment's quoting and the `$(…)` runs.
+/// Regression guard for `common::write_login_shell_pinning_dir`: a shim
+/// directory whose name carries shell metacharacters must still be pinned first
+/// on `PATH`, and must not be EXECUTED. Reintroducing the old
+/// `format!("export PATH=\"{keep}:$PATH\"")` interpolation fails this
+/// immediately — the embedded `"` breaks the assignment's quoting and the
+/// `$(…)` runs.
+///
+/// This covers the login-shell fixture for all three files that share it —
+/// here, `tests/e2e_login_path.rs` and `tests/e2e_issue_dispatch_live.rs`
+/// (issue #57 folded their hand-rolled copies onto the shared helper).
 #[test]
 fn login_shell_fixture_survives_shell_metacharacters_in_the_shim_path() {
     let scratch = tempfile::tempdir().expect("scratch tempdir");
@@ -718,16 +690,16 @@ fn login_shell_fixture_survives_shell_metacharacters_in_the_shim_path() {
         .join(r#"shim "$(touch pwned)" `touch pwned` \x"#);
     std::fs::create_dir_all(&shim_dir).expect("create metacharacter shim dir");
 
-    // `shim_preserving_login_shell_env` self-checks that the shim dir lands
+    // `write_login_shell_pinning_dir` self-checks that the shim dir lands
     // first on PATH, so construction alone proves the pin survives the
     // metacharacters. Probe again from inside the scratch dir to prove nothing
     // was executed: raw interpolation would have run `touch pwned` here.
-    let env = shim_preserving_login_shell_env(scratch.path(), &shim_dir);
+    let env = common::write_login_shell_pinning_dir(scratch.path(), &shim_dir);
     let shell = std::path::PathBuf::from(&env[0].1);
     let out = std::process::Command::new(&shell)
         .arg("-ilc")
         .arg(r#"printf '%s' "$PATH""#)
-        .env(SHIM_DIR_ENV, &env[1].1)
+        .env(common::LOGIN_SHELL_KEEP_DIR_ENV, &env[1].1)
         .current_dir(scratch.path())
         .output()
         .expect("probe fake login shell");
@@ -797,7 +769,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     // The shim dir reaches the script through the environment, not through its
     // source, so a `TMPDIR` carrying shell metacharacters cannot break (or run
     // inside) the generated program.
-    let login_shell_env = shim_preserving_login_shell_env(scratch.path(), &shim_dir);
+    let login_shell_env = common::write_login_shell_pinning_dir(scratch.path(), &shim_dir);
 
     let mut builder = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())

@@ -46,8 +46,11 @@ struct LoginFixture {
     stub_name: String,
     /// Absolute path of the marker the stub writes when it runs.
     marker: std::path::PathBuf,
-    /// A fake login shell whose `-ilc` output adds the stub dir to PATH.
-    fake_shell: std::path::PathBuf,
+    /// Env pairs arming a fake login shell whose `-ilc` output adds the stub dir
+    /// to PATH: `SHELL` plus `common::LOGIN_SHELL_KEEP_DIR_ENV`. Both must be
+    /// applied — the generated shell exits non-zero without the second (issue
+    /// #57 moved the stub dir out of the script's source and into its env).
+    shell_env: [(&'static str, String); 2],
     /// Working dir for the spawned pane / task.
     work: std::path::PathBuf,
     /// Config file whose `default_command` is the bare stub.
@@ -76,42 +79,19 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 
     let marker = base.join("STUB_RAN");
 
-    // The stub: write the marker via a pure-shell redirection (no external
-    // binary needed for the create), then stay alive so the card is "running".
     let stub = stub_dir.join(stub_name);
-    std::fs::write(
-        &stub,
-        format!(
-            "#!/bin/sh\n: > \"{marker}\"\nexec sleep 30\n",
-            marker = marker.to_string_lossy()
-        ),
-    )
-    .expect("write stub command");
+    write_marker_stub(&stub, &marker);
 
     // The fake login shell: prepend the stub dir to PATH (the one profile effect
     // we emulate), then exec whatever command was requested. Drops any leading
     // flag bundle (`-l`, `-c`, `-lc`, `-ilc`, `-lic`, …) so `$SHELL -ilc '<script>'`
     // works; the capture's `printf` then prints the enriched PATH.
-    let fake_shell = base.join("login-shell.sh");
-    std::fs::write(
-        &fake_shell,
-        format!(
-            "#!/bin/sh\n\
-             export PATH=\"{stub_dir}:$PATH\"\n\
-             while [ \"$#\" -gt 0 ]; do\n\
-             case \"$1\" in\n\
-             -*) shift ;;\n\
-             *) break ;;\n\
-             esac\n\
-             done\n\
-             if [ \"$#\" -gt 0 ]; then\n\
-             exec /bin/sh -c \"$1\"\n\
-             fi\n\
-             exec /bin/sh\n",
-            stub_dir = stub_dir.to_string_lossy()
-        ),
-    )
-    .expect("write fake login shell");
+    //
+    // Shared with `e2e_scheduler_manager.rs` / `e2e_issue_dispatch_live.rs`: the
+    // stub dir reaches the script through the ENVIRONMENT rather than through
+    // its source (issue #57), and the helper self-checks that the dir really
+    // lands first on PATH — so this fixture can no longer degrade silently.
+    let shell_env = common::write_login_shell_pinning_dir(&base, &stub_dir);
 
     // default_command = the bare stub, so the new-pane form opens pre-filled
     // with it (and so PRD #170's authoring helper would too, once it reads
@@ -120,22 +100,89 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
     std::fs::write(&config, format!("default_command = \"{stub_name}\"\n"))
         .expect("write config.toml");
 
-    #[cfg(unix)]
-    {
-        for p in [&stub, &fake_shell] {
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fixture script");
-        }
-    }
-
     LoginFixture {
         _scratch: scratch,
         stub_name: stub_name.to_string(),
         marker,
-        fake_shell,
+        shell_env,
         work,
         config,
     }
+}
+
+/// Write an executable stub at `stub` that touches `marker` via a pure-shell
+/// redirection (no external binary needed for the create), then stays alive so
+/// the spawned card reads as "running".
+///
+/// The marker path is POSIX single-quoted (issue #57) — it descends from
+/// `tempfile::tempdir()`, i.e. `TMPDIR`, so a `"`, `$`, backtick, `\` or newline
+/// in it would otherwise terminate or expand inside the redirection, and the
+/// marker this whole file asserts on would be written somewhere else (or a
+/// substitution executed) rather than failing loudly.
+fn write_marker_stub(stub: &std::path::Path, marker: &std::path::Path) {
+    std::fs::write(
+        stub,
+        format!(
+            "#!/bin/sh\n: > {marker}\nexec sleep 30\n",
+            marker = common::sh_quote(&marker.to_string_lossy())
+        ),
+    )
+    .expect("write stub command");
+    #[cfg(unix)]
+    std::fs::set_permissions(stub, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fixture script");
+}
+
+/// Regression guard for [`write_marker_stub`] (issue #57): a marker path
+/// carrying shell metacharacters must be created VERBATIM, and none of it may
+/// be EXECUTED.
+///
+/// Reintroducing the old `: > "{marker}"` interpolation fails this immediately —
+/// the embedded `"` rebalances the redirection's quoting and the `$(…)` runs, so
+/// the marker every test in this file waits on never appears where it is
+/// expected while a command substitution silently executes instead.
+#[test]
+fn marker_stub_survives_shell_metacharacters_in_the_marker_path() {
+    let scratch = tempfile::tempdir().expect("scratch tempdir");
+
+    // Every character the double-quoted-interpolation bug is sensitive to:
+    // a quote, a command substitution, a backtick and a backslash.
+    let marker_dir = scratch
+        .path()
+        .join(r#"marker "$(touch pwned)" `touch pwned` \x"#);
+    std::fs::create_dir_all(&marker_dir).expect("create metacharacter marker dir");
+    let marker = marker_dir.join("STUB_RAN");
+
+    let stub = scratch.path().join("stub");
+    write_marker_stub(&stub, &marker);
+
+    // Run from the scratch dir so a substitution that escaped the quoting lands
+    // its marker where the assertion below can see it. The stub `exec sleep 30`s
+    // after touching the marker, so wait for the file and then kill it.
+    let mut child = std::process::Command::new(&stub)
+        .current_dir(scratch.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn marker stub");
+    let appeared = common::wait_for_path(&marker, Duration::from_secs(15));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        appeared,
+        "the stub must create its marker VERBATIM — nothing appeared at `{}`, \
+         which means the metacharacters in the path broke the generated \
+         redirection",
+        marker.display()
+    );
+    assert!(
+        !scratch.path().join("pwned").exists(),
+        "the marker path must reach the stub as DATA — a `pwned` marker means \
+         the `$(…)` in the path was parsed as shell syntax and EXECUTED, i.e. \
+         the path is being interpolated into the script source unquoted"
+    );
 }
 
 /// Scenario: Launch the deck with `default_command` set to a bare stub command
@@ -153,10 +200,12 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 fn login_path_001_new_pane_resolves_login_shell_command() {
     let fx = login_path_fixture("stub-newpane-agent");
 
-    let deck = TuiDeck::builder()
-        .with_env("SHELL", fx.fake_shell.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_CONFIG", fx.config.to_string_lossy())
-        .launch_with_fixture("minimal");
+    let mut builder =
+        TuiDeck::builder().with_env("DOT_AGENT_DECK_CONFIG", fx.config.to_string_lossy());
+    for (key, value) in &fx.shell_env {
+        builder = builder.with_env(*key, value);
+    }
+    let deck = builder.launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
     // Open the new-pane form: Ctrl+n → directory picker, Space confirms the
@@ -208,9 +257,10 @@ fn login_path_002_scheduled_fire_resolves_login_shell_command() {
         cmd = fx.stub_name,
     );
 
-    let shell = fx.fake_shell.to_string_lossy().into_owned();
-    let daemon =
-        common::spawn_daemon_serve_with_env(Some(&toml), "0", &[("SHELL", shell.as_str())]);
+    // Both pairs must reach the daemon: the generated login shell reads its keep
+    // dir from the environment and exits non-zero without it.
+    let env: Vec<(&str, &str)> = fx.shell_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon.run_now("login-fire").expect("run-now login-fire");
 
@@ -262,11 +312,13 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
     )
     .expect("write fixture schedules.toml");
 
-    let deck = TuiDeck::builder()
-        .with_env("SHELL", fx.fake_shell.to_string_lossy())
+    let mut builder = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_CONFIG", fx.config.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
-        .launch_with_fixture("minimal");
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy());
+    for (key, value) in &fx.shell_env {
+        builder = builder.with_env(*key, value);
+    }
+    let deck = builder.launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
     // Open the Scheduled-Tasks manager and edit the auto-selected `digest` row,
