@@ -2313,14 +2313,16 @@ async fn wait_for_second_occurrence(
 /// unconditionally, with no existence check on what's already there.
 ///
 /// Returns the orchestrator's cumulative PTY snapshot after both calls (so a
-/// caller can diff it against a baseline run with no injected collision) and
+/// caller can diff it against a baseline run with no injected collision),
 /// the `.dot-agent-deck` directory path (so a caller can inspect what
-/// survived on disk).
+/// survived on disk), and the `TempDir` guard itself — the caller must hold
+/// this alive until after it has finished inspecting the directory, since
+/// dropping it recursively deletes `cwd`.
 #[cfg(unix)]
 async fn run_two_work_done_calls(
     label: &str,
     inject_external_write_between_calls: bool,
-) -> (Vec<u8>, std::path::PathBuf) {
+) -> (Vec<u8>, std::path::PathBuf, tempfile::TempDir) {
     common::init_test_env();
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -2431,7 +2433,8 @@ async fn run_two_work_done_calls(
     .await;
 
     registry.shutdown_all();
-    (after_second, cwd.path().join(".dot-agent-deck"))
+    let dot_agent_deck_dir = cwd.path().join(".dot-agent-deck");
+    (after_second, dot_agent_deck_dir, cwd)
 }
 
 /// Scenario: Simulate upstream #331 — a report already sits at the daemon's
@@ -2451,9 +2454,9 @@ fn delegate_020_existing_report_survives_and_collision_is_announced() {
         .build()
         .expect("build existing-report collision runtime")
         .block_on(async {
-            let (baseline_feedback, _baseline_dir) =
+            let (baseline_feedback, _baseline_dir, _baseline_cwd) =
                 run_two_work_done_calls("baseline", false).await;
-            let (collision_feedback, collision_dir) =
+            let (collision_feedback, collision_dir, _collision_cwd) =
                 run_two_work_done_calls("collision", true).await;
 
             let combined = all_dot_agent_deck_text(&collision_dir);
