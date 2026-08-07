@@ -163,14 +163,6 @@ pub enum Tab {
         /// consumed by `auto_focus_waiting_pane` was never remembered, and the
         /// all-clear move for it never fired.
         all_clear_pending: bool,
-        /// PRD #374 (#361 Item 3): whether direct keystroke entry to
-        /// non-orchestrator role panes on this tab is locked. Starts
-        /// `true` — only the orchestrator pane accepts direct input until
-        /// `Ctrl+e` unlocks it. Per-tab: toggling one orchestration tab's
-        /// lock never affects another open orchestration tab. (It used to
-        /// cite `split_stage` as its precedent; PRD #387 M2 made that one
-        /// deck-global, so the lock is now the per-tab case on its own.)
-        command_entry_locked: bool,
     },
 }
 
@@ -919,7 +911,6 @@ impl TabManager {
             // off of.
             had_waiting_pane: false,
             all_clear_pending: false,
-            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -1638,7 +1629,6 @@ mod tests {
             status: OrchestrationStatus::WaitingForOrchestrator,
             had_waiting_pane: false,
             all_clear_pending: false,
-            command_entry_locked: true,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1670,7 +1660,6 @@ mod tests {
             status: OrchestrationStatus::WaitingForOrchestrator,
             had_waiting_pane: false,
             all_clear_pending: false,
-            command_entry_locked: true,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
