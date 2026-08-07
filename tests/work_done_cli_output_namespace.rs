@@ -235,3 +235,118 @@ fn delegate_028_work_done_refuses_task_file_through_aliased_output_dir() {
         String::from_utf8_lossy(&allowed.stderr),
     );
 }
+
+/// Scenario: A worker's pane cwd (where the daemon actually writes its
+/// output, per `pane_cwd_map` at `StartAgent`) has its own `.dot-agent-deck`
+/// directory holding the real `work-done-coder.md`. The worker then `cd`s
+/// into a CHILD directory that carries a second, unrelated
+/// `.dot-agent-deck` directory of its own before invoking the CLI — so the
+/// pane's real output file and the CLI process's own cwd disagree. From that
+/// child cwd, `work-done --task-file` naming the pane cwd's real output file
+/// — first as an absolute path, then as a relative `../` path — must still
+/// be refused; a harmless `work-done-*.md` inside the CHILD's own decoy
+/// `.dot-agent-deck` is refused too (an accepted false positive); a plain
+/// file outside any `.dot-agent-deck` is still accepted.
+#[cfg(unix)]
+#[spec("orchestration/delegate/031")]
+#[test]
+fn delegate_031_work_done_refuses_task_file_despite_cwd_drift() {
+    let daemon = common::spawn_daemon_serve(None, "0");
+    let pane_cwd = common::race_safe_tempdir();
+    let home = pane_cwd.path().join("home");
+    std::fs::create_dir_all(&home).expect("create fresh HOME for the CLI subprocess");
+
+    // The pane's own namespace — where the daemon's real output for this
+    // pane lives, per `pane_cwd_map` captured at `StartAgent`.
+    let pane_dot_dir = pane_cwd.path().join(".dot-agent-deck");
+    std::fs::create_dir_all(&pane_dot_dir).expect("create pane cwd's .dot-agent-deck");
+    let real_target = pane_dot_dir.join("work-done-coder.md");
+    std::fs::write(&real_target, "some report content").expect("seed real namespace file");
+
+    // The CLI's OWN cwd: a child directory the worker `cd`d into before
+    // invoking the CLI, carrying a second, unrelated `.dot-agent-deck` of
+    // its own. This is what makes a cwd-anchored check diverge: comparing
+    // against `current_dir()/.dot-agent-deck` resolves to THIS directory,
+    // not the pane's real output directory.
+    let child_cwd = pane_cwd.path().join("subdir");
+    let child_dot_dir = child_cwd.join(".dot-agent-deck");
+    std::fs::create_dir_all(&child_dot_dir).expect("create child cwd's own .dot-agent-deck");
+
+    // 1) Absolute path from the child cwd, naming the pane cwd's real
+    // output file.
+    let absolute = real_target
+        .to_str()
+        .expect("real_target path is valid UTF-8")
+        .to_string();
+    let refused_absolute = run_work_done_task_file(&daemon, &child_cwd, &home, &absolute);
+    assert!(
+        !refused_absolute.status.success(),
+        "`work-done --task-file <absolute path>` naming the PANE cwd's real work-done \
+         output, invoked from a different (child) cwd, exited successfully instead of \
+         being refused — a check anchored to the CLI process's OWN cwd cannot see this, \
+         since the pane's real output directory is a different .dot-agent-deck than the \
+         one under the CLI's cwd.\nstdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&refused_absolute.stdout),
+        String::from_utf8_lossy(&refused_absolute.stderr),
+    );
+
+    // 2) Same target, via a relative `../` path from the child cwd.
+    let refused_relative = run_work_done_task_file(
+        &daemon,
+        &child_cwd,
+        &home,
+        "../.dot-agent-deck/work-done-coder.md",
+    );
+    assert!(
+        !refused_relative.status.success(),
+        "`work-done --task-file ../.dot-agent-deck/work-done-coder.md`, naming the PANE \
+         cwd's real output via a relative path from a child cwd, exited successfully \
+         instead of being refused.\nstdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&refused_relative.stdout),
+        String::from_utf8_lossy(&refused_relative.stderr),
+    );
+
+    // 3) A harmless decoy: a `work-done-*.md` inside the CHILD's own
+    // unrelated `.dot-agent-deck` — not the pane's real output at all.
+    // Under the fixed rule (anchored to nothing but the literal
+    // `.dot-agent-deck/work-done-*.md` shape, anywhere on disk) this is
+    // refused too — a deliberately accepted false positive, since a decoy
+    // refusal is harmless while a missed real file destroys a report.
+    std::fs::write(
+        child_dot_dir.join("work-done-decoy.md"),
+        "unrelated decoy report",
+    )
+    .expect("seed decoy file in the child cwd's own .dot-agent-deck");
+    let refused_decoy = run_work_done_task_file(
+        &daemon,
+        &child_cwd,
+        &home,
+        ".dot-agent-deck/work-done-decoy.md",
+    );
+    assert!(
+        !refused_decoy.status.success(),
+        "`work-done --task-file .dot-agent-deck/work-done-decoy.md`, a harmless decoy \
+         under the CLI's own (non-pane) cwd, was expected to be refused too under the \
+         fixed rule (an accepted false positive) but exited successfully instead.\n\
+         stdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&refused_decoy.stdout),
+        String::from_utf8_lossy(&refused_decoy.stderr),
+    );
+
+    // Control: a plain file outside any `.dot-agent-deck` must still be
+    // accepted.
+    std::fs::write(
+        child_cwd.join("worker-report.md"),
+        "an ordinary worker report",
+    )
+    .expect("seed non-collision file");
+    let allowed = run_work_done_task_file(&daemon, &child_cwd, &home, "worker-report.md");
+    assert!(
+        allowed.status.success(),
+        "a plain --task-file outside any .dot-agent-deck must still be accepted; the \
+         refusal must be scoped to the work-done-*.md namespace shape, not a blanket \
+         rejection of --task-file.\nstdout: {:?}\nstderr: {:?}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr),
+    );
+}
