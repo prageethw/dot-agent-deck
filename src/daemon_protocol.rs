@@ -2810,6 +2810,7 @@ mod tests {
                 first_prompts: vec!["build the feature".into()],
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
+                shell_synthetic_working: false,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -2844,6 +2845,7 @@ mod tests {
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
                 live_target: None,
+                shell_synthetic_working: false,
             }),
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");

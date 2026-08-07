@@ -282,6 +282,20 @@ pub struct SessionSnapshot {
     /// [`AppState::seed_hydrated_session`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+    /// Fork issue #21: the PRD #370 provenance marker for the `status` above —
+    /// `true` when that `Working` was synthesized from `ShellBusy` rather than
+    /// emitted by the agent. Without it a card rehydrated mid-`ShellBusy` came
+    /// back with the marker reset to `false`, so the daemon's paired `ShellIdle`
+    /// declined to revert and the dashboard read `Working` forever. Restored by
+    /// [`AppState::seed_hydrated_session`] alongside the status it qualifies.
+    ///
+    /// Additive optional under the same convention as the fields above
+    /// (`#[serde(default)]` + omitted when `false`): an older daemon sends
+    /// nothing, which decodes to `false` — exactly today's behavior — so this
+    /// is NOT a wire-shape change and needs no `PROTOCOL_VERSION` bump (see the
+    /// "Protocol versioning" section of [`crate::daemon_protocol`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell_synthetic_working: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +350,12 @@ pub struct SessionState {
     /// synthetic promotion. Cleared by ANY other event type, real or
     /// synthetic (see the bottom of `apply_event`), so a real event always
     /// wins the "what set this status" question.
+    ///
+    /// Fork issue #21: this travels across a detach/reconnect on
+    /// [`SessionSnapshot::shell_synthetic_working`]. It has to — restoring the
+    /// `Working` faithfully while resetting the marker to `false` leaves the
+    /// card permanently unrevertible, because the paired `ShellIdle` reads the
+    /// marker, not the status.
     pub shell_synthetic_working: bool,
 }
 
@@ -365,6 +385,10 @@ impl SessionState {
             // PRD #20 blocker-4: carry the durable live-target so a reconnect
             // restores the card's write-semantics (history-only / view-only).
             live_target: self.live_target(),
+            // Fork issue #21: carry the synthetic-`Working` provenance so the
+            // reconnecting TUI's copy of this card stays revertible by the
+            // paired `ShellIdle`.
+            shell_synthetic_working: self.shell_synthetic_working,
         }
     }
 
@@ -3648,7 +3672,10 @@ impl AppState {
     /// "No agent" until the next event arrives.
     ///
     /// - `live = Some(snap)`: the card takes the snapshot's `status` /
-    ///   `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt`,
+    ///   `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt` /
+    ///   `shell_synthetic_working` (fork issue #21 — the PRD #370 provenance
+    ///   marker has to travel WITH the status it qualifies, or a card
+    ///   reconnected mid-`ShellBusy` is stranded at `Working`),
     ///   and its `agent_type` is the snapshot's **event-derived** value —
     ///   falling back to the spawn-time `agent_type` argument **only** when
     ///   the snapshot's is `None` (the "No agent" fix).
@@ -3687,6 +3714,24 @@ impl AppState {
                 session.tool_count = snap.tool_count;
                 session.first_prompts = snap.first_prompts.clone();
                 session.last_user_prompt = snap.last_user_prompt.clone();
+                // Fork issue #21: restore the PRD #370 synthetic-`Working`
+                // provenance alongside the status it qualifies. Dropping it
+                // stranded a card that reconnected mid-`ShellBusy` at
+                // `Working` forever: the daemon's paired `ShellIdle` arrived,
+                // saw a `false` marker on the TUI's copy, and declined to
+                // revert (see `apply_event`'s `ShellIdle` arm).
+                //
+                // Gated on the restored status actually being `Working` so the
+                // marker can never arm over a real `Thinking`/`WaitingForInput`
+                // /`Compacting`: daemon-side the two are only ever set
+                // together, and mirroring that invariant here means a
+                // malformed or forged snapshot can't make a genuine
+                // agent-emitted status revertible by a stray `ShellIdle`. The
+                // absence of the marker is never treated as evidence — a
+                // snapshot from an older daemon decodes to `false` and keeps
+                // today's behavior.
+                session.shell_synthetic_working =
+                    snap.shell_synthetic_working && session.status == SessionStatus::Working;
                 // PRD #20 blocker-4: restore the durable live-target so a
                 // history-only / view-only card keeps refusing input right
                 // after reconnect, before any new event re-declares it. The

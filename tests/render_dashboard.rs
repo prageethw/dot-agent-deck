@@ -57,22 +57,21 @@ fn pane_004_card_title_row() {
     // doesn't need its own fn — keeping the test body
     // self-contained also reads as cleaner generated `.md` Steps).
     //
-    // Both timestamps derive from one current instant so the fixture keeps a
-    // compact `0s` elapsed value; a fixed calendar instant previously drifted
-    // into a large hour count as the test aged (M3 fix).
-    //
-    // `last_activity` is nudged 30s into the *future* of that instant rather
-    // than left equal to it (issue #350). The bottom border's `Last:` field is
-    // computed by `format_elapsed` (src/ui.rs) from `Utc::now()` at *render*
-    // time, not at fixture-build time, so `last_activity == now` put the
-    // rendered value exactly on the `0s`/`1s` boundary — any scheduling delay
-    // between building the fixture and rendering (routine under parallel test
-    // load) tipped this snapshot to `Last: 1s`. A *past* offset would only
-    // shrink the margin further; nudging forward instead relies on
-    // `format_elapsed`'s existing clamp of a negative delta to zero
-    // (`delta.num_seconds().max(0)`), so the value holds at `0s` for any
-    // render within 30s. No production change is needed — the clamp already
-    // handles this shape of input, and the committed snapshot is unchanged.
+    // Both timestamps derive from one current instant so the fixture starts
+    // with a compact `0s` elapsed value; a fixed calendar instant previously
+    // drifted into a large hour count as the test aged (M3 fix). `last_activity`
+    // is nudged 30s into the *future* of that instant rather than left equal to
+    // it (issue #15): the bottom border's `Last:` field is computed from
+    // `Utc::now()` at render time (`format_elapsed`, src/ui.rs), not at fixture
+    // build time, and that renderer clamps a negative elapsed delta to zero
+    // (`delta.num_seconds().max(0)`). Seeding `last_activity == now` put the
+    // rendered value exactly on the boundary between `0s` and `1s` — any
+    // scheduling delay between building the fixture and the snapshot render
+    // (routine under parallel test load) could tip it over intermittently. A
+    // *past* offset (e.g. `now - 500ms`) would only shrink that safety margin
+    // further; nudging forward instead means the render-time delta stays
+    // negative (clamped to `0s`) for any render happening within 30s of this
+    // instant, which comfortably covers ordinary scheduling jitter.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "sess-abc123".to_string(),
@@ -763,17 +762,24 @@ fn pane_007_pi_card_omits_agent_type_badge() {
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_omits_agent_type_badge() {
-    // `last_activity` is nudged 30s into the future of `now` (issue #350). This
-    // fixture feeds *both* snapshots below — the immediate one, and
-    // `pane_008_named_agent_badges` via `session.clone()` in the loop further
-    // down — so by the time the second one renders, real wall-clock time has
-    // already been spent on the first snapshot's assertions and comparisons.
-    // `format_elapsed` (src/ui.rs) reads `Utc::now()` at render time, so
-    // `last_activity == now` raced the `0s`/`1s` boundary, and the widened
-    // window is why the *second* snapshot is the one that flaked first. The
-    // forward nudge relies on `format_elapsed`'s existing clamp of a negative
-    // delta to zero (`delta.num_seconds().max(0)`): both renders stay at `0s`
-    // for 30s. Committed snapshots are unchanged.
+    // `last_activity` is nudged 30s into the future of `now` rather than left
+    // equal to it (issue #15): this fixture feeds both the immediate snapshot
+    // below AND the later `pane_008_named_agent_badges` snapshot (via
+    // `session.clone()` in the loop further down), so by the time the second
+    // snapshot renders, real wall-clock time has already passed doing the
+    // first snapshot's assertions and comparisons. The bottom border's
+    // `Last:` field is computed from `Utc::now()` at render time
+    // (`format_elapsed`, src/ui.rs), not at fixture build time, so seeding
+    // `last_activity == now` raced that elapsed computation across a whole
+    // second boundary under any scheduling delay (routine under parallel test
+    // load) — intermittently rendering `Last: 1s` instead of the pinned
+    // `Last: 0s`. A *past* offset (e.g. `now - 500ms`) would only shrink the
+    // safety margin further and make the race worse, not fix it. Nudging
+    // forward instead relies on `format_elapsed`'s existing clamp of a
+    // negative elapsed delta to zero (`delta.num_seconds().max(0)`): the
+    // render-time delta stays negative (clamped to `0s`) for any render
+    // happening within 30s of this instant, comfortably covering both
+    // snapshots in this test.
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "wrapped-01".to_string(),
@@ -1663,16 +1669,12 @@ fn pane_005_highlight_follows_selected_session_id() {
     // stable id (highlighting card 0) would visibly diff the snapshot.
     //
     // All sessions share one current activity time, keeping their compact
-    // bottom-border elapsed values identical in the snapshot.
-    //
-    // That time is nudged 30s into the future (issue #350): `format_elapsed`
-    // (src/ui.rs) reads `Utc::now()` at render time, so seeding it to exactly
-    // `now` left every card on the `0s`/`1s` boundary — and this test renders
-    // several cards in sequence, so the later ones sat furthest from the
-    // instant the fixture was built. The forward nudge relies on
-    // `format_elapsed`'s existing clamp of a negative delta to zero
-    // (`delta.num_seconds().max(0)`), holding every card at `0s` for 30s.
-    // Committed snapshot is unchanged.
+    // bottom-border elapsed values identical in the snapshot. `last_activity`
+    // is nudged 30s into the future of that shared instant rather than left
+    // equal to it — see the identical rationale in `pane_004_card_title_row`
+    // above (issue #15): the render-time `Last:` field races the wall clock
+    // when seeded at exactly `now`, and `format_elapsed`'s clamp to zero for a
+    // negative delta (src/ui.rs) makes a forward offset the safe fix.
     let now = chrono::Utc::now();
     let make = |sid: &str, pane: &str, name: &str, cwd: &str| SessionState {
         session_id: sid.to_string(),
