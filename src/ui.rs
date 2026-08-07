@@ -4318,13 +4318,27 @@ const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+e to unloc
 /// [`UiState::command_entry_locked`] rather than a per-tab field. Only WHERE
 /// the value lives changed — the tab-kind match below is what bounds the
 /// gate's reach to Orchestration tabs (decision 3), and it is unchanged.
-/// `ui` is taken whole rather than as a bare `bool` so M3's `WaitingForInput`
-/// carve-out can read live pane status here without another signature change.
+/// `ui` is taken whole rather than as a bare `bool` because the lock is a
+/// `UiState` concern and the gate reads it from that seam — *not* because
+/// `UiState` can also answer "what is this pane's status right now". It
+/// cannot: nothing in `UiState` caches per-pane [`SessionStatus`], so M3's
+/// carve-out takes the pane-status join as its own parameter below. (An
+/// earlier version of this comment claimed the opposite; it was wrong.)
+///
+/// PRD #393 M3 (decision 4), **first of two commits**: `pane_status` — the
+/// same `pane_id -> SessionStatus` join [`build_pane_status`] returns, passed
+/// straight from the call site — is threaded in here but deliberately NOT yet
+/// consulted, so this commit changes no gating behavior at all. The split
+/// exists to see `orchestration/lock/009` and `010` fail at *runtime* on their
+/// carve-out assertions rather than only failing to compile: a test that has
+/// only ever been observed green is indistinguishable from one that passes for
+/// the wrong reason. The exemption itself lands in the follow-up commit.
 fn gate_pane_input_key(
     action: Action,
     ui: &UiState,
     tab_manager: &TabManager,
     pane: &dyn PaneController,
+    _pane_status: &HashMap<&str, SessionStatus>,
 ) -> Action {
     if !matches!(action, Action::ForwardToPane(_)) {
         return action;
@@ -9216,7 +9230,18 @@ fn handle_key_event(
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
             UiMode::PaneInput => {
                 let candidate = handle_pane_input_key(key);
-                let gated = gate_pane_input_key(candidate.clone(), ui, tab_manager, pane);
+                // PRD #393 M3: the gate needs live per-pane status for
+                // decision 4's `WaitingForInput` carve-out, and `UiState`
+                // caches none — so build the same join the deck cards and
+                // pane borders read, from the `snapshot` already in scope
+                // here, and hand it over.
+                let gated = gate_pane_input_key(
+                    candidate.clone(),
+                    ui,
+                    tab_manager,
+                    pane,
+                    &build_pane_status(snapshot),
+                );
                 if matches!(candidate, Action::ForwardToPane(_))
                     && matches!(gated, Action::Continue)
                 {
@@ -25150,11 +25175,24 @@ mod tests {
         // The strongest case: the deck-global lock is engaged.
         ui.command_entry_locked = true;
 
+        // M3 gave `gate_pane_input_key` a pane-status parameter after this
+        // test was written; an EMPTY map is the neutral value for it. No pane
+        // reports `WaitingForInput`, so decision 4's carve-out cannot fire and
+        // the pass-through asserted below can only come from the tab-kind
+        // match — which is exactly this test's claim, unweakened.
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+
         assert!(
             matches!(tm.active_tab(), Tab::Dashboard { .. }),
             "expected the always-present Dashboard tab to be active"
         );
-        let gated = gate_pane_input_key(Action::ForwardToPane(vec![b'x']), &ui, &tm, pc.as_ref());
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
         match gated {
             Action::ForwardToPane(bytes) => assert_eq!(
                 bytes,
@@ -25189,7 +25227,13 @@ mod tests {
             matches!(tm.active_tab(), Tab::Mode { .. }),
             "expected the Mode tab to be active after spawning it"
         );
-        let gated = gate_pane_input_key(Action::ForwardToPane(vec![b'x']), &ui, &tm, pc.as_ref());
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
         match gated {
             Action::ForwardToPane(bytes) => assert_eq!(
                 bytes,
