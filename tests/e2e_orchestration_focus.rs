@@ -1,46 +1,45 @@
 #![cfg(feature = "e2e")]
 
-//! L2 end-to-end coverage for PRD #373 M2: the 30-second inactivity
-//! snap-back on Orchestration tabs. Closes the CLAUDE.md rule 4 gap —
-//! #373 shipped M1/M2 with only L1/unit coverage
-//! (`tabs/orchestration/012`-`018` in `src/tab.rs`/`src/ui.rs`) and zero
-//! PTY-attached e2e coverage.
+//! L2 end-to-end coverage for PRD #393 M5: the real-binary proof of the
+//! lock-governed focus contract, the CLAUDE.md rule 4 headline test for this
+//! PRD. `orchestration/lock/*` (`e2e_orchestration_lock.rs`) and
+//! `tabs/orchestration/010`/`012`/`020`/`025`/`026` (`src/tab.rs`) each pin
+//! one mechanism in isolation — the keystroke gate, the auto-focus chain, the
+//! lock-gated call site's `TabManager`-level contract. Nothing before this
+//! test drives all of it together, end to end, in a real pane, the way a
+//! human actually experiences it: locked by default, a worker visibly pulling
+//! focus when it needs the human and visibly releasing it once resolved,
+//! `Ctrl+e` handing control back, and a manual focus choice actually sticking
+//! once it does.
 //!
-//! `orchestration_focus_001` reuses the `orch-deck` fixture (two stub
-//! `cat` roles, no LLM tokens spent) `orchestration_lock_004` already
-//! established. It observes "which pane is focused" purely on the
-//! RENDERED GRID, the same surface a user sees: the currently-focused
-//! role's pane box top border fuses its title in as `┌<role>` (Plain,
-//! PaneInput mode — see `e2e_dashboard_pane_column.rs::pane_box_left_edge`
-//! for the precedent), while every other role collapses to a small
-//! numbered card with no live PTY content at all
-//! (`orchestration/layout/004`). So a keystroke can only ever echo inside
-//! the ONE expanded box on screen, and that box's header names which role
-//! it belongs to — no daemon-side per-pane scrollback lookup is needed
-//! (an earlier version of this test tried `common::wait_for_pane_text_on`
-//! against each role's registered agent id and found it always empty for
-//! these plain `cat` stubs; that path is for daemon/stream-backed
-//! real-agent panes, not these).
+//! `orchestration_focus_001` — the PRD #373 M2 inactivity snap-back's PTY
+//! proof — was deleted outright at M4 along with the production behavior it
+//! covered (see `fa651ac`); this file and the `orchestration/focus` catalog
+//! section did not survive that deletion. `focus_002` re-establishes both,
+//! covering the DIFFERENT (successor) behavior M4/M4b/M5 actually shipped.
 //!
-//! The production interval is `TabManager::INACTIVITY_TIMEOUT`
-//! (`src/tab.rs`), read at its sole per-frame call site (`src/ui.rs`, the
-//! `auto_focus_after_inactivity` branch of the auto-focus chain) via the
-//! `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS` test seam this test sets to a
-//! short interval, mirroring the existing `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS`
-//! seam (`src/agent_pty.rs`, `src/daemon.rs`).
+//! Uses the `orch-focus-lifecycle` fixture (`orchestrator` start role plus
+//! `alpha` and `beta`, all plain `printf`+`sleep` stubs — no LLM tokens
+//! spent), the same 3-role fixture `tabs/orchestration/008`
+//! (`e2e_orchestration_pane_column.rs`) opens, because the "manual focus
+//! sticks" half needs a role OTHER than the one going `WaitingForInput` to
+//! prove the human's choice survives — a 2-role fixture where the focused
+//! role and the waiting role are the same pane can't tell a genuine stick
+//! apart from `auto_focus_waiting_pane`'s own no-flicker same-pane no-op.
+//! `write_beta_agent` (that other file's runtime patch making `beta`
+//! self-post real hooks) is deliberately NOT used here — this test drives
+//! `WaitingForInput` synthetically over the hook socket instead, exactly as
+//! `orchestration/lock/010` does, so `beta`'s checked-in placeholder script
+//! (a plain sentinel-then-sleep, no different from `alpha`'s) is fine as is.
 //!
-//! That branch only ever arms while the tab is command-entry LOCKED
-//! (PRD #374's default state): #374 makes the orchestrator the only pane
-//! typable by default, so genuinely continuous typing on a role pane is
-//! only possible after a deliberate Ctrl+e unlock, and a wall-clock "time
-//! since last keystroke" check is inherently racy against render-loop
-//! stalls — a frame that takes even a few hundred ms to drain queued
-//! keystrokes makes the last stamp look stale even though the user never
-//! stopped typing. Gating the timer on the LOCKED state removes that race
-//! for the unlocked case entirely (no timer runs, so there's nothing to
-//! misread), which is why this test drives Part 1 (idle -> snap-back)
-//! while still LOCKED and only unlocks for Part 2 (the continuous-typing
-//! control).
+//! `open_orchestration` and `expanded_header` mirror
+//! `e2e_orchestration_pane_column.rs`'s `open_focus_lifecycle_orchestration`
+//! and the deleted `orchestration_focus_001`'s helpers of the same shape;
+//! `role_agent_record` and `inject_role_status` mirror
+//! `e2e_orchestration_lock.rs`'s `worker_agent_record`/`inject_worker_status`
+//! (generalized from a single hardcoded "worker" role name to any role in the
+//! fixture) rather than reinventing the `pane_id_env` + `agent_id`
+//! reuse-guard fix issue #395 cost that file a real bug for.
 //!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
@@ -50,201 +49,342 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
-/// Test-only override for `TabManager::INACTIVITY_TIMEOUT` this test
-/// expects the production per-frame call site to read (see module doc).
-/// Kept short so the test suite stays fast once the seam exists.
-const SHORT_INACTIVITY_TIMEOUT_SECS: &str = "2";
-const SHORT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Drive the new-pane dialog to open the (single) orchestration in the
-/// `orch-deck` fixture. Mirrors `e2e_orchestration_lock.rs::open_orchestration`
-/// — with no `[[modes]]` defined the Mode chip row is `[No mode] [Orch: …]
-/// [schedule]`, so ONE Right selects the orchestration; selecting an
-/// orchestration hides the Command field, so a second Enter submits the
-/// form. Lands with the orchestrator (start) role focused in `PaneInput`
-/// mode.
+/// `orch-focus-lifecycle` fixture. Mirrors
+/// `e2e_orchestration_pane_column.rs::open_focus_lifecycle_orchestration`'s
+/// shape (renamed locally since this file has no other `open_orchestration`
+/// to collide with, unlike `e2e_orchestration_lock.rs`'s own same-named
+/// helper for the 2-role `orch-deck` fixture) —
+/// with no `[[modes]]` defined the Mode chip row is `[No mode] [Orch:
+/// focus-lifecycle] [schedule]`, so ONE Right selects the orchestration;
+/// selecting an orchestration hides the Command field, so a second Enter
+/// submits the form. Lands with the orchestrator (start) role focused in
+/// `PaneInput` mode, the tab's default LOCKED state untouched.
 fn open_orchestration(deck: &TuiDeck) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: demo-orch]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-}
-
-/// Switch focus from the orchestrator role to the `orch-deck` fixture's
-/// second role ("worker", `role_pane_ids` index 1): Ctrl+D back to Normal
-/// mode, then digit `2` (`Jump2` -> `Action::FocusCard(1)`) — the same
-/// mechanism `e2e_orchestration_lock.rs::focus_worker_role` uses.
-/// `focus_deck` re-enters `PaneInput` mode on success, so no separate
-/// Enter is needed. Reusable across both role-jumps this test needs
-/// (initial focus, and the re-focus at the start of the control half).
-fn focus_worker_role(deck: &TuiDeck) {
-    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
-    deck.send_keys(b"2"); // Jump2 -> focus role index 1 ("worker")
+    deck.send_bytes(b"\x1b[C"); // Right -> [Orch: focus-lifecycle]
+    deck.send_bytes(b"\r"); // Mode -> Name
+    deck.send_bytes(b"\r"); // submit (Command hidden for an orchestration)
 }
 
 /// The rendered grid's expanded-pane top border fuses the pane's title
 /// directly into the box-drawing corner as `┌<role>` in `PaneInput` mode
 /// (`TerminalWidget`, `src/terminal_widget.rs`; the precedent needle is
-/// `e2e_dashboard_pane_column.rs::pane_box_left_edge`'s `plain_needle`).
-/// Only the currently-focused role ever renders this way — every other
-/// role collapses to a small numbered card with no live PTY body
-/// (`orchestration/layout/004`) — so this string's presence names which
-/// role currently holds focus with live content on screen.
+/// `e2e_dashboard_pane_column.rs::pane_box_left_edge`'s `plain_needle`, reused
+/// verbatim by the deleted `orchestration_focus_001`). Only the currently
+/// focused role ever renders this way — every other role collapses to a
+/// small numbered card with no live PTY body (`orchestration/layout/004`) —
+/// so this string's presence on the settled grid names which role currently
+/// holds focus with live content on screen: the observable this whole test
+/// is built on, per CLAUDE.md rule 4's "assert on the rendered grid" bar.
 fn expanded_header(role: &str) -> String {
     format!("┌{role}")
 }
 
-/// Scenario: Open a real orchestration tab, still in its default LOCKED
-/// (PRD #374) state, and focus the non-orchestrator "worker" role. With
-/// ZERO further input, once the (shortened) inactivity interval elapses,
-/// confirm a subsequent keystroke sent with NO manual refocus shows up
-/// inside the ORCHESTRATOR's own expanded pane box on the rendered grid
-/// rather than the worker's — i.e. focus visibly snapped back on its own.
-/// Then, as the control half, deliberately UNLOCK the tab (Ctrl+e),
-/// re-focus the worker role, and keep sending it small keystrokes
-/// throughout an interval LONGER than the configured timeout; confirm a
-/// final keystroke still lands in the worker's own expanded box, proving
-/// the unlocked state suppresses the snap-back entirely.
-#[spec("orchestration/focus/001")]
+/// The `orch-focus-lifecycle` fixture's full daemon registry record for
+/// `role`. Mirrors `e2e_orchestration_lock.rs::worker_agent_record`,
+/// generalized from a single hardcoded "worker" role name to any role name in
+/// this 3-role fixture, since `focus_002` needs to target `alpha` and `beta`
+/// independently.
+fn role_agent_record(
+    socket: &std::path::Path,
+    role: &str,
+) -> dot_agent_deck::agent_pty::AgentRecord {
+    common::agent_records_on(socket)
+        .into_iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { role_name, .. })
+                    if role_name == role
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "orch-focus-lifecycle fixture's {role} role pane must be registered with the daemon"
+            )
+        })
+}
+
+/// Inject a synthetic `AgentEvent` for `role`'s real `(pane_id_env,
+/// agent_id)` pair over the deck's hook socket — the SAME bare-`AgentEvent`,
+/// no-`DaemonMessage`-envelope wire the real `dot-agent-deck agent-event
+/// --type running|waiting|finished` CLI already rides for Pi's status
+/// reporting. Mirrors `e2e_orchestration_lock.rs::inject_worker_status`
+/// (generalized to any role) rather than writing a second injector — that
+/// file's version already carries the issue #395 fix (both `pane_id` AND
+/// `agent_id` set to the role's REAL values, not just `pane_id`, so
+/// `AppState::apply_event`'s same-pane reuse guard updates the pane's
+/// existing session in place instead of forking a second, disconnected one
+/// on the same `pane_id` whose status then races the real one for which
+/// wins `build_pane_status`'s join).
+///
+/// Blocks not on the daemon's broadcast (fires whether or not `apply_event`
+/// actually accepted the event) but on `ListAgents`' `AgentRecord.live` join
+/// reporting the expected `SessionStatus` back for `role`'s pane — proof the
+/// daemon's OWN state, not just its wire, reflects the change before the
+/// caller starts asserting on focus movement driven by it.
+#[cfg(unix)]
+fn inject_role_status(
+    deck: &TuiDeck,
+    socket: &std::path::Path,
+    pane_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    event_type: EventType,
+) {
+    let expected_status = match event_type {
+        EventType::WaitingForInput => dot_agent_deck::state::SessionStatus::WaitingForInput,
+        EventType::Thinking => dot_agent_deck::state::SessionStatus::Thinking,
+        other => {
+            panic!("inject_role_status: no expected SessionStatus mapping wired up for {other:?}")
+        }
+    };
+    let event = AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::Pi,
+        event_type: event_type.clone(),
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
+    common::write_hook_line(deck.hook_socket_path(), &line)
+        .expect("inject synthetic AgentEvent over hook socket");
+
+    let applied = common::wait_until(Duration::from_secs(10), || {
+        common::agent_records_on(socket).into_iter().any(|r| {
+            r.pane_id_env.as_deref() == Some(pane_id)
+                && r.live.as_ref().map(|s| &s.status) == Some(&expected_status)
+        })
+    });
+    assert!(
+        applied,
+        "the daemon's own ListAgents/live-status join never reported {event_type:?} \
+         for pane {pane_id} (agent_id {agent_id}) within 10s — the hook socket write \
+         was accepted, but AppState::apply_event may have rejected it or applied it \
+         to the wrong session.",
+    );
+}
+
+/// Scenario: PRD #393 M5, the CLAUDE.md rule 4 headline test for this PRD —
+/// the full lock-governed focus contract in one real Orchestration tab, as a
+/// user experiences it, asserted purely on the rendered grid. (1) A freshly
+/// opened tab (LOCKED, the default) shows the orchestrator role's expanded
+/// pane box. (2) Injecting `WaitingForInput` for the non-orchestrator `alpha`
+/// role visibly steers focus onto ITS expanded box. (3) Injecting `Thinking`
+/// for `alpha` (status clears) visibly returns focus to the orchestrator's
+/// expanded box — the all-clear edge. (4) `Ctrl+d` then `Ctrl+e` unlocks,
+/// surfacing the `Pane entry: unlocked` status message. (5) With the tab now
+/// unlocked, manually focusing the OTHER non-orchestrator role (`beta`, not
+/// `alpha` — so the fresh waiting episode below is a genuine steer-attempt
+/// rather than a same-pane no-op `auto_focus_waiting_pane` would no-op on
+/// regardless) and then injecting a fresh `WaitingForInput`/`Thinking` pair
+/// for `alpha` moves focus nowhere: `beta`'s expanded box, and a sentinel
+/// typed into it, survive both the waiting pane appearing and its all-clear
+/// — because while unlocked `src/ui.rs`'s per-frame call site
+/// (`if ui.command_entry_locked { observe_waiting_panes(...); ... }`) never
+/// even calls `observe_waiting_panes`, so there is no auto-focus branch left
+/// to fight the human's manual choice.
+#[spec("orchestration/focus/002")]
 #[test]
-fn orchestration_focus_001_inactivity_snap_back_visible_on_real_binary() {
-    const ORCH_AFTER_IDLE: &str = "FOCUS001_ORCH_IDLE_9b62";
-    const WORKER_REFOCUS: &str = "FOCUS001_WORKER_REFOCUS_4e07";
-    const WORKER_FINAL: &str = "FOCUS001_WORKER_FINAL_c581";
+fn orchestration_focus_002_lock_governed_focus_contract_on_real_binary() {
+    const BETA_STICK_SENTINEL: &str = "FOCUS002_BETA_STICK_6d4e";
 
     let deck = TuiDeck::builder()
-        .with_pty_size(120, 40)
-        .with_env(
-            "DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS",
-            SHORT_INACTIVITY_TIMEOUT_SECS,
-        )
-        .launch_with_fixture("orch-deck");
+        .with_pty_size(160, 45)
+        .launch_with_fixture("orch-focus-lifecycle");
     deck.wait_for_string("No active sessions");
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab up, orchestrator focused
 
-    // Settle point mirroring `e2e_orchestration_lock.rs::orchestration_lock_004`:
-    // confirm the orchestrator pane (still focused, never gated) is fully up
-    // and echoing before doing anything else. Without this, the worker
-    // role's `cat` process may not have finished spawning yet (process
-    // spawn is ~380ms on this machine) when the focus switch + first
-    // keystroke below race ahead of it.
-    const ORCH_SETTLE: &str = "FOCUS001_ORCH_SETTLE_1a90";
-    deck.send_keys(format!("{ORCH_SETTLE}\r").as_bytes());
-    deck.wait_for_string(ORCH_SETTLE);
+    let socket = deck.attach_socket_path().to_path_buf();
+    let alpha_record = role_agent_record(&socket, "alpha");
+    let alpha_id = alpha_record.id.clone();
+    let alpha_pane_id = alpha_record
+        .pane_id_env
+        .clone()
+        .expect("alpha role pane must have a DOT_AGENT_DECK_PANE_ID recorded");
+    let alpha_session_id = format!("{alpha_id}-focus002-session");
 
+    // --- Step 1: LOCKED by default, focus sits on the orchestrator pane. ---
     let orch_expanded = expanded_header("orchestrator");
-    let worker_expanded = expanded_header("worker");
-
-    // --- Part 1: manually focus the worker role while the tab is STILL
-    // LOCKED (PRD #374's default) — the M2 inactivity timer only ever
-    // arms while locked (PRD #373 M2 fix), so this is the state that
-    // matters for the idle -> snap-back assertion below. Then send
-    // NOTHING for the configured inactivity interval -> expect an
-    // automatic snap-back.
-    focus_worker_role(&deck);
-
-    // Confirm the forwarding target really is the worker before relying
-    // on the timer. Can't confirm via a typed+echoed sentinel here — the
-    // tab is still locked, so a keystroke aimed at the worker pane is
-    // dropped before it reaches the PTY (PRD #374) — so this checks the
-    // expanded header alone.
-    let initial_ok = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        grid.contains(&worker_expanded)
-    });
+    let alpha_expanded = expanded_header("alpha");
+    let beta_expanded = expanded_header("beta");
     assert!(
-        initial_ok,
-        "focusing the worker role never showed its expanded pane box on \
-         screen (needle {worker_expanded:?}) — cannot proceed with the \
-         inactivity assertion below without confirming the initial focus \
-         target first.\n\
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            grid.contains(&orch_expanded)
+        }),
+        "a freshly opened orchestration tab never showed the orchestrator \
+         role's expanded pane box (needle {orch_expanded:?}) — expected the \
+         default LOCKED state to leave focus on the orchestrator.\n\
          === rendered grid ===\n{}",
-        deck.snapshot_grid(),
+        deck.snapshot_grid()
     );
 
-    // Let the (shortened) inactivity interval elapse with ZERO further
-    // input at all. `wait_for_grid_predicate_within`'s internal poll loop
-    // (common/mod.rs) is the sanctioned wait primitive (Decision 21 bans a
-    // raw `std::thread::sleep` in an `e2e_*.rs` body) — the predicate
-    // never matches, so this simply blocks for the full duration.
-    deck.wait_for_grid_predicate_within(SHORT_INACTIVITY_TIMEOUT * 2, |_| false);
-
-    // No manual refocus here on purpose: if the snap-back fired on its
-    // own, this keystroke lands in the orchestrator's expanded box without
-    // the test doing anything to move focus itself.
-    deck.send_keys(format!("{ORCH_AFTER_IDLE}\r").as_bytes());
-    let snapped_back = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        grid.contains(&orch_expanded) && grid.contains(ORCH_AFTER_IDLE)
-    });
+    // --- Step 2: alpha goes WaitingForInput and visibly pulls focus. ---
+    inject_role_status(
+        &deck,
+        &socket,
+        &alpha_pane_id,
+        &alpha_id,
+        &alpha_session_id,
+        EventType::WaitingForInput,
+    );
     assert!(
-        snapped_back,
-        "after {:?} with no activity on a non-orchestrator role pane in an \
-         Orchestration tab, a subsequent keystroke never showed up inside \
-         the ORCHESTRATOR's own expanded pane box (needle {orch_expanded:?}) \
-         — expected `TabManager::auto_focus_after_inactivity` to have \
-         snapped focus back to the orchestrator role once the (shortened) \
-         inactivity interval elapsed.\n\
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+            grid.contains(&alpha_expanded)
+        }),
+        "injecting WaitingForInput for the non-orchestrator alpha role never \
+         steered focus onto its expanded pane box (needle {alpha_expanded:?}) \
+         — expected the locked tab's auto-focus chain to pull focus onto a \
+         waiting role.\n\
          === rendered grid ===\n{}",
-        SHORT_INACTIVITY_TIMEOUT,
-        deck.snapshot_grid(),
+        deck.snapshot_grid()
     );
 
-    // --- Part 2 (control): deliberately UNLOCK the tab (PRD #374) — the
-    // M2 timer only ever arms while locked (PRD #373 M2 fix), so
-    // unlocking removes the snap-back risk for the rest of this test
-    // entirely, rather than racing a wall-clock "time since last
-    // keystroke" check against render-loop jitter. Then re-focus the
-    // worker role and keep it ALIVE with small keystrokes spanning MORE
-    // wall-clock time than the configured timeout -> expect NO snap-back.
-    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05 -> unlock
-    focus_worker_role(&deck);
-    deck.send_keys(format!("{WORKER_REFOCUS}\r").as_bytes());
-    let refocus_ok = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        grid.contains(&worker_expanded) && grid.contains(WORKER_REFOCUS)
-    });
+    // --- Step 3: alpha resolves; focus returns to the orchestrator on the
+    // all-clear edge. ---
+    inject_role_status(
+        &deck,
+        &socket,
+        &alpha_pane_id,
+        &alpha_id,
+        &alpha_session_id,
+        EventType::Thinking,
+    );
     assert!(
-        refocus_ok,
-        "re-focusing the worker role for the control half didn't show a \
-         confirmation sentinel inside its own expanded pane box.\n\
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| {
+            grid.contains(&orch_expanded)
+        }),
+        "alpha's status clearing from WaitingForInput never returned focus \
+         to the orchestrator's expanded pane box (needle {orch_expanded:?}) \
+         — expected the locked tab's all-clear edge to fire.\n\
          === rendered grid ===\n{}",
-        deck.snapshot_grid(),
+        deck.snapshot_grid()
     );
 
-    // Keep the worker role ALIVE for longer than the configured timeout:
-    // the predicate below never matches, so `wait_for_grid_predicate_within`
-    // just blocks for the full duration, but on each ~50ms poll (its
-    // internal cadence, common/mod.rs) it also forwards a keystroke —
-    // continuous activity spanning more wall-clock time than
-    // `SHORT_INACTIVITY_TIMEOUT`, entirely through the sanctioned poll
-    // primitive rather than a raw sleep loop (Decision 21).
-    deck.wait_for_grid_predicate_within(SHORT_INACTIVITY_TIMEOUT * 2, |_| {
-        deck.send_keys(b"x"); // any forwarded keystroke resets the timer
-        false
-    });
+    // --- Step 4: Ctrl+d then Ctrl+e unlocks. ---
+    deck.send_bytes(b"\x04"); // Ctrl+d -> Normal (command) mode
+    deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            grid.contains("Pane entry: unlocked")
+        }),
+        "Ctrl+d then Ctrl+e never surfaced the 'Pane entry: unlocked' \
+         status message — expected the command-mode chord to flip \
+         ui.command_entry_locked to unlocked.\n\
+         === rendered grid ===\n{}",
+        deck.snapshot_grid()
+    );
 
-    // Leading `\r` first: the loop above lands the cursor mid-line after
-    // ~80 raw `x` bytes with no line breaks of their own (the `cat` stub
-    // echoes verbatim), close enough to the pane's column width that the
-    // sentinel below would otherwise wrap across a line boundary and
-    // break the plain `contains` substring check even though the text is
-    // genuinely there.
-    deck.send_keys(format!("\r{WORKER_FINAL}\r").as_bytes());
-    let stayed_on_worker = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        grid.contains(&worker_expanded) && grid.contains(WORKER_FINAL)
+    // --- Step 5: manual focus on beta (a NON-orchestrator role, deliberately
+    // NOT alpha — see the doc comment) sticks across both a fresh waiting
+    // episode and its all-clear, because unlocked runs no auto-focus branch
+    // at all. Still in Normal mode from the Ctrl+e above: digit '3' ->
+    // Jump3 -> Action::FocusCard(2) -> role_pane_ids[2] == beta.
+    // `focus_deck` re-enters PaneInput mode on success, so no extra Ctrl+d
+    // is needed before the sentinel below.
+    deck.send_bytes(b"3");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            grid.contains(&beta_expanded)
+        }),
+        "manually jumping to the beta role (digit '3') never showed its \
+         expanded pane box (needle {beta_expanded:?}) — cannot proceed with \
+         the manual-focus-sticks assertion below without confirming the \
+         initial focus target first.\n\
+         === rendered grid ===\n{}",
+        deck.snapshot_grid()
+    );
+
+    // A fresh waiting episode on alpha — a DIFFERENT role than the one
+    // manually focused. Under the LOCKED contract (steps 1-3 above) this
+    // would steer focus onto alpha; unlocked, it must not.
+    inject_role_status(
+        &deck,
+        &socket,
+        &alpha_pane_id,
+        &alpha_id,
+        &alpha_session_id,
+        EventType::WaitingForInput,
+    );
+    // No in-process signal for "the deck observed the event and chose not to
+    // move focus" — poll for a bounded stretch and confirm beta's expanded
+    // box is what's there throughout, exactly as `wait_for_grid_predicate_within`
+    // is used as a bounded no-op wait in the deleted `orchestration_focus_001`.
+    let alpha_stole_focus = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        grid.contains(&alpha_expanded)
     });
     assert!(
-        stayed_on_worker,
-        "with continuous keystroke activity spanning longer than the \
-         configured inactivity interval, a final keystroke never showed up \
-         inside the WORKER's own expanded pane box — expected the ongoing \
-         activity to keep resetting the timer and suppress any snap-back, \
-         but focus appears to have moved off the worker role anyway.\n\
+        !alpha_stole_focus,
+        "while UNLOCKED, injecting WaitingForInput for alpha steered focus \
+         onto its expanded pane box (needle {alpha_expanded:?}) anyway — \
+         expected the unlocked tab to run no auto-focus branch at all, \
+         leaving the human's manual focus on beta untouched.\n\
          === rendered grid ===\n{}",
-        deck.snapshot_grid(),
+        deck.snapshot_grid()
+    );
+    assert!(
+        deck.snapshot_grid().contains(&beta_expanded),
+        "beta's expanded pane box was gone after a waiting episode arrived \
+         on alpha while unlocked — manual focus must survive untouched.\n\
+         === rendered grid ===\n{}",
+        deck.snapshot_grid()
+    );
+
+    // alpha resolves; under the LOCKED contract this would fire the
+    // all-clear move back to the orchestrator. Unlocked, it must not either
+    // — beta stays focused.
+    inject_role_status(
+        &deck,
+        &socket,
+        &alpha_pane_id,
+        &alpha_id,
+        &alpha_session_id,
+        EventType::Thinking,
+    );
+    let snapped_to_orchestrator = deck
+        .wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+            grid.contains(&orch_expanded)
+        });
+    assert!(
+        !snapped_to_orchestrator,
+        "while UNLOCKED, alpha's status clearing fired an all-clear move \
+         back to the orchestrator's expanded pane box (needle \
+         {orch_expanded:?}) anyway — expected no auto-focus branch to run \
+         at all while unlocked.\n\
+         === rendered grid ===\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The final proof, not just that beta's box is still drawn but that it
+    // genuinely still holds live PTY focus: a keystroke typed now must
+    // appear inside beta's own expanded box.
+    deck.send_keys(format!("{BETA_STICK_SENTINEL}\r").as_bytes());
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+            grid.contains(&beta_expanded) && grid.contains(BETA_STICK_SENTINEL)
+        }),
+        "after surviving both a waiting episode and its all-clear while \
+         unlocked, a keystroke typed at the end never showed up inside \
+         beta's own expanded pane box — manual focus must have stuck all \
+         the way through.\n\
+         === rendered grid ===\n{}",
+        deck.snapshot_grid()
     );
 }
