@@ -588,6 +588,25 @@ pub fn foreground_pgid(_master: &dyn portable_pty::MasterPty) -> Option<i32> {
 }
 
 // ---------------------------------------------------------------------------
+// Process-table sample (PRD #386 M1).
+// ---------------------------------------------------------------------------
+
+/// Always `None` on Windows: PRD #386 scopes native Windows process walking
+/// out, exactly as [`foreground_pgid`] does today. There is also nothing for
+/// the discriminator to compare — the whole signal rests on POSIX sessions
+/// (`getsid(2)`), which Windows has no analogue of, so a `Toolhelp32Snapshot`
+/// walk would enumerate a tree it could not classify.
+///
+/// Callers must treat `None` as "no signal available" and leave whatever status
+/// they already have alone, never read it as "not busy". The cross-platform
+/// half — [`super::ProcessInfo`], [`super::descendants`] and
+/// [`super::descendant_shell_activity`] — still compiles and is still tested
+/// here, so a future Windows backend only has to supply this one function.
+pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 
