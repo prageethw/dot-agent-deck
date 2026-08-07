@@ -456,11 +456,54 @@ pub fn send_to_socket(json: &str) -> Option<()> {
 /// PTY-injection safety net rather than hanging or erroring. A blank reply
 /// line is returned as `Some(String::new())`.
 pub fn request_from_socket(json: &str) -> Option<String> {
+    match request_from_socket_inner(json, None) {
+        SocketReply::Line(line) => Some(line),
+        SocketReply::NoReply | SocketReply::Unreachable => None,
+    }
+}
+
+/// Outcome of [`request_from_socket_with_deadline`] — richer than
+/// [`request_from_socket`]'s `Option<String>` because the `delegate` CLI
+/// (unlike `get-seed`) needs to tell "never even reached the daemon" apart
+/// from "reached it, but got no confirmation back" to report each honestly.
+pub enum SocketReply {
+    /// Connected, wrote the request, and read a reply line (possibly empty).
+    Line(String),
+    /// Connected and wrote the request, but no reply arrived before the
+    /// deadline — either the daemon closed without answering (an old daemon
+    /// that doesn't know this request type) or the read timed out. The
+    /// request was still sent.
+    NoReply,
+    /// Could not connect to the daemon, or failed while writing — the
+    /// request was never sent.
+    Unreachable,
+}
+
+/// [`request_from_socket`] with an explicit read/write deadline and a
+/// three-way outcome, for a caller that must distinguish "never sent" from
+/// "sent but unconfirmed" — see [`SocketReply`]. Used by `delegate`, whose
+/// degrade path against an old daemon that never answers must still report
+/// the delegate as sent, matching the pre-existing fire-and-forget behaviour
+/// (upstream #309/#330; `docs/develop/versioning.md`'s rule-12 note).
+pub fn request_from_socket_with_deadline(json: &str, timeout: std::time::Duration) -> SocketReply {
+    request_from_socket_inner(json, Some(timeout))
+}
+
+fn request_from_socket_inner(json: &str, timeout: Option<std::time::Duration>) -> SocketReply {
     let path = socket_path();
-    let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
+    let mut stream = match crate::platform::ipc::IpcClient::connect(&path) {
+        Ok(stream) => stream,
+        Err(_) => return SocketReply::Unreachable,
+    };
+    if let Some(timeout) = timeout
+        && stream.set_timeouts(timeout).is_err()
+    {
+        return SocketReply::Unreachable;
+    }
     let msg = format!("{json}\n");
-    stream.write_all(msg.as_bytes()).ok()?;
-    stream.flush().ok()?;
+    if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
+        return SocketReply::Unreachable;
+    }
     // Half-close our write side so the daemon's line reader sees EOF after our
     // single request and doesn't block waiting for more (it reads in a loop).
     // Best-effort: on a transport without a half-close primitive (Windows named
@@ -475,12 +518,15 @@ pub fn request_from_socket(json: &str) -> Option<String> {
     // is EOF-independent and returns the identical value on Unix (the daemon
     // writes exactly one JSON line). An absent/older daemon that never answers
     // still terminates: it either closes (EOF → empty line) or hits the sync
-    // client's read deadline, and both fold into the caller's documented
-    // "no seed" → PTY-injection fallback.
+    // client's read deadline (when `timeout` is set), and both fold into
+    // `SocketReply::NoReply` here / the caller's documented "no seed" →
+    // PTY-injection fallback for `get-seed`.
     let mut reader = std::io::BufReader::new(&mut stream);
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    Some(line.trim_end_matches(['\n', '\r']).to_string())
+    match reader.read_line(&mut line) {
+        Ok(_) => SocketReply::Line(line.trim_end_matches(['\n', '\r']).to_string()),
+        Err(_) => SocketReply::NoReply,
+    }
 }
 
 #[cfg(test)]
