@@ -104,6 +104,12 @@ The tab bar carries the same signal one level up: a **background** orchestration
 
 In the default `Stacked` pane layout, only the focused role's pane is drawn — switching roles swaps which pane is visible, but every other role's agent keeps running underneath, and the sidebar is what tells you it's still busy or idle. Toggle to `Tiled` (`Ctrl+t`) to see every role's pane at once.
 
+#### Focus returns to the orchestrator on its own
+
+The orchestrator pane is where you type, so an orchestration tab brings focus back to it in two situations, without you having to walk focus back yourself. First, whenever a role pane starts waiting for input, focus is steered to it so you can answer — and the moment the last one is resolved, so nothing on the tab still needs you, focus moves back to the orchestrator once. Second, while the tab is command-entry locked (the default — see [command-entry lock](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane)), if you move focus to another role pane yourself and then leave it untouched for 30 seconds, focus snaps back to the orchestrator.
+
+Anything you do in that pane restarts the 30 seconds — including a keystroke the lock drops rather than forwards, since typing at a locked pane still means you are engaged with it. The snap-back also holds off entirely while any role on the tab is waiting for input: you are never pulled away from a pane that is asking you a question. If you unlock command entry (`Ctrl+e`) to type directly into a role pane, the 30-second timer stops applying altogether for as long as the tab stays unlocked — re-locking (or leaving the tab) resumes normal tracking. Both behaviors are limited to orchestration tabs — the Dashboard and workspace-mode tabs never move focus on their own.
+
 ## How delegation works
 
 The orchestrator delegates a task to one or more workers. The deck delivers the task to each worker's pane automatically, including the worker's [`prompt_template`](#configuration-reference) as standing context. Each worker works independently, then signals completion. The deck notifies the orchestrator, which reads the summary and decides what to do next.
