@@ -4,7 +4,7 @@
 //!
 //! Spawns the real `dot-agent-deck` binary inside an isolated PTY, gets
 //! ≥1 session card on the dashboard, then drives the mouse via SGR reports
-//! through the `TuiDeck::click` / `find_in_grid` / `send_bytes` helpers:
+//! through the `TuiDeck::click` / `wait_for_in_grid` / `send_bytes` helpers:
 //!   - mouse/dashboard/001 — single-click selects a card (== j/k); double-
 //!     click focuses its pane / enters PaneInput (== Enter on the selected
 //!     card).
@@ -69,14 +69,10 @@ fn dashboard_001_click_selects_double_click_focuses() {
     deck.send_bytes(b"\x04"); // Ctrl+D → dashboard / Normal mode
     deck.wait_for_string("[New Pane Ctrl+N]");
     // The realpane card's body shows "Launch an agent..." (a No-agent pane).
-    // Locate the card by that text — find_in_grid("realpane") would hit the
-    // focused-pane preview's title bar on the right, not the card.
-    deck.wait_for_string("Launch an agent");
-
-    // Double-click the realpane card → focus its pane (PaneInput mode).
-    let (col, row) = deck
-        .find_in_grid("Launch an agent")
-        .expect("realpane card body should be on the dashboard");
+    // Wait for the card by that text and double-click it → focus its pane
+    // (PaneInput mode). Locating "realpane" instead would hit the focused-pane
+    // preview's title bar on the right, not the card.
+    let (col, row) = deck.wait_for_in_grid("Launch an agent");
     deck.click(col, row);
     deck.click(col, row); // second click within the double-click window
     deck.wait_for_string("PaneInput mode");
@@ -88,7 +84,7 @@ fn dashboard_001_click_selects_double_click_focuses() {
 /// filter prompt, == `/`); the Rename button → rename mode (the `Rename:`
 /// prompt, == `r` on the selected card); the Generate-config button → the
 /// config-generation prompt (`Generate .dot-agent-deck.toml`, == `g`). Each
-/// button is located by its label text via `find_in_grid`. RED until M4
+/// button is located by its label text via `wait_for_in_grid`. RED until M4
 /// renders these clickable buttons (today they do not exist, so the lookup
 /// fails). Assumed placement: context buttons added to the bottom button
 /// bar while in Dashboard / Normal mode, carrying their shortcuts inline
@@ -109,9 +105,7 @@ fn dashboard_002_filter_rename_generate_buttons() {
 
     // Filter button → filter mode. Typed text echoes in the filter prompt,
     // which only happens once filter mode is active.
-    let (c, r) = deck
-        .find_in_grid("Filter")
-        .expect("dashboard should render a clickable Filter button");
+    let (c, r) = deck.wait_for_in_grid("Filter");
     deck.click(c, r);
     deck.send_bytes(b"zqx");
     deck.wait_for_string("zqx");
@@ -121,18 +115,14 @@ fn dashboard_002_filter_rename_generate_buttons() {
     deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Rename button (acts on the selected card) → rename mode.
-    let (c, r) = deck
-        .find_in_grid("Rename")
-        .expect("dashboard should render a clickable Rename button");
+    let (c, r) = deck.wait_for_in_grid("Rename");
     deck.click(c, r);
     deck.wait_for_string("Rename:");
     deck.send_bytes(b"\x1b"); // Esc → back to Normal mode
     deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Generate-config button → config-generation prompt.
-    let (c, r) = deck
-        .find_in_grid("Generate")
-        .expect("dashboard should render a clickable Generate-config button");
+    let (c, r) = deck.wait_for_in_grid("Generate");
     deck.click(c, r);
     deck.wait_for_string("Generate .dot-agent-deck.toml");
 }
