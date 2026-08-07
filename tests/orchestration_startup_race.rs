@@ -339,9 +339,22 @@ async fn delegate_029_pi_start_role_delegate_survives_worker_registration_race_i
             // finds no role config and falls straight to the no-respawn
             // path: no readiness wait, the prompt writes to this existing
             // `cat` pane as soon as `delegate_targets` resolves it.
+            //
+            // Raw-mode, not bare `cat`: a bare `cat` pane keeps the PTY
+            // slave's default canonical/echo termios, so a single
+            // daemon-initiated write is BOTH echoed by the kernel tty layer
+            // AND copied through by `cat` itself, landing twice in the
+            // master-side scrollback this test asserts against — a harness
+            // artifact, not a second delivery. Every other `cat` stand-in in
+            // this suite that reads its own scrollback for an exact count
+            // wraps it the same way (`tests/idle_worker_detector.rs`,
+            // `tests/delegate_prompt_injection.rs`,
+            // `src/agent_pty.rs`'s `write_to_pane_notice_bytes_precede_…`
+            // test) — `stty -echo -icanon` before `exec cat -u` collapses it
+            // back to exactly one occurrence per write.
             OrchestrationRoleConfig {
                 name: WORKER_ROLE.to_string(),
-                command: "cat".to_string(),
+                command: "stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u".to_string(),
                 start: false,
                 description: None,
                 prompt_template: None,
