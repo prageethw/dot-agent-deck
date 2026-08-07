@@ -81,7 +81,7 @@ name = "dot-agent-deck"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run claude-opus-devbox"
+command = "devbox run claude-opus-devbox --permission-mode plan"
 # command = "devbox run pi-big"   # pi (Opus, high thinking)
 start = true
 prompt_template = """
@@ -210,7 +210,7 @@ Begin every `work-done` report with a short **Summary** section — two or three
 
 [[orchestrations.roles]]
 name = "release"
-command = "devbox run claude-haiku-devbox"
+command = "devbox run claude-sonnet-devbox"
 # command = "devbox run oc-release"
 clear = false
 description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
