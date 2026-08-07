@@ -486,17 +486,18 @@ jobs:
       - name: Skip if SONAR_TOKEN is not set
         if: env.SONAR_TOKEN == ''
         run: echo "SONAR_TOKEN not set - skipping SonarQube analysis"
-      - uses: dtolnay/rust-toolchain@v1
+      # The three third-party actions below are SHA-pinned, unlike the rest of the repo's tag-pinned actions, specifically to satisfy Sonar's `new_security_rating` quality gate (rule githubactions:S7637), which grades new code only; `actions/checkout` above is GitHub-owned and exempt.
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         if: env.SONAR_TOKEN != ''
         with:
           toolchain: 1.97.1
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: env.SONAR_TOKEN != ''
       - name: Generate clippy report for Sonar import
         if: env.SONAR_TOKEN != ''
         run: cargo clippy --message-format=json > clippy-report.json
-      - uses: SonarSource/sonarqube-scan-action@v7
+      - uses: SonarSource/sonarqube-scan-action@c7ee0f9df90b7aa20e8dcf9695dcfe2e7da5b4f2 # v7
         if: env.SONAR_TOKEN != ''
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
