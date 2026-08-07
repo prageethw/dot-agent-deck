@@ -187,14 +187,6 @@ pub enum Tab {
         /// always returns the full supervisory view. It is pure presentation —
         /// nothing about it reaches the daemon.
         zoomed: bool,
-        /// PRD #374 (#361 Item 3): whether direct keystroke entry to
-        /// non-orchestrator role panes on this tab is locked. Starts
-        /// `true` — only the orchestrator pane accepts direct input until
-        /// `Ctrl+e` unlocks it. Per-tab: toggling one orchestration tab's
-        /// lock never affects another open orchestration tab. (It used to
-        /// cite `split_stage` as its precedent; PRD #387 M2 made that one
-        /// deck-global, so the lock is now the per-tab case on its own.)
-        command_entry_locked: bool,
     },
 }
 
@@ -959,7 +951,6 @@ impl TabManager {
             // PRD #313: zoom is PER-TAB, so a newly opened tab always starts
             // unzoomed regardless of what any other tab is doing.
             zoomed: false,
-            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -1100,7 +1091,6 @@ impl TabManager {
             // PRD #313: zoom is ephemeral view state and is never persisted, so
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
-            command_entry_locked: true,
         });
 
         let index = self.tabs.len() - 1;
@@ -1826,7 +1816,6 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
-            command_entry_locked: true,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1859,7 +1848,6 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
-            command_entry_locked: true,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),
