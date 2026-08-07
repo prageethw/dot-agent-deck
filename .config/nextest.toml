@@ -160,8 +160,13 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # Every test in a `tests/e2e_*.rs` binary that matters here drives a real spawned
 # deck binary plus a daemon plus one or more agent PTYs, then asserts on rendered
 # UI state against fixed wall-clock deadlines (`WAIT_TIMEOUT` in
-# `tests/common/mod.rs` is 10s, and `wait_for_*_within` callers pass 2-15s). They
-# do not degrade gracefully under CPU starvation — they go red.
+# `tests/common/mod.rs`, and whatever `wait_for_*_within` callers pass). They do
+# not degrade gracefully under CPU starvation — they go red. Fork issue #81
+# followed that thread the rest of the way: this cap reduced how often the
+# deadlines fire but did not make them realistic, so `WAIT_TIMEOUT` is now 30s
+# via `OBSERVATION_BUDGET` and the tight per-call-site budgets this comment used
+# to describe as "2-15s" were either raised to that constant or replaced by a
+# wait on a stronger signal.
 #
 # Measured on the fork's informational `e2e:` job (job 92534838701, 2026-08-06):
 # nextest kept a steady FOUR tests in flight for the whole run, because GitHub's
