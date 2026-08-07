@@ -575,12 +575,12 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // `codex/worker/001` and is too LLM-dependent to hard-gate here): did the
     // worker also follow the task file's completion footer back to the daemon?
     // Kept short so a worker that never signals cannot push the run past
-    // nextest's 180s cap.
-    let work_done = work
-        .join(".dot-agent-deck")
-        .join(format!("work-done-{WORKER_ROLE}.md"));
+    // nextest's 180s cap. The worker pane's `pane_id` is assigned by the real
+    // daemon spawn (not a literal this test controls), so the exact
+    // digest-suffixed filename can't be predicted — glob for it instead.
+    let work_done_dir = work.join(".dot-agent-deck");
     eprintln!(
         "soft: worker signalled work-done through the hook socket = {}",
-        common::wait_for_path(&work_done, Duration::from_secs(30))
+        common::find_work_done_file(&work_done_dir, WORKER_ROLE, Duration::from_secs(30)).is_some()
     );
 }

@@ -37,7 +37,7 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::dispatch_return::DispatchCaller;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
-use dot_agent_deck::state::{AppState, OrchestrationIdentity};
+use dot_agent_deck::state::{AppState, OrchestrationIdentity, work_done_file_name};
 use spec::spec;
 
 mod common;
@@ -49,10 +49,22 @@ const WORKER_ROLE: &str = "coder";
 const ORCHESTRATION: &str = "work-done-test-orchestration";
 const ORCHESTRATION_INSTANCE: &str = "work-done-test-orchestration-instance-1";
 
+/// The daemon's own output filename for [`WORKER_ROLE`]/[`WORKER_PANE`] — keyed
+/// on the reporting pane (upstream #331 + fork #76), not on role name alone, so
+/// this is computed the same way the daemon computes it rather than hardcoded.
+fn summary_file_name() -> String {
+    work_done_file_name(WORKER_ROLE, WORKER_PANE)
+}
+
 /// The daemon's unchanged happy-path pointer. Its ABSENCE is the assertion in two
 /// of these tests: pointing an orchestrator at a file the daemon did not write is
 /// exactly the #433 defect, and it is what the daemon used to do unconditionally.
-const POINTER_NEEDLE: &str = "Read .dot-agent-deck/work-done-coder.md for their full report.";
+fn pointer_needle() -> String {
+    format!(
+        "Read .dot-agent-deck/{} for their full report.",
+        summary_file_name()
+    )
+}
 
 /// The #448 label. Spelled out here rather than imported from `src/` so a silent
 /// rewording of the daemon's own template fails these tests instead of following
@@ -60,7 +72,12 @@ const POINTER_NEEDLE: &str = "Read .dot-agent-deck/work-done-coder.md for their 
 const UNSOLICITED_NEEDLE: &str = "you have no outstanding delegation to that worker";
 
 /// The #433 label, for a commissioned completion whose file could not be written.
-const UNFILED_NEEDLE: &str = "could not write .dot-agent-deck/work-done-coder.md";
+fn unfiled_needle() -> String {
+    format!(
+        "could not write .dot-agent-deck/{}",
+        summary_file_name()
+    )
+}
 
 /// The daemon frames an inlined report as inert data, so matching the WRAPPED
 /// opening marker — not just the report text — proves the text arrived through
@@ -220,7 +237,10 @@ impl WorkDoneHarness {
     }
 
     fn summary_path(&self) -> std::path::PathBuf {
-        self.cwd.path().join(".dot-agent-deck/work-done-coder.md")
+        self.cwd
+            .path()
+            .join(".dot-agent-deck")
+            .join(summary_file_name())
     }
 
     fn orchestrator_snapshot(&self) -> String {
@@ -263,7 +283,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("build multi-thread runtime")
 }
 
-/// Scenario: Park an earlier delegation's report at `.dot-agent-deck/work-done-coder.md`, then have the `coder` worker run `work-done` with NO delegation outstanding — the case of a human tasking a worker directly. The orchestrator pane must receive a report explicitly labelled as one it never commissioned, carrying the worker's text inline, and must NOT be told to read the summary file; the earlier report must still be on disk byte-for-byte.
+/// Scenario: Park an earlier delegation's report at the daemon's own pane-keyed output path, then have the `coder` worker run `work-done` with NO delegation outstanding — the case of a human tasking a worker directly. The orchestrator pane must receive a report explicitly labelled as one it never commissioned, carrying the worker's text inline, and must NOT be told to read the summary file; the earlier report must still be on disk byte-for-byte.
 #[spec("orchestration/work-done/001")]
 #[test]
 fn work_done_001_unsolicited_completion_is_labelled_and_clobbers_nothing() {
@@ -290,7 +310,7 @@ fn work_done_001_unsolicited_completion_is_labelled_and_clobbers_nothing() {
              back; snapshot = {snapshot:?}"
         );
         assert!(
-            !snapshot.contains(POINTER_NEEDLE),
+            !snapshot.contains(&pointer_needle()),
             "the orchestrator must not be pointed at a file this completion did not write; \
              snapshot = {snapshot:?}"
         );
@@ -328,12 +348,12 @@ fn work_done_002_disabled_idle_detector_still_reports_a_genuine_completion() {
 
         let snapshot = harness
             .wait_for_orchestrator(
-                |snapshot| snapshot.contains(POINTER_NEEDLE),
+                |snapshot| snapshot.contains(&pointer_needle()),
                 Duration::from_secs(5),
             )
             .await;
         assert!(
-            snapshot.contains(POINTER_NEEDLE),
+            snapshot.contains(&pointer_needle()),
             "a project with the idle detector OFF must still get its completion reported — \
              suppressing on 'no watch armed' would silently break every such project; \
              snapshot = {snapshot:?}"
@@ -380,17 +400,17 @@ fn work_done_003_failed_summary_write_inlines_the_report_instead_of_pointing_at_
 
         let snapshot = harness
             .wait_for_orchestrator(
-                |snapshot| snapshot.contains(UNFILED_NEEDLE),
+                |snapshot| snapshot.contains(&unfiled_needle()),
                 Duration::from_secs(5),
             )
             .await;
         assert!(
-            snapshot.contains(UNFILED_NEEDLE),
+            snapshot.contains(&unfiled_needle()),
             "a summary the daemon could not write must be reported as missing, not vouched for; \
              snapshot = {snapshot:?}"
         );
         assert!(
-            !snapshot.contains(POINTER_NEEDLE),
+            !snapshot.contains(&pointer_needle()),
             "pointing at an unwritten path is the defect: whatever sits there belongs to an \
              earlier delegation; snapshot = {snapshot:?}"
         );
@@ -472,7 +492,7 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
              through the very ledger added to prevent it; snapshot = {snapshot:?}"
         );
         assert!(
-            !snapshot.contains(POINTER_NEEDLE),
+            !snapshot.contains(&pointer_needle()),
             "and the laundered label brings the clobber with it: a solicited completion is \
              pointed at a summary file this one must never have written; snapshot = {snapshot:?}"
         );
@@ -544,12 +564,12 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
             .await;
         let delivered = harness
             .wait_for_orchestrator(
-                |snapshot| snapshot.contains(POINTER_NEEDLE),
+                |snapshot| snapshot.contains(&pointer_needle()),
                 Duration::from_secs(5),
             )
             .await;
         assert!(
-            delivered.contains(POINTER_NEEDLE),
+            delivered.contains(&pointer_needle()),
             "control: a commissioned completion must reach the orchestrator that commissioned \
              it, or the refusal asserted below is not a refusal of anything; snapshot = \
              {delivered:?}"
@@ -622,7 +642,7 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
              untested; snapshot = {snapshot:?}"
         );
         assert!(
-            !snapshot.contains(POINTER_NEEDLE)
+            !snapshot.contains(&pointer_needle())
                 && !snapshot.contains(UNSOLICITED_NEEDLE)
                 && !snapshot.contains(REPORT_FRAME_NEEDLE),
             "a previous conversation's completion report was typed into — and submitted in — an \

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
+use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
 
 mod common;
@@ -180,7 +181,7 @@ async fn codex_worker_001_inner() {
     let work_done = cwd
         .path()
         .join(".dot-agent-deck")
-        .join("work-done-coder.md");
+        .join(work_done_file_name(WORKER_ROLE, WORKER_PANE));
     assert!(
         common::wait_for_path_async(&work_done, Duration::from_secs(120)).await,
         "wrapped Codex created the sentinel but never signalled work-done through the hook socket (missing {work_done:?})\n=== Codex worker pane ===\n{}\n=== end ===",

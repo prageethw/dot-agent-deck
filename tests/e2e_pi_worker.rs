@@ -18,7 +18,7 @@
 //! 2. The pi worker **does the task** — creates a uniquely-named sentinel file
 //!    with known contents.
 //! 3. The pi worker **signals `work-done`** — the daemon writes
-//!    `.dot-agent-deck/work-done-<role>.md`. Whether pi shells the footer's
+//!    `.dot-agent-deck/work-done-<role>-<pane digest>.md`. Whether pi shells the footer's
 //!    `dot-agent-deck work-done` CLI or calls its extension's native `work_done`
 //!    tool, both route the same `WorkDone` signal over the hook socket, so the
 //!    file's appearance is a path-agnostic proof.
@@ -83,6 +83,7 @@ use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
+use dot_agent_deck::state::work_done_file_name;
 
 mod common;
 
@@ -171,7 +172,7 @@ fn path_with_binary_dir() -> String {
 /// is deferred out of the window via `DOT_AGENT_DECK_SEED_FALLBACK_SECS`). Assert
 /// the full WORKER chain: the pi worker created the sentinel with the expected
 /// contents (received AND did the task), the daemon wrote
-/// `.dot-agent-deck/work-done-coder.md` (signalled work-done — footer CLI or the
+/// `.dot-agent-deck/work-done-coder-<pane digest>.md` (signalled work-done — footer CLI or the
 /// native `work_done` tool), AND the daemon recorded the seed was delivered
 /// NATIVELY (`seed_delivered_native`, proving the native pull ran, not the
 /// injection fallback). Generous per-step timeouts sized to confidence, not token
@@ -437,7 +438,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     let work_done = cwd
         .path()
         .join(".dot-agent-deck")
-        .join(format!("work-done-{WORKER_ROLE}.md"));
+        .join(work_done_file_name(WORKER_ROLE, WORKER_PANE));
     let work_done_ok = common::wait_for_path_async(&work_done, Duration::from_secs(120)).await;
     assert!(
         work_done_ok,
