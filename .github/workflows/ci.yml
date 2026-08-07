@@ -277,18 +277,27 @@ jobs:
   # expected to be noisier than the fast tier, not less. Treat a red run
   # here as a signal worth reading, not a merge blocker.
   #
-  # NO API KEYS CONFIGURED, AND THAT IS FINE FOR NOW: only 4 of the 64
-  # `tests/e2e_*.rs` files (`e2e_pi_live`, `e2e_issue_dispatch_real`,
-  # `e2e_issue_dispatch_live`, `e2e_scheduler_live_surface`) spend real LLM
-  # tokens against a live agent CLI + credentials; every one of them
-  # self-skips at runtime (Decision 26, `skip_unless!(...)` /
-  # `check_claude_available()` / `OPENROUTER_API_KEY` checks) rather than
-  # failing when the CLI or key is absent. The other 60 files drive the real
-  # spawned binary over a PTY against synthetic `cat`/scripted stub agents —
-  # no network, no spend, no secrets — and run for real here. Wiring real
+  # NO API KEYS CONFIGURED: 19 of the 66 `tests/e2e_*.rs` files (25 test
+  # functions) spend real LLM tokens against a live agent CLI + credentials;
+  # every one of them self-skips at runtime (Decision 26, `skip_unless!(...)`
+  # on `check_claude_available()` / `check_codex_available()` /
+  # `check_opencode_available()` / `check_pi_available()`'s
+  # `OPENROUTER_API_KEY`) rather than failing when the CLI or key is absent.
+  # Regenerate the list with `grep -rln 'skip_unless' tests/e2e_*.rs` rather
+  # than trusting this comment. The other 47 files drive the real spawned
+  # binary over a PTY against synthetic `cat`/scripted stub agents — no
+  # network, no spend, no secrets — and run for real here. Wiring real
   # credentials (an `ANTHROPIC_API_KEY`/`OPENROUTER_API_KEY` secret, and
-  # installing the `claude`/`codex`/`pi` CLIs) to also cover those 4 is a
+  # installing the `claude`/`codex`/`pi` CLIs) to also cover those 19 is a
   # separate follow-up with its own cost/security tradeoffs, not bundled in.
+  #
+  # Corrected 2026-08-07 (fork issue #26), counted on `main` at `4f872c5`:
+  # this comment previously said "only 4 of the 64", naming `e2e_pi_live`,
+  # `e2e_issue_dispatch_real`, `e2e_issue_dispatch_live` and
+  # `e2e_scheduler_live_surface`. Two of those four carry no credential gate
+  # at all (`e2e_issue_dispatch_live` and `e2e_scheduler_live_surface` drive
+  # `cat` and DO run here), and 17 gated files were missing. CLAUDE.md rule
+  # 5's carve-out (a) carried the same wrong number and is corrected with it.
   #
   # ubuntu-latest, matching `build` (not build-macos/build-windows): the
   # Unix-domain-socket daemon/attach/hook suites this tier depends on are
