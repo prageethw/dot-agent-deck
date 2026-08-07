@@ -787,7 +787,36 @@ jobs:
             printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757. Checksums for these assets are in \`checksums-desktop-alpha.txt\`.\n"
           } | gh release edit "v$RELEASE_VERSION" --notes-file -
 
+  # FORK-ONLY GUARD (fork issue #71). Publishing the docs site is upstream's
+  # concern: `docs-publish.yml` builds and pushes to the hardcoded
+  # `ghcr.io/vfarcic/dot-agent-deck-docs` using the caller's `GITHUB_TOKEN`,
+  # which on a fork has no write access to that namespace — a 403 on `Build and
+  # push docs image` is the guaranteed outcome, not a configuration accident.
+  # It then commits a chart bump straight to `main`, which a fork does not want
+  # either: the fork runs no docs site and consumes upstream's published one.
+  #
+  # This job only started *reaching* that failure because of fork issue #35.
+  # Before #35, `finalize` died on the missing `HOMEBREW_TAP_TOKEN` and `docs`
+  # was skipped as an unsatisfied `needs:` dependency; with #35's packaging
+  # steps guarded, `finalize` now succeeds on a fork and `docs` runs for the
+  # first time. So #35 did not cause this — it uncovered it.
+  #
+  # Guarded HERE, on the caller, rather than inside `docs-publish.yml`, because
+  # the two are not equivalent. `docs-publish.yml` is also invoked standalone
+  # via `workflow_dispatch` by the `publish-docs` skill; a guard placed inside
+  # it would turn that deliberate, human-requested publish into a silent green
+  # no-op on a fork. An automatic side effect of tagging should skip quietly; an
+  # explicit request should still fail loudly with the 403 that says exactly
+  # what is wrong. Only the release path is silenced.
+  #
+  # Same `if:`-not-`continue-on-error:` reasoning as #35's guard above: skipping
+  # something that cannot work keeps the release run green instead of leaving a
+  # permanently red job, and it is keyed on the repository rather than on secret
+  # presence because the decision is about ownership. Upstream is unaffected —
+  # the condition is true there, so `docs` runs exactly as before. Nothing in
+  # this workflow depends on `docs`; it is the last job in the graph.
   docs:
+    if: github.repository == 'vfarcic/dot-agent-deck'
     needs: [prepare, finalize]
     uses: ./.github/workflows/docs-publish.yml
     # A reusable workflow invoked via `uses:` receives NO secrets unless the
