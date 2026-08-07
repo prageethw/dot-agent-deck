@@ -111,6 +111,10 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `ac12948` | `fork-only: skip the docs publish job on fork releases (#71)` | **PERMANENT** fork-only (release CI) |
 | `665ed77` | `test(daemon): pin ingest_event's broadcast/apply atomicity (fork #31)` | **UPSTREAM-WORTHY** — generic daemon regression test |
 | `352a782` | `docs(fork-sync): record the open-upstream-PR branch-deletion hazard (#83)` | **PERMANENT** fork-only (doc) |
+| `819c5c1` | `test(harness): fix the fixed-budget PTY/grid observation flake class (fork #81, #82)` | **UPSTREAM-WORTHY** — generic e2e/PTY timing determinism, no fork-specific content |
+| `aed6343` | `feat(delegate): make daemon rejections and confirmations visible to the caller (#84)` | **UPSTREAM-WORTHY** — `delegate` is upstream functionality; the touched surfaces (`handle_delegate`, the hook socket reply, the CLI) carry no fork-only symbols |
+| `7441b0f` | `ci: add a Semgrep CE scan publishing SARIF to GitHub code scanning (#85, #86)` | **PERMANENT** fork-only (CI) |
+| `a9ef53e` | `ci: add SonarQube Cloud analysis, gated on the SONAR_TOKEN secret (#88)` | **PERMANENT** fork-only (CI) |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
