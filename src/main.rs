@@ -14,8 +14,20 @@ use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
 use dot_agent_deck::pane::PaneController;
+use dot_agent_deck::reconnect::{HydrationGate, spawn_event_subscriber};
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::run_tui;
+
+/// Fork issue #36 backstop: how long the reconnect hydration gate may hold
+/// live events before it is opened regardless.
+///
+/// The normal path releases it in well under a second (one `ListAgents`
+/// round-trip plus the per-agent attaches). This bound only matters when the
+/// hydration path never runs at all or dies before signalling; firing it
+/// restores the pre-fix behaviour rather than leaving the TUI permanently
+/// blind to live events. Generous relative to `embedded_pane`'s 5s list
+/// timeout so a merely-slow daemon is not mistaken for a missing hydrator.
+const HYDRATION_GATE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
@@ -1543,7 +1555,35 @@ async fn run_tui_session() -> ExitCode {
     }
     // PRD #76 M2.17: subscribe to the daemon's `AgentEvent` broadcast so
     // the TUI's `AppState` mirrors live agent activity.
-    spawn_event_subscriber(attach_path.clone(), state.clone());
+    //
+    // Fork issue #36: the subscription and the `ListAgents` hydration snapshot
+    // below used to race, and an edge-triggered event that fell between them
+    // (the shell-activity monitor's paired `ShellIdle`) was delivered to
+    // nobody — leaving the reconnected pane reading `Working` forever. The
+    // gate orders the two: hydration waits for the subscription to be
+    // confirmed before snapshotting, and the subscriber holds events back
+    // until hydration has seeded its cards. See `dot_agent_deck::reconnect`.
+    let hydration_gate = HydrationGate::armed();
+    spawn_event_subscriber(attach_path.clone(), state.clone(), hydration_gate.clone());
+    // Safety net: hydration is what opens the gate, and it only runs under the
+    // embedded-pane (external-daemon) controller. If that path is skipped, or
+    // dies before signalling, nothing else would ever release the held events.
+    // Opening the gate late is a return to the pre-fix behaviour (the window
+    // stays open for this attach), never a stall.
+    {
+        let gate = hydration_gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(HYDRATION_GATE_WATCHDOG).await;
+            if !gate.is_seeded() {
+                tracing::warn!(
+                    held_secs = HYDRATION_GATE_WATCHDOG.as_secs(),
+                    "hydration gate never released by the reconnect path; opening it so live \
+                     events resume"
+                );
+                gate.mark_seeded();
+            }
+        });
+    }
 
     let version_state = state.clone();
     tokio::spawn(async move {
@@ -1583,10 +1623,12 @@ async fn run_tui_session() -> ExitCode {
         }
     }
 
-    let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
-        attach_path.clone(),
-        tokio::runtime::Handle::current(),
-    ));
+    let pane_controller: Arc<dyn PaneController> = Arc::new(
+        EmbeddedPaneController::new(attach_path.clone(), tokio::runtime::Handle::current())
+            // Fork issue #36: hydration waits on this gate before snapshotting
+            // and releases it once every rebuilt pane is seeded.
+            .with_hydration_gate(hydration_gate),
+    );
     let tui_state = state.clone();
     let tui_result = tokio::task::spawn_blocking(move || {
         run_tui(tui_state, pane_controller, config, keybindings)
@@ -1605,75 +1647,6 @@ async fn run_tui_session() -> ExitCode {
         eprintln!("TUI error: {e}");
     }
     ExitCode::SUCCESS
-}
-
-/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
-/// long-lived `SubscribeEvents` connection against the daemon and
-/// route each [`BroadcastMsg::Event`] into the TUI's `AppState` via
-/// `apply_event`.
-///
-/// PRD #93 round-5: the delegate / work-done variants used to ride this
-/// channel too — the daemon couldn't dispatch them locally and the TUI
-/// re-ran the role-validation guards. The daemon now owns dispatch end
-/// to end (writes the prompt directly into the target pane's PTY), so
-/// only hook events flow through here.
-///
-/// Reconnects with a small backoff on transport errors so a daemon
-/// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
-/// automatically.
-fn spawn_event_subscriber(
-    attach_path: std::path::PathBuf,
-    state: dot_agent_deck::state::SharedState,
-) {
-    use dot_agent_deck::event::BroadcastMsg;
-
-    tokio::spawn(async move {
-        // Backoff parameters tuned for "daemon briefly unavailable" rather
-        // than long outages: a fresh-daemon ready window is sub-second, so
-        // a 500ms initial delay catches most transient cases, and we cap
-        // at 5s so a stuck daemon doesn't burn CPU on reconnect attempts.
-        let mut delay = std::time::Duration::from_millis(500);
-        let max_delay = std::time::Duration::from_secs(5);
-        let client = DaemonClient::new(attach_path);
-        loop {
-            match client.subscribe_events().await {
-                Ok(mut sub) => {
-                    // Reset backoff on a successful subscribe.
-                    delay = std::time::Duration::from_millis(500);
-                    loop {
-                        match sub.next_event().await {
-                            Ok(Some(BroadcastMsg::Event(event))) => {
-                                state.write().await.apply_event(event);
-                            }
-                            // PRD #120: a daemon-spawned orchestration (issue
-                            // dispatch). Queue it for the render loop, which owns
-                            // the TabManager + pane controller and builds the
-                            // live tab. The subscriber task can't touch those.
-                            Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
-                                state.write().await.queue_orchestration_surface(surface);
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "subscribe_events: stream error, reconnecting"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "subscribe_events: subscribe failed, retrying"
-                    );
-                }
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, max_delay);
-        }
-    });
 }
 
 /// `dot-agent-deck connect [name]` — PRD #76 M2.9.
