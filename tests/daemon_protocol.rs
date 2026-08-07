@@ -9,6 +9,7 @@
 //! a UnixStream client, and verifies every message kind round-trips
 //! correctly — including concurrent attach-stream subscribers.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,14 +36,16 @@ mod test_temp;
 // `arm()`.
 #[path = "common/child_lifetime_bound.rs"]
 mod child_lifetime_bound;
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
+use dot_agent_deck::build_id::local_build_id;
+use dot_agent_deck::build_version_handshake::ensure_compatible_daemon_or_die;
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, RunningAgentsSummary, TabMembership,
-    bind_attach_listener, serve_attach_with_counter, write_resp,
+    KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, PROTOCOL_VERSION, RunningAgentsSummary,
+    TabMembership, bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, BroadcastMsg, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -936,6 +939,95 @@ async fn hello_response_carries_running_agents_and_daemon_version() {
         summary.names,
         vec![id],
         "the summary names the running agent (id fallback — no display_name set)"
+    );
+}
+
+/// Bind a minimal Unix-socket "daemon" that answers exactly one
+/// `AttachRequest::Hello` with a caller-supplied `hello_response` and then
+/// drops the connection — mirroring the real daemon's one-shot `Hello`
+/// round-trip (`build_version_handshake::probe_daemon`'s doc comment notes it
+/// always closes its end after replying). Lets a test pin a specific
+/// `server_version` on the wire without building a second binary at a
+/// different `PROTOCOL_VERSION` (fork issue #17). Every other request kind is
+/// ignored — the local-attach probe only ever sends `Hello`.
+async fn run_single_hello_server(listener: UnixListener, hello_response: AttachResponse) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let resp = hello_response.clone();
+        tokio::spawn(async move {
+            if let Some((KIND_REQ, payload)) = read_frame(&mut stream).await
+                && let Ok(AttachRequest::Hello { .. }) = serde_json::from_slice(&payload)
+            {
+                let _ = write_resp(&mut stream, &resp).await;
+            }
+        });
+    }
+}
+
+/// Scenario: Stand up a mock local daemon whose `Hello` reply carries the
+/// SAME `build_version` the test process reports for itself (so the
+/// build-id comparison the local-attach handshake performs today matches)
+/// but a `server_version` one higher than the compiled-in `PROTOCOL_VERSION`
+/// — a newer daemon, exactly the direction fork issue #17's verified
+/// reproduction used (protocol 7 daemon, protocol 6 TUI). Call the real
+/// `build_version_handshake::ensure_compatible_daemon_or_die` — the exact
+/// function `run_tui_session` calls before every local attach, over the
+/// exact wire shape `probe_daemon` speaks — against it, and assert the call
+/// refuses the attach instead of returning `Ok(HandshakeOutcome::Match)` and
+/// leaving the caller to proceed into a dashboard that will silently drop
+/// every event it can't decode.
+#[spec("lifecycle/handshake/008")]
+#[test]
+fn handshake_008_local_attach_refuses_a_protocol_version_mismatch() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build handshake runtime");
+    runtime.block_on(handshake_008_local_attach_refuses_a_protocol_version_mismatch_inner());
+}
+
+async fn handshake_008_local_attach_refuses_a_protocol_version_mismatch_inner() {
+    let local_build = local_build_id();
+    let mismatched_server_version = PROTOCOL_VERSION + 1;
+
+    let hello_response = AttachResponse {
+        ok: true,
+        build_version: Some(local_build),
+        server_version: Some(mismatched_server_version),
+        running_agents: Some(RunningAgentsSummary {
+            count: 0,
+            names: Vec::new(),
+        }),
+        ..Default::default()
+    };
+
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let server = tokio::spawn(run_single_hello_server(listener, hello_response));
+
+    let result = ensure_compatible_daemon_or_die(&path).await;
+
+    server.abort();
+    drop(dir);
+
+    assert!(
+        result.is_err(),
+        "local attach must refuse when the daemon's server_version \
+         ({mismatched_server_version}) does not match the client's compiled-in \
+         PROTOCOL_VERSION ({PROTOCOL_VERSION}); got {result:?} instead — the local-attach \
+         handshake never inspects `server_version` at all (fork issue #17), so a \
+         protocol-skewed daemon attaches successfully and the TUI then silently drops every \
+         event it cannot decode"
     );
 }
 
