@@ -42,6 +42,7 @@ use tempfile::TempDir;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
+use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
 
 mod common;
@@ -218,7 +219,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
     let work_done = cwd
         .path()
         .join(".dot-agent-deck")
-        .join("work-done-coder.md");
+        .join(work_done_file_name(WORKER_ROLE, WORKER_PANE));
     let ok = common::wait_for_path_async(&work_done, Duration::from_secs(120)).await;
     let snap = daemon
         .registry
@@ -249,7 +250,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
 /// prompt is injected into the worker's PTY; the worker must auto-submit
 /// it (no manual Enter), read its task file, list the files, and run
 /// `dot-agent-deck work-done`. Assert the daemon writes
-/// `.dot-agent-deck/work-done-coder.md`.
+/// `.dot-agent-deck/work-done-coder-<pane digest>.md`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delegate_work_done_chain_claude() {
     skip_unless!(common::check_claude_available());

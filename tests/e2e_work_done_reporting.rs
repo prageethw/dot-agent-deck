@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::daemon_protocol::TabMembership;
+use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
 
 /// The `orch-deck` fixture's non-start `cat` role — the worker whose completion
@@ -41,8 +42,16 @@ const UNSOLICITED_NEEDLE: &str = "you have no outstanding delegation to that wor
 const DAEMON_CLAUSE: &str = "dot-agent-deck daemon report, not a message from a person or an agent";
 
 /// The happy-path pointer. Its ABSENCE is the assertion: nothing was delegated,
-/// so no summary file was written, so there is nothing to point at.
-const POINTER_NEEDLE: &str = "Read .dot-agent-deck/work-done-worker.md for their full report.";
+/// so no summary file was written, so there is nothing to point at. The exact
+/// filename carries a per-pane digest (upstream #331 + fork #76) that depends on
+/// the worker pane id discovered at test time, so the needle is built in the
+/// test body via [`work_done_file_name`] rather than hardcoded here.
+fn pointer_needle(worker_pane_id: &str) -> String {
+    format!(
+        "Read .dot-agent-deck/{} for their full report.",
+        work_done_file_name(WORKER_ROLE, worker_pane_id)
+    )
+}
 
 /// Opening marker of the untrusted-report frame the inlined report sits inside.
 const REPORT_FRAME_NEEDLE: &str = "[UNTRUSTED-WORKER-REPORT:";
@@ -173,7 +182,7 @@ fn orchestrator_pty(deck: &TuiDeck, orchestrator_agent_id: &str) -> String {
     .into_owned()
 }
 
-/// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, and run the REAL `dot-agent-deck work-done` binary from the live `worker` pane without anything ever having been delegated to it — the shape of a worker a person tasked directly. The rendered orchestration surface must visibly carry the daemon's unsolicited label and the worker's own report inside its untrusted-report markers, must NOT carry the pointer to a summary file, and no `work-done-worker.md` may appear on disk.
+/// Scenario: Launch the real TUI and its lazy daemon, open the two-role `orch-deck` fixture, and run the REAL `dot-agent-deck work-done` binary from the live `worker` pane without anything ever having been delegated to it — the shape of a worker a person tasked directly. The rendered orchestration surface must visibly carry the daemon's unsolicited label and the worker's own report inside its untrusted-report markers, must NOT carry the pointer to a summary file, and no `work-done-worker-<pane digest>.md` may appear on disk.
 #[spec("orchestration/work-done/004")]
 #[test]
 fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui() {
@@ -190,9 +199,12 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
     deck.wait_for_string(WORKER_ROLE);
 
     let (worker_pane, orchestrator_agent) = orchestration_ids(&deck);
+    let summary_file_name = work_done_file_name(WORKER_ROLE, &worker_pane);
     let summary_path = deck
         .workdir()
-        .join(format!(".dot-agent-deck/work-done-{WORKER_ROLE}.md"));
+        .join(".dot-agent-deck")
+        .join(&summary_file_name);
+    let pointer_needle_text = pointer_needle(&worker_pane);
 
     // The REAL CLI, as the footer tells a worker to run it, against the deck's
     // own daemon. Nothing was delegated, so the daemon owes this pane nothing.
@@ -250,7 +262,7 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
         deck.snapshot_grid()
     );
     assert!(
-        !pane_contains(&deck, POINTER_NEEDLE),
+        !pane_contains(&deck, &pointer_needle_text),
         "the orchestrator was pointed at a summary file that was never written — the #433 \
          defect, reached through #448's path\nFinal grid:\n{}",
         deck.snapshot_grid()
