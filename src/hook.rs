@@ -781,6 +781,7 @@ mod tests {
     /// timeout.
     #[spec("error/socket/003")]
     #[test]
+    #[cfg(unix)]
     fn socket_003_unbounded_daemon_does_not_hang_forever() {
         let _guard = crate::config::STATE_DIR_ENV_LOCK
             .lock()
@@ -859,6 +860,7 @@ mod tests {
     /// and after the fix.
     #[spec("error/socket/004")]
     #[test]
+    #[cfg(unix)]
     fn socket_004_slow_but_replying_daemon_still_returns_the_reply() {
         let _guard = crate::config::STATE_DIR_ENV_LOCK
             .lock()
