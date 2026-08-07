@@ -940,6 +940,111 @@ mod tests {
         );
     }
 
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, then dribbles a single non-newline byte at a fixed interval
+    /// forever — never sending the newline `read_line` is waiting for. Fork
+    /// issue #101: the per-read idle timeout PR #99 added for
+    /// `error/socket/003` resets on every byte received, so each dribbled
+    /// byte restarts it before it can fire, and `request_from_socket` never
+    /// returns even though the peer never goes silent for as long as one
+    /// read. Run it on a worker thread and bound the wait with
+    /// `recv_timeout` at a ceiling generous enough to hold whatever
+    /// operation-level deadline the fix chooses, so a still-unbounded
+    /// `request_from_socket` fails with a clear panic instead of hanging the
+    /// CI runner.
+    #[spec("error/socket/005")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_005_slow_drip_daemon_does_not_hang_forever() {
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // 200ms is ~25x under the 5s per-read SO_RCVTIMEO PR #99 added, so
+        // every dribbled byte comfortably resets the timer well before it
+        // could fire even under CI scheduler jitter — this deterministically
+        // exercises the "resets on every read" gap rather than racing it.
+        // The daemon dribbles for DRIP_TOTAL (20s), safely longer than
+        // ASSERT_CEILING (15s) below, so the drip is still ongoing for the
+        // *entire* assertion wait — the failure can only come from the
+        // channel timing out, never from the peer going quiet on its own.
+        const DRIP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        const DRIP_TOTAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+        let _daemon_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+
+                let deadline = std::time::Instant::now() + DRIP_TOTAL;
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(DRIP_INTERVAL);
+                    // A single non-newline byte: never completes the line
+                    // `read_line` is waiting for, but is enough on its own
+                    // to reset SO_RCVTIMEO on the reader side.
+                    if std::io::Write::write_all(&mut stream, b".").is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut stream);
+                }
+                drop(stream);
+            }
+        });
+
+        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
+        // the previous value is restored below before the lock is dropped.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = request_from_socket(r#"{"type":"get-seed"}"#);
+            let _ = tx.send(result);
+        });
+
+        // Deliberately generous relative to the 5s per-read timeout (#99) so
+        // this does not pin the exact operation-level deadline the fix has
+        // not chosen yet — it only needs to hold whatever sane deadline the
+        // fix picks, while still failing well before it would hang CI's own
+        // per-test timeout.
+        const ASSERT_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
+        let outcome = rx.recv_timeout(ASSERT_CEILING);
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_socket {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+        }
+
+        match outcome {
+            // Any return within the ceiling proves the operation is bounded
+            // in total time — this test pins that property, not a specific
+            // reply shape (the peer never sends a valid reply line at all).
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "request_from_socket did not return within {ASSERT_CEILING:?} against a peer \
+                 that dribbles one non-newline byte every {DRIP_INTERVAL:?} — each byte resets \
+                 the per-read timeout added for fork issue #89 before it can fire, so \
+                 read_line() never sees a newline, EOF, or an error and blocks indefinitely \
+                 (fork issue #101)"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the worker thread running request_from_socket dropped its channel without \
+                 sending a result"
+            ),
+        }
+    }
+
     #[test]
     fn deserialize_claude_code_hook_input() {
         let json = r#"{
