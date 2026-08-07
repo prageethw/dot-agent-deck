@@ -939,7 +939,7 @@ jobs:
             --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
             --sarif --output semgrep.sarif \
             --no-error
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         if: always()
         with:
           sarif_file: semgrep.sarif
