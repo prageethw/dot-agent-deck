@@ -32,35 +32,20 @@ Prefer the reporter's configuration over a convenient stand-in. A `cat` role or 
 
 ## TDD loop
 
-Fast tier (per-task gate):
+**On this fork, every test run happens in CI — do not run tests locally** *(updated 2026-08-06; this previously kept filtered "progression" runs local, and no longer does)*. `cargo test-fast`, `cargo test-e2e`, `cargo nextest run …` and the `bacon` watch loops are **not** to be run on your machine, filtered or not. A single filtered test is not exempt: each PTY test spawns a binary, a daemon and panes, and local contention makes a passing test fail in a way that is indistinguishable from a real defect — which has already cost real triage time here. So the TDD loop is push-and-wait: commit the failing test, push, and read the RED from CI; implement, push again, and read the GREEN. Each confirmation costs a round trip (~1–2 min fast tier, ~9–12 min e2e), so batch your work to the point where one push answers several questions. Expect more commits per branch; that is fine, and squashing is not required.
+
+**Open the PR first, or the push produces nothing to read.** CI triggers on `pull_request` (opened / synchronize / reopened), on pushes to `main`, and on `workflow_dispatch` — a push to a feature branch with no PR open fires no run at all. Open the PR as a **draft** at the start of the branch so every subsequent push re-runs CI via `synchronize`; `gh workflow run ci.yml --ref <branch>` is the fallback when you truly cannot.
+
+The tier commands below are the reference for **what CI runs and how to name a filter** — Decision 17's `<sub-area>_<NNN>_<suffix>` function names make a filter unique by construction, which is what lets you say precisely which test you expect to flip and find it in a CI log without hunting:
 
 ```sh
-cargo test-fast lifecycle_001     # filter to one test
-cargo test-fast                   # run the full fast tier
+cargo test-fast lifecycle_001     # fast tier (per-task gate), filtered to one test
+cargo test-fast                   # fast tier, whole tier
+cargo test-e2e lifecycle_001      # e2e tier (pre-PR gate per Decision 8), filtered
+cargo test-e2e                    # e2e tier, whole tier
 ```
 
-E2e tier — two lanes since issue #502, split by whether a test reaches a **real agent** (CLAUDE.md rule 5 — see the fork note below for where lane 1 actually runs on this fork):
-
-| Lane | Command | Contents | Runs |
-| --- | --- | --- | --- |
-| 1 — deterministic | `cargo test-e2e` | the 47 `tests/e2e_*.rs` files that reach no real agent | in CI, on every PR (the `e2e-deterministic` job) |
-| 2 — real agent | `cargo test-e2e-live` | a **superset**: all 71 files, so lane 1 plus the 24 credentialed ones | **your machine only — never CI** |
-| 3 — local | either alias with a filter | the test you are debugging, then its module | your machine |
-
-**There is no obligation to run the full tier before opening a PR.** That mandate was removed with issue #502: CI runs lane 1 on every PR, and every dispatched agent running the whole tier concurrently was itself a source of failures (#415 measured 6-7 of 40 files failing in parallel against 40/40 at `-j 1`). What you *do* owe is **the tests covering what you changed** — any tier, credentialed included — found via [`tests/CATALOG.md`](tests/CATALOG.md), the `#[spec]` annotations, or `cargo xtask list-tests`, and named in your PR description:
-
-```sh
-cargo test-e2e lifecycle_001            # lane 1 needs no credentials
-cargo test-e2e-live claude_001          # lane 2 needs your own agent credentials
-```
-
-**No e2e test reaches a real agent in CI, and no test credential is registered on this repository.** (That is about the test tier. The Codex issue-labeler is a separately credentialed workflow that does pass a repository secret to a real agent on a runner — its own feature, its own threat model, [`docs/develop/issue-labeling.md`](docs/develop/issue-labeling.md), out of scope here.) Running a credentialed job less often does not reduce the risk that a key leaks from a public repository's CI — it reduces the number of exposures, not the vulnerability — and the line that matters is "reaches a real agent", not "reads a key", because your agent CLIs are already logged in. So lane 2 runs only where you run it, and a real-agent regression surfaces when someone runs those tests rather than on a schedule. That is a deliberate trade, and running lane 2 for the surface you touched is your half of it.
-
-For a watch loop, `bacon test-fast` (or `bacon test-e2e` / `bacon test-e2e-live`) reruns on every save; press `f` to filter to currently-failing tests, `esc` to clear. Function names follow Decision 17's `<sub-area>_<NNN>_<suffix>` pattern, so the filter is unique by construction.
-
-[`docs/develop/e2e-lanes.md`](docs/develop/e2e-lanes.md) covers the operational side: how to drive lane 2, why a green run can still mean almost nothing, and what keeps a credential out of the `.cast` recordings the demo reel publishes.
-
-**On this fork, full-tier runs belong to CI.** The filtered forms above (`cargo test-fast <one_test>`, `cargo test-e2e <one_test>`) are *progression* testing — the new or changed tests of the task in hand — and stay local and unrestricted. The bare full-tier forms (`cargo test-fast`, `cargo test-e2e`) are *regression* testing: push the branch and read the results from CI, which runs the L2 tier via the fork's informational, non-blocking `e2e:` job, rather than running them locally to check nothing broke. The two exceptions — real-agent paths CI cannot cover for lack of credentials, and local `.cast` recordings for the demo reel — require naming which one applies. `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo xtask linkage-check` stay local and are required before every commit. See `CLAUDE.md` rule 5's fork-only addendum for the full statement.
+CI runs the L2 tier via the fork's informational, non-blocking `e2e:` job. The two carve-outs from CI-only — real-agent paths CI cannot cover for lack of credentials, and local `.cast` recordings for the demo reel — are authorised by the orchestrator, never by the session that wants to run the tests. `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo xtask linkage-check` do stay local and are required before every commit; they are lint/build checks, not tests. See `CLAUDE.md` rule 5's fork-only addendum for the full statement.
 
 ## How to add a new test
 
