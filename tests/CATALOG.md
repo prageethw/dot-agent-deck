@@ -3039,6 +3039,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** active-tool restoration (`session/live/006` covers a `Working` snapshot with a tool); real LLM behavior; scheduler/dispatch spawning (`scheduler/spawn/007`).
 - **Platform coverage:** mac+linux.
 
+##### session/live/013 — Rehydration preserves the PRD #370 synthetic-`Working` provenance, so a card reconnected mid-`ShellBusy` is still reverted by the paired `ShellIdle` (fork issue #21).
+- **Layer:** L1 state/wire integration (two `AppState`s modelling daemon and TUI, joined by a real `live_snapshot()` → JSON → `seed_hydrated_session` round-trip).
+- **Agent:** synthetic Claude Code hook events plus the daemon's synthesized `ShellBusy`/`ShellIdle` shape — `session_id` resolved via `pane_hook_session_id` (the pane's current hook generation) and `agent_id: Some(..)` resolved independently from the pane's current card via `pane_session_id`, mirroring `run_shell_activity_monitor`.
+- **Asserts:** a pane promoted to `Working` by `ShellBusy` and then rehydrated from the daemon's `SessionSnapshot` returns to `Idle` when the paired `ShellIdle` arrives, instead of reading `Working` forever; and a second pane whose `Working` came from a real `ToolStart` is NOT reverted by the same `ShellIdle`. Both are checked against the daemon-side `AppState` as a control, so the test fails if the daemon's own precedence changes. The shell pane goes through a same-agent `/clear` restart first, so the synthesized events are built while its hook generation and its stable card id disagree, and the single-card assertion covers that shape too.
+- **Does not assert:** the wire-boundary scrub/clamp (`session/live/007`); rendered card output; a real socket reconnect (`session/live/006`); the pure `ShellBusy`/`ShellIdle` precedence rules in isolation (`src/state.rs`'s `shell_busy_idle_promote_and_revert_without_clobbering_real_status`); that `run_shell_activity_monitor` itself emits that shape — this test builds the event, so the production seam is pinned by `src/daemon.rs`'s `shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover`.
+- **Platform coverage:** mac+linux+windows.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
