@@ -9105,6 +9105,36 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
     path.exists()
 }
 
+/// Sync sibling of [`find_work_done_file_async`], for a `#[test]` body driving
+/// a real TUI where the worker pane's `pane_id` is assigned dynamically (so
+/// the exact digest-suffixed filename can't be computed in advance — see that
+/// function's doc comment).
+#[allow(dead_code)]
+pub fn find_work_done_file(
+    dot_agent_deck_dir: &Path,
+    role: &str,
+    timeout: Duration,
+) -> Option<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    let prefix = format!("work-done-{role}-");
+    loop {
+        if let Ok(entries) = std::fs::read_dir(dot_agent_deck_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".md") && !name.ends_with(".prev.md")
+                {
+                    return Some(entry.path());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Human description of what `path` holds *right now* — missing, unreadable,
 /// or its exact contents. Used by the content-polling waiters below so a
 /// timeout says whether the file never appeared, appeared empty, or simply
@@ -9446,6 +9476,43 @@ pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> bool {
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Find the daemon's work-done file for `role` under `dot_agent_deck_dir`
+/// (a `.dot-agent-deck` directory), polling up to `timeout`.
+///
+/// The daemon keys the filename on the reporting pane's `pane_id`
+/// (`dot_agent_deck::state::work_done_file_name`, upstream #331 + fork #76),
+/// so a caller that does not know the real worker pane's `pane_id` — a real
+/// orchestration where the daemon assigns it dynamically, rather than a
+/// synthetic test pane spawned with a literal `DOT_AGENT_DECK_PANE_ID` —
+/// cannot reconstruct the exact filename and has to glob for it instead. When
+/// the exact `pane_id` IS known, prefer computing the name directly with
+/// `dot_agent_deck::state::work_done_file_name` over this glob.
+#[allow(dead_code)]
+pub async fn find_work_done_file_async(
+    dot_agent_deck_dir: &Path,
+    role: &str,
+    timeout: Duration,
+) -> Option<PathBuf> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let prefix = format!("work-done-{role}-");
+    loop {
+        if let Ok(entries) = std::fs::read_dir(dot_agent_deck_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".md") && !name.ends_with(".prev.md")
+                {
+                    return Some(entry.path());
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
