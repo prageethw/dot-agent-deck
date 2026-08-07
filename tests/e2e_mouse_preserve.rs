@@ -7,7 +7,7 @@
 //! Unlike the per-milestone RED specs, these assert behavior that should
 //! ALREADY hold after M1–M8, so they are expected to pass (GREEN). A failure
 //! here is a regression. Spawns the real binary in a PTY and drives the mouse
-//! via `TuiDeck::click` / `scroll` / `find_in_grid` / `send_bytes` /
+//! via `TuiDeck::click` / `scroll` / `wait_for_in_grid` / `send_bytes` /
 //! `write_hook_line`. Decision 6: gated behind the `e2e` feature.
 
 mod common;
@@ -77,9 +77,7 @@ fn preserve_001_existing_pane_mouse_behavior_intact() {
     // scroll, and the detach click — buffered and processed in order. If a
     // mid-pane event had wrongly fired the New-Pane button, the picker would
     // cover the bar and the detach click would not return us to Normal.
-    let (dcol, drow) = deck
-        .find_in_grid("[Command Mode Ctrl+D]")
-        .expect("PaneInput bottom bar should render [Command Mode Ctrl+D]");
+    let (dcol, drow) = deck.wait_for_in_grid("[Command Mode Ctrl+D]");
     deck.click(60, 5); // non-button click inside the focused-pane preview
     deck.scroll(60, 5, true); // scroll inside the pane region (not Down/Up → never hits buttons)
     deck.click(dcol, drow); // detach
@@ -117,9 +115,7 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 
     // (1) Miss-falls-through: clicking the bravo card selects it (▸ marker
     // on bravo's row). The deterministic wait IS the assertion.
-    let (col, row) = deck
-        .find_in_grid("bravo")
-        .expect("bravo card should be on the dashboard");
+    let (col, row) = deck.wait_for_in_grid("bravo");
     deck.click(col, row);
     let bravo_selected = |g: &str| {
         g.lines()
@@ -129,9 +125,7 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 
     // (2) Short-circuit: clicking the [New Pane Ctrl+N] bar button fires its
     // action (picker opens) and does NOT also act on the cards underneath.
-    let (bcol, brow) = deck
-        .find_in_grid("[New Pane Ctrl+N]")
-        .expect("global button bar should render [New Pane Ctrl+N]");
+    let (bcol, brow) = deck.wait_for_in_grid("[New Pane Ctrl+N]");
     deck.click(bcol, brow);
     deck.wait_for_string("Select Directory");
 
@@ -173,9 +167,7 @@ fn preserve_modal_click_miss_is_consumed() {
 
     // Double-click a blank interior cell of the modal, offset right so it sits
     // over the pane region behind the centered popup.
-    let (qcol, qrow) = deck
-        .find_in_grid("Quit dot-agent-deck?")
-        .expect("quit-confirm modal should be open");
+    let (qcol, qrow) = deck.wait_for_in_grid("Quit dot-agent-deck?");
     let cx = qcol + 20;
     let cy = qrow + 1; // the blank line just below the title
     deck.click(cx, cy);
@@ -186,9 +178,7 @@ fn preserve_modal_click_miss_is_consumed() {
     // closes it. If the stray click had leaked/closed the modal, [Cancel]
     // would be gone and this would fail. No copy may have leaked to the pane
     // behind.
-    let (ccol, crow) = deck
-        .find_in_grid("[Cancel]")
-        .expect("quit-confirm modal should still render its [Cancel] button");
+    let (ccol, crow) = deck.wait_for_in_grid("[Cancel]");
     assert!(
         !deck.snapshot_grid().contains("Copied to clipboard"),
         "a modal-interior click must not leak into a text selection/copy behind the popup:\n{}",
@@ -217,9 +207,7 @@ fn preserve_disabled_button_is_inert() {
     deck.wait_for_string("No active sessions");
 
     // The dashboard bar renders [Generate g] dimmed (no cards → disabled).
-    let (col, row) = deck
-        .find_in_grid("Generate")
-        .expect("dashboard bar should render a (dimmed) Generate button");
+    let (col, row) = deck.wait_for_in_grid("Generate");
     deck.click(col, row);
 
     // Anchor: open the help overlay (?). It renders only from Normal mode, so
