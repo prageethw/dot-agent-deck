@@ -2126,6 +2126,13 @@ without depending on the config struct API.
 - **Does not assert:** the timeout duration itself (`error/socket/003` pins the unbounded-hang failure mode; this test never reaches the bound); daemon behavior beyond a single reply line; real daemon timing.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### error/socket/005 — `request_from_socket` has no operation-level deadline: a peer that drips a single non-newline byte every 300ms, never completing a reply line, keeps it alive indefinitely (fork issue #101).
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then drips a single non-newline byte every 300ms — well under the production 5s per-read timeout — until told to stop via a shared `AtomicBool`, never sending a newline).
+- **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at 20s (comfortably above the total-elapsed deadline a fix would plausibly use), returns before the 20s bound and the returned value is exactly `None`. A `RecvTimeoutError::Timeout` is treated as the RED failure (`GET_SEED_REQUEST_TIMEOUT` bounds each individual blocking read via `SO_RCVTIMEO`, which resets on every byte received, not the whole operation) and fails the test with an explicit panic message rather than hanging until nextest's own timeout.
+- **Does not assert:** the exact total-deadline duration chosen by the fix (only that it is comfortably under 20s); the reply-size half of fork issue #101 (an unbounded `String` growing while the peer drips) — not pinned here because doing so from outside `request_from_socket` would require a production seam it does not currently expose; `SocketReply`/`request_from_socket_with_deadline` (the `delegate` path, which shares `request_from_socket_inner` and therefore the identical exposure, but is not covered by this test); real daemon behavior; Windows named-pipe timeout semantics.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.

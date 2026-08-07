@@ -940,6 +940,107 @@ mod tests {
         );
     }
 
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, then dribbles a single non-newline byte every 300ms —
+    /// comfortably shorter than the production per-read timeout — forever,
+    /// never completing a line. Fork issue #101: `GET_SEED_REQUEST_TIMEOUT`
+    /// bounds each individual blocking read (`SO_RCVTIMEO`), which resets on
+    /// every byte received, not the whole `get-seed` operation. A peer that
+    /// keeps a byte moving just before each per-read timeout therefore keeps
+    /// `request_from_socket` alive indefinitely, which is exactly what this
+    /// test pins as the RED failure. Run on a worker thread and bounded via
+    /// `recv_timeout` well above any total deadline the fix will plausibly
+    /// use, so an unfixed `request_from_socket` fails fast with a legible
+    /// panic instead of hanging the runner.
+    #[spec("error/socket/005")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_005_slow_drip_daemon_has_no_operation_level_bound() {
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let daemon_stop = stop.clone();
+
+        // Stub daemon: read the request line, then drip a single non-newline
+        // byte every 300ms (well under the production 5s per-read timeout)
+        // until told to stop — never sending a newline, so `read_line` never
+        // completes on its own. Each byte resets `SO_RCVTIMEO`'s idle clock,
+        // which is precisely the gap fork issue #101 describes.
+        let _daemon_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                while !daemon_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::io::Write::write_all(&mut stream, b".").is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut stream);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            }
+        });
+
+        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
+        // the previous value is restored below before the lock is dropped.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SOCKET", &socket_path);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = request_from_socket(r#"{"type":"get-seed"}"#);
+            let _ = tx.send(result);
+        });
+
+        // 20s: comfortably above any total-elapsed deadline the fix will
+        // plausibly land on (the existing per-read bound is 5s, so an
+        // operation-level deadline should sit at or below that), while the
+        // 300ms drip interval is well under that same per-read timeout so it
+        // keeps resetting SO_RCVTIMEO before the fix exists.
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(20));
+
+        // Told the stub daemon to stop before doing anything that could
+        // panic below, so it stops promptly on both the success and the
+        // panic path rather than dribbling into a closed socket forever.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_socket {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+        }
+
+        match outcome {
+            Ok(value) => assert_eq!(
+                value, None,
+                "request_from_socket must fold a peer that never completes a reply line into \
+                 None (\"no seed\"), identical to a daemon that closes without replying — got \
+                 {value:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "request_from_socket outlived a peer that dripped a single non-newline byte \
+                 every 300ms and never completed a line — GET_SEED_REQUEST_TIMEOUT bounds only \
+                 each individual blocking read and resets on every byte received, so there is \
+                 no bound on the operation as a whole (fork issue #101)"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the worker thread running request_from_socket dropped its channel without \
+                 sending a result"
+            ),
+        }
+    }
+
     #[test]
     fn deserialize_claude_code_hook_input() {
         let json = r#"{
