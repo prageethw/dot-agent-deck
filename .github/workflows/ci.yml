@@ -676,6 +676,33 @@ jobs:
   # Unix-domain-socket daemon/attach/hook suites this tier depends on are
   # gated to Unix at the source level, same reasoning as `build-windows`'s
   # comment above.
+  #
+  # FORK-ONLY NOTE (fork issue #32) — where a red e2e result is actually
+  # visible, and where it is not. `continue-on-error: true` on THIS job only
+  # ever changes the WORKFLOW RUN's rolled-up `conclusion` (the field behind
+  # `gh run list/view --json conclusion`, and the run-level status GitHub
+  # computes for `needs:`/branch-protection purposes) — that is what it is
+  # documented to do, and it is by design, not a bug: there is no way to keep
+  # this job non-blocking while also making the run-level conclusion reflect
+  # its result. It does NOT touch this job's OWN check-run conclusion. Verified
+  # directly against the GitHub API on a run where e2e hard-failed (PR #72, run
+  # `31160646366`): `gh api repos/{owner}/{repo}/commits/{sha}/check-runs` and
+  # `gh run view --json jobs` both report the `e2e` check-run/job's own
+  # `conclusion` as `failure`, correctly, even though the run's `conclusion`
+  # was `success`; `gh pr checks` also prints `e2e  fail` plainly. So a red e2e
+  # run was never actually hidden from anything that reads job/check-level
+  # status — it was hidden only from whoever reads the aggregate run
+  # `conclusion` and stops there, which is what misled this orchestration
+  # twice. Read job/check level, not run level.
+  #
+  # What genuinely WAS unreadable via tooling: the curated failed/flaky table
+  # the step below builds from junit.xml only ever went to
+  # `$GITHUB_STEP_SUMMARY`, and that file's contents are not exposed through
+  # any API (`check-run.output.summary` is `null` for a step-summary write,
+  # confirmed on the same PR #72 run) — the raw `cargo nextest` log was the
+  # only machine-readable source for it. Fixed below by also writing the same
+  # table to the step's stdout (the job log), which `gh run view --job <id>
+  # --log` (or the checks API's log endpoint) can read.
   e2e:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true'
@@ -708,12 +735,19 @@ jobs:
       - run: cargo nextest run --features e2e --retries 2
       # `if: always()` because the step above exits non-zero on a real failure and
       # that is exactly when this summary is worth having. (Job-level
-      # `continue-on-error` keeps the WORKFLOW green; it does not keep later steps
-      # running.)
+      # `continue-on-error` keeps the WORKFLOW conclusion green; it does not
+      # keep later steps running, and it does not touch THIS job's own
+      # check-run conclusion — see the fork-only note above the job.)
       - name: Publish flaky and failed e2e tests to the run summary
         if: always()
         run: |
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          # `tee -a`, not `>>`: the summary file (`$GITHUB_STEP_SUMMARY`) is
+          # not retrievable through the GitHub API (fork issue #32 — a
+          # check-run's `output.summary` is `null` for a step-summary write),
+          # so mirroring the same table to stdout puts it somewhere the job
+          # log — and therefore `gh run view --job <id> --log` — can actually
+          # read.
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import os
           import xml.etree.ElementTree as ET
 
