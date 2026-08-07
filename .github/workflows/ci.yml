@@ -453,6 +453,54 @@ jobs:
         with:
           sarif_file: semgrep.sarif
 
+  # SonarQube Cloud (free plan) analysis. Complements, does not replace, Semgrep
+  # CE above -- Sonar covers bugs/maintainability/complexity with real Rust depth
+  # (85 rules), Semgrep covers security patterns. Cloud rather than Community
+  # Build: Community Build only analyzes the main branch (no PR analysis, per its
+  # own GitHub Actions guide), while Cloud Free analyzes PRs too when they target
+  # main -- every PR in this repo does. See docs/develop/sonarqube.md.
+  #
+  # Secret-gated rather than `if:`-gated at the job level: the `secrets` context
+  # is not reliably available in a job-level `if:`, so SONAR_TOKEN is surfaced as
+  # a job-level env var and the scan steps check that instead. This matters for
+  # PRs opened from forks, which never receive repo secrets, and would otherwise
+  # fail outright rather than skip.
+  #
+  # `fetch-depth: 0` (unlike every other job's checkout) because Sonar needs full
+  # git history for blame and new-code detection.
+  #
+  # The clippy run here is a separate, non-blocking report import
+  # (`sonar.rust.clippyReport.reportPaths`), not a duplicate of rule 2's gate --
+  # deliberately no `-D warnings`, since a non-zero exit here would kill the job
+  # over findings Sonar is about to read anyway.
+  sonarqube:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Skip if SONAR_TOKEN is not set
+        if: env.SONAR_TOKEN == ''
+        run: echo "SONAR_TOKEN not set - skipping SonarQube analysis"
+      - uses: dtolnay/rust-toolchain@v1
+        if: env.SONAR_TOKEN != ''
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        if: env.SONAR_TOKEN != ''
+      - name: Generate clippy report for Sonar import
+        if: env.SONAR_TOKEN != ''
+        run: cargo clippy --message-format=json > clippy-report.json
+      - uses: SonarSource/sonarqube-scan-action@v7
+        if: env.SONAR_TOKEN != ''
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
   # devbox.json / devbox.lock had NO CI coverage until this job. Every other job
   # installs its toolchain directly (dtolnay/rust-toolchain, taiki-e/install-action,
   # cargo install), so a Renovate devbox bump went green on all five checks
