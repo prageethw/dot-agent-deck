@@ -254,6 +254,51 @@ pub(crate) fn parse_ps_table(stdout: &str, session_id_of: &dyn Fn(i32) -> i32) -
     rows
 }
 
+/// Fork issue #30 — drop the `getsid` answer for every row whose identity did
+/// not survive a second `ps` sample, taken *after* the session ids were read.
+///
+/// The sample is not atomic: the process table is captured at one instant and
+/// [`parse_ps_table`]'s `getsid(2)` calls happen at a later one. A pid that
+/// exits in between can be recycled by the kernel, and then `getsid` answers
+/// about a **different process** than the row describes — which, for a
+/// descendant of an agent, can invent a "different session" and flip an idle
+/// pane to busy.
+///
+/// The invariant this restores: *a `getsid` answer is trusted only if the
+/// process table describes the same process before and after the call.*
+/// `confirm_stdout` is a second sample in the same `ps` format; a row is
+/// confirmed when its `ppid` **and** its whole command line are unchanged. An
+/// unconfirmed row keeps its `pid`/`ppid` edge — so the descendant walk still
+/// reaches anything below it — but its session id is reset to the same
+/// "could not be read" sentinel a failed `getsid` produces, which
+/// [`descendant_shell_activity`] already treats as unclassifiable rather than
+/// as evidence of a different session.
+///
+/// This narrows the window; it does not close it. Two identical observations
+/// still cannot distinguish a pid recycled into a process with the *same*
+/// parent and the *same* command line (a build loop re-spawning `cc` with
+/// identical argv is the realistic case) — and that residual is only closable
+/// with an atomic snapshot or a per-pid start-time token the POSIX surface
+/// does not offer.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn invalidate_unconfirmed_session_ids(rows: &mut [ProcessInfo], confirm_stdout: &str) {
+    let mut identity: HashMap<i32, (i32, &str)> = HashMap::new();
+    for line in confirm_stdout.lines() {
+        if let Some((pid, ppid, _tty, argv)) = split_ps_row(line) {
+            identity.insert(pid, (ppid, argv));
+        }
+    }
+    for row in rows.iter_mut() {
+        let confirmed = identity
+            .get(&row.pid)
+            .is_some_and(|(ppid, argv)| *ppid == row.ppid && row.argv == *argv);
+        if !confirmed {
+            row.session_id = -1;
+            row.session_leader = false;
+        }
+    }
+}
+
 /// Split one `ps` row into `(pid, ppid, tty, argv)`. The first three columns
 /// are whitespace-free tokens; everything after them is the command line,
 /// **kept whole** — the argv must never be tokenised.
@@ -397,6 +442,73 @@ mod tests {
 
         assert!(!rows[2].has_controlling_tty, "Linux prints ? for no ctty");
         assert!(!rows[2].session_leader, "getsid(300) == 100 != 300");
+    }
+
+    /// Fork issue #30 — the PID-reuse invariant: a `getsid` answer survives only
+    /// when the second `ps` sample still describes the same process. A row whose
+    /// `ppid` moved, whose command line changed, or that vanished entirely has
+    /// its session id reset to the unreadable sentinel, while an untouched row
+    /// keeps the session id that was read for it.
+    #[test]
+    fn an_unconfirmed_row_loses_its_session_id_but_keeps_its_edge() {
+        let mut rows = vec![
+            row(100, 1, 100, "claude --model opus"),
+            row(200, 100, 250, "recycled-into-a-different-parent"),
+            row(300, 100, 350, "argv-rewritten-under-us"),
+            row(400, 100, 450, "exited-between-the-two-samples"),
+        ];
+        let confirm = concat!(
+            "100     1 ttys014  claude --model opus\n",
+            // pid 200 reappears under a different parent — recycled.
+            "200    999 ttys014  recycled-into-a-different-parent\n",
+            // pid 300 kept its parent but is running something else entirely.
+            "300    100 ttys014  something-completely-different\n",
+            // pid 400 is simply gone.
+        );
+        invalidate_unconfirmed_session_ids(&mut rows, confirm);
+
+        assert_eq!(
+            rows[0].session_id, 100,
+            "an unchanged row must keep its sid"
+        );
+        assert!(rows[0].session_leader);
+        for unconfirmed in &rows[1..] {
+            assert_eq!(
+                unconfirmed.session_id, -1,
+                "an unconfirmed row must lose its getsid answer: {unconfirmed:?}"
+            );
+            assert!(!unconfirmed.session_leader, "{unconfirmed:?}");
+            assert_eq!(
+                unconfirmed.ppid, 100,
+                "the pid/ppid edge must survive so the descendant walk still reaches below it"
+            );
+        }
+    }
+
+    /// The consequence that matters: a descendant whose identity could not be
+    /// confirmed must not be able to invent a busy reading. Before the
+    /// confirmation pass the same table classifies the pane as busy; after it,
+    /// the pane reads idle rather than trusting a `getsid` answer that may
+    /// describe an unrelated, recycled process.
+    #[test]
+    fn an_unconfirmed_descendant_cannot_flip_a_pane_to_busy() {
+        let mut rows = vec![
+            row(100, 1, 100, "claude --model opus"),
+            row(200, 100, 250, "detached-or-recycled"),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&rows, 100, &[]),
+            Some(true),
+            "the unfiltered table reads busy — this is what the confirmation pass has to override"
+        );
+
+        let confirm = "100     1 ttys014  claude --model opus\n";
+        invalidate_unconfirmed_session_ids(&mut rows, confirm);
+        assert_eq!(
+            descendant_shell_activity(&rows, 100, &[]),
+            Some(false),
+            "a descendant the second sample could not confirm must not count as busy evidence"
+        );
     }
 
     /// A row with no command line at all must still be kept: the descendant
