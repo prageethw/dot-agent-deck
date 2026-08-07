@@ -512,12 +512,13 @@ pub fn request_from_socket(json: &str) -> Option<String> {
     }
 }
 
-/// Outcome of [`request_from_socket_inner`]/[`request_from_socket_at`] —
-/// richer than [`request_from_socket`]'s `Option<String>` because a caller
-/// that needs to tell "never even reached the daemon" apart from "reached
-/// it, but got no confirmation back" (as the not-yet-submitted `delegate`
-/// wiring will) can report each honestly instead of collapsing both to
-/// `None` the way [`request_from_socket`] does.
+/// Outcome of [`request_from_socket_inner`]/[`request_from_socket_at`]/
+/// [`request_from_socket_with_deadline`] — richer than
+/// [`request_from_socket`]'s `Option<String>` because a caller that needs to
+/// tell "never even reached the daemon" apart from "reached it, but got no
+/// confirmation back" (the `delegate` CLI, unlike `get-seed`) can report each
+/// honestly instead of collapsing both to `None` the way
+/// [`request_from_socket`] does.
 #[derive(Debug)]
 pub enum SocketReply {
     /// Connected, wrote the request, and read a reply line (possibly empty).
@@ -532,6 +533,16 @@ pub enum SocketReply {
     /// Could not connect to the daemon, or failed while writing — the
     /// request was never sent.
     Unreachable,
+}
+
+/// [`request_from_socket`] with an explicit read/write deadline and a
+/// three-way outcome, for a caller that must distinguish "never sent" from
+/// "sent but unconfirmed" — see [`SocketReply`]. Used by `delegate`, whose
+/// degrade path against an old daemon that never answers must still report
+/// the delegate as sent, matching the pre-existing fire-and-forget behaviour
+/// (upstream #309/#330; `docs/develop/versioning.md`'s rule-12 note).
+pub fn request_from_socket_with_deadline(json: &str, timeout: std::time::Duration) -> SocketReply {
+    request_from_socket_inner(json, Some(timeout))
 }
 
 fn request_from_socket_inner(json: &str, timeout: Option<std::time::Duration>) -> SocketReply {

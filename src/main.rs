@@ -29,6 +29,15 @@ use dot_agent_deck::ui::run_tui;
 /// timeout so a merely-slow daemon is not mistaken for a missing hydrator.
 const HYDRATION_GATE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Upstream #309/#330: how long `delegate` waits for the daemon's
+/// acceptance/rejection reply before degrading to the pre-existing
+/// fire-and-forget behaviour. The daemon writes this reply synchronously,
+/// before any per-target dispatch task runs (see `AppState::handle_delegate`),
+/// so a healthy daemon answers in well under a second; sized like
+/// `ui::DAEMON_REQUEST_TIMEOUT` (an answer the caller is waiting on) rather
+/// than the request's own work, since the reply does not wait on that work.
+const DELEGATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Parser)]
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
@@ -761,11 +770,57 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
-                eprintln!("Failed to send delegate signal to daemon socket.");
-                return ExitCode::FAILURE;
+            // Upstream #309/#330: await the daemon's acceptance/rejection
+            // reply instead of firing and forgetting, so a rejected
+            // delegate is visible to the caller instead of looking
+            // identical to a shipped one.
+            use dot_agent_deck::hook::SocketReply;
+            match dot_agent_deck::hook::request_from_socket_with_deadline(
+                &json,
+                DELEGATE_REPLY_TIMEOUT,
+            ) {
+                SocketReply::Unreachable => {
+                    eprintln!("Error: failed to send delegate signal to daemon socket.");
+                    ExitCode::FAILURE
+                }
+                SocketReply::Line(line) if !line.trim().is_empty() => {
+                    match serde_json::from_str::<dot_agent_deck::event::DelegateResponse>(&line) {
+                        Ok(resp) if resp.ok => {
+                            println!("Delegated to {}.", resp.roles.join(", "));
+                            ExitCode::SUCCESS
+                        }
+                        Ok(resp) => {
+                            eprintln!(
+                                "Error: delegate rejected — {}",
+                                resp.error.as_deref().unwrap_or("the daemon gave no reason")
+                            );
+                            ExitCode::FAILURE
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: delegate sent, but the daemon's reply could not be \
+                                 parsed ({e}); unable to confirm whether it was accepted."
+                            );
+                            ExitCode::SUCCESS
+                        }
+                    }
+                }
+                // No reply within the deadline (an old daemon that doesn't
+                // answer `Delegate`, or a genuinely wedged one) — degrade to
+                // the pre-existing fire-and-forget behaviour: the signal was
+                // already written to the socket above, so proceed as sent
+                // rather than hang or claim a confirmation never received.
+                SocketReply::Line(_) | SocketReply::NoReply => {
+                    eprintln!(
+                        "Warning: delegate signal sent, but the daemon did not confirm receipt \
+                         within {}s (likely an older daemon that doesn't yet acknowledge \
+                         delegate). Proceeding as sent — this cannot tell you whether it was \
+                         accepted.",
+                        DELEGATE_REPLY_TIMEOUT.as_secs()
+                    );
+                    ExitCode::SUCCESS
+                }
             }
-            ExitCode::SUCCESS
         }
         Some(Commands::Dispatch {
             name,

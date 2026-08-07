@@ -1591,11 +1591,26 @@ async fn run_hook_loop(
                                     // `SessionStart` event before writing
                                     // the prompt (event-driven readiness,
                                     // replacing the F9 250ms fixed delay).
-                                    state
+                                    //
+                                    // Upstream #309/#330: write the
+                                    // acceptance/rejection back on this same
+                                    // connection, mirroring the `GetSeed`
+                                    // arm below — an OLD daemon build simply
+                                    // doesn't reach this line, which is the
+                                    // graceful-degradation contract the
+                                    // `delegate` CLI's read deadline is
+                                    // built around.
+                                    let resp = state
                                         .read()
                                         .await
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                 }
                                 DaemonMessage::Dispatch(signal) => {
                                     info!(

@@ -8,8 +8,8 @@ use tracing::warn;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateResponse,
+    DelegateSignal, EventType, LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -3054,10 +3054,16 @@ impl AppState {
         signal: DelegateSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
-    ) {
+    ) -> DelegateResponse {
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
-            return;
+            return DelegateResponse::rejected(format!(
+                "pane {:?} is not known to this daemon (no role on record) — this usually \
+                 means DOT_AGENT_DECK_PANE_ID is wrong, or the pane has not finished \
+                 registering with its orchestration yet; retry from a managed pane once it \
+                 has started",
+                signal.pane_id
+            ));
         }
         if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
             let role = self
@@ -3066,7 +3072,12 @@ impl AppState {
                 .cloned()
                 .unwrap_or_default();
             warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
-            return;
+            return DelegateResponse::rejected(format!(
+                "pane {:?} has role {role:?}, not orchestrator — only the orchestrator pane \
+                 may call delegate; if you are a worker, report your own progress with \
+                 `work-done` instead of delegating",
+                signal.pane_id
+            ));
         }
 
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
@@ -3167,6 +3178,13 @@ impl AppState {
                 .await;
             });
         }
+
+        // Upstream #330: name what was armed so a caller polling stdout can
+        // tell a first success apart from a duplicate one instead of
+        // re-running the delegate "to check" — the fan-out above is already
+        // queued by this point, so this reply doesn't wait on any dispatch
+        // task to finish.
+        DelegateResponse::accepted(signal.to)
     }
 
     /// Handle a worker's work-done signal: write the per-role summary file
