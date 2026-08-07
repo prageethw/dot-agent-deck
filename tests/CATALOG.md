@@ -2585,6 +2585,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the wire-boundary scrub/clamp (`session/live/007`); rendered card output; a real socket reconnect (`session/live/006`); the pure `ShellBusy`/`ShellIdle` precedence rules in isolation (`src/state.rs`'s `shell_busy_idle_promote_and_revert_without_clobbering_real_status`); that `run_shell_activity_monitor` itself emits that shape — this test builds the event, so the production seam is pinned by `src/daemon.rs`'s `shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover`.
 - **Platform coverage:** mac+linux+windows.
 
+##### session/live/012 — A `ShellIdle` broadcast in the window between the `ListAgents` snapshot and the TUI's event stream coming up still reaches the rebuilt card (fork issue #36).
+- **Layer:** L1 client/wire integration — the real production reconnect bootstrap (`reconnect::run_event_subscriber` + `EmbeddedPaneController::hydrate_from_daemon` + `AppState::seed_hydrated_session`) driven against a mock daemon over a real Unix socket.
+- **Agent:** none (a mock daemon that serves one `AgentRecord` and one synthesized `ShellIdle`; no PTY, no LLM).
+- **Asserts:** with a daemon that is deliberately slow to acknowledge `SubscribeEvents` (receiver registered immediately before the OK `RESP`, exactly as `handle_subscribe_events` does) and that broadcasts the paired `ShellIdle` the instant it has served the `ListAgents` snapshot, the reconnected card seeds `Working` from the already-stale snapshot and then comes back to `Idle`. That requires BOTH halves of the fix: hydration waits for the subscription before snapshotting (or the broadcast finds no receiver and `send` drops it), and the subscriber holds events until hydration has seeded (or `apply_event` drops the edge for an unregistered pane). The delay makes the window deterministic rather than scheduler-dependent, so a revert of either half fails the test rather than flaking.
+- **Does not assert:** the provenance-marker half of the story (`session/live/011` — the marker surviving the wire); recovery of events lost during a LATER subscription outage (out of scope for #36 — the TUI does not re-hydrate on re-subscribe); rendered card output; a real daemon's timing.
+- **Platform coverage:** mac+linux.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

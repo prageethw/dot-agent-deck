@@ -41,11 +41,12 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_REQ, KIND_RESP, bind_attach_listener, read_frame,
-    serve_attach, serve_attach_with_counter, write_frame,
+    AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, bind_attach_listener,
+    read_frame, serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType, Writable};
+use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType, Writable};
+use dot_agent_deck::reconnect::{HydrationGate, run_event_subscriber};
 use dot_agent_deck::state::{
     ActiveTool, AppState, OrchestrationIdentity, SessionSnapshot, SessionState, SessionStatus,
     SharedState,
@@ -2827,4 +2828,289 @@ fn live_011_rehydration_preserves_shell_synthetic_working() {
         SessionStatus::Working,
         "rehydration must not make a real, agent-emitted Working clearable by ShellIdle"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Fork issue #36 — the snapshot/subscribe window.
+// ---------------------------------------------------------------------------
+
+/// The pane/agent/session identity the issue #36 harness below reconnects to.
+const RACE_PANE: &str = "pane-race-36";
+const RACE_AGENT: &str = "agent-race-36";
+const RACE_SESSION: &str = "sess-race-36";
+
+/// How long the mock daemon sits on the `SubscribeEvents` connection before it
+/// registers a receiver and acknowledges it. Long enough that a client which
+/// snapshots WITHOUT waiting for the acknowledgement deterministically wins the
+/// race to `ListAgents` — that is the window issue #36 is about, made
+/// reproducible instead of left to scheduler luck.
+const RACE_SUBSCRIBE_DELAY: Duration = Duration::from_millis(500);
+
+/// Mock daemon for fork issue #36: it is SLOW to service its `SubscribeEvents`
+/// connection, and it broadcasts an event the instant it has served the
+/// `ListAgents` snapshot.
+///
+/// The two behaviours together reproduce the daemon's real ordering guarantee
+/// and the client-side gap it exposes:
+///
+/// * Like the real `handle_subscribe_events`, the broadcast receiver is
+///   registered immediately BEFORE the OK `RESP` is written — so a client that
+///   has read that RESP can no longer miss anything. Unlike the real daemon it
+///   takes [`RACE_SUBSCRIBE_DELAY`] to get there, standing in for a daemon that
+///   has not yet got round to the connection.
+/// * The `ShellIdle` is broadcast right after the snapshot is serialized,
+///   modelling the shell-activity monitor firing the paired edge in exactly the
+///   window between snapshot capture and subscription.
+///
+/// A client that snapshots first therefore has no receiver registered when the
+/// event goes out, and `broadcast::Sender::send` drops it — the edge is lost
+/// with nothing to replay it. A client that waits for the subscription
+/// acknowledgement first receives it.
+async fn run_delayed_subscribe_server(
+    listener: UnixListener,
+    event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
+    record: AgentRecord,
+    idle_event: AgentEvent,
+) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let event_tx = event_tx.clone();
+        let record = record.clone();
+        let idle_event = idle_event.clone();
+        tokio::spawn(async move {
+            let req = match read_frame(&mut stream).await {
+                Ok(Some((KIND_REQ, payload))) => {
+                    match serde_json::from_slice::<AttachRequest>(&payload) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                }
+                _ => return,
+            };
+            match req {
+                AttachRequest::ListAgents => {
+                    let resp = AttachResponse {
+                        ok: true,
+                        agent_records: Some(vec![record]),
+                        ..Default::default()
+                    };
+                    let _ = write_resp(&mut stream, &resp).await;
+                    // The snapshot is now on the wire and already stale: the
+                    // foreground command has finished. `send` errs when there
+                    // are no receivers — which is precisely the lost edge.
+                    let _ = event_tx.send(BroadcastMsg::Event(idle_event));
+                }
+                AttachRequest::SubscribeEvents => {
+                    tokio::time::sleep(RACE_SUBSCRIBE_DELAY).await;
+                    let mut rx = event_tx.subscribe();
+                    let payload = serde_json::to_vec(&AttachResponse::ok())
+                        .expect("AttachResponse must serialize");
+                    if write_frame(&mut stream, KIND_RESP, &payload).await.is_err() {
+                        return;
+                    }
+                    while let Ok(msg) = rx.recv().await {
+                        let payload = serde_json::to_vec(&msg).expect("BroadcastMsg serializes");
+                        if write_frame(&mut stream, KIND_EVENT, &payload)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                AttachRequest::AttachStream { .. } => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                    loop {
+                        match read_frame(&mut stream).await {
+                            Ok(None) | Err(_) => break,
+                            Ok(Some(_)) => continue,
+                        }
+                    }
+                }
+                _ => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                }
+            }
+        });
+    }
+}
+
+/// Scenario: A daemon-side pane is `Working` only because the shell-activity
+/// monitor synthesized a `ShellBusy`, and the foreground command finishes in
+/// the window between the reconnecting TUI capturing its `ListAgents` snapshot
+/// and its event stream coming up. Drive the real reconnect bootstrap — the
+/// production event subscriber plus `hydrate_from_daemon` — against a daemon
+/// that is deliberately slow to acknowledge the subscription and broadcasts the
+/// paired `ShellIdle` the moment it has served the snapshot. The rebuilt card
+/// must end up `Idle`: the edge has to be received (subscribe before snapshot)
+/// AND held until the pane exists (buffer across hydration), or the pane reads
+/// `Working` forever with nothing left to correct it.
+#[spec("session/live/012")]
+#[test]
+fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_card() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    rt.block_on(live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_card_inner());
+}
+
+async fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_card_inner() {
+    // The snapshot the daemon serializes: `Working`, and flagged as the
+    // shell-activity monitor's SYNTHETIC promotion (fork issue #21's marker, so
+    // the paired `ShellIdle` is entitled to revert it).
+    let record = AgentRecord {
+        id: RACE_AGENT.to_string(),
+        pane_id_env: Some(RACE_PANE.to_string()),
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+        rows: 24,
+        cols: 80,
+        live: Some(SessionSnapshot {
+            status: SessionStatus::Working,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 0,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: true,
+        }),
+    };
+    // The paired `ShellIdle`, shaped the way `run_shell_activity_monitor`
+    // stamps it: neutral agent type, the owning `agent_id` (so
+    // `apply_event`'s same-pane reuse guard can remap it onto the seeded card,
+    // whose id is `pane-{pane_id}` rather than the daemon's session id).
+    let idle_event = AgentEvent {
+        session_id: RACE_SESSION.to_string(),
+        agent_type: AgentType::None,
+        event_type: EventType::ShellIdle,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(RACE_PANE.to_string()),
+        agent_id: Some(RACE_AGENT.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    // Bound to `_` so the initial Receiver drops immediately: the only
+    // receivers must be the ones the mock registers per subscribe connection,
+    // otherwise a broadcast with no subscriber would be silently kept alive by
+    // this one and the lost-edge case could not be reproduced.
+    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastMsg>(16);
+    let server = tokio::spawn(run_delayed_subscribe_server(
+        listener,
+        event_tx.clone(),
+        record,
+        idle_event,
+    ));
+
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+
+    // --- the production reconnect bootstrap, in the order `main` runs it ----
+    let gate = HydrationGate::armed();
+    let subscriber = tokio::spawn(run_event_subscriber(
+        path.clone(),
+        state.clone(),
+        gate.clone(),
+    ));
+
+    let ctrl = Arc::new(
+        EmbeddedPaneController::new(path.clone(), tokio::runtime::Handle::current())
+            .with_hydration_gate(gate.clone()),
+    );
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(hydrated.len(), 1, "the single daemon agent must hydrate");
+    assert_eq!(hydrated[0].pane_id, RACE_PANE);
+
+    // ...and the seeding `run_tui` performs for each hydrated pane, followed by
+    // the gate release that lets held events land.
+    {
+        let mut st = state.write().await;
+        for h in &hydrated {
+            st.register_pane(h.pane_id.clone());
+            st.seed_hydrated_session(
+                h.pane_id.clone(),
+                h.cwd.clone(),
+                h.agent_type.clone(),
+                Some(h.agent_id.clone()),
+                h.live.as_ref(),
+            );
+        }
+        assert_eq!(
+            st.sessions[&format!("pane-{RACE_PANE}")].status,
+            SessionStatus::Working,
+            "precondition: the card seeds Working from the (already stale) snapshot"
+        );
+    }
+    gate.mark_seeded();
+
+    // The card must come back to Idle off the buffered edge. Polled rather than
+    // asserted immediately because the subscriber applies it on its own task.
+    let cleared = {
+        let state = state.clone();
+        wait_for(Duration::from_secs(5), Duration::from_millis(25), || {
+            race_pane_is_idle(&state)
+        })
+        .await
+    };
+
+    let status = state.read().await.sessions[&format!("pane-{RACE_PANE}")]
+        .status
+        .clone();
+    assert!(
+        cleared,
+        "the ShellIdle broadcast between snapshot capture and the event stream \
+         coming up must still reach the rebuilt card — the card is stuck at \
+         {status:?} (fork issue #36)"
+    );
+    assert_eq!(
+        status,
+        SessionStatus::Idle,
+        "a card rebuilt from a snapshot that was already stale must be corrected \
+         by the edge that made it stale (fork issue #36)"
+    );
+
+    subscriber.abort();
+    server.abort();
+    drop(ctrl);
+    drop(dir);
+}
+
+/// Synchronous peek at the race pane's status for [`wait_for`]'s `FnMut() ->
+/// bool` predicate, which cannot await. `try_read` is enough: the subscriber
+/// holds the write lock only for the duration of one `apply_event`, so a
+/// contended poll simply retries on the next tick.
+fn race_pane_is_idle(state: &SharedState) -> bool {
+    match state.try_read() {
+        Ok(st) => st
+            .sessions
+            .get(&format!("pane-{RACE_PANE}"))
+            .is_some_and(|s| s.status == SessionStatus::Idle),
+        Err(_) => false,
+    }
 }

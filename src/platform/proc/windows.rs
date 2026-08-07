@@ -606,6 +606,14 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
     None
 }
 
+/// The async form the daemon's shell-activity poll calls (see the Unix backend,
+/// where it exists to keep a slow `ps` off a Tokio worker). Windows has no
+/// sample to take at all, so this is the same unconditional `None` — there is
+/// nothing to await and nothing that can block.
+pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------

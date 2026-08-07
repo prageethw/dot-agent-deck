@@ -35,6 +35,7 @@ pub mod pane;
 pub mod pane_input;
 pub mod platform;
 pub mod project_config;
+pub mod reconnect;
 pub mod remote;
 pub mod schedule_cli;
 pub mod scheduler;
