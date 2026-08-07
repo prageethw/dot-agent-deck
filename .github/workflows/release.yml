@@ -441,4 +441,3 @@ jobs:
       image_tag: v${{ needs.prepare.outputs.version }}
       chart_version: ${{ needs.prepare.outputs.version }}
       push_latest: true
-    secrets: inherit
