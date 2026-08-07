@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, broadcast};
 use tracing::warn;
 
-use crate::agent_pty::AgentPtyRegistry;
+use crate::agent_pty::{AgentPtyRegistry, AgentRecord};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
@@ -2756,6 +2756,127 @@ impl AppState {
                         .push_back(live_target_carrier_event(session, live_target));
                 }
             }
+        }
+    }
+
+    /// Fork issues #49 / #28: reconcile the cards that ALREADY exist against a
+    /// fresh `ListAgents` snapshot, after the event subscription died
+    /// mid-session and the reconnect loop re-established it.
+    ///
+    /// This is [`Self::seed_hydrated_session`]'s mid-session counterpart, and
+    /// deliberately a much narrower operation. Bootstrap hydration owns pane
+    /// *creation*: it attaches a PTY per agent and mints a card for it
+    /// (`EmbeddedPaneController::hydrate_from_daemon`). Here every pane is
+    /// already attached and already has a card — the only thing lost across the
+    /// outage is the *session state* the daemon broadcast while nobody was
+    /// listening. So this updates matched sessions **in place** and creates
+    /// nothing: a record with no matching card is skipped, not minted (a
+    /// second session on one `pane_id` is exactly the ambiguity
+    /// `build_pane_status` reports as issue #398), and a card with no matching
+    /// record is left alone (its agent's disappearance is `SessionEnd`'s
+    /// business, not the resync's).
+    ///
+    /// Applying the snapshot on top of live state is safe for the same reason
+    /// the bootstrap replay is (see [`crate::reconnect`]): the caller captures
+    /// it *after* the new subscription is confirmed, so it is strictly newer
+    /// than the stream, and every event broadcast after the capture is still
+    /// read and applied afterwards.
+    ///
+    /// Returns the number of sessions whose `status` the snapshot actually
+    /// moved — the recovered-state count issues #49/#28 are about.
+    pub fn resync_hydrated_sessions(&mut self, records: &[AgentRecord]) -> usize {
+        let mut recovered = 0;
+        for record in records {
+            let Some(snap) = record.live.as_ref() else {
+                continue;
+            };
+            let Some(session_id) = self.resync_target_session_id(record) else {
+                continue;
+            };
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                continue;
+            };
+
+            if session.status != snap.status {
+                recovered += 1;
+                tracing::debug!(
+                    session_id = %session_id,
+                    agent_id = %record.id,
+                    from = ?session.status,
+                    to = ?snap.status,
+                    "resync_hydrated_sessions: recovering a status missed during the outage"
+                );
+                session.status = snap.status.clone();
+            }
+            // The snapshot's event-derived agent_type wins when it has one, as
+            // it does in `seed_hydrated_session`; `None` there means "the agent
+            // never identified itself", which must not clobber a known type.
+            if let Some(agent_type) = snap.agent_type.clone() {
+                session.agent_type = agent_type;
+            }
+            session.active_tool = snap.active_tool.clone();
+            session.tool_count = snap.tool_count;
+            session.first_prompts = snap.first_prompts.clone();
+            session.last_user_prompt = snap.last_user_prompt.clone();
+            // Fork issue #21's provenance marker, under the same guard
+            // `seed_hydrated_session` applies: it may only qualify a `Working`.
+            session.shell_synthetic_working =
+                snap.shell_synthetic_working && session.status == SessionStatus::Working;
+            // PRD #20 blocker-4: the durable live-target lives in
+            // `recent_events`, so restamp it ONLY when it actually differs —
+            // re-pushing an identical carrier on every reconnect would evict
+            // real events out of the bounded journal.
+            if let Some(live_target) = snap.live_target
+                && session.live_target() != Some(live_target)
+            {
+                session
+                    .recent_events
+                    .push_back(live_target_carrier_event(session, live_target));
+                while session.recent_events.len() > MAX_RECENT_EVENTS {
+                    session.recent_events.pop_front();
+                }
+            }
+        }
+        recovered
+    }
+
+    /// Which existing session (if any) [`Self::resync_hydrated_sessions`]
+    /// should apply `record`'s snapshot to.
+    ///
+    /// The PRD #110 `agent_id` is the authoritative join: bootstrap stamps it
+    /// on every seeded card from `HydratedPane::agent_id`, which is the same
+    /// `AgentRecord::id` we are matching. The `pane-{pane_id_env}` fallback
+    /// covers a card that predates that stamping (or a placeholder minted
+    /// without an id), and only fires when the card claims no *other* agent —
+    /// a pane id that has since been taken over by a different agent must not
+    /// be overwritten with the old one's state.
+    ///
+    /// An ambiguous match (two cards carrying one `agent_id`, which should not
+    /// happen) resolves to `None` rather than to whichever the HashMap
+    /// happened to yield first: a nondeterministic resync target is worse than
+    /// no resync.
+    fn resync_target_session_id(&self, record: &AgentRecord) -> Option<String> {
+        let mut by_agent_id = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.agent_id.as_deref() == Some(record.id.as_str()))
+            .map(|(id, _)| id.clone());
+        if let Some(first) = by_agent_id.next() {
+            if by_agent_id.next().is_some() {
+                warn!(
+                    agent_id = %record.id,
+                    "resync_hydrated_sessions: more than one session claims this agent_id; \
+                     skipping the resync for it"
+                );
+                return None;
+            }
+            return Some(first);
+        }
+
+        let session_id = format!("pane-{}", record.pane_id_env.as_ref()?);
+        match self.sessions.get(&session_id) {
+            Some(session) if session.agent_id.is_none() => Some(session_id),
+            _ => None,
         }
     }
 
