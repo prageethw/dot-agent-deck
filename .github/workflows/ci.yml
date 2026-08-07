@@ -682,6 +682,51 @@ jobs:
           diagnostic-endpoint: ""
       - run: nix flake check -L --all-systems
 
+  # Semgrep CE (open source) static analysis. Runs alongside cargo audit above
+  # and alongside Greptile's PR review (CLAUDE.md rule 8) -- neither replaces the
+  # other. `auto` is deliberately not used: it is broad, slower, and phones home
+  # telemetry. These packs are scoped to where CE's coverage actually pays off on
+  # this repo -- the GitHub Actions workflows themselves and secrets -- since
+  # `cargo clippy -- -D warnings` (CLAUDE.md rule 2) already covers most of what
+  # CE's thin Rust ruleset would add. `p/bash` was tried and dropped: it 404s --
+  # the current Semgrep registry has no general bash/shell ruleset pack, only an
+  # unrelated `reverse-shells` pack that happens to tag `bash` as a language.
+  #
+  # `--no-error` is a deliberate first-rollout choice: this run establishes a
+  # baseline finding count. Findings still reach code scanning either way, so
+  # nothing is lost by not blocking yet. Flipping this to blocking (dropping
+  # `--no-error`) is a follow-up decision once the baseline is triaged.
+  semgrep:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          # `unsafe-usage` fires on every `unsafe {}` block. This is a systems
+          # codebase doing openpty / process control / raw fd handling, so
+          # `unsafe` is expected rather than a defect -- and the rule produced
+          # 209 of the first run's 286 findings, drowning everything else.
+          # Excluding it is a readability decision, not a claim that the
+          # `unsafe` code is audited.
+          semgrep scan \
+            --config p/rust \
+            --config p/github-actions \
+            --config p/secrets \
+            --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
+            --sarif --output semgrep.sarif \
+            --no-error
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
   # devbox.json / devbox.lock had NO CI coverage until this job. Every other job
   # installs its toolchain directly (dtolnay/rust-toolchain, taiki-e/install-action,
   # cargo install), so a Renovate devbox bump went green on all five checks
