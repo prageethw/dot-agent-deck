@@ -1554,6 +1554,41 @@ impl TuiDeck {
         }
         None
     }
+
+    /// Like [`find_in_grid`](Self::find_in_grid) but WAITS for `needle` to
+    /// appear, returning its 0-based `(col, row)` start cell or panicking with
+    /// the final grid after [`WAIT_TIMEOUT`].
+    ///
+    /// Use this — not `wait_for_string(<some other text>)` followed by a bare
+    /// `find_in_grid(needle).expect(…)` — whenever a test needs a widget's
+    /// coordinates in order to click it. The deck writes one rendered frame as
+    /// a single burst, but the reader thread feeds the vt100 parser in
+    /// `read()`-sized chunks (≤4 KiB, and as little as ~1 KiB on macOS PTYs), so
+    /// a frame taller than one chunk lands in the parser in pieces. Between two
+    /// of those pieces the grid is a legitimate but TORN view of the frame: the
+    /// rows written by the earlier chunk are already painted while the later
+    /// rows still show the previous screen. A `wait_for_string` on a proxy
+    /// string that happens to sit in an earlier chunk therefore returns while
+    /// the widget the test actually wants has not been parsed yet, and the
+    /// immediately-following `find_in_grid` legitimately misses it. Polling for
+    /// the needle itself closes that window: the wait ends only once the chunk
+    /// carrying it has been processed.
+    pub fn wait_for_in_grid(&self, needle: &str) -> (u16, u16) {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            if let Some(pos) = self.find_in_grid(needle) {
+                return pos;
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                panic!(
+                    "did not find {needle:?} in the grid within {WAIT_TIMEOUT:?}.\n\
+                     Final grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for TuiDeck {
@@ -3642,6 +3677,228 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
         }
     }
     Err(last_err.unwrap_or_else(|| std::io::Error::other("timed out waiting for hook socket")))
+}
+
+// ---------------------------------------------------------------------------
+// Generated-shell-script safety (issue #57)
+// ---------------------------------------------------------------------------
+//
+// Several fixtures build tiny `/bin/sh` programs by string interpolation, and
+// the values they interpolate derive from DEVELOPER-controlled roots:
+// `tempfile::tempdir()` follows `TMPDIR`, and `env!("CARGO_BIN_EXE_…")` follows
+// the cargo target dir. A `"`, `$`, backtick, `\` or newline anywhere in such a
+// path terminates or expands inside a double-quoted `"{path}"`.
+//
+// PR #54 MEASURED that this does not fail loudly. With a shim dir named
+// ``shim "$(touch pwned)" `touch pwned` \x`` the broken quotes rebalanced into
+// syntactically valid shell, the `$(…)` executed, and the fixture whose whole
+// job was keeping a real `claude` off `PATH` handed the spawn a real `claude` —
+// while still reporting success. Assume nothing here fails safely.
+//
+// Two mechanisms defuse it, in order of preference:
+//   1. pass the value through the ENVIRONMENT, so the generated script contains
+//      no interpolation at all and the value travels as `execve` data that is
+//      never parsed as shell syntax — see [`write_login_shell_pinning_dir`];
+//   2. where the value is genuinely part of the script's text, route it through
+//      [`sh_quote`].
+
+/// POSIX single-quote `value` so it survives verbatim as ONE literal word
+/// inside generated `/bin/sh` source.
+///
+/// Inside `'…'` the shell performs no expansion whatsoever, so the only
+/// character needing care is `'` itself: close the quote, emit an escaped
+/// `\'`, and reopen (`'\''`). The result is always fully quoted, which also
+/// makes it safe to place adjacent to other quoted runs
+/// (`export PATH='/a b'":$PATH"`).
+///
+/// What this deliberately does NOT do: quoting governs how the SHELL splits a
+/// line into words, not how the command receiving that word interprets it. A
+/// value beginning with `-` still arrives in the consumer's argv as `-rf` and
+/// is still parsed as an option — `rm '-rf' dir` recurses. Every call site here
+/// is a command name or a redirection target, where that cannot bite; a future
+/// fixture that passes an untrusted value as an OPERAND needs `--` before it at
+/// the call site, which is a different mechanism from quoting.
+///
+/// Prefer the environment route (mechanism 1 above) when the fixture allows it;
+/// reach for this when the value must appear in the script's text. For a
+/// `Path`, use [`sh_quote_path`] so a non-UTF-8 pathname fails loudly instead of
+/// being rewritten.
+pub fn sh_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            // Close, emit a backslash-escaped quote outside any quoting, reopen.
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Render `path` as a `&str`, PANICKING if it is not valid UTF-8.
+///
+/// Every fixture path here descends from a DEVELOPER-controlled root (`TMPDIR`
+/// via `tempfile::tempdir()`, the cargo target dir), and on Unix a pathname is
+/// a byte string that need not be valid UTF-8. The obvious `to_string_lossy()`
+/// replaces each invalid byte with U+FFFD, which yields a DIFFERENT, normally
+/// non-existent pathname — so a generated shim, a `PATH` entry or a recorder
+/// target silently points somewhere else.
+///
+/// That is the same class of silent degradation as issue #57 itself, and it is
+/// equally self-concealing: a fixture that compares the PATH it captured against
+/// the same lossy string it supplied passes while pinning a directory that does
+/// not exist, so `manager_010`'s `claude` neutralizer becomes unreachable while
+/// the inherited PATH still holds a real Homebrew `claude` — the test launches
+/// the REAL agent and the (also lossy) recorder path hides it.
+///
+/// No fixture here needs to *support* non-UTF-8 paths; they need to not lie
+/// about them. So this fails closed: a loud panic naming the offending path,
+/// raised at fixture-construction time before anything is spawned. (Preserving
+/// bytes end to end — `OsStr`/`OsString` through the harness env surface plus a
+/// byte-oriented POSIX quoter — is strictly better and a much larger change to
+/// the harness API; it is not needed to make these fixtures honest.)
+pub fn require_utf8_path(path: &Path) -> &str {
+    path.to_str().unwrap_or_else(|| {
+        panic!(
+            "fixture path is not valid UTF-8, and must not be silently rewritten: \
+             {path:?}\nThis path is about to become generated shell source, a \
+             `PATH` entry or an env value. `to_string_lossy()` would replace the \
+             invalid bytes with U+FFFD and target a DIFFERENT pathname, so the \
+             fixture would keep passing while pinning (or writing to) the wrong \
+             place. Point `TMPDIR` and the cargo target dir at valid-UTF-8 \
+             locations."
+        )
+    })
+}
+
+/// [`sh_quote`] a `Path`, failing closed on non-UTF-8 via [`require_utf8_path`].
+///
+/// Prefer this to `sh_quote(&path.to_string_lossy())` at every call site that
+/// splices a path into generated shell source: the lossy form quotes a pathname
+/// the script will never find, which is a silent wrong-target rather than a
+/// failure.
+pub fn sh_quote_path(path: &Path) -> String {
+    sh_quote(require_utf8_path(path))
+}
+
+/// Env var through which [`write_login_shell_pinning_dir`]'s generated login
+/// shell learns which directory to keep first on `PATH`.
+///
+/// The path travels as DATA (an `execve` environment entry the script reads
+/// with `"$…"`), never as generated shell SOURCE. Interpolating it into the
+/// script body instead would make a `"`, `$`, backtick, `\` or newline anywhere
+/// in the path terminate or expand inside the assignment. The worse half of
+/// that is not the command execution but the SILENT degradation: a malformed
+/// script fails, the daemon keeps its inherited PATH, and the fixture quietly
+/// stops pinning the shim — the exact failure it exists to prevent.
+pub const LOGIN_SHELL_KEEP_DIR_ENV: &str = "DOT_AGENT_DECK_TEST_SHIM_DIR";
+
+/// Write a fake login shell (`<dir>/login-shell.sh`) that keeps `keep_dir`
+/// first on `PATH` and then runs whatever command it was asked to run, and
+/// return the env pairs that arm it — `SHELL` pointing at the script plus
+/// [`LOGIN_SHELL_KEEP_DIR_ENV`] carrying `keep_dir`.
+///
+/// Both pairs are returned together as a CONVENTION, not as a guarantee the
+/// type system enforces — the array can be destructured, so nothing stops a
+/// caller applying only `SHELL`. Apply both. Half-arming it is not harmless:
+/// the script is inert without the keep-dir variable (it exits non-zero rather
+/// than silently prepending an empty component), so the daemon's capture fails
+/// and it falls back to its inherited PATH — precisely the lost pin this fixture
+/// exists to prevent.
+///
+/// Panics if `dir` or `keep_dir` is not valid UTF-8, before anything is written
+/// or spawned — see [`require_utf8_path`] for why lossy conversion here is a
+/// silent wrong-directory pin rather than a cosmetic issue.
+///
+/// Needed by any test that puts a command SHIM on `PATH` and then lets the
+/// daemon start. PRD #170's `apply_login_shell_path` runs
+/// `$SHELL -ilc 'printf %s "$PATH"'` at daemon startup and REPLACES the
+/// inherited PATH with whatever the login shell prints. The harness pins
+/// `SHELL=/bin/sh`, so on a host whose login profile rewrites `PATH` the shim
+/// dir the test prepended is reordered or dropped and the daemon resolves the
+/// REAL binary instead — on macOS `/etc/profile`'s `path_helper` moves
+/// `/opt/homebrew/bin` ahead of it, so a `claude` shim silently loses to a real
+/// Homebrew `claude`. Pointing `$SHELL` at this script makes the captured PATH
+/// deterministic (shim first) on every host. The daemon inherits the deck's env
+/// and `Command::new(shell)` inherits the daemon's, so
+/// [`LOGIN_SHELL_KEEP_DIR_ENV`] reaches the script unmodified.
+///
+/// Panics if the generated shell does not actually put `keep_dir` first when
+/// probed exactly the way the daemon probes it — turning any future regression
+/// here into a loud failure instead of a test that passes while asserting
+/// nothing.
+#[cfg(unix)]
+pub fn write_login_shell_pinning_dir(dir: &Path, keep_dir: &Path) -> [(&'static str, String); 2] {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Fail closed BEFORE writing or spawning anything: a lossy conversion here
+    // would arm the fixture with a U+FFFD directory that does not exist, and
+    // `assert_login_shell_keeps_dir_first` would then compare the captured PATH
+    // against that same lossy string and pass while pinning nothing real.
+    let shell = dir.join("login-shell.sh");
+    let shell_path = require_utf8_path(&shell).to_owned();
+    let keep = require_utf8_path(keep_dir).to_owned();
+
+    // No path interpolation: the keep dir arrives in the environment, so
+    // nothing in this program is derived from a path the test does not control.
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\n\
+             if [ -z \"${LOGIN_SHELL_KEEP_DIR_ENV}\" ]; then\n\
+             echo \"fake login shell: {LOGIN_SHELL_KEEP_DIR_ENV} is unset\" >&2\n\
+             exit 1\n\
+             fi\n\
+             export PATH=\"${LOGIN_SHELL_KEEP_DIR_ENV}:$PATH\"\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             -*) shift ;;\n\
+             *) break ;;\n\
+             esac\n\
+             done\n\
+             if [ \"$#\" -gt 0 ]; then\n\
+             exec /bin/sh -c \"$1\"\n\
+             fi\n\
+             exec /bin/sh\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("write fake login shell: {e}"));
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod fake login shell: {e}"));
+
+    assert_login_shell_keeps_dir_first(&shell, &keep);
+    [("SHELL", shell_path), (LOGIN_SHELL_KEEP_DIR_ENV, keep)]
+}
+
+/// Probe `shell` the way PRD #170's `apply_login_shell_path` does — `-ilc` with
+/// the marker-free form of its `printf` probe — and assert the first `PATH`
+/// entry is exactly `keep`.
+///
+/// This is the fixture's self-check. Without it, a login shell that fails to
+/// parse (or forgets the keep dir) degrades silently: the daemon keeps its
+/// inherited PATH, which on most hosts still starts with the shim dir, so the
+/// test passes while no longer pinning anything.
+#[cfg(unix)]
+pub fn assert_login_shell_keeps_dir_first(shell: &Path, keep: &str) {
+    let out = std::process::Command::new(shell)
+        .arg("-ilc")
+        .arg(r#"printf '%s' "$PATH""#)
+        .env(LOGIN_SHELL_KEEP_DIR_ENV, keep)
+        .output()
+        .unwrap_or_else(|e| panic!("probe fake login shell: {e}"));
+    let path = String::from_utf8_lossy(&out.stdout).into_owned();
+    let first = path.split(':').next().unwrap_or_default();
+    assert!(
+        out.status.success() && first == keep,
+        "the fake login shell must print a PATH whose FIRST entry is the shim \
+         dir `{keep}` — it is what pins the shim ahead of any real binary. Got \
+         status {status}, PATH `{path}`, stderr `{stderr}`.",
+        status = out.status,
+        stderr = String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
