@@ -4302,7 +4302,13 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 /// because the active orchestration tab's command-entry lock is engaged.
 /// Follows this codebase's existing no-op-with-feedback convention (e.g.
 /// `RequestConfigGen`'s "No active agent session to send prompt to.").
-const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+e to unlock";
+///
+/// PRD #393 M6: the wording now names `Ctrl+d` first. This message is only
+/// ever shown from `UiMode::PaneInput` — which, after M1 scoped
+/// `ToggleOrchestrationLock` to `UiMode::Normal`, is precisely the mode where
+/// `Ctrl+e` alone does nothing. Naming only the unlock chord instructed the
+/// user to press a chord that provably cannot work from where they stand.
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
 
 /// PRD #374 (#361 Item 3): gate the PTY-forward fallback [`handle_pane_input_key`]
 /// produces against the command-entry lock. When the active tab is

@@ -91,6 +91,7 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 | `Left` / `Right` (or `h` / `l`) | Cycle to previous / next tab |
 | `1`–`9` | Jump to role card N and focus its pane |
 | `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
+| `Ctrl+e` | Toggle the [command-entry lock](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane) — one value shared by every orchestration tab |
 
 These work from anywhere, including while typing in a role pane:
 
@@ -104,11 +105,13 @@ The tab bar carries the same signal one level up: an orchestration tab's label i
 
 In the default `Stacked` pane layout, only the focused role's pane is drawn — switching roles swaps which pane is visible, but every other role's agent keeps running underneath, and the sidebar is what tells you it's still busy or idle. Toggle to `Tiled` (`Ctrl+t`) to see every role's pane at once.
 
-#### Focus returns to the orchestrator on its own
+#### Focus follows the lock
 
-The orchestrator pane is where you type, so an orchestration tab brings focus back to it in two situations, without you having to walk focus back yourself. First, whenever a role pane starts waiting for input, focus is steered to it so you can answer — and the moment the last one is resolved, so nothing on the tab still needs you, focus moves back to the orchestrator once. Second, while the tab is command-entry locked (the default — see [command-entry lock](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane)), if you move focus to another role pane yourself and then leave it untouched for 30 seconds, focus snaps back to the orchestrator.
+Focus moves on its own only while the deck is command-entry locked — the default, see [command-entry lock](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane). While locked, the orchestrator pane is where you type, so the tab keeps focus there for you: whenever a role pane starts waiting for input, focus is steered to it so you can answer — visiting them in sidebar order when several are waiting at once, and advancing as each is resolved — and the moment the last one is resolved, so nothing on the tab still needs you, focus moves back to the orchestrator once.
 
-Anything you do in that pane restarts the 30 seconds — including a keystroke the lock drops rather than forwards, since typing at a locked pane still means you are engaged with it. The snap-back also holds off entirely while any role on the tab is waiting for input: you are never pulled away from a pane that is asking you a question. If you unlock command entry (`Ctrl+e`) to type directly into a role pane, the 30-second timer stops applying altogether for as long as the tab stays unlocked — re-locking (or leaving the tab) resumes normal tracking. Both behaviors are limited to orchestration tabs — the Dashboard and workspace-mode tabs never move focus on their own.
+While **unlocked**, nothing moves focus at all. It stays exactly where you put it, across a role pane starting to wait and across the all-clear alike, until you lock the deck again — at which point the steering above resumes from whatever is waiting then. There is no inactivity timer in either state: earlier versions snapped focus back to the orchestrator after 30 seconds on a role pane, and that behavior is gone. Focus now only ever moves on a status change you can see coming.
+
+The lock is what decides whether a keystroke reaches a role pane, but a pane that is waiting for input is exempt from it — so when focus is steered to a role that is asking you a question, you can answer it there without unlocking first. All of this is limited to orchestration tabs; the Dashboard and workspace-mode tabs never move focus on their own.
 
 ## How delegation works
 
