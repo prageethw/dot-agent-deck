@@ -124,6 +124,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `8641f52` | `docs(develop): record the "red for one reason" TDD lesson (fork #98)` | **PERMANENT** fork-only (doc) — maintainer-facing process documentation about this fork's own CI-driven TDD loop (CLAUDE.md rule 5), no upstream analogue |
 | `9ed01ae` | `fix(hook): bound get-seed's socket read/write at 5s (fork #99, #89)` | **UPSTREAM-WORTHY** — `request_from_socket` is upstream's own hook-socket plumbing; an unbounded blocking read/write against a silent daemon is a defect there too, not a fork customisation |
 | `5b213f2` | `ci: SHA-pin GitHub Actions references (fork #87, #103)` | **PERMANENT** fork-only (CI) — the workflow files it touches are already fork-only-customised (release CI, docs-publish skip, the fork's own `e2e:` job), so the pinned tree only exists in this shape on the fork |
+| `88cb1aa` | `fix/test(daemon): work-done output-path collisions & cwd-dependent --task-file refusal (fork #76, upstream #331) (#90)` | **UPSTREAM-WORTHY** — `work_done_file_name`/`archive_existing_report`/the `--task-file` cwd-drift refusal are upstream's own daemon plumbing (`src/main.rs`, `src/state.rs`); a work-done output path colliding between concurrent panes, and a refusal check that depends on the daemon's own cwd, are defects there too — no fork-only symbols touched |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
@@ -149,6 +150,7 @@ The rows above marked **UPSTREAM-WORTHY** or **MIXED** are on `fork-only` becaus
 - `7fb79f6` — `docs-publish.yml` splices `${{ … }}` into `run:` blocks; `release.yml`'s `docs:` job passes `secrets: inherit` unnecessarily (fork #87) — now open upstream as PR #410 (https://github.com/vfarcic/dot-agent-deck/pull/410, opened 2026-08-07).
 - `d4d0fe4` — `manager_016` samples the side pane before an 8-notch scroll has drained (fork #81).
 - `9ed01ae` — `request_from_socket` has no read/write bound of its own and hangs forever against a daemon that accepts the connection and then goes silent (fork #99, #89).
+- `88cb1aa` — work-done output paths collide between concurrent panes, and the `--task-file` cwd-drift refusal depends on the daemon's own working directory instead of being cwd-independent (fork #76, upstream #331).
 
 **Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
