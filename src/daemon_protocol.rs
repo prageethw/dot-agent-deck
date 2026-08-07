@@ -1328,33 +1328,31 @@ async fn handle_connection(
             };
             match registry.spawn_agent(opts) {
                 Ok(id) => {
-                    // PRD #201 native prompt delivery: if the spawn carried a
-                    // seed (a Pi start-role orchestrator pane), stash it for the
-                    // pane's extension to pull natively via `get-seed`, and arm
-                    // the PTY-injection safety net in case the pull never comes.
-                    // Do this right after spawn so the seed is available before
-                    // pi boots + fires `session_start`. Non-seed spawns (every
-                    // other pane) skip this entirely and keep the legacy path.
-                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
-                        && !seed.trim().is_empty()
-                    {
-                        registry.set_pending_seed(pane_id, seed);
-                        crate::agent_pty::arm_seed_fallback(
-                            registry.clone(),
-                            pane_id.to_string(),
-                            crate::agent_pty::seed_fallback_grace(),
-                        );
-                    }
                     // Fork issue #92 test seam: give a test the chance to hold
-                    // THIS pane's registration open, right after spawn (and
-                    // the seed stash above) but before the role/orchestrator
-                    // maps below are published. Production's
+                    // THIS pane's registration open, right after spawn but
+                    // before the role/orchestrator maps below are published
+                    // AND before the native seed becomes pullable. Production's
                     // `start_agent_registration_hook` is the no-op default —
                     // this `await` resolves immediately and is not observable.
                     // See `StartAgentRegistrationHook`'s doc comment.
                     if let Some(meta) = orchestration_meta.as_ref() {
                         (start_agent_registration_hook)(&meta.role_name).await;
                     }
+                    // Fork #92 P1: populate daemon-side role maps BEFORE the
+                    // native-seed stash below, not after. A Pi start-role
+                    // pane's seed becomes pullable (and thus actionable via
+                    // `delegate --to <role>`) the moment it's stashed; if that
+                    // happened before every role's registration was
+                    // installed, a Pi start role spawned ahead of a worker
+                    // could delegate to a worker pane that does not exist in
+                    // `AppState` yet, and `delegate_targets` would resolve
+                    // nothing. `TabManager::open_orchestration_tab`
+                    // (`src/tab.rs`) now spawns the Pi start role LAST for
+                    // the same reason, so by the time this handler runs for
+                    // the Pi pane every other role's registration is already
+                    // installed — this ordering is what makes that
+                    // sufficient rather than merely likely.
+                    //
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -1422,6 +1420,26 @@ async fn handle_connection(
                         if is_start_role {
                             st.orchestrator_pane_ids.insert(pane_id.to_string());
                         }
+                    }
+                    // PRD #201 native prompt delivery: if the spawn carried a
+                    // seed (a Pi start-role orchestrator pane), stash it for the
+                    // pane's extension to pull natively via `get-seed`, and arm
+                    // the PTY-injection safety net in case the pull never comes.
+                    // This now runs AFTER the AppState registration above (fork
+                    // #92 P1) so the seed cannot become pullable — and therefore
+                    // actionable via a native `delegate --to <role>` — before
+                    // every role's registration is installed. Non-seed spawns
+                    // (every other pane) skip this entirely and keep the legacy
+                    // path.
+                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
+                        && !seed.trim().is_empty()
+                    {
+                        registry.set_pending_seed(pane_id, seed);
+                        crate::agent_pty::arm_seed_fallback(
+                            registry.clone(),
+                            pane_id.to_string(),
+                            crate::agent_pty::seed_fallback_grace(),
+                        );
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }

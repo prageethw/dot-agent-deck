@@ -772,7 +772,6 @@ impl TabManager {
         // active tab's focus state) on the first frame.
         spawn_dims: (u16, u16),
     ) -> Result<(usize, Vec<String>), TabError> {
-        let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
         let (spawn_rows, spawn_cols) = spawn_dims;
 
         // PRD #201 native prompt delivery: when the START (orchestrator) role is
@@ -836,7 +835,35 @@ impl TabManager {
         // membership so the daemon-side registry can echo it back via
         // `list_agents` and the TUI rebuilds the orchestration tab on
         // reconnect instead of stranding all role panes on the dashboard.
-        for (role_index, role) in config.roles.iter().enumerate() {
+        //
+        // Fork #92 P1 fix: spawn non-start roles first and the Pi start
+        // role LAST, so every other role's daemon-side registration is
+        // installed (`src/daemon_protocol.rs`) before the Pi pane's native
+        // seed can be pulled and acted on with `delegate --to <role>`.
+        // Spawn order changes; declaration order does not — pane ids are
+        // stored by ORIGINAL role index so tab layout, focus, statuses,
+        // persistence and `TabMembership.role_index` stay config-ordered
+        // (`orchestration/delegate/030` guards this).
+        let spawn_order: Vec<usize> = config
+            .roles
+            .iter()
+            .enumerate()
+            .filter(|(_, role)| !role.start)
+            .map(|(role_index, _)| role_index)
+            .chain(
+                config
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, role)| role.start)
+                    .map(|(role_index, _)| role_index),
+            )
+            .collect();
+
+        let mut role_pane_ids_by_index: Vec<Option<String>> = vec![None; config.roles.len()];
+
+        for role_index in spawn_order {
+            let role = &config.roles[role_index];
             let opts = AgentSpawnOptions {
                 display_name: Some(role.name.as_str()),
                 tab_membership: Some(TabMembership::Orchestration {
@@ -879,15 +906,27 @@ impl TabManager {
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    // Clean up any panes already created.
-                    for id in &role_pane_ids {
+                    // Clean up any panes already created, regardless of
+                    // spawn order — never leave a partially-spawned
+                    // orchestration where a role may still (per the fix
+                    // above) be waiting on a registration that will now
+                    // never come.
+                    for id in role_pane_ids_by_index.iter().flatten() {
                         let _ = self.pane_controller.close_pane(id);
                     }
                     return Err(ModeManagerError::Pane(e).into());
                 }
             };
-            role_pane_ids.push(pane_id);
+            role_pane_ids_by_index[role_index] = Some(pane_id);
         }
+
+        // Every role above either populated its slot or the function
+        // already returned on the first spawn failure, so every slot is
+        // `Some` here.
+        let role_pane_ids: Vec<String> = role_pane_ids_by_index
+            .into_iter()
+            .map(|id| id.expect("every configured role was spawned successfully"))
+            .collect();
 
         let id = self.next_id;
         self.next_id += 1;
