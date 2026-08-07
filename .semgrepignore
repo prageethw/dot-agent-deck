@@ -1,0 +1,16 @@
+# Build output -- not source, nothing to scan.
+target/
+
+# Generated test fixtures -- terminal-capture snapshots, not hand-written code.
+tests/snapshots/
+
+# Per-clone dev state -- orchestrator IPC, regenerated recordings/docs, never committed.
+.dot-agent-deck/
+
+# Docusaurus build output and its node_modules.
+site/build/
+site/node_modules/
+
+# Go-templated YAML, not valid standalone YAML -- the YAML parser emits
+# non-fatal parse errors on these (log noise, not scan findings).
+site/helm/templates/
