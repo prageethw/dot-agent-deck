@@ -38,9 +38,7 @@ fn buttonbar_003_click_new_pane_opens_picker() {
     deck.wait_for_string("No active sessions");
 
     // Find the New Pane button by its on-screen label and click inside it.
-    let (col, row) = deck
-        .find_in_grid("[New Pane")
-        .expect("button bar should render a New Pane button");
+    let (col, row) = deck.wait_for_in_grid("[New Pane");
     deck.click(col + 1, row);
 
     // Ctrl+N's outcome: the directory picker opens. Same action, via click.
@@ -86,9 +84,7 @@ fn buttonbar_004_click_scheduled_tasks_opens_manager() {
     deck.wait_for_string("No active sessions");
 
     // Find the Scheduled Tasks button by its on-screen label and click inside it.
-    let (col, row) = deck
-        .find_in_grid("[Scheduled")
-        .expect("button bar should render a Scheduled Tasks button");
+    let (col, row) = deck.wait_for_in_grid("[Scheduled");
     deck.click(col + 1, row);
 
     // Same outcome as the keyboard open-shortcut: the manager dialog opens,
@@ -111,18 +107,14 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
     deck.send_bytes(b"?");
     deck.wait_for_string("Create new pane");
 
-    let (close_col, close_row) = deck
-        .find_in_grid("[Close Ctrl+W]")
-        .expect("Help mode must still render the dimmed Close button");
+    let (close_col, close_row) = deck.wait_for_in_grid("[Close Ctrl+W]");
     deck.click(close_col + 1, close_row);
 
     // The help overlay's exact `[Close]` label is distinct from the bar's
     // `[Close Ctrl+W]`. If the dimmed click wrongly armed close confirmation,
     // this second real click either hits that modal or leaves it visible; both
     // outcomes fail the assertions below.
-    let (help_close_col, help_close_row) = deck
-        .find_in_grid("[Close]")
-        .expect("the Help overlay must render its own Close button");
+    let (help_close_col, help_close_row) = deck.wait_for_in_grid("[Close]");
     deck.click(help_close_col + 1, help_close_row);
     deck.wait_for_absence("Create new pane");
     deck.wait_for_string("[Back to Pane Ctrl+D]");
