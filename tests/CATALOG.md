@@ -831,6 +831,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the marker file's *content* or format (the ownership gate is an existence check by design; the unit tests in `src/issue_dispatch_run.rs` cover the write's placement, tree-cleanliness and idempotency); the `reclaim` removal path for this fixture (`002`); retro-marking of pre-existing worktrees, which is deliberately not done at all.
 - **Platform coverage:** mac+linux.
 
+#### daemon/protocol
+
+##### daemon/protocol/001 — A `SubscribeEvents` receiver that falls behind the broadcast capacity is torn down with `KIND_STREAM_END` carrying exactly the documented `"lagged"` reason (`handle_subscribe_events`'s doc comment, src/daemon_protocol.rs).
+- **Layer:** L1 client/wire integration (real `serve_attach_with_counter`/`handle_subscribe_events` over a real Unix socket; a raw client reads frames directly rather than through `DaemonClient`, since `EventSubscription::next_event` collapses every `KIND_STREAM_END` reason to `Ok(None)`).
+- **Agent:** none (a flood of inert filler `AgentEvent`s; no PTY, no LLM).
+- **Asserts:** a client that subscribes and never drains, once the daemon-wide broadcast is flooded well past its capacity in a tight loop with no `.await` between sends (deterministic by construction — the connection task cannot poll `rx.recv()` even once until every send has landed, so its first poll is guaranteed to observe `RecvError::Lagged`, not a race against the flood), receives `KIND_STREAM_END` with payload exactly `b"lagged"` — not a timeout reason, not more `KIND_EVENT` frames. Added because no test in the suite exercised this path before: part of why issues #49/#28 could drift the TUI's reconnect behavior away from what this handler already documents.
+- **Does not assert:** anything about the TUI's reconnect/re-hydration response to this tear-down (`session/live/017`, which pins that separately and does not depend on this daemon-side reason string being exactly right); the `timeout`/`Closed` tear-down reasons on the same handler; wire-format serde round-trips (`protocol/live-target`, `protocol/send-result`).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
@@ -3382,7 +3391,21 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Layer:** L1 client/wire integration — the real production reconnect bootstrap (`reconnect::run_event_subscriber` + `EmbeddedPaneController::hydrate_from_daemon` + `AppState::seed_hydrated_session`) driven against a mock daemon over a real Unix socket.
 - **Agent:** none (a mock daemon that serves one `AgentRecord` and one synthesized `ShellIdle`; no PTY, no LLM).
 - **Asserts:** with a daemon that is deliberately slow to acknowledge `SubscribeEvents` (receiver registered immediately before the OK `RESP`, exactly as `handle_subscribe_events` does) and that broadcasts the paired `ShellIdle` the instant it has served the `ListAgents` snapshot, the reconnected card seeds `Working` from the already-stale snapshot and then comes back to `Idle`. That requires BOTH halves of the fix: hydration waits for the subscription before snapshotting (or the broadcast finds no receiver and `send` drops it), and the subscriber holds events until hydration has seeded (or `apply_event` drops the edge for an unregistered pane). The delay makes the window deterministic rather than scheduler-dependent, so a revert of either half fails the test rather than flaking.
-- **Does not assert:** the provenance-marker half of the story (`session/live/015` — the marker surviving the wire); recovery of events lost during a LATER subscription outage (out of scope for #36 — the TUI does not re-hydrate on re-subscribe); rendered card output; a real daemon's timing.
+- **Does not assert:** the provenance-marker half of the story (`session/live/015` — the marker surviving the wire); recovery of events lost during a LATER subscription outage (`session/live/017`, `session/live/018` — issues #49/#28); rendered card output; a real daemon's timing.
+- **Platform coverage:** mac+linux.
+
+##### session/live/017 — A `SubscribeEvents` connection that dies mid-session with the daemon's documented `KIND_STREAM_END "lagged"` tear-down is recovered by the reconnect loop draining a fresh `list_agents` snapshot, not left stuck on the pre-outage status (issues #49/#28).
+- **Layer:** L1 client/wire integration — the real production reconnect bootstrap (`reconnect::run_event_subscriber` + `EmbeddedPaneController::hydrate_from_daemon` + `AppState::seed_hydrated_session`) driven against a mock daemon over a real Unix socket.
+- **Agent:** none (a mock daemon serving one `AgentRecord` whose live status the test mutates mid-test; no PTY, no LLM).
+- **Asserts:** after the real bootstrap seeds the card `Working` from the daemon's snapshot and the subscription is confirmed up, the daemon's OWN truth moves to `Idle` while the sole live `SubscribeEvents` connection is structurally incapable of observing it (it never calls `rx.recv()` — see `run_reconnect_teardown_server`'s doc comment, which makes the outage window exact by construction rather than by timing), then the connection ends with `KIND_STREAM_END "lagged"`. The reconnect loop's re-subscribe must be followed by a fresh `list_agents` drain that lands the card on `Idle`; today it isn't, so the card stays `Working` forever with nothing left to correct it.
+- **Does not assert:** the BOOTSTRAP snapshot/subscribe window (`session/live/016`, fork issue #36 — a different, already-closed hazard); the daemon-side `"lagged"` reason itself, pinned in isolation by `daemon/protocol/001`; the no-reason transport-drop shape of the same hazard (`session/live/018`); rendered card output; a real daemon's timing.
+- **Platform coverage:** mac+linux.
+
+##### session/live/018 — A `SubscribeEvents` connection that dies mid-session WITHOUT a `lagged` reason — the connection just drops, standing in for a daemon restart or a bare transport failure — is recovered by the same reconnect re-hydration as the `lagged` case (issues #49/#28).
+- **Layer:** L1 client/wire integration — same production reconnect bootstrap and mock-daemon harness as `session/live/017`.
+- **Agent:** none (same mock daemon; no PTY, no LLM).
+- **Asserts:** identical setup and outage-window construction to `session/live/017`, except the mock daemon's forced tear-down sends no `KIND_STREAM_END` frame at all — it just drops the connection (EOF), the shape the approved design ("always re-hydrate on reconnect", not just on `lagged`) exists to cover. The reconnected card must still converge on `Idle` off a fresh `list_agents` snapshot.
+- **Does not assert:** the `lagged`-reason shape of the same hazard (`session/live/017`); the BOOTSTRAP snapshot/subscribe window (`session/live/016`); which client-side mechanism recovers the snapshot (only the observable end state — the status the TUI holds for the card — not internal call counts).
 - **Platform coverage:** mac+linux.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)
