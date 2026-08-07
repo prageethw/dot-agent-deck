@@ -247,7 +247,7 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             &authoring_record,
             "DIGESTPROMPTMARKER",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "editing a schedule must open the dir picker → mode-locked Edit Schedule form, then on \
          submit spawn the seeded authoring agent running the CONFIGURED `default_command` \
@@ -648,7 +648,7 @@ fn recorder_shim_survives_shell_metacharacters_in_the_record_path() {
     // Close stdin so the shim's delivery loop ends; `pwd >> <record>` is its
     // FIRST line, so the record appears whatever the later hook call does.
     drop(child.stdin.take());
-    let appeared = common::wait_for_path(&record, Duration::from_secs(15));
+    let appeared = common::wait_for_path(&record, common::OBSERVATION_BUDGET);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -815,7 +815,7 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
             &claude_record,
             "throwaway authoring session",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "an unset/blank `default_command` must fall back to `claude` (not spawn a bare \
          `$SHELL`): the authoring agent must run `claude` and deliver the base authoring \
@@ -895,6 +895,16 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
 
     deck.send_keys(b"s");
     deck.wait_for_string("NEXT FIRE");
+    // `NEXT FIRE` is a dialog row; the side-pane rows behind it may still be
+    // mid-repaint when it lands, because the deck's frame reaches the vt100
+    // parser in `read()`-sized chunks. Wait for the side pane to be whole
+    // before reading the baseline marker list off it — a torn baseline makes
+    // the two `assert_eq!`s below compare a partial list against a full one
+    // and report a scrollback leak that never happened (fork #81).
+    deck.wait_until_grid(
+        "side pane fully painted behind the manager dialog",
+        |grid| visible_side_scroll_markers(grid).len() >= 5,
+    );
     let before = visible_side_scroll_markers(&deck.snapshot_grid());
     assert!(
         before.len() >= 5,
@@ -913,9 +923,17 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
 
     deck.scroll(wheel_col, dialog_row, true);
     let selection_moved_down = deck
-        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+        .wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
             grid.contains("\u{25b6} bravo")
         });
+    // Same frame-completeness wait as for the baseline, and for the same
+    // reason. Deliberately a COUNT check, not `== before`: a genuine wheel
+    // leak scrolls the pane, which changes WHICH markers are visible without
+    // changing how many, so this can only wait out a torn frame — it cannot
+    // wait out (and so cannot mask) the leak the `assert_eq!` below is for.
+    deck.wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
+        visible_side_scroll_markers(grid).len() >= before.len()
+    });
     let after_down_grid = deck.snapshot_grid();
     let after_down = visible_side_scroll_markers(&after_down_grid);
     assert!(
@@ -924,8 +942,12 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     );
 
     deck.scroll(wheel_col, dialog_row, false);
-    let selection_moved_up = deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
-        grid.contains("\u{25b6} alpha")
+    let selection_moved_up = deck
+        .wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
+            grid.contains("\u{25b6} alpha")
+        });
+    deck.wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
+        visible_side_scroll_markers(grid).len() >= before.len()
     });
     let after_up_grid = deck.snapshot_grid();
     let after_up = visible_side_scroll_markers(&after_up_grid);
@@ -1078,7 +1100,7 @@ fn form_002_add_spawns_authoring_agent_in_picked_dir() {
             &authoring_record,
             "throwaway authoring session",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "adding a schedule must open the dir picker → mode-locked New Schedule form, then on \
          submit spawn the seeded authoring agent running the configured `default_command` \
@@ -1180,7 +1202,7 @@ fn form_003_edit_prefills_seed_and_spawns_in_row_working_dir() {
             &authoring_record,
             "EDITPROMPTMARKER",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "editing a schedule must pre-fill the authoring seed with the existing schedule's \
          values — the recorder never received the row's `EDITPROMPTMARKER` prompt"
@@ -1495,7 +1517,7 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
             &authoring_record,
             "EDITPROMPTF3",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "editing must spawn the seeded authoring agent pre-filled from the row — the recorder \
          never received the row's `EDITPROMPTF3` prompt"
@@ -1615,7 +1637,7 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
             &authoring_record,
             "schedule add --repo",
             1,
-            Duration::from_secs(15),
+            common::OBSERVATION_BUDGET,
         ),
         "selecting `schedule: issues` must seed the authoring agent with issue-dispatch \
          instructions calling `dot-agent-deck schedule add --repo …` (DISTINCT from the plain \
