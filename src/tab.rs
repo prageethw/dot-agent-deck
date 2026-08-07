@@ -2558,10 +2558,14 @@ mod tests {
     /// `ui.command_entry_locked`; this L1 test cannot reach that real call
     /// site (that is `tabs/orchestration/011`'s / M5's job), so it pins the
     /// `TabManager`-level contract the gated call site must be built on top
-    /// of. It also forces `TabManager::clear_waiting_pane_latch` -- the
+    /// of. It also exercises `TabManager::clear_waiting_pane_latch` -- the
     /// setter the locked->unlocked toggle handler (`src/ui.rs:7238`) must
-    /// call -- to exist; that method does not exist yet, which is why this
-    /// test is RED (fails to compile) today.
+    /// call. Manual focus is parked on `beta` (the pane that already stole
+    /// it during the locked stretch), not `alpha`: the final re-locked
+    /// episode moves focus onto `alpha`, and parking on `alpha` instead
+    /// would make that a same-pane no-op under
+    /// `auto_focus_waiting_pane`'s no-flicker early return rather than an
+    /// observable move.
     #[spec("tabs/orchestration/026")]
     #[test]
     fn orchestration_026_unlock_suspends_auto_focus_and_clears_stale_latch() {
@@ -2619,13 +2623,18 @@ mod tests {
         tm.clear_waiting_pane_latch();
 
         // The human takes manual control of a non-orchestrator role while
-        // unlocked.
+        // unlocked -- re-affirming `beta`, which already has focus from the
+        // steal above. Deliberately NOT `alpha`: the final episode below
+        // moves focus onto `alpha`, and parking manual focus there instead
+        // would make that a same-pane no-op (`auto_focus_waiting_pane`'s
+        // documented no-flicker early return, `454-476`) rather than the
+        // genuine focus move this test needs to observe.
         if let Tab::Orchestration {
             focused_role_pane_id,
             ..
         } = &mut tm.tabs[orch_idx]
         {
-            *focused_role_pane_id = Some(alpha.clone());
+            *focused_role_pane_id = Some(beta.clone());
         }
 
         // While unlocked, `beta` (still nominally "waiting" per `status`)
@@ -2637,7 +2646,7 @@ mod tests {
         );
         assert!(matches!(
             &tm.tabs[orch_idx],
-            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+            Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
         ));
 
         // `beta` resolves while unlocked -- e.g. the human answered it
@@ -2652,9 +2661,9 @@ mod tests {
         assert!(
             matches!(
                 &tm.tabs[orch_idx],
-                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
             ),
-            "manual focus on alpha must survive the entire unlocked stretch"
+            "manual focus on beta must survive the entire unlocked stretch"
         );
 
         // *** THE STALE-LATCH ASSERTION ***
@@ -2663,7 +2672,7 @@ mod tests {
         // its OLD `had_waiting_pane == true` (frozen from before the
         // unlock, when `beta` was still waiting) against the CURRENT idle
         // status and misread that as a fresh true->false edge -- firing a
-        // spurious all-clear move that yanks focus off `alpha`, the pane
+        // spurious all-clear move that yanks focus off `beta`, the pane
         // the human deliberately left it on. With the latch cleared, this
         // must be a no-op.
         assert_eq!(
@@ -2675,7 +2684,7 @@ mod tests {
         assert!(
             matches!(
                 &tm.tabs[orch_idx],
-                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == alpha
+                Tab::Orchestration { focused_role_pane_id: Some(p), .. } if *p == beta
             ),
             "focus must still be exactly where the human left it after re-lock"
         );
