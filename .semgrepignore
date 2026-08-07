@@ -10,3 +10,7 @@ tests/snapshots/
 # Docusaurus build output and its node_modules.
 site/build/
 site/node_modules/
+
+# Go-templated YAML, not valid standalone YAML -- the YAML parser emits
+# non-fatal parse errors on these (log noise, not scan findings).
+site/helm/templates/
