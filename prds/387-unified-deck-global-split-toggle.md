@@ -1,6 +1,8 @@
 # PRD #387: A unified, deck-global `Ctrl+L` split toggle — and a chord that stops being swallowed
 
-**Status**: M1–M6 complete, green, and reviewed — implemented on branch `prd-387-unified-deck-global-split-toggle`, pending PR. M7 (the upstream follow-up PR) remains gated on upstream PR #342 merging.
+**Status**: **CLOSED — fork-complete.** M1–M6 shipped and released. Merged 2026-08-06 as [prageethw/dot-agent-deck#19](https://github.com/prageethw/dot-agent-deck/pull/19) (merge commit `43a22bc`), reviewer and auditor clean, Greptile 5/5 with no findings, and **released in [v0.35.8](https://github.com/prageethw/dot-agent-deck/releases/tag/v0.35.8)** (published 2026-08-06, binaries for darwin/linux × amd64/arm64) alongside PRD #386.
+
+**M7 is deliberately NOT tracked here any more.** It is gated on upstream PR [#342](https://github.com/vfarcic/dot-agent-deck/pull/342) — still OPEN, untouched since 2026-08-06 01:56, no review decision — and per decision 4 it must land as a *separate* upstream PR that deletes `split_narrow` in the same change. That is an upstream contribution on someone else's merge queue, not fork work, so keeping this PRD open on it would misrepresent finished work as unfinished. **Upstream issue [#387](https://github.com/vfarcic/dot-agent-deck/issues/387) was reopened and now owns that tracking.** Note that **upstream still swallows `Ctrl+L` on orchestration tabs** — only the fork is fixed.
 **Priority**: Medium-High (the swallowed-chord half is a daily annoyance in the deck's primary use case; the unification half is a behaviour improvement)
 **Created**: 2026-08-06
 **GitHub Issue**: [#387](https://github.com/vfarcic/dot-agent-deck/issues/387) (filed upstream — the swallowing bug and the fix both live in upstream's own code)
@@ -162,7 +164,7 @@ Each is independently testable; the test that proves each one is named in the Te
 - [x] **M4 — Invert the three isolation tests.** `layout_003`, `dashboard_001`, `orchestration_006` rewritten to assert shared-stage behaviour, preserving the spawn-order/`cols` coupling in `layout_003`.
 - [x] **M5 — Real-pane proof.** The new L2 test that a focused orchestration role pane genuinely receives `Ctrl+L`, plus the deck-global cycle driven through a real PTY.
 - [x] **M6 — Docs, changelog, cross-version check.** `docs/keyboard-shortcuts.md`; changelog fragment; CLAUDE.md rule 12 manual cross-version test. The cross-version check was run and **partially** confirmed — see the Work Log entry below for the delegate leg that stayed unverified and why.
-- [ ] **M7 — Upstream follow-up PR.** Authored against post-#342 upstream, deleting `split_narrow` in the same PR (decision 4). **Gated on #342 actually merging — not startable from this branch.**
+- [ ] **M7 — Upstream follow-up PR.** Authored against post-#342 upstream, deleting `split_narrow` in the same PR (decision 4). **Gated on #342 actually merging — not startable from this branch, and no longer tracked by this PRD.** Ownership moved to upstream issue [#387](https://github.com/vfarcic/dot-agent-deck/issues/387) when this PRD was closed fork-complete on 2026-08-06.
 
 ## Test Plan
 
