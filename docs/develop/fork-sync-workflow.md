@@ -132,7 +132,7 @@ The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sy
 
 **Keep it current.** This is the second time the drift has been discovered rather than prevented (the 2026-08-05 sync picked up 7 uncurated commits; this one picked up 184). Re-curate whenever a PR merges to `main`, or at minimum on a fixed cadence — not "whenever it's badly out of date". Every re-curation that waits makes the squash grouping coarser and the next upstream rebase harder to reason about.
 
-**`65e46b2` (fork #32) landed on `main` via PR #91 after the 2026-08-07 re-curation above closed**, so it is exactly the kind of drift this section warns about: recorded here so it is not missed, but it still needs to be actually picked into `fork-only`'s own commit stack at the next sync — this row does not by itself mean it is there yet.
+**`65e46b2` (fork #32) landed on `main` via PR #91 after the 2026-08-07 re-curation above closed**, so it is exactly the kind of drift this section warns about — and it was subsequently carried onto `fork-only` as `2ccf984` during the #91/#94 carry-over the same day, so it is no longer outstanding. The general lesson stands, though: a row in this table records a commit's classification, it does not by itself prove the commit is on `fork-only` — only a `git diff fork-only origin/main` check proves that.
 
 ### Upstream candidates: what is on this stack that is not a fork customisation
 
