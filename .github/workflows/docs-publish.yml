@@ -28,6 +28,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # FORK-ONLY NOTE (fork issue #71) — DELIBERATELY UNGUARDED. This workflow is
+  # upstream-only in effect: the image tags below are hardcoded to
+  # `ghcr.io/vfarcic/dot-agent-deck-docs`, and the login uses the caller's
+  # `GITHUB_TOKEN`, so on `prageethw/dot-agent-deck` the push is a 403.
+  #
+  # The `github.repository == 'vfarcic/dot-agent-deck'` guard for that lives on
+  # the CALLER — the `docs` job in `release.yml` — and must NOT be duplicated
+  # here. `workflow_dispatch` makes this workflow directly invocable, and the
+  # `publish-docs` skill uses exactly that path; guarding the job here would
+  # make a human-requested publish report success while doing nothing. A
+  # standalone run on the fork is meant to fail loudly on the 403, which names
+  # the actual problem (no write access to upstream's GHCR namespace).
+  #
+  # If the fork ever wants its own docs image, the fix is to repoint the tags
+  # and the Helm values at `prageethw/…` — not to add a guard here.
   publish:
     runs-on: ubuntu-latest
     steps:
