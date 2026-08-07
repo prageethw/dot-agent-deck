@@ -177,7 +177,10 @@ impl GhStub {
     }
 
     /// Write a fake login shell that re-adds the stub `gh` dir to `$PATH`, and
-    /// return its path (for `.with_env("SHELL", …)`).
+    /// return the env pairs that arm it — `SHELL` plus
+    /// `common::LOGIN_SHELL_KEEP_DIR_ENV`. BOTH must be applied to the deck: the
+    /// generated shell reads its keep dir from the environment and exits
+    /// non-zero without it, rather than silently prepending an empty component.
     ///
     /// Why this is needed for the PTY/`TuiDeck` path but not the headless one:
     /// the deck lazy-spawns its daemon DETACHED and pins `SHELL=/bin/sh`, so
@@ -189,35 +192,16 @@ impl GhStub {
     /// survives. Pointing `$SHELL` at a login shell whose `-ilc` output prepends
     /// the stub dir makes the captured PATH resolve the stub `gh` (real `git`
     /// still comes from the inherited PATH), mirroring `tests/e2e_login_path.rs`.
-    fn login_shell(&self) -> PathBuf {
+    fn login_shell_env(&self) -> [(&'static str, String); 2] {
         let base = self.bindir.parent().expect("stub bindir has a parent");
-        let shell = base.join("login-shell.sh");
-        std::fs::write(
-            &shell,
-            format!(
-                "#!/bin/sh\n\
-                 export PATH=\"{bindir}:$PATH\"\n\
-                 while [ \"$#\" -gt 0 ]; do\n\
-                 case \"$1\" in\n\
-                 -*) shift ;;\n\
-                 *) break ;;\n\
-                 esac\n\
-                 done\n\
-                 if [ \"$#\" -gt 0 ]; then\n\
-                 exec /bin/sh -c \"$1\"\n\
-                 fi\n\
-                 exec /bin/sh\n",
-                bindir = self.bindir.display()
-            ),
-        )
-        .expect("write ghstub login shell");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod ghstub login shell");
-        }
-        shell
+        // Shared with `e2e_scheduler_manager.rs` / `e2e_login_path.rs`: the stub
+        // bindir reaches the script through the ENVIRONMENT rather than through
+        // its source (issue #57 — `tempfile::tempdir()` follows `TMPDIR`, so a
+        // `"`, `$`, backtick, `\` or newline in it would otherwise terminate or
+        // expand inside the `export PATH=…` assignment), and the helper
+        // self-checks that the dir really lands first on PATH — so this fixture
+        // can no longer degrade silently into resolving the REAL `gh`.
+        common::write_login_shell_pinning_dir(base, &self.bindir)
     }
 }
 
@@ -336,17 +320,19 @@ fn dispatch_011_card_surfaces_live_in_tui() {
 
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let deck = TuiDeck::builder()
+    let mut builder = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("PATH", path)
-        // The deck's detached daemon re-derives PATH from `$SHELL -ilc` at
-        // startup (PRD #170), which would drop the stub `gh` off the inherited
-        // PATH. Point `$SHELL` at a login shell that re-adds the stub dir so the
-        // dispatch clone resolves the stub `gh` rather than the real one.
-        .with_env("SHELL", stub.login_shell().to_string_lossy())
         .with_env("GHSTUB_DIR", ghdir)
-        .with_env("DOT_AGENT_DECK_CONFIG", cfg_str)
-        .launch_with_fixture("minimal");
+        .with_env("DOT_AGENT_DECK_CONFIG", cfg_str);
+    // The deck's detached daemon re-derives PATH from `$SHELL -ilc` at startup
+    // (PRD #170), which would drop the stub `gh` off the inherited PATH. Point
+    // `$SHELL` at a login shell that re-adds the stub dir so the dispatch clone
+    // resolves the stub `gh` rather than the real one.
+    for (key, value) in stub.login_shell_env() {
+        builder = builder.with_env(key, value);
+    }
+    let deck = builder.launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
     // Fire the dispatch into the SAME daemon this TUI is attached to.
