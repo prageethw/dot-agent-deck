@@ -535,11 +535,22 @@ impl TabManager {
         *had_waiting_pane = now_waiting;
     }
 
-    /// PRD #393 M4b — fork-only. Resets the active Orchestration tab's
+    /// PRD #393 M4b — fork-only. Resets EVERY Orchestration tab's
     /// waiting-episode edge state (`had_waiting_pane` /
-    /// `all_clear_pending`) to "nothing seen yet". No-op for any active
-    /// tab that isn't `Tab::Orchestration`, exactly like
-    /// [`Self::observe_waiting_panes`].
+    /// `all_clear_pending`) to "nothing seen yet". Tabs that aren't
+    /// `Tab::Orchestration` carry no such state and are skipped.
+    ///
+    /// Deck-wide rather than active-tab-only because the lock it
+    /// compensates for is itself deck-global (`UiState::command_entry_locked`,
+    /// one value for every tab): unlocking stops the observation chain for
+    /// ALL Orchestration tabs at once, so every one of them can be left
+    /// holding a frozen latch, not merely whichever happened to be active
+    /// when the human pressed `Ctrl+e`. Clearing only the active tab left
+    /// exactly the same stale-edge bug alive on the others — the human
+    /// unlocks from tab `B`, tab `A`'s episode resolves unobserved, and on
+    /// re-lock `A`'s surviving `true` is misread as a fresh all-clear that
+    /// yanks focus off wherever `A` was left (`tabs/orchestration/027`,
+    /// PRD #393 review blocker 1).
     ///
     /// Called from the locked→unlocked half of the command-entry lock
     /// toggle, and only from there. It exists because M4b stops running
@@ -558,16 +569,18 @@ impl TabManager {
     /// ever touches the latch, so nothing goes stale.
     /// `tabs/orchestration/026` is written against the straddling trace.
     pub fn clear_waiting_pane_latch(&mut self) {
-        let Tab::Orchestration {
-            had_waiting_pane,
-            all_clear_pending,
-            ..
-        } = &mut self.tabs[self.active_index]
-        else {
-            return;
-        };
-        *had_waiting_pane = false;
-        *all_clear_pending = false;
+        for tab in &mut self.tabs {
+            let Tab::Orchestration {
+                had_waiting_pane,
+                all_clear_pending,
+                ..
+            } = tab
+            else {
+                continue;
+            };
+            *had_waiting_pane = false;
+            *all_clear_pending = false;
+        }
     }
 
     /// PRD #373 M1 — fork-only. Edge-triggered sibling of

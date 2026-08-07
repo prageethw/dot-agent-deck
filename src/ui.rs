@@ -4341,8 +4341,12 @@ const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctr
 /// read of live status with nothing latched anywhere, so the gate re-engages on
 /// the very next keystroke once the status clears.
 ///
-/// `pane_status` is the same `pane_id -> SessionStatus` join
-/// [`build_pane_status`] returns, handed straight over by the call site.
+/// `pane_status` is the `pane_id -> SessionStatus` join
+/// [`build_pane_status_for_gate`] returns, handed straight over by the call
+/// site. That producer — not this consumer — is where ambiguity is resolved: it
+/// omits any `pane_id` claimed by more than one session, and the `Some(...)`
+/// match below then denies the exemption for a missing key without needing to
+/// know why it is missing. See its docs for why the guard cannot live here.
 /// **Accepted limitation** (decision 4, stated in the PRD): an agent that never
 /// reports `WaitingForInput` gets no carve-out and still needs a deliberate
 /// `Ctrl+e` — the same blind spot `auto_focus_waiting_pane` and PRD #333's tab
@@ -7279,7 +7283,10 @@ fn dispatch_action(
         Action::ToggleOrchestrationLock => {
             ui.command_entry_locked = !ui.command_entry_locked;
             // PRD #393 M4b — on the locked→unlocked half ONLY, drop the
-            // active tab's waiting-episode latch. From this frame on the
+            // waiting-episode latch on EVERY Orchestration tab: the lock
+            // is deck-global, so unlocking stops observation everywhere at
+            // once and any tab can be left holding a frozen latch, not
+            // just the one active right now. From this frame on the
             // render loop stops calling `observe_waiting_panes`, so a
             // latch left standing here would freeze at its current value
             // and be misread on re-lock as a fresh all-clear edge for an
@@ -9259,15 +9266,19 @@ fn handle_key_event(
                 let candidate = handle_pane_input_key(key);
                 // PRD #393 M3: the gate needs live per-pane status for
                 // decision 4's `WaitingForInput` carve-out, and `UiState`
-                // caches none — so build the same join the deck cards and
-                // pane borders read, from the `snapshot` already in scope
-                // here, and hand it over.
+                // caches none — so build the join from the `snapshot`
+                // already in scope here and hand it over. Deliberately
+                // `build_pane_status_for_gate`, not the plain
+                // `build_pane_status` the deck cards and pane borders read:
+                // it omits any `pane_id` claimed by more than one session,
+                // so an ambiguous pane can never earn the carve-out (review
+                // blocker 2 — see that function's docs).
                 let gated = gate_pane_input_key(
                     candidate.clone(),
                     ui,
                     tab_manager,
                     pane,
-                    &build_pane_status(snapshot),
+                    &build_pane_status_for_gate(snapshot),
                 );
                 if matches!(candidate, Action::ForwardToPane(_))
                     && matches!(gated, Action::Continue)
@@ -12371,6 +12382,61 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
         .sessions
         .values()
         .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect()
+}
+
+/// PRD #393 review blocker 2 (PR #51) — the same `pane_id -> SessionStatus`
+/// join as [`build_pane_status`], but **fail-closed on ambiguity**: a `pane_id`
+/// claimed by more than one session is OMITTED from the result entirely,
+/// whatever those sessions' statuses say.
+///
+/// Only [`gate_pane_input_key`] (M3 decision 4's `WaitingForInput` carve-out)
+/// reads this. **Omission means "deny"**: the gate tests
+/// `matches!(pane_status.get(pane_id), Some(SessionStatus::WaitingForInput))`,
+/// which is false for a missing key, so leaving an ambiguous pane out of the
+/// map is exactly what makes the carve-out refuse to widen the lock. A single,
+/// unambiguous session behaves identically to [`build_pane_status`].
+///
+/// **Why this is a separate function, and why it must be the producer** — do
+/// not merge it back into [`build_pane_status`], and do not try to move the
+/// check into the gate instead:
+///
+/// - [`build_pane_status`] is deliberately left as-is. Its no-dedupe /
+///   iteration-order behaviour on colliding `pane_id`s is issue **#398**, which
+///   is out of scope here; PRD #333's tab colouring and PRD #373's focus
+///   steering both consume it and must keep today's behaviour. A colour or a
+///   focus hint being wrong on a collision is cosmetic; the lock being wrong is
+///   the security-shaped one, so only the lock's feed hardens.
+/// - `HashMap<&str, SessionStatus>` is one key, one value by construction, so a
+///   collision cannot be *represented* in the join's output at all — by the time
+///   the gate reads the map the ambiguity has already been discarded and no
+///   consumer-side check, however clever, can recover it. Only the raw
+///   `state.sessions` collection still knows, which is why the guard has to live
+///   here, on the producing side.
+/// - The rule is "any duplicate", not "any *disagreeing* duplicate". Permitting
+///   agreeing duplicates would hand the #401 scenario precisely what it wants: a
+///   second session that also claims `WaitingForInput` would sail through.
+///   "Closed only when the duplicates happen to disagree" is not fail-closed.
+///
+/// Reachable without an adversary: PRD #110 preserves `agent_id: None` for
+/// pre-F9 hooks, and that shape produces a duplicate session for an
+/// already-tracked pane (#398).
+pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, SessionStatus> {
+    // `None` marks a pane_id seen more than once; it is dropped below rather
+    // than resolved, since there is no defensible way to pick a winner.
+    let mut joined: HashMap<&str, Option<SessionStatus>> = HashMap::new();
+    for session in state.sessions.values() {
+        let Some(pane_id) = session.pane_id.as_deref() else {
+            continue;
+        };
+        joined
+            .entry(pane_id)
+            .and_modify(|slot| *slot = None)
+            .or_insert_with(|| Some(session.status.clone()));
+    }
+    joined
+        .into_iter()
+        .filter_map(|(pane_id, status)| status.map(|status| (pane_id, status)))
         .collect()
 }
 
