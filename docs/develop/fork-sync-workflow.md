@@ -78,7 +78,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `703b4d2` | `docs(prd-383): create PRD #383 - blocked-keystroke reset for the Orchestration inactivity timer [skip ci]` | **PERMANENT** fork-only (doc) — **describes behaviour that no longer exists**: PRD #393 deleted the inactivity timer this PRD's reset applied to; see note below |
 | `d6e1d21` | `feat(prd-370): treat underlying shell activity as Working status inside a worker pane (#14)` | **PERMANENT** fork-only, but **as an ancestor only** — its `tcgetpgrp` body never fired and was replaced by `296b9d1` (PRD #386); see watch-item below |
 | `a8987e6` | `fork-only: update the fork-sync-workflow stack table after the 2026-08-05 sync` | **PERMANENT** fork-only (this doc) |
-| `08a9402` | `fork-only: run the L2 e2e tier in CI as an informational, non-blocking job` | **PERMANENT** fork-only |
+| `08a9402` | `fork-only: run the L2 e2e tier in CI as an informational, non-blocking job` | **PERMANENT** fork-only — originally landed in `ci.yml`; moved to its own `.github/workflows/e2e.yml` by fork #50 item 1, see note below |
 | `0348ebb` | `docs(claude): correct rule 5's stale never-in-CI e2e claim for this fork` | **PERMANENT** fork-only (rules) |
 | `d3c278f` | `docs(claude): correct rule 4's stale never-in-CI e2e claim for this fork` | **PERMANENT** fork-only (rules) |
 | `166cb8b` | `docs: make "regression runs in CI, not locally" an explicit fork rule` | **PERMANENT** fork-only (rules) |
@@ -115,7 +115,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `aed6343` | `feat(delegate): make daemon rejections and confirmations visible to the caller (#84)` | **UPSTREAM-WORTHY** — `delegate` is upstream functionality; the touched surfaces (`handle_delegate`, the hook socket reply, the CLI) carry no fork-only symbols |
 | `7441b0f` | `ci: add a Semgrep CE scan publishing SARIF to GitHub code scanning (#85, #86)` | **PERMANENT** fork-only (CI) |
 | `a9ef53e` | `ci: add SonarQube Cloud analysis, gated on the SONAR_TOKEN secret (#88)` | **PERMANENT** fork-only (CI) |
-| `65e46b2` | `fork-only: mirror the e2e failed/flaky summary to the job log (fork #32)` | **PERMANENT** fork-only (CI) — mirrors the fork-only `e2e:` job's own summary; that job does not exist upstream, so there is nothing there for this to apply to |
+| `65e46b2` | `fork-only: mirror the e2e failed/flaky summary to the job log (fork #32)` | **PERMANENT** fork-only (CI) — mirrors the fork-only `e2e:` job's own summary; that job does not exist upstream, so there is nothing there for this to apply to. Also moved into `.github/workflows/e2e.yml` alongside `08a9402`, see note below |
 | `d2ae7f4` | `ci: bump codeql-action/upload-sarif to v4, SHA-pinned (#94)` | **PERMANENT** fork-only (CI) |
 | `7fb79f6` | `ci: harden docs-publish shell-injection sites, drop secrets: inherit (fork #87) (#97)` | **UPSTREAM-WORTHY** — hardens `docs-publish.yml`/`release.yml`, both upstream's own files (hardcoded `ghcr.io/vfarcic/…` tags, `docs:` job gated to `github.repository == 'vfarcic/dot-agent-deck'`); the shell-injection pattern it fixes exists identically upstream |
 | `d4d0fe4` | `test(scheduler): settle the side pane before sampling in manager_016 (fork #81) (#96)` | **UPSTREAM-WORTHY** — generic e2e timing determinism plus a reusable test helper, no fork-specific content |
@@ -134,6 +134,14 @@ The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sy
 **Keep it current.** This is the second time the drift has been discovered rather than prevented (the 2026-08-05 sync picked up 7 uncurated commits; this one picked up 184). Re-curate whenever a PR merges to `main`, or at minimum on a fixed cadence — not "whenever it's badly out of date". Every re-curation that waits makes the squash grouping coarser and the next upstream rebase harder to reason about.
 
 **`65e46b2` (fork #32) landed on `main` via PR #91 after the 2026-08-07 re-curation above closed**, so it is exactly the kind of drift this section warns about — and it was subsequently carried onto `fork-only` as `2ccf984` during the #91/#94 carry-over the same day, so it is no longer outstanding. The general lesson stands, though: a row in this table records a commit's classification, it does not by itself prove the commit is on `fork-only` — only a `git diff fork-only origin/main` check proves that.
+
+### `08a9402`/`65e46b2`'s job moved out of `ci.yml` into `.github/workflows/e2e.yml` (fork #50 item 1)
+
+The `e2e:` job these two commits introduced (`08a9402`) and extended (`65e46b2`) originally lived inside `ci.yml`. It has since been split into its own workflow file, `.github/workflows/e2e.yml`, for a reason unrelated to the sync workflow itself: `gh run view --log-failed` returns nothing while *any* job in a run is still in progress, and sharing one workflow meant a fast-tier RED result on `ci.yml`'s jobs stayed unreadable through `--log-failed` for however much longer `e2e` (9-12 minutes) was still running. `e2e` was already `continue-on-error: true` and not a merge gate, so the split loses no coverage — full detail lives in the header comment of `e2e.yml` itself.
+
+**Why this matters at rebase time.** A future `git rebase upstream/main` replaying `08a9402`/`65e46b2` will try to apply their `ci.yml` hunks against a `ci.yml` that no longer contains an `e2e:` job — expect a conflict (or a silent no-op patch) at that hunk, not a clean apply. Resolve it by discarding the `ci.yml` hunk and re-verifying the *content* it would have added is already present in `.github/workflows/e2e.yml` on the post-rebase tree (job body, `continue-on-error: true`, the `--retries 2` from `4a21e02`, and the summary-mirroring step from `65e46b2`), rather than reapplying it into `ci.yml` and recreating the two-workflow coupling this split exists to remove.
+
+The `changes` job that gates `e2e` (Renovate/devbox-only skip) is **duplicated**, not shared, between `ci.yml` and `e2e.yml` — a job output cannot cross a workflow-file boundary, so keeping the skip meant carrying a second copy of the gate. If a future change to the Renovate-skip logic lands in one file's `changes` job, check whether the other needs the same edit; nothing enforces that they stay identical besides this note.
 
 ### Upstream candidates: what is on this stack that is not a fork customisation
 
