@@ -435,10 +435,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: |
+          # `unsafe-usage` fires on every `unsafe {}` block. This is a systems
+          # codebase doing openpty / process control / raw fd handling, so
+          # `unsafe` is expected rather than a defect -- and the rule produced
+          # 209 of the first run's 286 findings, drowning everything else.
+          # Excluding it is a readability decision, not a claim that the
+          # `unsafe` code is audited.
           semgrep scan \
             --config p/rust \
             --config p/github-actions \
             --config p/secrets \
+            --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
             --sarif --output semgrep.sarif \
             --no-error
       - uses: github/codeql-action/upload-sarif@v3
