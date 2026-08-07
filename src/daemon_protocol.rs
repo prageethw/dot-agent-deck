@@ -1846,7 +1846,12 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// so a wedged client can't pin this task forever. A lagged receiver
 /// (the client fell further behind than the broadcast capacity) closes
 /// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
-/// TUI's reconnect path drains a `list_agents` snapshot to recover.
+/// TUI's reconnect path drains a `list_agents` snapshot to recover
+/// ([`crate::reconnect::run_event_subscriber`] — which does so on EVERY
+/// re-subscribe, not just this one, because a bare transport drop loses
+/// exactly as much and announces nothing. Fork issues #49/#28; the
+/// sentence above stated the contract for some time before the client
+/// actually honoured it).
 /// Client disconnect is detected by racing a one-byte read against
 /// `rx.recv()` so the broadcast `Receiver` is dropped promptly when
 /// the client goes away between messages — otherwise the

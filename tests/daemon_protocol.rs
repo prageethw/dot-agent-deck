@@ -39,7 +39,7 @@ use dot_agent_deck::daemon_protocol::{
     bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
-    AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
+    AgentEvent, AgentType, BroadcastMsg, EventType, LiveTarget, SendResult, TargetKind, Writable,
 };
 use dot_agent_deck::state::{AppState, SharedState};
 use spec::spec;
@@ -3054,4 +3054,140 @@ async fn registry_resize_clamps_oversized_cols() {
 #[tokio::test]
 async fn registry_resize_clamps_both() {
     assert_resize_clamps(u16::MAX, u16::MAX, 4096, 4096).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #49 / #28 — `handle_subscribe_events`'s documented `lagged`
+// tear-down (src/daemon_protocol.rs, the `handle_subscribe_events` doc
+// comment). Zero coverage existed for this path before this test: nothing in
+// the suite ever forces a real `broadcast::error::RecvError::Lagged`, which
+// is part of how the TUI-side reconnect contract drifted from what the
+// daemon actually documents.
+// ---------------------------------------------------------------------------
+
+/// Like [`start_server`], but returns the daemon-wide `BroadcastMsg` sender
+/// too, with `capacity` slots, so a test can flood it past capacity from the
+/// outside. `start_server` doesn't expose this: it constructs its own
+/// `event_tx` and moves it into the spawned task.
+async fn start_server_with_broadcast(
+    capacity: usize,
+) -> (Server, tokio::sync::broadcast::Sender<BroadcastMsg>) {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = bind_attach_listener(&path).expect("bind attach listener");
+        (dir, path, listener)
+    };
+    registry.set_hook_socket(dir.path().join("hook.sock"));
+
+    let registry_for_task = registry.clone();
+    let state_for_task = state.clone();
+    let (event_tx, _) = tokio::sync::broadcast::channel(capacity);
+    let event_tx_for_task = event_tx.clone();
+    let handle = tokio::spawn(async move {
+        let _ = serve_attach_with_counter(
+            listener,
+            registry_for_task,
+            event_tx_for_task,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            state_for_task,
+            None,
+            Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier()),
+            dot_agent_deck::spawn::new_reuse_registry(),
+            dot_agent_deck::issue_dispatch_run::new_worktree_registry(),
+        )
+        .await;
+    });
+
+    (
+        Server {
+            _dir: dir,
+            path,
+            registry,
+            state,
+            handle,
+        },
+        event_tx,
+    )
+}
+
+/// A minimal, otherwise-inert `AgentEvent` for flooding the broadcast channel
+/// — its content is irrelevant, only the fact that it's sent matters.
+fn filler_event(n: usize) -> AgentEvent {
+    AgentEvent {
+        session_id: format!("sess-flood-{n}"),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Idle,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: None,
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
+}
+
+/// Scenario: Subscribe a raw client to the real `handle_subscribe_events`
+/// stream, then — in a tight loop with no `.await` between sends, so the
+/// connection task cannot run `rx.recv()` even once until every send has
+/// already landed — flood the daemon-wide broadcast well past its capacity
+/// without ever draining the connection from this side. Assert the daemon
+/// ends the stream with `KIND_STREAM_END` carrying exactly the documented
+/// `"lagged"` reason, not a different reason or more `KIND_EVENT` frames.
+// Deliberately `new_current_thread`, unlike this file's other `#[spec]`
+// wrappers: the flood loop below relies on cooperative (not preemptive)
+// scheduling — no other OS thread may run the connection task's `rx.recv()`
+// while the loop is mid-flood — to guarantee the lag rather than merely make
+// it likely. See the inner fn's doc comment.
+#[spec("daemon/protocol/001")]
+#[test]
+fn protocol_001_lagged_receiver_ends_the_stream_with_the_documented_reason() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build daemon-protocol runtime");
+    runtime
+        .block_on(protocol_001_lagged_receiver_ends_the_stream_with_the_documented_reason_inner());
+}
+
+async fn protocol_001_lagged_receiver_ends_the_stream_with_the_documented_reason_inner() {
+    const CAPACITY: usize = 2;
+    let (server, event_tx) = start_server_with_broadcast(CAPACITY).await;
+
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &AttachRequest::SubscribeEvents).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        resp.ok,
+        "SubscribeEvents must be acknowledged: {:?}",
+        resp.error
+    );
+
+    for n in 0..(CAPACITY * 20) {
+        let _ = event_tx.send(BroadcastMsg::Event(filler_event(n)));
+    }
+
+    let (kind, reason) = read_frame(&mut stream)
+        .await
+        .expect("daemon must end the stream once the receiver has lagged");
+    assert_eq!(
+        kind, KIND_STREAM_END,
+        "a lagged receiver must be torn down with KIND_STREAM_END (0x{KIND_STREAM_END:02x}), \
+         not more KIND_EVENT frames or any other kind — got 0x{kind:02x}"
+    );
+    assert_eq!(
+        reason,
+        b"lagged",
+        "the documented tear-down reason must be exactly \"lagged\" — got {:?}",
+        String::from_utf8_lossy(&reason)
+    );
 }
