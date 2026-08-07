@@ -447,29 +447,47 @@ pub fn send_to_socket(json: &str) -> Option<()> {
     Some(())
 }
 
-/// Fork issue #89: bounds how long `get-seed` waits for the daemon's reply
-/// before folding into "no seed" (see [`request_from_socket`]). The daemon's
-/// `GetSeed` handler never touches the `state` lock that `delegate`'s reply
-/// path contends on — it only reads/clears an in-memory entry in
-/// `pty_registry` — so it is strictly cheaper than the `delegate` reply
-/// already bounded at `DELEGATE_REPLY_TIMEOUT` (5s, `src/main.rs`). Matching
-/// that value therefore gives get-seed at least as much headroom as delegate
-/// has, without inventing a smaller number that could fire against a merely
-/// busy (not wedged) daemon and needlessly downgrade a working socket
-/// delivery to the PTY-injection fallback.
+/// Fork issue #89: a per-read/per-write idle timeout (`SO_RCVTIMEO`/
+/// `SO_SNDTIMEO` on Unix) applied to the socket used by
+/// [`request_from_socket`]. It bounds how long a single blocking read or
+/// write may sit with no bytes moving before failing — it resets on every
+/// byte received, so it does **not** bound the total time `get-seed` spends
+/// waiting for the daemon's reply. It closes the failure mode issue #89
+/// describes (a daemon that has gone completely silent), not a daemon that
+/// keeps trickling bytes without ever finishing a line — see
+/// [`request_from_socket`] for that gap. The daemon's `GetSeed` handler never
+/// touches the `state` lock that `delegate`'s reply path contends on — it
+/// only reads/clears an in-memory entry in `pty_registry` — so it is
+/// strictly cheaper than the `delegate` reply already bounded at
+/// `DELEGATE_REPLY_TIMEOUT` (5s, `src/main.rs`). Matching that value
+/// therefore gives get-seed's socket at least as much idle headroom per
+/// read/write as delegate's reply has overall, without inventing a smaller
+/// number that could fire against a merely busy (not wedged) daemon and
+/// needlessly downgrade a working socket delivery to the PTY-injection
+/// fallback.
 const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PRD #201: send a line to the daemon hook socket and read ONE line of reply
 /// back on the same connection. Used by the read-only `get-seed` verb, the one
 /// hook-socket message that expects a response (the delegate / work-done /
 /// agent-event senders are fire-and-forget). Returns `None` if the socket is
-/// absent/unreadable, or if no reply arrives within
+/// absent/unreadable, or if the daemon goes completely silent for longer than
 /// [`GET_SEED_REQUEST_TIMEOUT`] (fork issue #89) — the caller (get-seed)
 /// treats all three identically as "no seed", so an older daemon that never
 /// replies, a daemon that never even accepts the connection, or one that
-/// accepts but goes silent, all degrade to the PTY-injection safety net
-/// rather than hanging or erroring. A blank reply line is returned as
-/// `Some(String::new())`.
+/// accepts the connection and then stops sending bytes altogether, all
+/// degrade to the PTY-injection safety net rather than hanging or erroring.
+/// A blank reply line is returned as `Some(String::new())`.
+///
+/// [`GET_SEED_REQUEST_TIMEOUT`] is a per-read/per-write **idle** timeout, not
+/// a deadline on the whole exchange: it resets on every byte moved, so it
+/// only fires once the daemon has gone fully silent. It does **not** bound
+/// total elapsed time or reply size — a peer that keeps dribbling a byte at a
+/// time without ever completing the reply line resets the timer on each byte
+/// and can keep the underlying `read_line` blocked, and the `String` it
+/// appends into growing, indefinitely. Closing that gap needs an
+/// operation-level deadline plus a reply-size cap, which is tracked as a
+/// separate follow-up rather than fixed here.
 pub fn request_from_socket(json: &str) -> Option<String> {
     match request_from_socket_inner(json, Some(GET_SEED_REQUEST_TIMEOUT)) {
         SocketReply::Line(line) => Some(line),
@@ -761,11 +779,26 @@ mod tests {
     #[test]
     fn send_to_missing_socket_returns_none() {
         // With no daemon running, send should silently fail
-        // SAFETY: This test runs single-threaded; no other thread reads this env var concurrently.
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_socket = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
+
+        // SAFETY: STATE_DIR_ENV_LOCK is held for the duration of this test;
+        // the previous value is restored below before the lock is dropped.
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_SOCKET", "/tmp/nonexistent-test-socket.sock");
         }
         let result = send_to_socket(r#"{"test": true}"#);
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_socket {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SOCKET"),
+            }
+        }
+
         assert!(result.is_none());
     }
 
