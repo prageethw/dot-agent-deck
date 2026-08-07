@@ -668,7 +668,9 @@ impl TabManager {
         pane_status: &HashMap<&str, crate::state::SessionStatus>,
         input_pending: bool,
     ) -> Option<String> {
-        let _ = input_pending;
+        if input_pending {
+            return None;
+        }
         self.auto_focus_waiting_pane(pane_status)
             .or_else(|| self.auto_focus_all_clear())
     }
