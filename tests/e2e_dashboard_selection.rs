@@ -170,8 +170,13 @@ fn selection_019_enter_paints_highlight_on_orchestration_real_binary() {
 
     // Open the orchestration tab (Dashboard + Orchestration = the ≥2 tabs the
     // round-trip needs). Its two `cat` role panes render as deck cards.
+    // Fork-only (`349e895`): the dashboard title bar itself now reads
+    // `worker-deck`, so a bare "worker" needle would match the chrome from
+    // frame one — bound it with spaces (` worker `, the "worker" role card's
+    // own title, not "worker-deck ") so this genuinely waits for the 2nd
+    // role card to render.
     open_orchestration(&deck);
-    deck.wait_for_string("worker"); // the 2nd role card → orchestration deck is up
+    deck.wait_for_string(" worker "); // the 2nd role card → orchestration deck is up
 
     // Detach to Normal mode on the Orchestration tab so `j` / Enter drive the
     // deck (Enter would otherwise type into the focused role pane).
@@ -183,10 +188,17 @@ fn selection_019_enter_paints_highlight_on_orchestration_real_binary() {
     // Round-trip: Orchestration → Dashboard → Orchestration. The highlight
     // clears on the tab switch (SC1 / orchestration_003).
     deck.send_bytes(b"\x1b[D"); // Left → previous tab → Dashboard
-    deck.wait_for_absence("worker"); // left the orchestration (role cards gone; role panes are excluded from the Dashboard)
+    // `wait_for_absence("worker")` can never succeed post-`349e895`: the
+    // Dashboard's own title bar reads `worker-deck — N/M session(s)`, so a
+    // bare "worker" needle is permanently present in the deck's own chrome
+    // regardless of whether role cards are showing. Bound the needle to the
+    // role card's own title (` worker `) — the title bar's `worker-deck `
+    // has no space after "worker" (a hyphen follows instead), so it can't
+    // satisfy this needle.
+    deck.wait_for_absence(" worker "); // left the orchestration (role cards gone; role panes are excluded from the Dashboard)
     deck.wait_for_absence("\u{25b8}"); // highlight cleared
     deck.send_bytes(b"\x1b[C"); // Right → next tab → Orchestration
-    deck.wait_for_string("worker"); // back on the Orchestration deck
+    deck.wait_for_string(" worker "); // back on the Orchestration deck
 
     // THE REGRESSION: Enter on the Orchestration deck must RESTORE the previous
     // role AND paint its highlight. Pre-fix the role pane is already focused, so
