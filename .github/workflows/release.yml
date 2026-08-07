@@ -436,23 +436,52 @@ jobs:
       # are the highest-value sink for an injected value: bind both the version
       # and the channel name through `env:` and pass each `task` variable as a
       # single quoted argv element.
+      #
+      # FORK-ONLY GUARD (fork issue #35). Package publishing is upstream's
+      # concern: `homebrew-publish` clones `vfarcic/homebrew-tap` and
+      # `scoop-publish` clones `vfarcic/scoop-bucket`, and the two `Generate`
+      # steps bake `github.com/vfarcic/dot-agent-deck/releases/download/...`
+      # URLs into artifacts only those publish steps consume. None of that can
+      # or should succeed from a fork, and on the fork's first tag-triggered
+      # release (v0.35.8, run 31092050462) `Publish Homebrew formula` failed on
+      # the missing `HOMEBREW_TAP_TOKEN`, which failed `finalize`, which SKIPPED
+      # the `docs` job that needs it — the docs site never publishes on a fork
+      # release.
+      #
+      # `if:` rather than `continue-on-error: true` on purpose: skipping
+      # something that cannot work is more honest than running it and discarding
+      # the result, it keeps the release run green instead of leaving a
+      # permanently red step, and it costs nothing downstream — the four steps
+      # produce `dist/*.rb` / `dist/*.json`, which nothing else reads (the
+      # GitHub Release is created above them and attaches only
+      # `dist/dot-agent-deck-*` and `dist/checksums.txt`).
+      #
+      # Keyed on the repository rather than on secret presence because the
+      # decision is about ownership, not about whether a token happens to be
+      # configured: a fork must not publish these regardless. Upstream is
+      # unaffected — the condition is true there, so all four steps run exactly
+      # as before.
       - name: Generate Homebrew formula
+        if: github.repository == 'vfarcic/dot-agent-deck'
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL_NAME: ${{ steps.channel.outputs.name }}
         run: task homebrew-formula "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
       - name: Publish Homebrew formula
+        if: github.repository == 'vfarcic/dot-agent-deck'
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL_NAME: ${{ steps.channel.outputs.name }}
         run: task homebrew-publish "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
       - name: Generate Scoop manifest
+        if: github.repository == 'vfarcic/dot-agent-deck'
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL_NAME: ${{ steps.channel.outputs.name }}
         run: task scoop-manifest "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
       - name: Publish Scoop manifest
+        if: github.repository == 'vfarcic/dot-agent-deck'
         env:
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
