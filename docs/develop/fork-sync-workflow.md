@@ -127,6 +127,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `88cb1aa` | `fix/test(daemon): work-done output-path collisions & cwd-dependent --task-file refusal (fork #76, upstream #331) (#90)` | **UPSTREAM-WORTHY** — `work_done_file_name`/`archive_existing_report`/the `--task-file` cwd-drift refusal are upstream's own daemon plumbing (`src/main.rs`, `src/state.rs`); a work-done output path colliding between concurrent panes, and a refusal check that depends on the daemon's own cwd, are defects there too — no fork-only symbols touched |
 | `8ddee05` | `docs(fork-sync): correct the 65e46b2 drift note — it was carried as 2ccf984 (#105)` | **PERMANENT** fork-only (doc) — edits this fork's own sync-workflow doc |
 | `d89b1ca` | `ci: split the e2e job into its own workflow (fork #50 item 1) (#108)` | **PERMANENT** fork-only (CI) — splits out the fork's own `e2e:` job (`08a9402`/`65e46b2`), which does not exist upstream, into its own workflow file; same basis as `08a9402` and the Semgrep/Sonar rows |
+| `9cc775c` | `test(hook): pin the slow-drip socket hang left open by #99 (fork #101) (#106)` | **UPSTREAM-WORTHY** — `request_from_socket_inner` is upstream's own hook-socket plumbing; an unbounded total-operation deadline against a peer that drips bytes slowly enough to keep resetting each individual read/write timeout is a defect there too, same basis as `9ed01ae` (#99), which this directly extends |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
@@ -161,6 +162,7 @@ The rows above marked **UPSTREAM-WORTHY** or **MIXED** are on `fork-only` becaus
 - `d4d0fe4` — `manager_016` samples the side pane before an 8-notch scroll has drained (fork #81).
 - `9ed01ae` — `request_from_socket` has no read/write bound of its own and hangs forever against a daemon that accepts the connection and then goes silent (fork #99, #89).
 - `88cb1aa` — work-done output paths collide between concurrent panes, and the `--task-file` cwd-drift refusal depends on the daemon's own working directory instead of being cwd-independent (fork #76, upstream #331).
+- `9cc775c` — `request_from_socket_inner` has no total-operation deadline, so a peer that drips bytes slowly enough to keep resetting each individual read/write timeout can still hang the overall call forever (fork #101, #99).
 
 **Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
