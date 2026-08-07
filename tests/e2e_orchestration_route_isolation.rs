@@ -18,12 +18,15 @@
 //! and the signals are issued by real agents rather than by the test.
 //!
 //! ## Why THREE roles, and why both chains run at once
-//! `.dot-agent-deck/worker-task-{role}.md` and `work-done-{role}.md` are keyed by
-//! ROLE within a cwd — deliberately, PRD #140 keeps that layer out of scope — so
-//! two same-cwd tabs sharing a role name also share those files. That makes a
-//! file artifact useless as a "which tab did this?" discriminator, and an agent
-//! TUI's redrawing scrollback makes occurrence-COUNTING unreliable. The fixture
-//! therefore carries three roles and each tab is driven through a DIFFERENT one:
+//! `.dot-agent-deck/worker-task-{role}.md` is keyed by ROLE within a cwd —
+//! deliberately, PRD #140 keeps that layer out of scope — so two same-cwd tabs
+//! sharing a role name still share that file. (`work-done-{role}-<pane digest>.md`
+//! no longer does, since upstream #331 + fork #76 added a per-pane digest, but
+//! the fixture keeps the role split below regardless — it is what makes an agent
+//! TUI's redrawing scrollback occurrence-COUNTING unnecessary, not just the file
+//! artifact.) That still makes the worker-task file useless as a "which tab did
+//! this?" discriminator on its own. The fixture therefore carries three roles
+//! and each tab is driven through a DIFFERENT one:
 //!
 //! - tab A: `orchestrator` → delegate to `coder`
 //! - tab B: `orchestrator` → delegate to `reviewer`
@@ -62,6 +65,7 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
 use dot_agent_deck::daemon_protocol::AttachRequest;
+use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
 
 /// The fixture's `[[orchestrations]] name` — the label BOTH tabs render with in
@@ -481,22 +485,24 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
          === tab B reviewer pane (normalized, tail) ===\n{}",
         tail(&common::pane_search_key_on(&socket, &reviewer_b.agent_id)),
     );
+    let work_done_coder_a = work_done_file_name("coder", &coder_a.pane_id);
     assert!(
         common::wait_for_path(
-            &cwd.join(".dot-agent-deck").join("work-done-coder.md"),
+            &cwd.join(".dot-agent-deck").join(&work_done_coder_a),
             Duration::from_secs(150)
         ),
-        "tab A's coder never signalled work-done (no .dot-agent-deck/work-done-coder.md).\n\
+        "tab A's coder never signalled work-done (no .dot-agent-deck/{work_done_coder_a}).\n\
          === tab A coder pane (normalized, tail) ===\n{}",
         tail(&common::pane_search_key_on(&socket, &coder_a.agent_id)),
     );
+    let work_done_reviewer_b = work_done_file_name("reviewer", &reviewer_b.pane_id);
     assert!(
         common::wait_for_path(
-            &cwd.join(".dot-agent-deck").join("work-done-reviewer.md"),
+            &cwd.join(".dot-agent-deck").join(&work_done_reviewer_b),
             Duration::from_secs(150)
         ),
         "tab B's reviewer never signalled work-done (no \
-         .dot-agent-deck/work-done-reviewer.md).\n\
+         .dot-agent-deck/{work_done_reviewer_b}).\n\
          === tab B reviewer pane (normalized, tail) ===\n{}",
         tail(&common::pane_search_key_on(&socket, &reviewer_b.agent_id)),
     );
