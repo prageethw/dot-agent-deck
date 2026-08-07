@@ -60,8 +60,8 @@ use dot_agent_deck::agent_pty::{
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::daemon_protocol::{
-    AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, bind_attach_listener,
-    read_frame, serve_attach, serve_attach_with_counter, write_frame,
+    AttachRequest, AttachResponse, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_STREAM_END,
+    bind_attach_listener, read_frame, serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType, Writable};
@@ -3350,4 +3350,332 @@ fn race_pane_is_idle(state: &SharedState) -> bool {
             .is_some_and(|s| s.status == SessionStatus::Idle),
         Err(_) => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issues #49 / #28 — the TUI re-subscribes on reconnect but never
+// re-hydrates. `session/live/012` (above) closes the BOOTSTRAP snapshot/
+// subscribe window; these close the same hazard LATER in the connection's
+// life, once the subscription that bootstrap already ordered correctly dies
+// mid-session and the reconnect loop re-subscribes without draining a fresh
+// `list_agents` snapshot.
+// ---------------------------------------------------------------------------
+
+const RECONNECT_PANE: &str = "pane-reconnect-49";
+const RECONNECT_AGENT: &str = "agent-reconnect-49";
+
+/// Which shape the mock daemon's forced tear-down takes — the two ways
+/// issues #49/#28 report the subscription dying mid-session. The approved
+/// design (`docs`/PRD decision recorded in the work-done report) is "always
+/// re-hydrate on reconnect", not just on `Lagged`, so both variants must
+/// converge the same way.
+#[derive(Clone, Copy)]
+enum ReconnectTeardown {
+    /// `KIND_STREAM_END` carrying the documented `"lagged"` reason —
+    /// `handle_subscribe_events`'s `RecvError::Lagged` arm.
+    Lagged,
+    /// The connection simply drops with no `KIND_STREAM_END` frame at all —
+    /// stands in for a daemon restart or a bare transport failure.
+    Dropped,
+}
+
+/// Mock daemon for issues #49/#28. `ListAgents` always answers from
+/// `record`'s CURRENT value, read fresh on every call, so a later call sees
+/// whatever the test has since mutated. The FIRST `SubscribeEvents`
+/// connection acknowledges normally and then does nothing but wait for
+/// `teardown` — it deliberately never calls `rx.recv()`, so nothing broadcast
+/// while it is the live subscription can ever reach the client through it —
+/// then ends the stream per `reason`. Every LATER `SubscribeEvents`
+/// connection (the reconnect) forwards broadcast events normally.
+///
+/// This makes the outage window exact by construction rather than by timing:
+/// only events sent after the reconnect's OWN `subscribe()` call can ever be
+/// observed, which is exactly how a real `tokio::sync::broadcast::Sender`
+/// behaves (a new subscriber never sees history) — no sleep, no race.
+async fn run_reconnect_teardown_server(
+    listener: UnixListener,
+    event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
+    record: Arc<Mutex<AgentRecord>>,
+    teardown: Arc<tokio::sync::Notify>,
+    reason: ReconnectTeardown,
+) {
+    let subscribe_count = Arc::new(AtomicUsize::new(0));
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let event_tx = event_tx.clone();
+        let record = record.clone();
+        let teardown = teardown.clone();
+        let subscribe_count = subscribe_count.clone();
+        tokio::spawn(async move {
+            let req = match read_frame(&mut stream).await {
+                Ok(Some((KIND_REQ, payload))) => {
+                    match serde_json::from_slice::<AttachRequest>(&payload) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
+                }
+                _ => return,
+            };
+            match req {
+                AttachRequest::ListAgents => {
+                    let snapshot = record.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let resp = AttachResponse {
+                        ok: true,
+                        agent_records: Some(vec![snapshot]),
+                        ..Default::default()
+                    };
+                    let _ = write_resp(&mut stream, &resp).await;
+                }
+                AttachRequest::SubscribeEvents => {
+                    let rx = event_tx.subscribe();
+                    if write_resp(&mut stream, &AttachResponse::ok())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let is_first =
+                        subscribe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    if is_first {
+                        // Never drains `rx` — see the function doc. Waits
+                        // ONLY for the test's explicit signal, so the
+                        // tear-down happens exactly when the test wants it.
+                        drop(rx);
+                        teardown.notified().await;
+                        match reason {
+                            ReconnectTeardown::Lagged => {
+                                let _ = write_frame(&mut stream, KIND_STREAM_END, b"lagged").await;
+                            }
+                            ReconnectTeardown::Dropped => {
+                                // No STREAM_END frame — just drop the stream.
+                            }
+                        }
+                    } else {
+                        let mut rx = rx;
+                        while let Ok(msg) = rx.recv().await {
+                            let payload =
+                                serde_json::to_vec(&msg).expect("BroadcastMsg serializes");
+                            if write_frame(&mut stream, KIND_EVENT, &payload)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                AttachRequest::AttachStream { .. } => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                    loop {
+                        match read_frame(&mut stream).await {
+                            Ok(None) | Err(_) => break,
+                            Ok(Some(_)) => continue,
+                        }
+                    }
+                }
+                _ => {
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                }
+            }
+        });
+    }
+}
+
+/// Drives the real production reconnect bootstrap — `reconnect::run_event_subscriber`,
+/// `EmbeddedPaneController::hydrate_from_daemon`, and `AppState::seed_hydrated_session`
+/// together — against [`run_reconnect_teardown_server`], tears the live subscription
+/// down via `reason` once bootstrap has completed and the card reads the bootstrap
+/// `Working` snapshot, and asserts the pane converges to `Idle` — the daemon's truth,
+/// which only a fresh `list_agents` drained on reconnect can recover. Shared by
+/// session/live/013 and session/live/014; only the tear-down shape differs.
+async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) {
+    let record = Arc::new(Mutex::new(AgentRecord {
+        id: RECONNECT_AGENT.to_string(),
+        pane_id_env: Some(RECONNECT_PANE.to_string()),
+        display_name: None,
+        cwd: None,
+        tab_membership: None,
+        agent_type: Some(AgentType::ClaudeCode),
+        rows: 24,
+        cols: 80,
+        live: Some(SessionSnapshot {
+            status: SessionStatus::Working,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 0,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: false,
+        }),
+    }));
+
+    let (dir, path, listener) = {
+        let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = UnixListener::bind(&path).expect("bind mock attach socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path, listener)
+    };
+    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastMsg>(16);
+    let teardown = Arc::new(tokio::sync::Notify::new());
+    let server = tokio::spawn(run_reconnect_teardown_server(
+        listener,
+        event_tx.clone(),
+        record.clone(),
+        teardown.clone(),
+        reason,
+    ));
+
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+
+    // --- the production reconnect bootstrap, in the order `main` runs it ---
+    let gate = HydrationGate::armed();
+    let subscriber = tokio::spawn(run_event_subscriber(
+        path.clone(),
+        state.clone(),
+        gate.clone(),
+    ));
+
+    let ctrl = Arc::new(
+        EmbeddedPaneController::new(path.clone(), tokio::runtime::Handle::current())
+            .with_hydration_gate(gate.clone()),
+    );
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(hydrated.len(), 1, "the single daemon agent must hydrate");
+    assert_eq!(hydrated[0].pane_id, RECONNECT_PANE);
+
+    {
+        let mut st = state.write().await;
+        for h in &hydrated {
+            st.register_pane(h.pane_id.clone());
+            st.seed_hydrated_session(
+                h.pane_id.clone(),
+                h.cwd.clone(),
+                h.agent_type.clone(),
+                Some(h.agent_id.clone()),
+                h.live.as_ref(),
+            );
+        }
+        assert_eq!(
+            st.sessions[&format!("pane-{RECONNECT_PANE}")].status,
+            SessionStatus::Working,
+            "precondition: the card seeds Working from the bootstrap snapshot"
+        );
+    }
+    gate.mark_seeded();
+    assert!(
+        gate.is_subscribed(),
+        "precondition: the bootstrap subscription must be up before the outage is staged"
+    );
+
+    // The outage: the daemon's own truth moves to Idle while the ONLY current
+    // subscription (the mock's first `SubscribeEvents` connection) is
+    // structurally incapable of observing it — see
+    // `run_reconnect_teardown_server`'s doc comment. This is exactly the kind
+    // of broadcast a real daemon emits and a really-disconnected client
+    // misses.
+    teardown.notify_one();
+    {
+        let mut rec = record.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(live) = rec.live.as_mut() {
+            live.status = SessionStatus::Idle;
+        }
+    }
+    let corrected_event = AgentEvent {
+        session_id: format!("sess-{RECONNECT_AGENT}"),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Idle,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some(RECONNECT_PANE.to_string()),
+        agent_id: Some(RECONNECT_AGENT.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    let _ = event_tx.send(BroadcastMsg::Event(corrected_event));
+
+    let corrected = {
+        let state = state.clone();
+        wait_for(
+            Duration::from_secs(8),
+            Duration::from_millis(25),
+            || match state.try_read() {
+                Ok(st) => st
+                    .sessions
+                    .get(&format!("pane-{RECONNECT_PANE}"))
+                    .is_some_and(|s| s.status == SessionStatus::Idle),
+                Err(_) => false,
+            },
+        )
+        .await
+    };
+
+    let status = state.read().await.sessions[&format!("pane-{RECONNECT_PANE}")]
+        .status
+        .clone();
+
+    subscriber.abort();
+    server.abort();
+    drop(ctrl);
+    drop(dir);
+
+    assert!(
+        corrected,
+        "reconnect must re-hydrate a fresh `list_agents` snapshot and recover the \
+         status change broadcast during the outage — the card is stuck at {status:?} \
+         instead of Idle (issues #49 / #28)"
+    );
+}
+
+/// Scenario: Bootstrap a reconnecting TUI against a mock daemon (same
+/// production path as `session/live/014`), then force the live
+/// `SubscribeEvents` connection to close with the daemon's documented
+/// `KIND_STREAM_END "lagged"` tear-down while the daemon's own status moves
+/// from `Working` to `Idle`. The TUI's reconnect loop re-subscribes; the card
+/// must land on `Idle` because reconnect drains a fresh `list_agents`
+/// snapshot, not stay stuck on the `Working` it saw before the outage.
+#[spec("session/live/015")]
+#[test]
+fn live_015_lagged_teardown_mid_session_is_recovered_by_reconnect_rehydration() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    rt.block_on(assert_reconnect_recovers_the_missed_status(
+        ReconnectTeardown::Lagged,
+    ));
+}
+
+/// Scenario: Same bootstrap as `session/live/015`, but the subscription dies
+/// WITHOUT a `lagged` reason — the connection just drops, standing in for a
+/// daemon restart or a bare transport failure. The approved design is
+/// "always re-hydrate on reconnect", not just on `lagged`, so the card must
+/// still recover to `Idle` off a fresh snapshot after this shape of outage.
+#[spec("session/live/016")]
+#[test]
+fn live_016_transport_drop_mid_session_is_also_recovered_by_reconnect_rehydration() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("multi-thread runtime");
+    rt.block_on(assert_reconnect_recovers_the_missed_status(
+        ReconnectTeardown::Dropped,
+    ));
 }
