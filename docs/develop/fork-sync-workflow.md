@@ -56,7 +56,7 @@ git push --force origin main   # force-with-lease won't help here: we didn't fet
 
 ## The current `fork-only` stack
 
-Oldest to newest, rooted at an upstream base commit. Always re-verify against the live branch before trusting exact SHAs — run `git log origin/fork-only --oneline -20`, since a sync rewrites every SHA below the base:
+Oldest to newest, rooted at an upstream base commit. Always re-verify against the live branch before trusting exact SHAs — run `git log origin/fork-only --oneline -50`, since a sync rewrites every SHA below the base:
 
 | SHA | Commit | Status |
 | --- | --- | --- |
@@ -76,10 +76,60 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `35780ef` | `fork-only: reassign orchestrator/coder to opus, release to haiku (#13)` | **PERMANENT** fork-only |
 | `fc45d01` | `docs(prd-370): create PRD #370 - shell activity working status [skip ci]` | **PERMANENT** fork-only (doc) |
 | `703b4d2` | `docs(prd-383): create PRD #383 - blocked-keystroke reset for the Orchestration inactivity timer [skip ci]` | **PERMANENT** fork-only (doc) — **describes behaviour that no longer exists**: PRD #393 deleted the inactivity timer this PRD's reset applied to; see note below |
-| `d6e1d21` | `feat(prd-370): treat underlying shell activity as Working status inside a worker pane (#14)` | **PERMANENT** fork-only |
+| `d6e1d21` | `feat(prd-370): treat underlying shell activity as Working status inside a worker pane (#14)` | **PERMANENT** fork-only, but **as an ancestor only** — its `tcgetpgrp` body never fired and was replaced by `296b9d1` (PRD #386); see watch-item below |
+| `a8987e6` | `fork-only: update the fork-sync-workflow stack table after the 2026-08-05 sync` | **PERMANENT** fork-only (this doc) |
 | `08a9402` | `fork-only: run the L2 e2e tier in CI as an informational, non-blocking job` | **PERMANENT** fork-only |
+| `0348ebb` | `docs(claude): correct rule 5's stale never-in-CI e2e claim for this fork` | **PERMANENT** fork-only (rules) |
+| `d3c278f` | `docs(claude): correct rule 4's stale never-in-CI e2e claim for this fork` | **PERMANENT** fork-only (rules) |
+| `166cb8b` | `docs: make "regression runs in CI, not locally" an explicit fork rule` | **PERMANENT** fork-only (rules) |
+| `f7c9e6d` | `fork-only: align worker prompt templates with "regression runs in CI"` | **PERMANENT** fork-only (prompts) |
+| `03ba9e9` | `fork-only: condition step 6 on local casts, add checkpoint-findings rule, document generated orchestrator context` | **PERMANENT** fork-only (prompts) |
+| `e80c4a0` | `docs(prd-370): record that the tcgetpgrp signal never fired; superseded by #386` | **PERMANENT** fork-only (doc) |
+| `7692861` | `docs(prd-370): mark the PRD superseded by #386 in its status line` | **PERMANENT** fork-only (doc) |
+| `9baf503` | `fork-only: require every work-done report to lead with a Summary naming the PRD/issue` | **PERMANENT** fork-only (prompts) |
+| `6b00f5e` | `fork-only: require a progress table in orchestrator status reports` | **PERMANENT** fork-only (prompts) |
+| `0451799` | `feat(prd-373): auto-return focus to the orchestrator pane (#18)` | **PERMANENT** fork-only — but **half of it is dead**: `6df86c1` (PRD #393) deletes its inactivity snap-back; see note below |
+| `91c245a` | `feat(prd-387): unified, deck-global, command-mode-scoped Ctrl+L split toggle (#19)` | **PERMANENT** fork-only — generalises `30c5f79` |
+| `09ccc53` | `chore: remove Telegram and Slack MCP wiring and the orchestrator notification protocol (#22)` | **PERMANENT** fork-only (config/prompts) |
+| `296b9d1` | `feat(prd-386): descendant-scan shell-activity signal (#23)` | **TEMPORARY** — open upstream as PR #390; see watch-item below |
+| `c43266f` | `test/docs: repair card-badge assertions, v0.35.8 changelog, notification-recipe tense (#24, #25)` | **PERMANENT** fork-only — the assertions follow `349e895`'s badge removal |
+| `3154929` | `fix(prd-386): preserve synthetic-working provenance across hydration (#34, #37, #38)` | **TEMPORARY** — rides on `296b9d1` / PR #390 |
+| `4a21e02` | `ci/docs: stop the e2e job flaking under runner contention; move all test runs to CI (#40, #42)` | **PERMANENT** fork-only (CI/rules) |
+| `60634fd` | `fix: close the hydration idle-edge race and harden shell-activity ps sampling (#43, #44)` | **MIXED** — the `ps`-sampling half rides on `296b9d1`; the hydration-race half is an upstream-worthy bug fix, see the upstream-candidate note below |
+| `beaf579` | `docs(fork): worktree-per-fix default, CI-only testing in the role prompts, PRD #361 record (#48, #52, #53)` | **PERMANENT** fork-only (rules/prompts) |
+| `af0a0f1` | `test/docs: de-flake manager_010, quote generated shims, record Greptile's credit-limit mode (#54, #55, #59)` | **MIXED** — the two test fixes are upstream-worthy; the Greptile note is fork-only |
+| `6df86c1` | `feat(prd-393): command-mode-scoped, deck-global command-entry lock and lock-governed focus (#51)` | **PERMANENT** fork-only — amends `26255e8`, deletes `0451799`'s timer; see note below |
+| `5eddb54` | `test(e2e): make delegate_011 clock-independent and wait on the widget, not a proxy string (#60, #61)` | **UPSTREAM-WORTHY** — generic e2e determinism, no fork-specific content |
+| `de8c161` | `docs(prd-393): revive M7 - the upstream proposal is open as PR #404 (#66)` | **PERMANENT** fork-only (doc) |
+| `6553f44` | `fix(orchestration): guard the waiting-focus move against queued input (#69)` | **PERMANENT** fork-only — fixes `bbad18a`/`6df86c1`'s focus chain |
+| `7e27ec3` | `fix: re-hydrate a fresh snapshot on every reconnect, not just at bootstrap (#49, #28)` | **UPSTREAM-WORTHY** — upstream reconnect defect, not a fork customisation |
+| `e2d77a3` | `fix: enforce PROTOCOL_VERSION on the local daemon attach path (#17)` | **UPSTREAM-WORTHY** — upstream protocol-gate defect, not a fork customisation |
+| `4e11558` | `fork-only: skip upstream-only Homebrew/Scoop publishing on fork releases (#35)` | **PERMANENT** fork-only (release CI) |
+| `c04ab81` | `docs(changelog): key the command-entry-lock fragment to fork issue #68 (#72)` | **PERMANENT** fork-only (changelog) |
+| `c50f931` | `chore(config): run the orchestrator in plan mode, the coder and release roles on sonnet (#77)` | **PERMANENT** fork-only — amends `35780ef`/`d87f995` |
+| `3e1d4ec` | `docs: correct the real-agent e2e file count from 4 to 19 (fork #26)` | **UPSTREAM-WORTHY** — corrects an upstream doc/rule count |
+| `ac12948` | `fork-only: skip the docs publish job on fork releases (#71)` | **PERMANENT** fork-only (release CI) |
+| `665ed77` | `test(daemon): pin ingest_event's broadcast/apply atomicity (fork #31)` | **UPSTREAM-WORTHY** — generic daemon regression test |
 
-The base is `9ca7de1` — `upstream/main`'s tip at the time of this sync (2026-08-05). Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`. This sync also picked up 7 commits (`30c5f79` through `d6e1d21`) that had landed directly on `main` since the previous sync without ever being added to `fork-only` — a reminder that `fork-only` needs to be kept current as fork-specific work lands on `main`, not just rebuilt at sync time. Consider re-curating it (or running the sync procedure) more often than "whenever it's badly out of date" to keep this drift small.
+The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
+
+**Re-curated 2026-08-07.** The 2026-08-05 sync closed with `main` reset to `fork-only`; two days later `main` was **184 commits ahead** and running the documented `git reset --hard fork-only` would have discarded every one of them. Rows `0451799` onward are that re-curation: the 184 commits squashed into 22 logically-grouped commits, in `main`'s own topological order, each one's tree taken verbatim from `main` at a PR-merge boundary. Because `main` never takes upstream changes directly, the re-curation is verifiable by a single check — `git diff fork-only origin/main` must be **empty** apart from this file's own table update. It was, at `665ed77`.
+
+**Keep it current.** This is the second time the drift has been discovered rather than prevented (the 2026-08-05 sync picked up 7 uncurated commits; this one picked up 184). Re-curate whenever a PR merges to `main`, or at minimum on a fixed cadence — not "whenever it's badly out of date". Every re-curation that waits makes the squash grouping coarser and the next upstream rebase harder to reason about.
+
+### Upstream candidates: what is on this stack that is not a fork customisation
+
+Six rows above are marked **UPSTREAM-WORTHY** or **MIXED**. They are on `fork-only` because they are on `main` and the invariant demands it, not because the fork wants to keep them diverged. They fix defects or flakes that exist in `upstream/main` just as much as here:
+
+- `7e27ec3` — the TUI never re-hydrates after a mid-session subscription loss (fork #49/#28).
+- `e2d77a3` — the local daemon attach path never checks `PROTOCOL_VERSION` (fork #17). Note this one carries a `changelog.d/17.breaking.md` fragment.
+- `665ed77` — `ingest_event`'s broadcast/apply atomicity is unpinned (fork #31).
+- `5eddb54` — `delegate_011` depends on paused-clock tick alignment; e2e waits keyed on proxy strings sample torn frames (#402, #395).
+- `af0a0f1` — `manager_010`'s `[Submit]` torn-frame flake, and developer-controlled paths interpolated into generated `/bin/sh` shims (#54, #59).
+- `3e1d4ec` — the real-agent e2e file count in the rules is stale (fork #26).
+- The hydration-race half of `60634fd` (`send_replace` on the hydration gate, closing the reconnect snapshot/subscribe window — fork #36).
+
+**Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
 ### Supersession: PRD #371's `SplitStage` replaces PRD #336's `split_narrow`
 
@@ -103,15 +153,25 @@ So `26255e8` stays **independently PERMANENT**: it is a feature to preserve on i
 
 **`703b4d2` is the one that genuinely lost its subject.** PRD #383's blocked-keystroke reset existed to keep #373's 30-second inactivity timer from misreading a locked pane as idle. PRD #393 **deleted that timer entirely** — along with `auto_focus_after_inactivity`, `last_role_pane_activity_at` and all six of its stamp sites, the `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS` test seam, and eleven tests. The doc commit stays in the stack as an ancestor, but nothing it describes is live behaviour any more.
 
-**Drift worth noticing while you are here:** PRD #373's *implementation* commit is not in this table at all — only #383's doc commit is. #373 landed directly on `main` after the previous sync without being curated in, exactly the drift the paragraph above the table warns about. It is now partially deleted by #393, so re-curating the stack should record #373's all-clear focus move (which survives) separately from its inactivity timer (which does not).
+**Drift resolved 2026-08-07:** PRD #373's *implementation* used to be missing from this table — it landed directly on `main` after the 2026-08-05 sync without being curated in. It is now curated in as `0451799`. It was **not** split into its surviving and deleted halves, deliberately: `main` merged all of #373 as one PR (#18), and carving M1's all-clear focus move out of M2/M3's inactivity snap-back would have meant hunk-level surgery on a tree that no commit on `main` ever had. The stack therefore replays history faithfully — `0451799` adds the timer, `6df86c1` (PRD #393) deletes it — and this note is how a future conflict resolver knows that roughly half of `0451799` is dead on arrival. **If a rebase conflicts inside `0451799` on `auto_focus_after_inactivity`, `last_role_pane_activity_at`, or `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS`, resolve it however is cheapest** — `6df86c1` removes all three a few commits later. Only `0451799`'s all-clear focus move is worth resolving with care.
 
 **None of this changes upstream conflict risk**, because none of it exists upstream: `command_entry_locked`, `auto_focus_*`, `ToggleOrchestrationLock` and `gate_pane_input_key` all have **zero** occurrences on `upstream/main`, verified during #393. #373 and #374 were both closed upstream as not-planned. See PRD #393's Upstream section for why a future contribution would be a net-new proposal rather than a port, and issue #369 for the maintainer's recorded position on the feature itself.
 
 ### Watch-item: PRD #333 is temporary
 
-`ac43b4e` (PRD #333, colour orchestration tab labels by status) is **not** a permanent fork feature. It already has an open upstream PR — **#356** on `vfarcic/dot-agent-deck`, still open/unmerged as of this sync (2026-08-05), blocked on upstream maintainer merge rights, the same situation as PRs #352/#346. It sits in the stack only because fork-only commit #5 (`bbad18a`, auto-focus) structurally depends on the `pane_status_for_tabs` code PRD #333 introduces.
+`ac43b4e` (PRD #333, colour orchestration tab labels by status) is **not** a permanent fork feature. It already has an open upstream PR — **#356** on `vfarcic/dot-agent-deck`, still open/unmerged as of 2026-08-07, blocked on upstream maintainer merge rights, the same situation as PRs #352/#346. It sits in the stack only because fork-only commit #5 (`bbad18a`, auto-focus) structurally depends on the `pane_status_for_tabs` code PRD #333 introduces.
 
 **When PR #356 actually merges upstream:** the next `git rebase upstream/main` should find `73b233c`'s changes already present natively. Git will likely reduce it to an empty/no-op commit — drop it at that point (`git rebase --skip` when it stops on the empty commit, or rebase with `--empty=drop`). Until #356 merges, leave it in.
+
+### Watch-item: PRD #386 is temporary too
+
+`296b9d1` (PRD #386, the descendant-scan shell-activity signal) is the same shape as PRD #333: real fork work that is already **offered upstream as PR #390** on `vfarcic/dot-agent-deck`, still open/unmerged as of 2026-08-07. Two rows ride on it — `3154929` (synthetic-working provenance across hydration) and the `ps`-sampling half of `60634fd` — and `d6e1d21` (PRD #370) is its dead predecessor.
+
+**When PR #390 merges upstream,** do *not* expect a single clean empty commit the way #333 will produce: #390 carries the M1–M3 core, while `3154929` and `60634fd` are fork-side follow-ups authored after the PR was opened. Rebase `296b9d1` first, drop whatever git reduces to empty, then rebase the two follow-ups on top of upstream's merged version and keep only the hunks upstream does not already have. `d6e1d21` becomes purely historical at that point.
+
+### Watch-item: this stack now contains upstream-worthy work
+
+Unlike the two above, the rows marked **UPSTREAM-WORTHY** in the table have **no upstream PR at all**. Nothing will make them go away on their own — they will be replayed by every future rebase until someone offers them upstream. See the upstream-candidate note under the table for the list and why it is worth clearing.
 
 ### Caution: don't assume a commit is a redundant duplicate
 
