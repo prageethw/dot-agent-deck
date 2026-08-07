@@ -2119,6 +2119,20 @@ without depending on the config struct API.
 - **Does not assert:** the time spent in the recovery path.
 - **Platform coverage:** mac+linux.
 
+##### error/socket/003 — `request_from_socket` returns `None` within a bounded wait against a daemon that reads the request and then never replies and never closes, instead of hanging forever (fork issue #89).
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; a synthetic stub daemon over a real temp Unix socket, no PTY, no daemon binary, no real agent).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then sleeps well past the bound without replying or closing).
+- **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at 15s (comfortably above the production 5s bound the fix adds), returns before the 15s bound and the returned value is exactly `None` — a timed-out/unbounded daemon must fold into the same "no seed" bucket as a daemon that closes without replying, not a distinct outcome. A `RecvTimeoutError::Timeout` is treated as the RED failure (`request_from_socket` is unbounded) and fails the test with an explicit panic message rather than hanging until nextest's own timeout.
+- **Does not assert:** the exact timeout duration chosen by the fix (only that it is comfortably under 15s); `SocketReply`/`request_from_socket_with_deadline` (the `delegate` path, already covered elsewhere); real daemon behavior; Windows named-pipe timeout semantics.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/004 — `request_from_socket` still returns the reply from a daemon that is merely slow, not absent — a bound that fires too eagerly must not be mistaken for "no seed" (the regression fork issue #89 explicitly warns against).
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, sleeps 300ms — comfortably inside the production 5s bound — then writes one JSON reply line).
+- **Asserts:** `request_from_socket` returns `Some("{\"seed\":\"abc123\"}")` — the exact reply line, unmodified — proving the timeout bound added for `error/socket/003` does not fire against a daemon that is merely slow. Passes both before and after the fix; it is a correctness control, not a timing measurement, and the delay is deliberately far from the 5s bound to avoid the flake class in fork issue #81.
+- **Does not assert:** the timeout duration itself (`error/socket/003` pins the unbounded-hang failure mode; this test never reaches the bound); daemon behavior beyond a single reply line; real daemon timing.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.
