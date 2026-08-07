@@ -1699,6 +1699,65 @@ impl TuiDeck {
         }
     }
 
+    /// Generic sibling of [`wait_for_settled_terminal_cursor`](Self::wait_for_settled_terminal_cursor)
+    /// for tests that need some other VALUE derived from the rendered grid —
+    /// not the terminal cursor cell — to stop changing before they sample
+    /// it, e.g. a filtered list of markers read off `snapshot_grid()`.
+    /// Debounced read: poll `sample(&self.snapshot_grid())` until
+    /// `STABLE_SAMPLES` consecutive calls return an equal value, or
+    /// `timeout` elapses, whichever is first.
+    ///
+    /// The same trap documented on
+    /// [`wait_for_settled_terminal_cursor`](Self::wait_for_settled_terminal_cursor)
+    /// applies here: called immediately after an action whose effect has
+    /// not landed yet, the first several reads can all agree on the stale
+    /// pre-action value, which is trivially "stable" — this returns that
+    /// stale value within one poll interval instead of waiting for the real
+    /// change. Call this only once a coarse check (e.g.
+    /// [`wait_until_grid`](Self::wait_until_grid) for a divergence from a
+    /// known baseline) has established the change is under way — the
+    /// two-phase composition
+    /// [`wait_for_terminal_cursor_change_then_settle`](Self::wait_for_terminal_cursor_change_then_settle)
+    /// uses for the cursor case.
+    ///
+    /// Fork issue #81: `manager_016_wheel_over_dialog_does_not_scroll_side_pane`
+    /// sent 8 queued wheel notches via `scroll_n` and waited only for the
+    /// FIRST one's repaint (a bare "changed from baseline" predicate) before
+    /// sampling its `before` marker list. Under CI contention the remaining
+    /// notches were still draining and landed after `before` was captured,
+    /// so the pane legitimately changed again and the test's leak assertion
+    /// read that as a wheel event leaking through a dialog that was not
+    /// even open yet. Settling on this debounced value first — not merely a
+    /// changed one — closes that gap: it can only return once the derived
+    /// value has stopped changing across 3 samples, so no part of a
+    /// still-queued burst can land after the caller proceeds, regardless of
+    /// how slow the runner is.
+    pub fn wait_for_settled_grid_value<T: PartialEq>(
+        &self,
+        timeout: Duration,
+        sample: impl Fn(&str) -> T,
+    ) -> T {
+        const STABLE_SAMPLES: u32 = 3;
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+        let deadline = Instant::now() + timeout;
+        let mut last = sample(&self.snapshot_grid());
+        let mut stable_count = 1;
+        loop {
+            if stable_count >= STABLE_SAMPLES || Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+            let current = sample(&self.snapshot_grid());
+            if current == last {
+                stable_count += 1;
+            } else {
+                last = current;
+                stable_count = 1;
+            }
+        }
+    }
+
     /// Two-phase cursor wait for "this keystroke should move the cursor away
     /// from `from`": first a coarse, cheap `(row, col)` divergence check
     /// (catches "did anything move at all", bounded by `timeout`), then a
