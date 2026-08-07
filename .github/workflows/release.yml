@@ -55,7 +55,7 @@ jobs:
             echo "::error::RELEASE_TOKEN is unset or empty. This job pushes the changelog commit to the protected \`main\` branch and needs the admin PAT to bypass the ruleset; GITHUB_TOKEN cannot. Set the RELEASE_TOKEN secret and re-run. See CLAUDE.md rule 8."
             exit 1
           fi
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN }}
@@ -267,14 +267,14 @@ jobs:
             binary_ext: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross
@@ -413,7 +413,7 @@ jobs:
           BINARY_NAME="dot-agent-deck-${MATRIX_ARTIFACT_SUFFIX}${MATRIX_BINARY_EXT}"
           cp "target/${MATRIX_TARGET}/release/dot-agent-deck${MATRIX_BINARY_EXT}" "$BINARY_NAME"
           echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
           path: ${{ env.BINARY_NAME }}
@@ -422,11 +422,11 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: arduino/setup-task@v3.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
         with:
           version: 3.x
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
@@ -454,7 +454,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
