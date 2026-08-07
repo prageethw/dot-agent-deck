@@ -128,7 +128,7 @@ The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sy
 
 ### Upstream candidates: what is on this stack that is not a fork customisation
 
-Six rows above are marked **UPSTREAM-WORTHY** or **MIXED**. They are on `fork-only` because they are on `main` and the invariant demands it, not because the fork wants to keep them diverged. They fix defects or flakes that exist in `upstream/main` just as much as here:
+The rows above marked **UPSTREAM-WORTHY** or **MIXED** are on `fork-only` because they are on `main` and the invariant demands it, not because the fork wants to keep them diverged (the table on `main` lags `fork-only` by the most recent re-curation, so the current set is best read on `fork-only`). They fix defects or flakes that exist in `upstream/main` just as much as here:
 
 - `7e27ec3` — the TUI never re-hydrates after a mid-session subscription loss (fork #49/#28).
 - `e2d77a3` — the local daemon attach path never checks `PROTOCOL_VERSION` (fork #17). Note this one carries a `changelog.d/17.breaking.md` fragment.
@@ -137,6 +137,10 @@ Six rows above are marked **UPSTREAM-WORTHY** or **MIXED**. They are on `fork-on
 - `af0a0f1` — `manager_010`'s `[Submit]` torn-frame flake, and developer-controlled paths interpolated into generated `/bin/sh` shims (#54, #59).
 - `3e1d4ec` — the real-agent e2e file count in the rules is stale (fork #26).
 - The hydration-race half of `60634fd` (`send_replace` on the hydration gate, closing the reconnect snapshot/subscribe window — fork #36).
+- `819c5c1` — the fixed-budget PTY/grid observation flake class (fork #81, #82).
+- `aed6343` — `delegate` never surfaced daemon rejections or confirmations back to the caller (fork #84).
+- `7fb79f6` — `docs-publish.yml` splices `${{ … }}` into `run:` blocks; `release.yml`'s `docs:` job passes `secrets: inherit` unnecessarily (fork #87) — now open upstream as PR #410 (https://github.com/vfarcic/dot-agent-deck/pull/410, opened 2026-08-07).
+- `d4d0fe4` — `manager_016` samples the side pane before an 8-notch scroll has drained (fork #81).
 
 **Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
