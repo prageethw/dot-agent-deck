@@ -1401,6 +1401,11 @@ mod tests {
         next: Mutex<u32>,
         focused: Mutex<Option<String>>,
         focus_calls: Mutex<Vec<String>>,
+        /// `orchestration/delegate/030`: every `create_pane` call, recorded
+        /// in the order the CONTROLLER actually received it (which need not
+        /// match `config.roles` declaration order — that's the whole point
+        /// of the test this backs). `(command, minted pane id)`.
+        created: Mutex<Vec<(Option<String>, String)>>,
     }
 
     impl MockPaneController {
@@ -1409,6 +1414,7 @@ mod tests {
                 next: Mutex::new(0),
                 focused: Mutex::new(None),
                 focus_calls: Mutex::new(Vec::new()),
+                created: Mutex::new(Vec::new()),
             }
         }
 
@@ -1419,17 +1425,37 @@ mod tests {
         fn last_focus(&self) -> Option<String> {
             self.focus_calls.lock().unwrap().last().cloned()
         }
+
+        /// `orchestration/delegate/030`: the pane id minted for the create
+        /// call whose `command` was exactly `command`. Panics if no such
+        /// call was recorded — every role's command in this file's test
+        /// configs is unique, so an absent match means the test's own setup
+        /// is wrong, not that zero panes were created.
+        fn pane_id_for_command(&self, command: &str) -> String {
+            self.created
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(c, _)| c.as_deref() == Some(command))
+                .unwrap_or_else(|| panic!("no create_pane call recorded for command {command:?}"))
+                .1
+                .clone()
+        }
     }
 
     impl PaneController for MockPaneController {
         fn create_pane(
             &self,
-            _command: Option<&str>,
+            command: Option<&str>,
             _cwd: Option<&str>,
         ) -> Result<String, PaneError> {
             let mut n = self.next.lock().unwrap();
             let id = format!("pane-{n}");
             *n += 1;
+            self.created
+                .lock()
+                .unwrap()
+                .push((command.map(str::to_string), id.clone()));
             Ok(id)
         }
         fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
@@ -1646,6 +1672,73 @@ mod tests {
             )
             .expect("reattach without title");
         assert_eq!(tm.tab_labels()[fallback_idx], "orch");
+    }
+
+    /// Scenario: Open an orchestration whose config declares the start role
+    /// (`orchestrator`) FIRST and a worker (`coder`) SECOND — today's
+    /// spawn order — through a real `TabManager` against a
+    /// `MockPaneController` that records the command each `create_pane`
+    /// call actually received. Assert the returned `role_pane_ids` and the
+    /// stored `Tab::Orchestration.role_pane_ids`/`start_role_index` are
+    /// keyed by the CONFIG's declared role index (0 = orchestrator, 1 =
+    /// coder), not by whichever order the controller's calls arrived in.
+    /// fork #92's approved fix reorders the spawn LOOP (non-start roles
+    /// first, the Pi start role last) but must not disturb this indexing —
+    /// this guards that invariant. Not RED before the fix exists: today's
+    /// code spawns in declaration order already, so the property holds
+    /// trivially; this is a regression guard for the reorder to come, not a
+    /// pin on today's behavior (see the tester's `work-done` report).
+    #[spec("orchestration/delegate/030")]
+    #[test]
+    fn delegate_030_pi_last_spawn_order_keeps_pane_ids_declaration_indexed() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+
+        let (tab_index, role_pane_ids) = tm
+            .open_orchestration_tab(&orch_config("race-order"), "/work", None, None, (24, 80))
+            .expect("open_orchestration_tab");
+
+        assert_eq!(role_pane_ids.len(), 2, "one pane id per declared role");
+
+        // `orch_config` declares "echo orch" (start=true, index 0) before
+        // "echo coder" (index 1) — see its definition above.
+        let orchestrator_pane = pc.pane_id_for_command("echo orch");
+        let coder_pane = pc.pane_id_for_command("echo coder");
+        assert_eq!(
+            role_pane_ids[0], orchestrator_pane,
+            "role_pane_ids[0] is the config's declared index for the start role — it must hold \
+             the pane id actually minted FOR that role's command, regardless of what order the \
+             controller's create_pane calls happened in. A fix that reorders the spawn loop but \
+             keeps a naive sequential `role_pane_ids.push(pane_id)` would put the LAST-spawned \
+             pane's id here instead"
+        );
+        assert_eq!(
+            role_pane_ids[1], coder_pane,
+            "role_pane_ids[1] must hold the pane id minted for the coder role, by the same \
+             declaration-indexed contract — this is the id `TabMembership.role_index` and every \
+             layout/focus/status lookup keyed on role position depend on"
+        );
+
+        match &tm.tabs[tab_index] {
+            Tab::Orchestration {
+                start_role_index,
+                role_pane_ids: stored_ids,
+                ..
+            } => {
+                assert_eq!(
+                    *start_role_index, 0,
+                    "the start role's DECLARED index is 0 (orchestrator is listed first in \
+                     `orch_config`) — this must stay the config position, not a spawn-order \
+                     position, even once the fix spawns it last"
+                );
+                assert_eq!(
+                    stored_ids, &role_pane_ids,
+                    "the tab's own stored role_pane_ids must match what open_orchestration_tab \
+                     returned to the caller"
+                );
+            }
+            _ => panic!("expected Tab::Orchestration, got a different tab variant"),
+        }
     }
 
     /// Scenario: Give the Dashboard, a Mode tab, and an Orchestration tab

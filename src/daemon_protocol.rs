@@ -785,6 +785,7 @@ pub async fn serve_attach(
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
     let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
+    let dummy_start_agent_registration_hook = crate::daemon::noop_start_agent_registration_hook();
     serve_attach_with_counter(
         listener,
         registry,
@@ -795,6 +796,7 @@ pub async fn serve_attach(
         dummy_scheduler,
         dummy_reuse,
         dummy_worktrees,
+        dummy_start_agent_registration_hook,
     )
     .await
 }
@@ -818,6 +820,7 @@ pub async fn serve_attach_with_counter(
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    start_agent_registration_hook: crate::daemon::StartAgentRegistrationHook,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -841,6 +844,7 @@ pub async fn serve_attach_with_counter(
                 let scheduler = scheduler.clone();
                 let reuse_registry = reuse_registry.clone();
                 let worktree_registry = worktree_registry.clone();
+                let start_agent_registration_hook = start_agent_registration_hook.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -879,6 +883,7 @@ pub async fn serve_attach_with_counter(
                         scheduler,
                         reuse_registry,
                         worktree_registry,
+                        start_agent_registration_hook,
                     )
                     .await
                     {
@@ -922,6 +927,7 @@ pub async fn run_attach_server_with_counter(
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
     let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
+    let dummy_start_agent_registration_hook = crate::daemon::noop_start_agent_registration_hook();
     serve_attach_with_counter(
         listener,
         registry,
@@ -932,6 +938,7 @@ pub async fn run_attach_server_with_counter(
         dummy_scheduler,
         dummy_reuse,
         dummy_worktrees,
+        dummy_start_agent_registration_hook,
     )
     .await
 }
@@ -1111,6 +1118,7 @@ async fn handle_connection(
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    start_agent_registration_hook: crate::daemon::StartAgentRegistrationHook,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -1336,6 +1344,16 @@ async fn handle_connection(
                             pane_id.to_string(),
                             crate::agent_pty::seed_fallback_grace(),
                         );
+                    }
+                    // Fork issue #92 test seam: give a test the chance to hold
+                    // THIS pane's registration open, right after spawn (and
+                    // the seed stash above) but before the role/orchestrator
+                    // maps below are published. Production's
+                    // `start_agent_registration_hook` is the no-op default —
+                    // this `await` resolves immediately and is not observable.
+                    // See `StartAgentRegistrationHook`'s doc comment.
+                    if let Some(meta) = orchestration_meta.as_ref() {
+                        (start_agent_registration_hook)(&meta.role_name).await;
                     }
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
