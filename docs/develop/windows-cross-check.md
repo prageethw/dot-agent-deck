@@ -41,7 +41,9 @@ If a future dependency bump pulls in another native library the shims do not cov
 
 ## Reading the result
 
-Only **errors** matter. The Windows job runs `cargo clippy -- -D warnings` *without* `--all-targets` — deliberately, so a test-only lint cannot fail Windows-only and be unreproducible on the Linux pre-push gate (PRD #42 review S1). Test-target warnings (`tests/delegate_prompt_injection.rs` has had a few unused-import/unused-const warnings on Windows for a long while) do not fail CI and are not something this check asks you to fix.
+Only **errors** matter *here*. The Windows job runs `cargo clippy -- -D warnings` *without* `--all-targets` — deliberately, so a test-only lint cannot fail Windows-only and be unreproducible on the local pre-commit gate (PRD #42 review S1). **Windows-only** test-target warnings (`tests/delegate_prompt_injection.rs` has had a few unused-import/unused-const warnings on Windows for a long while, from `cfg`-gated code that is live on Unix and dead on Windows) do not fail CI and are not something this check asks you to fix.
+
+Note the scope of that carve-out narrowed in fork #117: test-target warnings that also appear **on Linux** now *do* fail CI, because the Linux `build` job lints `--all-targets --features e2e -- -D warnings`. Only warnings genuinely specific to the Windows build are tolerated, and only because no local gate can reproduce them.
 
 The Linux `build` job is no longer symmetric with it: issue #407 moved that one to `cargo clippy --all-targets --features e2e -- -D warnings`, because the bare invocation type-checked no test file at all. Windows and macOS stayed on the narrow command for the reason above, and because the L2 tier is Unix-only in practice — `--features e2e` against the Windows target reports dozens of E0425s (#164). So a test-target lint is enforced on Linux only, which is the intended asymmetry, not drift.
 
