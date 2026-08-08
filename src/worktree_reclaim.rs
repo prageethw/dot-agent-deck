@@ -177,15 +177,39 @@ struct RawWorktree {
     branch: Option<String>,
 }
 
-/// Parse `git worktree list --porcelain` into path/branch pairs. The first
-/// entry is always the main working tree (git's own documented ordering);
-/// callers skip it, since the primary checkout is never a reclaim candidate.
-fn parse_worktree_porcelain(text: &str) -> Vec<RawWorktree> {
+/// Build a `PathBuf` from one raw `-z` path field without a lossy UTF-8
+/// round-trip. On Unix a path is an arbitrary byte sequence, so this goes
+/// straight through `OsStr`; elsewhere (Windows paths are UTF-16, and `git`
+/// there emits UTF-8 on the wire) a lossy fallback is the best available.
+#[cfg(unix)]
+fn path_from_porcelain_field(field: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(field))
+}
+
+#[cfg(not(unix))]
+fn path_from_porcelain_field(field: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(field).into_owned())
+}
+
+/// Parse `git worktree list --porcelain -z` into path/branch pairs. `-z`
+/// NUL-terminates each field instead of newline-terminating it, which is
+/// what makes this safe: `--porcelain`'s default text mode C-quotes a path
+/// containing a newline, a double quote, or other characters it decides to
+/// escape, so treating that quoted, human-oriented text as a literal
+/// filesystem path silently misparses (or entirely skips) such a worktree.
+/// A path can never contain a NUL byte, so splitting on NUL is unambiguous
+/// regardless of what the path itself contains. An empty field marks the end
+/// of a worktree record, mirroring the blank-line separator `-z` replaces.
+/// The first entry is always the main working tree (git's own documented
+/// ordering); callers skip it, since the primary checkout is never a reclaim
+/// candidate.
+fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<RawWorktree> {
     let mut result = Vec::new();
     let mut cur_path: Option<PathBuf> = None;
     let mut cur_branch: Option<String> = None;
-    for line in text.lines() {
-        if line.is_empty() {
+    for field in bytes.split(|&b| b == 0) {
+        if field.is_empty() {
             if let Some(path) = cur_path.take() {
                 result.push(RawWorktree {
                     path,
@@ -194,16 +218,21 @@ fn parse_worktree_porcelain(text: &str) -> Vec<RawWorktree> {
             }
             continue;
         }
-        if let Some(rest) = line.strip_prefix("worktree ") {
+        if let Some(rest) = field.strip_prefix(b"worktree ") {
             if let Some(path) = cur_path.take() {
                 result.push(RawWorktree {
                     path,
                     branch: cur_branch.take(),
                 });
             }
-            cur_path = Some(PathBuf::from(rest));
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            cur_branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
+            cur_path = Some(path_from_porcelain_field(rest));
+        } else if let Some(rest) = field.strip_prefix(b"branch ") {
+            let rest = String::from_utf8_lossy(rest);
+            cur_branch = Some(
+                rest.strip_prefix("refs/heads/")
+                    .unwrap_or(&rest)
+                    .to_string(),
+            );
         }
     }
     if let Some(path) = cur_path.take() {
@@ -220,7 +249,7 @@ fn parse_worktree_porcelain(text: &str) -> Vec<RawWorktree> {
 fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
-        .args(["worktree", "list", "--porcelain"])
+        .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .map_err(|e| format!("failed to spawn `git worktree list`: {e}"))?;
     if !out.status.success() {
@@ -229,8 +258,7 @@ fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut all = parse_worktree_porcelain(&text);
+    let mut all = parse_worktree_porcelain(&out.stdout);
     if !all.is_empty() {
         all.remove(0); // the main working tree
     }
@@ -675,13 +703,32 @@ mod tests {
 
     #[test]
     fn parse_porcelain_skips_nothing_and_strips_refs_prefix() {
-        let text = "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n\nworktree /repo/wt-a\nHEAD def456\nbranch refs/heads/feat/a\n";
-        let parsed = parse_worktree_porcelain(text);
+        let text = "worktree /repo\0HEAD abc123\0branch refs/heads/main\0\0worktree /repo/wt-a\0HEAD def456\0branch refs/heads/feat/a\0\0";
+        let parsed = parse_worktree_porcelain(text.as_bytes());
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].path, PathBuf::from("/repo"));
         assert_eq!(parsed[0].branch.as_deref(), Some("main"));
         assert_eq!(parsed[1].path, PathBuf::from("/repo/wt-a"));
         assert_eq!(parsed[1].branch.as_deref(), Some("feat/a"));
+    }
+
+    #[test]
+    fn parse_porcelain_preserves_a_path_containing_a_literal_newline() {
+        // The exact case newline-delimited parsing cannot handle: a path
+        // byte sequence containing `\n` would be C-quoted by `--porcelain`'s
+        // default text mode and misparsed (or silently split apart) by a
+        // reader that treats each newline as a field terminator. With `-z`,
+        // only a NUL byte terminates a field, so a literal `\n` inside the
+        // path is just more path content.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"worktree /repo\0HEAD abc123\0branch refs/heads/main\0\0");
+        bytes.extend_from_slice(
+            b"worktree /repo/wt-\n-embedded\0HEAD def456\0branch refs/heads/feat/weird\0\0",
+        );
+        let parsed = parse_worktree_porcelain(&bytes);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].path, PathBuf::from("/repo/wt-\n-embedded"));
+        assert_eq!(parsed[1].branch.as_deref(), Some("feat/weird"));
     }
 
     #[test]
