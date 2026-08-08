@@ -50,6 +50,16 @@ use spec::spec;
 /// A missing fixture file (no PR for this branch) still prints `[]`, same as
 /// real `gh pr list` — that is a correctly-resolved "no PR" answer, not a
 /// wrong-invocation error, and must not look like one.
+///
+/// - **A fixture may be scoped to a specific `--repo` value, not just
+///   `--head`.** Every fixture up through `006` shares one `origin` remote, so
+///   keying on the branch alone was enough. `007` needs the SAME branch name
+///   to resolve to different PR states depending on which `--repo` was
+///   passed — the exact discrimination the `repo_dir`-vs-`wt.path` bug turned
+///   on — so the lookup first tries a `pr-<repo>-<branch>.json` file and only
+///   falls back to the branch-only `pr-<branch>.json` when that's absent.
+///   Every existing fixture never writes a repo-scoped file, so this fallback
+///   leaves `001`-`006` byte-for-byte unaffected.
 const GH_STUB_SCRIPT: &str = r#"#!/bin/sh
 all_args="$*"
 group="$1"
@@ -80,7 +90,11 @@ if [ "$group" = "pr" ] && [ "$sub" = "list" ]; then
     fi
 
     key=$(printf '%s' "$head" | tr '/' '_')
-    file="$GHSTUB_DIR/pr-$key.json"
+    repokey=$(printf '%s' "$repo" | tr '/' '_')
+    file="$GHSTUB_DIR/pr-$repokey-$key.json"
+    if [ ! -f "$file" ]; then
+        file="$GHSTUB_DIR/pr-$key.json"
+    fi
     if [ ! -f "$file" ]; then
         printf '[]\n'
         exit 0
@@ -226,6 +240,37 @@ impl Fixture {
         let key = branch.replace('/', "_");
         let body = format!(r#"[{{"state":"{state}","headRefName":"{branch}"}}]"#);
         std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
+    }
+
+    /// Canned `gh pr list --head <branch> --repo <repo_slug>` reply, scoped to
+    /// a specific `--repo` value rather than the branch alone — see the note
+    /// on `GH_STUB_SCRIPT`. Needed to make the SAME branch name resolve to
+    /// different PR states depending on which repo's remote was queried.
+    fn set_pr_state_for_repo(&self, repo_slug: &str, branch: &str, state: &str) {
+        let key = format!(
+            "{}-{}",
+            repo_slug.replace('/', "_"),
+            branch.replace('/', "_")
+        );
+        let body = format!(r#"[{{"state":"{state}","headRefName":"{branch}"}}]"#);
+        std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
+    }
+
+    /// Give a linked worktree its OWN `origin` remote, distinct from the main
+    /// checkout's. Mirrors real usage of `extensions.worktreeConfig`
+    /// (documented on `derive_repo_slug`): enabling the extension is
+    /// repository-scoped (it permits per-worktree overrides at all) but does
+    /// not itself change any existing remote, and `git config --worktree`
+    /// only writes an override into the ONE worktree it targets — the main
+    /// checkout's `origin` (read by any command run with `self.repo` as its
+    /// cwd) is untouched, and so is every other worktree that never gets this
+    /// call.
+    fn set_worktree_origin(&self, worktree: &Path, url: &str) {
+        git(&self.repo, &["config", "extensions.worktreeConfig", "true"]);
+        git(
+            worktree,
+            &["config", "--worktree", "remote.origin.url", url],
+        );
     }
 
     /// Mark a worktree as deck-created. The marker lives in the worktree's OWN
@@ -572,5 +617,74 @@ fn worktree_reclaim_006_json_output_carries_schema_version_and_verdicts() {
         Some("remove"),
         "a MERGED, clean, deck-owned worktree's JSON entry must carry verdict \"remove\", not \
          merely be present in the document; got entry:\n{entry}\nfull document:\n{stdout}"
+    );
+}
+
+/// Scenario: A linked worktree carries its OWN `origin` remote (via
+/// `extensions.worktreeConfig`), naming a different GitHub repo than the main
+/// checkout's. An unrelated PR under the SAME branch name is MERGED in the
+/// main checkout's repo, but the worktree's own repo has no PR for that
+/// branch at all. `worktree list` must resolve PR state against the
+/// worktree's own remote (finding no PR, so `keep`) rather than the caller's
+/// cwd remote (which would find the unrelated MERGED PR and report
+/// `remove`), even though the worktree is otherwise clean and owned.
+#[spec("worktree/reclaim/007")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller_cwd() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-divergent-remote", "feat/divergent-remote");
+    fx.mark_owned(&wt); // clean by construction, owned: only PR state can protect it
+
+    // The main checkout's own repo ("test-org/test-repo", set in Fixture::new)
+    // has an UNRELATED PR merged under this exact branch name -- coincidence,
+    // not evidence about this worktree's own work.
+    fx.set_pr_state_for_repo("test-org/test-repo", "feat/divergent-remote", "MERGED");
+
+    // The worktree carries its OWN remote, naming a different repo, which has
+    // no PR fixture at all for this branch -> the stub's `[]` (no_pr).
+    fx.set_worktree_origin(&wt, "https://github.com/other-org/other-repo.git");
+
+    let out = fx.run(&["worktree", "list"]);
+    assert!(
+        out.status.success(),
+        "`worktree list` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let text = combined(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("wt-divergent-remote"))
+        .unwrap_or_else(|| {
+            panic!("`worktree list` must name the worktree it examined; got:\n{text}")
+        });
+    let fields: Vec<&str> = line.split('\t').collect();
+    assert_eq!(
+        fields.len(),
+        7,
+        "unexpected `worktree list` row shape; got fields {fields:?} from line:\n{line}"
+    );
+    assert_eq!(
+        fields[2], "no_pr",
+        "PR state must be resolved against the worktree's OWN remote, which has no PR for this \
+         branch -- not the caller's cwd remote, which has an unrelated MERGED PR under the same \
+         branch name; got PR column {:?} from line:\n{line}\nfull output:\n{text}",
+        fields[2]
+    );
+    assert_eq!(
+        fields[5], "keep",
+        "with no PR in the worktree's own repo, the verdict must be \"keep\", never \"remove\" \
+         -- resolving against the caller's cwd instead would see the unrelated repo's MERGED PR \
+         and remove real, unmerged work; got verdict column {:?} from line:\n{line}\nfull \
+         output:\n{text}",
+        fields[5]
+    );
+    assert_eq!(
+        fields[6], "no pull request found for this branch",
+        "the kept reason must name the true cause -- no PR in the worktree's OWN repo -- not an \
+         unrelated repo's merged one nor an unresolvable-PR-state message; got reason column \
+         {:?} from line:\n{line}\nfull output:\n{text}",
+        fields[6]
     );
 }

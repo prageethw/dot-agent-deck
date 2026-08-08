@@ -722,6 +722,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the full document shape; per-verdict field naming.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/007 — PR state is resolved against a worktree's OWN `origin` remote, not the caller's cwd — regression coverage for the `resolve_pr_state(repo_dir, ...)` → `resolve_pr_state(&wt.path, ...)` fix.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a worktree given its own `remote.origin.url` via `extensions.worktreeConfig`, naming a different GitHub repo than the main checkout's; the stub `gh` fixture is keyed by `--repo` as well as `--head` so the same branch name resolves to a MERGED PR under the main checkout's repo and no PR at all under the worktree's own repo).
+- **Asserts:** `worktree list`'s row for the worktree carries PR column `no_pr`, verdict `keep`, and reason `no pull request found for this branch` — the outcome only reachable by resolving PR state from the worktree's own remote; resolving from the caller's cwd (the pre-fix behaviour) would see the main checkout's unrelated MERGED PR and report verdict `remove` instead.
+- **Does not assert:** the `reclaim` (removal) path for this fixture, or JSON output — same gate, already covered elsewhere (`002`, `006`).
+- **Platform coverage:** mac+linux.
+
 
 ### Prompts
 
