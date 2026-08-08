@@ -791,6 +791,7 @@ pub async fn serve_attach(
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
     let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
+    let dummy_start_agent_registration_hook = crate::daemon::noop_start_agent_registration_hook();
     serve_attach_with_counter(
         listener,
         registry,
@@ -801,6 +802,7 @@ pub async fn serve_attach(
         dummy_scheduler,
         dummy_reuse,
         dummy_worktrees,
+        dummy_start_agent_registration_hook,
     )
     .await
 }
@@ -824,6 +826,7 @@ pub async fn serve_attach_with_counter(
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    start_agent_registration_hook: crate::daemon::StartAgentRegistrationHook,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -847,6 +850,7 @@ pub async fn serve_attach_with_counter(
                 let scheduler = scheduler.clone();
                 let reuse_registry = reuse_registry.clone();
                 let worktree_registry = worktree_registry.clone();
+                let start_agent_registration_hook = start_agent_registration_hook.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -885,6 +889,7 @@ pub async fn serve_attach_with_counter(
                         scheduler,
                         reuse_registry,
                         worktree_registry,
+                        start_agent_registration_hook,
                     )
                     .await
                     {
@@ -928,6 +933,7 @@ pub async fn run_attach_server_with_counter(
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
     let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
+    let dummy_start_agent_registration_hook = crate::daemon::noop_start_agent_registration_hook();
     serve_attach_with_counter(
         listener,
         registry,
@@ -938,6 +944,7 @@ pub async fn run_attach_server_with_counter(
         dummy_scheduler,
         dummy_reuse,
         dummy_worktrees,
+        dummy_start_agent_registration_hook,
     )
     .await
 }
@@ -1117,6 +1124,7 @@ async fn handle_connection(
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    start_agent_registration_hook: crate::daemon::StartAgentRegistrationHook,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -1326,23 +1334,31 @@ async fn handle_connection(
             };
             match registry.spawn_agent(opts) {
                 Ok(id) => {
-                    // PRD #201 native prompt delivery: if the spawn carried a
-                    // seed (a Pi start-role orchestrator pane), stash it for the
-                    // pane's extension to pull natively via `get-seed`, and arm
-                    // the PTY-injection safety net in case the pull never comes.
-                    // Do this right after spawn so the seed is available before
-                    // pi boots + fires `session_start`. Non-seed spawns (every
-                    // other pane) skip this entirely and keep the legacy path.
-                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
-                        && !seed.trim().is_empty()
-                    {
-                        registry.set_pending_seed(pane_id, seed);
-                        crate::agent_pty::arm_seed_fallback(
-                            registry.clone(),
-                            pane_id.to_string(),
-                            crate::agent_pty::seed_fallback_grace(),
-                        );
+                    // Fork issue #92 test seam: give a test the chance to hold
+                    // THIS pane's registration open, right after spawn but
+                    // before the role/orchestrator maps below are published
+                    // AND before the native seed becomes pullable. Production's
+                    // `start_agent_registration_hook` is the no-op default —
+                    // this `await` resolves immediately and is not observable.
+                    // See `StartAgentRegistrationHook`'s doc comment.
+                    if let Some(meta) = orchestration_meta.as_ref() {
+                        (start_agent_registration_hook)(&meta.role_name).await;
                     }
+                    // Fork #92 P1: populate daemon-side role maps BEFORE the
+                    // native-seed stash below, not after. A Pi start-role
+                    // pane's seed becomes pullable (and thus actionable via
+                    // `delegate --to <role>`) the moment it's stashed; if that
+                    // happened before every role's registration was
+                    // installed, a Pi start role spawned ahead of a worker
+                    // could delegate to a worker pane that does not exist in
+                    // `AppState` yet, and `delegate_targets` would resolve
+                    // nothing. `TabManager::open_orchestration_tab`
+                    // (`src/tab.rs`) now spawns the Pi start role LAST for
+                    // the same reason, so by the time this handler runs for
+                    // the Pi pane every other role's registration is already
+                    // installed — this ordering is what makes that
+                    // sufficient rather than merely likely.
+                    //
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -1410,6 +1426,26 @@ async fn handle_connection(
                         if is_start_role {
                             st.orchestrator_pane_ids.insert(pane_id.to_string());
                         }
+                    }
+                    // PRD #201 native prompt delivery: if the spawn carried a
+                    // seed (a Pi start-role orchestrator pane), stash it for the
+                    // pane's extension to pull natively via `get-seed`, and arm
+                    // the PTY-injection safety net in case the pull never comes.
+                    // This now runs AFTER the AppState registration above (fork
+                    // #92 P1) so the seed cannot become pullable — and therefore
+                    // actionable via a native `delegate --to <role>` — before
+                    // every role's registration is installed. Non-seed spawns
+                    // (every other pane) skip this entirely and keep the legacy
+                    // path.
+                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
+                        && !seed.trim().is_empty()
+                    {
+                        registry.set_pending_seed(pane_id, seed);
+                        crate::agent_pty::arm_seed_fallback(
+                            registry.clone(),
+                            pane_id.to_string(),
+                            crate::agent_pty::seed_fallback_grace(),
+                        );
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
