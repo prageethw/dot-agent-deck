@@ -2616,6 +2616,13 @@ without depending on the config struct API.
 - **Does not assert:** how the worktree path was resolved or created (covered by `orchestration/worktree/001`/`002`); real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/worktree/004 — Dispatching `Action::SpawnPane` for a request whose `dir` is a real git repository and whose `orchestration_worktree_path` is `Some(<sibling path>)` actually creates that worktree on disk and roots every role pane in it, not in `req.dir` (fork #122 — the actual feature, as opposed to `003`'s pre-existing-mechanism characterization).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; real `git` subprocess against a tempdir-backed fixture repo with one commit, no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** after dispatch, the resolved worktree path exists on disk as a directory; every role's `create_pane_with_options` call is recorded with the worktree path (not `req.dir`) as `cwd`; every `AppState.pane_cwd_map` entry for the orchestration's role panes equals the worktree path. `req.dir` and the worktree path are deliberately distinct directories, so the assertions cannot pass by `003`'s coincidence of the two being equal.
+- **Does not assert:** how the worktree path was resolved from a slug (covered by `orchestration/worktree/001`); the fail-loud refusal path (`orchestration/worktree/002`); branch naming or content; real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
+- **Platform coverage:** mac+linux (spawns a real `git` subprocess).
+
 ### Session restore
 
 #### session/restore

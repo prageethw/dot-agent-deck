@@ -29203,6 +29203,119 @@ mod tests {
         }
     }
 
+    /// Scenario: Build a `NewPaneRequest` whose `dir` is a real git repository
+    /// and whose `orchestration_worktree_path` is `Some(<sibling path>)` —
+    /// the shape `001` proves the form produces, `002` proves fails loud, and
+    /// `003` characterizes only the pre-existing `req.dir` → pane-cwd
+    /// threading with `orchestration_worktree_path: None`. Dispatch the real
+    /// `Action::SpawnPane` against that request. Unlike `003`, `req.dir` and
+    /// the worktree path are deliberately DIFFERENT directories, so this
+    /// exercises the actual fork #122 behavior: the worktree must exist on
+    /// disk afterward, and every role pane's cwd — `recorded_cwds()` and
+    /// every `pane_cwd_map` value — must be the worktree path, not `req.dir`.
+    #[spec("orchestration/worktree/004")]
+    #[test]
+    fn worktree_004_worktree_path_creates_and_roots_role_panes() {
+        let tmp = tempdir().expect("tempdir");
+        // Nest the repo one level inside the tempdir so the sibling worktree
+        // `git worktree add` creates (`<tmp>/repo-<slug>`, next to `<tmp>/repo`)
+        // lands inside `tmp` too, and `TempDir`'s cleanup on drop removes both.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_004 fixture\n").expect("write README");
+        run_git(&["add", "-A"]);
+        // CI runners carry no global git identity; pin it inline so the
+        // commit succeeds regardless of host config. A commit is required —
+        // `git worktree add -b` needs a ref to branch from.
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        // Sibling of `repo`, matching `resolve_orchestration_worktree_path`'s
+        // `<dir-basename>-<slug>` convention, but deliberately NOT equal to
+        // `req.dir` — that inequality is the whole point of this test.
+        let worktree = tmp.path().join("repo-my-feature");
+        assert_ne!(
+            repo, worktree,
+            "precondition: req.dir must differ from the worktree path"
+        );
+        let worktree_str = worktree.display().to_string();
+
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir: repo.clone(),
+            name: String::new(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            orchestration_worktree_path: Some(worktree.clone()),
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // The worktree actually exists on disk now.
+        assert!(
+            worktree.is_dir(),
+            "SpawnPane must have created the worktree on disk at {worktree_str}"
+        );
+
+        // Every role pane's create_pane_with_options call carried the
+        // worktree — NOT req.dir — as its cwd.
+        let cwds = pc.recorded_cwds();
+        assert_eq!(cwds.len(), config.roles.len(), "one pane per role");
+        for cwd in &cwds {
+            assert_eq!(
+                cwd.as_deref(),
+                Some(worktree_str.as_str()),
+                "every role pane must be spawned rooted in the created worktree, not req.dir"
+            );
+        }
+
+        // pane_cwd_map — what work-done resolution keys off — must resolve
+        // every role pane to the worktree, not the deck's shared cwd or
+        // req.dir.
+        let st = state.blocking_read();
+        assert_eq!(st.pane_cwd_map.len(), config.roles.len());
+        for cwd in st.pane_cwd_map.values() {
+            assert_eq!(cwd, &worktree_str);
+        }
+    }
+
     /// Scenario: Open an orchestration with an initial start-role agent, then
     /// rebind that pane before readiness. The queued prompt must remain bound to
     /// the original agent identity captured when the tab was created.
