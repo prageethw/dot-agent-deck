@@ -254,6 +254,37 @@ The lesson: a catalog-ID or filename collision can look like a false-positive "d
 git show upstream/main:src/ui.rs | grep ToggleOrchestrationSplit   # empty ⇒ genuinely fork-only, keep it
 ```
 
+### Caution: `gh pr create` targets **upstream** by default from this fork
+
+`gh pr create` without `--repo` opens the PR against the repository's **parent** — `vfarcic/dot-agent-deck` — not against this fork. So the default behaviour of the most obvious command puts a pull request on the maintainer's tracker.
+
+This fired **twice on 2026-08-07**, in unrelated sessions, on work that was never meant to leave the fork:
+
+| Accidental upstream PR | Intended fork PR | Outcome |
+| --- | --- | --- |
+| `vfarcic/dot-agent-deck#409` | fork #90 (work-done path-collision tests) | caught and closed within the same turn |
+| `vfarcic/dot-agent-deck#411` | fork #109 (Codex `write_atomic` mode fix) | caught and closed within the same turn |
+
+Both were self-caught, closed with an apology comment, and left nothing behind beyond a title and body — but both reached the maintainer's repository first, and a close does not un-send a notification. Relying on each author noticing is not a control: both authors *did* notice, and it still happened twice in one day.
+
+**Always pass the repository explicitly**, even when the fork is the obvious target:
+
+```bash
+gh pr create --repo prageethw/dot-agent-deck --draft --base main ...
+```
+
+Verify after creating, rather than assuming. `url` is the unambiguous check — it names the repository the PR actually landed on:
+
+```bash
+gh pr view <n> --repo prageethw/dot-agent-deck --json isCrossRepository,url \
+  --jq '"cross-repo=\(.isCrossRepository) url=\(.url)"'
+# expect: cross-repo=false url=https://github.com/prageethw/dot-agent-deck/pull/<n>
+```
+
+(There is no `baseRepository` field on `gh pr view` — `gh` rejects it and lists the valid ones. `isCrossRepository` alone is also not sufficient: it reports whether head and base differ, which is `false` for an ordinary same-repo PR on *either* repository.)
+
+If one does slip through: close it immediately with a brief explanatory comment, confirm `state` is `CLOSED`, and check that **no push landed on an upstream branch** — a PR carries only a title and body, but a push would leave commits behind. Note that the reverse case is legitimate and deliberate: this fork *does* open genuine upstream PRs (see [Caution: never delete a fork branch that backs an open upstream PR](#caution-never-delete-a-fork-branch-that-backs-an-open-upstream-pr)), so the goal is that every upstream PR is intentional, not that there are none.
+
 ## Relationship to the config-backup files
 
 [`fork-config-backups.md`](fork-config-backups.md) documents the `.fork-backup` snapshots of `devbox.json` / `.dot-agent-deck.toml` and a manual diff-and-restore procedure. That doc predates this workflow. Now that those two files are carried through `fork-only`'s rebase like any other fork commit (`6e20ca7`), the rebase is the **primary** mechanism that preserves them. The `.fork-backup` files and their diff-and-restore steps become a **secondary, belt-and-suspenders** safety net for detecting an accidental override — not the main line of defence. Keep them fresh per that doc, but treat `fork-only` as the source of truth.
