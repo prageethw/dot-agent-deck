@@ -2839,6 +2839,27 @@ without depending on the config struct API.
 - **Does not assert:** the bounded best-effort `git worktree remove --force` cleanup that `create_worktree_sync` layers on top of a `TimedOut` classification, or its own timeout; the user-facing message built in `ui.rs`'s `SpawnPane` dispatch; a real hook actually exceeding the 30s bound (deliberately not exercised — slow and flaky).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/worktree/008 — A child spawned through `spawn_in_new_process_group` is a process-group leader — its pgid equals its pid — where a plainly-spawned `std::process::Command` child inherits the caller's group instead (fork #133: the new spawn-time seam the timeout-kill fix needs, so a subsequent `killpg` on the child's own pid reaches the right group).
+- **Layer:** L1 (pure — spawns two real short-lived `sleep 30` processes directly via `std::process::Command`/the new helper and reads `getpgid`; no daemon, no PTY, no real `git`).
+- **Agent:** none.
+- **Asserts:** `getpgid` on the pid of a child spawned via `spawn_in_new_process_group` equals that pid; `getpgid` on a plainly-spawned `std::process::Command` child does NOT equal that child's own pid — asserted by contrast, so the first assertion cannot pass vacuously (e.g. if the test process itself happened to be a group leader).
+- **Does not assert:** signal delivery or descendant teardown (covered by `009`); Windows (no equivalent spawn-time seam exists there — `AgentProcessGroup::adopt` already works against a plainly-spawned child post-hoc via the job object).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the assertions read POSIX pgids).
+
+##### orchestration/worktree/009 — After `terminate_child_with_grace_and_wait` on a child spawned through `spawn_in_new_process_group`, neither the child nor a grandchild it forked before termination survives (fork #133: PR #123's 30s timeout kill reaped only the direct `git` process, leaving hook grandchildren — e.g. `post-checkout` — running past the bound; this pins the fix's mechanism with a cheap shell stand-in rather than a slow, flaky real 30s hook).
+- **Layer:** L1 (pure — a real `sh -c 'sleep 300 & sleep 300'` child spawned via the new helper, its backgrounded grandchild discovered through the repo's own `process_table`/`descendants` scan; no daemon, no PTY, no real `git`).
+- **Agent:** none.
+- **Asserts:** with a 200ms grace window, `terminate_child_with_grace_and_wait` leaves both the direct child's pid and its discovered grandchild's pid absent from the process table (`kill(pid, 0)` reports `ESRCH` for both, confirmed with a bounded poll rather than a single point-in-time read) — proving the process-group kill reaches a descendant a single-pid kill would orphan.
+- **Does not assert:** a real 30s `git` hook actually exceeding the bound (deliberately not exercised — slow and flaky, same call as `007` on the previous PR); the `TimedOut` classification or cleanup path (`007`); Windows (the job-object mechanism there already reaps the whole tree via `TerminateJobObject`, unaffected by this fork-only Unix gap).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the assertions read POSIX pgids/pids).
+
+##### orchestration/worktree/010 — `terminate_child_with_grace_and_wait_forcing_group_backstop` still reaps a same-group descendant that ignores SIGTERM even though the direct child (the group leader) exits promptly on SIGTERM during the grace window (fork #133 P1, found independently by the reviewer and the auditor on PR #134: the plain `terminate_child_with_grace_and_wait` returns as soon as `try_wait` shows the direct child reaped, skipping the phase-3 SIGKILL entirely — the exact orphan #133 exists to kill, since `git` exits promptly on SIGTERM while a `post-checkout` hook can trap or ignore it; `009` cannot see this because `sleep` dies on SIGTERM the same as everything else in that scenario).
+- **Layer:** L1 (pure — a real `sh -c '(trap "" TERM; exec sleep 300) & exec sleep 300'` child spawned via `spawn_in_new_process_group`, whose backgrounded descendant is discovered through the repo's own `process_table`/`descendants` scan; no daemon, no PTY, no real `git`).
+- **Agent:** none.
+- **Asserts:** with a 200ms grace window, `terminate_child_with_grace_and_wait_forcing_group_backstop` leaves both the direct child's pid (reaped inside the grace window, since it tail-`exec`s into a `sleep` with TERM's default disposition) and its discovered descendant's pid (reaped only by the forced SIGKILL backstop, since it tail-`exec`s into a `sleep` that inherited `trap "" TERM`'s SIG_IGN disposition across `exec`) absent from the process table (`kill(pid, 0)` reports `ESRCH` for both, confirmed with a bounded poll).
+- **Does not assert:** the non-forcing `terminate_child_with_grace_and_wait` (unchanged; still used by the single-pane Ctrl+W/respawn path — see its doc comment); a real 30s `git` hook (deliberately not exercised, same reasoning as `009`); Windows (`terminate_child_with_grace_and_wait_forcing_group_backstop` there is a plain passthrough to the existing Windows `terminate_child_with_grace_and_wait`, which already reaches the whole Job Object unconditionally).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the assertions read POSIX pids and rely on `trap`/`exec` signal-disposition semantics).
+
 ### Session restore
 
 #### session/restore
