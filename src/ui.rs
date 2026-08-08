@@ -3716,6 +3716,24 @@ pub struct NewPaneRequest {
     /// in this worktree instead of `dir`. `None` preserves today's exact
     /// behavior (panes spawn in `dir`).
     orchestration_worktree_path: Option<PathBuf>,
+    /// Fork #122 audit (P1): the validated raw slug that produced
+    /// `orchestration_worktree_path` — `Some` exactly when that field is
+    /// `Some`. `Action::SpawnPane`'s orchestration branch uses this
+    /// directly as the worktree's branch name, instead of recovering it by
+    /// stripping the `<dir-basename>-` prefix back off the resolved path
+    /// (the fragile inverse the #122/#123 audit and review both flagged —
+    /// deleted along with this field's introduction).
+    orchestration_worktree_slug: Option<String>,
+    /// Fork #122 audit (P1): set instead of `orchestration_worktree_path`
+    /// when the form's worktree slug was non-blank but failed validation
+    /// (path separators, `.`/`..`, a leading `-`, control characters, or
+    /// anything else outside the allowlist — see
+    /// `validate_orchestration_worktree_slug`). `Action::SpawnPane` checks
+    /// this BEFORE attempting worktree creation and refuses the tab through
+    /// the same fail-loud path a creation failure uses — never a silent
+    /// fallback to the deck's shared cwd, which is the exact collision this
+    /// feature exists to prevent.
+    orchestration_worktree_error: Option<String>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -6472,6 +6490,8 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             orchestration_config: None,
             seed_prompt: Some(build_issue_dispatch_authoring_seed(&form.dir)),
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
     }
     // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
@@ -6515,8 +6535,12 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             seed_prompt: build_schedule_authoring_mode(form.schedule_existing.as_ref(), &form.dir)
                 .seed_prompt,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
     }
+    let (orchestration_worktree_path, orchestration_worktree_slug, orchestration_worktree_error) =
+        resolve_orchestration_worktree_request(&form.dir, &form.worktree_slug);
     NewPaneRequest {
         dir: form.dir.clone(),
         name: form.name.clone(),
@@ -6524,15 +6548,51 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
-        orchestration_worktree_path: if form.worktree_slug.trim().is_empty() {
-            None
-        } else {
-            Some(resolve_orchestration_worktree_path(
-                &form.dir,
-                form.worktree_slug.trim(),
-            ))
-        },
+        orchestration_worktree_path,
+        orchestration_worktree_slug,
+        orchestration_worktree_error,
     }
+}
+
+/// Fork #122 audit (P1): validate a worktree slug BEFORE any path arithmetic
+/// touches it. `resolve_orchestration_worktree_path` used to splice the raw
+/// slug straight into the final path component with no checks at all — a
+/// slug like `x/../../../tmp/owned` against repo `/safe/repo` resolved to a
+/// path entirely outside `/safe`, and every role pane was then started with
+/// that escaped directory as its cwd.
+///
+/// A narrow allowlist (letters, digits, `-`, `_`) is used instead of a
+/// blocklist of "bad characters" — a blocklist is the pattern that keeps
+/// missing one. The allowlist alone already rejects everything the audit
+/// named: `/` and `\` (path separators — `\` is also a separator on
+/// Windows), `.` (so a slug can never BE `.` or `..`), NUL and other control
+/// bytes, and anything that isn't a valid git branch name. A leading `-` is
+/// rejected by a separate check below, because `git` can read a
+/// leading-dash ref/branch name as a flag rather than a name.
+fn validate_orchestration_worktree_slug(slug: &str) -> Result<(), String> {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return Err("worktree name cannot be blank".to_string());
+    }
+    let starts_ok = trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !starts_ok {
+        return Err(format!(
+            "worktree name {trimmed:?} must start with a letter, digit, or underscore"
+        ));
+    }
+    if let Some(bad) = trimmed
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(format!(
+            "worktree name {trimmed:?} may only contain letters, digits, '-', and '_' \
+             (found {bad:?})"
+        ));
+    }
+    Ok(())
 }
 
 /// Fork #122: resolve the sibling worktree path for an orchestration's own
@@ -6540,40 +6600,78 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
 /// `my-feature` → `/tmp/dot-agent-deck-my-feature`). Pure path arithmetic, no
 /// I/O; the actual `git worktree add` happens in [`Action::SpawnPane`]'s
 /// orchestration branch.
-fn resolve_orchestration_worktree_path(dir: &Path, slug: &str) -> PathBuf {
-    let mut name = dir
+///
+/// Two independent layers, per the #122/#123 audit (P1): (1)
+/// [`validate_orchestration_worktree_slug`] rejects anything that isn't a
+/// plain alphanumeric/`-`/`_` token before it touches path arithmetic at
+/// all; (2) belt and braces, the candidate built from the validated slug is
+/// re-decomposed and checked to still be the exact, immediate
+/// `<dir-parent>/<dir-basename>-<slug>` sibling intended — catching
+/// anything layer (1) missed, in case the allowlist above is ever weakened
+/// by a future edit.
+///
+/// Layer (2) is a pure, lexical component check — deliberately NOT
+/// `fs::canonicalize` — for two reasons: `dir` need not exist on disk yet
+/// when this runs (this function stays I/O-free, as documented above; the
+/// real filesystem check happens later, when `git worktree add` itself
+/// runs), and canonicalizing would be actively wrong here — on the macOS CI
+/// runner `/tmp` is a symlink to `/private/tmp`, so canonicalizing a `/tmp`-
+/// rooted `dir` would silently rewrite an already-correct literal path and
+/// reject input that `orchestration/worktree/001` pins byte-for-byte on
+/// that runner. Since the allowlist already forbids every character that
+/// could shift a path component (no `/`, `\`, or `.`), `Path::with_file_name`
+/// cannot algebraically escape `dir`'s parent — this check is a structural
+/// assertion of that guarantee, not a mechanism that changes behavior for
+/// any valid input.
+fn resolve_orchestration_worktree_path(dir: &Path, slug: &str) -> Result<PathBuf, String> {
+    validate_orchestration_worktree_slug(slug)?;
+    let trimmed = slug.trim();
+
+    let dir_name = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push('-');
-    name.push_str(slug);
-    dir.with_file_name(name)
+    let mut sibling_name = dir_name;
+    sibling_name.push('-');
+    sibling_name.push_str(trimmed);
+
+    let candidate = dir.with_file_name(&sibling_name);
+
+    if candidate.parent() != dir.parent()
+        || candidate.file_name().and_then(|n| n.to_str()) != Some(sibling_name.as_str())
+    {
+        return Err(format!(
+            "worktree path {} is not a direct sibling of {}",
+            candidate.display(),
+            dir.display()
+        ));
+    }
+
+    Ok(candidate)
 }
 
-/// Fork #122: recover the branch name (the raw slug) from a worktree path
-/// built by [`resolve_orchestration_worktree_path`] — the inverse of that
-/// function's `<dir-basename>-<slug>` join. `Action::SpawnPane`'s
-/// orchestration branch needs this because `NewPaneRequest` carries only the
-/// resolved `orchestration_worktree_path`, not the raw slug (the API
-/// contract adds exactly the one field); deriving it back out keeps that
-/// contract to one field instead of threading the slug through a second one.
-/// "Branch naming: use the slug itself as the branch name" (fork #122) —
-/// falls back to the worktree dir's full basename if the expected prefix is
-/// ever absent (defensive; every real caller goes through
-/// `resolve_orchestration_worktree_path` first).
-fn orchestration_worktree_branch_name(dir: &Path, worktree_path: &Path) -> String {
-    let base = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = worktree_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.strip_prefix(&base)
-        .and_then(|s| s.strip_prefix('-'))
-        .map(str::to_string)
-        .unwrap_or(name)
+/// Fork #122 audit (P1): resolve the `(path, slug, error)` triple
+/// [`NewPaneRequest`] carries for its worktree fields, from the form's raw
+/// (untrimmed, unvalidated) slug text. A blank slug preserves today's exact
+/// behavior — `(None, None, None)`, panes spawn in `dir`. A non-blank slug
+/// that validates carries BOTH the resolved path and the validated raw slug
+/// (used directly as the branch name by `Action::SpawnPane`, replacing the
+/// prefix-stripping recovery that used to derive it back out of the path). A
+/// non-blank slug that fails validation carries the rejection reason instead
+/// — `Action::SpawnPane` checks that field first and refuses the tab through
+/// the same fail-loud path a creation failure uses.
+fn resolve_orchestration_worktree_request(
+    dir: &Path,
+    slug: &str,
+) -> (Option<PathBuf>, Option<String>, Option<String>) {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return (None, None, None);
+    }
+    match resolve_orchestration_worktree_path(dir, trimmed) {
+        Ok(path) => (Some(path), Some(trimmed.to_string()), None),
+        Err(reason) => (None, None, Some(reason)),
+    }
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -8050,6 +8148,20 @@ fn dispatch_action(
                     // branch rather than relying on the doors re-setting it
                     // before the next dispatch.
                     ui.pending_last_command = None;
+                    // Fork #122 audit (P1): a non-blank slug that failed
+                    // validation carries its reason here instead of a
+                    // resolved path — refuse through the same fail-loud path
+                    // a creation failure below uses, before any tab/pane
+                    // state exists, rather than silently falling back to the
+                    // shared cwd (the exact collision this feature exists to
+                    // prevent).
+                    if let Some(reason) = req.orchestration_worktree_error.as_ref() {
+                        ui.status_message = Some((
+                            format!("Orchestration failed: {reason}"),
+                            std::time::Instant::now(),
+                        ));
+                        return Flow::Continue;
+                    }
                     // Fork #122: when the form resolved a worktree path,
                     // create it now — before any tab/pane state exists — so a
                     // failure never leaves a half-open orchestration behind.
@@ -8060,8 +8172,22 @@ fn dispatch_action(
                     // it worked.
                     let dir_str = match req.orchestration_worktree_path.as_ref() {
                         Some(worktree_path) => {
+                            // Fork #122 audit (P1): use the validated raw
+                            // slug the request carries directly as the
+                            // branch name — no more recovering it by
+                            // stripping the `<dir-basename>-` prefix back
+                            // off the resolved path (the fragile inverse
+                            // both reviews flagged). The basename fallback
+                            // below only fires for a request built directly
+                            // (bypassing `build_new_pane_request`, e.g. in
+                            // tests) without a slug.
                             let branch =
-                                orchestration_worktree_branch_name(&req.dir, worktree_path);
+                                req.orchestration_worktree_slug.clone().unwrap_or_else(|| {
+                                    worktree_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default()
+                                });
                             match crate::issue_dispatch_run::create_worktree_sync(
                                 &req.dir,
                                 worktree_path,
@@ -24558,6 +24684,8 @@ mod tests {
             orchestration_config: Some(orch_config("tab-a")),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_a)),
@@ -24610,6 +24738,8 @@ mod tests {
             orchestration_config: Some(orch_config("tab-b")),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_b)),
@@ -24959,6 +25089,8 @@ mod tests {
             orchestration_config: Some(orch_config("shared-orch")),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -25218,6 +25350,8 @@ mod tests {
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -25612,6 +25746,8 @@ mod tests {
             orchestration_config: Some(lock_test_orch_config("lock-waiting")),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -25800,6 +25936,8 @@ mod tests {
             orchestration_config: Some(lock_test_orch_config("lock-ambiguous")),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -28967,6 +29105,8 @@ mod tests {
             orchestration_config: Some(config),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -29162,6 +29302,8 @@ mod tests {
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -29268,6 +29410,12 @@ mod tests {
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
             orchestration_worktree_path: Some(worktree.clone()),
+            // No slug: exercises the defensive fallback branch-name path
+            // (worktree basename) rather than `001`'s slug-carrying shape —
+            // deliberate, per `orchestration/worktree/004`'s own scope note
+            // above ("does not assert ... branch naming").
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -29314,6 +29462,54 @@ mod tests {
         for cwd in st.pane_cwd_map.values() {
             assert_eq!(cwd, &worktree_str);
         }
+    }
+
+    /// Scenario: Call `resolve_orchestration_worktree_path` with four slugs,
+    /// each violating exactly one rule of the #122/#123 audit's P1 fix — a
+    /// path separator, the literal `..`, a leading dash, and a NUL control
+    /// character — and confirm every one comes back `Err` rather than
+    /// resolving to a path (the original bug let a slug like
+    /// `x/../../../tmp/owned` against repo `/safe/repo` escape `/safe`
+    /// entirely, and every role pane was then started with that escaped
+    /// directory as its cwd). A final case proves the validation added here
+    /// does not regress the working path: a plain alphanumeric-and-dash slug
+    /// still resolves exactly as `orchestration/worktree/001` expects.
+    #[spec("orchestration/worktree/006")]
+    #[test]
+    fn worktree_006_slug_validation_rejects_escapes() {
+        let dir = PathBuf::from("/tmp/dot-agent-deck");
+
+        let separator = resolve_orchestration_worktree_path(&dir, "x/owned");
+        assert!(
+            separator.is_err(),
+            "a slug containing a path separator must be rejected: {separator:?}"
+        );
+
+        let dot_dot = resolve_orchestration_worktree_path(&dir, "..");
+        assert!(
+            dot_dot.is_err(),
+            "a slug that is exactly '..' must be rejected: {dot_dot:?}"
+        );
+
+        let leading_dash = resolve_orchestration_worktree_path(&dir, "-oops");
+        assert!(
+            leading_dash.is_err(),
+            "a slug with a leading dash must be rejected: {leading_dash:?}"
+        );
+
+        let control_char = resolve_orchestration_worktree_path(&dir, "bad\u{0}name");
+        assert!(
+            control_char.is_err(),
+            "a slug containing a NUL control character must be rejected: {control_char:?}"
+        );
+
+        let valid = resolve_orchestration_worktree_path(&dir, "my-feature")
+            .expect("a plain alphanumeric-and-dash slug must still validate");
+        assert_eq!(
+            valid,
+            PathBuf::from("/tmp/dot-agent-deck-my-feature"),
+            "a valid slug must still resolve exactly as orchestration/worktree/001 expects"
+        );
     }
 
     /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one
@@ -29460,6 +29656,8 @@ mod tests {
             orchestration_config: Some(config),
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let controller = Arc::new(CapturingPaneController::new());
         let mut tab_manager = TabManager::new(controller.clone());
@@ -29522,6 +29720,8 @@ mod tests {
             orchestration_config: None,
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         }
     }
 
@@ -29802,6 +30002,8 @@ mod tests {
             orchestration_config: None,
             seed_prompt: None,
             orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         }
     }
 

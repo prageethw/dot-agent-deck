@@ -41,7 +41,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 
@@ -703,9 +705,24 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
 
 /// Run a subprocess that must exit zero; on failure return a message carrying
 /// the program, args, exit status, and any stderr.
+///
+/// Fork #122/#123 audit (P2): stdin closed and a non-interactive git
+/// environment applied — `GIT_TERMINAL_PROMPT=0` suppresses git's own
+/// terminal credential prompt, and neutralising `GIT_ASKPASS`/`SSH_ASKPASS`
+/// stops git/ssh from shelling out to an inherited askpass helper that
+/// could itself block waiting on input — so a credential prompt can no
+/// longer read anything and fails fast instead of waiting. No bounded wait
+/// here, unlike [`run_status_sync`] below: this async path already runs off
+/// the render/event loop (inside the issue-dispatch scheduler's own tokio
+/// task), so a slow call here does not freeze the TUI the way a synchronous
+/// one on the `SpawnPane` dispatch path would.
 async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
         .output()
         .await
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
@@ -729,23 +746,84 @@ async fn run_status_args(program: &str, args: &[String]) -> Result<(), String> {
     run_status(program, &refs).await
 }
 
+/// Fork #122/#123 audit (P2): the maximum time a single blocking `git`
+/// invocation made from [`create_worktree_sync`] — which runs directly on
+/// the TUI's synchronous render/event loop — is allowed to run before it is
+/// killed. `git worktree add` does no network I/O, so under normal
+/// conditions this returns in well under a second; the bound exists for the
+/// pathological cases the audit named — a stuck `index.lock`, a slow
+/// filesystem, or a misbehaving checkout hook — where `Command::output()`
+/// would otherwise wait forever with the TUI unable to repaint, show an
+/// error, or accept input. 30s is generous enough that a slow-but-working
+/// worktree checkout is never killed, and short enough that a genuine wedge
+/// does not read as "the TUI is just doing something".
+const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`run_status_sync`] polls its spawned child for exit while
+/// enforcing [`WORKTREE_GIT_TIMEOUT`]. Short enough that the timeout bound
+/// is accurate to a fraction of a second; long enough not to spin the CPU on
+/// the render/event loop while a normal, fast `git` call is still running.
+const WORKTREE_GIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Blocking twin of [`run_status_args`] for [`create_worktree_sync`], which
 /// runs on the TUI's synchronous `SpawnPane` dispatch path and cannot
 /// `.await`.
+///
+/// Fork #122/#123 audit (P2), two layers: stdin closed and a
+/// non-interactive git environment applied — same three env vars as
+/// [`run_status`] above — so a credential prompt fails fast instead of
+/// waiting on input nothing will ever supply; and `Command::output()` —
+/// which waits for termination with no bound — is replaced with `spawn()`
+/// plus `try_wait()` polling against [`WORKTREE_GIT_TIMEOUT`], killing the
+/// child and returning an ordinary `Err` (which flows into the existing
+/// refuse-the-tab path in `Action::SpawnPane`) on expiry, rather than
+/// leaving the render/event loop unable to repaint, show an error, or
+/// accept input.
 fn run_status_sync(program: &str, args: &[String]) -> Result<(), String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = std::process::Command::new(program)
+    let mut child = std::process::Command::new(program)
         .args(&refs)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .spawn()
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
-    if output.status.success() {
+
+    let deadline = Instant::now() + WORKTREE_GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "`{program} {}` timed out after {WORKTREE_GIT_TIMEOUT:?} without exiting",
+                        refs.join(" "),
+                    ));
+                }
+                std::thread::sleep(WORKTREE_GIT_POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("failed to wait on `{program}`: {e}")),
+        }
+    };
+
+    if status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut stderr_buf = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_end(&mut stderr_buf);
+    }
+    let stderr = String::from_utf8_lossy(&stderr_buf);
     Err(format!(
         "`{program} {}` failed ({}): {}",
         refs.join(" "),
-        output.status,
+        status,
         stderr.trim()
     ))
 }

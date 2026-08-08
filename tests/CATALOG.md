@@ -2599,7 +2599,7 @@ without depending on the config struct API.
 - **Layer:** L1 (pure — `build_new_pane_request` against a `NewPaneFormState`; no PTY, no daemon, no filesystem).
 - **Agent:** none.
 - **Asserts:** with an orchestration selected and a non-blank worktree slug, the built `NewPaneRequest.orchestration_worktree_path` equals the sibling directory `<dir>-<slug>` next to the form's picked `dir`; the identical form with a blank slug yields `orchestration_worktree_path == None`.
-- **Does not assert:** actually creating the worktree on disk (covered by `orchestration/worktree/002`/`003`); keyboard focus/typing into the slug field; branch naming.
+- **Does not assert:** actually creating the worktree on disk (covered by `orchestration/worktree/004`, and `005` on the real binary); keyboard focus/typing into the slug field; branch naming.
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/worktree/002 — When the resolved worktree fails to create (e.g. `dir` is not a git repository), the orchestration tab is refused and the error surfaces — never a silent fallback to the shared cwd (fork #122).
@@ -2613,7 +2613,7 @@ without depending on the config struct API.
 - **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; no PTY, no real agent).
 - **Agent:** none.
 - **Asserts:** with `NewPaneRequest.dir` set to a worktree-like path, every role's `create_pane_with_options` call is recorded with that path as `cwd`, and every entry `AppState.pane_cwd_map` inserts for the orchestration's role panes equals that same path — the map `work-done` resolution keys off (CLAUDE.md rule 1 / fork #74's collision).
-- **Does not assert:** how the worktree path was resolved or created (covered by `orchestration/worktree/001`/`002`); real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
+- **Does not assert:** how the worktree path was resolved (covered by `orchestration/worktree/001`) or actually created on disk (covered by `orchestration/worktree/004`, and `005` on the real binary); real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/worktree/004 — Dispatching `Action::SpawnPane` for a request whose `dir` is a real git repository and whose `orchestration_worktree_path` is `Some(<sibling path>)` actually creates that worktree on disk and roots every role pane in it, not in `req.dir` (fork #122 — the actual feature, as opposed to `003`'s pre-existing-mechanism characterization).
@@ -2629,6 +2629,13 @@ without depending on the config struct API.
 - **Asserts:** submitting the form with a typed Worktree slug creates the resolved sibling worktree directory on disk, and BOTH role panes' `pwd` logs — written by each role's own shell command before it sleeps — resolve to the created worktree, not the fixture directory the deck was launched in. This is the keyboard path whose Enter-chain regression earlier on this PR was found only as collateral damage in unrelated e2e helpers; this test exercises the Worktree field directly.
 - **Does not assert:** the slug-to-path resolution in isolation (`orchestration/worktree/001`); the fail-loud refusal path (`orchestration/worktree/002`); the pre-existing cwd-threading mechanism (`orchestration/worktree/003`) or the `dispatch_action`-level creation proof (`orchestration/worktree/004`); branch naming or content; work-done file routing (`orchestration/route/*`).
 - **Platform coverage:** mac+linux (spawns a real `git` subprocess).
+
+##### orchestration/worktree/006 — `resolve_orchestration_worktree_path` rejects a slug containing a path separator, the literal `..`, a leading dash, or a NUL control character, and still resolves a plain alphanumeric-and-dash slug exactly as `001` expects (fork #122/#123 audit P1: the original bug let a slug like `x/../../../tmp/owned` against repo `/safe/repo` escape `/safe` entirely, and every role pane was then started with that escaped directory as its cwd).
+- **Layer:** L1 (pure — direct calls to `resolve_orchestration_worktree_path`; no PTY, no daemon, no filesystem).
+- **Agent:** none.
+- **Asserts:** each of a slash-containing slug, `..`, a leading-dash slug, and a NUL-containing slug returns `Err`; a plain alphanumeric-and-dash slug still returns `Ok` with the exact sibling path `001` pins.
+- **Does not assert:** the sibling-of-`dir` belt-and-braces check in isolation (both layers reject the escape cases here together); the refusal reaching the user (`ui.status_message`, the SpawnPane-level fail-loud path — covered by `002`'s shape for creation failures); branch naming.
+- **Platform coverage:** mac+linux+windows.
 
 ### Session restore
 
