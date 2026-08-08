@@ -119,8 +119,8 @@ pub fn decide(pr_state: &PrState, clean: &Cleanliness, ownership: Ownership) -> 
                     .to_string(),
             ),
             Cleanliness::Unresolvable(reason) => Verdict::Keep(format!(
-                "cleanliness could not be determined ({reason}) — keeping rather than guessing, \
-                 not because anything dirty was found"
+                "the cleanliness check itself failed ({reason}) — keeping rather than guessing; \
+                 nothing was found in the tree"
             )),
             Cleanliness::Clean => match ownership {
                 Ownership::Ours => Verdict::Remove,
