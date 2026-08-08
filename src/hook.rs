@@ -563,14 +563,32 @@ fn request_from_socket_at(
     json: &str,
     timeout: Option<std::time::Duration>,
 ) -> SocketReply {
+    // Fork issue #419 (Greptile finding, upstream PR): the total-operation
+    // deadline starts here, before connect, rather than being re-armed with a
+    // fresh full budget once the connection is established and the request
+    // written below. Connect and the write are usually fast on a local
+    // Unix/named-pipe socket, but a wedged/overloaded daemon can stall either
+    // one, and this is the only way the deadline actually bounds the *whole*
+    // exchange the way `request_from_socket`/`request_from_socket_with_deadline`
+    // document. The 5s value itself is unchanged — only when the clock starts.
+    let deadline = timeout.map(|budget| std::time::Instant::now() + budget);
     let mut stream = match crate::platform::ipc::IpcClient::connect(path) {
         Ok(stream) => stream,
         Err(_) => return SocketReply::Unreachable,
     };
-    if let Some(timeout) = timeout
-        && stream.set_timeouts(timeout).is_err()
-    {
-        return SocketReply::Unreachable;
+    if let Some(deadline) = deadline {
+        // Zero/negative remaining budget: do not hand the socket a zero
+        // timeout — on some platforms that means "block forever", the
+        // opposite of what an exhausted deadline should do (same guard
+        // `read_reply_line` applies per-read below). A deadline that expired
+        // during connect folds into `NoReply`, matching how the read loop
+        // treats a deadline that expires mid-operation.
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return SocketReply::NoReply;
+        };
+        if stream.set_timeouts(remaining).is_err() {
+            return SocketReply::Unreachable;
+        }
     }
     let msg = format!("{json}\n");
     if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
@@ -593,15 +611,15 @@ fn request_from_socket_at(
     // the total-operation deadline below (when `timeout` is set), and both
     // fold into `SocketReply::NoReply` here / the caller's documented "no
     // seed" → PTY-injection fallback for `get-seed`.
-    match read_reply_line(&mut stream, timeout) {
+    match read_reply_line(&mut stream, deadline) {
         Some(line) => SocketReply::Line(line),
         None => SocketReply::NoReply,
     }
 }
 
 /// Read one reply line off `stream`, bounded by a **total-operation**
-/// deadline (fork issue #101) rather than the per-read idle timeout `timeout`
-/// already puts on the socket via `IpcClient::set_timeouts`.
+/// deadline (fork issue #101) rather than the per-read idle timeout the
+/// caller already puts on the socket via `IpcClient::set_timeouts`.
 ///
 /// The previous implementation drove a `BufRead::read_line` directly against
 /// `stream`, which keeps issuing reads until it sees a newline, EOF, or an
@@ -609,25 +627,30 @@ fn request_from_socket_at(
 /// peer that dribbles one byte per interval, always comfortably under the
 /// per-read bound, could keep the read alive indefinitely even though the
 /// line never completed. This loop instead tracks wall-clock elapsed time
-/// against `timeout` (the caller's overall budget) and re-arms the socket's
-/// per-read timeout to whatever is left before each individual read, so the
-/// *operation as a whole* — regardless of how the peer paces its bytes —
-/// cannot exceed `timeout`. Once the deadline has passed, any read fails, the
-/// peer closes before sending a single byte, or the line is not valid UTF-8,
-/// this returns `None`; the caller folds that into `SocketReply::NoReply`
-/// exactly as it already did for a timed-out read (fork issue #89's contract
-/// — see [`request_from_socket`]). A peer that closes *after* writing part of
-/// a line, but before the newline, is a distinct case: the partial line is
+/// against `deadline` and re-arms the socket's per-read timeout to whatever
+/// is left before each individual read, so the *operation as a whole* —
+/// regardless of how the peer paces its bytes — cannot run past `deadline`.
+/// Once the deadline has passed, any read fails, the peer closes before
+/// sending a single byte, or the line is not valid UTF-8, this returns
+/// `None`; the caller folds that into `SocketReply::NoReply` exactly as it
+/// already did for a timed-out read (fork issue #89's contract — see
+/// [`request_from_socket`]). A peer that closes *after* writing part of a
+/// line, but before the newline, is a distinct case: the partial line is
 /// still returned as `Some(partial)`, not folded into `None`.
 ///
-/// When `timeout` is `None` this falls back to unbounded blocking reads with
-/// no re-arming, identical to the pre-#101 behavior for callers that pass no
-/// deadline at all.
+/// `deadline` is computed once by the caller — [`request_from_socket_at`] —
+/// from a point **before** it connects, not re-derived here from a fresh
+/// `Instant::now()`. Fork issue #419 (Greptile finding, upstream PR): doing
+/// the latter let connect and the request write each consume wall-clock time
+/// against nothing, so only the read phase was ever actually bounded and the
+/// exchange as a whole could run past what the caller's `timeout` advertises.
+///
+/// `None` falls back to unbounded blocking reads with no re-arming, identical
+/// to the pre-#101 behavior for callers that pass no deadline at all.
 fn read_reply_line(
     stream: &mut crate::platform::ipc::IpcClient,
-    timeout: Option<std::time::Duration>,
+    deadline: Option<std::time::Instant>,
 ) -> Option<String> {
-    let deadline = timeout.map(|budget| std::time::Instant::now() + budget);
     let mut buf = [0u8; 512];
     let mut line = Vec::new();
     loop {
