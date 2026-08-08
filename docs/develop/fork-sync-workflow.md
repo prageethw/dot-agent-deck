@@ -147,12 +147,20 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `4986ca0` | `docs(prd-422): add an ownership gate — own it, or ask (#129)` | **PERMANENT** fork-only (doc) — amends the fork-authored PRD #422 |
 | `eb71210` | `docs(prds): when it asks, it asks specifically (#130)` | **PERMANENT** fork-only (doc) — amends PRDs #421/#422 |
 | `23f268f` | `docs(claude): rule 17 — the orchestrator delegates, never writes src/ or tests/ (#132)` | **PERMANENT** fork-only (rules) — describes this fork's own orchestrator-role discipline, no upstream analogue |
+| `251ee7c` | `feat(orchestration): root each orchestration tab in its own worktree (fork #122) (#123)` | **UPSTREAM-WORTHY** — `issue_dispatch`/`issue_dispatch_run`/orchestration-tab plumbing is upstream's own; rooting a tab in its own worktree is generic, no fork-only symbols |
+| `5a1eec8` | `fix(worktree): kill the git process group on timeout so hook grandchildren cannot outlive it (fork #133) (#134)` | **UPSTREAM-WORTHY** — `src/platform/proc/{mod,unix,windows}.rs` is upstream's own process-group plumbing; a hook grandchild outliving its timeout is a defect there too |
+| `716b22f` | `feat(422): reclaim merged worktrees behind a PR-state + clean + ownership gate (#131)` | **PERMANENT** fork-only — `src/worktree_reclaim.rs` exists only because this fork's own orchestrator workflow (rule 1, one worktree per fix) accumulates merged worktrees; upstream has no equivalent per-fix worktree convention |
+| `5ba8166` | `fix(worktree): move the post-SIGKILL reap off the render loop (fork #136) (#137)` | **UPSTREAM-WORTHY** — same `src/platform/proc/{mod,unix,windows}.rs` plumbing as `5a1eec8`; a reap blocking the render loop is a defect upstream shares |
+| `5ec6671` | `fix(worktree): parse \`git worktree list --porcelain -z\` instead of text mode (#139)` | **PERMANENT** fork-only — amends `716b22f`'s fork-only `worktree_reclaim.rs`; fixes Greptile P2 raised against the fork's own upstream port PR #427 |
+| `4348411` | `docs: update changelog for v0.36.0` | **PERMANENT** fork-only (release) — the fork's own `CHANGELOG.md`/`changelog.d/*` release bookkeeping, not upstream-worthy content |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
 **Re-curated 2026-08-07.** The 2026-08-05 sync closed with `main` reset to `fork-only`; two days later `main` was **184 commits ahead** and running the documented `git reset --hard fork-only` would have discarded every one of them. Rows `0451799` onward are that re-curation: the 184 commits squashed into 22 logically-grouped commits, in `main`'s own topological order, each one's tree taken verbatim from `main` at a PR-merge boundary. Because `main` never takes upstream changes directly, the re-curation is verifiable by a single check — `git diff fork-only origin/main` must be **empty** apart from this file's own table update. It was, at `665ed77`.
 
 **Keep it current.** This is the second time the drift has been discovered rather than prevented (the 2026-08-05 sync picked up 7 uncurated commits; this one picked up 184). Re-curate whenever a PR merges to `main`, or at minimum on a fixed cadence — not "whenever it's badly out of date". Every re-curation that waits makes the squash grouping coarser and the next upstream rebase harder to reason about.
+
+**Re-curated again 2026-08-08.** The 2026-08-07 re-curation above closed with `main` reset to `fork-only`; `main` drifted 15 first-parent boundaries / 30 commits ahead again, including the v0.36.0 release commit. Rows `4bb36c7` through `4348411` are that re-curation, one commit per boundary in `main`'s own topological order (oldest first), each tree taken verbatim from `main` at the boundary SHA. This is the third time the drift has been discovered rather than prevented (7, then 184, then 30 commits) — see "Keep it current" above, which still applies.
 
 **`65e46b2` (fork #32) landed on `main` via PR #91 after the 2026-08-07 re-curation above closed**, so it is exactly the kind of drift this section warns about — and it was subsequently carried onto `fork-only` as `2ccf984` during the #91/#94 carry-over the same day, so it is no longer outstanding. The general lesson stands, though: a row in this table records a commit's classification, it does not by itself prove the commit is on `fork-only` — only a `git diff fork-only origin/main` check proves that.
 
@@ -187,6 +195,13 @@ The rows above marked **UPSTREAM-WORTHY** or **MIXED** are on `fork-only` becaus
 - `6104d94` — `write_atomic` silently widened `CODEX_HOME/hooks.json` / `config.toml` permissions instead of preserving the destination's mode (fork #382).
 - `83ff76e` — `idle_worker_011`'s timeout path had no diagnostics tying the failure back to whether the delegate dispatched or the idle detector fired (fork #81).
 - `d5b7378` — `request_from_socket_inner`'s EOF branch folded a genuinely empty buffer to `Line("")` instead of `NoReply`, and its operation deadline started after `connect`/the request write instead of before (fork #120, raised against upstream PR #419).
+- `4bb36c7` — no `dot-agent-deck daemon status [--json]` introspection command exists (fork #47).
+- `406d151` — a bare `cargo clippy` never lints the 64 `tests/e2e_*.rs` files, which all gate on `feature = "e2e"` (fork #117).
+- `80acb86` — `read_reply_line` had no maximum, so a flooding peer could grow the get-seed reply buffer unbounded for the full deadline (fork #101).
+- `6b5a58d` — `idle_worker_011`'s wait budget was widened before its diagnostic landed, leaving the flake uncharacterised (fork #81).
+- `251ee7c` — orchestration tab panes all shared one worktree instead of each tab rooting its own (fork #122).
+- `5a1eec8` — a worktree-add timeout left the git process group alive, so hook grandchildren could outlive it (fork #133).
+- `5ba8166` — the post-SIGKILL reap ran on the render loop and could block it (fork #136).
 
 **Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
