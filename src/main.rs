@@ -410,6 +410,32 @@ enum DaemonCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// List every linked worktree with its resolved PR state, cleanliness,
+    /// ownership, and gate verdict (remove/ask/keep) with a reason. Read-only
+    /// — never removes anything.
+    List {
+        /// Emit a versioned JSON document (`{schema_version, worktrees}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove every worktree the gate marks `remove` (deck-owned, merged,
+    /// clean) unconditionally. A worktree the deck cannot prove it created is
+    /// reported as reclaimable-pending-confirmation and left alone unless
+    /// `--yes` is passed. A dirty worktree, an open/closed-unmerged PR, or an
+    /// unresolvable PR state always keeps, `--yes` or not. Never deletes the
+    /// branch.
+    Reclaim {
+        /// Authorize removing worktrees the deck did NOT prove it created
+        /// (the `ask` verdict), in addition to the ones it did. Has no effect
+        /// on worktrees the gate already keeps for another reason.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 enum CliRemoteType {
     #[default]
@@ -2061,6 +2087,80 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
     } else {
         print!("{}", format_human(&agents));
         ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck worktree list [--json]` — PRD #422. Pure CLI-subprocess
+/// operation over `git`/`gh` in the current directory's repo — no daemon
+/// involved, so unlike the `daemon status`/`daemon stop` wrappers below this
+/// is plain synchronous code, no `#[tokio::main]`. Row shaping and the gate
+/// itself live in [`dot_agent_deck::worktree_reclaim`]; this wrapper only
+/// translates the outcome into stdout/stderr text and an exit code.
+fn run_worktree_list_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{
+        WorktreeListDocument, examine_worktrees, format_list_human,
+    };
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree list: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reports = match examine_worktrees(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("worktree list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        match serde_json::to_string(&WorktreeListDocument::new(reports)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("worktree list: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_list_human(&reports));
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck worktree reclaim [--yes]` — PRD #422. Removes every
+/// worktree the gate marks `remove` (deck-owned, merged PR, clean tree)
+/// unconditionally, and — only with `--yes` — also those it marks `ask`
+/// (merged and clean, but the deck cannot prove it created them). Without
+/// `--yes`, `ask`-verdict worktrees are left alone and reported as a pending
+/// decision that leads the output, naming their exact paths and the
+/// ready-to-copy `--yes` command. Always exits successfully once it has
+/// finished examining and acting on every worktree; only a failure to
+/// enumerate worktrees at all (e.g. not a git repo) is reported as failure.
+fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree reclaim: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run_reclaim(&cwd, yes) {
+        Ok(outcome) => {
+            print!("{}", format_reclaim_human(&outcome));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("worktree reclaim: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
