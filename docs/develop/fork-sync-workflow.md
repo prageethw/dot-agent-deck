@@ -136,6 +136,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `b8e3b92` | `docs(fork-sync): warn that gh pr create targets upstream by default (#113)` | **PERMANENT** fork-only (doc) — documents a fork-vs-upstream hazard (`gh pr create` defaulting to `vfarcic/dot-agent-deck`) that only exists because this is a fork |
 | `984e6cc` | `docs: require task-supplied absolute findings paths for read-only roles (fork #114) (#115)` | **PERMANENT** fork-only (rules) — describes this fork's own delegation harness and codex per-directory trust model; no upstream analogue |
 | `83ff76e` | `test(idle-worker): dump delegate/detector state on idle_worker_011's timeout path (fork #81) (#116)` | **UPSTREAM-WORTHY** — the idle-worker detector and its e2e coverage are upstream's own; better failure diagnostics on a shared test benefit upstream identically, no fork-only symbols |
+| `a40e029` | `docs: add rule 16 — every consumed value needs a named supplier (fork #118) (#119)` | **PERMANENT** fork-only (rules) — describes this fork's own delegation-harness discipline (task-contract completeness between orchestrator and worker roles); no upstream analogue |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
