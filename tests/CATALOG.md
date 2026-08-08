@@ -2623,6 +2623,13 @@ without depending on the config struct API.
 - **Does not assert:** how the worktree path was resolved from a slug (covered by `orchestration/worktree/001`); the fail-loud refusal path (`orchestration/worktree/002`); branch naming or content; real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
 - **Platform coverage:** mac+linux (spawns a real `git` subprocess).
 
+##### orchestration/worktree/005 — Driving the real new-pane form's keyboard path end to end — `Ctrl+n` -> directory picker -> Mode cycled to an orchestration -> Tab to the Worktree field -> a typed slug -> submit — creates the worktree on disk and roots every role pane in it, on the real binary (fork #122, CLAUDE.md rule 4).
+- **Layer:** L2 (real-binary PTY; real `git` subprocess against the fixture directory, committed inline before submission so `git worktree add -b` has a ref to branch from; no real agent).
+- **Agent:** none (both roles dump their own `pwd` to a role-named log file, then `sleep 600` — no LLM tokens).
+- **Asserts:** submitting the form with a typed Worktree slug creates the resolved sibling worktree directory on disk, and BOTH role panes' `pwd` logs — written by each role's own shell command before it sleeps — resolve to the created worktree, not the fixture directory the deck was launched in. This is the keyboard path whose Enter-chain regression earlier on this PR was found only as collateral damage in unrelated e2e helpers; this test exercises the Worktree field directly.
+- **Does not assert:** the slug-to-path resolution in isolation (`orchestration/worktree/001`); the fail-loud refusal path (`orchestration/worktree/002`); the pre-existing cwd-threading mechanism (`orchestration/worktree/003`) or the `dispatch_action`-level creation proof (`orchestration/worktree/004`); branch naming or content; work-done file routing (`orchestration/route/*`).
+- **Platform coverage:** mac+linux (spawns a real `git` subprocess).
+
 ### Session restore
 
 #### session/restore
@@ -2724,6 +2731,20 @@ without depending on the config struct API.
 - **Asserts:** restoring a saved plain pane whose command basename is `opencode` immediately renders an `Idle` card and never requires a hook event to replace the `No agent` placeholder identity.
 - **Does not assert:** OpenCode plugin delivery or later working/waiting transitions; restore fallback paths after a mode-tab failure.
 - **Platform coverage:** mac+linux.
+
+##### session/restore/015 — An orchestration tab captured while rooted in a worktree restores with its role panes still rooted in that worktree, not the deck's own cwd (fork #122).
+- **Layer:** L1 (in-process — `resolve_orchestration_for_restore` against a real `.dot-agent-deck.toml` on disk, then `TabManager::open_orchestration_tab` against a `CapturingPaneController`; no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** an `OrchestrationSnapshot` whose `project_path` names a real worktree directory (carrying its own `.dot-agent-deck.toml`) re-resolves successfully via `resolve_orchestration_for_restore`, and feeding the resolved config into `open_orchestration_tab` with that same worktree path as `cwd` — exactly as the daemon-empty restore path calls it with `saved_pane.dir` — spawns every role pane's `create_pane_with_options` call rooted in the worktree. Fork #122's rooting was already implemented (restore always passes `saved_pane.dir`, which capture always writes as the worktree); this pins the property so it stays true across refactors.
+- **Does not assert:** `pane_cwd_map`/`pane_role_map` population (a trivial `saved_pane.dir.clone()` insert in `run_tui`, not the rooting mechanism); the drift-fallback path (`session/restore/016`); the daemon-hydration restore path (`session/restore/007`/`008`); real daemon/PTY spawn.
+- **Platform coverage:** mac+linux+windows.
+
+##### session/restore/016 — When a captured orchestration tab's worktree has been removed from disk (e.g. via `git worktree remove`), restore re-resolution fails loud, naming the orchestration — the mechanism the caller's plain-dashboard-pane-with-a-warning fallback depends on (fork #122).
+- **Layer:** L1 (in-process — `resolve_orchestration_for_restore` against a worktree path that was never created on disk; no PTY, no filesystem beyond the missing-path check).
+- **Agent:** none.
+- **Asserts:** an `OrchestrationSnapshot` whose `project_path` (and the saved pane `dir` passed alongside it) name a nonexistent directory makes `resolve_orchestration_for_restore` return `Err` — `canonicalize()` fails on the missing dir before any config load is attempted — and the error message names the orchestration (`snap.config_name`), matching every other drift reason this function produces.
+- **Does not assert:** the caller's `session_warnings` push or the plain-dashboard-pane fallback itself (`run_tui`, exercised end to end by `session/restore/009`/`010`'s L2 drift coverage, which predate this worktree-specific removal scenario); that the deck ever auto-removes a worktree (it does not — product decision); real `git worktree remove`.
+- **Platform coverage:** mac+linux+windows.
 
 ### Live session status on reconnect (PRD #162)
 

@@ -29316,6 +29316,124 @@ mod tests {
         }
     }
 
+    /// Fork #122: a real `.dot-agent-deck.toml` at `dir` defining one
+    /// orchestration with the same `coder`/`reviewer` role shape
+    /// `make_orchestration` builds in memory — used by both
+    /// `restore_015`/`restore_016` so `resolve_orchestration_for_restore`
+    /// (which reads the config from disk, unlike `make_orchestration`) has a
+    /// real file to load.
+    fn write_restore_fixture_config(dir: &Path, orchestration_name: &str) {
+        let toml = format!(
+            "[[orchestrations]]\nname = \"{orchestration_name}\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"claude\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"reviewer\"\ncommand = \"claude\"\nstart = false\n"
+        );
+        std::fs::write(dir.join(".dot-agent-deck.toml"), toml)
+            .expect("write fixture .dot-agent-deck.toml");
+    }
+
+    /// Scenario: Build an `OrchestrationSnapshot` whose `project_path` (and the
+    /// saved pane `dir` passed alongside it) point at a real worktree
+    /// directory carrying its own `.dot-agent-deck.toml`. Feed it through
+    /// `resolve_orchestration_for_restore` — the exact seam the daemon-empty
+    /// restore path in `run_tui` calls — then feed the resolved config into
+    /// `TabManager::open_orchestration_tab` with that SAME worktree path as
+    /// `cwd`, exactly as restore does with `saved_pane.dir`. Every role pane
+    /// must spawn rooted in the worktree, proving a captured orchestration tab
+    /// restores without falling back onto the deck's own cwd.
+    #[spec("session/restore/015")]
+    #[test]
+    fn restore_015_orchestration_tab_restores_rooted_in_captured_worktree() {
+        let tmp = tempdir().expect("tempdir");
+        let worktree = tmp.path().join("dot-agent-deck-my-feature");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+        write_restore_fixture_config(&worktree, "restore-worktree");
+        let worktree_str = worktree.display().to_string();
+
+        // Fork #122: capture always writes `project_path == dir` (both the
+        // worktree) — the anti-tampering check `resolve_orchestration_for_restore`
+        // enforces — so a genuine saved snapshot always names the worktree on
+        // both sides, exactly as built here.
+        let snap = config::OrchestrationSnapshot {
+            version: 1,
+            roles: vec!["coder".to_string(), "reviewer".to_string()],
+            start_role_index: 0,
+            orchestrator_prompt: String::new(),
+            config_name: "restore-worktree".to_string(),
+            project_path: worktree_str.clone(),
+            started_role_indices: Vec::new(),
+            display_title: None,
+        };
+
+        let (orch_config, start_idx) = resolve_orchestration_for_restore(&snap, &worktree_str)
+            .expect("resolve_orchestration_for_restore must succeed for a live worktree");
+        assert_eq!(start_idx, 0);
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (_, role_pane_ids) = tm
+            .open_orchestration_tab(&orch_config, &worktree_str, None, None, (24, 80))
+            .expect("open_orchestration_tab");
+
+        let cwds = pc.recorded_cwds();
+        assert_eq!(
+            role_pane_ids.len(),
+            orch_config.roles.len(),
+            "one pane per role"
+        );
+        assert_eq!(cwds.len(), orch_config.roles.len());
+        for cwd in &cwds {
+            assert_eq!(
+                cwd.as_deref(),
+                Some(worktree_str.as_str()),
+                "restore calls open_orchestration_tab with the saved pane's dir \
+                 (the captured worktree) — every role pane must spawn rooted in \
+                 it, not in the deck's own cwd"
+            );
+        }
+    }
+
+    /// Scenario: Build an `OrchestrationSnapshot` whose `project_path` (and
+    /// saved `dir`) name a worktree directory that was never created — standing
+    /// in for one the user removed with `git worktree remove` after the tab was
+    /// captured (the deck itself never auto-removes one). Feed it through
+    /// `resolve_orchestration_for_restore` and assert it returns `Err` naming
+    /// the orchestration: `canonicalize()` fails on the missing directory
+    /// before any config is loaded, which is the mechanism the caller's
+    /// `session_warnings` fallback to a plain dashboard pane depends on.
+    #[spec("session/restore/016")]
+    #[test]
+    fn restore_016_removed_worktree_fails_resolution_by_name() {
+        let tmp = tempdir().expect("tempdir");
+        // Deliberately never created on disk.
+        let worktree = tmp.path().join("dot-agent-deck-removed-feature");
+        let worktree_str = worktree.display().to_string();
+
+        let snap = config::OrchestrationSnapshot {
+            version: 1,
+            roles: vec!["coder".to_string(), "reviewer".to_string()],
+            start_role_index: 0,
+            orchestrator_prompt: String::new(),
+            config_name: "restore-worktree".to_string(),
+            project_path: worktree_str.clone(),
+            started_role_indices: Vec::new(),
+            display_title: None,
+        };
+
+        let result = resolve_orchestration_for_restore(&snap, &worktree_str);
+        let err = result.expect_err(
+            "a saved orchestration whose worktree no longer exists on disk must fail \
+             re-resolution — canonicalize() on the missing dir returns Err — so the \
+             caller falls back to a plain dashboard pane instead of building a \
+             half-broken orchestration tab",
+        );
+        assert!(
+            err.contains(&snap.config_name),
+            "the resolve error must name the orchestration so session_warnings \
+             surfaces something the user can act on: {err:?}"
+        );
+    }
+
     /// Scenario: Open an orchestration with an initial start-role agent, then
     /// rebind that pane before readiness. The queued prompt must remain bound to
     /// the original agent identity captured when the tab was created.
