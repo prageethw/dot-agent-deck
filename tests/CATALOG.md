@@ -2593,6 +2593,29 @@ without depending on the config struct API.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
+#### orchestration/worktree
+
+##### orchestration/worktree/001 — Submitting the orchestration form with a worktree slug typed in yields a request carrying the resolved sibling worktree path; a blank slug carries `None`, preserving today's exact behavior (fork #122 reopened — deliberately NOT PRD #220's shape).
+- **Layer:** L1 (pure — `build_new_pane_request` against a `NewPaneFormState`; no PTY, no daemon, no filesystem).
+- **Agent:** none.
+- **Asserts:** with an orchestration selected and a non-blank worktree slug, the built `NewPaneRequest.orchestration_worktree_path` equals the sibling directory `<dir>-<slug>` next to the form's picked `dir`; the identical form with a blank slug yields `orchestration_worktree_path == None`.
+- **Does not assert:** actually creating the worktree on disk (covered by `orchestration/worktree/002`/`003`); keyboard focus/typing into the slug field; branch naming.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/worktree/002 — When the resolved worktree fails to create (e.g. `dir` is not a git repository), the orchestration tab is refused and the error surfaces — never a silent fallback to the shared cwd (fork #122).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; real `git` subprocess against a tempdir that is deliberately not a repository, no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** dispatching `Action::SpawnPane` for a request whose `orchestration_worktree_path` is `Some(..)` but whose creation fails leaves the active tab as `Tab::Dashboard` (no orchestration tab opened), spawns no role panes, and sets a non-empty `ui.status_message` describing the failure.
+- **Does not assert:** the exact error wording; the TOCTOU/branch-exists probing `create_worktree` (`src/issue_dispatch_run.rs`) already covers for the scheduler path; recovery/retry UX.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/worktree/003 — Role panes spawned for an orchestration whose request `dir` is already the resolved worktree path land rooted in that worktree: every pane's spawn `cwd` and every `pane_cwd_map` entry resolve to it, not the deck's own cwd (fork #122 — characterization of the existing cwd-threading mechanism this feature builds on).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** with `NewPaneRequest.dir` set to a worktree-like path, every role's `create_pane_with_options` call is recorded with that path as `cwd`, and every entry `AppState.pane_cwd_map` inserts for the orchestration's role panes equals that same path — the map `work-done` resolution keys off (CLAUDE.md rule 1 / fork #74's collision).
+- **Does not assert:** how the worktree path was resolved or created (covered by `orchestration/worktree/001`/`002`); real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Session restore
 
 #### session/restore

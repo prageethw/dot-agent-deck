@@ -28560,6 +28560,11 @@ mod tests {
         /// correlate each role pane's initial PTY width with the tab it
         /// belongs to.
         spawn_cols: std::sync::Mutex<Vec<u16>>,
+        /// fork #122: the `cwd` passed to every `create_pane_with_options`
+        /// call, in call order — lets a test assert which directory each role
+        /// pane actually spawned into (e.g. the orchestration's own
+        /// worktree, rather than the deck's shared cwd).
+        cwds: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl CapturingPaneController {
@@ -28569,6 +28574,7 @@ mod tests {
                 memberships: std::sync::Mutex::new(Vec::new()),
                 agent_generation: std::sync::Mutex::new("original".to_string()),
                 spawn_cols: std::sync::Mutex::new(Vec::new()),
+                cwds: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -28591,6 +28597,11 @@ mod tests {
             self.spawn_cols.lock().unwrap().clone()
         }
 
+        /// See `cwds` field doc.
+        fn recorded_cwds(&self) -> Vec<Option<String>> {
+            self.cwds.lock().unwrap().clone()
+        }
+
         fn rebind_agents(&self) {
             *self.agent_generation.lock().unwrap() = "replacement".to_string();
         }
@@ -28600,7 +28611,7 @@ mod tests {
         fn create_pane_with_options(
             &self,
             _command: Option<&str>,
-            _cwd: Option<&str>,
+            cwd: Option<&str>,
             opts: AgentSpawnOptions<'_>,
         ) -> Result<(String, String), PaneError> {
             self.memberships
@@ -28608,6 +28619,7 @@ mod tests {
                 .unwrap()
                 .push(opts.tab_membership.clone());
             self.spawn_cols.lock().unwrap().push(opts.cols);
+            self.cwds.lock().unwrap().push(cwd.map(|s| s.to_string()));
             let mut n = self.next.lock().unwrap();
             let id = format!("pane-{n}");
             *n += 1;
@@ -28762,6 +28774,192 @@ mod tests {
                 "tab TITLE should preserve the form/basename name (PRD #107)"
             ),
             _ => panic!("expected an Orchestration tab to be active after SpawnPane"),
+        }
+    }
+
+    /// Scenario: Build the new-pane form for an orchestration with a
+    /// worktree slug typed in, then submit it. The resulting request must
+    /// carry the resolved sibling worktree path (`<dir>-<slug>`, next to the
+    /// picked directory). The identical form with a BLANK slug must carry
+    /// `None`, preserving today's exact behavior — panes spawn in the deck's
+    /// own cwd (fork #122 reopened: this issue's shape, deliberately not
+    /// PRD #220's).
+    #[spec("orchestration/worktree/001")]
+    #[test]
+    fn worktree_001_slug_resolves_path_blank_yields_none() {
+        let dir = PathBuf::from("/tmp/dot-agent-deck");
+
+        // A typed slug resolves to a sibling worktree dir named <repo>-<slug>.
+        let mut with_slug = NewPaneFormState::new(
+            dir.clone(),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_worktree_slug("my-feature".to_string());
+        with_slug.selection_index = 1; // the only orchestration
+        let req = build_new_pane_request(&with_slug, "claude");
+        assert_eq!(
+            req.orchestration_worktree_path,
+            Some(PathBuf::from("/tmp/dot-agent-deck-my-feature")),
+            "a typed slug must resolve to a sibling worktree dir named <repo>-<slug>"
+        );
+
+        // A blank slug is today's behavior exactly: no worktree path, so the
+        // SpawnPane handler falls back to the deck's own cwd.
+        let mut blank = NewPaneFormState::new(
+            dir,
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        );
+        blank.selection_index = 1;
+        let req = build_new_pane_request(&blank, "claude");
+        assert_eq!(
+            req.orchestration_worktree_path, None,
+            "a blank slug must preserve today's behavior: no worktree, panes spawn in the deck's cwd"
+        );
+    }
+
+    /// Scenario: Submit an orchestration form whose worktree slug resolves
+    /// against a `dir` that is deliberately NOT a git repository, so the
+    /// real worktree-creation step fails when `Action::SpawnPane` is
+    /// dispatched. The fail-loud contract (fork #122) requires the
+    /// orchestration tab is never opened and the error surfaces to the user
+    /// — never a silent fallback to the shared cwd, which would reintroduce
+    /// the collision (CLAUDE.md rule 1 / fork #74) while looking like it
+    /// worked.
+    #[spec("orchestration/worktree/002")]
+    #[test]
+    fn worktree_002_creation_failure_refuses_tab_and_surfaces_error() {
+        let tmp = tempdir().expect("tempdir");
+        // Deliberately not a git repository: `git worktree add` must fail.
+        let dir = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let mut form = NewPaneFormState::new(
+            dir.clone(),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_worktree_slug("my-feature".to_string());
+        form.selection_index = 1;
+
+        let req = build_new_pane_request(&form, "claude");
+        assert!(
+            req.orchestration_worktree_path.is_some(),
+            "precondition: the form must resolve a worktree path to attempt creating"
+        );
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // Fail-loud: no tab was created...
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "worktree creation failure must refuse to open the orchestration tab, \
+             never silently spawn into the shared cwd"
+        );
+        // ...no role pane was spawned...
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "no role pane should be spawned when worktree creation fails"
+        );
+        // ...and the error surfaces to the user.
+        let message = ui
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !message.is_empty(),
+            "worktree creation failure must surface a status message, not fail silently"
+        );
+    }
+
+    /// Scenario: Submit a new-pane orchestration request whose `dir` is
+    /// ALREADY the resolved worktree path (simulating that a worktree was
+    /// created and its path threaded into the request), and dispatch the
+    /// real `Action::SpawnPane`. Every role pane must be spawned with that
+    /// worktree as its `cwd`, and `AppState.pane_cwd_map` — the map
+    /// `work-done` resolution keys off — must resolve every role pane to the
+    /// SAME worktree, not the deck's shared cwd. This is a characterization
+    /// test of the EXISTING cwd-threading mechanism
+    /// (`create_pane_with_options(cwd)`) fork #122 builds on: it needs no new
+    /// API and may already pass today.
+    #[spec("orchestration/worktree/003")]
+    #[test]
+    fn worktree_003_role_panes_root_in_the_worktree() {
+        let tmp = tempdir().expect("tempdir");
+        let worktree = tmp.path().join("dot-agent-deck-my-feature");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+        let worktree_str = worktree.display().to_string();
+
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir: worktree.clone(),
+            name: String::new(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // Every role pane's create_pane_with_options call carried the
+        // worktree as its cwd.
+        let cwds = pc.recorded_cwds();
+        assert_eq!(cwds.len(), config.roles.len(), "one pane per role");
+        for cwd in &cwds {
+            assert_eq!(
+                cwd.as_deref(),
+                Some(worktree_str.as_str()),
+                "every role pane must be spawned rooted in the orchestration's own worktree"
+            );
+        }
+
+        // pane_cwd_map — what work-done resolution keys off — must resolve
+        // every role pane to the SAME worktree, not the deck's shared cwd.
+        let st = state.blocking_read();
+        assert_eq!(st.pane_cwd_map.len(), config.roles.len());
+        for cwd in st.pane_cwd_map.values() {
+            assert_eq!(cwd, &worktree_str);
         }
     }
 
