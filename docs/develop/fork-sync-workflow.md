@@ -128,6 +128,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `8ddee05` | `docs(fork-sync): correct the 65e46b2 drift note — it was carried as 2ccf984 (#105)` | **PERMANENT** fork-only (doc) — edits this fork's own sync-workflow doc |
 | `d89b1ca` | `ci: split the e2e job into its own workflow (fork #50 item 1) (#108)` | **PERMANENT** fork-only (CI) — splits out the fork's own `e2e:` job (`08a9402`/`65e46b2`), which does not exist upstream, into its own workflow file; same basis as `08a9402` and the Semgrep/Sonar rows |
 | `9cc775c` | `test(hook): pin the slow-drip socket hang left open by #99 (fork #101) (#106)` | **UPSTREAM-WORTHY** — `request_from_socket_inner` is upstream's own hook-socket plumbing; an unbounded total-operation deadline against a peer that drips bytes slowly enough to keep resetting each individual read/write timeout is a defect there too, same basis as `9ed01ae` (#99), which this directly extends |
+| `7270c8a` | `docs(claude,config): harden worktree/agent isolation and add issue-claim check (fork #74) (#104)` | **PERMANENT** fork-only (rules/config) |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
