@@ -142,17 +142,192 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+/// Fork issue #136 finding 2: the process-wide cap on outstanding detached
+/// reap threads (see [`detach_reap_or_fallback_sync`]) both platforms'
+/// `terminate_child_with_grace_and_detached_reap_forcing_group_backstop` fall
+/// back to a synchronous `wait()` at.
+///
+/// "One thread per timeout" is not a bound — a single `create_worktree_sync`
+/// attempt can reach this path up to three times (the branch probe, the add
+/// that still runs even when the probe already timed out, and the best-effort
+/// cleanup after a timed-out add all share [`crate::issue_dispatch_run::run_status_sync`]),
+/// and a user retrying after the visible failure repeats it. Each blocked
+/// `wait()` — a process wedged in uninterruptible kernel I/O never returns
+/// until that I/O completes — holds a native OS thread and its stack
+/// (typically 2-8MB) indefinitely, so an *unbounded* count of these is exactly
+/// the thread-exhaustion state that this fix's finding 1 half depends on
+/// avoiding (a `spawn` failing is what turns finding 1's dropped-`Result` bug
+/// into a real zombie).
+///
+/// 8 is chosen as comfortably more than one attempt's worst case (3) — so a
+/// single stuck attempt does not immediately force a second, independent
+/// attempt onto the synchronous fallback — while still keeping the worst-case
+/// resident cost (8 native threads' worth of stack) small and bounded no
+/// matter how many timeouts accumulate. This is a small, infrequent,
+/// user-triggered path (`git worktree add`/`remove` past a 30s timeout), not a
+/// hot one, so there is no throughput reason to pick anything larger.
+pub(crate) const MAX_OUTSTANDING_DETACHED_REAPS: usize = 8;
+
+/// The live count of detached reap threads currently blocked in `wait()`
+/// against [`MAX_OUTSTANDING_DETACHED_REAPS`]. Incremented by
+/// [`try_reserve_detached_reap_slot`] and released by
+/// [`release_detached_reap_slot`] once a reap completes (or is abandoned
+/// because the thread never started — see [`detach_reap_or_fallback_sync`]).
+static OUTSTANDING_DETACHED_REAPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Try to reserve one of `cap` outstanding detached-reap slots against
+/// `counter`. `true` means the slot is reserved and the caller owns
+/// releasing it (via [`release_detached_reap_slot`]) once its reap
+/// completes; `false` means the cap is saturated and the caller must fall
+/// back to a synchronous reap instead of spawning a detached thread.
+///
+/// Takes `counter` and `cap` as parameters, rather than reaching for
+/// [`OUTSTANDING_DETACHED_REAPS`] / [`MAX_OUTSTANDING_DETACHED_REAPS`]
+/// directly, so `orchestration/worktree/012` can force the cap low and drive
+/// this exact reservation policy against its own private counter — the
+/// production mechanism, not a reimplementation of it — without needing a
+/// process-wide state reset between tests.
+pub(crate) fn try_reserve_detached_reap_slot(
+    counter: &std::sync::atomic::AtomicUsize,
+    cap: usize,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < cap).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+/// Release a slot reserved by [`try_reserve_detached_reap_slot`]. Called once
+/// a detached reap thread's `wait()` returns, or immediately if the thread
+/// that would have released it never started at all (spawn failure).
+fn release_detached_reap_slot(counter: &'static std::sync::atomic::AtomicUsize) {
+    counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Fork issue #136: reap `child` on a short-lived detached thread, subject to
+/// the `counter`/`cap` bound from [`try_reserve_detached_reap_slot`] — the
+/// single mechanism both platforms' `terminate_child_with_grace_and_detached_reap_forcing_group_backstop`
+/// end their SIGKILL phase with, closing findings 1 and 2 together:
+///
+/// - **Cap saturated:** fall back to a synchronous `wait()` on the calling
+///   thread rather than spawning past the bound.
+/// - **Spawn fails:** finding 1 — the old code discarded `Builder::spawn`'s
+///   `Result` with `let _ =`, so a failed spawn dropped the closure that
+///   *owned* `child`, and `Child` does not reap on `Drop`. Here `child` is
+///   handed to the new thread over an (unbounded, non-blocking) channel
+///   rather than moved directly into its closure, so a failed spawn — the
+///   closure and its `Receiver` half are simply never created/dropped
+///   unrun — leaves `child` untouched in this function's own scope,
+///   recoverable for the same synchronous fallback as the at-cap case.
+///
+/// Either fallback is logged (`caller_context` names which call site and
+/// phase this came from) so a saturated cap or a failing spawn is visible in
+/// the logs rather than silently changing latency.
+///
+/// Why a bounded synchronous fallback rather than a queue or a shared worker
+/// pool: a single worker thread stalls every *other* outstanding reap the
+/// moment one child blocks forever — exactly the failure mode this exists to
+/// defend against. The synchronous fallback's cost is small in practice: the
+/// `wait()` normally returns immediately after the SIGKILL already delivered
+/// by the caller, so blocking here requires both uninterruptible I/O *and*
+/// saturation at the same time. Trading a rare, brief block for a guaranteed
+/// reap and a hard thread bound is the right trade.
+pub(crate) fn detach_reap_or_fallback_sync(
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    thread_name: &'static str,
+    caller_context: &'static str,
+) {
+    detach_reap_or_fallback_sync_with_cap(
+        child,
+        &OUTSTANDING_DETACHED_REAPS,
+        MAX_OUTSTANDING_DETACHED_REAPS,
+        thread_name,
+        caller_context,
+    );
+}
+
+/// [`detach_reap_or_fallback_sync`], parameterized on `counter`/`cap` so
+/// `orchestration/worktree/012` can exercise the real reservation/fallback
+/// policy with the cap forced low, against a counter private to the test —
+/// see [`try_reserve_detached_reap_slot`]'s doc comment for why.
+pub(crate) fn detach_reap_or_fallback_sync_with_cap(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    counter: &'static std::sync::atomic::AtomicUsize,
+    cap: usize,
+    thread_name: &'static str,
+    caller_context: &'static str,
+) {
+    if !try_reserve_detached_reap_slot(counter, cap) {
+        tracing::warn!(
+            context = caller_context,
+            cap,
+            "outstanding detached-reap cap saturated; reaping synchronously on the calling \
+             thread instead of spawning past the bound"
+        );
+        let _ = child.wait();
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Box<dyn portable_pty::Child + Send + Sync>>();
+    let spawn_result = std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            if let Ok(mut child) = rx.recv() {
+                let _ = child.wait();
+            }
+            release_detached_reap_slot(counter);
+        });
+
+    let Ok(_join_handle) = spawn_result else {
+        // Fork issue #136 finding 1: `child` was never moved into the failed
+        // spawn's closure (only `rx` was), so it is still owned right here —
+        // nothing to recover, nothing dropped unreaped.
+        release_detached_reap_slot(counter);
+        tracing::warn!(
+            context = caller_context,
+            "failed to spawn a detached reap thread; reaping synchronously on the calling \
+             thread instead"
+        );
+        let _ = child.wait();
+        return;
+    };
+
+    // The thread exists and is blocked on `rx.recv()`; handing off `child`
+    // cannot fail unless that thread already died before receiving (e.g. an
+    // immediate panic), in which case `send` returns it back to us rather
+    // than silently discarding it.
+    if let Err(unsent) = tx.send(child) {
+        // The thread died (e.g. panicked) before reaching `rx.recv()`, so it
+        // never reached its own `release_detached_reap_slot` call either —
+        // release the slot here instead of leaking it permanently.
+        release_detached_reap_slot(counter);
+        tracing::warn!(
+            context = caller_context,
+            "detached reap thread was spawned but exited before it could receive the child; \
+             reaping synchronously on the calling thread instead"
+        );
+        let mut child = unsent.0;
+        let _ = child.wait();
+    }
+}
+
 #[cfg(unix)]
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    spawn_in_new_process_group, terminate_child_with_grace_and_wait,
+    spawn_in_new_process_group,
+    terminate_child_with_grace_and_detached_reap_forcing_group_backstop,
+    terminate_child_with_grace_and_wait,
     terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
+    terminate_child_with_grace_and_detached_reap_forcing_group_backstop,
     terminate_child_with_grace_and_wait,
     terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
@@ -537,6 +712,256 @@ mod tests {
                     }
                 );
             }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Fork issue #136: `terminate_child_with_grace_and_detached_reap_forcing_group_backstop`
+    /// must return promptly even when the underlying `wait()` cannot complete
+    /// immediately, instead of blocking the caller for however long the reap
+    /// takes — that is the property the fix exists to guarantee. A genuinely
+    /// unkillable process (one wedged in uninterruptible kernel I/O, e.g. a
+    /// stuck NFS mount) cannot be constructed in a test, so this pins the same
+    /// observable shape with a pure-Rust `portable_pty::Child` stand-in whose
+    /// `wait()` deliberately blocks far longer than the grace window — the
+    /// call must still return quickly, and the reap must still complete on
+    /// its own afterward. This asserts on that OBSERVABLE behavior (return
+    /// latency, eventual completion of the stand-in's `wait()`), not on the
+    /// implementation detail of a thread existing.
+    ///
+    /// Scenario: a fake child that never reports exited via `try_wait` and
+    /// whose `wait()` sleeps 1s before completing is torn down with a 50ms
+    /// grace window. The call is expected to return in well under a second —
+    /// comfortably less than what blocking on the fake's `wait()` would cost
+    /// — and the fake's `wait()` is separately confirmed (via a bounded poll
+    /// on a shared flag it sets when done) to have run to completion shortly
+    /// after, proving the reap was not simply dropped.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/011")]
+    #[test]
+    fn worktree_011_detached_reap_forcing_backstop_returns_before_a_slow_wait_completes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct SlowReapChild {
+            reaped: Arc<AtomicBool>,
+            reap_delay: std::time::Duration,
+        }
+
+        impl portable_pty::ChildKiller for SlowReapChild {
+            fn kill(&mut self) -> std::io::Result<()> {
+                // No real process backs this stand-in — SIGTERM/SIGKILL are
+                // both no-ops here, matching a process that has already been
+                // killed but is stuck in kernel I/O and has not yet been
+                // reaped.
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(SlowReapChild {
+                    reaped: self.reaped.clone(),
+                    reap_delay: self.reap_delay,
+                })
+            }
+        }
+
+        impl portable_pty::Child for SlowReapChild {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                // Never reports exited via polling, so the caller always runs
+                // phase 3 and reaches the final reap.
+                Ok(None)
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                std::thread::sleep(self.reap_delay);
+                self.reaped.store(true, Ordering::SeqCst);
+                Ok(portable_pty::ExitStatus::with_exit_code(137))
+            }
+            fn process_id(&self) -> Option<u32> {
+                // No real pid to report; this exercises
+                // `signal_child_pgroup_or_fallback`'s `child.kill()` fallback
+                // path rather than a real `killpg`.
+                None
+            }
+        }
+
+        let reaped = Arc::new(AtomicBool::new(false));
+        let reap_delay = std::time::Duration::from_secs(1);
+        let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(SlowReapChild {
+            reaped: reaped.clone(),
+            reap_delay,
+        });
+        let grace = std::time::Duration::from_millis(50);
+        let group = AgentProcessGroup;
+
+        let started = std::time::Instant::now();
+        super::terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
+            child, grace, &group,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the call should return once the grace window and signalling are done, without \
+             waiting for the slow reap to finish (reap takes {reap_delay:?}, call took \
+             {elapsed:?})"
+        );
+        assert!(
+            !reaped.load(Ordering::SeqCst),
+            "the reap should not have completed synchronously within the call — otherwise this \
+             test is not exercising the detached path at all"
+        );
+
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !reaped.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < confirm_deadline,
+                "the detached reap never completed — the child was signalled but never reaped, \
+                 which would reintroduce the zombie leak the detached thread exists to avoid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Fork issue #136 finding 2 (both the reviewer and the auditor, and the
+    /// auditor's correction of a justification the spec had accepted):
+    /// "one thread per timeout" was never a bound on its own — a single
+    /// stuck `create_worktree_sync` attempt can reach the detached-reap tail
+    /// up to three times, and a retrying user repeats it — so the outstanding
+    /// count must itself be capped, with a synchronous fallback that still
+    /// reaps rather than ever dropping the child (finding 1).
+    ///
+    /// This drives [`super::detach_reap_or_fallback_sync_with_cap`] directly
+    /// — the exact function both platforms' detached-reap backstops funnel
+    /// into, parameterized on `counter`/`cap` rather than reimplemented —
+    /// with the cap forced to 1 and a counter private to this test, so
+    /// nothing here depends on (or asserts) the real process-wide cap value
+    /// or interferes with any other test's use of it.
+    ///
+    /// Scenario: two fake children, each reporting never-exited via
+    /// `try_wait` and recording completion via their own `AtomicBool` when
+    /// their `wait()` returns (child A after 500ms, child B after 150ms).
+    /// With the cap forced to 1, child A is handed to the detached path
+    /// first — it takes the only slot, so the call returns promptly, well
+    /// before A's own `wait()` could have finished. Child B is handed off
+    /// immediately afterward, while A's slot is still held: the cap is
+    /// saturated, so B's call takes the synchronous fallback branch instead
+    /// — it must therefore both take at least as long as B's own `wait()`
+    /// AND have B's completion flag already set the moment it returns,
+    /// proving the fallback genuinely reaps inline rather than dropping B or
+    /// racing its own return against the reap. A bounded poll afterward
+    /// confirms A's detached reap also eventually completes — the honest
+    /// property this test exists for: a reap beyond the cap still completes,
+    /// on either path.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/012")]
+    #[test]
+    fn worktree_012_outstanding_reap_cap_falls_back_to_a_synchronous_reap_that_still_completes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct SlowReapChild {
+            reaped: Arc<AtomicBool>,
+            reap_delay: std::time::Duration,
+        }
+
+        impl portable_pty::ChildKiller for SlowReapChild {
+            fn kill(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(SlowReapChild {
+                    reaped: self.reaped.clone(),
+                    reap_delay: self.reap_delay,
+                })
+            }
+        }
+
+        impl portable_pty::Child for SlowReapChild {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                Ok(None)
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                std::thread::sleep(self.reap_delay);
+                self.reaped.store(true, Ordering::SeqCst);
+                Ok(portable_pty::ExitStatus::with_exit_code(137))
+            }
+            fn process_id(&self) -> Option<u32> {
+                None
+            }
+        }
+
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        const CAP: usize = 1;
+
+        let a_reaped = Arc::new(AtomicBool::new(false));
+        let a: Box<dyn portable_pty::Child + Send + Sync> = Box::new(SlowReapChild {
+            reaped: a_reaped.clone(),
+            reap_delay: std::time::Duration::from_millis(500),
+        });
+        let b_reaped = Arc::new(AtomicBool::new(false));
+        let b_reap_delay = std::time::Duration::from_millis(150);
+        let b: Box<dyn portable_pty::Child + Send + Sync> = Box::new(SlowReapChild {
+            reaped: b_reaped.clone(),
+            reap_delay: b_reap_delay,
+        });
+
+        // A takes the only slot and goes detached: returns promptly, well
+        // under its own 500ms reap delay.
+        let a_started = std::time::Instant::now();
+        super::detach_reap_or_fallback_sync_with_cap(
+            a,
+            &COUNTER,
+            CAP,
+            "worktree-012-reap-a",
+            "orchestration-worktree-012-test-a",
+        );
+        let a_elapsed = a_started.elapsed();
+        assert!(
+            a_elapsed < std::time::Duration::from_millis(300),
+            "the first call should take the free slot and return via the detached path, well \
+             before its own 500ms reap could finish (call took {a_elapsed:?})"
+        );
+        assert!(
+            !a_reaped.load(Ordering::SeqCst),
+            "A's reap should not have completed synchronously within the call — otherwise the \
+             cap forced no detached path at all and the rest of this test cannot distinguish \
+             the two branches"
+        );
+
+        // B is handed off immediately after, while A's slot is still held —
+        // the cap is saturated, so B must take the synchronous fallback.
+        let b_started = std::time::Instant::now();
+        super::detach_reap_or_fallback_sync_with_cap(
+            b,
+            &COUNTER,
+            CAP,
+            "worktree-012-reap-b",
+            "orchestration-worktree-012-test-b",
+        );
+        let b_elapsed = b_started.elapsed();
+        assert!(
+            b_elapsed >= b_reap_delay.saturating_sub(std::time::Duration::from_millis(30)),
+            "with the cap saturated by A, B's call must fall back to a synchronous wait and so \
+             cost at least B's own reap delay ({b_reap_delay:?}), not return early (call took \
+             {b_elapsed:?})"
+        );
+        assert!(
+            b_reaped.load(Ordering::SeqCst),
+            "B's reap must already be complete the moment the saturated-cap call returns — the \
+             synchronous fallback must reap inline, not merely schedule the reap and return \
+             before it finishes"
+        );
+
+        // A's detached reap — which the cap allowed to proceed — must still
+        // complete on its own; the cap must never turn into a second way to
+        // drop a child.
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !a_reaped.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < confirm_deadline,
+                "A's detached reap never completed — it was allowed past the cap but then \
+                 dropped, which is exactly the zombie leak finding 1 exists to prevent"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
