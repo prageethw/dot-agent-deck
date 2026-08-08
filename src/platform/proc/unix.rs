@@ -61,6 +61,52 @@ pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
     }
 }
 
+/// Fork issue #133 — spawn `command` as the leader of a brand-new process
+/// group, so a subsequent `killpg` targeting the returned pid reaches the
+/// whole tree it spawns (including hook grandchildren such as
+/// `post-checkout`) rather than a group the child never led.
+///
+/// A `portable-pty`-spawned agent already gets this for free — the pty
+/// allocation itself calls `setsid` — but a plain `std::process::Command`
+/// child (e.g. the `git` invocation behind `run_status_sync`) inherits the
+/// deck's own process group, so `killpg` on its pid would target the
+/// **deck's** group, not the child's. This makes the child a session/process-
+/// group leader before `exec` runs, which is what makes `getpgid(pid) == pid`
+/// hold afterward and the existing `killpg` teardown paths address the right
+/// group.
+///
+/// `command` must be configured (args, env, stdio) but not yet spawned.
+///
+/// # Safety / panics
+///
+/// `pre_exec`'s closure runs in the forked child, strictly between `fork` and
+/// `exec` — at that point only the calling thread exists and only
+/// async-signal-safe operations are defined behavior, and unwinding a panic
+/// across the fork boundary is undefined behavior. `setsid(2)` is
+/// async-signal-safe, and a hypothetical failure is reported back to the
+/// parent as an `io::Error` (which `Command::spawn` propagates) rather than
+/// panicking.
+pub fn spawn_in_new_process_group(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, AgentProcessGroup)> {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure only calls `setsid(2)` (async-signal-safe) and maps
+    // its one failure mode to an `io::Error` instead of panicking — see the
+    // doc comment above for why both properties are required here.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    let group = AgentProcessGroup::adopt(Some(child.id()));
+    Ok((child, group))
+}
+
 /// Low-level shared helper. Send `signal` to the child's process group,
 /// falling back to `portable_pty::Child::kill` when `pid_to_pgid` rejects the
 /// raw pid (F1-followup defensive boundary check). `phase` is included in

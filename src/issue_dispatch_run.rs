@@ -821,6 +821,13 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
 /// the render/event loop (inside the issue-dispatch scheduler's own tokio
 /// task), so a slow call here does not freeze the TUI the way a synchronous
 /// one on the `SpawnPane` dispatch path would.
+///
+/// Fork issue #133 deliberately does not touch this function: `.output()`
+/// waits unboundedly and this path never kills its child on a timeout, so it
+/// has no kill whose blast radius could be too narrow — there is nothing here
+/// for a process-group kill to fix, and no `AgentProcessGroup` handle worth
+/// threading through an await that never times out. The asymmetry with
+/// [`run_status_sync`] is intentional, not an oversight.
 async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
@@ -873,12 +880,79 @@ const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// checkout in it.
 const WORKTREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Fork issue #133: how long [`run_status_sync`] waits after SIGTERM before
+/// escalating to SIGKILL when [`WORKTREE_GIT_TIMEOUT`] (or
+/// [`WORKTREE_CLEANUP_TIMEOUT`]) expires and the child's whole process group
+/// is torn down via
+/// [`crate::platform::proc::terminate_child_with_grace_and_wait`]. This grace
+/// is spent blocking the TUI's synchronous render/event loop — the exact
+/// thing the timeout above exists to protect — so it is kept far shorter than
+/// either timeout rather than reusing one of them. 200ms is enough for `git`
+/// and any hook it ran to notice SIGTERM and exit on the common path, while
+/// staying short enough that even the worst case (a hook that ignores
+/// SIGTERM entirely, forcing the SIGKILL backstop) resolves in a fraction of
+/// a second rather than adding a second multi-second stall on top of the
+/// timeout that already fired.
+const WORKTREE_GIT_KILL_GRACE: Duration = Duration::from_millis(200);
+
 /// How often [`run_status_sync`] polls its spawned child for exit while
 /// enforcing its caller-supplied timeout. Short enough that the timeout
 /// bound is accurate to a fraction of a second; long enough not to spin the
 /// CPU on the render/event loop while a normal, fast `git` call is still
 /// running.
 const WORKTREE_GIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Configure and spawn the `git` child [`run_status_sync`] bounds, plus the
+/// [`crate::platform::proc::AgentProcessGroup`] handle its later
+/// [`crate::platform::proc::terminate_child_with_grace_and_wait`] escalation
+/// needs (fork issue #133).
+///
+/// On Unix the spawn goes through
+/// [`crate::platform::proc::spawn_in_new_process_group`] so the child leads
+/// its own process group and a subsequent `killpg` reaches it plus any hook
+/// grandchild it forked (a plain `std::process::Command::spawn()` would
+/// inherit the deck's own group instead). On Windows there is no spawn-time
+/// hook to make: `AgentProcessGroup::adopt(pid)` already works post-hoc there
+/// (the group is a Job Object the child is added to after the fact), so the
+/// child is spawned exactly as before and only then adopted.
+///
+/// Residual on Windows: a descendant the child forks in the window between
+/// `spawn()` returning and `adopt()` running is not yet in the Job Object and
+/// so is not reached by a later `TerminateJobObject` — the same class
+/// `windows.rs:194` already documents for agent teardown. Closing it needs
+/// `CREATE_SUSPENDED` plus a resume after `adopt()`, which is out of scope
+/// here; the window is small (no code runs between the two calls below) and
+/// unchanged from today's behavior.
+fn spawn_git_status_child(
+    program: &str,
+    args: &[&str],
+) -> std::io::Result<(
+    std::process::Child,
+    crate::platform::proc::AgentProcessGroup,
+)> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "");
+
+    #[cfg(unix)]
+    {
+        crate::platform::proc::spawn_in_new_process_group(&mut command)
+    }
+    #[cfg(windows)]
+    {
+        let child = command.spawn()?;
+        // See the doc comment above: the descendant-before-adopt window is
+        // the accepted residual, not a new gap introduced here.
+        let group = crate::platform::proc::AgentProcessGroup::adopt(Some(child.id()));
+        Ok((child, group))
+    }
+}
 
 /// Blocking twin of [`run_status_args`] for [`create_worktree_sync`] and
 /// [`attempt_worktree_cleanup`], which run on the TUI's synchronous
@@ -897,15 +971,7 @@ const WORKTREE_GIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// can give its own cleanup call a shorter, independent bound.
 fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<(), AddError> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut child = std::process::Command::new(program)
-        .args(&refs)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "")
-        .spawn()
+    let (mut child, group) = spawn_git_status_child(program, &refs)
         .map_err(|e| AddError::Failed(format!("failed to run `{program}`: {e}")))?;
 
     let deadline = Instant::now() + timeout;
@@ -914,8 +980,20 @@ fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Fork issue #133: escalate to a whole-process-group kill
+                    // instead of a bare `child.kill()`, which reaps only the
+                    // direct `git` process and leaves a hook grandchild (e.g.
+                    // `post-checkout`) running past this bound. `child` leads
+                    // its own group on Unix (see `spawn_git_status_child` /
+                    // `spawn_in_new_process_group`), so `killpg` here reaches
+                    // it and everything it forked.
+                    let mut boxed: Box<dyn portable_pty::Child + Send + Sync> =
+                        Box::new(crate::platform::proc::test_child::StdChild(child));
+                    crate::platform::proc::terminate_child_with_grace_and_wait(
+                        &mut boxed,
+                        WORKTREE_GIT_KILL_GRACE,
+                        &group,
+                    );
                     return Err(AddError::TimedOut(format!(
                         "`{program} {}` timed out after {timeout:?} without exiting",
                         refs.join(" "),

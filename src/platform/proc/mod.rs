@@ -146,7 +146,7 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    spawn_in_new_process_group, terminate_child_with_grace_and_wait, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
@@ -164,7 +164,15 @@ pub use windows::{
 /// methods the teardown path actually calls do anything; `clone_killer` is not on
 /// that path and returns a no-op killer rather than pretending to duplicate the
 /// handle.
-#[cfg(test)]
+///
+/// Promoted out of `#[cfg(test)]` for fork issue #133:
+/// [`crate::issue_dispatch_run::run_status_sync`] spawns a plain
+/// `std::process::Child` (not a pty) and, on timeout, needs the same
+/// `&mut Box<dyn portable_pty::Child + Send + Sync>` shape
+/// [`terminate_child_with_grace_and_wait`] takes — so this wrapper is now a
+/// production dependency, not only a test one. Visibility change only; the
+/// `NoopKiller` caveat above still holds (nothing on the teardown path clones
+/// a killer).
 pub(crate) mod test_child {
     /// Wraps a real OS child. `Debug` is required by the `portable_pty` traits.
     #[derive(Debug)]
@@ -392,10 +400,10 @@ mod tests {
         // `&` is near-instant but not synchronous with `spawn()` returning.
         let discover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let grandchild_pid = loop {
-            if let Some(table) = process_table() {
-                if let Some(descendant) = descendants(&table, child_pid as i32).first() {
-                    break descendant.pid as libc::pid_t;
-                }
+            if let Some(table) = process_table()
+                && let Some(descendant) = descendants(&table, child_pid as i32).first()
+            {
+                break descendant.pid as libc::pid_t;
             }
             assert!(
                 std::time::Instant::now() < discover_deadline,
