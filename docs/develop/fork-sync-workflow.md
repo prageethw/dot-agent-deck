@@ -245,13 +245,15 @@ Both were self-caught, closed with an apology comment, and left nothing behind b
 gh pr create --repo prageethw/dot-agent-deck --draft --base main ...
 ```
 
-Verify after creating, rather than assuming — the field is unambiguous:
+Verify after creating, rather than assuming. `url` is the unambiguous check — it names the repository the PR actually landed on:
 
 ```bash
-gh pr view <n> --repo prageethw/dot-agent-deck --json isCrossRepository,baseRepository \
-  --jq '"cross-repo=\(.isCrossRepository) base=\(.baseRepository.name)"'
-# expect: cross-repo=false base=dot-agent-deck
+gh pr view <n> --repo prageethw/dot-agent-deck --json isCrossRepository,url \
+  --jq '"cross-repo=\(.isCrossRepository) url=\(.url)"'
+# expect: cross-repo=false url=https://github.com/prageethw/dot-agent-deck/pull/<n>
 ```
+
+(There is no `baseRepository` field on `gh pr view` — `gh` rejects it and lists the valid ones. `isCrossRepository` alone is also not sufficient: it reports whether head and base differ, which is `false` for an ordinary same-repo PR on *either* repository.)
 
 If one does slip through: close it immediately with a brief explanatory comment, confirm `state` is `CLOSED`, and check that **no push landed on an upstream branch** — a PR carries only a title and body, but a push would leave commits behind. Note that the reverse case is legitimate and deliberate: this fork *does* open genuine upstream PRs (see [Caution: never delete a fork branch that backs an open upstream PR](#caution-never-delete-a-fork-branch-that-backs-an-open-upstream-pr)), so the goal is that every upstream PR is intentional, not that there are none.
 
