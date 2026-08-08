@@ -45,6 +45,23 @@ So a **third gate: ownership.** Remove without asking only what the deck can pro
 
 **Remove the worktree; keep the branch.** The branch costs nothing and keeps committed work recoverable.
 
+### When it asks, it asks specifically
+
+"Ask the human" is not a design until the shape of the question is pinned. An ask rendered as prose — a paragraph the reader must parse and translate into a decision — is the same failure this PRD exists to fix, only smaller: it moves the burden back onto the person instead of removing it.
+
+**Reuse the existing confirmation pattern rather than inventing one.** `Mode::CloseConfirm` and `CloseConfirmState` (`src/ui.rs:209`, `:1686`) are PRD #241's precedent for confirming a destructive action, and they already carry the two properties this needs:
+
+- **The safe option is the default.** `CloseConfirmState` is documented `0=Cancel, 1=Close` and is *"re-seeded to the Cancel default every time the dialog is armed"*. A worktree-removal prompt defaults to **keep**, every time it is raised.
+- **The question is bound to the identity captured when it was posed.** `close_confirm_target` (`:1693`) exists because of #241's review finding F1: the confirmation *"closes THIS and only this — never whatever happens to be selected"* at answer time. That applies here directly and is easy to get wrong — an ask about removing N worktrees must act on the **exact set enumerated when the question was raised**, never re-resolve at answer time. A tree can become dirty, or a new one appear, while the human is deciding.
+
+**Rules for the ask itself:**
+
+1. **Name the objects.** List the exact worktree paths. Not a count, not a category.
+2. **State the exact choice**, with keep as the default.
+3. **The ask leads; detail follows.** A pending decision is the output, not a footnote. It must never be discoverable only by reading past a report.
+4. **The non-interactive path emits the exact command to run**, ready to copy — not a description of what could be done.
+5. **One question for the batch.** N reclaimable foreign worktrees is one prompt listing N paths, not N prompts.
+
 ## Scope
 
 ### In Scope
@@ -52,6 +69,7 @@ So a **third gate: ownership.** Remove without asking only what the deck can pro
 - A pure, testable gate: `MERGED` PR **and** clean tree **and** (deck-created **or** explicitly authorised) → reclaimable; anything else → keep, with the reason reported.
 - **All worktrees are enumerated**, not only deck-created ones — the 8 stale trees measured are hand-made, so a deck-only scope would not solve the problem this PRD exists for. Provenance decides *whether to ask*, never whether to look.
 - A CLI verb to list reclaimable worktrees and to remove them, following the conventions of the existing read-only `daemon status [--json]` command — human-readable table plus versioned JSON, meaningful exit codes.
+- **The shape of the ask**: named objects, an explicit choice defaulting to keep, the question leading rather than trailing a report, a copy-ready command on the non-interactive path, and one prompt per batch. Bound to the set captured when the question was posed, reusing `CloseConfirmState`'s armed-target discipline.
 - Reporting *why* a worktree was kept (dirty, no PR, PR still open, PR closed-unmerged), so the output is actionable rather than a bare list.
 - Wiring the command into the orchestrator's post-merge protocol, and repointing the existing prose rule at the command instead of restating the policy.
 - Tests per CLAUDE.md rule 4, explicitly covering the squash-merged case and the no-PR-but-ancestor case, since those are the two that bite.
@@ -75,6 +93,8 @@ So a **third gate: ownership.** Remove without asking only what the deck can pro
 - The branch survives every removal.
 - A **deck-created** merged clean tree is removed with no human confirmation.
 - A **foreign** merged clean tree is never removed unattended: it is reported as reclaimable-pending-confirmation, and removed only on explicit authorisation.
+- A pending decision **names the exact worktree paths** and defaults to keep, and answering it acts on the set captured when it was posed — not on whatever is reclaimable at answer time.
+- A pending decision is never discoverable only by reading past a report.
 - When ownership cannot be determined — which includes every worktree after a daemon restart — the tree is treated as foreign, never as deck-created.
 - The orchestrator can invoke reclamation after a merge, and the safety decision is made by tested code rather than by the agent.
 - `cargo test-fast` green per task; `cargo test-e2e` green pre-PR.
@@ -91,7 +111,8 @@ So a **third gate: ownership.** Remove without asking only what the deck can pro
 
 - [ ] **M2.0** — Enumerate worktrees and resolve each one's PR state via `gh` and cleanliness via `git status --porcelain`.
 - [ ] **M2.1** — The CLI verb: listing (human table + versioned JSON) and removal, with removal explicit rather than implicit.
-- [ ] **M2.2** — Tests for the command surface, including the kept-with-reason output.
+- [ ] **M2.2** — The ask surface: named paths, keep-by-default, bound to the captured set, and a copy-ready command when non-interactive. Reuse `Mode::CloseConfirm`/`CloseConfirmState` rather than adding a parallel confirmation path.
+- [ ] **M2.3** — Tests for the command surface, including the kept-with-reason output and the ask's default-to-keep behaviour.
 
 ### Phase 3: Ship
 
