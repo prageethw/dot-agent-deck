@@ -53,6 +53,7 @@ pub struct StatusAgent {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
+    pub shell_synthetic_working: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<ActiveTool>,
 }
@@ -113,6 +114,10 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                 cwd: record.cwd,
                 role: role_of(&record.tab_membership),
                 status: live.as_ref().map(|s| s.status.clone()),
+                shell_synthetic_working: live
+                    .as_ref()
+                    .map(|s| s.shell_synthetic_working)
+                    .unwrap_or(false),
                 active_tool: live.and_then(|s| s.active_tool),
             }
         })
@@ -140,6 +145,13 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
             .as_ref()
             .map(|s| format!("{s:?}"))
             .unwrap_or_else(|| DASH.to_string());
+        // Fork issue #21 provenance marker: flag a status that was
+        // synthesized from shell activity rather than agent-emitted.
+        let status = if a.shell_synthetic_working {
+            format!("{status}*")
+        } else {
+            status
+        };
         let tool = a
             .active_tool
             .as_ref()
@@ -187,6 +199,7 @@ mod tests {
             first_prompts: Vec::new(),
             last_user_prompt: None,
             live_target: None,
+            shell_synthetic_working: false,
         }
     }
 
