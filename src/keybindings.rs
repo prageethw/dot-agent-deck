@@ -56,9 +56,10 @@ pub enum Action {
     NewPane,
     ClosePane,
     ToggleLayout,
-    /// PRD #336: toggle the orchestration sidebar/pane-column split between
-    /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across
-    /// orchestration tabs, though only pressable from one.
+    /// PRD #336/#387: cycle the deck-global sidebar/pane-column split
+    /// (`ui.split_stage`) through its three stages — Default, Narrow, and
+    /// Hidden. Claimed on any tab with a sidebar split (Dashboard and
+    /// Orchestration tabs), not orchestration tabs only.
     ToggleOrchestrationSplit,
     /// PRD #374 (#361 Item 3): toggle an orchestration tab's command-entry
     /// lock — whether direct keystrokes reach a focused non-orchestrator

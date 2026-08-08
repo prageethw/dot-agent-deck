@@ -28,7 +28,7 @@ expression: text
         │  1-9                Jump to pane N                                                                  │         
         │  Enter              Focus selected pane             j / Down        Select next                     │         
         │  Ctrl+w             Close selected pane (confirms)  k / Up          Select previous                 │         
-        │  Ctrl+l             Toggle orch tab split ratio     l / Right / Enter   Enter directory             │         
+        │  Ctrl+l             Cycle sidebar split stage       l / Right / Enter   Enter directory             │         
         │  /                  Filter sessions                 h / Left / Bksp     Go up one level             │         
         │  Esc                Clear filter                    Space           Confirm current directory       │         
         │  r                  Rename session                  /               Filter (case-insensitive)       │         
