@@ -1,0 +1,17 @@
+# Fixture for the L2 real-binary proof of fork #122's worktree-slug form
+# field (orchestration/worktree/005): a single orchestration with TWO roles,
+# each dumping its OWN cwd to a role-named log file before staying alive on
+# `sleep` — no real LLM tokens spent. The log content (not just its presence)
+# is what proves each role pane was spawned rooted in the created worktree
+# rather than the fixture's own directory.
+[[orchestrations]]
+name = "worktree-demo"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "pwd > pwd-orchestrator.log; sleep 600"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "pwd > pwd-worker.log; sleep 600"
