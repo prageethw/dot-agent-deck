@@ -312,6 +312,43 @@ async fn probe_socket_alive(path: &Path) -> bool {
     IpcStream::connect(path).await.is_ok()
 }
 
+/// Fork issue #92 test seam: the shape of a hook a test can install via
+/// [`Daemon::with_start_agent_registration_hook`], invoked once per
+/// orchestration-tagged `StartAgent` in `daemon_protocol::handle_connection`
+/// — after the child process is spawned (and, for a seeded start role, after
+/// its native seed is stashed pullable) but **before** that pane's
+/// `AppState` role/orchestrator maps are published. Called with the
+/// spawning pane's role name. Production installs
+/// [`noop_start_agent_registration_hook`], an immediately-ready empty
+/// future that inlines to nothing, so this costs nothing on the hot path.
+///
+/// A trait-object closure rather than a generic type parameter (contrast
+/// [`ingest_event_with_hook`]'s `H: FnOnce() -> F`): `Daemon` is
+/// constructed from over a dozen call sites across `main.rs` and the test
+/// suite, none of which care about this hook, so giving `Daemon` itself a
+/// generic parameter would ripple a type argument through every one of
+/// them for a seam only ever installed by a single test. A per-instance
+/// field — the same shape as the existing [`Daemon::lock_dir_override`]
+/// test seam on this struct — keeps the change local to `Daemon` plus the
+/// two functions that thread a value to `handle_connection` exactly the
+/// way `registry`/`event_tx`/`state` already are. Not `#[cfg(test)]`
+/// global/thread-local state either, for the same cross-test-interference
+/// reason documented on `ingest_event_with_hook`.
+pub type StartAgentRegistrationHook = Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// The production default for [`StartAgentRegistrationHook`]: ignores the
+/// role name and resolves immediately. `pub` (not `pub(crate)`) so both
+/// `daemon_protocol`'s no-counter [`serve_attach`] convenience wrapper AND
+/// the several `tests/*.rs` integration-test harnesses that call
+/// `serve_attach_with_counter` directly (each compiled as its own external
+/// crate against this library) can hand it through without constructing a
+/// whole `Daemon` just to read the field back off it.
+pub fn noop_start_agent_registration_hook() -> StartAgentRegistrationHook {
+    Arc::new(|_role_name: &str| Box::pin(async {}))
+}
+
 /// Bundle of daemon state. Owns the hook-event `SharedState` and the agent
 /// PTY registry, plus the path of the M1.2 streaming-attach socket. The
 /// registry is held for the lifetime of the daemon coroutine; on drop it
@@ -383,6 +420,10 @@ pub struct Daemon {
     /// between the scheduler callback factory and the attach server; wiped on
     /// restart (the worktree-exists idempotency signal reclaims entries).
     pub worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    /// Fork issue #92 test seam — see [`StartAgentRegistrationHook`].
+    /// `None`-shaped default (the inert no-op) in every production path;
+    /// set only via [`Self::with_start_agent_registration_hook`].
+    pub start_agent_registration_hook: StartAgentRegistrationHook,
 }
 
 impl Daemon {
@@ -405,6 +446,7 @@ impl Daemon {
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
+            start_agent_registration_hook: noop_start_agent_registration_hook(),
         }
     }
 
@@ -430,6 +472,7 @@ impl Daemon {
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
+            start_agent_registration_hook: noop_start_agent_registration_hook(),
         }
     }
 
@@ -450,6 +493,16 @@ impl Daemon {
     /// clear a previously-set override.
     pub fn with_lock_dir_override(mut self, dir: Option<PathBuf>) -> Self {
         self.lock_dir_override = dir;
+        self
+    }
+
+    /// Fork issue #92 test seam: install a [`StartAgentRegistrationHook`].
+    /// Production never calls this; it exists so a lifecycle test can hold
+    /// a specific role's `AppState` registration open deterministically
+    /// instead of relying on real OS scheduling to probabilistically
+    /// reproduce the startup race PR #93 pins.
+    pub fn with_start_agent_registration_hook(mut self, hook: StartAgentRegistrationHook) -> Self {
+        self.start_agent_registration_hook = hook;
         self
     }
 }
@@ -550,6 +603,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let scheduler = daemon.scheduler;
     let reuse_registry = daemon.reuse_registry;
     let worktree_registry = daemon.worktree_registry;
+    let start_agent_registration_hook = daemon.start_agent_registration_hook;
 
     // PRD #127 M1.3/M1.4: load the global `schedules.toml` and register each
     // enabled task before the idle monitor starts, so a registered schedule is
@@ -676,6 +730,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_scheduler = scheduler.clone();
         let attach_reuse = reuse_registry.clone();
         let attach_worktrees = worktree_registry.clone();
+        let attach_start_agent_registration_hook = start_agent_registration_hook.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
                 listener,
@@ -687,6 +742,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_scheduler,
                 attach_reuse,
                 attach_worktrees,
+                attach_start_agent_registration_hook,
             )
             .await
             {
