@@ -369,8 +369,13 @@ fn worktree_reclaim_002_squash_merged_clean_owned_is_reclaimed_and_branch_surviv
 #[cfg(unix)]
 fn worktree_reclaim_003_dirty_worktree_is_kept_even_when_merged() {
     let fx = Fixture::new();
-    let wt = fx.add_worktree_with_commit("wt-dirty", "feat/dirty");
-    fx.set_pr_state("feat/dirty", "MERGED");
+    // Deliberately NOT named with "dirty"/"uncommitted"/"untracked": the gh
+    // stub's specific-failure messages (added for PRD #422's follow-up) echo
+    // back the full invocation, including `--head <branch>`, so a branch or
+    // worktree name containing one of those words would make this test pass
+    // on ANY unresolvable-PR-state failure, not on the dirty check it names.
+    let wt = fx.add_worktree_with_commit("wt-scratch-file", "feat/scratch-file");
+    fx.set_pr_state("feat/scratch-file", "MERGED");
     fx.mark_owned(&wt);
     std::fs::write(wt.join("scratch-notes.txt"), "never committed\n").expect("write untracked");
 
@@ -385,7 +390,7 @@ fn worktree_reclaim_003_dirty_worktree_is_kept_even_when_merged() {
         Some(2),
         "exit code 2 is clap's own generic usage/parse-error code; an implemented `worktree \
          reclaim` correctly keeping this dirty worktree must use a code that does not collide \
-         with it, or the absence of `wt-dirty`'s removal below is no evidence at all; \
+         with it, or the absence of `wt-scratch-file`'s removal below is no evidence at all; \
          status={:?} out={}",
         out.status,
         combined(&out)
