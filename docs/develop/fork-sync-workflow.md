@@ -143,6 +143,10 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `80acb86` | `fix(101): bound the get-seed reply line length, not just its duration (#125)` | **UPSTREAM-WORTHY** — same `request_from_socket`/get-seed hook-socket plumbing as `9ed01ae`/`9cc775c`/`4f85bf1`/`d5b7378` |
 | `6b5a58d` | `test(idle-worker): restore idle_worker_011's 20s budget to expose the flake (#126)` | **UPSTREAM-WORTHY** — generic e2e wait-budget tuning on a shared test, same basis as `819c5c1` |
 | `db7e0a1` | `docs(prds): add PRD #421 (issue labelling) and #422 (worktree reclaim) (#127)` | **PERMANENT** fork-only (doc) — new fork-authored planning documents, no upstream analogue yet |
+| `0e5da69` | `docs(prd-421): a claim is authoritative regardless of who made it (#128)` | **PERMANENT** fork-only (doc) — amends the fork-authored PRD #421 |
+| `4986ca0` | `docs(prd-422): add an ownership gate — own it, or ask (#129)` | **PERMANENT** fork-only (doc) — amends the fork-authored PRD #422 |
+| `eb71210` | `docs(prds): when it asks, it asks specifically (#130)` | **PERMANENT** fork-only (doc) — amends PRDs #421/#422 |
+| `23f268f` | `docs(claude): rule 17 — the orchestrator delegates, never writes src/ or tests/ (#132)` | **PERMANENT** fork-only (rules) — describes this fork's own orchestrator-role discipline, no upstream analogue |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
