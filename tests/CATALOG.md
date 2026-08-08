@@ -3287,6 +3287,57 @@ without depending on the config struct API.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
+#### orchestration/worktree
+
+##### orchestration/worktree/001 — Submitting the orchestration form with a worktree slug typed in yields a request carrying the resolved sibling worktree path; a blank slug carries `None`, preserving today's exact behavior (fork #122 reopened — deliberately NOT PRD #220's shape).
+- **Layer:** L1 (pure — `build_new_pane_request` against a `NewPaneFormState`; no PTY, no daemon, no filesystem).
+- **Agent:** none.
+- **Asserts:** with an orchestration selected and a non-blank worktree slug, the built `NewPaneRequest.orchestration_worktree_path` equals the sibling directory `<dir>-<slug>` next to the form's picked `dir`; the identical form with a blank slug yields `orchestration_worktree_path == None`.
+- **Does not assert:** actually creating the worktree on disk (covered by `orchestration/worktree/004`, and `005` on the real binary); keyboard focus/typing into the slug field; branch naming.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/worktree/002 — When the resolved worktree fails to create (e.g. `dir` is not a git repository), the orchestration tab is refused and the error surfaces — never a silent fallback to the shared cwd (fork #122).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; real `git` subprocess against a tempdir that is deliberately not a repository, no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** dispatching `Action::SpawnPane` for a request whose `orchestration_worktree_path` is `Some(..)` but whose creation fails leaves the active tab as `Tab::Dashboard` (no orchestration tab opened), spawns no role panes, and sets a non-empty `ui.status_message` describing the failure.
+- **Does not assert:** the exact error wording; the TOCTOU/branch-exists probing `create_worktree` (`src/issue_dispatch_run.rs`) already covers for the scheduler path; recovery/retry UX.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/worktree/003 — Role panes spawned for an orchestration whose request `dir` is already the resolved worktree path land rooted in that worktree: every pane's spawn `cwd` and every `pane_cwd_map` entry resolve to it, not the deck's own cwd (fork #122 — characterization of the existing cwd-threading mechanism this feature builds on).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** with `NewPaneRequest.dir` set to a worktree-like path, every role's `create_pane_with_options` call is recorded with that path as `cwd`, and every entry `AppState.pane_cwd_map` inserts for the orchestration's role panes equals that same path — the map `work-done` resolution keys off (CLAUDE.md rule 1 / fork #74's collision).
+- **Does not assert:** how the worktree path was resolved (covered by `orchestration/worktree/001`) or actually created on disk (covered by `orchestration/worktree/004`, and `005` on the real binary); real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/worktree/004 — Dispatching `Action::SpawnPane` for a request whose `dir` is a real git repository and whose `orchestration_worktree_path` is `Some(<sibling path>)` actually creates that worktree on disk and roots every role pane in it, not in `req.dir` (fork #122 — the actual feature, as opposed to `003`'s pre-existing-mechanism characterization).
+- **Layer:** L1 (in-process — dispatch the real `Action::SpawnPane` through `dispatch_action` against a `CapturingPaneController`; real `git` subprocess against a tempdir-backed fixture repo with one commit, no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** after dispatch, the resolved worktree path exists on disk as a directory; every role's `create_pane_with_options` call is recorded with the worktree path (not `req.dir`) as `cwd`; every `AppState.pane_cwd_map` entry for the orchestration's role panes equals the worktree path. `req.dir` and the worktree path are deliberately distinct directories, so the assertions cannot pass by `003`'s coincidence of the two being equal.
+- **Does not assert:** how the worktree path was resolved from a slug (covered by `orchestration/worktree/001`); the fail-loud refusal path (`orchestration/worktree/002`); branch naming or content; real daemon/PTY spawn; work-done file routing itself (`orchestration/route/*`).
+- **Platform coverage:** mac+linux (spawns a real `git` subprocess).
+
+##### orchestration/worktree/005 — Driving the real new-pane form's keyboard path end to end — `Ctrl+n` -> directory picker -> Mode cycled to an orchestration -> Tab to the Worktree field -> a typed slug -> submit — creates the worktree on disk and roots every role pane in it, on the real binary (fork #122, CLAUDE.md rule 4).
+- **Layer:** L2 (real-binary PTY; real `git` subprocess against the fixture directory, committed inline before submission so `git worktree add -b` has a ref to branch from; no real agent).
+- **Agent:** none (both roles dump their own `pwd` to a role-named log file, then `sleep 600` — no LLM tokens).
+- **Asserts:** submitting the form with a typed Worktree slug creates the resolved sibling worktree directory on disk, and BOTH role panes' `pwd` logs — written by each role's own shell command before it sleeps — resolve to the created worktree, not the fixture directory the deck was launched in. This is the keyboard path whose Enter-chain regression earlier on this PR was found only as collateral damage in unrelated e2e helpers; this test exercises the Worktree field directly.
+- **Does not assert:** the slug-to-path resolution in isolation (`orchestration/worktree/001`); the fail-loud refusal path (`orchestration/worktree/002`); the pre-existing cwd-threading mechanism (`orchestration/worktree/003`) or the `dispatch_action`-level creation proof (`orchestration/worktree/004`); branch naming or content; work-done file routing (`orchestration/route/*`).
+- **Platform coverage:** mac+linux (spawns a real `git` subprocess).
+
+##### orchestration/worktree/006 — `resolve_orchestration_worktree_path` rejects a slug containing a path separator, the literal `..`, a leading dash, or a NUL control character, and still resolves a plain alphanumeric-and-dash slug exactly as `001` expects (fork #122/#123 audit P1: the original bug let a slug like `x/../../../tmp/owned` against repo `/safe/repo` escape `/safe` entirely, and every role pane was then started with that escaped directory as its cwd).
+- **Layer:** L1 (pure — direct calls to `resolve_orchestration_worktree_path`; no PTY, no daemon, no filesystem).
+- **Agent:** none.
+- **Asserts:** each of a slash-containing slug, `..`, a leading-dash slug, and a NUL-containing slug returns `Err`; a plain alphanumeric-and-dash slug still returns `Ok` with the exact sibling path `001` pins.
+- **Does not assert:** the sibling-of-`dir` belt-and-braces check in isolation (both layers reject the escape cases here together); the refusal reaching the user (`ui.status_message`, the SpawnPane-level fail-loud path — covered by `002`'s shape for creation failures); branch naming.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/worktree/007 — `classify_worktree_add_result` classifies a timed-out `git worktree add` (directory present) as `TimedOut`, never `AlreadyClaimed`, while a genuine non-timeout failure with the directory present still classifies as `AlreadyClaimed` (fork #122/#123 re-audit P2: a timed-out add registers the worktree directory before it is killed, so collapsing that into `AlreadyClaimed` permanently wedged the slug — every later attempt saw the same present directory and refused it with no cleanup).
+- **Layer:** L1 (pure — direct calls to `classify_worktree_add_result` with a synthetic `AddError`; no PTY, no daemon, no real `git` subprocess, no 30s wait).
+- **Agent:** none.
+- **Asserts:** a present worktree directory fed `Err(AddError::TimedOut(_))` classifies as `Ok(AddOutcome::TimedOut)`; the identical present directory fed `Err(AddError::Failed(_))` still classifies as `Ok(AddOutcome::AlreadyClaimed)`, preserving the pre-existing TOCTOU-claim behavior.
+- **Does not assert:** the bounded best-effort `git worktree remove --force` cleanup that `create_worktree_sync` layers on top of a `TimedOut` classification, or its own timeout; the user-facing message built in `ui.rs`'s `SpawnPane` dispatch; a real hook actually exceeding the 30s bound (deliberately not exercised — slow and flaky).
+- **Platform coverage:** mac+linux+windows.
+
 ### Session restore
 
 #### session/restore
@@ -3395,6 +3446,20 @@ without depending on the config struct API.
 - **Asserts:** with a hand-staged `session.toml` whose single saved pane points at a directory that does not exist — the restore loop's "skipping pane … directory … not found" branch, which interpolates the saved pane NAME — and whose name carries an ANSI escape, a CR and an LF each bracketed by a unique sentinel, a clean detach-quit flushes that warning to the real terminal (post-`ratatui::restore()`, so no widget layer filters it) with the sentinels present but NO raw ESC/CR/LF following any of them, and with the whole warning on ONE line. Pins that the exit flush cannot be driven by an attacker-influenced pane name, orchestration `display_name` or `agent_id` to repaint the shell the user is dropped back into or forge an extra line of deck output — the property `ratatui-core`'s `!symbol.contains(char::is_control)` filter already gives the in-session sink.
 - **Does not assert:** the exact escape spelling (`\u{1b}` vs `\e` vs stripping — pinned by the `escape_control_chars` unit tests in `src/ui.rs`); that every one of the fifteen push sites is reachable (the fix is at the single flush loop, so one site proves the sanitisation point); non-control Unicode trickery (bidi overrides, homoglyphs), which the in-session sink does not filter either.
 - **Platform coverage:** mac+linux.
+
+##### session/restore/016 — An orchestration tab captured while rooted in a worktree restores with its role panes still rooted in that worktree, not the deck's own cwd (fork #122).
+- **Layer:** L1 (in-process — `resolve_orchestration_for_restore` against a real `.dot-agent-deck.toml` on disk, then `TabManager::open_orchestration_tab` against a `CapturingPaneController`; no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** an `OrchestrationSnapshot` whose `project_path` names a real worktree directory (carrying its own `.dot-agent-deck.toml`) re-resolves successfully via `resolve_orchestration_for_restore`, and feeding the resolved config into `open_orchestration_tab` with that same worktree path as `cwd` — exactly as the daemon-empty restore path calls it with `saved_pane.dir` — spawns every role pane's `create_pane_with_options` call rooted in the worktree. Fork #122's rooting was already implemented (restore always passes `saved_pane.dir`, which capture always writes as the worktree); this pins the property so it stays true across refactors.
+- **Does not assert:** `pane_cwd_map`/`pane_role_map` population (a trivial `saved_pane.dir.clone()` insert in `run_tui`, not the rooting mechanism); the drift-fallback path (`session/restore/017`); the daemon-hydration restore path (`session/restore/007`/`008`); real daemon/PTY spawn.
+- **Platform coverage:** mac+linux+windows.
+
+##### session/restore/017 — When a captured orchestration tab's worktree has been removed from disk (e.g. via `git worktree remove`), restore re-resolution fails loud, naming the orchestration — the mechanism the caller's plain-dashboard-pane-with-a-warning fallback depends on (fork #122).
+- **Layer:** L1 (in-process — `resolve_orchestration_for_restore` against a worktree path that was never created on disk; no PTY, no filesystem beyond the missing-path check).
+- **Agent:** none.
+- **Asserts:** an `OrchestrationSnapshot` whose `project_path` (and the saved pane `dir` passed alongside it) name a nonexistent directory makes `resolve_orchestration_for_restore` return `Err` — `canonicalize()` fails on the missing dir before any config load is attempted — and the error message names the orchestration (`snap.config_name`), matching every other drift reason this function produces.
+- **Does not assert:** the caller's `session_warnings` push or the plain-dashboard-pane fallback itself (`run_tui`, exercised end to end by `session/restore/009`/`010`'s L2 drift coverage, which predate this worktree-specific removal scenario); that the deck ever auto-removes a worktree (it does not — product decision); real `git worktree remove`.
+- **Platform coverage:** mac+linux+windows.
 
 ### Live session status on reconnect (PRD #162)
 
