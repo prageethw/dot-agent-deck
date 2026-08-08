@@ -34,8 +34,12 @@ fn guard_001_warns_for_same_cwd_live_orchestration_only() {
         100,
         28,
     ));
+    // Fork #122: the new-pane form always shows a "Worktree:" slug field once
+    // an orchestration is selected, independent of this warning — so a bare
+    // "worktree" substring no longer distinguishes the two. "/worktree-prd" is
+    // the warning copy's own text and doesn't appear in the field label.
     assert!(
-        !fresh.contains(".dot-agent-deck") && !fresh.to_lowercase().contains("worktree"),
+        !fresh.contains(".dot-agent-deck") && !fresh.contains("/worktree-prd"),
         "a fresh cwd must not show the shared-resource warning, got:\n{fresh}"
     );
 

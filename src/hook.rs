@@ -934,6 +934,12 @@ enum ReplyReadError {
     Io(std::io::Error),
     /// A reply line arrived but was not valid UTF-8.
     InvalidUtf8,
+    /// The reply line grew past [`MAX_REPLY_LINE_BYTES`] before its
+    /// terminating newline arrived (fork issue #101) — a flooding or
+    /// malfunctioning peer, distinct from an ordinary oversized-but-honest
+    /// reply because the deadline alone bounds *how long* the read runs, not
+    /// *how much* it can buffer while doing so.
+    LineTooLong,
 }
 
 impl std::fmt::Display for ReplyReadError {
@@ -943,6 +949,10 @@ impl std::fmt::Display for ReplyReadError {
             Self::ClosedWithoutReply => write!(f, "peer closed without writing any bytes"),
             Self::Io(err) => write!(f, "read failed: {err} (kind {:?})", err.kind()),
             Self::InvalidUtf8 => write!(f, "reply line was not valid UTF-8"),
+            Self::LineTooLong => write!(
+                f,
+                "reply line exceeded {MAX_REPLY_LINE_BYTES} bytes without a terminating newline"
+            ),
         }
     }
 }
@@ -1106,7 +1116,7 @@ fn read_reply_line(
         // that completes the line can itself be the one that busts the cap,
         // and growing past the bound to discover that would defeat it.
         if line.len().saturating_add(end) > MAX_REPLY_LINE_BYTES {
-            return None;
+            return Err(ReplyReadError::LineTooLong);
         }
         line.extend_from_slice(&buf[..end]);
         if newline_pos.is_some() {

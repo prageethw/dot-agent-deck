@@ -544,6 +544,31 @@ pub async fn handle_dispatch(
                 ),
             };
         }
+        // Fork #122/#123: `create_worktree`'s async path has no bound on its
+        // own `git worktree add` invocation today, so this arm is unreachable
+        // in practice — but the match must stay exhaustive so it stays safe
+        // if that ever changes. Treated the same shape as `AlreadyClaimed`
+        // rather than a bare `unreachable!()`: a bound could land on this
+        // path independently of dispatch.rs, and a real `TimedOut` here means
+        // the worktree directory may or may not have been cleaned up
+        // (`cleaned_up`), which is worth telling the caller either way.
+        Ok(WorktreeCreation::TimedOut { cleaned_up }) => {
+            return DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: false,
+                message: format!(
+                    "dispatch: creating worktree {} timed out ({}). Wait for any \
+                     concurrent `git worktree add` to finish, or dispatch under a \
+                     different name.",
+                    paths.worktree_dir.display(),
+                    if cleaned_up {
+                        "the partial worktree was cleaned up"
+                    } else {
+                        "the partial worktree may still be present and may need manual cleanup"
+                    }
+                ),
+            };
+        }
         Err(e) => {
             return DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
