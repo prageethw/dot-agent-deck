@@ -789,6 +789,12 @@ fn main() -> ExitCode {
                     match serde_json::from_str::<dot_agent_deck::event::DelegateResponse>(&line) {
                         Ok(resp) if resp.ok => {
                             println!("Delegated to {}.", resp.roles.join(", "));
+                            if !resp.unresolved.is_empty() {
+                                eprintln!(
+                                    "Warning: role(s) not delegated (no matching worker pane): {}.",
+                                    resp.unresolved.join(", ")
+                                );
+                            }
                             ExitCode::SUCCESS
                         }
                         Ok(resp) => {
