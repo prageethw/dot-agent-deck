@@ -23,12 +23,22 @@ That matters more than status display, because of how dispatch decides what to p
 Three parts, one theme: make the claim explicit, attributable, and machine-maintained.
 
 1. **Write `in-progress` at dispatch and read it as a third idempotency signal.** Write it *after* the worktree and spawn succeed, so a failed dispatch never leaves a false claim. Then have `dispatch_decision` read it. The claim stops being an inferred side-effect.
-2. **Record the claimant.** A bare label says *someone* claimed the issue, not *who* — so a second instance cannot tell "another orchestration owns this" from "this is my own earlier claim, resume it".
+2. **Record the claimant, and report it when skipping.** A bare label says *someone* claimed the issue, not *who*. The claim is honoured either way — provenance never changes the decision — but a skip that cannot name its claimant is an exclusion nobody can act on.
 3. **Priority and size labels, applied by an agent, with an honest fallback for uncertainty.**
 
 **The deck does not classify.** It already spawns agents with substituted prompts and those agents have `gh` on `PATH`, so the triage agent applies its own labels. The deck supplies the vocabulary, the prompt template, and the uncertainty rule — not a classifier, not an API client, not a parser for the answer. This keeps the Rust surface small and puts the judgement where judgement already lives.
 
 **The fallback for uncertainty is a label, not a question.** When the agent is not confident it applies `needs-triage` and leaves priority unset rather than guessing. That works unattended *and* interactively — in a pane the agent can additionally just ask, but correctness never depends on someone watching. A wrong priority is worse than an absent one, because it is indistinguishable from a considered one.
+
+### A claim is authoritative regardless of who made it
+
+**Provenance never affects the skip decision.** An `in-progress` label set by a human, by another tool, by another deck, or by this deck is treated identically: the issue is claimed, so dispatch skips it. Generalised: **any status marker this deck did not just create is a reason to exclude the issue, and to say so.**
+
+Two consequences follow, and both are simplifications:
+
+**The claimant becomes reporting content, not a decision input.** There is no "is this my own claim?" comparison to implement, and therefore no subtle failure mode where a deck talks itself into re-dispatching something. The recorded identity exists purely to make the skip *legible* — "claimed by orchestration `X` (`id`) at `T`" versus "in-progress, no claimant recorded, so a human or an external tool set it". The self-resume case that comparison might have served is already covered by the existing worktree-exists signal.
+
+**Skipping must be highlighted, never silent.** This is the load-bearing half: excluding an issue is only safe if the exclusion is visible, otherwise a stray label silently starves the backlog and looks like nothing happening. Today's event cannot express this — `IssueDispatchSkipped` (`src/scheduler.rs:76`) carries `{ task, repo, issue, branch }` and **no reason**, so every skip renders as the same line: `skipping already-claimed issue #N of <repo> (<branch>)`. **Three** distinct causes already collapse into it — the worktree exists, an open PR matches the head branch, or `create_worktree` lost a concurrent-creator race — and a label would be an indistinguishable fourth. The event needs a reason, which repairs the three existing cases as well as serving the new one.
 
 ### Why the classifier must be local
 
@@ -50,7 +60,8 @@ The two write points have different claimants and both must be representable: sc
 ### In Scope
 
 - Writing `in-progress` on successful dispatch in the fire-time flow (`src/issue_dispatch_run.rs`), placed so a failed dispatch leaves the issue unmarked.
-- Reading the label as a third signal in `dispatch_decision`, including comparing a recorded claimant against the reader's own identity so a deck can distinguish its own claim from another instance's.
+- Reading the label as a third signal in `dispatch_decision`, **independent of who applied it** — human, external tool, another deck, or this one.
+- Adding a **reason** to `IssueDispatchSkipped` (`src/scheduler.rs:76`) and surfacing it, so an excluded issue always says why it was excluded. This also disambiguates the three existing skip causes, which currently render identically.
 - A claimant comment carrying orchestration name, instance id, host and timestamp.
 - The label vocabulary: `priority:high|medium|low`, `size:high|medium|low`, `needs-triage` — created idempotently rather than assumed to exist.
 - An agent-driven triage path that applies priority/size labels itself, with `needs-triage` as the uncertainty outcome.
@@ -69,7 +80,8 @@ The two write points have different claimants and both must be representable: sc
 
 - Dispatching an issue marks it `in-progress` and records the claimant; a **failed** dispatch leaves the issue completely unmarked.
 - A second dispatch of an already-claimed issue skips it, and the skip is driven by the label — demonstrable with the worktree and PR signals both absent.
-- A deck can tell **its own** claim from **another instance's**, using the recorded id rather than the name.
+- An issue labelled `in-progress` **by a human or an external tool** is skipped exactly as one claimed by a deck, and the skip **names the reason**.
+- Every skip reports which of the four causes fired; no two causes render identically.
 - An agent triaging an issue applies a priority and a size, or applies `needs-triage` and no priority — never a guessed priority.
 - Priority and size are visible and filterable on GitHub via `gh issue list --label`.
 - No `PROTOCOL_VERSION` bump and no change to `DelegateSignal`.
@@ -81,8 +93,9 @@ The two write points have different claimants and both must be representable: sc
 
 - [ ] **M1.0** — Write `in-progress` on successful dispatch, after worktree creation and spawn both succeed. The per-issue error boundary is where this is won or lost.
 - [ ] **M1.1** — Post the claimant comment (orchestration name, instance id, host, timestamp), with the scheduler claiming under `ScheduledTask.name`.
-- [ ] **M1.2** — Read the label as a third signal in `dispatch_decision`, comparing the recorded id against the reader's own.
-- [ ] **M1.3** — Tests: labels-on-success, no-label-on-failed-dispatch, label-as-skip-signal, own-claim-vs-foreign-claim.
+- [ ] **M1.2** — Read the label as a third signal in `dispatch_decision`, regardless of provenance.
+- [ ] **M1.3** — Add a reason to `IssueDispatchSkipped` and render it, covering all four causes (worktree exists, open PR, concurrent-creator race, label present).
+- [ ] **M1.4** — Tests: labels-on-success, no-label-on-failed-dispatch, label-as-skip-signal, externally-applied-label-also-skips, and each skip reason rendering distinguishably.
 
 ### Phase 2: Triage
 
@@ -102,20 +115,20 @@ The two write points have different claimants and both must be representable: sc
 - `src/state.rs` — `OrchestrationIdentity` and its `Instance { id, name }` variant; `pane_orchestration_map` (`:509`).
 - `src/agent_pty.rs` — `mint_orchestration_id` (`:383`); `TabMembership::Orchestration::orchestration_id` (`:364`).
 - `src/config.rs` — `IssueDispatchConfig` (`:586`); `ScheduledTask.name` (`:609`).
+- `src/scheduler.rs` — `NotifyEvent::IssueDispatchSkipped` (`:76`) and its rendering (`:135`); the two emit sites are `src/issue_dispatch_run.rs:279` and `:320`.
 - `src/event.rs` — `DelegateSignal` (`:674`), deliberately untouched.
 
 ## Risks and Mitigations
 
 - **A false claim on a failed dispatch.** Marking too early would make an issue permanently un-dispatchable. Mitigation: write only after worktree and spawn both succeed, and make the no-label-on-failure case an explicit test rather than an assumption.
 - **A stale claim outlives the deck that made it.** A crashed deck leaves its label behind. Mitigation: the recorded claimant makes a stale claim *diagnosable* rather than anonymous; expiry policy is an open question, deliberately not guessed here.
-- **A human-applied label blocks the scheduler.** Once the label is a skip signal, a person marking an issue `in-progress` stops dispatch. Mitigation: this is arguably correct — it is the same claim — but it must be documented, not discovered.
+- **A stray label silently starves the backlog.** Since any `in-progress` excludes an issue regardless of provenance, a label left by a human or a tool stops dispatch indefinitely. Mitigation: this is *why* the reason-carrying skip report is in scope rather than optional — an exclusion nobody can see is the actual hazard, not the exclusion itself.
 - **Guessed priorities look considered.** An LLM will always produce an answer if asked for one. Mitigation: `needs-triage` is a first-class outcome, and the prompt makes declining the *expected* behaviour under uncertainty rather than a failure.
 - **`gh` calls on the dispatch path can fail.** Labelling is now a step that can error. Mitigation: it runs inside the existing per-issue error boundary — a labelling failure must not abort the run or the other issues.
 - **Comment noise on re-dispatched issues.** Mitigation: see Open Questions — edit one claim comment in place rather than appending per dispatch.
 
 ## Open Questions
 
-- **Does the skip-signal apply to human-applied labels?** Probably yes — it is the same claim — but it means a person can block dispatch with a label, which needs documenting.
 - **Do claims expire?** A deck that dies mid-work leaves its claim behind, and only issue *close* currently clears the label. Is there a staleness window, and who acts on it?
 - **Priority of what, exactly?** Priority to a maintainer and priority to a dispatch scheduler are not the same ordering. If dispatch ever sorts by priority, that distinction has to be settled first.
 - **Re-triage on change.** If an issue is substantially edited after triage, is size/priority revisited, or is triage once-only?
