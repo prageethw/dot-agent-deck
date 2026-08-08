@@ -269,6 +269,21 @@ fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
     {
         let mut file = std::fs::File::create(&tmp)?;
+        // Publish with the destination's OWN mode, or owner-only when the file
+        // is new. `File::create` would otherwise apply `0666 & !umask` — 0644
+        // under a typical 022 umask — and the rename below would silently widen
+        // a config the user (or Codex itself) had kept private. This publishes
+        // both `hooks.json` and, via `edit_trust_state`, the user's real
+        // `config.toml`, so widening it leaks whatever the user keeps there to
+        // every local account.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dest)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -997,6 +1012,52 @@ mod tests {
         assert_eq!(
             deck_rules, 1,
             "deck hook present exactly once after re-install"
+        );
+    }
+
+    /// The atomic publish must never widen the destination's permissions.
+    /// `write_atomic` publishes both `hooks.json` and, via `edit_trust_state`,
+    /// the user's real `config.toml`, so a `File::create` default of 0644
+    /// (under a typical 022 umask) would widen a file the user (or Codex
+    /// itself) had kept restrictive the first time the deck wrote through it —
+    /// `rename(2)` replaces the destination inode, so the old mode does not
+    /// contain the new one.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_an_existing_destinations_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("hooks.json");
+        std::fs::write(&dest, b"{}").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(dir.path(), &dest, b"{\"hooks\":{}}").expect("write_atomic");
+
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "rename must not widen a destination the user kept restrictive"
+        );
+    }
+
+    /// A destination that does not exist yet gets created owner-only (0600),
+    /// not the umask-dependent `0666 & !umask` `File::create` would otherwise
+    /// apply.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_creates_a_new_destination_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("hooks.json");
+
+        write_atomic(dir.path(), &dest, b"{\"hooks\":{}}").expect("write_atomic");
+
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a newly-created destination must be owner-only, not umask-dependent"
         );
     }
 }
