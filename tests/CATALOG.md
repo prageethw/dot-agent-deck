@@ -2318,6 +2318,48 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side archive/no-clobber behavior for a NON-`--task-file`-sourced collision (covered by `orchestration/delegate/020`); the exact refusal wording (stderr is not inspected — only the exit code).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+##### orchestration/delegate/022 — An unresolved role must not be confirmed as delegated: `delegate_targets` drops a role with no registered pane, but `handle_delegate` still echoes it back as armed (fork #92 P1, follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket + real `handle_delegate` + a `cat`-stub worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess targets a THIRD role with no pane at all).
+- **Asserts:** the subprocess's exit status is not success. Deliberately does not pin the exit-code value, stderr wording, or `DelegateResponse` field shape — the fix's exact reply shape for zero-resolution is not settled, only that it must not read as success.
+- **Does not assert:** partial resolution (one requested role resolves, a sibling does not) — the tester's `work-done` report flags this as needing a design decision before it can be pinned; the self-target sibling case (`orchestration/delegate/023`); the duplicate-role case (`orchestration/delegate/024`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/023 — A self-targeted delegate (the orchestrator naming its own role) must not be confirmed as delegated: `delegate_targets` excludes the orchestrator's own pane from role resolution regardless of role-name match (fork #92 P1, follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket + real `handle_delegate` + a `cat`-stub worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess is invoked from the orchestrator pane targeting its own role name, `"orchestrator"`).
+- **Asserts:** the subprocess's exit status is not success, for the same reason as `orchestration/delegate/022`.
+- **Does not assert:** the exit-code value, stderr wording, or `DelegateResponse` field shape; the unresolved-role sibling case (`orchestration/delegate/022`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/024 — A duplicated target role (`--to coder --to coder`) must be confirmed as armed exactly once, matching the single pane `delegate_targets` actually dispatches to after de-duplication (fork #92 P2, follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess, invoked with two `--to coder` flags, + an in-process daemon hook socket + real `handle_delegate` + a single `cat`-stub worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and one `cat`-stub `coder` worker pane registered in the same orchestration).
+- **Asserts:** the subprocess exits successfully (one pane really is armed) and its stdout names the role exactly once — not once per duplicated request — so the caller cannot mistake an echoed duplicate for a second worker having been armed.
+- **Does not assert:** the exact confirmation wording or format; the unresolved-role and self-target cases (`orchestration/delegate/022`/`023`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/025 — A partially-resolved delegate (`--to coder --to nonexistent-role`, one role resolves, the sibling does not) must exit successfully but name the unresolved role too, distinguishably from the one that armed, per the fork #92 partial-resolution decision (follow-up to upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess, invoked with `--to coder --to nonexistent-role`, + an in-process daemon hook socket + real `handle_delegate` + a single `cat`-stub `coder` worker pane; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess targets `coder` (resolves to that pane) and a second role with no pane at all (does not)).
+- **Asserts:** the subprocess exits successfully (one pane really did arm, so failing the whole call would make a retry-on-non-zero orchestrator double-delegate the role that DID arm — upstream #330's harm); its combined stdout/stderr names both the armed role and the unresolved role; and the two are not folded into one undifferentiated comma-joined echo of the raw request, which is today's bug and would read exactly like both roles armed.
+- **Does not assert:** the exact confirmation wording, format, or which stream (stdout vs stderr) carries the unresolved role; the zero-resolution cases (`orchestration/delegate/022`/`023`); the duplicate-role case (`orchestration/delegate/024`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/029 — A Pi start role declared BEFORE a worker role in an orchestration's config can delegate before the worker's daemon-side registration exists, losing its first task with no retry (fork #92 P1, PR #93 pre-merge review, follow-up to `orchestration/delegate/022`-`025`).
+- **Layer:** fast synthetic real-daemon integration through the actual production spawn path — a real `TabManager` + `EmbeddedPaneController` against a real M1.2 attach-protocol daemon (not the hook-socket-only harness `022`-`025` use), plus a real `pi` shell-script shim and a `cat` stand-in worker on `$PATH`; no vt100 attach, no LLM, no `e2e` feature gate. Uses the fork #92 `StartAgentRegistrationHook` test seam (`src/daemon.rs`/`src/daemon_protocol.rs`) to deterministically hold the worker's `StartAgent` registration open, rather than relying on real OS scheduling to probabilistically reproduce the race.
+- **Agent:** none (synthetic — a real `pi`-named shell script that calls `get-seed` then `delegate --to coder` on boot, and a `cat` stand-in worker whose PTY echoes whatever the daemon injects).
+- **Asserts:** while a registration gate holds the worker's `AppState` maps unpublished (armed by role name, not spawn order), the pi shim's seed-consumption marker must NOT appear; after releasing the gate, the marker must hold the exact seed text and the worker's PTY scrollback must contain the delegate pointer EXACTLY once — 0 is this defect's loss, 2+ would reproduce upstream #330's duplicate-arming harm. Deliberately does not assert which role's `StartAgent` is issued first — see `orchestration/delegate/030` for the spawn-order-agnostic pane-id-indexing guard.
+- **Does not assert:** the reordering mechanism itself (spawn-index plan, which role's `StartAgent` fires first); the exact wording of any daemon log line; the PTY-injection seed-fallback safety net's timing.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/030 — Reordering `open_orchestration_tab`'s spawn loop (a Pi start role spawned last, per PR #93's approved fix) must not disturb `role_pane_ids`/`TabMembership.role_index`, which stay keyed by the config's DECLARED role position, not by spawn order (fork #92 P1 follow-up).
+- **Layer:** fast in-process unit test — a real `TabManager` against a `MockPaneController` that records the command each `create_pane` call actually received, so the test can distinguish "declared index" from "spawn call order" even though today's code doesn't yet reorder them.
+- **Agent:** none (synthetic — `MockPaneController`, no real process, no daemon).
+- **Asserts:** `role_pane_ids[0]`/`role_pane_ids[1]` hold the pane ids actually minted for the start role's and the worker's commands respectively (declared order: start role first), and the stored `Tab::Orchestration.start_role_index`/`role_pane_ids` match. Not RED before PR #93's fix exists — today's spawn loop already iterates in declaration order, so this holds trivially; it is a regression guard for the coming reorder, not a pin on current behavior.
+- **Does not assert:** the reorder mechanism itself or actual spawn call order (that's `orchestration/delegate/029`'s territory, exercised against a real daemon); layout, focus, or persisted-status ordering beyond `role_pane_ids`/`start_role_index`.
+- **Platform coverage:** mac+linux.
+
 ##### orchestration/delegate/026 — A THIRD `work-done` collision from the same pane must not destroy the report a SECOND collision already archived (PR #90 pre-merge review P1).
 - **Layer:** fast/pure-ish state (real `AppState::handle_work_done` against one hand-registered pane, three calls in a row; no PTY spawn — same technique as `orchestration/delegate/019`).
 - **Agent:** none.

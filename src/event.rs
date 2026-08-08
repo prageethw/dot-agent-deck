@@ -696,6 +696,14 @@ pub struct DelegateResponse {
     /// The role(s) the delegate armed — empty when `ok` is false.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// Fork #92: requested role(s) that did NOT resolve to any pane —
+    /// unknown role names, or the orchestrator targeting its own role.
+    /// Populated alongside `ok: true` only on partial resolution (some
+    /// requested roles armed, others didn't); empty on full resolution and
+    /// on rejection (where `roles` itself is empty, so there's nothing to
+    /// contrast it against).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
 }
 
 impl DelegateResponse {
@@ -704,6 +712,21 @@ impl DelegateResponse {
             ok: true,
             error: None,
             roles,
+            unresolved: Vec::new(),
+        }
+    }
+
+    /// Fork #92: some requested roles armed a pane, others didn't. Still an
+    /// accepted delegate — something really did happen — but `unresolved`
+    /// lets the caller distinguish "this role armed" from "this role was
+    /// requested but nothing exists for it", which a plain merged echo of
+    /// `roles` alone cannot do.
+    pub fn accepted_partial(roles: Vec<String>, unresolved: Vec<String>) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            roles,
+            unresolved,
         }
     }
 
@@ -712,6 +735,7 @@ impl DelegateResponse {
             ok: false,
             error: Some(reason.into()),
             roles: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
 }
@@ -1249,6 +1273,50 @@ mod tests {
             Some("pane is not an orchestrator pane")
         );
         assert!(back.roles.is_empty());
+    }
+
+    // Fork #93 review: the no-PROTOCOL_VERSION-bump decision for `unresolved`
+    // rests on wire-compat in both directions. Pin that by assertion instead
+    // of by inspection of the derive attributes alone.
+    #[test]
+    fn delegate_response_missing_unresolved_defaults_to_empty() {
+        // An older daemon's reply shape — no `unresolved` key at all.
+        let json = r#"{"ok":true,"roles":["coder"]}"#;
+        let back: DelegateResponse = serde_json::from_str(json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.roles, vec!["coder"]);
+        assert!(back.unresolved.is_empty());
+    }
+
+    #[test]
+    fn delegate_response_tolerates_unknown_field() {
+        // A newer daemon's reply shape read by an older client — no
+        // `deny_unknown_fields`, so an extra key must not fail to parse.
+        let json = r#"{"ok":true,"roles":["coder"],"some_future_field":"value"}"#;
+        let back: DelegateResponse = serde_json::from_str(json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.roles, vec!["coder"]);
+        assert!(back.unresolved.is_empty());
+    }
+
+    #[test]
+    fn delegate_response_omits_unresolved_when_empty() {
+        // Full resolution: `unresolved` is empty, so it must not appear in
+        // the serialized JSON — keeps the wire identical to the pre-#92 shape.
+        let ok = DelegateResponse::accepted(vec!["coder".into()]);
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(
+            !json.contains("unresolved"),
+            "expected no `unresolved` key in {json}"
+        );
+        // Partial resolution: `unresolved` is non-empty, so it must appear.
+        let partial =
+            DelegateResponse::accepted_partial(vec!["coder".into()], vec!["reviewer".into()]);
+        let json = serde_json::to_string(&partial).unwrap();
+        assert!(
+            json.contains("unresolved"),
+            "expected an `unresolved` key in {json}"
+        );
     }
 
     #[test]

@@ -420,6 +420,7 @@ async fn start_attach_server(harness: &IdleHarness) -> AttachServer {
             Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier()),
             dot_agent_deck::spawn::new_reuse_registry(),
             dot_agent_deck::issue_dispatch_run::new_worktree_registry(),
+            dot_agent_deck::daemon::noop_start_agent_registration_hook(),
         )
         .await;
     });
