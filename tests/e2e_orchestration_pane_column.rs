@@ -1,10 +1,20 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
-//! PRD #311 — L2 (real-binary PTY) coverage for the Orchestration tab's
-//! `PaneLayout::Stacked` pane column: removing the non-focused roles'
-//! collapsed 1-row title frames must not touch agent lifecycle. Every role's
-//! PTY stays open, keeps running, and keeps reporting status regardless of
-//! whether its pane is currently drawn.
+//! L2 end-to-end coverage for the Orchestration tab's pane column.
+//!
+//! - PRD #336/#361/#387: spawns the real `dot-agent-deck` binary against the
+//!   `orch-deck` fixture and drives the Ctrl+l chord through the PTY,
+//!   asserting on the rendered vt100 grid's column geometry as the deck-global
+//!   sidebar/pane-column split cycles through its three stages (Default,
+//!   Narrow, Hidden), and that the chord forwards to the PTY when it isn't
+//!   claimed.
+//! - PRD #311: `PaneLayout::Stacked` pane column coverage — removing the
+//!   non-focused roles' collapsed 1-row title frames must not touch agent
+//!   lifecycle. Every role's PTY stays open, keeps running, and keeps
+//!   reporting status regardless of whether its pane is currently drawn.
+//!
+//! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
+//! compiles it.
 
 mod common;
 

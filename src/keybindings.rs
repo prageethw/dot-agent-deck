@@ -56,13 +56,16 @@ pub enum Action {
     NewPane,
     ClosePane,
     ToggleLayout,
-    /// Toggle the deck-global command-entry lock — whether direct keystrokes
-    /// reach a focused non-orchestrator role pane's PTY. Claimed only on an
-    /// Orchestration tab in command mode (see `scope_command_entry_lock`).
+    /// PRD #374 (#361 Item 3), moved deck-global by PRD #393: toggle the
+    /// command-entry lock — whether keystrokes reach a focused
+    /// non-orchestrator role pane's PTY. Only ever reaches the handler from
+    /// an Orchestration tab in command mode — `scope_command_entry_lock`
+    /// un-resolves it everywhere else.
     ToggleOrchestrationLock,
-    /// PRD #336: toggle the orchestration sidebar/pane-column split between
-    /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across
-    /// orchestration tabs, though only pressable from one.
+    /// PRD #336/#387: cycle the deck-global sidebar/pane-column split
+    /// (`ui.split_stage`) through its three stages — Default, Narrow, and
+    /// Hidden. Claimed on any tab with a sidebar split (Dashboard and
+    /// Orchestration tabs), not orchestration tabs only.
     ToggleOrchestrationSplit,
     /// PRD #313: zoom the focused role pane to the whole frame, hiding the
     /// orchestration sidebar. Per-tab and claimed only on an Orchestration tab
