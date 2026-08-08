@@ -68,12 +68,21 @@ bash .claude/skills/dot-ai-tag-release/cleanup.sh
 ```
 
 Interpret the output:
+- If the output contains `PR_STATE_DEGRADED=true`, the PR-state or ref-freshness
+  data this run relied on could not be fully trusted (a `gh` failure or absence, an
+  undetermined repository slug, a truncated result page, or a failed `git fetch`
+  — see the `DEGRADED_REASONS:` lines when present) — stop and do not delete
+  anything until you can re-run it clean, since an open-PR branch could
+  otherwise be offered unprotected.
 - If `NOTHING_TO_CLEAN=true`, tell the user there is nothing to clean and finish.
 - Otherwise present the `WORKTREES`, `LOCAL_BRANCHES`, and `REMOTE_BRANCHES` lists
-  and ask the user to confirm before deleting anything.
+  and ask the user to confirm before deleting anything. Each `WORKTREES:` entry
+  is `path<TAB>branch` (a literal TAB, not `|` — a branch name may legally
+  contain `|`, which would make that separator ambiguous); split on the TAB to
+  get the `[worktree_path]` step 1 below removes.
 
 **This step is destructive — always show the full list and get explicit
-confirmation first.** `.claude/skills/dot-ai-tag-release/cleanup.sh` already excludes: the default branch (`DEFAULT_BRANCH`); `fork-only`, which is trivially "merged" into `main` immediately after every fork/upstream sync while being the one branch that must never be deleted (`docs/develop/fork-sync-workflow.md`); the branch/worktree you are currently on; and any branch that backs an open PR on either this fork or upstream. If the script's output contains `PR_STATE_DEGRADED=true`, the open-PR guard did not run (a `gh` failure or `gh` being absent) — stop and do not delete anything until you can re-run it clean, since an open-PR branch could otherwise be offered unprotected.
+confirmation first.** `.claude/skills/dot-ai-tag-release/cleanup.sh` already excludes: the ROOT checkout, by its own path — not by matching a branch name, so it stays excluded no matter what branch it happens to be on; `fork-only`, which is trivially "merged" into `main` immediately after every fork/upstream sync while being the one branch that must never be deleted (`docs/develop/fork-sync-workflow.md`); the worktree/local branch you are currently on; and any branch that backs an open PR on either this fork or upstream. The current-branch exclusion applies to the worktree and local-branch guards only — `REMOTE_BRANCHES:` does not exclude your current branch's own `origin/<branch>`, so it can still be offered there if merged.
 
 After confirmation, process the items **in this order**:
 
@@ -83,7 +92,12 @@ After confirmation, process the items **in this order**:
    git worktree remove [worktree_path]
    ```
    If a worktree has uncommitted changes git refuses; report it and skip rather
-   than using `--force`, unless the user explicitly asks.
+   than using `--force`, unless the user explicitly asks. If it instead fails with
+   `fatal: '<path>' is a main working tree` (exit 128 — `--force` does not
+   override this either), stop and report it rather than working around it: this
+   should never happen once the exclusion guard above is working, and
+   improvising something like `rm -rf` on that path is the exact destructive
+   mistake this whole step exists to prevent.
 
 2. Delete each local branch:
    ```bash
