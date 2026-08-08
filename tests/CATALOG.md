@@ -2181,6 +2181,7 @@ without depending on the config struct API.
 - **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`–`007`).
 - **Agent:** none (a `std::thread` stub daemon that replies with one well-formed line carrying a 256 KiB seed).
 - **Asserts:** `request_from_socket_at` returns `SocketReply::Line` whose length equals the sent line's exactly. 256 KiB is far above the 64 KiB `MAX_FIRST_PROMPT_BYTES` the daemon clamps stored prompts to, so this pins real headroom rather than a value that merely happens to fit. This is the control fork issue #101 explicitly asks for: "a cap that is too tight would silently truncate a legitimate prompt, which is worse than the DoS it prevents". Passes both before and after the fix — a correctness control, not a timing measurement.
+- **Harness note:** the stub holds the connection open until the client signals it has finished reading, and propagates its write result rather than swallowing it. This reply is the only one in the file larger than the socket buffer; closing with unread data pending resets the peer and discards it on macOS (Linux leaves it readable), which failed this test on macOS for a harness reason unrelated to truncation.
 - **Does not assert:** the cap value; any seed larger than 256 KiB; that the daemon would ever actually produce a seed this large.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 

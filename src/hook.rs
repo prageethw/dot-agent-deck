@@ -1312,15 +1312,27 @@ mod tests {
         let expected = format!(r#"{{"seed":"{seed}"}}"#);
         let to_send = expected.clone();
 
-        let daemon_thread = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut reader = std::io::BufReader::new(&stream);
-                let mut line = String::new();
-                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
-                let _ = std::io::Write::write_all(&mut stream, to_send.as_bytes());
-                let _ = std::io::Write::write_all(&mut stream, b"\n");
-                let _ = std::io::Write::flush(&mut stream);
-            }
+        // The client signals here once it has finished reading, so the stub
+        // does not close while bytes are still in flight. This reply is the
+        // only one in this file larger than the socket buffer, and on macOS
+        // closing a Unix socket with unread data pending resets the peer and
+        // discards it (Linux leaves it readable) — which failed this test on
+        // macOS for a harness reason that had nothing to do with truncation.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let daemon_thread = std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line)?;
+            // Propagated, not swallowed: a write that fails here would
+            // otherwise surface as an unexplained `NoReply` and make this
+            // test red for a reason it hides.
+            std::io::Write::write_all(&mut stream, to_send.as_bytes())?;
+            std::io::Write::write_all(&mut stream, b"\n")?;
+            std::io::Write::flush(&mut stream)?;
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
         });
 
         let result = request_from_socket_at(
@@ -1328,8 +1340,14 @@ mod tests {
             r#"{"type":"get-seed"}"#,
             Some(GET_SEED_REQUEST_TIMEOUT),
         );
+        let _ = done_tx.send(());
 
-        let _ = daemon_thread.join();
+        let stub_outcome = daemon_thread.join().expect("stub daemon thread panicked");
+        assert!(
+            stub_outcome.is_ok(),
+            "the stub daemon failed to write the 256 KiB reply ({stub_outcome:?}); the assertion \
+             below would otherwise report this as truncation by the cap"
+        );
 
         match result {
             SocketReply::Line(line) => assert_eq!(
