@@ -408,8 +408,8 @@ fn worktree_reclaim_003_dirty_worktree_is_kept_even_when_merged() {
     // `wt.exists()` below would hold trivially even if `worktree reclaim` were
     // not a real subcommand at all — clap rejects it before touching the
     // filesystem, so the worktree is untouched either way. Rule that out
-    // explicitly first, mirroring `daemon_status_003`'s idiom, so the RED
-    // signal is unambiguous rather than an accidental pass.
+    // explicitly first, ruling out clap's own usage/parse-error exit code so
+    // the RED signal is unambiguous rather than an accidental pass.
     assert_ne!(
         out.status.code(),
         Some(2),
@@ -468,8 +468,9 @@ fn worktree_reclaim_004_ancestor_branch_without_a_pr_is_never_removed() {
     // Without this, `wt.exists()` below is not evidence: it holds trivially
     // right now because `worktree reclaim` is not a real subcommand yet, so
     // clap rejects it and the filesystem is never touched — the exact same
-    // "pass by doing nothing" trap `003` guards against. Rule out clap's
-    // generic parse error first, mirroring `daemon_status_003`.
+    // "pass by doing nothing" trap `worktree_reclaim_003` guards against.
+    // Rule out clap's own usage/parse-error exit code first, so the
+    // assertion cannot pass merely because the subcommand was rejected.
     assert_ne!(
         out.status.code(),
         Some(2),
