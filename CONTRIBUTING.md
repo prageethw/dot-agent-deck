@@ -33,7 +33,7 @@ cargo test-e2e lifecycle_001      # e2e tier (pre-PR gate per Decision 8), filte
 cargo test-e2e                    # e2e tier, whole tier
 ```
 
-CI runs the L2 tier via the fork's informational, non-blocking `e2e:` job. The two carve-outs from CI-only — real-agent paths CI cannot cover for lack of credentials, and local `.cast` recordings for the demo reel — are authorised by the orchestrator, never by the session that wants to run the tests. `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo xtask linkage-check` do stay local and are required before every commit; they are lint/build checks, not tests. See `CLAUDE.md` rule 5's fork-only addendum for the full statement.
+CI runs the L2 tier via the fork's informational, non-blocking `e2e:` job. The two carve-outs from CI-only — real-agent paths CI cannot cover for lack of credentials, and local `.cast` recordings for the demo reel — are authorised by the orchestrator, never by the session that wants to run the tests. `cargo fmt --check`, `cargo clippy --all-targets --features e2e -- -D warnings` and `cargo xtask linkage-check` do stay local and are required before every commit; they are lint/build checks, not tests. See `CLAUDE.md` rule 5's fork-only addendum for the full statement.
 
 ## How to add a new test
 
