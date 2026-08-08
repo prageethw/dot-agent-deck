@@ -1,0 +1,20 @@
+name: Issue Label Hygiene
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  remove-in-progress:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'in-progress')
+    steps:
+      - name: Remove stale in-progress label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label in-progress
