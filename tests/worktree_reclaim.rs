@@ -23,33 +23,91 @@ use spec::spec;
 // ---------------------------------------------------------------------------
 
 /// Synthetic `gh` reading canned PR JSON from `$GHSTUB_DIR`, keyed by the
-/// `--head <branch>` value with `/` → `_`. A missing file means "no PR for this
-/// branch" and prints `[]`, which is what real `gh pr list` does.
+/// `--head <branch>` value with `/` → `_`. Models three pieces of real `gh
+/// pr list` semantics precisely, because a stub that accepts any flags
+/// validates only that `gh` was invoked, never that it was invoked
+/// correctly (PRD #422 follow-up: two flags were missing from the real
+/// invocation and no test caught it):
+///
+/// - **`--repo` is required.** These fixture repos carry an `origin` remote
+///   (see `Fixture::new`) precisely so a fixed implementation has something
+///   non-empty to derive `--repo` from, but the stub does not care what the
+///   value IS — only that it is present. Real `gh`, run in a repo with no
+///   configured remotes at all, fails with its own "no git remotes found"
+///   rather than silently guessing; an absent `--repo` here fails the same
+///   way, with a message that says exactly what was missing.
+/// - **`--state` gates a `MERGED` fixture.** Real `gh pr list` defaults to
+///   `--state open`, so a fixture whose canned state is `MERGED` must NOT be
+///   returned unless the caller passed `--state all` (or `--state merged`).
+///   With no `--state`, or `--state open`, the stub prints `[]`, exactly as
+///   real `gh` does — this is a legitimate, non-error empty result, not a
+///   wrong-invocation failure.
+/// - **Unknown flags are rejected, not swallowed.** Real `gh` errors on a
+///   flag it does not recognize; the previous `*) ;;` catch-all silently
+///   accepted anything, which is how a caller could omit `--state` and
+///   `--repo` entirely and still get back fixture data.
+///
+/// A missing fixture file (no PR for this branch) still prints `[]`, same as
+/// real `gh pr list` — that is a correctly-resolved "no PR" answer, not a
+/// wrong-invocation error, and must not look like one.
 const GH_STUB_SCRIPT: &str = r#"#!/bin/sh
+all_args="$*"
 group="$1"
 sub="$2"
 shift 2 2>/dev/null || true
 
 head=""
+state=""
+repo=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --head) shift; head="$1" ;;
-        *) ;;
+        --state) shift; state="$1" ;;
+        --repo) shift; repo="$1" ;;
+        --json) shift; ;;
+        *)
+            echo "gh stub: unrecognized flag \"$1\" (real gh errors on an unknown flag; a permissive catch-all is how a wrong invocation went undetected) -- full invocation: gh $all_args" 1>&2
+            exit 1
+            ;;
     esac
     shift
 done
 
 if [ "$group" = "pr" ] && [ "$sub" = "list" ]; then
+    if [ -z "$repo" ]; then
+        echo "gh stub: --repo is required -- this fixture repo has no git remote for gh to infer one from, matching real gh's own failure in a repo with no remotes configured; full invocation: gh $all_args" 1>&2
+        exit 1
+    fi
+
     key=$(printf '%s' "$head" | tr '/' '_')
-    if [ -f "$GHSTUB_DIR/pr-$key.json" ]; then
-        cat "$GHSTUB_DIR/pr-$key.json"
+    file="$GHSTUB_DIR/pr-$key.json"
+    if [ ! -f "$file" ]; then
+        printf '[]\n'
+        exit 0
+    fi
+
+    fixture_state=$(grep -o '"state":"[A-Z]*"' "$file" | head -n1 | cut -d'"' -f4)
+    norm_state=$(printf '%s' "$state" | tr 'A-Z' 'a-z')
+    case "$norm_state" in
+        all) match=1 ;;
+        merged) if [ "$fixture_state" = "MERGED" ]; then match=1; else match=0; fi ;;
+        closed) if [ "$fixture_state" = "CLOSED" ]; then match=1; else match=0; fi ;;
+        open|"") if [ "$fixture_state" = "OPEN" ]; then match=1; else match=0; fi ;;
+        *)
+            echo "gh stub: unrecognized --state value \"$state\" -- full invocation: gh $all_args" 1>&2
+            exit 1
+            ;;
+    esac
+
+    if [ "$match" = "1" ]; then
+        cat "$file"
     else
         printf '[]\n'
     fi
     exit 0
 fi
 
-echo "gh stub: unhandled invocation: $group $sub $*" 1>&2
+echo "gh stub: unhandled invocation: $group $sub $all_args" 1>&2
 exit 1
 "#;
 
@@ -86,6 +144,20 @@ impl Fixture {
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "--quiet", "-m", "seed"]);
+        // A real implementation needs a non-empty value to pass as `gh`'s
+        // `--repo`; without a configured remote there is nothing to derive
+        // one from, which would make defect 2's RED unfixable in this
+        // harness rather than a defect to fix. The stub only checks that
+        // `--repo` is non-empty, not its exact value, so any origin works.
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/test-org/test-repo.git",
+            ],
+        );
 
         let bindir = scratch.path().join("bin");
         std::fs::create_dir_all(&bindir).expect("create bindir");
@@ -223,9 +295,16 @@ fn worktree_reclaim_001_lists_a_removable_worktree() {
         combined(&out)
     );
     let text = combined(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("wt-merged"))
+        .unwrap_or_else(|| {
+            panic!("`worktree list` must name the worktree it examined; got:\n{text}")
+        });
     assert!(
-        text.contains("wt-merged"),
-        "`worktree list` must name the worktree it examined; got:\n{text}"
+        line.contains("remove"),
+        "a MERGED, clean, deck-owned worktree must be reported with a \"remove\" verdict, not \
+         merely be named in the output -- got line:\n{line}\nfull output:\n{text}"
     );
 }
 
@@ -467,8 +546,26 @@ fn worktree_reclaim_006_json_output_carries_schema_version_and_verdicts() {
         doc.get("schema_version").is_some(),
         "the JSON document must carry `schema_version`; got:\n{stdout}"
     );
-    assert!(
-        stdout.contains("wt-json"),
-        "the JSON document must include the examined worktree; got:\n{stdout}"
+    let entries = doc
+        .get("worktrees")
+        .and_then(|w| w.as_array())
+        .unwrap_or_else(|| {
+            panic!("the JSON document must carry a `worktrees` array; got:\n{stdout}")
+        });
+    let entry = entries
+        .iter()
+        .find(|e| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.contains("wt-json"))
+        })
+        .unwrap_or_else(|| {
+            panic!("the JSON document must include the examined worktree; got:\n{stdout}")
+        });
+    assert_eq!(
+        entry.get("verdict").and_then(|v| v.as_str()),
+        Some("remove"),
+        "a MERGED, clean, deck-owned worktree's JSON entry must carry verdict \"remove\", not \
+         merely be present in the document; got entry:\n{entry}\nfull document:\n{stdout}"
     );
 }
