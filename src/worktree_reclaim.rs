@@ -275,16 +275,68 @@ fn ownership_of(worktree_path: &Path) -> Ownership {
     }
 }
 
-/// `gh pr list --head <branch> --json state,headRefName` — the exact
-/// invocation this module implements against (see the module's PRD task: the
-/// test stub implements only this one). `--json` selects a machine-readable
-/// document from a real `gh`; the stub ignores flags it does not itself
-/// interpret, so this is compatible with both.
+/// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
+/// remote — never from `gh`'s own inference, which resolves against the
+/// upstream repo when run from a fork checkout with no default set (the
+/// exact trap `docs/develop/fork-sync-workflow.md` documents, and precisely
+/// what let this module's original invocation query the wrong repo).
+///
+/// Fails closed to `None` — the caller turns that into `Unresolvable` (keep,
+/// never remove) — on any remote misconfiguration: no `origin` remote, a URL
+/// that doesn't parse as `owner/name`, or a host other than `github.com`
+/// (`gh` only ever talks to GitHub, so a non-GitHub remote must never resolve
+/// to a slug `gh` would misinterpret rather than reject).
+fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(repo_dir)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    parse_github_owner_repo(&url)
+}
+
+/// Parse a GitHub remote URL (HTTPS, `git@` SSH, or `ssh://` SSH) into an
+/// `owner/name` slug. Returns `None` for anything else, including a
+/// non-GitHub host, a URL with no path, or a path with more than two
+/// segments — fail closed rather than guess.
+fn parse_github_owner_repo(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// `gh pr list --head <branch> --state all --repo <owner/name> --json
+/// state,headRefName` — `--state all` because `gh pr list` defaults to
+/// `--state open`, which makes every merged PR invisible; `--repo`, derived
+/// from `origin` via [`derive_repo_slug`], because letting `gh` infer it
+/// queries the upstream repo from a fork checkout with no default set.
 ///
 /// Matches results on `headRefName` exactly (mitigates "a PR is matched to
 /// the wrong branch" from the PRD's risk list) and treats zero matches as
 /// `NoPr`, more than one as `Unresolvable` (ambiguous), never guessing.
 fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
+    let repo_slug = match derive_repo_slug(repo_dir) {
+        Some(slug) => slug,
+        None => {
+            return PrState::Unresolvable(
+                "could not derive --repo from the origin remote (missing, or not a parseable \
+                 GitHub URL)"
+                    .to_string(),
+            );
+        }
+    };
     let out = Command::new("gh")
         .current_dir(repo_dir)
         .args([
@@ -292,6 +344,10 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "list",
             "--head",
             branch,
+            "--state",
+            "all",
+            "--repo",
+            &repo_slug,
             "--json",
             "state,headRefName",
         ])
