@@ -134,6 +134,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `6104d94` | `fix(codex-hooks): preserve destination mode in write_atomic (fork #382) (#109)` | **UPSTREAM-WORTHY** — a file-permission-widening defect in `write_atomic` is generic and exists upstream identically; nothing fork-specific |
 | `9bb52a2` | `ci: catch stale in-progress labels on closed issues (fork #111) (#112)` | **PERMANENT** fork-only (CI) — the `in-progress` label convention is this fork's own (CLAUDE.md rule 14), upstream has no such label and no such workflow, same basis as the Semgrep/Sonar/e2e-split CI rows |
 | `b8e3b92` | `docs(fork-sync): warn that gh pr create targets upstream by default (#113)` | **PERMANENT** fork-only (doc) — documents a fork-vs-upstream hazard (`gh pr create` defaulting to `vfarcic/dot-agent-deck`) that only exists because this is a fork |
+| `984e6cc` | `docs: require task-supplied absolute findings paths for read-only roles (fork #114) (#115)` | **PERMANENT** fork-only (rules) — describes this fork's own delegation harness and codex per-directory trust model; no upstream analogue |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
