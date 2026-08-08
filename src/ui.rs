@@ -6632,16 +6632,12 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             FormField::Name if form.command_visible() => {
                 form.focused = FormField::Command;
             }
-            // Fork #122: an orchestration is selected — Name advances to the
-            // worktree-slug field instead of submitting, mirroring the
-            // Command door above.
-            FormField::Name if form.worktree_slug_visible() => {
-                form.focused = FormField::WorktreeSlug;
-            }
             // PRD #106: when the Command field is hidden (orchestration
-            // selected) AND there's no worktree-slug field to advance to
-            // either, pressing Enter on Name submits — there's no later
-            // field.
+            // selected), pressing Enter on Name submits directly. Fork #122's
+            // worktree-slug field stays out of this chain deliberately — it's
+            // opt-in and rarely used, so it isn't worth taxing every
+            // orchestration launch's Enter-to-submit muscle memory. The field
+            // is still reachable via Tab, and Enter submits from there too.
             FormField::Name | FormField::Command | FormField::WorktreeSlug => {
                 // The blank-command -> `default_command` authoring default now
                 // lives in `build_new_pane_request`, so both this Enter door and
@@ -27860,11 +27856,8 @@ mod tests {
             handle_new_pane_form_key(key, &mut ui);
         }
 
-        // PRD #106: with an orchestration selected, Command is hidden.
-        // Fork #122: the worktree-slug field takes Command's place in the
-        // Enter chain instead, so Name now advances to WorktreeSlug rather
-        // than submitting; a second Enter (blank slug) submits.
-        handle_new_pane_form_key(enter, &mut ui); // Name → WorktreeSlug
+        // PRD #106: with an orchestration selected, Command is hidden — so
+        // pressing Enter on Name submits directly. No second navigation step.
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -27902,14 +27895,11 @@ mod tests {
         ));
 
         // Select orchestration, skip Name field (leave it empty), submit.
-        // PRD #106: Command is hidden. Fork #122: Enter on Name now advances
-        // to the worktree-slug field instead of submitting; a second Enter
-        // (blank slug) submits.
+        // PRD #106: Command is hidden, so Enter on Name submits.
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(right, &mut ui);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
-        handle_new_pane_form_key(enter, &mut ui); // Name → WorktreeSlug
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -28091,11 +28081,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_name_advances_to_worktree_slug_when_orchestration_selected() {
-        // Fork #122: Enter on Name no longer submits directly when an
-        // orchestration is selected — it advances to the worktree-slug
-        // field (the field a real user needs to reach by keyboard to type
-        // a slug), and Enter on THAT field submits.
+    fn enter_on_name_submits_when_orchestration_selected() {
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(
@@ -28115,16 +28101,7 @@ mod tests {
         handle_new_pane_form_key(enter, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
 
-        // Enter on Name advances to WorktreeSlug rather than submitting.
-        handle_new_pane_form_key(enter, &mut ui);
-        assert_eq!(
-            ui.new_pane_form.as_ref().unwrap().focused,
-            FormField::WorktreeSlug
-        );
-        assert!(ui.new_pane_form.is_some(), "must not submit yet");
-
-        // Enter on WorktreeSlug (still blank) submits — a blank slug
-        // preserves today's exact behavior (no worktree).
+        // Enter on Name should submit directly, not advance to a hidden field.
         let result = handle_new_pane_form_key(enter, &mut ui);
         assert!(matches!(result, Action::SpawnPane(_)));
         assert!(ui.new_pane_form.is_none());
@@ -28132,7 +28109,6 @@ mod tests {
         if let Action::SpawnPane(req) = result {
             assert!(req.orchestration_config.is_some());
             assert!(req.mode_config.is_none());
-            assert!(req.orchestration_worktree_path.is_none());
         }
     }
 
