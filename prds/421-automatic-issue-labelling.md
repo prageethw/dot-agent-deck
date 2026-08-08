@@ -100,7 +100,7 @@ The two write points have different claimants and both must be representable: sc
 ### Phase 2: Triage
 
 - [ ] **M2.0** — Label vocabulary, created idempotently and documented as canonical.
-- [ ] **M2.1** — The agent-driven triage path and its prompt template, including the `needs-triage` uncertainty rule.
+- [ ] **M2.1** — The agent-driven triage path and its prompt template, including the `needs-triage` uncertainty rule. When a human **is** present, the agent asks a specific, bounded question — "priority for #N: high, medium, or low?" — rather than prose. The unattended path is unchanged: apply `needs-triage` and move on, never block a scheduled run on a prompt.
 - [ ] **M2.2** — Tests for the triage path's label application and its uncertainty outcome.
 
 ### Phase 3: Ship
