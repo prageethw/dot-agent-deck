@@ -226,6 +226,24 @@ pub fn worktree_add_argv(
     argv
 }
 
+/// Argv for `git worktree remove --force`: fork #122/#123 re-audit's (P2)
+/// best-effort cleanup after a `git worktree add` is killed for exceeding
+/// its timeout mid-checkout. `git worktree add` registers the worktree
+/// before checkout/hooks finish, so a killed add leaves a half-created
+/// directory (and usually its registration) behind; `--force` is required
+/// because a plain `worktree remove` refuses a directory whose checkout
+/// never completed cleanly.
+pub fn worktree_remove_argv(clone_dir: &Path, worktree_dir: &Path) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        clone_dir.to_string_lossy().into_owned(),
+        "worktree".to_string(),
+        "remove".to_string(),
+        "--force".to_string(),
+        worktree_dir.to_string_lossy().into_owned(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // M1 — validate the user-config GitHub knobs that flow into `gh`/`git` argv
 // ---------------------------------------------------------------------------

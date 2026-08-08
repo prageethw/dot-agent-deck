@@ -8206,6 +8206,36 @@ fn dispatch_action(
                                     ));
                                     return Flow::Continue;
                                 }
+                                // Fork #122/#123 re-audit (P2): distinct from
+                                // `AlreadyClaimed` above — `git worktree add`
+                                // was killed for taking too long, not beaten
+                                // by another actor, and it may have left a
+                                // half-created directory behind that
+                                // permanently wedges this slug unless
+                                // cleared. Name the exact path and exact
+                                // command rather than falling back to the
+                                // deck's cwd.
+                                Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
+                                    cleaned_up,
+                                }) => {
+                                    let detail = if cleaned_up {
+                                        "the half-created directory was removed automatically — try again".to_string()
+                                    } else {
+                                        format!(
+                                            "run `git -C {} worktree remove --force {}` to clear it, then try again",
+                                            req.dir.display(),
+                                            worktree_path.display()
+                                        )
+                                    };
+                                    ui.status_message = Some((
+                                        format!(
+                                            "Orchestration failed: worktree add timed out at {} — {detail}",
+                                            worktree_path.display()
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
+                                    return Flow::Continue;
+                                }
                                 Err(e) => {
                                     ui.status_message = Some((
                                         format!("Orchestration failed: {e}"),

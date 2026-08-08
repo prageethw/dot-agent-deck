@@ -2637,6 +2637,13 @@ without depending on the config struct API.
 - **Does not assert:** the sibling-of-`dir` belt-and-braces check in isolation (both layers reject the escape cases here together); the refusal reaching the user (`ui.status_message`, the SpawnPane-level fail-loud path — covered by `002`'s shape for creation failures); branch naming.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/worktree/007 — `classify_worktree_add_result` classifies a timed-out `git worktree add` (directory present) as `TimedOut`, never `AlreadyClaimed`, while a genuine non-timeout failure with the directory present still classifies as `AlreadyClaimed` (fork #122/#123 re-audit P2: a timed-out add registers the worktree directory before it is killed, so collapsing that into `AlreadyClaimed` permanently wedged the slug — every later attempt saw the same present directory and refused it with no cleanup).
+- **Layer:** L1 (pure — direct calls to `classify_worktree_add_result` with a synthetic `AddError`; no PTY, no daemon, no real `git` subprocess, no 30s wait).
+- **Agent:** none.
+- **Asserts:** a present worktree directory fed `Err(AddError::TimedOut(_))` classifies as `Ok(AddOutcome::TimedOut)`; the identical present directory fed `Err(AddError::Failed(_))` still classifies as `Ok(AddOutcome::AlreadyClaimed)`, preserving the pre-existing TOCTOU-claim behavior.
+- **Does not assert:** the bounded best-effort `git worktree remove --force` cleanup that `create_worktree_sync` layers on top of a `TimedOut` classification, or its own timeout; the user-facing message built in `ui.rs`'s `SpawnPane` dispatch; a real hook actually exceeding the 30s bound (deliberately not exercised — slow and flaky).
+- **Platform coverage:** mac+linux+windows.
+
 ### Session restore
 
 #### session/restore

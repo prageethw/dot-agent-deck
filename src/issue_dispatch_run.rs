@@ -318,7 +318,11 @@ async fn dispatch_one_issue(
     // mirroring the `dispatch_decision` worktree-presence skip.
     match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch).await? {
         WorktreeCreation::Created => {}
-        WorktreeCreation::AlreadyClaimed => {
+        // `TimedOut` cannot actually occur on this async path today (its
+        // `run_status`/`run_status_args` calls have no bound) — handled
+        // identically to `AlreadyClaimed` (skip, not fail) only so the match
+        // stays exhaustive and safe if that ever changes.
+        WorktreeCreation::AlreadyClaimed | WorktreeCreation::TimedOut { .. } => {
             notifier.notify(NotifyEvent::IssueDispatchSkipped {
                 task: task_name.to_string(),
                 repo: cfg.repo.clone(),
@@ -579,16 +583,29 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 }
 
 /// Outcome of [`create_worktree`] / [`create_worktree_sync`]: either we
-/// created the worktree, or a concurrent creator had already claimed it (the
-/// benign TOCTOU race below). The async caller (issue-dispatch) surfaces
+/// created the worktree, a concurrent creator had already claimed it (the
+/// benign TOCTOU race below), or the `git worktree add` itself was killed
+/// for exceeding [`WORKTREE_GIT_TIMEOUT`] while the directory it half-created
+/// is still present. The async caller (issue-dispatch) surfaces
 /// `AlreadyClaimed` as a skip; the sync caller (fork #122's orchestration-tab
 /// `SpawnPane` path) surfaces it as a fail-loud refusal — there is no
 /// "concurrent fire" concept for a single interactively-opened tab, so an
 /// already-claimed path there means something else already occupies it.
+///
+/// Fork #122/#123 re-audit (P2): `TimedOut` is deliberately its own variant,
+/// never folded into `AlreadyClaimed` — the two mean different things
+/// (another actor holds this path vs. we half-created it ourselves) and
+/// reporting one as the other hid the wedge entirely (see
+/// [`classify_worktree_add_result`]). `cleaned_up` records whether the
+/// best-effort `git worktree remove --force` attempt
+/// ([`create_worktree_sync`]) confirmed the half-created directory was
+/// actually removed, so the caller can tell the user either "try again" or
+/// give them the exact manual command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorktreeCreation {
     Created,
     AlreadyClaimed,
+    TimedOut { cleaned_up: bool },
 }
 
 /// Ensure the worktree's parent directory exists before `git worktree add`
@@ -603,24 +620,63 @@ fn ensure_worktree_parent_dir(worktree_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Pure classification result of [`classify_worktree_add_result`] — the
+/// shape under direct unit test (`orchestration/worktree/007`), before
+/// [`create_worktree_sync`] layers cleanup on top of `TimedOut` to produce
+/// the richer [`WorktreeCreation`] its own caller sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddOutcome {
+    Created,
+    AlreadyClaimed,
+    TimedOut,
+}
+
+/// A failed `git` invocation from [`run_status`] / [`run_status_args`] /
+/// [`run_status_sync`], distinguishing a genuine command failure from the
+/// bounded [`run_status_sync`] wait expiring before the child exited.
+/// [`run_status`]/[`run_status_args`] can never time out (no bound on that
+/// path — see their doc comments) and always produce `Failed`.
+#[derive(Debug)]
+enum AddError {
+    Failed(String),
+    TimedOut(String),
+}
+
 /// TOCTOU classification shared by [`create_worktree`] and
 /// [`create_worktree_sync`]: the caller only reaches here after seeing the
 /// worktree dir ABSENT, but a concurrent creator can win the race in the
 /// window before `git worktree add` runs — the add then fails on the now-
 /// present path. Because we only arrive with the dir believed absent, its
 /// presence after a failed add means a concurrent claim, not our error:
-/// report [`WorktreeCreation::AlreadyClaimed`] instead of a hard failure. A
+/// report [`AddOutcome::AlreadyClaimed`] instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
+///
+/// Fork #122/#123 re-audit (P2): a *timed-out* add with the directory
+/// present is a DIFFERENT situation from a concurrent claim — `git worktree
+/// add` registers the worktree before checkout/hooks finish, so a killed add
+/// leaves a half-created directory behind that is ours, not another actor's.
+/// Reporting it as `AlreadyClaimed` was the bug: every later attempt at that
+/// slug saw the same present directory and took the same "already claimed"
+/// branch forever, with no cleanup and no way for the user to tell what
+/// actually happened. `TimedOut` keeps that case distinct all the way to the
+/// caller instead.
 fn classify_worktree_add_result(
     worktree_dir: &Path,
-    add_result: Result<(), String>,
-) -> Result<WorktreeCreation, String> {
+    add_result: Result<(), AddError>,
+) -> Result<AddOutcome, String> {
     match add_result {
-        Ok(()) => Ok(WorktreeCreation::Created),
-        Err(e) => {
+        Ok(()) => Ok(AddOutcome::Created),
+        Err(AddError::TimedOut(e)) => {
             if worktree_dir.exists() {
-                Ok(WorktreeCreation::AlreadyClaimed)
+                Ok(AddOutcome::TimedOut)
+            } else {
+                Err(e)
+            }
+        }
+        Err(AddError::Failed(e)) => {
+            if worktree_dir.exists() {
+                Ok(AddOutcome::AlreadyClaimed)
             } else {
                 Err(e)
             }
@@ -655,8 +711,16 @@ async fn create_worktree(
         "git",
         &crate::issue_dispatch::worktree_add_argv(clone_dir, worktree_dir, branch, branch_exists),
     )
-    .await;
-    classify_worktree_add_result(worktree_dir, add)
+    .await
+    .map_err(AddError::Failed);
+    // `run_status_args` has no bound (see its doc comment), so `AddOutcome::TimedOut`
+    // is unreachable on this path today; handled here only so the match stays
+    // exhaustive if that ever changes.
+    Ok(match classify_worktree_add_result(worktree_dir, add)? {
+        AddOutcome::Created => WorktreeCreation::Created,
+        AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
+        AddOutcome::TimedOut => WorktreeCreation::TimedOut { cleaned_up: false },
+    })
 }
 
 /// Sync twin of [`create_worktree`] for the TUI's synchronous `SpawnPane`
@@ -679,13 +743,54 @@ pub(crate) fn create_worktree_sync(
     let branch_exists = run_status_sync(
         "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
+        WORKTREE_GIT_TIMEOUT,
     )
     .is_ok();
     let add = run_status_sync(
         "git",
         &crate::issue_dispatch::worktree_add_argv(clone_dir, worktree_dir, branch, branch_exists),
+        WORKTREE_GIT_TIMEOUT,
     );
-    classify_worktree_add_result(worktree_dir, add)
+    Ok(match classify_worktree_add_result(worktree_dir, add)? {
+        AddOutcome::Created => WorktreeCreation::Created,
+        AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
+        // Fork #122/#123 re-audit (P2): the add registered `worktree_dir`
+        // before it was killed. Best-effort clean it up now, bounded by its
+        // own (shorter) timeout so a stuck cleanup cannot hang the very loop
+        // this exists to unwedge — see `attempt_worktree_cleanup`.
+        AddOutcome::TimedOut => {
+            let cleaned_up = attempt_worktree_cleanup(clone_dir, worktree_dir);
+            WorktreeCreation::TimedOut { cleaned_up }
+        }
+    })
+}
+
+/// Fork #122/#123 re-audit (P2): best-effort cleanup for a `git worktree add`
+/// killed by [`run_status_sync`]'s [`WORKTREE_GIT_TIMEOUT`] bound —
+/// `git worktree add` registers the worktree before checkout/hooks finish,
+/// so the kill leaves a half-created directory (and usually its
+/// registration) behind that would otherwise wedge this slug permanently
+/// (every later attempt sees the directory present and refuses it).
+///
+/// Runs through the same bounded, non-interactive subprocess path as the add
+/// itself (stdin closed, `GIT_TERMINAL_PROMPT=0`, …) but with its OWN,
+/// shorter timeout ([`WORKTREE_CLEANUP_TIMEOUT`]) — a stuck cleanup must not
+/// hang the loop it exists to protect. Only ever targets `worktree_dir`, the
+/// exact path this invocation derived and already confirmed to be the
+/// intended direct sibling — never a path from anywhere else.
+///
+/// "Confirmed" means both the command exited successfully AND the directory
+/// is actually gone afterward; either check failing is reported as `false`
+/// so the caller fails loudly with the manual command rather than assuming
+/// success it cannot back up.
+fn attempt_worktree_cleanup(clone_dir: &Path, worktree_dir: &Path) -> bool {
+    let removed = run_status_sync(
+        "git",
+        &crate::issue_dispatch::worktree_remove_argv(clone_dir, worktree_dir),
+        WORKTREE_CLEANUP_TIMEOUT,
+    )
+    .is_ok();
+    removed && !worktree_dir.exists()
 }
 
 /// Parse a `gh issue list --json number` array into issue numbers, in order.
@@ -759,27 +864,38 @@ async fn run_status_args(program: &str, args: &[String]) -> Result<(), String> {
 /// does not read as "the TUI is just doing something".
 const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Fork #122/#123 re-audit (P2): the bound for [`attempt_worktree_cleanup`]'s
+/// `git worktree remove --force` call — deliberately its OWN, shorter timeout
+/// rather than reusing [`WORKTREE_GIT_TIMEOUT`], so a stuck cleanup cannot
+/// itself hang for as long as the add it is cleaning up after. A plain
+/// `remove` does no checkout work and no hooks run, so this only needs to
+/// cover filesystem removal of a directory that may still have a partial
+/// checkout in it.
+const WORKTREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How often [`run_status_sync`] polls its spawned child for exit while
-/// enforcing [`WORKTREE_GIT_TIMEOUT`]. Short enough that the timeout bound
-/// is accurate to a fraction of a second; long enough not to spin the CPU on
-/// the render/event loop while a normal, fast `git` call is still running.
+/// enforcing its caller-supplied timeout. Short enough that the timeout
+/// bound is accurate to a fraction of a second; long enough not to spin the
+/// CPU on the render/event loop while a normal, fast `git` call is still
+/// running.
 const WORKTREE_GIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Blocking twin of [`run_status_args`] for [`create_worktree_sync`], which
-/// runs on the TUI's synchronous `SpawnPane` dispatch path and cannot
-/// `.await`.
+/// Blocking twin of [`run_status_args`] for [`create_worktree_sync`] and
+/// [`attempt_worktree_cleanup`], which run on the TUI's synchronous
+/// `SpawnPane` dispatch path and cannot `.await`.
 ///
 /// Fork #122/#123 audit (P2), two layers: stdin closed and a
 /// non-interactive git environment applied — same three env vars as
 /// [`run_status`] above — so a credential prompt fails fast instead of
 /// waiting on input nothing will ever supply; and `Command::output()` —
 /// which waits for termination with no bound — is replaced with `spawn()`
-/// plus `try_wait()` polling against [`WORKTREE_GIT_TIMEOUT`], killing the
-/// child and returning an ordinary `Err` (which flows into the existing
-/// refuse-the-tab path in `Action::SpawnPane`) on expiry, rather than
+/// plus `try_wait()` polling against the caller-supplied `timeout`, killing
+/// the child and returning [`AddError::TimedOut`] on expiry, rather than
 /// leaving the render/event loop unable to repaint, show an error, or
-/// accept input.
-fn run_status_sync(program: &str, args: &[String]) -> Result<(), String> {
+/// accept input. `timeout` is a parameter (fork #122/#123 re-audit, P2)
+/// rather than the fixed [`WORKTREE_GIT_TIMEOUT`] so [`attempt_worktree_cleanup`]
+/// can give its own cleanup call a shorter, independent bound.
+fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<(), AddError> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut child = std::process::Command::new(program)
         .args(&refs)
@@ -790,9 +906,9 @@ fn run_status_sync(program: &str, args: &[String]) -> Result<(), String> {
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "")
         .spawn()
-        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+        .map_err(|e| AddError::Failed(format!("failed to run `{program}`: {e}")))?;
 
-    let deadline = Instant::now() + WORKTREE_GIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -800,14 +916,18 @@ fn run_status_sync(program: &str, args: &[String]) -> Result<(), String> {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "`{program} {}` timed out after {WORKTREE_GIT_TIMEOUT:?} without exiting",
+                    return Err(AddError::TimedOut(format!(
+                        "`{program} {}` timed out after {timeout:?} without exiting",
                         refs.join(" "),
-                    ));
+                    )));
                 }
                 std::thread::sleep(WORKTREE_GIT_POLL_INTERVAL);
             }
-            Err(e) => return Err(format!("failed to wait on `{program}`: {e}")),
+            Err(e) => {
+                return Err(AddError::Failed(format!(
+                    "failed to wait on `{program}`: {e}"
+                )));
+            }
         }
     };
 
@@ -820,12 +940,12 @@ fn run_status_sync(program: &str, args: &[String]) -> Result<(), String> {
         let _ = stderr.read_to_end(&mut stderr_buf);
     }
     let stderr = String::from_utf8_lossy(&stderr_buf);
-    Err(format!(
+    Err(AddError::Failed(format!(
         "`{program} {}` failed ({}): {}",
         refs.join(" "),
         status,
         stderr.trim()
-    ))
+    )))
 }
 
 /// Run a subprocess that must exit zero and return its captured stdout. Accepts
@@ -858,6 +978,7 @@ async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[test]
     fn parse_issue_numbers_reads_number_field_in_order() {
@@ -1084,6 +1205,48 @@ mod tests {
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
+        );
+    }
+
+    // Fork #122/#123 re-audit (P2): `classify_worktree_add_result` must not
+    // collapse a timed-out add into `AlreadyClaimed` just because the
+    // directory it half-created is present — that is the exact bug that let
+    // a wedged slug masquerade as "someone else already claimed it" forever.
+    // A unit test on the classifier itself (rather than a real 30s-hook
+    // integration test) is deliberate: the classification is pure and where
+    // the bug lived, and a real timed-out hook would be slow and flaky.
+    /// Scenario: `classify_worktree_add_result` is fed a synthetic
+    /// `AddError::TimedOut` alongside a worktree directory that is present on
+    /// disk (standing in for `git worktree add` having registered the
+    /// directory before it was killed) and must classify it as `TimedOut`,
+    /// not `AlreadyClaimed`. The same present directory fed a plain
+    /// `AddError::Failed` (a genuine concurrent claim, not a timeout) must
+    /// still classify as `AlreadyClaimed`, exactly as before this change.
+    #[spec("orchestration/worktree/007")]
+    #[test]
+    fn worktree_007_timeout_classifies_distinctly_from_already_claimed() {
+        let ws = tempfile::tempdir().unwrap();
+        let worktree_dir = ws.path().join("worktree");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+
+        let timed_out = classify_worktree_add_result(
+            &worktree_dir,
+            Err(AddError::TimedOut("timed out".to_string())),
+        );
+        assert_eq!(
+            timed_out,
+            Ok(AddOutcome::TimedOut),
+            "a timed-out add with the directory present must classify as TimedOut, not AlreadyClaimed, got {timed_out:?}"
+        );
+
+        let already_claimed = classify_worktree_add_result(
+            &worktree_dir,
+            Err(AddError::Failed("add failed".to_string())),
+        );
+        assert_eq!(
+            already_claimed,
+            Ok(AddOutcome::AlreadyClaimed),
+            "a genuine (non-timeout) failure with the directory present must still classify as AlreadyClaimed, got {already_claimed:?}"
         );
     }
 
