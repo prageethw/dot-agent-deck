@@ -130,6 +130,7 @@ Oldest to newest, rooted at an upstream base commit. Always re-verify against th
 | `9cc775c` | `test(hook): pin the slow-drip socket hang left open by #99 (fork #101) (#106)` | **UPSTREAM-WORTHY** — `request_from_socket_inner` is upstream's own hook-socket plumbing; an unbounded total-operation deadline against a peer that drips bytes slowly enough to keep resetting each individual read/write timeout is a defect there too, same basis as `9ed01ae` (#99), which this directly extends |
 | `7270c8a` | `docs(claude,config): harden worktree/agent isolation and add issue-claim check (fork #74) (#104)` | **PERMANENT** fork-only (rules/config) |
 | `4f85bf1` | `refactor(hook): pass the socket endpoint explicitly instead of through the environment (fork #102) (#110)` | **UPSTREAM-WORTHY** — `request_from_socket_inner`/`send_to_socket` are upstream's own hook-socket plumbing; routing test isolation through process-global `env::set_var` (`unsafe` in edition 2024, UB under concurrent access) is a defect upstream shares, same basis as `9ed01ae` (#99) and `9cc775c` (#106) |
+| `4386951` | `test(delegate): RED tests for a delegate confirmed with unresolved targets, fix Pi start-role spawn-order race (fork #92) (#93)` | **UPSTREAM-WORTHY** — `delegate` and the daemon's spawn/registration path are upstream's own functionality; confirming a delegation actually resolved its target is a defect upstream shares, no fork-only files touched, same basis as `aed6343` (#84) |
 
 The base is `9ca7de1` — `upstream/main`'s tip at the time of the 2026-08-05 sync. Every commit above it was verified as genuinely fork-only before inclusion: none of the symbols/behaviors they introduce (`SplitStage`, `command_entry_locked`, `ToggleOrchestrationSplit`, the shell-activity status change, `claude-sonnet-devbox`) exist anywhere in `upstream/main`.
 
@@ -166,6 +167,7 @@ The rows above marked **UPSTREAM-WORTHY** or **MIXED** are on `fork-only` becaus
 - `88cb1aa` — work-done output paths collide between concurrent panes, and the `--task-file` cwd-drift refusal depends on the daemon's own working directory instead of being cwd-independent (fork #76, upstream #331).
 - `9cc775c` — `request_from_socket_inner` has no total-operation deadline, so a peer that drips bytes slowly enough to keep resetting each individual read/write timeout can still hang the overall call forever (fork #101, #99).
 - `4f85bf1` — test isolation for the hook-socket helpers mutated the process-global `DOT_AGENT_DECK_SOCKET` env var (`unsafe` in edition 2024, UB under concurrent access) instead of taking the socket path as an argument (fork #102).
+- `4386951` — a delegate confirmed with unresolved targets replied from the raw request instead of the resolved set, and a Pi start-role agent could lose its own registration to a spawn-order race (fork #92).
 
 **Offering these upstream would shrink the stack.** Each one that merges upstream becomes a duplicate the next rebase can drop, exactly like PRD #333's row. Worth doing before the next sync rather than after.
 
