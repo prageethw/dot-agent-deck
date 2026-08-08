@@ -150,13 +150,15 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    spawn_in_new_process_group, terminate_child_with_grace_and_wait,
+    terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    terminate_child_with_grace_and_wait,
+    terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the
@@ -168,7 +170,15 @@ pub use windows::{
 /// methods the teardown path actually calls do anything; `clone_killer` is not on
 /// that path and returns a no-op killer rather than pretending to duplicate the
 /// handle.
-#[cfg(test)]
+///
+/// Promoted out of `#[cfg(test)]` for fork issue #133:
+/// [`crate::issue_dispatch_run::run_status_sync`] spawns a plain
+/// `std::process::Child` (not a pty) and, on timeout, needs the same
+/// `&mut Box<dyn portable_pty::Child + Send + Sync>` shape
+/// [`terminate_child_with_grace_and_wait`] takes — so this wrapper is now a
+/// production dependency, not only a test one. Visibility change only; the
+/// `NoopKiller` caveat above still holds (nothing on the teardown path clones
+/// a killer).
 pub(crate) mod test_child {
     /// Wraps a real OS child. `Debug` is required by the `portable_pty` traits.
     #[derive(Debug)]
@@ -221,6 +231,7 @@ pub(crate) mod test_child {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     /// PRD #163 M3 — the platform seam `daemon stop` is built on. On Unix the
     /// graceful step MUST stay a signal: that is the property that lets
@@ -303,5 +314,234 @@ mod tests {
             "an already-exited child must not cost the full grace window (took {:?})",
             started.elapsed()
         );
+    }
+
+    /// Fork issue #133 — PR #123 bounded `git worktree add` at 30s on the TUI's
+    /// synchronous path and kills the child on expiry, but `child.kill()` reaps
+    /// only the direct `git` process; a hook grandchild (`post-checkout`
+    /// especially) is not in that kill's blast radius and can outlive the
+    /// bound. The fix escalates to a process-group kill instead, which only
+    /// works if the child leads its own group — `killpg` on a pid that is NOT
+    /// a group leader targets the wrong group entirely. Unlike an agent
+    /// spawned through `portable-pty` (already `setsid`'d for pty allocation),
+    /// a plain `std::process::Command` child inherits the deck's own group, so
+    /// `unix::spawn_in_new_process_group` has to make it a group leader at
+    /// spawn time.
+    ///
+    /// Scenario: a child spawned through `spawn_in_new_process_group` is a
+    /// process-group leader — `getpgid(pid) == pid` — while a plainly-spawned
+    /// `std::process::Command` child is not. The plain-spawn side is asserted
+    /// too, by contrast, so the leader assertion cannot pass vacuously (e.g.
+    /// if the test process itself happened to already be a group leader).
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/008")]
+    #[test]
+    fn worktree_008_spawn_in_new_process_group_is_its_own_leader() {
+        let mut grouped_command = std::process::Command::new("sleep");
+        grouped_command.arg("30");
+        let (mut grouped_child, _group) =
+            super::unix::spawn_in_new_process_group(&mut grouped_command)
+                .expect("spawn a group-leader child");
+        let grouped_pid = grouped_child.id() as libc::pid_t;
+        // SAFETY: `getpgid(2)` is async-signal-safe and has no side effects; it
+        // only reports the target's process-group id.
+        let grouped_pgid = unsafe { libc::getpgid(grouped_pid) };
+
+        let mut plain_child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a plainly-spawned child");
+        let plain_pid = plain_child.id() as libc::pid_t;
+        // SAFETY: same as above.
+        let plain_pgid = unsafe { libc::getpgid(plain_pid) };
+
+        // Cleanup before asserting, so a failed assertion never leaks a
+        // 30-second `sleep`.
+        let _ = grouped_child.kill();
+        let _ = grouped_child.wait();
+        let _ = plain_child.kill();
+        let _ = plain_child.wait();
+
+        assert_eq!(
+            grouped_pgid, grouped_pid,
+            "a child spawned via spawn_in_new_process_group must lead its own process group \
+             (getpgid must equal its own pid), or a subsequent killpg on that pid targets the \
+             wrong group"
+        );
+        assert_ne!(
+            plain_pgid, plain_pid,
+            "a plainly-spawned std::process::Command child must inherit the caller's process \
+             group rather than lead its own — this contrast is what keeps the assertion above \
+             from passing vacuously"
+        );
+    }
+
+    /// Fork issue #133 — the mechanism the fix actually buys: killing the
+    /// whole process group, not just the tracked child, reaches a grandchild
+    /// the child forked before it died. A real 30s-hook integration test would
+    /// be slow and flaky (same call as `orchestration/worktree/007` on the
+    /// previous PR), so this stands in with a cheap shell one-liner that forks
+    /// a backgrounded sibling process before termination ever runs.
+    ///
+    /// Scenario: a child spawned through `spawn_in_new_process_group` runs
+    /// `sh -c 'sleep 300 & sleep 300'`, which forks a backgrounded grandchild
+    /// `sleep` before anything terminates it. After
+    /// `terminate_child_with_grace_and_wait` returns, both the direct child's
+    /// pid and the discovered grandchild's pid are confirmed gone (`kill(pid,
+    /// 0)` reporting `ESRCH` for each, via a bounded poll rather than a single
+    /// point-in-time read) — proving the group kill reached the grandchild a
+    /// single-pid kill would have orphaned.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/009")]
+    #[test]
+    fn worktree_009_terminate_with_grace_kills_the_whole_group_including_grandchildren() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 300 & sleep 300"]);
+        let (child, group) = super::unix::spawn_in_new_process_group(&mut command)
+            .expect("spawn a group-leader shell child");
+        let child_pid = child.id() as libc::pid_t;
+
+        // Discover the backgrounded grandchild through the repo's own
+        // descendant scan. Bounded polling, not a bare sleep: the fork behind
+        // `&` is near-instant but not synchronous with `spawn()` returning.
+        let discover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let grandchild_pid = loop {
+            if let Some(table) = process_table()
+                && let Some(descendant) = descendants(&table, child_pid as i32).first()
+            {
+                break descendant.pid as libc::pid_t;
+            }
+            assert!(
+                std::time::Instant::now() < discover_deadline,
+                "the backgrounded `sleep` never showed up as a descendant of pid {child_pid} \
+                 within the discovery window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        let mut boxed_child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(super::test_child::StdChild(child));
+        terminate_child_with_grace_and_wait(
+            &mut boxed_child,
+            std::time::Duration::from_millis(200),
+            &group,
+        );
+
+        // SAFETY: signal 0 sends nothing; it only probes whether `pid` still
+        // exists (ESRCH means it is gone).
+        let alive = |pid: libc::pid_t| -> bool { unsafe { libc::kill(pid, 0) == 0 } };
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let child_alive = alive(child_pid);
+            let grandchild_alive = alive(grandchild_pid);
+            if !child_alive && !grandchild_alive {
+                break;
+            }
+            if std::time::Instant::now() >= confirm_deadline {
+                panic!(
+                    "expected the process-group kill to reap both the direct child (pid \
+                     {child_pid}) and its grandchild (pid {grandchild_pid}); still alive: {}",
+                    match (child_alive, grandchild_alive) {
+                        (true, true) => "both",
+                        (true, false) => "the direct child",
+                        (false, true) => "the grandchild",
+                        (false, false) => unreachable!(),
+                    }
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Fork issue #133 P1 (found independently by both the reviewer and the
+    /// auditor on PR #134): `terminate_child_with_grace_and_wait` returns as
+    /// soon as `try_wait` shows the *direct* child reaped, skipping phase 3's
+    /// SIGKILL entirely — the exact orphan fork issue #133 exists to kill,
+    /// since `git` exits promptly on SIGTERM while a `post-checkout` hook can
+    /// trap or ignore it. `009` cannot see this: `sleep` dies on SIGTERM the
+    /// same as everything else in that scenario, so the direct child and its
+    /// grandchild always die together regardless of whether phase 3 ever
+    /// runs. This test constructs the shape `009` cannot: a leader that dies
+    /// promptly on SIGTERM alongside a same-group descendant that ignores it.
+    ///
+    /// Scenario: spawn `sh -c '(trap "" TERM; exec sleep 300) & exec sleep
+    /// 300'` as a process-group leader. The backgrounded subshell sets `trap
+    /// "" TERM` (SIG_IGN) for itself before tail-`exec`ing into `sleep`,
+    /// which inherits that ignored disposition across `exec` per POSIX (an
+    /// ignored signal's disposition survives exec; only a *caught* signal
+    /// resets to default) — making it SIGTERM-resistant. The outer script
+    /// never touches TERM's disposition and tail-`exec`s into its own
+    /// `sleep`, which keeps the default disposition and so dies on SIGTERM
+    /// like an ordinary cooperative process. After discovering the
+    /// backgrounded descendant through the repo's own descendant scan (same
+    /// mechanism as `009`, not inferred from the leader's exit),
+    /// `terminate_child_with_grace_and_wait_forcing_group_backstop` runs with
+    /// a 200ms grace window, and both the leader (reaped inside the grace
+    /// window) and the resistant descendant (reaped only by the forced
+    /// SIGKILL backstop) are confirmed gone afterward via a bounded
+    /// `kill(pid, 0)` poll.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/010")]
+    #[test]
+    fn worktree_010_forcing_backstop_kills_a_sigterm_resistant_descendant_after_a_cooperative_leader_exits()
+     {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "(trap \"\" TERM; exec sleep 300) & exec sleep 300"]);
+        let (child, group) = super::unix::spawn_in_new_process_group(&mut command)
+            .expect("spawn a group-leader shell child");
+        let child_pid = child.id() as libc::pid_t;
+
+        // Discover the backgrounded, SIGTERM-resistant descendant the same
+        // way `009` does: bounded polling against the repo's own descendant
+        // scan, not a bare sleep or an assumption inferred from the parent's
+        // exit.
+        let discover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let descendant_pid = loop {
+            if let Some(table) = process_table()
+                && let Some(descendant) = descendants(&table, child_pid as i32).first()
+            {
+                break descendant.pid as libc::pid_t;
+            }
+            assert!(
+                std::time::Instant::now() < discover_deadline,
+                "the backgrounded SIGTERM-resistant shell never showed up as a descendant of \
+                 pid {child_pid} within the discovery window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        let mut boxed_child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(super::test_child::StdChild(child));
+        super::terminate_child_with_grace_and_wait_forcing_group_backstop(
+            &mut boxed_child,
+            std::time::Duration::from_millis(200),
+            &group,
+        );
+
+        // SAFETY: signal 0 sends nothing; it only probes whether `pid` still
+        // exists (ESRCH means it is gone).
+        let alive = |pid: libc::pid_t| -> bool { unsafe { libc::kill(pid, 0) == 0 } };
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let leader_alive = alive(child_pid);
+            let descendant_alive = alive(descendant_pid);
+            if !leader_alive && !descendant_alive {
+                break;
+            }
+            if std::time::Instant::now() >= confirm_deadline {
+                panic!(
+                    "expected the forcing backstop to reap both the cooperative leader (pid \
+                     {child_pid}) and the SIGTERM-resistant descendant (pid {descendant_pid}); \
+                     still alive: {}",
+                    match (leader_alive, descendant_alive) {
+                        (true, true) => "both",
+                        (true, false) => "the leader",
+                        (false, true) => "the descendant",
+                        (false, false) => unreachable!(),
+                    }
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
