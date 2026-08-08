@@ -64,9 +64,9 @@ fn run_work_done_task_file(
 /// namespace must still succeed, proving the refusal is scoped rather than a
 /// blanket rejection of `--task-file`.
 #[cfg(unix)]
-#[spec("orchestration/delegate/024")]
+#[spec("orchestration/delegate/031")]
 #[test]
-fn delegate_024_work_done_refuses_task_file_inside_own_output_namespace() {
+fn delegate_031_work_done_refuses_task_file_inside_own_output_namespace() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::race_safe_tempdir();
     let home = cwd.path().join("home");
@@ -123,9 +123,9 @@ fn delegate_024_work_done_refuses_task_file_inside_own_output_namespace() {
 /// because of what it is lexically named; a second, otherwise-identical call
 /// with no symlink involved at all must still succeed.
 #[cfg(unix)]
-#[spec("orchestration/delegate/026")]
+#[spec("orchestration/delegate/033")]
 #[test]
-fn delegate_026_work_done_refuses_file_symlink_resolving_into_output_namespace() {
+fn delegate_033_work_done_refuses_file_symlink_resolving_into_output_namespace() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::race_safe_tempdir();
     let home = cwd.path().join("home");
@@ -186,9 +186,9 @@ fn delegate_026_work_done_refuses_file_symlink_resolving_into_output_namespace()
 /// into the namespace. The CLI must still refuse; a second, otherwise-
 /// identical call with no symlink involved at all must still succeed.
 #[cfg(unix)]
-#[spec("orchestration/delegate/027")]
+#[spec("orchestration/delegate/034")]
 #[test]
-fn delegate_027_work_done_refuses_task_file_through_aliased_output_dir() {
+fn delegate_034_work_done_refuses_task_file_through_aliased_output_dir() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let cwd = common::race_safe_tempdir();
     let home = cwd.path().join("home");
@@ -248,9 +248,9 @@ fn delegate_027_work_done_refuses_task_file_through_aliased_output_dir() {
 /// `.dot-agent-deck` is refused too (an accepted false positive); a plain
 /// file outside any `.dot-agent-deck` is still accepted.
 #[cfg(unix)]
-#[spec("orchestration/delegate/028")]
+#[spec("orchestration/delegate/035")]
 #[test]
-fn delegate_028_work_done_refuses_task_file_despite_cwd_drift() {
+fn delegate_035_work_done_refuses_task_file_despite_cwd_drift() {
     let daemon = common::spawn_daemon_serve(None, "0");
     let pane_cwd = common::race_safe_tempdir();
     let home = pane_cwd.path().join("home");
