@@ -27860,8 +27860,11 @@ mod tests {
             handle_new_pane_form_key(key, &mut ui);
         }
 
-        // PRD #106: with an orchestration selected, Command is hidden — so
-        // pressing Enter on Name submits directly. No second navigation step.
+        // PRD #106: with an orchestration selected, Command is hidden.
+        // Fork #122: the worktree-slug field takes Command's place in the
+        // Enter chain instead, so Name now advances to WorktreeSlug rather
+        // than submitting; a second Enter (blank slug) submits.
+        handle_new_pane_form_key(enter, &mut ui); // Name → WorktreeSlug
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -27899,11 +27902,14 @@ mod tests {
         ));
 
         // Select orchestration, skip Name field (leave it empty), submit.
-        // PRD #106: Command is hidden, so Enter on Name submits.
+        // PRD #106: Command is hidden. Fork #122: Enter on Name now advances
+        // to the worktree-slug field instead of submitting; a second Enter
+        // (blank slug) submits.
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(right, &mut ui);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        handle_new_pane_form_key(enter, &mut ui); // Name → WorktreeSlug
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
