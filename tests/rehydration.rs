@@ -283,6 +283,7 @@ async fn start_server_with_state(
             scheduler,
             reuse,
             worktrees,
+            dot_agent_deck::daemon::noop_start_agent_registration_hook(),
         )
         .await;
     });
