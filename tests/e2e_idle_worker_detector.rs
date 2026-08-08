@@ -64,6 +64,85 @@ fn wait_for_wrapped_grid_string(deck: &TuiDeck, needle: &str, timeout: Duration)
     common::wait_until(timeout, || squeeze(&deck.snapshot_grid()).contains(&needle))
 }
 
+/// Fork issue #81: timeout-path diagnostic for `idle_worker_011`. Reads the
+/// daemon's ground-truth PTY scrollback for both role panes directly over
+/// the attach socket (`AttachRequest::Snapshot`, via
+/// `common::pane_search_key_on`) — independent of whatever
+/// `wait_for_wrapped_grid_string` happened to have scrolled into the polled
+/// vt100 viewport — so a failure can tell apart:
+///   - the delegate never reaching dispatch (no pointer text ever written to
+///     the worker's own scrollback: the hook was dropped, the pane/role
+///     gate in `AppState::handle_delegate` rejected it, or the fan-out write
+///     itself failed);
+///   - the delegate reaching the worker but the detector never firing (the
+///     daemon-report clause never appears in the orchestrator's scrollback
+///     AT ALL, not just in the current viewport: the idle timer or its
+///     delivery write is broken);
+///   - the detector firing with the wrong content (the clause is present in
+///     scrollback but the role label is missing: a data-shape bug, not a
+///     timing one);
+///   - the detector firing correctly in scrollback but never showing up in
+///     the polled viewport (a render/scroll lag under CI contention, not a
+///     pipeline defect).
+///
+/// Read-only: issues no keystrokes and asserts nothing itself, so it cannot
+/// perturb the budget or the outcome it is reporting on.
+fn idle_timeout_diagnostics(deck: &TuiDeck, waited_for: &str) -> String {
+    let socket = deck.attach_socket_path();
+    let records = common::agent_records_on(socket);
+    let orchestrator_id = records.iter().find_map(|r| match &r.tab_membership {
+        Some(TabMembership::Orchestration {
+            role_name,
+            is_start_role: true,
+            ..
+        }) if role_name == "orchestrator" => Some(r.id.clone()),
+        _ => None,
+    });
+    let worker_id = records.iter().find_map(|r| match &r.tab_membership {
+        Some(TabMembership::Orchestration { role_name, .. }) if role_name == "worker" => {
+            Some(r.id.clone())
+        }
+        _ => None,
+    });
+
+    let worker_scrollback = worker_id
+        .as_deref()
+        .map(|id| common::pane_search_key_on(socket, id))
+        .unwrap_or_default();
+    let orchestrator_scrollback = orchestrator_id
+        .as_deref()
+        .map(|id| common::pane_search_key_on(socket, id))
+        .unwrap_or_default();
+
+    let delegate_pointer_key =
+        common::search_key("Read .dot-agent-deck/worker-task-worker.md for your task.");
+    let delegate_accepted = worker_scrollback.contains(&delegate_pointer_key);
+    let daemon_clause_written =
+        orchestrator_scrollback.contains(&common::search_key(IDLE_DAEMON_CLAUSE));
+    let role_label_written =
+        orchestrator_scrollback.contains(&common::search_key(&idle_role_label("worker")));
+
+    let grid = deck.snapshot_grid();
+    let waited_for_in_viewport = squeeze(&grid).contains(&squeeze(waited_for));
+
+    format!(
+        "idle_worker_011 timeout diagnostics (fork #81):\n\
+         - worker pane registered with the daemon: {worker_registered}\n\
+         - orchestrator pane registered with the daemon: {orchestrator_registered}\n\
+         - delegate accepted & dispatched to the worker (its file-pointer text \
+           was ever written to the worker pane's own scrollback): {delegate_accepted}\n\
+         - idle detector fired (the daemon-report clause was ever written to \
+           the orchestrator pane's own scrollback, at any point): {daemon_clause_written}\n\
+         - idle prompt ever carried the worker role label in that scrollback: \
+           {role_label_written}\n\
+         - what this wait needed ever appeared in the polled viewport at \
+           timeout: {waited_for_in_viewport}\n\
+         Final polled viewport:\n{grid}",
+        worker_registered = worker_id.is_some(),
+        orchestrator_registered = orchestrator_id.is_some(),
+    )
+}
+
 fn path_with_binary_dir() -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let bin_dir = Path::new(bin)
@@ -191,8 +270,8 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
     assert!(
         wait_for_wrapped_grid_string(&deck, IDLE_DAEMON_CLAUSE, common::OBSERVATION_BUDGET),
         "the daemon-authored idle prompt never became visible in the attached orchestration \
-         pane\nFinal grid:\n{}",
-        deck.snapshot_grid()
+         pane\n{}",
+        idle_timeout_diagnostics(&deck, IDLE_DAEMON_CLAUSE)
     );
     assert!(
         wait_for_wrapped_grid_string(
@@ -201,8 +280,8 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
             common::OBSERVATION_BUDGET
         ),
         "the idle prompt did not carry the silent role inside its untrusted-role-label \
-         markers\nFinal grid:\n{}",
-        deck.snapshot_grid()
+         markers\n{}",
+        idle_timeout_diagnostics(&deck, &idle_role_label("worker"))
     );
 }
 
