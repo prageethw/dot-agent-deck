@@ -891,13 +891,19 @@ const WORKTREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// enough for `git` and any hook it ran to notice SIGTERM and exit on the
 /// common path, while staying short enough that even the worst case (a hook
 /// that ignores SIGTERM entirely, forcing the SIGKILL backstop) only adds
-/// 200ms on top of the timeout that already fired — **not** a hard bound on
-/// the whole escalation: both platforms' backstops end in an unbounded
-/// `wait()`/`wait4()` for the reap, so a process wedged in uninterruptible
-/// kernel I/O (e.g. a stuck NFS mount) can still delay this call's return
-/// past 200ms. That unbounded-wait property predates this fix (inherited
-/// from PR #123) and is tracked separately; it is not something the grace
-/// duration controls.
+/// 200ms on top of the timeout that already fired.
+///
+/// Fork issue #136: this grace **is** now a hard bound on the whole call.
+/// Earlier, both platforms' backstops ended in a blocking reap
+/// (`wait()`/`wait4()`) on this thread, so a process wedged in
+/// uninterruptible kernel I/O (e.g. a stuck NFS mount) could still delay the
+/// call's return past this grace, no matter how short it was set — the exact
+/// freeze `WORKTREE_GIT_TIMEOUT` exists to prevent, reappearing through a
+/// narrower door. `run_status_sync`'s timeout escalation now hands the child
+/// to a detached thread for that final reap
+/// (`terminate_child_with_grace_and_detached_reap_forcing_group_backstop`)
+/// instead of waiting on it here, so this grace once again bounds the whole
+/// call, not just the pre-SIGKILL portion of it.
 const WORKTREE_GIT_KILL_GRACE: Duration = Duration::from_millis(200);
 
 /// How often [`run_status_sync`] polls its spawned child for exit while
@@ -992,10 +998,17 @@ fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<
                     // its own group on Unix (see `spawn_git_status_child` /
                     // `spawn_in_new_process_group`), so `killpg` here reaches
                     // it and everything it forked.
-                    let mut boxed: Box<dyn portable_pty::Child + Send + Sync> =
+                    //
+                    // Fork issue #136: the detached-reap variant, not the
+                    // synchronous one — this call runs on the TUI's
+                    // synchronous render/event loop (this function's only
+                    // caller path from `dispatch_action`), so the final
+                    // reap must not block here. See that function's doc
+                    // comment for why.
+                    let boxed: Box<dyn portable_pty::Child + Send + Sync> =
                         Box::new(crate::platform::proc::test_child::StdChild(child));
-                    crate::platform::proc::terminate_child_with_grace_and_wait_forcing_group_backstop(
-                        &mut boxed,
+                    crate::platform::proc::terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
+                        boxed,
                         WORKTREE_GIT_KILL_GRACE,
                         &group,
                     );

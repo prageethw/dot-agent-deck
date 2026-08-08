@@ -146,13 +146,16 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    spawn_in_new_process_group, terminate_child_with_grace_and_wait,
+    spawn_in_new_process_group,
+    terminate_child_with_grace_and_detached_reap_forcing_group_backstop,
+    terminate_child_with_grace_and_wait,
     terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
+    terminate_child_with_grace_and_detached_reap_forcing_group_backstop,
     terminate_child_with_grace_and_wait,
     terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
@@ -537,6 +540,111 @@ mod tests {
                     }
                 );
             }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Fork issue #136: `terminate_child_with_grace_and_detached_reap_forcing_group_backstop`
+    /// must return promptly even when the underlying `wait()` cannot complete
+    /// immediately, instead of blocking the caller for however long the reap
+    /// takes — that is the property the fix exists to guarantee. A genuinely
+    /// unkillable process (one wedged in uninterruptible kernel I/O, e.g. a
+    /// stuck NFS mount) cannot be constructed in a test, so this pins the same
+    /// observable shape with a pure-Rust `portable_pty::Child` stand-in whose
+    /// `wait()` deliberately blocks far longer than the grace window — the
+    /// call must still return quickly, and the reap must still complete on
+    /// its own afterward. This asserts on that OBSERVABLE behavior (return
+    /// latency, eventual completion of the stand-in's `wait()`), not on the
+    /// implementation detail of a thread existing.
+    ///
+    /// Scenario: a fake child that never reports exited via `try_wait` and
+    /// whose `wait()` sleeps 1s before completing is torn down with a 50ms
+    /// grace window. The call is expected to return in well under a second —
+    /// comfortably less than what blocking on the fake's `wait()` would cost
+    /// — and the fake's `wait()` is separately confirmed (via a bounded poll
+    /// on a shared flag it sets when done) to have run to completion shortly
+    /// after, proving the reap was not simply dropped.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/011")]
+    #[test]
+    fn worktree_011_detached_reap_forcing_backstop_returns_before_a_slow_wait_completes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct SlowReapChild {
+            reaped: Arc<AtomicBool>,
+            reap_delay: std::time::Duration,
+        }
+
+        impl portable_pty::ChildKiller for SlowReapChild {
+            fn kill(&mut self) -> std::io::Result<()> {
+                // No real process backs this stand-in — SIGTERM/SIGKILL are
+                // both no-ops here, matching a process that has already been
+                // killed but is stuck in kernel I/O and has not yet been
+                // reaped.
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(SlowReapChild {
+                    reaped: self.reaped.clone(),
+                    reap_delay: self.reap_delay,
+                })
+            }
+        }
+
+        impl portable_pty::Child for SlowReapChild {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                // Never reports exited via polling, so the caller always runs
+                // phase 3 and reaches the final reap.
+                Ok(None)
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                std::thread::sleep(self.reap_delay);
+                self.reaped.store(true, Ordering::SeqCst);
+                Ok(portable_pty::ExitStatus::with_exit_code(137))
+            }
+            fn process_id(&self) -> Option<u32> {
+                // No real pid to report; this exercises
+                // `signal_child_pgroup_or_fallback`'s `child.kill()` fallback
+                // path rather than a real `killpg`.
+                None
+            }
+        }
+
+        let reaped = Arc::new(AtomicBool::new(false));
+        let reap_delay = std::time::Duration::from_secs(1);
+        let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(SlowReapChild {
+            reaped: reaped.clone(),
+            reap_delay,
+        });
+        let grace = std::time::Duration::from_millis(50);
+        let group = AgentProcessGroup;
+
+        let started = std::time::Instant::now();
+        super::terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
+            child, grace, &group,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the call should return once the grace window and signalling are done, without \
+             waiting for the slow reap to finish (reap takes {reap_delay:?}, call took \
+             {elapsed:?})"
+        );
+        assert!(
+            !reaped.load(Ordering::SeqCst),
+            "the reap should not have completed synchronously within the call — otherwise this \
+             test is not exercising the detached path at all"
+        );
+
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !reaped.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < confirm_deadline,
+                "the detached reap never completed — the child was signalled but never reaped, \
+                 which would reintroduce the zombie leak the detached thread exists to avoid"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }

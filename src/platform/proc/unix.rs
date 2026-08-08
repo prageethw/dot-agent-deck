@@ -232,6 +232,79 @@ pub fn terminate_child_with_grace_and_wait_forcing_group_backstop(
     terminate_child_with_grace_and_wait_impl(child, grace, true);
 }
 
+/// Fork issue #136: like
+/// [`terminate_child_with_grace_and_wait_forcing_group_backstop`], except the
+/// final reap after phase 3's SIGKILL runs on a short-lived **detached**
+/// thread instead of blocking the caller.
+///
+/// The forcing function above is correct about *what* to kill but not about
+/// *how long the call may take*: its final `child.wait()` is unbounded, and a
+/// process wedged in uninterruptible kernel I/O (a stuck NFS mount is the
+/// classic case) does not die on SIGKILL until that I/O completes, so `wait()`
+/// blocks until it does. The only caller of this function —
+/// [`crate::issue_dispatch_run::run_status_sync`]'s timeout escalation — runs
+/// on the TUI's synchronous render/event loop, which is exactly the freeze
+/// [`crate::issue_dispatch_run::WORKTREE_GIT_TIMEOUT`] exists to prevent, so
+/// that unbounded wait can re-introduce the freeze through a narrower door.
+/// Moving only the reap off the loop closes it without changing the SIGTERM →
+/// grace → SIGKILL ordering above.
+///
+/// Takes `child` by value, not `&mut`, because the whole point is to move it
+/// into the detached thread that performs the final `wait()` — a borrow
+/// cannot outlive this call. The agent Ctrl+W / respawn paths are unaffected:
+/// they keep calling [`terminate_child_with_grace_and_wait`], which this
+/// function does not touch or share an implementation with.
+pub fn terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    grace: Duration,
+    _group: &AgentProcessGroup,
+) {
+    // Phase 1: SIGTERM the process group.
+    signal_child_pgroup_or_fallback(&mut child, libc::SIGTERM, "worktree-timeout-sigterm");
+
+    // Phase 2: poll `try_wait` until the child exits or the grace elapses.
+    let deadline = std::time::Instant::now() + grace;
+    let mut child_reaped = false;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                child_reaped = true;
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 3: SIGKILL backstop, always sent to the whole group — forcing,
+    // like the synchronous-reap variant above, so an already-reaped direct
+    // child does not skip a same-group descendant it forked (fork #133). A
+    // `killpg` that reports ESRCH (group already empty) is already treated as
+    // benign by `signal_child_pgroup_or_fallback`.
+    signal_child_pgroup_or_fallback(&mut child, libc::SIGKILL, "worktree-timeout-sigkill");
+
+    // A child already reaped above has nothing left to `wait` for, and
+    // `portable_pty::Child::wait` is not guaranteed safe to call twice.
+    if child_reaped {
+        return;
+    }
+
+    // Hand the child to a short-lived detached thread for the final blocking
+    // reap. Deliberately not joined — joining would just move the same
+    // unbounded wait back onto the render loop this exists to protect. Cost
+    // is one thread per *timeout*, not per call: this code path is only
+    // reached after `WORKTREE_GIT_TIMEOUT` (30s) has already expired on a
+    // user-triggered, infrequent operation (`git worktree add`/`remove`), so
+    // even a wedged reap accumulating threads is bounded by how often a user
+    // hits that timeout, not by call volume.
+    let _ = std::thread::Builder::new()
+        .name("worktree-git-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 fn terminate_child_with_grace_and_wait_impl(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
