@@ -73,8 +73,7 @@ Interpret the output:
   and ask the user to confirm before deleting anything.
 
 **This step is destructive — always show the full list and get explicit
-confirmation first.** Never touch the default branch (`DEFAULT_BRANCH`) or the
-branch/worktree you are currently on; `.claude/skills/dot-ai-tag-release/cleanup.sh` already excludes them.
+confirmation first.** `.claude/skills/dot-ai-tag-release/cleanup.sh` already excludes: the default branch (`DEFAULT_BRANCH`); `fork-only`, which is trivially "merged" into `main` immediately after every fork/upstream sync while being the one branch that must never be deleted (`docs/develop/fork-sync-workflow.md`); the branch/worktree you are currently on; and any branch that backs an open PR on either this fork or upstream. If the script's output contains `PR_STATE_DEGRADED=true`, the open-PR guard did not run (a `gh` failure or `gh` being absent) — stop and do not delete anything until you can re-run it clean, since an open-PR branch could otherwise be offered unprotected.
 
 After confirmation, process the items **in this order**:
 
