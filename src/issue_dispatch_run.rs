@@ -884,15 +884,20 @@ const WORKTREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// escalating to SIGKILL when [`WORKTREE_GIT_TIMEOUT`] (or
 /// [`WORKTREE_CLEANUP_TIMEOUT`]) expires and the child's whole process group
 /// is torn down via
-/// [`crate::platform::proc::terminate_child_with_grace_and_wait`]. This grace
-/// is spent blocking the TUI's synchronous render/event loop — the exact
-/// thing the timeout above exists to protect — so it is kept far shorter than
-/// either timeout rather than reusing one of them. 200ms is enough for `git`
-/// and any hook it ran to notice SIGTERM and exit on the common path, while
-/// staying short enough that even the worst case (a hook that ignores
-/// SIGTERM entirely, forcing the SIGKILL backstop) resolves in a fraction of
-/// a second rather than adding a second multi-second stall on top of the
-/// timeout that already fired.
+/// [`crate::platform::proc::terminate_child_with_grace_and_wait_forcing_group_backstop`].
+/// This grace is spent blocking the TUI's synchronous render/event loop — the
+/// exact thing the timeout above exists to protect — so it is kept far
+/// shorter than either timeout rather than reusing one of them. 200ms is
+/// enough for `git` and any hook it ran to notice SIGTERM and exit on the
+/// common path, while staying short enough that even the worst case (a hook
+/// that ignores SIGTERM entirely, forcing the SIGKILL backstop) only adds
+/// 200ms on top of the timeout that already fired — **not** a hard bound on
+/// the whole escalation: both platforms' backstops end in an unbounded
+/// `wait()`/`wait4()` for the reap, so a process wedged in uninterruptible
+/// kernel I/O (e.g. a stuck NFS mount) can still delay this call's return
+/// past 200ms. That unbounded-wait property predates this fix (inherited
+/// from PR #123) and is tracked separately; it is not something the grace
+/// duration controls.
 const WORKTREE_GIT_KILL_GRACE: Duration = Duration::from_millis(200);
 
 /// How often [`run_status_sync`] polls its spawned child for exit while
@@ -989,7 +994,7 @@ fn run_status_sync(program: &str, args: &[String], timeout: Duration) -> Result<
                     // it and everything it forked.
                     let mut boxed: Box<dyn portable_pty::Child + Send + Sync> =
                         Box::new(crate::platform::proc::test_child::StdChild(child));
-                    crate::platform::proc::terminate_child_with_grace_and_wait(
+                    crate::platform::proc::terminate_child_with_grace_and_wait_forcing_group_backstop(
                         &mut boxed,
                         WORKTREE_GIT_KILL_GRACE,
                         &group,

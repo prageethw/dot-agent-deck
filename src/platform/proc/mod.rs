@@ -146,13 +146,15 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    spawn_in_new_process_group, terminate_child_with_grace_and_wait, terminate_pid,
+    spawn_in_new_process_group, terminate_child_with_grace_and_wait,
+    terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
     foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    terminate_child_with_grace_and_wait,
+    terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
 };
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the
@@ -439,6 +441,98 @@ mod tests {
                         (true, true) => "both",
                         (true, false) => "the direct child",
                         (false, true) => "the grandchild",
+                        (false, false) => unreachable!(),
+                    }
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Fork issue #133 P1 (found independently by both the reviewer and the
+    /// auditor on PR #134): `terminate_child_with_grace_and_wait` returns as
+    /// soon as `try_wait` shows the *direct* child reaped, skipping phase 3's
+    /// SIGKILL entirely — the exact orphan fork issue #133 exists to kill,
+    /// since `git` exits promptly on SIGTERM while a `post-checkout` hook can
+    /// trap or ignore it. `009` cannot see this: `sleep` dies on SIGTERM the
+    /// same as everything else in that scenario, so the direct child and its
+    /// grandchild always die together regardless of whether phase 3 ever
+    /// runs. This test constructs the shape `009` cannot: a leader that dies
+    /// promptly on SIGTERM alongside a same-group descendant that ignores it.
+    ///
+    /// Scenario: spawn `sh -c '(trap "" TERM; exec sleep 300) & exec sleep
+    /// 300'` as a process-group leader. The backgrounded subshell sets `trap
+    /// "" TERM` (SIG_IGN) for itself before tail-`exec`ing into `sleep`,
+    /// which inherits that ignored disposition across `exec` per POSIX (an
+    /// ignored signal's disposition survives exec; only a *caught* signal
+    /// resets to default) — making it SIGTERM-resistant. The outer script
+    /// never touches TERM's disposition and tail-`exec`s into its own
+    /// `sleep`, which keeps the default disposition and so dies on SIGTERM
+    /// like an ordinary cooperative process. After discovering the
+    /// backgrounded descendant through the repo's own descendant scan (same
+    /// mechanism as `009`, not inferred from the leader's exit),
+    /// `terminate_child_with_grace_and_wait_forcing_group_backstop` runs with
+    /// a 200ms grace window, and both the leader (reaped inside the grace
+    /// window) and the resistant descendant (reaped only by the forced
+    /// SIGKILL backstop) are confirmed gone afterward via a bounded
+    /// `kill(pid, 0)` poll.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/010")]
+    #[test]
+    fn worktree_010_forcing_backstop_kills_a_sigterm_resistant_descendant_after_a_cooperative_leader_exits()
+     {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "(trap \"\" TERM; exec sleep 300) & exec sleep 300"]);
+        let (child, group) = super::unix::spawn_in_new_process_group(&mut command)
+            .expect("spawn a group-leader shell child");
+        let child_pid = child.id() as libc::pid_t;
+
+        // Discover the backgrounded, SIGTERM-resistant descendant the same
+        // way `009` does: bounded polling against the repo's own descendant
+        // scan, not a bare sleep or an assumption inferred from the parent's
+        // exit.
+        let discover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let descendant_pid = loop {
+            if let Some(table) = process_table()
+                && let Some(descendant) = descendants(&table, child_pid as i32).first()
+            {
+                break descendant.pid as libc::pid_t;
+            }
+            assert!(
+                std::time::Instant::now() < discover_deadline,
+                "the backgrounded SIGTERM-resistant shell never showed up as a descendant of \
+                 pid {child_pid} within the discovery window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+
+        let mut boxed_child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(super::test_child::StdChild(child));
+        super::terminate_child_with_grace_and_wait_forcing_group_backstop(
+            &mut boxed_child,
+            std::time::Duration::from_millis(200),
+            &group,
+        );
+
+        // SAFETY: signal 0 sends nothing; it only probes whether `pid` still
+        // exists (ESRCH means it is gone).
+        let alive = |pid: libc::pid_t| -> bool { unsafe { libc::kill(pid, 0) == 0 } };
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let leader_alive = alive(child_pid);
+            let descendant_alive = alive(descendant_pid);
+            if !leader_alive && !descendant_alive {
+                break;
+            }
+            if std::time::Instant::now() >= confirm_deadline {
+                panic!(
+                    "expected the forcing backstop to reap both the cooperative leader (pid \
+                     {child_pid}) and the SIGTERM-resistant descendant (pid {descendant_pid}); \
+                     still alive: {}",
+                    match (leader_alive, descendant_alive) {
+                        (true, true) => "both",
+                        (true, false) => "the leader",
+                        (false, true) => "the descendant",
                         (false, false) => unreachable!(),
                     }
                 );

@@ -2673,6 +2673,13 @@ without depending on the config struct API.
 - **Does not assert:** a real 30s `git` hook actually exceeding the bound (deliberately not exercised — slow and flaky, same call as `007` on the previous PR); the `TimedOut` classification or cleanup path (`007`); Windows (the job-object mechanism there already reaps the whole tree via `TerminateJobObject`, unaffected by this fork-only Unix gap).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]` — the assertions read POSIX pgids/pids).
 
+##### orchestration/worktree/010 — `terminate_child_with_grace_and_wait_forcing_group_backstop` still reaps a same-group descendant that ignores SIGTERM even though the direct child (the group leader) exits promptly on SIGTERM during the grace window (fork #133 P1, found independently by the reviewer and the auditor on PR #134: the plain `terminate_child_with_grace_and_wait` returns as soon as `try_wait` shows the direct child reaped, skipping the phase-3 SIGKILL entirely — the exact orphan #133 exists to kill, since `git` exits promptly on SIGTERM while a `post-checkout` hook can trap or ignore it; `009` cannot see this because `sleep` dies on SIGTERM the same as everything else in that scenario).
+- **Layer:** L1 (pure — a real `sh -c '(trap "" TERM; exec sleep 300) & exec sleep 300'` child spawned via `spawn_in_new_process_group`, whose backgrounded descendant is discovered through the repo's own `process_table`/`descendants` scan; no daemon, no PTY, no real `git`).
+- **Agent:** none.
+- **Asserts:** with a 200ms grace window, `terminate_child_with_grace_and_wait_forcing_group_backstop` leaves both the direct child's pid (reaped inside the grace window, since it tail-`exec`s into a `sleep` with TERM's default disposition) and its discovered descendant's pid (reaped only by the forced SIGKILL backstop, since it tail-`exec`s into a `sleep` that inherited `trap "" TERM`'s SIG_IGN disposition across `exec`) absent from the process table (`kill(pid, 0)` reports `ESRCH` for both, confirmed with a bounded poll).
+- **Does not assert:** the non-forcing `terminate_child_with_grace_and_wait` (unchanged; still used by the single-pane Ctrl+W/respawn path — see its doc comment); a real 30s `git` hook (deliberately not exercised, same reasoning as `009`); Windows (`terminate_child_with_grace_and_wait_forcing_group_backstop` there is a plain passthrough to the existing Windows `terminate_child_with_grace_and_wait`, which already reaches the whole Job Object unconditionally).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the assertions read POSIX pids and rely on `trap`/`exec` signal-disposition semantics).
+
 ### Session restore
 
 #### session/restore
