@@ -17455,13 +17455,14 @@ fn render_help_overlay(
         help_key_line(&n(KbAction::FocusPane), "Focus selected pane"),
         // PRD #241: command-mode only, and it asks before it destroys anything.
         help_key_line(&n(KbAction::ClosePane), "Close selected pane (confirms)"),
-        // PRD #336: command-mode only and orchestration-tab only, so it sits
-        // here rather than under "Global" (see the note there). The description
-        // names the tab scope, and stays within the ~30 columns this field
-        // renders before it truncates mid-word.
+        // PRD #336: command-mode only, but global across any tab with a
+        // sidebar split (Dashboard included, not orchestration-tab only),
+        // so it sits here rather than under "Global" (see the note there).
+        // The description stays within the ~30 columns this field renders
+        // before it truncates mid-word.
         help_key_line(
             &n(KbAction::ToggleOrchestrationSplit),
-            "Toggle orch tab split ratio",
+            "Cycle sidebar split stage",
         ),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
