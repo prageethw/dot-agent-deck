@@ -463,6 +463,66 @@ pub fn terminate_child_with_grace_and_wait_forcing_group_backstop(
     terminate_child_with_grace_and_wait(child, grace, group);
 }
 
+/// Fork issue #136: like
+/// [`terminate_child_with_grace_and_wait_forcing_group_backstop`], except the
+/// final reap runs on a short-lived **detached** thread instead of blocking
+/// the caller. See the Unix backend's doc comment on the same function name
+/// for the render-loop-freeze this closes and why only the worktree timeout
+/// path ([`crate::issue_dispatch_run::run_status_sync`]) calls it — the same
+/// reasoning applies here: a job-object descendant stuck in blocking I/O can
+/// delay `wait()` past this call's return, and that call runs on the TUI's
+/// synchronous render/event loop.
+///
+/// Takes `child` by value, not `&mut`, so it can move into the detached
+/// thread that performs the final `wait()`. The agent Ctrl+W / respawn paths
+/// are unaffected: they keep calling
+/// [`terminate_child_with_grace_and_wait`], which this function does not
+/// touch.
+pub fn terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    grace: Duration,
+    group: &AgentProcessGroup,
+) {
+    // Phase 1: ask the agent's process group to stop.
+    best_effort_ctrl_break(child.process_id(), "worktree-timeout-ctrl-break");
+
+    // Phase 2: poll `try_wait` until the child exits or the grace elapses.
+    let deadline = std::time::Instant::now() + grace;
+    let mut child_exited = false;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                child_exited = true;
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 3: guaranteed backstop — the job, not the direct child's exit,
+    // decides whether descendants remain (see
+    // `terminate_child_with_grace_and_wait`'s doc comment for why an exited
+    // direct child still needs the job torn down).
+    if child_exited {
+        group.terminate_tree("worktree-timeout-terminate-job-after-child-exit");
+        return;
+    }
+    reap_tree_or_fallback(&mut child, group, "worktree-timeout-terminate-job");
+
+    // Hand the child to a short-lived detached thread for the final blocking
+    // reap, bounded and guaranteed-reaping — see
+    // [`super::detach_reap_or_fallback_sync`]'s doc comment for the cap
+    // (fork issue #136 finding 2) and the never-drop-the-child guarantee
+    // (finding 1) this shares with the Unix backend.
+    super::detach_reap_or_fallback_sync(
+        child,
+        "worktree-git-reap",
+        "worktree-timeout-sigkill-reap",
+    );
+}
+
 /// The daemon-wide `shutdown_all_graceful` "SIGTERM phase" for one agent: ask
 /// with `CTRL_BREAK_EVENT` and return without waiting (the caller polls every
 /// agent together, then force-kills survivors via
