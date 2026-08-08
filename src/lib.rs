@@ -48,4 +48,5 @@ pub mod terminal_widget;
 pub mod ui;
 pub mod version;
 pub mod watch;
+pub mod worktree_reclaim;
 pub mod wrap;
