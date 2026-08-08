@@ -103,30 +103,34 @@ impl Verdict {
 ///    reason even when it is deck-owned — dirty content was never part of the
 ///    PR, so "the code is already merged" does not cover it. This reason wins
 ///    over ownership: a dirty foreign worktree is reported as dirty, not as
-///    foreign, since dirty is the harder blocker (no flag can override it).
+///    foreign, since dirty is the harder blocker (no flag can override it). An
+///    *unresolvable* cleanliness probe (the check itself failed, rather than
+///    finding anything dirty) also keeps, but with a distinct reason — it
+///    must never be reported as "dirty" when nothing was actually found.
 /// 3. **Ownership last.** Only once merged-and-clean is established does
 ///    ownership decide `Remove` (ours) vs `Ask` (foreign) — cleanliness alone
 ///    proves nothing about ownership, since a freshly created, not-yet-written
 ///    worktree is clean by definition.
-pub fn decide(pr_state: &PrState, clean: bool, ownership: Ownership) -> Verdict {
+pub fn decide(pr_state: &PrState, clean: &Cleanliness, ownership: Ownership) -> Verdict {
     match pr_state {
-        PrState::Merged => {
-            if !clean {
-                Verdict::Keep(
-                    "dirty: uncommitted or untracked changes are present that were never part of the merged PR"
+        PrState::Merged => match clean {
+            Cleanliness::Dirty => Verdict::Keep(
+                "dirty: uncommitted or untracked changes are present that were never part of the merged PR"
+                    .to_string(),
+            ),
+            Cleanliness::Unresolvable(reason) => Verdict::Keep(format!(
+                "cleanliness could not be determined ({reason}) — keeping rather than guessing, \
+                 not because anything dirty was found"
+            )),
+            Cleanliness::Clean => match ownership {
+                Ownership::Ours => Verdict::Remove,
+                Ownership::Foreign => Verdict::Ask(
+                    "reclaimable: PR is merged and the tree is clean, but the deck cannot \
+                     prove it created this worktree"
                         .to_string(),
-                )
-            } else {
-                match ownership {
-                    Ownership::Ours => Verdict::Remove,
-                    Ownership::Foreign => Verdict::Ask(
-                        "reclaimable: PR is merged and the tree is clean, but the deck cannot \
-                         prove it created this worktree"
-                            .to_string(),
-                    ),
-                }
-            }
-        }
+                ),
+            },
+        },
         PrState::NoPr => Verdict::Keep("no pull request found for this branch".to_string()),
         PrState::Open => Verdict::Keep("pull request is still open".to_string()),
         PrState::ClosedUnmerged => {
@@ -233,15 +237,39 @@ fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
     Ok(all)
 }
 
-fn is_clean(worktree_path: &Path) -> bool {
+/// Outcome of probing a worktree's cleanliness. `Unresolvable` is distinct
+/// from `Dirty`: both fail closed to `Keep`, but only `Dirty` means the probe
+/// actually found uncommitted or untracked content — `Unresolvable` means the
+/// probe itself did not run to completion, so a report must never call it
+/// "dirty" (nothing was found; the check failed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleanliness {
+    Clean,
+    Dirty,
+    Unresolvable(String),
+}
+
+fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
     let out = Command::new("git")
         .current_dir(worktree_path)
         .args(["status", "--porcelain"])
         .output();
     match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        // Can't verify cleanliness — fail closed, treat as dirty.
-        _ => false,
+        Ok(o) if o.status.success() => {
+            if String::from_utf8_lossy(&o.stdout).trim().is_empty() {
+                Cleanliness::Clean
+            } else {
+                Cleanliness::Dirty
+            }
+        }
+        Ok(o) => Cleanliness::Unresolvable(format!(
+            "`git status --porcelain` exited with {}: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => {
+            Cleanliness::Unresolvable(format!("failed to spawn `git status --porcelain`: {e}"))
+        }
     }
 }
 
@@ -390,11 +418,18 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 /// Examine every linked worktree of the repo rooted at `repo_dir`: resolve PR
 /// state, cleanliness, and ownership for each, and decide its verdict. Pure
 /// I/O orchestration; [`decide`] is the tested pure core.
+///
+/// PR state is resolved against each candidate's OWN path (`wt.path`), never
+/// `repo_dir` (the caller's cwd): a linked worktree can carry its own
+/// `remote.origin.url` via `extensions.worktreeConfig`, and resolving against
+/// the wrong repo risks matching an unrelated same-named branch's PR — see
+/// [`derive_repo_slug`].
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
     let raw = list_linked_worktrees(repo_dir)?;
     let mut reports = Vec::with_capacity(raw.len());
     for wt in raw {
-        let clean = is_clean(&wt.path);
+        let cleanliness = check_cleanliness(&wt.path);
+        let clean = cleanliness == Cleanliness::Clean;
         let owned = ownership_of(&wt.path) == Ownership::Ours;
         let ownership = if owned {
             Ownership::Ours
@@ -402,10 +437,10 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             Ownership::Foreign
         };
         let pr_state = match &wt.branch {
-            Some(branch) => resolve_pr_state(repo_dir, branch),
+            Some(branch) => resolve_pr_state(&wt.path, branch),
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
         };
-        let verdict = decide(&pr_state, clean, ownership);
+        let verdict = decide(&pr_state, &cleanliness, ownership);
         reports.push(WorktreeReport {
             path: wt.path.to_string_lossy().to_string(),
             branch: wt.branch,
@@ -564,22 +599,34 @@ mod tests {
 
     #[test]
     fn decide_merged_clean_owned_removes() {
-        let v = decide(&PrState::Merged, true, Ownership::Ours);
+        let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Ours);
         assert_eq!(v, Verdict::Remove);
     }
 
     #[test]
     fn decide_merged_clean_foreign_asks() {
-        let v = decide(&PrState::Merged, true, Ownership::Foreign);
+        let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Foreign);
         assert!(matches!(v, Verdict::Ask(_)));
     }
 
     #[test]
     fn decide_merged_dirty_keeps_regardless_of_ownership() {
-        let owned = decide(&PrState::Merged, false, Ownership::Ours);
-        let foreign = decide(&PrState::Merged, false, Ownership::Foreign);
+        let owned = decide(&PrState::Merged, &Cleanliness::Dirty, Ownership::Ours);
+        let foreign = decide(&PrState::Merged, &Cleanliness::Dirty, Ownership::Foreign);
         assert!(matches!(owned, Verdict::Keep(ref r) if r.contains("dirty")));
         assert!(matches!(foreign, Verdict::Keep(ref r) if r.contains("dirty")));
+    }
+
+    #[test]
+    fn decide_merged_unresolvable_cleanliness_keeps_without_calling_it_dirty() {
+        let v = decide(
+            &PrState::Merged,
+            &Cleanliness::Unresolvable("spawn failed".to_string()),
+            Ownership::Ours,
+        );
+        assert!(
+            matches!(v, Verdict::Keep(ref r) if !r.contains("dirty") && r.contains("spawn failed"))
+        );
     }
 
     #[test]
@@ -587,18 +634,22 @@ mod tests {
         // The destructive false-positive this PRD exists to prevent: an
         // ancestor branch with no PR must never be removed, even clean and
         // owned.
-        let v = decide(&PrState::NoPr, true, Ownership::Ours);
+        let v = decide(&PrState::NoPr, &Cleanliness::Clean, Ownership::Ours);
         assert!(matches!(v, Verdict::Keep(_)));
     }
 
     #[test]
     fn decide_open_and_closed_unmerged_keep() {
         assert!(matches!(
-            decide(&PrState::Open, true, Ownership::Ours),
+            decide(&PrState::Open, &Cleanliness::Clean, Ownership::Ours),
             Verdict::Keep(_)
         ));
         assert!(matches!(
-            decide(&PrState::ClosedUnmerged, true, Ownership::Ours),
+            decide(
+                &PrState::ClosedUnmerged,
+                &Cleanliness::Clean,
+                Ownership::Ours
+            ),
             Verdict::Keep(_)
         ));
     }
@@ -607,7 +658,7 @@ mod tests {
     fn decide_unresolvable_keeps_never_removes() {
         let v = decide(
             &PrState::Unresolvable("gh not found".to_string()),
-            true,
+            &Cleanliness::Clean,
             Ownership::Ours,
         );
         assert!(matches!(v, Verdict::Keep(_)));
