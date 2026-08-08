@@ -2317,6 +2317,21 @@ without depending on the config struct API.
 - **Does not assert:** anything on Linux, where `setsockopt` has no shutdown rule and the re-arm simply succeeds — this test passes before and after the fix there, and only bites on macOS (issue #642 is the macOS-only evidence it was written from); which of `read_reply_line`'s callers reach this state; the partial-line-then-close case (`error/socket/006` owns the EOF boundary); the `Unreachable` classification of a `set_timeouts` failure in `request_from_socket_at_detailed`'s prelude, which is unchanged.
 - **Platform coverage:** mac+linux (Unix-domain socket) — asserted on both, meaningful on macOS.
 
+##### error/socket/009 — `request_from_socket` abandons a reply line that exceeds the maximum length, instead of buffering it until the total-operation deadline expires (fork issue #101 item 2, left open by #120).
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`–`006`).
+- **Agent:** none (a `std::thread` stub daemon that reads the request line, writes a bounded 4 MiB of non-newline bytes as fast as it can, then holds the connection open and silent past the deadline).
+- **Asserts:** two things together — the outcome is `SocketReply::NoReply` (an over-long line folds into the same "no seed" bucket as any other non-answer, per fork issue #89's contract, rather than becoming a new error path), **and** the call returns in under 2500ms. The timing assertion is what carries the RED signal: the outcome is `NoReply` with or without a cap, so only the elapsed time distinguishes "the cap fired" (milliseconds, once the buffer crosses the limit) from "only the 5s deadline stopped it" (the uncapped behavior #120 shipped). The peer's 4 MiB is deliberately bounded so the RED run has a fixed allocation ceiling — an open-ended flood would exercise the unbounded growth under test by allocating without limit inside CI.
+- **Does not assert:** the exact cap value (only that one exists and fires well before the deadline); the daemon-side ingestion bound (upstream #319, the other half of this problem); that memory is actually released; Windows named-pipe semantics.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/010 — A large but legitimate reply line (256 KiB seed) is returned whole, so the cap added for `error/socket/009` cannot silently truncate a real seed.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`–`009`).
+- **Agent:** none (a `std::thread` stub daemon that replies with one well-formed line carrying a 256 KiB seed).
+- **Asserts:** `request_from_socket_at` returns `SocketReply::Line` whose length equals the sent line's exactly. 256 KiB is far above the 64 KiB `MAX_FIRST_PROMPT_BYTES` the daemon clamps stored prompts to, so this pins real headroom rather than a value that merely happens to fit. This is the control fork issue #101 explicitly asks for: "a cap that is too tight would silently truncate a legitimate prompt, which is worse than the DoS it prevents". Passes both before and after the fix — a correctness control, not a timing measurement.
+- **Harness note:** the stub holds the connection open until the client signals it has finished reading, and propagates its write result rather than swallowing it. This reply is the only one in the file larger than the socket buffer; closing with unread data pending resets the peer and discards it on macOS (Linux leaves it readable), which failed this test on macOS for a harness reason unrelated to truncation.
+- **Does not assert:** the cap value; any seed larger than 256 KiB; that the daemon would ever actually produce a seed this large.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.

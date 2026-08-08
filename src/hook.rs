@@ -551,6 +551,33 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// wedged/adversarial) daemon is not mistaken for an absent one.
 const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Maximum length of a single reply line [`read_reply_line`] will buffer
+/// before abandoning the exchange (fork issue #101, item 2).
+///
+/// The total-operation deadline added alongside it bounds how *long* a peer
+/// can keep the buffer growing, not how *large* it can get — a peer that
+/// floods rather than dribbles allocates freely for the whole deadline. This
+/// is the size half of the same bound.
+///
+/// **Why 1 MiB.** The only thing this reply legitimately carries is a seed,
+/// which is a prompt, and the daemon already clamps stored prompts to
+/// `MAX_FIRST_PROMPT_BYTES` (64 KiB) in `daemon_client.rs`. 1 MiB is 16×
+/// that, so no reply the daemon can actually produce comes close — the cap
+/// cannot silently truncate a legitimate seed, which fork issue #101 flags
+/// as worse than the denial of service it prevents (`error/socket/008`
+/// pins that headroom at 256 KiB). It also matches `SCROLLBACK_CAP_BYTES`
+/// and sits well under the framed protocol's `MAX_FRAME_LEN` of 16 MiB, so
+/// it introduces no new order of magnitude to reason about.
+///
+/// Busting it folds into `SocketReply::NoReply` — the same "no seed" bucket
+/// as every other non-answer, per fork issue #89's contract — rather than
+/// becoming a distinct error path callers would have to learn.
+///
+/// Note this bounds the **client** side only. Upstream #319 is the
+/// daemon-side half (hook ingestion has no line-length or connection bound);
+/// it should be decided consistently with this number.
+const MAX_REPLY_LINE_BYTES: usize = 1024 * 1024;
+
 /// PRD #201: send a line to the daemon hook socket and read ONE line of reply
 /// back on the same connection. Used by the read-only `get-seed` verb, the one
 /// hook-socket message that expects a response (the delegate / work-done /
@@ -574,14 +601,15 @@ const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// elapsed wall-clock time against it and shrinks each individual blocking
 /// read's own timeout to whatever is left, so a peer that keeps dribbling a
 /// byte at a time without ever completing the reply line can no longer keep
-/// the read alive indefinitely — a per-read/per-write idle timeout alone
-/// resets on every byte moved and therefore never fires against a peer that
-/// never goes idle for a whole read. This pass does not add a reply-size cap
-/// — a peer can still
-/// grow the in-progress `String` for up to the deadline before the read is
-/// abandoned, which is a materially smaller exposure than the previous
-/// unbounded one but is intentionally left for a follow-up with its own
-/// size-cap justification.
+/// the read alive indefinitely (fork issue #101 — previously only a
+/// per-read/per-write idle timeout was applied, which resets on every byte
+/// moved and therefore never fires against a peer that never goes idle for a
+/// whole read). The reply is **also** bounded in size, by
+/// [`MAX_REPLY_LINE_BYTES`]: the deadline alone bounds how *long* the buffer
+/// can grow, not how *large* it can get, so a peer that floods rather than
+/// dribbles could still allocate freely for the whole deadline. Both halves
+/// of fork issue #101 are therefore closed, and a reply that busts either
+/// bound folds into the same "no seed" outcome as any other non-answer.
 pub fn request_from_socket(json: &str) -> Option<String> {
     match request_from_socket_inner(json, Some(GET_SEED_REQUEST_TIMEOUT)) {
         SocketReply::Line(line) => Some(line),
@@ -920,11 +948,18 @@ fn read_reply_line(
             }
             break;
         }
-        if let Some(newline_pos) = buf[..n].iter().position(|&b| b == b'\n') {
-            line.extend_from_slice(&buf[..newline_pos]);
+        let newline_pos = buf[..n].iter().position(|&b| b == b'\n');
+        let end = newline_pos.unwrap_or(n);
+        // Checked BEFORE extending, and on the newline branch too: a chunk
+        // that completes the line can itself be the one that busts the cap,
+        // and growing past the bound to discover that would defeat it.
+        if line.len().saturating_add(end) > MAX_REPLY_LINE_BYTES {
+            return None;
+        }
+        line.extend_from_slice(&buf[..end]);
+        if newline_pos.is_some() {
             break;
         }
-        line.extend_from_slice(&buf[..n]);
     }
     match String::from_utf8(line) {
         Ok(line) => Ok(line.trim_end_matches('\r').to_string()),
@@ -1698,6 +1733,168 @@ mod tests {
              macOS refusing `setsockopt` on a fully shut-down socket, which says nothing \
              about whether there is a reply waiting, and there is one."
         );
+    }
+
+    /// Scenario: A stub daemon accepts the connection, floods a fixed 4 MiB
+    /// of non-newline bytes as fast as it can, then goes silent without ever
+    /// sending the newline that would complete the line. `request_from_socket`
+    /// must give up as soon as the reply exceeds the maximum line length,
+    /// rather than buffering everything the peer sent and only unblocking
+    /// when the total-operation deadline expires. Fork issue #101 item 2:
+    /// #120's deadline bounds how *long* the buffer can grow, not how *large*
+    /// it can get.
+    ///
+    /// The discriminator is timing, because the returned value is `NoReply`
+    /// either way: uncapped, the call cannot return until the 5s deadline
+    /// elapses; capped, it returns as soon as the cap is crossed, which over
+    /// a local socket is milliseconds. The peer deliberately sends a bounded
+    /// 4 MiB and then stops — an unbounded flood would make the RED run
+    /// allocate without limit in CI, which is the very defect under test.
+    #[spec("error/socket/009")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_009_oversized_reply_line_is_abandoned_at_the_cap() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Bounded on purpose: comfortably above any sane cap, but a fixed
+        // allocation ceiling for the RED run rather than an open-ended flood.
+        const FLOOD_BYTES: usize = 4 * 1024 * 1024;
+
+        let daemon_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut sent = 0usize;
+                while sent < FLOOD_BYTES {
+                    if std::io::Write::write_all(&mut stream, &chunk).is_err() {
+                        // The reader hanging up mid-flood is the PASS path:
+                        // it means the cap fired and closed the socket.
+                        break;
+                    }
+                    sent += chunk.len();
+                }
+                let _ = std::io::Write::flush(&mut stream);
+                // Hold the connection open, silent, past the deadline so the
+                // uncapped implementation has nothing to unblock it early.
+                std::thread::sleep(std::time::Duration::from_secs(8));
+                drop(stream);
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = socket_path.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let reply = request_from_socket_at(
+                &probe_path,
+                r#"{"type":"get-seed"}"#,
+                Some(GET_SEED_REQUEST_TIMEOUT),
+            );
+            let _ = tx.send((started.elapsed(), reply));
+        });
+
+        // Sits between "the cap fired" (milliseconds) and "only the 5s
+        // deadline stopped it". Wide on both sides so runner contention
+        // cannot flip it — the flake class fork issue #81 tracks.
+        const CAP_CEILING: std::time::Duration = std::time::Duration::from_millis(2500);
+
+        let (elapsed, reply) = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the worker thread running request_from_socket_at sent no result");
+
+        let _ = daemon_thread.join();
+
+        assert!(
+            matches!(reply, SocketReply::NoReply),
+            "an over-long reply line must fold into the same \"no seed\" bucket as any other \
+             non-answer (fork issue #89's contract), not a new error path — got {reply:?}"
+        );
+        assert!(
+            elapsed < CAP_CEILING,
+            "request_from_socket_at took {elapsed:?} against a peer that sent {FLOOD_BYTES} \
+             bytes with no newline — that is the 5s total-operation deadline stopping it, not a \
+             maximum reply-line length. Without a length cap the buffer keeps growing for the \
+             whole deadline, which is the half of fork issue #101 that PR #120 left open"
+        );
+    }
+
+    /// Scenario: A stub daemon replies with a single well-formed line whose
+    /// seed is 256 KiB — far larger than the 64 KiB the daemon clamps stored
+    /// prompts to (`MAX_FIRST_PROMPT_BYTES`), but a legitimate reply all the
+    /// same. `request_from_socket` must return it whole and unmodified. This
+    /// is the control for `error/socket/009`: fork issue #101 warns that a
+    /// cap set too tight would silently truncate a real seed, which is worse
+    /// than the denial of service it prevents. Expected to pass before and
+    /// after the fix.
+    #[spec("error/socket/010")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_010_large_but_legitimate_reply_is_not_truncated() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        let seed = "s".repeat(256 * 1024);
+        let expected = format!(r#"{{"seed":"{seed}"}}"#);
+        let to_send = expected.clone();
+
+        // The client signals here once it has finished reading, so the stub
+        // does not close while bytes are still in flight. This reply is the
+        // only one in this file larger than the socket buffer, and on macOS
+        // closing a Unix socket with unread data pending resets the peer and
+        // discards it (Linux leaves it readable) — which failed this test on
+        // macOS for a harness reason that had nothing to do with truncation.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let daemon_thread = std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line)?;
+            // Propagated, not swallowed: a write that fails here would
+            // otherwise surface as an unexplained `NoReply` and make this
+            // test red for a reason it hides.
+            std::io::Write::write_all(&mut stream, to_send.as_bytes())?;
+            std::io::Write::write_all(&mut stream, b"\n")?;
+            std::io::Write::flush(&mut stream)?;
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
+        });
+
+        let result = request_from_socket_at(
+            &socket_path,
+            r#"{"type":"get-seed"}"#,
+            Some(GET_SEED_REQUEST_TIMEOUT),
+        );
+        let _ = done_tx.send(());
+
+        let stub_outcome = daemon_thread.join().expect("stub daemon thread panicked");
+        assert!(
+            stub_outcome.is_ok(),
+            "the stub daemon failed to write the 256 KiB reply ({stub_outcome:?}); the assertion \
+             below would otherwise report this as truncation by the cap"
+        );
+
+        match result {
+            SocketReply::Line(line) => assert_eq!(
+                line.len(),
+                expected.len(),
+                "a 256 KiB reply is well within what a legitimate seed can be; a maximum \
+                 reply-line length must leave real headroom above the 64 KiB prompt clamp \
+                 rather than truncating (fork issue #101)"
+            ),
+            other => panic!(
+                "a single well-formed 256 KiB reply line must come back as SocketReply::Line, \
+                 got {other:?}"
+            ),
+        }
     }
 
     #[test]
