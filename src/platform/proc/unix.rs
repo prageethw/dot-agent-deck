@@ -291,18 +291,15 @@ pub fn terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
     }
 
     // Hand the child to a short-lived detached thread for the final blocking
-    // reap. Deliberately not joined — joining would just move the same
-    // unbounded wait back onto the render loop this exists to protect. Cost
-    // is one thread per *timeout*, not per call: this code path is only
-    // reached after `WORKTREE_GIT_TIMEOUT` (30s) has already expired on a
-    // user-triggered, infrequent operation (`git worktree add`/`remove`), so
-    // even a wedged reap accumulating threads is bounded by how often a user
-    // hits that timeout, not by call volume.
-    let _ = std::thread::Builder::new()
-        .name("worktree-git-reap".into())
-        .spawn(move || {
-            let _ = child.wait();
-        });
+    // reap, bounded and guaranteed-reaping — see
+    // [`super::detach_reap_or_fallback_sync`]'s doc comment for the cap
+    // (fork issue #136 finding 2) and the never-drop-the-child guarantee
+    // (finding 1) this shares with the Windows backend.
+    super::detach_reap_or_fallback_sync(
+        child,
+        "worktree-git-reap",
+        "worktree-timeout-sigkill-reap",
+    );
 }
 
 fn terminate_child_with_grace_and_wait_impl(

@@ -495,14 +495,15 @@ pub fn terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
     reap_tree_or_fallback(&mut child, group, "worktree-timeout-terminate-job");
 
     // Hand the child to a short-lived detached thread for the final blocking
-    // reap rather than blocking here — see the Unix backend's doc comment for
-    // the per-timeout (not per-call) cost justification, which applies
-    // identically on this platform.
-    let _ = std::thread::Builder::new()
-        .name("worktree-git-reap".into())
-        .spawn(move || {
-            let _ = child.wait();
-        });
+    // reap, bounded and guaranteed-reaping — see
+    // [`super::detach_reap_or_fallback_sync`]'s doc comment for the cap
+    // (fork issue #136 finding 2) and the never-drop-the-child guarantee
+    // (finding 1) this shares with the Unix backend.
+    super::detach_reap_or_fallback_sync(
+        child,
+        "worktree-git-reap",
+        "worktree-timeout-sigkill-reap",
+    );
 }
 
 /// The daemon-wide `shutdown_all_graceful` "SIGTERM phase" for one agent: ask
