@@ -2265,9 +2265,9 @@ mod tests {
     /// the next-lowest still-waiting pane. A second orchestration tab then
     /// proves a background tab's newly-waiting pane has zero effect and
     /// never flips the active tab.
-    #[spec("tabs/orchestration/011")]
+    #[spec("tabs/orchestration/013")]
     #[test]
-    fn orchestration_011_auto_focus_follows_lowest_order_waiting_pane() {
+    fn orchestration_013_auto_focus_follows_lowest_order_waiting_pane() {
         use crate::state::SessionStatus;
 
         let pc = Arc::new(MockPaneController::new());
@@ -2465,7 +2465,7 @@ mod tests {
         ));
 
         // `beta` becomes WaitingForInput: `auto_focus_waiting_pane` steals
-        // focus to it exactly as `orchestration_010` pins — unchanged by
+        // focus to it exactly as `orchestration_013` pins — unchanged by
         // this PRD.
         status.insert(beta.as_str(), SessionStatus::WaitingForInput);
         assert_eq!(frame(&mut tm, &status).as_deref(), Some(beta.as_str()));
@@ -2791,7 +2791,7 @@ mod tests {
         status.insert(beta.as_str(), SessionStatus::Idle);
 
         // Locked start: `beta` goes WaitingForInput and steals focus,
-        // exactly as `orchestration_010` pins.
+        // exactly as `orchestration_013` pins.
         status.insert(beta.as_str(), SessionStatus::WaitingForInput);
         assert_eq!(
             frame(&mut tm, &status, true).as_deref(),
@@ -2879,7 +2879,7 @@ mod tests {
 
         // Re-locking resumes normal pinning: a NEW waiting episode steers
         // focus and its resolution snaps focus back to the orchestrator,
-        // exactly as `orchestration_010`/`012` pin for the always-locked
+        // exactly as `orchestration_013`/`012` pin for the always-locked
         // case.
         status.insert(alpha.as_str(), SessionStatus::WaitingForInput);
         assert_eq!(
@@ -2901,7 +2901,7 @@ mod tests {
     /// tab's waiting-episode edge state. Two Orchestration tabs (`A`, `B`):
     /// `A`'s `alpha` role goes `WaitingForInput` while `A` is active and
     /// locked, latching `A`'s `had_waiting_pane = true` and stealing focus
-    /// onto `alpha`, exactly as `orchestration_010` pins. The user then
+    /// onto `alpha`, exactly as `orchestration_013` pins. The user then
     /// switches to `B` and unlocks — the deck-global toggle's
     /// latch-clearing call fires with `B`, not `A`, active. While unlocked,
     /// `A`'s worker resolves unobserved (the chain never runs against a
@@ -2956,7 +2956,7 @@ mod tests {
 
         // 1. Tab A is active and locked; `alpha` goes WaitingForInput,
         // latching `had_waiting_pane = true` on A and stealing focus, as
-        // `orchestration_010` pins.
+        // `orchestration_013` pins.
         assert!(tm.switch_to(idx_a));
         status.insert(alpha_a.as_str(), SessionStatus::WaitingForInput);
         assert_eq!(
@@ -3016,7 +3016,7 @@ mod tests {
     /// (higher role order) is already focused and `WaitingForInput` — the
     /// human is mid-answer, so a keystroke is still queued for it. `alpha`
     /// (LOWER role order) then also goes `WaitingForInput`, which would
-    /// normally steal focus per `orchestration_010`'s lowest-order rule. On
+    /// normally steal focus per `orchestration_013`'s lowest-order rule. On
     /// the frame where `input_pending` is true, that steal must be
     /// DEFERRED, not applied, so the queued keystroke still lands on
     /// `beta` rather than being misrouted to `alpha`. Once `input_pending`
@@ -3063,7 +3063,7 @@ mod tests {
 
         // `beta` (higher role order) goes WaitingForInput and steals focus
         // -- no input pending yet, so the move applies immediately, exactly
-        // as `orchestration_010` pins.
+        // as `orchestration_013` pins.
         status.insert(beta.as_str(), SessionStatus::WaitingForInput);
         assert_eq!(
             frame(&mut tm, &status, false).as_deref(),
@@ -3077,7 +3077,7 @@ mod tests {
         // The human is mid-answer to `beta` -- a keystroke is queued. On
         // THIS frame, `alpha` (LOWER role order than `beta`) ALSO goes
         // WaitingForInput, which would normally steal focus per
-        // `orchestration_010`'s lowest-order rule. Because input is
+        // `orchestration_013`'s lowest-order rule. Because input is
         // pending, the steal must be DEFERRED: focus stays on `beta` so the
         // queued keystroke is not misrouted to `alpha`.
         status.insert(alpha.as_str(), SessionStatus::WaitingForInput);

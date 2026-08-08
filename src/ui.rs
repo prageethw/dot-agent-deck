@@ -23609,7 +23609,7 @@ mod tests {
     /// via `pane.focus_pane`, then read the live focus back off the SAME pane
     /// controller exactly as the render loop does before calling
     /// `compute_frame_layout` — instead of asserting on `TabManager`'s internal
-    /// field the way `tabs/orchestration/010` does. Feed that focus through
+    /// field the way `tabs/orchestration/013` does. Feed that focus through
     /// `compute_frame_layout` + `render_frame` into a real `TestBackend`
     /// terminal and assert on the OBSERVABLE render-layout outcome: under
     /// `PaneLayout::Stacked` the auto-focused `orchestrator` role reclaims the
