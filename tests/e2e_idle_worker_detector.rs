@@ -18,6 +18,33 @@ use dot_agent_deck::daemon_protocol::TabMembership;
 use dot_agent_deck::event::{DaemonMessage, DelegateSignal};
 use spec::spec;
 
+/// Observation budget for `idle_worker_011`'s two grid waits, deliberately
+/// held at the **pre-PR-#82 value of 20s** rather than following
+/// `common::OBSERVATION_BUDGET` (30s).
+///
+/// Fork issue #81's last open item is characterising this test: is it runner
+/// starvation, or a real defect somewhere in the hook-ingestion → role-lookup
+/// → timer → daemon-delivery → render pipeline? That question can only be
+/// answered from a failure captured *with a diagnostic attached*, and the two
+/// changes landed in the wrong order — PR #82 widened these waits 20s → 30s
+/// (against the issue's own review, which said not to widen before
+/// instrumenting), and PR #116 added [`idle_timeout_diagnostics`] only
+/// afterwards. The result was a detector aimed at a signal that had already
+/// been turned down, leaving the item open on evidence that may never arrive.
+///
+/// Narrowing back restores the original failure rate now that the diagnostic
+/// exists on both timeout paths. This is cheap to run as an experiment
+/// because the `e2e` job is `continue-on-error: true`, so a recurrence is
+/// non-blocking noise rather than a merge gate.
+///
+/// **Resolving this constant is the point, not keeping it.** If a run fires
+/// with a diagnostic dump, fix what it names and delete this in favour of
+/// `OBSERVATION_BUDGET`. If a stretch of runs stays green, that is evidence
+/// too — 20s was never the problem — and it should go the same way. It is
+/// scoped to this one test on purpose: `OBSERVATION_BUDGET` is shared by 134
+/// sites and none of them are under investigation.
+const IDLE_DETECTION_BUDGET: Duration = Duration::from_secs(20);
+
 const REAL_ORCHESTRATION_NAME: &str = "idle-worker-real";
 const REAL_ORCHESTRATOR_MODEL: &str = "claude-haiku-4-5-20251001";
 const REAL_WORKER_ROLE: &str = "worker";
@@ -268,17 +295,13 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         .expect("inject Delegate over hook socket");
 
     assert!(
-        wait_for_wrapped_grid_string(&deck, IDLE_DAEMON_CLAUSE, common::OBSERVATION_BUDGET),
+        wait_for_wrapped_grid_string(&deck, IDLE_DAEMON_CLAUSE, IDLE_DETECTION_BUDGET),
         "the daemon-authored idle prompt never became visible in the attached orchestration \
          pane\n{}",
         idle_timeout_diagnostics(&deck, IDLE_DAEMON_CLAUSE)
     );
     assert!(
-        wait_for_wrapped_grid_string(
-            &deck,
-            &idle_role_label("worker"),
-            common::OBSERVATION_BUDGET
-        ),
+        wait_for_wrapped_grid_string(&deck, &idle_role_label("worker"), IDLE_DETECTION_BUDGET),
         "the idle prompt did not carry the silent role inside its untrusted-role-label \
          markers\n{}",
         idle_timeout_diagnostics(&deck, &idle_role_label("worker"))
