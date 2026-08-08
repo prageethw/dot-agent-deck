@@ -36,7 +36,7 @@ expression: buf
    │  1-9                jump to pane n                                                                  │    
    │  enter              focus selected pane             j / down        select next                     │    
    │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
-   │  ctrl+l             toggle orch tab split ratio     l / right / enter   enter directory             │    
+   │  ctrl+l             cycle sidebar split stage       l / right / enter   enter directory             │    
    │  /                  filter sessions                 h / left / bksp     go up one level             │    
    │  esc                clear filter                    space           confirm current directory       │    
    │  r                  rename session                  /               filter (case-insensitive)       │    
