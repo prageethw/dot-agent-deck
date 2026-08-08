@@ -307,6 +307,7 @@ fn gh_stub_script(dir: &Path) -> String {
 
 struct CleanupOutput {
     stdout: String,
+    stderr: String,
 }
 
 impl CleanupOutput {
@@ -379,9 +380,27 @@ fn run_cleanup(cwd: &Path, gh_stub_dir: &Path) -> CleanupOutput {
         .output()
         .unwrap_or_else(|e| panic!("spawn {script:?}: {e}"));
 
-    CleanupOutput {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // A sanity check independent of whatever a given test is pinning: every
+    // successful run prints this header before anything else. Its absence
+    // means the script crashed (or was killed) before producing any of the
+    // sections a test would otherwise read as "empty", which would let an
+    // assertion of the form `!contains(...)` pass while proving nothing —
+    // exactly the "RED for the wrong reason" trap docs/develop/red-confirmation.md
+    // warns about. Fail loudly here, with the exit status and stderr, instead
+    // of letting that happen silently downstream.
+    assert!(
+        stdout.contains("DEFAULT_BRANCH="),
+        "cleanup.sh did not print its DEFAULT_BRANCH= header — it crashed or \
+         was killed before producing any output, in a way unrelated to \
+         whatever this test is asserting. cwd: {cwd:?}, status: {:?}\nstdout: \
+         {stdout}\nstderr: {stderr}",
+        out.status.code(),
+    );
+
+    CleanupOutput { stdout, stderr }
 }
 
 /// Scenario: build the synthetic repo, run `cleanup.sh` from the
@@ -400,15 +419,17 @@ fn release_cleanup_001_worktrees_exclude_root_checkout_and_fork_only() {
         "WORKTREES: must never offer the root checkout (branch `main`) for \
          removal — fork issue #140 (D1): the worktree loop guards only \
          against the CURRENT worktree, and `main` is trivially an ancestor \
-         of itself. Full stdout:\n{}",
-        out.stdout
+         of itself. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
     assert!(
         !branches.contains(&"fork-only".to_string()),
         "WORKTREES: must never offer the `fork-only` worktree for removal — \
          fork issue #140 (D2): `fork-only` is a trivial ancestor of \
-         `origin/main` and is excluded nowhere. Full stdout:\n{}",
-        out.stdout
+         `origin/main` and is excluded nowhere. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
 }
 
@@ -427,8 +448,9 @@ fn release_cleanup_002_worktrees_still_offer_a_genuinely_merged_feature() {
         branches.contains(&"feat/merged".to_string()),
         "WORKTREES: a genuinely merged feature worktree (`feat/merged`) must \
          still be offered — the long-lived guard is meant to exclude only \
-         `main` and `fork-only`, not every worktree. Full stdout:\n{}",
-        out.stdout
+         `main` and `fork-only`, not every worktree. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
 }
 
@@ -444,14 +466,16 @@ fn release_cleanup_003_local_and_remote_branches_exclude_fork_only() {
     assert!(
         !out.local_branches().contains(&"fork-only".to_string()),
         "LOCAL_BRANCHES: must exclude `fork-only` — fork issue #140 (D2). \
-         Full stdout:\n{}",
-        out.stdout
+         Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
     assert!(
         !out.remote_branches().contains(&"fork-only".to_string()),
         "REMOTE_BRANCHES: must exclude `fork-only` — fork issue #140 (D2). \
-         Full stdout:\n{}",
-        out.stdout
+         Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
 }
 
@@ -476,8 +500,9 @@ fn release_cleanup_004_local_branch_excluded_when_fork_reports_open_pr() {
          it is ancestor-merged. This requires the open-PR query to be pinned \
          with `--repo {FORK_SLUG}` (fork issue #140, D3) — today's script \
          passes no `--repo` at all, so this guard is a no-op against the \
-         fork's own open PRs. Full stdout:\n{}",
-        out.stdout
+         fork's own open PRs. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
 }
 
@@ -501,8 +526,9 @@ fn release_cleanup_005_local_branch_excluded_when_upstream_reports_open_pr() {
          name matches local branch `feat/merged` must still exclude it. This \
          requires a SECOND, explicit query pinned to `--repo {UPSTREAM_SLUG}` \
          (fork issue #140, D3) — today's script has only the one, unpinned \
-         query. Full stdout:\n{}",
-        out.stdout
+         query. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
 }
 
@@ -524,7 +550,8 @@ fn release_cleanup_006_degraded_marker_when_gh_fails() {
          so a degraded PR-state run is distinguishable from a clean one — \
          today every `gh` call is swallowed by `|| true` (fork issue #140, \
          D3; the same 'empty gate looks like a passed gate' class as \
-         CLAUDE.md rule 8 / issue #146). Full stdout:\n{}",
-        out.stdout
+         CLAUDE.md rule 8 / issue #146). Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
     );
 }
