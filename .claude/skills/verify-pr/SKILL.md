@@ -194,7 +194,7 @@ Fails at the merge-base too → not this PR's defect. Say so — but read the ne
 git -C ../dot-agent-deck-pr-<n>-base reset --hard origin/main
 ```
 
-Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 14). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
+Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 18). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
 
 **Flakes.** The e2e tier is flaky-tolerant by design — which is why rule 5 keeps lane 1 advisory rather than required, and why lane 2 is not a gate anywhere — and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
 

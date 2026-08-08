@@ -34,6 +34,8 @@ Add a keybinding action, default `Ctrl+l` (remappable via the existing `keybindi
 
 ## Technical Approach
 
+> **Superseded by PRD #371 / #387.** The `TabManager::orchestration_split_narrow: bool` field and `TabManager::toggle_orchestration_split()` method this section describes were replaced by a three-stage `SplitStage`/`scope_split_stage` mechanism and no longer exist in the tree. This section is left as-written below as the historical record of the design at the time; it is not the current source of truth.
+
 `ORCHESTRATION_LEFT_PERCENT` / `ORCHESTRATION_PANES_PERCENT` remain as the default-state values. A resolver, `orchestration_split_percents(narrow) -> (u16, u16)`, returns `(25, 75)` or `(34, 66)` and is the single source of truth every call site goes through.
 
 **The split is global, and `TabManager` owns it.** Sidebar width is a reading preference, not a property of which orchestration happens to be open. Per-tab state meant every newly opened tab reset to 34/66, so anyone who prefers the narrow sidebar re-toggled forever; the genuinely per-task case ("I want this diff wide *right now*") is #313's zoom, not this toggle. The single source of truth is therefore `TabManager::orchestration_split_narrow: bool`, flipped by `TabManager::toggle_orchestration_split()`. `dispatch_action` calls that and lets the next frame reflow, exactly as `ToggleLayout` does — no resize is pushed from the handler. The handler still guards on the active tab being an orchestration tab, so the chord remains inert everywhere else.
