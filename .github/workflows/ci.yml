@@ -115,7 +115,16 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      # `--all-targets --features e2e`, NOT a bare `cargo clippy` (fork #117).
+      # Every `tests/e2e_*.rs` opens with `#![cfg(feature = "e2e")]`, so without
+      # the feature those 64 files compile to nothing and clippy reports a
+      # vacuous zero over them. `--all-targets` adds the test/bench/example
+      # targets a default `cargo clippy` (lib + bins only) never lints.
+      # This is a strict superset of the bare invocation: `e2e = []` enables no
+      # dependency features and no `src/**` file reads `feature = "e2e"`, so
+      # turning it on cannot change how the lib and bins compile. One command
+      # therefore covers both, and no separate default-feature run is needed.
+      - run: cargo clippy --all-targets --features e2e -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
@@ -229,9 +238,16 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
       - run: cargo build
-      # Match the Linux `build` job's clippy invocation (no --all-targets) so a
-      # test-only lint can't fail Windows-only and be unreproducible on the
-      # Linux pre-push gate (PRD #42 review S1).
+      # Deliberately NARROWER than the Linux `build` job: no --all-targets, no
+      # --features e2e, so this job lints lib + bins only. PRD #42 review S1's
+      # concern is a test-only lint failing Windows-only and being
+      # unreproducible on the Linux pre-push gate. Fork #117 widened the Linux
+      # job to cover test targets, which resolves that concern for any lint
+      # reproducible on Linux -- but a lint inside a Windows-only `cfg` block
+      # in a test file still would not be, so this job stays narrow rather
+      # than matching. Test targets are linted on Linux; Windows compiles and
+      # runs them (`cargo build` / `cargo nextest run` below) but does not lint
+      # them.
       - run: cargo clippy -- -D warnings
       # test-fast tier only (CLAUDE.md #5): protocol/state + L1 render tests.
       # No `e2e` feature (needs real agents + LLM APIs) and no linkage-check /
@@ -265,9 +281,11 @@ jobs:
         with:
           tool: cargo-nextest@0.9.140
       - run: cargo build
-      # Match the Linux `build` job's clippy invocation (no --all-targets) so a
-      # test-only lint can't fail macOS-only and be unreproducible on the Linux
-      # pre-push gate.
+      # Deliberately NARROWER than the Linux `build` job, for the same reason
+      # as build-windows above: lib + bins only, so a macOS-only test lint
+      # can't fail here while being unreproducible on the Linux pre-push gate.
+      # Fork #117 widened the Linux job to lint test targets (including the
+      # e2e-gated files); this job intentionally did not follow.
       - run: cargo clippy -- -D warnings
       - run: cargo nextest run
 
@@ -290,7 +308,7 @@ jobs:
   # other. `auto` is deliberately not used: it is broad, slower, and phones home
   # telemetry. These packs are scoped to where CE's coverage actually pays off on
   # this repo -- the GitHub Actions workflows themselves and secrets -- since
-  # `cargo clippy -- -D warnings` (CLAUDE.md rule 2) already covers most of what
+  # `cargo clippy --all-targets --features e2e -- -D warnings` (rule 2) covers most of what
   # CE's thin Rust ruleset would add. `p/bash` was tried and dropped: it 404s --
   # the current Semgrep registry has no general bash/shell ruleset pack, only an
   # unrelated `reverse-shells` pack that happens to tag `bash` as a language.
