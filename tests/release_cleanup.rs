@@ -298,6 +298,155 @@ fn build_fixture() -> RepoFixture {
     }
 }
 
+/// Identical to [`build_fixture`] in every respect, EXCEPT a second remote,
+/// `upstream`, is configured with a GitHub-shaped URL for `{UPSTREAM_SLUG}` —
+/// same technique [`build_fixture_unparseable_upstream`] uses to give
+/// `upstream` a real, present value distinct from simply being unconfigured.
+/// The script only ever reads `upstream`'s URL via `git config --get
+/// remote.upstream.url` (never `git fetch`s it — see [`init_repo`]'s doc
+/// comment on why `insteadOf` rewriting matters for `origin` but is
+/// irrelevant here), so a plain configured URL with no backing bare repo is
+/// enough to stay hermetic. Exists so test 005 can exercise a genuine
+/// open-PR-on-upstream query instead of relying on `upstream_slug`'s old
+/// hardcoded fallback (fork issue #140 D3 / round 2 target 2).
+///
+/// Deliberately NOT folded into [`build_fixture`] itself: test 009 depends on
+/// the default fixture having no `upstream` remote at all, to pin "missing
+/// upstream does not degrade" (target behaviour 3).
+fn build_fixture_with_upstream() -> RepoFixture {
+    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let (origin_git_dir, clone_dir) = init_repo(
+        root.path(),
+        Some(&format!("https://github.com/{FORK_SLUG}.git")),
+    );
+    run_git(
+        &clone_dir,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            &format!("https://github.com/{UPSTREAM_SLUG}.git"),
+        ],
+    );
+
+    let fork_only_worktree = root.path().join("wt-fork-only");
+    let feat_merged_worktree = root.path().join("wt-feat-merged");
+    let feat_merged_2_worktree = root.path().join("wt-feat-merged-2");
+    let scratch_unmerged_worktree = root.path().join("wt-feat-unmerged-scratch");
+
+    // `fork-only` branches straight off `main`'s tip with no commits of its
+    // own, so it is trivially an ancestor of `origin/main` — mirroring the
+    // real branch immediately after a fork/upstream sync resets `main` onto
+    // it (D2).
+    run_git(&clone_dir, &["branch", "fork-only", "main"]);
+    run_git(&clone_dir, &["push", "origin", "fork-only"]);
+
+    // `feat/merged`: a real feature branch, fast-forward merged into `main`.
+    let feat_merged_wt_str = feat_merged_worktree
+        .to_str()
+        .expect("feat/merged worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/merged",
+            feat_merged_wt_str,
+            "main",
+        ],
+    );
+    std::fs::write(feat_merged_worktree.join("feature.txt"), "merged\n")
+        .expect("write feature file");
+    run_git(&feat_merged_worktree, &["add", "feature.txt"]);
+    run_git(
+        &feat_merged_worktree,
+        &["commit", "-m", "feat: merged work"],
+    );
+    run_git(&clone_dir, &["merge", "--ff-only", "feat/merged"]);
+    run_git(&clone_dir, &["push", "origin", "main"]);
+    run_git(&clone_dir, &["push", "origin", "feat/merged"]);
+    let feat_merged_sha = run_git(&clone_dir, &["rev-parse", "feat/merged"])
+        .trim()
+        .to_string();
+
+    // `feat/merged-2`: a SECOND genuinely merged feature branch, on its own
+    // worktree that stays alive for the fixture's lifetime — gives both
+    // `WORKTREES:` and `LOCAL_BRANCHES:` a genuine positive entry (mirrors
+    // `build_fixture`'s own rationale above).
+    let feat_merged_2_wt_str = feat_merged_2_worktree
+        .to_str()
+        .expect("feat/merged-2 worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/merged-2",
+            feat_merged_2_wt_str,
+            "main",
+        ],
+    );
+    std::fs::write(feat_merged_2_worktree.join("feature2.txt"), "merged2\n")
+        .expect("write second feature file");
+    run_git(&feat_merged_2_worktree, &["add", "feature2.txt"]);
+    run_git(
+        &feat_merged_2_worktree,
+        &["commit", "-m", "feat: second merged work"],
+    );
+    run_git(&clone_dir, &["merge", "--ff-only", "feat/merged-2"]);
+    run_git(&clone_dir, &["push", "origin", "main"]);
+    run_git(&clone_dir, &["push", "origin", "feat/merged-2"]);
+
+    // `feat/unmerged`: diverges from `main` and is never merged back — proves
+    // the fix does not turn into "exclude everything".
+    let scratch_wt_str = scratch_unmerged_worktree
+        .to_str()
+        .expect("feat/unmerged scratch worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/unmerged",
+            scratch_wt_str,
+            "main",
+        ],
+    );
+    std::fs::write(scratch_unmerged_worktree.join("wip.txt"), "wip\n").expect("write wip file");
+    run_git(&scratch_unmerged_worktree, &["add", "wip.txt"]);
+    run_git(
+        &scratch_unmerged_worktree,
+        &["commit", "-m", "wip: not merged"],
+    );
+    run_git(&clone_dir, &["push", "origin", "feat/unmerged"]);
+    let feat_unmerged_sha = run_git(&clone_dir, &["rev-parse", "feat/unmerged"])
+        .trim()
+        .to_string();
+    run_git(&clone_dir, &["worktree", "remove", scratch_wt_str]);
+
+    let fork_only_wt_str = fork_only_worktree
+        .to_str()
+        .expect("fork-only worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &["worktree", "add", fork_only_wt_str, "fork-only"],
+    );
+
+    run_git(&clone_dir, &["fetch", "--prune", "--quiet", "origin"]);
+
+    RepoFixture {
+        _root: root,
+        origin_git_dir,
+        fork_only_worktree,
+        feat_merged_worktree,
+        feat_unmerged_sha,
+        feat_merged_sha,
+    }
+}
+
 /// A fixture where the ROOT (administrative) checkout itself sits on a
 /// merged feature branch, `feat/root-merged`, rather than `main` — the exact
 /// condition target behaviour 1 (fork issue #140, the reviewer's headline
@@ -828,17 +977,18 @@ fn release_cleanup_004_local_branch_excluded_when_fork_reports_open_pr() {
     );
 }
 
-/// Scenario: a stub `gh` reports an open PR on UPSTREAM
-/// (`--repo vfarcic/dot-agent-deck`) whose head name matches local branch
-/// `feat/merged`. Confirms it is still excluded from `LOCAL_BRANCHES:` — the
-/// deliberate, explicit version of the protection D3 says today's script
-/// gets only by accident — AND that the query carried `--repo
-/// {UPSTREAM_SLUG}` specifically (fork issue #140 reviewer F3/F4 / T1/T2).
-/// Expected to fail as "not implemented yet": this pins the SECOND upstream
-/// query the coder needs to add, which does not exist in the script today.
+/// Scenario: a fixture with a real `upstream` remote (unlike the default
+/// [`build_fixture`], which has none) and a stub `gh` reports an open PR on
+/// UPSTREAM (`--repo vfarcic/dot-agent-deck`) whose head name matches local
+/// branch `feat/merged`. Confirms it is still excluded from
+/// `LOCAL_BRANCHES:` — the deliberate, explicit version of the protection D3
+/// says today's script gets only by accident — AND that the query carried
+/// `--repo {UPSTREAM_SLUG}` specifically, proving genuine derivation from the
+/// configured `upstream` remote rather than the old hardcoded-fallback
+/// coincidence (fork issue #140 reviewer F3/F4 / T1/T2).
 #[test]
 fn release_cleanup_005_local_branch_excluded_when_upstream_reports_open_pr() {
-    let fixture = build_fixture();
+    let fixture = build_fixture_with_upstream();
     let gh = GhStub::new();
     gh.set_open_upstream(&["feat/merged"]);
     let out = run_cleanup(&fixture.fork_only_worktree, gh.path());
