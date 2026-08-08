@@ -477,6 +477,33 @@ fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
 /// wedged/adversarial) daemon is not mistaken for an absent one.
 const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Maximum length of a single reply line [`read_reply_line`] will buffer
+/// before abandoning the exchange (fork issue #101, item 2).
+///
+/// The total-operation deadline added alongside it bounds how *long* a peer
+/// can keep the buffer growing, not how *large* it can get — a peer that
+/// floods rather than dribbles allocates freely for the whole deadline. This
+/// is the size half of the same bound.
+///
+/// **Why 1 MiB.** The only thing this reply legitimately carries is a seed,
+/// which is a prompt, and the daemon already clamps stored prompts to
+/// `MAX_FIRST_PROMPT_BYTES` (64 KiB) in `daemon_client.rs`. 1 MiB is 16×
+/// that, so no reply the daemon can actually produce comes close — the cap
+/// cannot silently truncate a legitimate seed, which fork issue #101 flags
+/// as worse than the denial of service it prevents (`error/socket/008`
+/// pins that headroom at 256 KiB). It also matches `SCROLLBACK_CAP_BYTES`
+/// and sits well under the framed protocol's `MAX_FRAME_LEN` of 16 MiB, so
+/// it introduces no new order of magnitude to reason about.
+///
+/// Busting it folds into `SocketReply::NoReply` — the same "no seed" bucket
+/// as every other non-answer, per fork issue #89's contract — rather than
+/// becoming a distinct error path callers would have to learn.
+///
+/// Note this bounds the **client** side only. Upstream #319 is the
+/// daemon-side half (hook ingestion has no line-length or connection bound);
+/// it should be decided consistently with this number.
+const MAX_REPLY_LINE_BYTES: usize = 1024 * 1024;
+
 /// PRD #201: send a line to the daemon hook socket and read ONE line of reply
 /// back on the same connection. Used by the read-only `get-seed` verb, the one
 /// hook-socket message that expects a response (the delegate / work-done /
@@ -500,11 +527,12 @@ const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// the read alive indefinitely (fork issue #101 — previously only a
 /// per-read/per-write idle timeout was applied, which resets on every byte
 /// moved and therefore never fires against a peer that never goes idle for a
-/// whole read). This pass does not add a reply-size cap — a peer can still
-/// grow the in-progress `String` for up to the deadline before the read is
-/// abandoned, which is a materially smaller exposure than the previous
-/// unbounded one but is intentionally left for a follow-up with its own
-/// size-cap justification.
+/// whole read). The reply is **also** bounded in size, by
+/// [`MAX_REPLY_LINE_BYTES`]: the deadline alone bounds how *long* the buffer
+/// can grow, not how *large* it can get, so a peer that floods rather than
+/// dribbles could still allocate freely for the whole deadline. Both halves
+/// of fork issue #101 are therefore closed, and a reply that busts either
+/// bound folds into the same "no seed" outcome as any other non-answer.
 pub fn request_from_socket(json: &str) -> Option<String> {
     match request_from_socket_inner(json, Some(GET_SEED_REQUEST_TIMEOUT)) {
         SocketReply::Line(line) => Some(line),
@@ -659,6 +687,9 @@ fn read_reply_line(
             stream.set_timeouts(remaining).ok()?;
         }
         let n = stream.read(&mut buf).ok()?;
+        // Applied unconditionally, not only when a `deadline` is set: the cap
+        // is a memory bound, and a caller that opts out of the time bound has
+        // not opted out of that.
         if n == 0 {
             // EOF with nothing received at all: the daemon closed without
             // answering — exactly the "old daemon that doesn't know this
@@ -675,11 +706,18 @@ fn read_reply_line(
             }
             break;
         }
-        if let Some(newline_pos) = buf[..n].iter().position(|&b| b == b'\n') {
-            line.extend_from_slice(&buf[..newline_pos]);
+        let newline_pos = buf[..n].iter().position(|&b| b == b'\n');
+        let end = newline_pos.unwrap_or(n);
+        // Checked BEFORE extending, and on the newline branch too: a chunk
+        // that completes the line can itself be the one that busts the cap,
+        // and growing past the bound to discover that would defeat it.
+        if line.len().saturating_add(end) > MAX_REPLY_LINE_BYTES {
+            return None;
+        }
+        line.extend_from_slice(&buf[..end]);
+        if newline_pos.is_some() {
             break;
         }
-        line.extend_from_slice(&buf[..n]);
     }
     String::from_utf8(line)
         .ok()
