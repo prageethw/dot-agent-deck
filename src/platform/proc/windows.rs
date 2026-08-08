@@ -395,14 +395,19 @@ pub fn force_kill_child_group(
 ///
 /// One deliberate structural difference from Unix, and the reason phase 3 is not
 /// simply skipped when the child exits inside the grace window (PRD #163 review):
-/// **the Job Object, not the direct child, decides when teardown is done.** On
-/// Unix an exited child means the process group is addressable but usually empty,
-/// and `killpg(SIGKILL)` on a group whose leader is gone is the same "reach the
-/// survivors" call phase 3 makes here — so returning early is harmless there. On
-/// Windows the direct child exiting says *nothing* about its job: a ConPTY child
-/// that spawns a tool process and exits (a shell wrapper, a launcher, `cmd /c`)
-/// leaves that tool process running *inside the job*, and nothing else will ever
-/// reap it. So an exited child still gets a `TerminateJobObject`.
+/// **the Job Object, not the direct child, decides when teardown is done.**
+/// Unix's non-forcing `terminate_child_with_grace_and_wait` *does* skip phase 3
+/// on an exited direct child, on the assumption that an exited leader means the
+/// group is already empty — fork issue #133 found that assumption false
+/// whenever a same-group descendant (a hook the leader forked) outlives a
+/// leader that exits promptly on SIGTERM, which is why the Unix backend now
+/// also has a forcing variant
+/// (`terminate_child_with_grace_and_wait_forcing_group_backstop`) that never
+/// skips it. Here on Windows there is no non-forcing variant at all: the direct
+/// child exiting says *nothing* about its job, since a ConPTY child that spawns
+/// a tool process and exits (a shell wrapper, a launcher, `cmd /c`) leaves that
+/// tool process running *inside the job*, and nothing else will ever reap it.
+/// So an exited child still gets a `TerminateJobObject` unconditionally.
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
@@ -439,6 +444,23 @@ pub fn terminate_child_with_grace_and_wait(
     }
     reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
     let _ = child.wait();
+}
+
+/// Fork issue #133: the Unix backend needs a distinct entry point whose phase 3
+/// backstop always reaches the whole process group even when the direct child
+/// already exited (`unix::terminate_child_with_grace_and_wait_forcing_group_backstop`),
+/// because Unix's plain [`terminate_child_with_grace_and_wait`] skips it in
+/// that case. [`terminate_child_with_grace_and_wait`] above already has that
+/// "always reach the group" property unconditionally — see its doc comment —
+/// so this is a plain passthrough, kept only so the worktree timeout path
+/// ([`crate::issue_dispatch_run::run_status_sync`]) can call the same
+/// function name on both platforms.
+pub fn terminate_child_with_grace_and_wait_forcing_group_backstop(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    grace: Duration,
+    group: &AgentProcessGroup,
+) {
+    terminate_child_with_grace_and_wait(child, grace, group);
 }
 
 /// The daemon-wide `shutdown_all_graceful` "SIGTERM phase" for one agent: ask
