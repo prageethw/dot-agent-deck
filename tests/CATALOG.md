@@ -1908,7 +1908,7 @@ without depending on the config struct API.
 - **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; a synthetic stub daemon over a real temp Unix socket, no PTY, no daemon binary, no real agent).
 - **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then sleeps well past the bound without replying or closing).
 - **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at 15s (comfortably above the production 5s bound the fix adds), returns before the 15s bound and the returned value is exactly `None` — a timed-out/unbounded daemon must fold into the same "no seed" bucket as a daemon that closes without replying, not a distinct outcome. A `RecvTimeoutError::Timeout` is treated as the RED failure (`request_from_socket` is unbounded) and fails the test with an explicit panic message rather than hanging until nextest's own timeout.
-- **Does not assert:** the exact timeout duration chosen by the fix (only that it is comfortably under 15s); `SocketReply`/`request_from_socket_with_deadline` (the `delegate` path, already covered elsewhere); real daemon behavior; Windows named-pipe timeout semantics.
+- **Does not assert:** the exact timeout duration chosen by the fix (only that it is comfortably under 15s); `SocketReply`'s three-way outcome (only `request_from_socket`'s two-way `None` collapse is exercised here — the richer outcome exists for a not-yet-submitted caller); real daemon behavior; Windows named-pipe timeout semantics.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
 ##### error/socket/004 — `request_from_socket` still returns the reply from a daemon that is merely slow, not absent — a bound that fires too eagerly must not be mistaken for "no seed".
@@ -1922,7 +1922,7 @@ without depending on the config struct API.
 - **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`).
 - **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then writes a single non-newline byte every 200ms for 20s without ever sending a newline).
 - **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at a 15s ceiling — comfortably above whatever operation-level deadline the fix adds, and comfortably inside the 20s the drip keeps running — returns before the ceiling. A `RecvTimeoutError::Timeout` is the RED failure (the per-read timeout keeps getting reset and never fires) and fails the test with an explicit panic rather than hanging until nextest's own timeout. Deliberately does not pin the exact deadline value so it keeps passing once any sane operation-level bound exists.
-- **Does not assert:** the exact operation-level deadline chosen by the fix; the reply-length cap (a separate, deliberately out-of-scope follow-up); `request_from_socket_with_deadline` directly — it shares the identical vulnerable `request_from_socket_inner` code path with only a different timeout value, so this test at the shared choke point covers both callers.
+- **Does not assert:** the exact operation-level deadline chosen by the fix; the reply-length cap (a separate, deliberately out-of-scope follow-up); any other caller of the shared, vulnerable `request_from_socket_inner` code path with a different timeout value — this test exercises the choke point itself, so any future caller inherits the same coverage.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
 #### error/config
