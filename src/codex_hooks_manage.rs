@@ -230,49 +230,6 @@ fn validate_structure(root: &Value) -> io::Result<()> {
     Ok(())
 }
 
-/// Atomically publish `bytes` to `dest` by writing a temp file in the SAME
-/// directory (so `rename(2)` stays on one filesystem and is atomic) and renaming
-/// over `dest`. A crash mid-write leaves either the old file or the temp file
-/// intact — never a truncated `dest` (finding #1/M-2).
-///
-/// The temp name is derived from `dest`'s file name (`.<name>.tmp.<pid>`) so the
-/// same publish discipline covers both `hooks.json` and — for scoped trust
-/// (§4.1.2) — the user's `config.toml`, without two files racing on one temp path.
-fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    let name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("hooks.json");
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        // Publish with the destination's OWN mode, or owner-only when the file
-        // is new. `File::create` would otherwise apply `0666 & !umask` — 0644
-        // under a typical 022 umask — and the rename below would silently widen
-        // a config the user (or Codex itself) had kept private. This publishes
-        // both `hooks.json` and, via `edit_trust_state`, the user's real
-        // `config.toml`, so widening it leaks whatever the user keeps there to
-        // every local account.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(dest)
-                .map(|meta| meta.permissions().mode() & 0o777)
-                .unwrap_or(0o600);
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
 /// Testable core: merge the deck's hooks into `<codex_home>/hooks.json`, writing
 /// the file atomically (creating the home dir if needed). `binary_path` is the
 /// absolute `dot-agent-deck` path the hook command should invoke.
@@ -1105,49 +1062,4 @@ mod tests {
         );
     }
 
-    /// The atomic publish must never widen the destination's permissions.
-    /// `write_atomic` publishes both `hooks.json` and, via `edit_trust_state`,
-    /// the user's real `config.toml`, so a `File::create` default of 0644
-    /// (under a typical 022 umask) would widen a file the user (or Codex
-    /// itself) had kept restrictive the first time the deck wrote through it —
-    /// `rename(2)` replaces the destination inode, so the old mode does not
-    /// contain the new one.
-    #[cfg(unix)]
-    #[test]
-    fn write_atomic_keeps_an_existing_destinations_restrictive_mode() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dest = dir.path().join("hooks.json");
-        std::fs::write(&dest, b"{}").unwrap();
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        write_atomic(dir.path(), &dest, b"{\"hooks\":{}}").expect("write_atomic");
-
-        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "rename must not widen a destination the user kept restrictive"
-        );
-    }
-
-    /// A destination that does not exist yet gets created owner-only (0600),
-    /// not the umask-dependent `0666 & !umask` `File::create` would otherwise
-    /// apply.
-    #[cfg(unix)]
-    #[test]
-    fn write_atomic_creates_a_new_destination_owner_only() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dest = dir.path().join("hooks.json");
-
-        write_atomic(dir.path(), &dest, b"{\"hooks\":{}}").expect("write_atomic");
-
-        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "a newly-created destination must be owner-only, not umask-dependent"
-        );
-    }
 }
