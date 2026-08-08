@@ -516,6 +516,7 @@ pub fn request_from_socket(json: &str) -> Option<String> {
 /// [`request_from_socket`]'s `Option<String>` because the `delegate` CLI
 /// (unlike `get-seed`) needs to tell "never even reached the daemon" apart
 /// from "reached it, but got no confirmation back" to report each honestly.
+#[derive(Debug)]
 pub enum SocketReply {
     /// Connected, wrote the request, and read a reply line (possibly empty).
     Line(String),
@@ -588,10 +589,10 @@ fn request_from_socket_at(
     // tell it we are done while still wanting its reply. Stopping at the newline
     // is EOF-independent and returns the identical value on Unix (the daemon
     // writes exactly one JSON line). An absent/older daemon that never answers
-    // still terminates: it either closes (EOF → empty line) or hits the
-    // total-operation deadline below (when `timeout` is set), and both fold into
-    // `SocketReply::NoReply` here / the caller's documented "no seed" →
-    // PTY-injection fallback for `get-seed`.
+    // still terminates: it either closes without writing a byte (EOF) or hits
+    // the total-operation deadline below (when `timeout` is set), and both
+    // fold into `SocketReply::NoReply` here / the caller's documented "no
+    // seed" → PTY-injection fallback for `get-seed`.
     match read_reply_line(&mut stream, timeout) {
         Some(line) => SocketReply::Line(line),
         None => SocketReply::NoReply,
@@ -611,10 +612,13 @@ fn request_from_socket_at(
 /// against `timeout` (the caller's overall budget) and re-arms the socket's
 /// per-read timeout to whatever is left before each individual read, so the
 /// *operation as a whole* — regardless of how the peer paces its bytes —
-/// cannot exceed `timeout`. Once the deadline has passed, or any read fails,
-/// or the line is not valid UTF-8, this returns `None`; the caller folds that
-/// into `SocketReply::NoReply` exactly as it already did for a timed-out read
-/// or a clean EOF (fork issue #89's contract — see [`request_from_socket`]).
+/// cannot exceed `timeout`. Once the deadline has passed, any read fails, the
+/// peer closes before sending a single byte, or the line is not valid UTF-8,
+/// this returns `None`; the caller folds that into `SocketReply::NoReply`
+/// exactly as it already did for a timed-out read (fork issue #89's contract
+/// — see [`request_from_socket`]). A peer that closes *after* writing part of
+/// a line, but before the newline, is a distinct case: the partial line is
+/// still returned as `Some(partial)`, not folded into `None`.
 ///
 /// When `timeout` is `None` this falls back to unbounded blocking reads with
 /// no re-arming, identical to the pre-#101 behavior for callers that pass no
@@ -633,8 +637,19 @@ fn read_reply_line(
         }
         let n = stream.read(&mut buf).ok()?;
         if n == 0 {
-            // EOF: the daemon closed without finishing a line (or without
-            // answering at all) — same "no reply" outcome as a deadline.
+            // EOF with nothing received at all: the daemon closed without
+            // answering — exactly the "old daemon that doesn't know this
+            // request type" case `SocketReply::NoReply`'s own doc comment
+            // already names, so this must fold into `None`/`NoReply`, not
+            // `Some(String::new())`/`Line("")` (an empty `Line` is meant to
+            // mean the daemon explicitly sent a blank reply line, which
+            // this is not). A *partial*, unterminated line — the daemon
+            // wrote some bytes then closed before the newline — is left as
+            // `Line(partial)` unchanged: that is a distinct scenario this
+            // fix does not touch.
+            if line.is_empty() {
+                return None;
+            }
             break;
         }
         if let Some(newline_pos) = buf[..n].iter().position(|&b| b == b'\n') {
@@ -1079,6 +1094,51 @@ mod tests {
                  sending a result"
             ),
         }
+    }
+
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, then closes immediately without writing a single byte back —
+    /// simulating an old daemon that doesn't understand the request type at
+    /// all. Greptile flagged (upstream PR #419) that `read_reply_line` folded
+    /// this into `Some(String::new())` — `SocketReply::Line("")` — even
+    /// though `SocketReply::NoReply`'s own doc comment already names exactly
+    /// this scenario ("the daemon closed without answering") as a `NoReply`
+    /// case. Asserts the fixed behavior: `request_from_socket_at` returns
+    /// `SocketReply::NoReply`, not `SocketReply::Line(String::new())`.
+    #[spec("error/socket/006")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_006_silent_close_returns_no_reply_not_empty_line() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Stub daemon: read the one request line, then close without
+        // writing anything back at all.
+        let daemon_thread = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                drop(stream);
+            }
+        });
+
+        let result = request_from_socket_at(
+            &socket_path,
+            r#"{"type":"get-seed"}"#,
+            Some(GET_SEED_REQUEST_TIMEOUT),
+        );
+
+        let _ = daemon_thread.join();
+
+        assert!(
+            matches!(result, SocketReply::NoReply),
+            "a daemon that closes without writing any bytes must fold into \
+             SocketReply::NoReply, matching its own doc comment's \"daemon closed without \
+             answering\" case, not SocketReply::Line(\"\") — got {result:?}"
+        );
     }
 
     #[test]

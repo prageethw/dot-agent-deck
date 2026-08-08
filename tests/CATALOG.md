@@ -2133,6 +2133,13 @@ without depending on the config struct API.
 - **Does not assert:** the exact operation-level deadline chosen by the fix; the reply-length cap (a separate, deliberately out-of-scope follow-up); `request_from_socket_with_deadline` directly — it shares the identical vulnerable `request_from_socket_inner` code path with only a different timeout value, so this test at the shared choke point covers both callers.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### error/socket/006 — A daemon that closes without writing any bytes back folds into `SocketReply::NoReply`, not `SocketReply::Line("")` (Greptile finding on upstream PR #419, against code already merged here via #106/#110).
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`/`005`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then closes without writing a single byte).
+- **Asserts:** `request_from_socket_at` returns `SocketReply::NoReply`. Before the fix, an EOF with an empty in-progress buffer returned `Some(String::new())` (`SocketReply::Line("")`), contradicting `SocketReply::NoReply`'s own doc comment, which already names "the daemon closed without answering" as a `NoReply` case.
+- **Does not assert:** the *partial*-line-then-EOF case (some bytes written, then closed before the newline) — that is deliberately left returning `Line(partial)`, unchanged by this fix; `SocketReply::Unreachable`; timing.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.
