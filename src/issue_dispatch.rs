@@ -178,6 +178,55 @@ pub fn pr_list_for_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Worktree creation argv (fork #122) — shared by the async issue-dispatch
+// creator (`issue_dispatch_run::create_worktree`) and the sync TUI creator
+// (`issue_dispatch_run::create_worktree_sync`, fork #122's orchestration-tab
+// `SpawnPane` path) so the two never drift on WHAT to run, only on how the
+// process gets spawned (tokio vs std).
+// ---------------------------------------------------------------------------
+
+/// Argv for `git rev-parse --verify --quiet refs/heads/<branch>` — probes
+/// whether `branch` already exists in `clone_dir`, so the caller can choose
+/// between attaching an existing branch and creating one with `-b` before
+/// `git worktree add`.
+pub fn worktree_branch_probe_argv(clone_dir: &Path, branch: &str) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        clone_dir.to_string_lossy().into_owned(),
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "--quiet".to_string(),
+        format!("refs/heads/{branch}"),
+    ]
+}
+
+/// Argv for `git worktree add`: attaches `branch` when `branch_exists`,
+/// otherwise creates it with `-b`. A branch left behind by an earlier run
+/// whose worktree was removed (but branch preserved) must be attached, not
+/// re-created — `git worktree add -b` on an existing branch name fails.
+pub fn worktree_add_argv(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    branch_exists: bool,
+) -> Vec<String> {
+    let mut argv = vec![
+        "-C".to_string(),
+        clone_dir.to_string_lossy().into_owned(),
+        "worktree".to_string(),
+        "add".to_string(),
+        worktree_dir.to_string_lossy().into_owned(),
+    ];
+    if branch_exists {
+        argv.push(branch.to_string());
+    } else {
+        argv.push("-b".to_string());
+        argv.push(branch.to_string());
+    }
+    argv
+}
+
+// ---------------------------------------------------------------------------
 // M1 — validate the user-config GitHub knobs that flow into `gh`/`git` argv
 // ---------------------------------------------------------------------------
 

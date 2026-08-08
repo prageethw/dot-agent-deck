@@ -576,69 +576,46 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
     Ok(!arr.is_empty())
 }
 
-/// Outcome of [`create_worktree`]: either we created the per-issue worktree, or
-/// a concurrent fire had already claimed it (the benign TOCTOU race below),
-/// which the caller surfaces as a skip rather than a failure.
+/// Outcome of [`create_worktree`] / [`create_worktree_sync`]: either we
+/// created the worktree, or a concurrent creator had already claimed it (the
+/// benign TOCTOU race below). The async caller (issue-dispatch) surfaces
+/// `AlreadyClaimed` as a skip; the sync caller (fork #122's orchestration-tab
+/// `SpawnPane` path) surfaces it as a fail-loud refusal — there is no
+/// "concurrent fire" concept for a single interactively-opened tab, so an
+/// already-claimed path there means something else already occupies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeCreation {
+pub(crate) enum WorktreeCreation {
     Created,
     AlreadyClaimed,
 }
 
-/// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
-/// parent is created first so the add never trips on a missing dir.
-///
-/// B1: `git worktree remove` PRESERVES the branch, so an issue that was
-/// dispatched, had its tab closed without a PR, and is still open leaves
-/// `agent/issue-<n>` behind. A naive `worktree add -b <branch>` would then fail
-/// ("a branch named … already exists") on EVERY later fire, permanently wedging
-/// the reuse-the-vacated-slot model. So probe for the branch first: attach the
-/// existing branch (no `-b`) when it is already there, and only create it (`-b`)
-/// when it is not.
-///
-/// TOCTOU: the caller only reaches here after [`dispatch_decision`] saw the
-/// worktree dir ABSENT, but a concurrent fire of the same task can create it in
-/// the window before this `worktree add` runs — the add then fails on the now-
-/// present path. Because we only arrive with the dir believed absent, its
-/// presence after a failed add means a concurrent claim, not our error: report
-/// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
-/// genuine add failure (bad ref, permissions, …) leaves the dir absent and
-/// still propagates as `Err`.
-async fn create_worktree(
-    clone_dir: &Path,
-    worktree_dir: &Path,
-    branch: &str,
-) -> Result<WorktreeCreation, String> {
+/// Ensure the worktree's parent directory exists before `git worktree add`
+/// runs, so the add never trips on a missing dir. Shared by
+/// [`create_worktree`] and [`create_worktree_sync`] — plain `std::fs`, so it
+/// needs no async/sync split.
+fn ensure_worktree_parent_dir(worktree_dir: &Path) -> Result<(), String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
     }
-    let clone = clone_dir.to_string_lossy();
-    let wt = worktree_dir.to_string_lossy();
-    let branch_ref = format!("refs/heads/{branch}");
-    let branch_exists = run_status(
-        "git",
-        &[
-            "-C",
-            &clone,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &branch_ref,
-        ],
-    )
-    .await
-    .is_ok();
-    let add = if branch_exists {
-        run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
-    } else {
-        run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
-    };
-    match add {
+    Ok(())
+}
+
+/// TOCTOU classification shared by [`create_worktree`] and
+/// [`create_worktree_sync`]: the caller only reaches here after seeing the
+/// worktree dir ABSENT, but a concurrent creator can win the race in the
+/// window before `git worktree add` runs — the add then fails on the now-
+/// present path. Because we only arrive with the dir believed absent, its
+/// presence after a failed add means a concurrent claim, not our error:
+/// report [`WorktreeCreation::AlreadyClaimed`] instead of a hard failure. A
+/// genuine add failure (bad ref, permissions, …) leaves the dir absent and
+/// still propagates as `Err`.
+fn classify_worktree_add_result(
+    worktree_dir: &Path,
+    add_result: Result<(), String>,
+) -> Result<WorktreeCreation, String> {
+    match add_result {
         Ok(()) => Ok(WorktreeCreation::Created),
-        // Concurrent claim (TOCTOU): the dir is present now though we arrived
-        // believing it absent — treat as already-claimed. A real failure leaves
-        // the dir absent and surfaces as the original error.
         Err(e) => {
             if worktree_dir.exists() {
                 Ok(WorktreeCreation::AlreadyClaimed)
@@ -647,6 +624,66 @@ async fn create_worktree(
             }
         }
     }
+}
+
+/// M2.2: create the per-issue worktree on `agent/issue-<n>`.
+///
+/// B1: `git worktree remove` PRESERVES the branch, so an issue that was
+/// dispatched, had its tab closed without a PR, and is still open leaves
+/// `agent/issue-<n>` behind. A naive `worktree add -b <branch>` would then fail
+/// ("a branch named … already exists") on EVERY later fire, permanently wedging
+/// the reuse-the-vacated-slot model. So probe for the branch first: attach the
+/// existing branch (no `-b`) when it is already there, and only create it (`-b`)
+/// when it is not. See [`crate::issue_dispatch::worktree_branch_probe_argv`] /
+/// [`crate::issue_dispatch::worktree_add_argv`], shared with
+/// [`create_worktree_sync`] so the two argv shapes cannot drift.
+async fn create_worktree(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+) -> Result<WorktreeCreation, String> {
+    ensure_worktree_parent_dir(worktree_dir)?;
+    let branch_exists = run_status_args(
+        "git",
+        &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
+    )
+    .await
+    .is_ok();
+    let add = run_status_args(
+        "git",
+        &crate::issue_dispatch::worktree_add_argv(clone_dir, worktree_dir, branch, branch_exists),
+    )
+    .await;
+    classify_worktree_add_result(worktree_dir, add)
+}
+
+/// Sync twin of [`create_worktree`] for the TUI's synchronous `SpawnPane`
+/// dispatch (fork #122): `dispatch_action` is not `async` and this runs on
+/// the hot input path, so it cannot `.await` the tokio-based creator. Shares
+/// every decision with the async path — argv construction
+/// ([`crate::issue_dispatch::worktree_branch_probe_argv`] /
+/// [`crate::issue_dispatch::worktree_add_argv`]), the parent-dir creation
+/// ([`ensure_worktree_parent_dir`]), and the TOCTOU classification
+/// ([`classify_worktree_add_result`]) — so the two implementations cannot
+/// drift on WHAT to run or how to interpret the result; only the actual
+/// process spawn (blocking `std::process::Command` here, `tokio::process`
+/// there) differs.
+pub(crate) fn create_worktree_sync(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+) -> Result<WorktreeCreation, String> {
+    ensure_worktree_parent_dir(worktree_dir)?;
+    let branch_exists = run_status_sync(
+        "git",
+        &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
+    )
+    .is_ok();
+    let add = run_status_sync(
+        "git",
+        &crate::issue_dispatch::worktree_add_argv(clone_dir, worktree_dir, branch, branch_exists),
+    );
+    classify_worktree_add_result(worktree_dir, add)
 }
 
 /// Parse a `gh issue list --json number` array into issue numbers, in order.
@@ -679,6 +716,35 @@ async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     Err(format!(
         "`{program} {}` failed ({}): {}",
         args.join(" "),
+        output.status,
+        stderr.trim()
+    ))
+}
+
+/// Like [`run_status`] but for `String` args — the `git` worktree argv
+/// helpers ([`crate::issue_dispatch::worktree_branch_probe_argv`] /
+/// [`crate::issue_dispatch::worktree_add_argv`]) produce `Vec<String>`.
+async fn run_status_args(program: &str, args: &[String]) -> Result<(), String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_status(program, &refs).await
+}
+
+/// Blocking twin of [`run_status_args`] for [`create_worktree_sync`], which
+/// runs on the TUI's synchronous `SpawnPane` dispatch path and cannot
+/// `.await`.
+fn run_status_sync(program: &str, args: &[String]) -> Result<(), String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = std::process::Command::new(program)
+        .args(&refs)
+        .output()
+        .map_err(|e| format!("failed to run `{program}`: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "`{program} {}` failed ({}): {}",
+        refs.join(" "),
         output.status,
         stderr.trim()
     ))

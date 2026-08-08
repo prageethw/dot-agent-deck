@@ -821,6 +821,10 @@ pub enum FormField {
     Agent,
     Name,
     Command,
+    /// Fork #122: the typed slug for the orchestration's own worktree. Only
+    /// reachable (Tab cycle) and rendered when an orchestration is selected
+    /// — see [`NewPaneFormState::worktree_slug_visible`].
+    WorktreeSlug,
 }
 
 /// PRD #170 (unify): why the directory picker is open — which form to build
@@ -896,6 +900,10 @@ struct NewPaneFormState {
     /// warning, so every other form construction site renders byte-for-byte as
     /// before.
     live_orchestration_in_same_cwd: bool,
+    /// Fork #122: the typed slug for the orchestration's own worktree. Empty
+    /// (the `new` default) means no worktree — panes spawn in `dir`, today's
+    /// exact behavior. Only meaningful when an orchestration is selected.
+    worktree_slug: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +986,8 @@ impl NewPaneFormState {
             // cwds via `with_live_orchestration_cwds`; unattached means no
             // warning.
             live_orchestration_in_same_cwd: false,
+            // Fork #122: no worktree by default — preserves today's behavior.
+            worktree_slug: String::new(),
         }
     }
 
@@ -992,6 +1002,20 @@ impl NewPaneFormState {
     /// every frame.
     fn with_live_orchestration_cwds(mut self, cwds: Vec<String>) -> Self {
         self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, &cwds);
+        self
+    }
+
+    /// Fork #122 test-only seam: attach a typed worktree slug without
+    /// threading it through the interactive keyboard-typing path (production
+    /// fills `worktree_slug` character-by-character via
+    /// `handle_new_pane_form_key`, never through a consuming builder).
+    /// Mirrors [`Self::with_live_orchestration_cwds`]'s shape but, unlike
+    /// that one, has no production call site — `#[cfg(test)]` keeps it out
+    /// of the production API surface entirely (same pattern as
+    /// `AgentPtyRegistry::agent_writer`, `src/agent_pty.rs`).
+    #[cfg(test)]
+    fn with_worktree_slug(mut self, slug: String) -> Self {
+        self.worktree_slug = slug;
         self
     }
 
@@ -1059,6 +1083,9 @@ impl NewPaneFormState {
             // PRD #140 M4.0: the locked schedule form can't select an
             // orchestration, so the same-cwd warning never applies to it.
             live_orchestration_in_same_cwd: false,
+            // Fork #122: the locked schedule form can't select an
+            // orchestration, so there is never a worktree slug to type.
+            worktree_slug: String::new(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -1180,6 +1207,14 @@ impl NewPaneFormState {
         self.selected_orchestration().is_none()
     }
 
+    /// Fork #122: the worktree-slug field is the mirror image of
+    /// `command_visible` — shown only when an orchestration IS selected (a
+    /// worktree slug is meaningless for a plain mode/card, which has no
+    /// `.dot-agent-deck.toml` role config to root in a worktree).
+    fn worktree_slug_visible(&self) -> bool {
+        self.selected_orchestration().is_some()
+    }
+
     /// PRD #20 finding #8: the label shown in the Agent chip — the selected
     /// registry entry's label, or `auto` when no agent is picked (Command comes
     /// from the global default / typed text).
@@ -1243,6 +1278,10 @@ impl NewPaneFormState {
             FormField::Name => {
                 if cmd_visible {
                     FormField::Command
+                } else if self.worktree_slug_visible() {
+                    // Fork #122: orchestration selected — offer the
+                    // worktree-slug field before cycling back to Mode.
+                    FormField::WorktreeSlug
                 } else if self.has_mode_field {
                     FormField::Mode
                 } else {
@@ -1250,6 +1289,15 @@ impl NewPaneFormState {
                 }
             }
             FormField::Command => {
+                if self.has_mode_field {
+                    FormField::Mode
+                } else {
+                    FormField::Name
+                }
+            }
+            // Fork #122: last field in the orchestration branch of the
+            // cycle — back to Mode (or Name, mirroring Command above).
+            FormField::WorktreeSlug => {
                 if self.has_mode_field {
                     FormField::Mode
                 } else {
@@ -1268,7 +1316,11 @@ impl NewPaneFormState {
         let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => {
-                if cmd_visible {
+                if self.worktree_slug_visible() {
+                    // Fork #122: symmetric to `next_field`'s Name ->
+                    // WorktreeSlug -> Mode chain.
+                    FormField::WorktreeSlug
+                } else if cmd_visible {
                     FormField::Command
                 } else {
                     FormField::Name
@@ -1287,6 +1339,8 @@ impl NewPaneFormState {
                 }
             }
             FormField::Command => FormField::Name,
+            // Fork #122: symmetric to Command's prev.
+            FormField::WorktreeSlug => FormField::Name,
         }
     }
 }
@@ -3658,6 +3712,10 @@ pub struct NewPaneRequest {
     /// here keeps the authoring session a dashboard card while still delivering
     /// the authoring prompt.
     seed_prompt: Option<String>,
+    /// Fork #122: when set, the orchestration's role panes root themselves
+    /// in this worktree instead of `dir`. `None` preserves today's exact
+    /// behavior (panes spawn in `dir`).
+    orchestration_worktree_path: Option<PathBuf>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -6413,6 +6471,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             mode_config: None,
             orchestration_config: None,
             seed_prompt: Some(build_issue_dispatch_authoring_seed(&form.dir)),
+            orchestration_worktree_path: None,
         };
     }
     // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
@@ -6455,6 +6514,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             orchestration_config: None,
             seed_prompt: build_schedule_authoring_mode(form.schedule_existing.as_ref(), &form.dir)
                 .seed_prompt,
+            orchestration_worktree_path: None,
         };
     }
     NewPaneRequest {
@@ -6464,7 +6524,56 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
+        orchestration_worktree_path: if form.worktree_slug.trim().is_empty() {
+            None
+        } else {
+            Some(resolve_orchestration_worktree_path(
+                &form.dir,
+                form.worktree_slug.trim(),
+            ))
+        },
     }
+}
+
+/// Fork #122: resolve the sibling worktree path for an orchestration's own
+/// worktree — `<dir>-<slug>`, next to `dir` (e.g. `/tmp/dot-agent-deck` +
+/// `my-feature` → `/tmp/dot-agent-deck-my-feature`). Pure path arithmetic, no
+/// I/O; the actual `git worktree add` happens in [`Action::SpawnPane`]'s
+/// orchestration branch.
+fn resolve_orchestration_worktree_path(dir: &Path, slug: &str) -> PathBuf {
+    let mut name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.push('-');
+    name.push_str(slug);
+    dir.with_file_name(name)
+}
+
+/// Fork #122: recover the branch name (the raw slug) from a worktree path
+/// built by [`resolve_orchestration_worktree_path`] — the inverse of that
+/// function's `<dir-basename>-<slug>` join. `Action::SpawnPane`'s
+/// orchestration branch needs this because `NewPaneRequest` carries only the
+/// resolved `orchestration_worktree_path`, not the raw slug (the API
+/// contract adds exactly the one field); deriving it back out keeps that
+/// contract to one field instead of threading the slug through a second one.
+/// "Branch naming: use the slug itself as the branch name" (fork #122) —
+/// falls back to the worktree dir's full basename if the expected prefix is
+/// ever absent (defensive; every real caller goes through
+/// `resolve_orchestration_worktree_path` first).
+fn orchestration_worktree_branch_name(dir: &Path, worktree_path: &Path) -> String {
+    let base = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = worktree_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.strip_prefix(&base)
+        .and_then(|s| s.strip_prefix('-'))
+        .map(str::to_string)
+        .unwrap_or(name)
 }
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -6523,10 +6632,17 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             FormField::Name if form.command_visible() => {
                 form.focused = FormField::Command;
             }
+            // Fork #122: an orchestration is selected — Name advances to the
+            // worktree-slug field instead of submitting, mirroring the
+            // Command door above.
+            FormField::Name if form.worktree_slug_visible() => {
+                form.focused = FormField::WorktreeSlug;
+            }
             // PRD #106: when the Command field is hidden (orchestration
-            // selected), pressing Enter on Name submits — there's no later
-            // field to advance to.
-            FormField::Name | FormField::Command => {
+            // selected) AND there's no worktree-slug field to advance to
+            // either, pressing Enter on Name submits — there's no later
+            // field.
+            FormField::Name | FormField::Command | FormField::WorktreeSlug => {
                 // The blank-command -> `default_command` authoring default now
                 // lives in `build_new_pane_request`, so both this Enter door and
                 // the [Submit] button door apply it identically.
@@ -6541,18 +6657,30 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 return Action::SpawnPane(Box::new(req));
             }
         },
-        KeyCode::Backspace if matches!(form.focused, FormField::Name | FormField::Command) => {
+        KeyCode::Backspace
+            if matches!(
+                form.focused,
+                FormField::Name | FormField::Command | FormField::WorktreeSlug
+            ) =>
+        {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
+                FormField::WorktreeSlug => &mut form.worktree_slug,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
             field.pop();
         }
-        KeyCode::Char(c) if matches!(form.focused, FormField::Name | FormField::Command) => {
+        KeyCode::Char(c)
+            if matches!(
+                form.focused,
+                FormField::Name | FormField::Command | FormField::WorktreeSlug
+            ) =>
+        {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
+                FormField::WorktreeSlug => &mut form.worktree_slug,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
             field.push(c);
@@ -7926,6 +8054,47 @@ fn dispatch_action(
                     // branch rather than relying on the doors re-setting it
                     // before the next dispatch.
                     ui.pending_last_command = None;
+                    // Fork #122: when the form resolved a worktree path,
+                    // create it now — before any tab/pane state exists — so a
+                    // failure never leaves a half-open orchestration behind.
+                    // Fail-loud: no tab, no panes, no pane_cwd_map writes.
+                    // Silently falling back to the shared cwd here would
+                    // reintroduce the multi-orchestration collision CLAUDE.md
+                    // rule 1 / fork #74 exists to prevent, while looking like
+                    // it worked.
+                    let dir_str = match req.orchestration_worktree_path.as_ref() {
+                        Some(worktree_path) => {
+                            let branch =
+                                orchestration_worktree_branch_name(&req.dir, worktree_path);
+                            match crate::issue_dispatch_run::create_worktree_sync(
+                                &req.dir,
+                                worktree_path,
+                                &branch,
+                            ) {
+                                Ok(crate::issue_dispatch_run::WorktreeCreation::Created) => {
+                                    worktree_path.display().to_string()
+                                }
+                                Ok(crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed) => {
+                                    ui.status_message = Some((
+                                        format!(
+                                            "Orchestration failed: worktree already exists at {}",
+                                            worktree_path.display()
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
+                                    return Flow::Continue;
+                                }
+                                Err(e) => {
+                                    ui.status_message = Some((
+                                        format!("Orchestration failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                    return Flow::Continue;
+                                }
+                            }
+                        }
+                        None => dir_str,
+                    };
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
                     // corrupted the orchestration IDENTITY — the canonical
@@ -15831,6 +16000,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
+    // Fork #122: the worktree-slug field takes the same two rows (label +
+    // spacer) when an orchestration is selected — mutually exclusive with
+    // `cmd_rows` since `worktree_slug_visible` is `command_visible`'s mirror.
+    let worktree_slug_visible = form.worktree_slug_visible();
+    let worktree_slug_rows: u16 = if worktree_slug_visible { 2 } else { 0 };
     // PRD #127 M3.2 / PRD #120: either authoring option ("schedule" or
     // "schedule: issues") adds one separator/label row marking it as a throwaway
     // authoring session (only in the unlocked Mode cycler — the locked schedule
@@ -15870,8 +16044,14 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // than the chip row (`warning_w` is 0 when no warning shows, so the width is
     // unchanged in every other state).
     let desired_w = chip_row_w.max(warning_w).saturating_add(4).max(56);
-    let desired_h =
-        9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
+    let desired_h = 9
+        + name_rows
+        + agent_rows
+        + mode_extra
+        + cmd_rows
+        + worktree_slug_rows
+        + schedule_rows
+        + warning_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -15895,6 +16075,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         unfocused_label
     };
     let agent_style = if form.focused == FormField::Agent {
+        focused_label
+    } else {
+        unfocused_label
+    };
+    let worktree_slug_style = if form.focused == FormField::WorktreeSlug {
         focused_label
     } else {
         unfocused_label
@@ -16009,6 +16194,28 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             ),
         ]));
     }
+    // Fork #122: the worktree-slug field — shown only when an orchestration
+    // is selected (mutually exclusive with the Command block above).
+    let mut worktree_slug_line_idx: Option<usize> = None;
+    if worktree_slug_visible {
+        lines.push(Line::from(""));
+        worktree_slug_line_idx = Some(lines.len());
+        lines.push(Line::from(vec![
+            Span::styled("  Worktree:", worktree_slug_style),
+            Span::styled(
+                format!(
+                    "{:<width$}",
+                    form.worktree_slug,
+                    width = inner_width.saturating_sub(11)
+                ),
+                if form.focused == FormField::WorktreeSlug {
+                    text_primary()
+                } else {
+                    unfocused_label
+                },
+            ),
+        ]));
+    }
     // PRD #140 M4.0: the same-cwd shared-resource warning sits directly above
     // the action row — the last thing read before Enter — and is purely
     // informational: `[Submit]` below it is untouched, so the user may proceed
@@ -16112,6 +16319,17 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
             },
         ));
     }
+    if let Some(wi) = worktree_slug_line_idx {
+        field_rects.push((
+            FormField::WorktreeSlug,
+            Rect {
+                x: row_x,
+                y: line_y(wi),
+                width: row_width,
+                height: 1,
+            },
+        ));
+    }
 
     // Mode chip row: render `  Mode: ` then one `[name]` chip per option, the
     // selected one highlighted. PRD #144: the chips sit on a SINGLE row —
@@ -16208,6 +16426,12 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     {
         let cursor_x = popup_area.x + 12 + form.command.len() as u16;
         frame.set_cursor_position(Position::new(cursor_x, line_y(ci)));
+    } else if form.focused == FormField::WorktreeSlug
+        && let Some(wi) = worktree_slug_line_idx
+        && line_y(wi) < popup_bottom
+    {
+        let cursor_x = popup_area.x + 12 + form.worktree_slug.len() as u16;
+        frame.set_cursor_position(Position::new(cursor_x, line_y(wi)));
     }
 
     (field_rects, chip_rects, button_rects)
@@ -24337,6 +24561,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("tab-a")),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_a)),
@@ -24388,6 +24613,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("tab-b")),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req_b)),
@@ -24736,6 +24962,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(orch_config("shared-orch")),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -24994,6 +25221,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -25387,6 +25615,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(lock_test_orch_config("lock-waiting")),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -25574,6 +25803,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(lock_test_orch_config("lock-ambiguous")),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -27813,11 +28043,16 @@ mod tests {
         f.focused = f.next_field();
         assert_eq!(f.focused, FormField::Name);
 
-        // Name should wrap back to Mode rather than visiting hidden Command.
+        // Fork #122: Name now visits the worktree-slug field (not hidden —
+        // shown exactly when Command is hidden) before wrapping to Mode.
+        f.focused = f.next_field();
+        assert_eq!(f.focused, FormField::WorktreeSlug);
         f.focused = f.next_field();
         assert_eq!(f.focused, FormField::Mode);
 
-        // Shift+Tab from Mode should land on Name (skip Command).
+        // Shift+Tab from Mode should land on WorktreeSlug (skip Command).
+        f.focused = f.prev_field();
+        assert_eq!(f.focused, FormField::WorktreeSlug);
         f.focused = f.prev_field();
         assert_eq!(f.focused, FormField::Name);
 
@@ -27850,7 +28085,11 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_name_submits_when_orchestration_selected() {
+    fn enter_on_name_advances_to_worktree_slug_when_orchestration_selected() {
+        // Fork #122: Enter on Name no longer submits directly when an
+        // orchestration is selected — it advances to the worktree-slug
+        // field (the field a real user needs to reach by keyboard to type
+        // a slug), and Enter on THAT field submits.
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
         ui.new_pane_form = Some(NewPaneFormState::new(
@@ -27870,7 +28109,16 @@ mod tests {
         handle_new_pane_form_key(enter, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
 
-        // Enter on Name should submit directly, not advance to a hidden field.
+        // Enter on Name advances to WorktreeSlug rather than submitting.
+        handle_new_pane_form_key(enter, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::WorktreeSlug
+        );
+        assert!(ui.new_pane_form.is_some(), "must not submit yet");
+
+        // Enter on WorktreeSlug (still blank) submits — a blank slug
+        // preserves today's exact behavior (no worktree).
         let result = handle_new_pane_form_key(enter, &mut ui);
         assert!(matches!(result, Action::SpawnPane(_)));
         assert!(ui.new_pane_form.is_none());
@@ -27878,6 +28126,7 @@ mod tests {
         if let Action::SpawnPane(req) = result {
             assert!(req.orchestration_config.is_some());
             assert!(req.mode_config.is_none());
+            assert!(req.orchestration_worktree_path.is_none());
         }
     }
 
@@ -27922,9 +28171,16 @@ mod tests {
                 .is_some()
         );
 
-        // Now Tab forward: Mode → Name → Mode (skipping hidden Command).
+        // Now Tab forward: Mode → Name → WorktreeSlug → Mode (skipping
+        // hidden Command; fork #122 inserts WorktreeSlug where Command
+        // would otherwise have been).
         handle_new_pane_form_key(tab, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Name);
+        handle_new_pane_form_key(tab, &mut ui);
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().focused,
+            FormField::WorktreeSlug
+        );
         handle_new_pane_form_key(tab, &mut ui);
         assert_eq!(ui.new_pane_form.as_ref().unwrap().focused, FormField::Mode);
     }
@@ -28728,6 +28984,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -28922,6 +29179,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config.clone()),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -28988,6 +29246,7 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(config),
             seed_prompt: None,
+            orchestration_worktree_path: None,
         };
         let controller = Arc::new(CapturingPaneController::new());
         let mut tab_manager = TabManager::new(controller.clone());
@@ -29049,6 +29308,7 @@ mod tests {
             mode_config: None,
             orchestration_config: None,
             seed_prompt: None,
+            orchestration_worktree_path: None,
         }
     }
 
@@ -29328,6 +29588,7 @@ mod tests {
             mode_config: Some(mode),
             orchestration_config: None,
             seed_prompt: None,
+            orchestration_worktree_path: None,
         }
     }
 
