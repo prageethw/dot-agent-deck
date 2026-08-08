@@ -420,10 +420,20 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 /// I/O orchestration; [`decide`] is the tested pure core.
 ///
 /// PR state is resolved against each candidate's OWN path (`wt.path`), never
-/// `repo_dir` (the caller's cwd): a linked worktree can carry its own
-/// `remote.origin.url` via `extensions.worktreeConfig`, and resolving against
-/// the wrong repo risks matching an unrelated same-named branch's PR — see
-/// [`derive_repo_slug`].
+/// `repo_dir` (the caller's cwd), consistently with `check_cleanliness(&wt.path)`
+/// and `ownership_of(&wt.path)`: every per-worktree property is read from the
+/// worktree it describes. One concrete case this affects: `remote.<name>.url`
+/// is a list-accumulating git config variable, and `git remote get-url`
+/// (called by [`derive_repo_slug`]) returns only the first value, so a
+/// worktree-scoped `origin` set via `extensions.worktreeConfig` never
+/// overrides one already defined in the common config — it only matters when
+/// the common config defines no `origin` at all. Resolving against `repo_dir`
+/// in that situation yields `Unresolvable`, keeping a worktree forever even
+/// though it is genuinely merged and clean; `worktree/reclaim/007` covers
+/// exactly this. (Resolving against the wrong repo in general would risk
+/// matching an unrelated same-named branch's PR, but that is not a reachable
+/// scenario via worktree-scoped remotes — the common config's value always
+/// wins.)
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
     let raw = list_linked_worktrees(repo_dir)?;
     let mut reports = Vec::with_capacity(raw.len());
