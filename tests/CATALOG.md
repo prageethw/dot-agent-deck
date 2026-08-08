@@ -2945,6 +2945,48 @@ without depending on the config struct API.
 - **Does not assert:** the symlink-defeated variants of the same rule (covered by `orchestration/delegate/036`/`037`); the exact refusal wording (stderr is not inspected — only the exit code).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+##### orchestration/delegate/039 — A Pi start role declared BEFORE a worker role in an orchestration's config can delegate before the worker's daemon-side registration exists, losing its first task with no retry (fork #92 P1, PR #93 pre-merge review).
+- **Layer:** fast synthetic real-daemon integration through the actual production spawn path — a real `TabManager` + `EmbeddedPaneController` against a real M1.2 attach-protocol daemon, plus a real `pi` shell-script shim and a `cat` stand-in worker on `$PATH`; no vt100 attach, no LLM, no `e2e` feature gate. Uses the fork #92 `StartAgentRegistrationHook` test seam (`src/daemon.rs`/`src/daemon_protocol.rs`) to deterministically hold the worker's `StartAgent` registration open, rather than relying on real OS scheduling to probabilistically reproduce the race.
+- **Agent:** none (synthetic — a real `pi`-named shell script that calls `get-seed` then `delegate --to coder` on boot, and a `cat` stand-in worker whose PTY echoes whatever the daemon injects).
+- **Asserts:** while a registration gate holds the worker's `AppState` maps unpublished (armed by role name, not spawn order), the pi shim's seed-consumption marker must NOT appear; after releasing the gate, the marker must hold the exact seed text and the worker's PTY scrollback must contain the delegate pointer EXACTLY once — 0 is this defect's loss, 2+ would reproduce a duplicate-arming harm. Deliberately does not assert which role's `StartAgent` is issued first — see `orchestration/delegate/044` for the spawn-order-agnostic pane-id-indexing guard.
+- **Does not assert:** the reordering mechanism itself (spawn-index plan, which role's `StartAgent` fires first); the exact wording of any daemon log line; the PTY-injection seed-fallback safety net's timing.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/040 — A `delegate` that resolves to ZERO targets (a role name with no registered pane) must not report success (fork #92 P1).
+- **Layer:** fast real-CLI-subprocess integration (the real `dot-agent-deck delegate` binary run against a real in-process daemon over its hook socket; a `cat`-stub `coder` worker exists so the daemon is not empty, just missing the TARGETED role).
+- **Agent:** none.
+- **Asserts:** with a real orchestrator pane and a resolvable `coder` worker registered, running `delegate --to nonexistent-role` — a role with no pane at all — exits NON-ZERO. `delegate_targets` silently drops the unresolved role (no dispatch queued, no worker watch armed), but `handle_delegate` used to reply `DelegateResponse::accepted(signal.to)` unconditionally, echoing the requested role regardless of whether anything was actually armed — the false-positive confirmation that can induce the duplicate-delegation retry upstream #330 exists to prevent.
+- **Does not assert:** exit-code value, message wording, or `DelegateResponse` field shape (same discipline as `orchestration/delegate/016`-`018`) — only that a zero-target delegate does not report success.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/041 — A `delegate` that self-targets the orchestrator's OWN role name also resolves to ZERO targets and must not report success (fork #92 P1).
+- **Layer:** fast real-CLI-subprocess integration (same technique as `orchestration/delegate/040`).
+- **Agent:** none.
+- **Asserts:** with the orchestrator pane registered under role `orchestrator` and a `coder` worker also present, running `delegate --to orchestrator` from the orchestrator pane exits NON-ZERO. `delegate_targets` deliberately excludes any pane in `orchestrator_pane_ids` from role resolution, so this resolves to nothing even though a pane with that exact role name exists — the same false-positive-confirmation hazard as `orchestration/delegate/040`, from a different resolution path.
+- **Does not assert:** exit-code value, message wording, or `DelegateResponse` field shape.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/042 — A `delegate --to coder --to coder` (a duplicated target role) must confirm the role exactly ONCE, not once per request (fork #92 P2).
+- **Layer:** fast real-CLI-subprocess integration (same technique as `orchestration/delegate/040`).
+- **Agent:** none.
+- **Asserts:** with exactly one `coder` worker pane registered, running `delegate --to coder --to coder` exits ZERO (one real pane was armed, so the call must succeed — failing it would make a retry-on-non-zero orchestrator double-delegate the role that DID arm, upstream #330's harm from the other direction) and the confirmation names `coder` exactly once, not twice. `delegate_targets` de-duplicates the repeated role before dispatch, so a reply that echoes `signal.to` verbatim would name the role twice even though only one worker pane was actually armed — indistinguishable from a genuine second worker having been armed.
+- **Does not assert:** exit-code value beyond success/failure, or the exact confirmation wording beyond the role-name occurrence count.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/043 — A `delegate --to coder --to nonexistent-role` (one resolvable, one not) must succeed AND name both the armed role and the unresolved one, distinguishably — not fold them into one undifferentiated echo (fork #92 partial-resolution decision).
+- **Layer:** fast real-CLI-subprocess integration (same technique as `orchestration/delegate/040`).
+- **Agent:** none.
+- **Asserts:** with exactly one `coder` worker pane registered, running `delegate --to coder --to nonexistent-role` exits ZERO (something really did arm, so failing the call would make a retry-on-non-zero orchestrator double-delegate the role that DID arm) and both `coder` (armed) and `nonexistent-role` (unresolved) are named somewhere observable in the output, not simply reported as one plain comma-joined pair indistinguishable from a fully-resolved multi-target delegate — the same silent-drop failure `orchestration/delegate/040`/`041` pin, wearing the partial-resolution shape.
+- **Does not assert:** exit-code value beyond success/failure, or the exact wording distinguishing the two roles.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/044 — Reordering `open_orchestration_tab`'s spawn loop (a Pi start role spawned last, per PR #93's approved fix) must not disturb `role_pane_ids`/`TabMembership.role_index`, which stay keyed by the config's DECLARED role position, not by spawn order (fork #92 P1 follow-up).
+- **Layer:** fast in-process unit test — a real `TabManager` against a `MockPaneController` that records the command each `create_pane` call actually received, so the test can distinguish "declared index" from "spawn call order" even though today's code doesn't yet reorder them.
+- **Agent:** none (synthetic — `MockPaneController`, no real process, no daemon).
+- **Asserts:** `role_pane_ids[0]`/`role_pane_ids[1]` hold the pane ids actually minted for the start role's and the worker's commands respectively (declared order: start role first), and the stored `Tab::Orchestration.start_role_index`/`role_pane_ids` match. Not RED before PR #93's fix exists — today's spawn loop already iterates in declaration order, so this holds trivially; it is a regression guard for the coming reorder, not a pin on current behavior.
+- **Does not assert:** the reorder mechanism itself or actual spawn call order (that's `orchestration/delegate/039`'s territory, exercised against a real daemon); layout, focus, or persisted-status ordering beyond `role_pane_ids`/`start_role_index`.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
