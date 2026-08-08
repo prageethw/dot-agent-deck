@@ -5534,6 +5534,11 @@ pub struct InProcDaemon {
     pub event_tx: tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
     /// Hand this to spawned agents as `DOT_AGENT_DECK_SOCKET`.
     pub hook_path: PathBuf,
+    /// The streaming-attach socket (`AttachRequest`/`AttachResponse`, e.g.
+    /// `ListAgents`). Hand this to a CLI subprocess as
+    /// `DOT_AGENT_DECK_ATTACH_SOCKET` for a real-binary integration test
+    /// against this in-process daemon (fork #47's `daemon status`).
+    pub attach_path: PathBuf,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -5597,6 +5602,7 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
         registry,
         event_tx,
         hook_path,
+        attach_path,
         handle,
     }
 }
