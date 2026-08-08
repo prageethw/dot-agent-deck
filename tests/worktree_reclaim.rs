@@ -296,6 +296,28 @@ fn worktree_reclaim_003_dirty_worktree_is_kept_even_when_merged() {
     std::fs::write(wt.join("scratch-notes.txt"), "never committed\n").expect("write untracked");
 
     let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    // `wt.exists()` below would hold trivially even if `worktree reclaim` were
+    // not a real subcommand at all — clap rejects it before touching the
+    // filesystem, so the worktree is untouched either way. Rule that out
+    // explicitly first, mirroring `daemon_status_003`'s idiom, so the RED
+    // signal is unambiguous rather than an accidental pass.
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "exit code 2 is clap's own generic usage/parse-error code; an implemented `worktree \
+         reclaim` correctly keeping this dirty worktree must use a code that does not collide \
+         with it, or the absence of `wt-dirty`'s removal below is no evidence at all; \
+         status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("Usage:"),
+        "stderr still carries clap's own subcommand-usage banner, meaning `worktree reclaim` \
+         was not recognized as a real subcommand rather than being handled and correctly \
+         deciding to keep this worktree; out={}",
+        combined(&out)
+    );
     assert!(
         wt.exists(),
         "a dirty worktree must never be removed, even with a MERGED PR and --yes — {} is gone\n{}",
@@ -334,6 +356,28 @@ fn worktree_reclaim_004_ancestor_branch_without_a_pr_is_never_removed() {
     );
 
     let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    // Without this, `wt.exists()` below is not evidence: it holds trivially
+    // right now because `worktree reclaim` is not a real subcommand yet, so
+    // clap rejects it and the filesystem is never touched — the exact same
+    // "pass by doing nothing" trap `003` guards against. Rule out clap's
+    // generic parse error first, mirroring `daemon_status_003`.
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "exit code 2 is clap's own generic usage/parse-error code; an implemented `worktree \
+         reclaim` correctly keeping this ancestor-but-no-PR worktree must use a code that does \
+         not collide with it, or the absence of `wt-scratch`'s removal below is no evidence at \
+         all; status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("Usage:"),
+        "stderr still carries clap's own subcommand-usage banner, meaning `worktree reclaim` \
+         was not recognized as a real subcommand rather than being handled and correctly \
+         deciding to keep this worktree; out={}",
+        combined(&out)
+    );
     assert!(
         wt.exists(),
         "a worktree with no PR must never be removed, even when its branch is an ancestor of \
@@ -357,6 +401,26 @@ fn worktree_reclaim_005_foreign_worktree_is_asked_about_not_removed() {
     // Deliberately NOT marked owned.
 
     let out = fx.run(&["worktree", "reclaim"]);
+    // As in `003`/`004`: `wt.exists()` below holds trivially today regardless
+    // of whether the ask surface exists, since clap rejects the unrecognized
+    // subcommand before touching the filesystem. Rule that out first so the
+    // signal is pinned to the assertions that actually carry it.
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "exit code 2 is clap's own generic usage/parse-error code; an implemented `worktree \
+         reclaim` correctly asking about this foreign worktree must use a code that does not \
+         collide with it; status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("Usage:"),
+        "stderr still carries clap's own subcommand-usage banner, meaning `worktree reclaim` \
+         was not recognized as a real subcommand rather than being handled and raising a \
+         pending decision; out={}",
+        combined(&out)
+    );
     assert!(
         wt.exists(),
         "a worktree the deck cannot prove it created must not be removed without explicit \

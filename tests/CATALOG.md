@@ -697,21 +697,21 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### worktree/reclaim/003 — A dirty worktree is never removed, even with a MERGED PR and `--yes`, and the report says why it was kept.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (an untracked file placed in an otherwise-reclaimable worktree).
-- **Asserts:** the worktree still exists after `reclaim --yes`, and the output names dirtiness/uncommitted/untracked as the reason. The untracked file was never part of the PR, so it is genuinely absent from `main` — the case the "the code is already merged" argument does not cover.
+- **Asserts:** first, that the exit code is not clap's own generic `2` and stderr carries no clap `Usage:` banner — ruling out "this build's CLI does not understand `worktree reclaim`" as the reason the worktree survives, so the domain assertion below is not vacuously true; then that the worktree still exists after `reclaim --yes`, and the output names dirtiness/uncommitted/untracked as the reason. The untracked file was never part of the PR, so it is genuinely absent from `main` — the case the "the code is already merged" argument does not cover.
 - **Does not assert:** the exact wording of the reason; behaviour for tracked-but-modified files (the same gate, one representative case tested).
 - **Platform coverage:** mac+linux.
 
 ##### worktree/reclaim/004 — A worktree whose branch IS an ancestor of `main` but has NO pull request is never removed.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (a branch created at `main`'s tip with no canned PR fixture, so the stub `gh` returns `[]`).
-- **Asserts:** a **fixture precondition** that `git branch --merged main` DOES list the branch — so the ancestry check's false-positive is genuinely present — and then that the worktree still exists after `reclaim --yes`. This is the destructive direction of the naive check: the same shape as a live scratch worktree that a "git says merged, delete it" rule would destroy.
+- **Asserts:** a **fixture precondition** that `git branch --merged main` DOES list the branch — so the ancestry check's false-positive is genuinely present — then, as in `003`, that the exit code and stderr rule out clap's own unrecognized-subcommand error (without this, "the worktree still exists" would hold vacuously today, since clap never touches the filesystem either) — and finally that the worktree still exists after `reclaim --yes`. This is the destructive direction of the naive check: the same shape as a live scratch worktree that a "git says merged, delete it" rule would destroy.
 - **Does not assert:** the reason wording; closed-unmerged or open-PR states (same gate, distinct fixtures).
 - **Platform coverage:** mac+linux.
 
 ##### worktree/reclaim/005 — A foreign (unmarked) merged clean worktree is asked about, not removed, and the ask names the exact path and the command that would proceed.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (a reclaimable worktree deliberately left without an ownership marker).
-- **Asserts:** the worktree still exists after a bare `reclaim`; the output contains the worktree's exact path (not a count or a category); and it contains `--yes`, the specific command that would proceed. Pins PRD #422's "when it asks, it asks specifically" rules 1 and 4.
+- **Asserts:** as in `003`/`004`, first that the exit code/stderr rule out clap's own unrecognized-subcommand error; then that the worktree still exists after a bare `reclaim`; the output contains the worktree's exact path (not a count or a category); and it contains `--yes`, the specific command that would proceed. Pins PRD #422's "when it asks, it asks specifically" rules 1 and 4.
 - **Does not assert:** interactive confirmation (this is the non-interactive path); the ordering of ask-versus-detail in the output (rule 3), which is not mechanically checkable here.
 - **Platform coverage:** mac+linux.
 
