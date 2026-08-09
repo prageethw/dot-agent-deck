@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status**: Not started
+**Status**: In progress — Phases 1 and 2 complete and green in CI; Phase 3 outstanding on the cross-version run, review and merge (PR [#154](https://github.com/prageethw/dot-agent-deck/pull/154))
 
 ## Problem Statement
 
@@ -91,22 +91,38 @@ The two write points have different claimants and both must be representable: sc
 
 ### Phase 1: The claim
 
-- [ ] **M1.0** — Write `in-progress` on successful dispatch, after worktree creation and spawn both succeed. The per-issue error boundary is where this is won or lost.
-- [ ] **M1.1** — Post the claimant comment (orchestration name, instance id, host, timestamp), with the scheduler claiming under `ScheduledTask.name`.
-- [ ] **M1.2** — Read the label as a third signal in `dispatch_decision`, regardless of provenance.
-- [ ] **M1.3** — Add a reason to `IssueDispatchSkipped` and render it, covering all four causes (worktree exists, open PR, concurrent-creator race, label present).
-- [ ] **M1.4** — Tests: labels-on-success, no-label-on-failed-dispatch, label-as-skip-signal, externally-applied-label-also-skips, and each skip reason rendering distinguishably.
+- [x] **M1.0** — Write `in-progress` on successful dispatch, after worktree creation and spawn both succeed. The per-issue error boundary is where this is won or lost. *Landed as `claim_issue`, called after `spawn` returns `Ok` and after the `IssueDispatched` notify; a `gh` failure logs a warning and is never propagated, so it cannot turn a successful dispatch into a spurious `IssueDispatchFailed`.*
+- [x] **M1.1** — Post the claimant comment (orchestration name, instance id, host, timestamp), with the scheduler claiming under `ScheduledTask.name`. *See "Only one write point exists" below — `Claimant::Instance` is implemented and unit-tested but has no call site, because the product has no human-orchestration entry into issue dispatch.*
+- [x] **M1.2** — Read the label as a third signal in `dispatch_decision`, regardless of provenance. *Read off the existing `gh issue list` enumeration (`--json number,labels`), so it costs no extra `gh` invocation.*
+- [x] **M1.3** — Add a reason to `IssueDispatchSkipped` and render it, covering all four causes (worktree exists, open PR, concurrent-creator race, label present). *`SkipReason` enum; the label cause renders two ways depending on whether a claimant was recorded.*
+- [x] **M1.4** — Tests: labels-on-success, no-label-on-failed-dispatch, label-as-skip-signal, externally-applied-label-also-skips, and each skip reason rendering distinguishably. *`scheduler/dispatch/010`, `014`, `015`, `016`, `017` plus two pure-data unit tests — see "Coverage of the fourth skip cause" below.*
 
 ### Phase 2: Triage
 
-- [ ] **M2.0** — Label vocabulary, created idempotently and documented as canonical.
-- [ ] **M2.1** — The agent-driven triage path and its prompt template, including the `needs-triage` uncertainty rule. When a human **is** present, the agent asks a specific, bounded question — "priority for #N: high, medium, or low?" — rather than prose. The unattended path is unchanged: apply `needs-triage` and move on, never block a scheduled run on a prompt.
-- [ ] **M2.2** — Tests for the triage path's label application and its uncertainty outcome.
+- [x] **M2.0** — Label vocabulary, created idempotently and documented as canonical. *Seven hyphenated labels created via `gh label create --force`, once per run; a per-label failure warns and continues.*
+- [x] **M2.1** — The agent-driven triage path and its prompt template, including the `needs-triage` uncertainty rule. When a human **is** present, the agent asks a specific, bounded question — "priority for #N: high, medium, or low?" — rather than prose. The unattended path is unchanged: apply `needs-triage` and move on, never block a scheduled run on a prompt. *Scoped to **triage-on-dispatch**: the instruction is appended to the prompt of each **dispatched** agent. Not a backlog sweep — see "Triage scope" below.*
+- [x] **M2.2** — Tests for the triage path's label application and its uncertainty outcome. *`scheduler/dispatch/018` (enabled) and `019` (off by default, a guard against the feature leaking into the default path).*
 
 ### Phase 3: Ship
 
-- [ ] **M3.0** — Docs: the vocabulary, what a claim means, and how to read the claimant.
-- [ ] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (touches the daemon and `issue_dispatch`); PR, review, merge, close #421.
+- [x] **M3.0** — Docs: the vocabulary, what a claim means, and how to read the claimant. *`docs/scheduled-tasks.md`. The pre-existing section "Idempotency: the worktree is the ledger" was **falsified** by this PRD and was rewritten as "Idempotency: three signals, one explicit claim".*
+- [ ] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (touches the daemon and `issue_dispatch`); PR, review, merge, close #421. *Changelog fragment `changelog.d/421.feature.md` landed. Protocol classification settled (see below). Cross-version run, review and merge outstanding.*
+
+### Also delivered, beyond the original milestones
+
+- **A `--triage` flag on `schedule add`.** Without it the feature was opt-in via a config field that the CLI hardcoded to `false`, so the only way to enable it was hand-editing `schedules.toml` — an opt-in feature with no supported way to opt in.
+
+## Decisions taken during implementation
+
+These settle items that were open when this PRD was written. Recorded here so they are not re-litigated.
+
+- **Label naming: hyphenated.** `priority-high|medium|low`, `size-high|medium|low`, `needs-triage` — matching the existing house style (`in-progress`, `ci-cd`) rather than the `priority:high` colon form. *(Settles the "Label naming" open question.)*
+- **Claim comment shape: append, one per dispatch — never edit in place.** The PRD's "comment noise" risk turns out not to be reachable: once M1.2 lands, the only path that re-runs the dispatch success flow for the same issue is a deliberate un-claim (label removed **and** worktree gone), which normally means a *different* claimant is taking over. Editing in place would overwrite the previous claimant's record and destroy exactly the provenance this PRD exists to add. *(Settles the "Claim comment shape" open question, and supersedes the "Comment noise" mitigation under Risks.)*
+- **Only one write point exists.** This PRD assumed two claimants — scheduler-side (`ScheduledTask.name`) and a human orchestration (`OrchestrationIdentity::Instance { id, name }`). In fact `run_issue_dispatch` has exactly one caller (`src/daemon.rs`, the scheduler); there is **no** human-orchestration entry into issue dispatch. The `ui.rs` worktree-creation path is fork #122's orchestration-tab feature and is unrelated to GitHub issues. `Claimant::Instance` is therefore implemented and unit-tested but deliberately unwired, ready for a second write point if one ever exists.
+- **Coverage of the fourth skip cause.** The concurrent-creator race (`WorktreeCreation::AlreadyClaimed`, a `git worktree add` TOCTOU) has no deterministic black-box trigger, so `scheduler/dispatch/017` covers three of the four causes end-to-end. Rather than adding a production test seam purely to force a race, a **pure-data unit test** asserts all four reasons render distinguishably — exhaustive over the variants, and therefore stronger evidence for the "no two causes render identically" success criterion than the e2e, which only samples three.
+- **Triage scope: triage-on-dispatch.** Triage applies only to the issues actually dispatched (≤ `max_per_run`, default 3), not to the whole backlog. Deliberately narrow because this PRD defers "should dispatch sort by priority" to an open question — so priority labels have **no consumer yet**, and broad backlog coverage would buy nothing today. Widening the coverage later is purely additive.
+- **No `experimental` feature flag** (CLAUDE.md rule 9). The feature is already opt-in through `IssueDispatchConfig`, and its surfaces are not TUI — a label write, a claim comment, stderr skip text and a config/CLI knob. A config opt-in is the stronger and more appropriate gate.
+- **Protocol classification: no bump** (CLAUDE.md rule 12). Verified rather than assumed: `NotifyEvent` derives only `Debug, Clone, PartialEq, Eq` — no serde — and its only production impl is `StderrNotifier`, so it never crosses the TUI↔daemon wire. Neither `IssueDispatchConfig` nor `ScheduledTask` appears anywhere in `src/daemon_protocol.rs`. The new `triage` field is additive under `#[serde(default)]`, so an older daemon ignores it and a newer one defaults it. No `PROTOCOL_VERSION` bump and no `.breaking.md`. The manual cross-version interop run still applies, since that is what catches a semantic break behind a stable wire.
 
 ## Key Files
 
@@ -125,12 +141,17 @@ The two write points have different claimants and both must be representable: sc
 - **A stray label silently starves the backlog.** Since any `in-progress` excludes an issue regardless of provenance, a label left by a human or a tool stops dispatch indefinitely. Mitigation: this is *why* the reason-carrying skip report is in scope rather than optional — an exclusion nobody can see is the actual hazard, not the exclusion itself.
 - **Guessed priorities look considered.** An LLM will always produce an answer if asked for one. Mitigation: `needs-triage` is a first-class outcome, and the prompt makes declining the *expected* behaviour under uncertainty rather than a failure.
 - **`gh` calls on the dispatch path can fail.** Labelling is now a step that can error. Mitigation: it runs inside the existing per-issue error boundary — a labelling failure must not abort the run or the other issues.
-- **Comment noise on re-dispatched issues.** Mitigation: see Open Questions — edit one claim comment in place rather than appending per dispatch.
+- **Comment noise on re-dispatched issues.** ~~Mitigation: edit one claim comment in place rather than appending per dispatch.~~ **Resolved as not reachable** — the dispatch success path cannot run twice for the same issue once the label is read back, so comments do not accumulate. Appending is the deliberate choice; see "Decisions taken during implementation".
 
 ## Open Questions
 
-- **Do claims expire?** A deck that dies mid-work leaves its claim behind, and only issue *close* currently clears the label. Is there a staleness window, and who acts on it?
-- **Priority of what, exactly?** Priority to a maintainer and priority to a dispatch scheduler are not the same ordering. If dispatch ever sorts by priority, that distinction has to be settled first.
+Still open — deliberately **not** decided by this work:
+
+- **Do claims expire?** A deck that dies mid-work leaves its claim behind, and only issue *close* currently clears the label. Is there a staleness window, and who acts on it? The recorded claimant makes a stale claim *diagnosable*, not self-healing.
+- **Priority of what, exactly?** Priority to a maintainer and priority to a dispatch scheduler are not the same ordering. If dispatch ever sorts by priority, that distinction has to be settled first. Nothing sorts by priority today.
 - **Re-triage on change.** If an issue is substantially edited after triage, is size/priority revisited, or is triage once-only?
-- **Label naming.** `priority:high` groups and filters better; the existing house style is hyphenated (`in-progress`, `ci-cd`). Pick one and apply it to all six new labels.
-- **Claim comment shape.** Edit a single claim comment in place, or append one per dispatch and accept the timeline?
+
+Resolved during implementation — see "Decisions taken during implementation" above:
+
+- ~~**Label naming.**~~ Settled: hyphenated.
+- ~~**Claim comment shape.**~~ Settled: append one per dispatch, never edit in place.
