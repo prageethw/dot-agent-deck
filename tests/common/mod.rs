@@ -4612,6 +4612,14 @@ impl DaemonProc {
             .unwrap_or(false)
     }
 
+    /// The full captured daemon stderr as of now (empty string if unreadable).
+    /// Unlike [`stderr_contains`], this lets a caller extract and compare
+    /// specific rendered lines (e.g. PRD #421's per-cause skip-reason text)
+    /// rather than only checking a loose substring.
+    pub fn stderr_text(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
     /// Poll the captured daemon stderr until it contains `needle` or a bounded
     /// timeout elapses.
     pub fn wait_for_stderr_contains(&self, needle: &str, timeout: Duration) -> bool {

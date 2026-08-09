@@ -55,7 +55,13 @@ use spec::spec;
 ///   - `repo clone <repo> <dest>` → `git clone <key>/remote <dest>` (the local
 ///     fixture remote becomes the clone's `origin`).
 const GH_STUB_SCRIPT: &str = r#"#!/bin/sh
-# Synthetic `gh` for PRD #120 issue_dispatch L2 tests — fully offline.
+# Synthetic `gh` for PRD #120/#421 issue_dispatch L2 tests — fully offline.
+# PRD #421: every invocation is recorded verbatim (before any parsing below)
+# to $GHSTUB_DIR/gh-calls.log, so tests can assert on WHAT gh was asked to do
+# (e.g. an `issue edit --add-label in-progress` call) without needing a new
+# Rust type for the not-yet-implemented label/comment writes.
+printf '%s\n' "$*" >> "$GHSTUB_DIR/gh-calls.log" 2>/dev/null || true
+
 group="$1"
 sub="$2"
 shift 2 2>/dev/null || true
@@ -67,12 +73,23 @@ if [ "$group" = "repo" ] && [ "$sub" = "clone" ]; then
     exec git clone --quiet "$GHSTUB_DIR/$key/remote" "$dest"
 fi
 
+# PRD #421: label-write (`issue edit --add-label ...`) / claim-comment
+# (`issue comment ...`) calls — already recorded above; accepted
+# unconditionally since no canned response is needed.
+if [ "$group" = "issue" ]; then
+    case "$sub" in
+        edit|comment) exit 0 ;;
+    esac
+fi
+
 repo=""
 head=""
+issue_num=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --repo) shift; repo="$1" ;;
         --head) shift; head="$1" ;;
+        [0-9]*) issue_num="$1" ;;
         *) ;;
     esac
     shift
@@ -81,6 +98,19 @@ key=$(printf '%s' "$repo" | tr '/' '_')
 
 if [ "$group" = "issue" ] && [ "$sub" = "list" ]; then
     cat "$GHSTUB_DIR/$key/issues.json"
+    exit 0
+fi
+
+# PRD #421: a per-issue `gh issue view` fixture, for a label/comment
+# read-back mechanism that queries per-issue instead of (or in addition to)
+# embedding `labels`/`comments` fields in the `issue list` response above —
+# whichever M1.2 uses, this stub serves consistent canned data either way.
+if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
+    if [ -f "$GHSTUB_DIR/$key/issue-$issue_num.json" ]; then
+        cat "$GHSTUB_DIR/$key/issue-$issue_num.json"
+    else
+        printf '{"number":%s,"labels":[],"comments":[]}\n' "$issue_num"
+    fi
     exit 0
 fi
 
@@ -188,6 +218,56 @@ impl GhStub {
             format!("[{body}]\n"),
         )
         .expect("write issues.json");
+    }
+
+    /// PRD #421: like [`set_issues`] but each issue carries its own label set
+    /// (possibly empty), so a test can pre-seed a label GitHub already carries
+    /// (applied by a human, another tool, or a prior deck) rather than one this
+    /// deck just wrote. The labels are embedded in BOTH the `gh issue list`
+    /// response (a `labels` field per item) and a per-issue `gh issue view`
+    /// fixture (`issue-<n>.json`, also carrying an empty `comments` array) —
+    /// M1.2's exact read mechanism isn't decided yet, so both plausible shapes
+    /// are served identically.
+    fn set_issues_with_labels(&self, repo: &str, entries: &[(u64, &[&str])]) {
+        let labels_json = |labels: &[&str]| {
+            labels
+                .iter()
+                .map(|l| format!("{{\"name\":\"{l}\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let body = entries
+            .iter()
+            .map(|(n, labels)| format!("{{\"number\":{n},\"labels\":[{}]}}", labels_json(labels)))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            self.repo_dir(repo).join("issues.json"),
+            format!("[{body}]\n"),
+        )
+        .expect("write issues.json with labels");
+        for (n, labels) in entries {
+            std::fs::write(
+                self.repo_dir(repo).join(format!("issue-{n}.json")),
+                format!(
+                    "{{\"number\":{n},\"labels\":[{}],\"comments\":[]}}\n",
+                    labels_json(labels)
+                ),
+            )
+            .expect("write issue-<n>.json fixture");
+        }
+    }
+
+    /// PRD #421: every `gh` invocation recorded so far (one line per call, in
+    /// call order), so a test can assert on WHAT `gh` was asked to do — e.g.
+    /// that `issue edit --add-label in-progress` was (or was never) invoked —
+    /// without needing a new Rust type for a write path that doesn't exist yet.
+    fn gh_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("gh-calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Make `gh pr list --head agent/issue-<n>` report an open PR (skip signal).
@@ -1207,5 +1287,387 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     assert!(
         paths.clone_dir.is_dir(),
         "the clone must be preserved (no re-clone)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD #421 Phase 1 — the `in-progress` claim (RED tests)
+// ---------------------------------------------------------------------------
+
+/// A `.dot-agent-deck.toml` whose orchestration role names a binary that does
+/// not exist on `PATH`, so `spawn`'s `spawn_command` fails synchronously on
+/// exec resolution — a deterministic spawn failure with no timing/race
+/// dependency (unlike a shell-wrapped command, a single bare word is exec'd
+/// directly, so Rust's `std::process::Command::spawn()` surfaces the ENOENT
+/// as an `Err` before this stub script or any shell is ever involved).
+const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
+     [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"dad-nonexistent-binary-421\"\nstart = true\n";
+
+/// Scenario: Fire an `issue_dispatch` task for one open issue with no other
+/// claim signal present. After the dispatch succeeds (worktree + orchestrator
+/// agent present, as in `scheduler/dispatch/001`), the stub `gh` log must show
+/// an `issue edit ... --add-label in-progress` invocation for the issue AND an
+/// `issue comment` invocation whose body names the claiming task
+/// (`ScheduledTask.name`, the scheduler-side claimant per PRD #421). Neither
+/// call exists in today's code, so this is RED.
+#[spec("scheduler/dispatch/010")]
+#[test]
+fn dispatch_010_success_writes_label_and_claim_comment() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "the dispatch must succeed (precondition for a label/comment write)"
+    );
+
+    let labelled = common::wait_until(Duration::from_secs(10), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("edit")
+                && l.contains("--add-label")
+                && l.contains("in-progress")
+                && l.contains('7')
+        })
+    });
+    assert!(
+        labelled,
+        "a successful dispatch must write the `in-progress` label via `gh issue edit --add-label in-progress`; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let commented = common::wait_until(Duration::from_secs(5), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("dispatch-task"))
+    });
+    assert!(
+        commented,
+        "a successful dispatch must post a claim comment naming the claiming task (`dispatch-task`); observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task against a fixture repo whose
+/// orchestration role names a nonexistent binary, so worktree creation
+/// succeeds but the spawn step fails deterministically. Assert the run
+/// surfaces an `IssueDispatchFailed` for the issue, and that the stub `gh`
+/// log carries no `issue edit`/`issue comment` invocation for it — a failed
+/// dispatch must leave the issue completely unmarked (PRD #421 risk
+/// mitigation: a false claim on a failed dispatch would make the issue
+/// permanently un-dispatchable once the label is read back as a signal).
+#[spec("scheduler/dispatch/014")]
+#[test]
+fn dispatch_014_failed_spawn_leaves_issue_unmarked() {
+    let stub = GhStub::new();
+    let repo = "acme/failing";
+    let fixture = stub.repo_dir(repo);
+    std::fs::create_dir_all(&fixture).expect("create failing-spawn fixture dir");
+    init_remote_with_orch_toml(&fixture.join("remote"), Some(FAILING_ORCH_TOML));
+    stub.set_issues(repo, &[9]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 9);
+    assert!(
+        common::wait_for_path(&paths.worktree_dir, W),
+        "the worktree is created BEFORE the spawn attempt, so it must exist even though the spawn itself fails"
+    );
+
+    let failed = common::wait_until(Duration::from_secs(10), || {
+        daemon.stderr_contains("issue #9") && daemon.stderr_contains("failed")
+    });
+    assert!(
+        failed,
+        "the nonexistent-binary orchestrator role must fail the spawn, surfaced as an IssueDispatchFailed for issue 9; observed stderr:\n{}",
+        daemon.stderr_text()
+    );
+
+    let stray_calls: Vec<String> = stub
+        .gh_calls()
+        .into_iter()
+        .filter(|l| l.contains("issue") && (l.contains("edit") || l.contains("comment")))
+        .collect();
+    assert!(
+        stray_calls.is_empty(),
+        "a FAILED dispatch must leave the issue completely unmarked — no `gh issue edit`/`gh issue comment` call may ever be made for it; observed gh calls: {stray_calls:?}"
+    );
+}
+
+/// Scenario: Seed the stub so issue 7 already carries an `in-progress` label
+/// (via [`GhStub::set_issues_with_labels`], covering both a plausible
+/// list-embedded and a per-issue-view read mechanism) with NO worktree on
+/// disk and NO open PR — the label is the only claim signal present. Fire the
+/// task and assert the issue is SKIPPED (no worktree ever created), even
+/// though today's `dispatch_decision` only consults the worktree/PR signals
+/// and would otherwise dispatch it. RED until the label is read as a third
+/// idempotency signal (PRD #421 M1.2).
+#[spec("scheduler/dispatch/015")]
+#[test]
+fn dispatch_015_externally_labelled_issue_skips_with_no_other_signal() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues_with_labels(repo, &[(7, &["in-progress"])]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+
+    // Give the (would-be, buggy) dispatch time to run, then assert it did
+    // NOT happen. `wait_until` exits EARLY if the worktree appears (catching
+    // the bug fast); it only waits out the full timeout when the worktree
+    // correctly never appears.
+    let dispatched = common::wait_until(Duration::from_secs(10), || paths.worktree_dir.exists());
+    assert!(
+        !dispatched,
+        "an issue already labelled `in-progress` must be skipped even with no worktree and no open PR (M1.2 third signal), but the worktree was created at {:?}",
+        paths.worktree_dir
+    );
+    assert_eq!(
+        count_orchestrators(&daemon),
+        0,
+        "a labelled issue with no other claim signal must not spawn an orchestrator"
+    );
+}
+
+/// Scenario: Seed issue 7 with an `in-progress` label but NO recorded claim
+/// comment (simulating a human or an external tool applying the label
+/// directly, never through this deck). Fire the task and assert the skip is
+/// surfaced AND its rendered text specifically reports that no claimant was
+/// recorded — distinguishing it from a skip whose claimant IS known. RED
+/// today: the label isn't read at all, so the issue dispatches instead of
+/// skipping, and no "no claimant" text is ever rendered (PRD #421 M1.2 +
+/// claimant reporting).
+#[spec("scheduler/dispatch/016")]
+#[test]
+fn dispatch_016_externally_labelled_issue_skip_reports_no_claimant() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues_with_labels(repo, &[(7, &["in-progress"])]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let skipped_no_claimant = common::wait_until(Duration::from_secs(10), || {
+        daemon.stderr_contains("no claimant")
+    });
+    assert!(
+        skipped_no_claimant,
+        "an issue labelled `in-progress` by a human/external tool (no deck claim comment) must be \
+         skipped, and the skip must report that no claimant was recorded; observed stderr:\n{}",
+        daemon.stderr_text()
+    );
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+    assert!(
+        !paths.worktree_dir.exists(),
+        "the externally-labelled issue must not be dispatched"
+    );
+}
+
+/// Strip the issue-number and branch substrings out of a rendered skip line,
+/// leaving only the shared template — used by `dispatch_017` to prove two
+/// lines are (or aren't) the SAME template independent of which issue they
+/// name.
+fn normalize_skip_line(line: &str, issue: u64, branch: &str) -> String {
+    line.replace(&format!("issue #{issue}"), "issue #N")
+        .replace(branch, "BRANCH")
+}
+
+/// Find the first line of `text` containing `needle`, if any.
+fn find_line_containing<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
+    text.lines().find(|l| l.contains(needle))
+}
+
+/// Scenario: Drive THREE of PRD #421's four skip causes in one repo — issue 31
+/// (worktree-exists, via a re-fire), issue 32 (an open PR), issue 33 (a
+/// pre-seeded `in-progress` label, both other signals absent) — and assert
+/// their rendered skip lines are pairwise distinguishable (with the
+/// issue-number/branch stripped out, so two causes can't appear "distinct"
+/// merely because they name different issues). Today's `StderrNotifier`
+/// renders every `IssueDispatchSkipped` identically regardless of cause, and
+/// the label cause doesn't even skip (dispatches instead) — so this is RED
+/// until BOTH the label read-back (M1.2) and a per-cause reason (M1.3) land.
+///
+/// Does not assert: the fourth cause (a concurrent creator winning the
+/// `git worktree add` TOCTOU race) — see the tester's report; it has no
+/// deterministic black-box trigger in this harness.
+#[spec("scheduler/dispatch/017")]
+#[test]
+fn dispatch_017_skip_causes_render_distinguishably() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues_with_labels(repo, &[(31, &[]), (32, &[]), (33, &["in-progress"])]);
+    stub.set_open_pr(repo, 32);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    let p31 = derive_issue_paths(Path::new(&work_str), "dispatch-task", 31);
+
+    // First fire: 31 has no signal (dispatches, proving the flow ran); 32 is
+    // skipped (open PR — cause B); 33 is skipped POST-FIX (label — cause C),
+    // captured now BEFORE a second fire could ever give it a worktree too.
+    daemon.run_now("dispatch-task").expect("run-now (first)");
+    assert!(
+        common::wait_for_path(&p31.worktree_dir, W),
+        "issue 31 (no signal) must dispatch — the proxy for 'the first fire completed'"
+    );
+    let snapshot_1 = daemon.stderr_text();
+    let line_b = find_line_containing(&snapshot_1, "issue #32").unwrap_or_default();
+    let line_c = find_line_containing(&snapshot_1, "issue #33").unwrap_or_default();
+
+    // Second fire: 31's worktree now exists → skipped (cause A). Captured from
+    // the DELTA past snapshot_1 so it can't be confused with any line already
+    // seen (stderr is append-only).
+    daemon.run_now("dispatch-task").expect("run-now (second)");
+    let cause_a_seen = common::wait_until(Duration::from_secs(10), || {
+        daemon.stderr_text()[snapshot_1.len()..].contains("issue #31")
+    });
+    assert!(
+        cause_a_seen,
+        "a re-fire with issue 31's worktree present must surface a skip for it; observed stderr:\n{}",
+        daemon.stderr_text()
+    );
+    let snapshot_2 = daemon.stderr_text();
+    let delta_2 = &snapshot_2[snapshot_1.len()..];
+    let line_a = find_line_containing(delta_2, "issue #31").unwrap_or_default();
+
+    // Each cause must actually have rendered SOMETHING — the label cause (C)
+    // is the one expected to be empty today (M1.2 missing), which is exactly
+    // the RED this test pins.
+    assert!(
+        !line_a.is_empty(),
+        "expected a skip line for cause A (worktree exists, issue #31); stderr:\n{}",
+        daemon.stderr_text()
+    );
+    assert!(
+        !line_b.is_empty(),
+        "expected a skip line for cause B (open PR, issue #32); stderr:\n{}",
+        daemon.stderr_text()
+    );
+    assert!(
+        !line_c.is_empty(),
+        "expected a skip line for cause C (in-progress label, issue #33) — RED until M1.2 reads \
+         the label as a third idempotency signal; stderr:\n{}",
+        daemon.stderr_text()
+    );
+
+    let norm_a = normalize_skip_line(line_a, 31, "agent/issue-31");
+    let norm_b = normalize_skip_line(line_b, 32, "agent/issue-32");
+    let norm_c = normalize_skip_line(line_c, 33, "agent/issue-33");
+    assert_ne!(
+        norm_a, norm_b,
+        "cause A (worktree exists) and cause B (open PR) must render distinguishably; both \
+         currently read: {norm_a:?}"
+    );
+    assert_ne!(
+        norm_a, norm_c,
+        "cause A (worktree exists) and cause C (in-progress label) must render distinguishably; \
+         both currently read: {norm_a:?}"
+    );
+    assert_ne!(
+        norm_b, norm_c,
+        "cause B (open PR) and cause C (in-progress label) must render distinguishably; both \
+         currently read: {norm_b:?}"
     );
 }

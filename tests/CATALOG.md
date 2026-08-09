@@ -3828,6 +3828,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/010 — A successful dispatch writes the `in-progress` label on the issue and posts exactly one claim comment naming the claiming task (PRD #421 M1.0/M1.1 — RED, the write path does not exist yet).
+- **Layer:** L2 (as `scheduler/dispatch/001`). The stub `gh` records every invocation verbatim to `$GHSTUB_DIR/gh-calls.log` (before any argv parsing), and unconditionally accepts `issue edit`/`issue comment` calls — no canned response is needed since the tests assert on WHAT `gh` was asked to do, not on read-back state.
+- **Agent:** none (run-now; observes the dispatched orchestrator agent + the stub's recorded `gh` invocations).
+- **Asserts:** after a successful dispatch (worktree + orchestrator agent present, as in `scheduler/dispatch/001`), the recorded `gh` calls include an `issue edit ... --add-label in-progress` for the issue AND an `issue comment` whose body names the claiming task (`ScheduledTask.name`, the scheduler-side claimant per PRD #421's two-write-point split).
+- **Does not assert:** the exact claimant-comment format (instance id / host / timestamp) beyond the task name — those fields are the coder's implementation choice, not dictated here; the human-orchestration (`Instance{id,name}`) claimant write point, out of this task's scope.
+- **Note:** RED today — neither `gh issue edit` nor `gh issue comment` is ever invoked by current code.
+- **Platform coverage:** mac+linux.
+
 ##### scheduler/dispatch/011 — A fired `issue_dispatch` task surfaces its per-issue card LIVE on an already-attached TUI — the user-visible showcase (and demo-reel clip) the headless `scheduler/dispatch/001-009` family can't observe (PRD #120 M2.3 live surfacing).
 - **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/live/*`, NOT the headless `daemon serve` of `scheduler/dispatch/001-009`). Composes the OFFLINE GitHub seam (stub `gh` on PATH: `issue list`/`pr list` → canned JSON, `repo clone` → `git clone` of a local one-commit fixture remote with NO `.dot-agent-deck.toml`) with the live-fire seam (`DOT_AGENT_DECK_SCHEDULES` loaded by the lazily-spawned daemon; fire via the `RunNow` control message over the deck's attach socket). The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; `default_command = cat` (via `DOT_AGENT_DECK_CONFIG`) makes the dispatched single-agent card a long-lived `cat`.
 - **Agent:** none (run-now; the dispatched single-agent card runs `cat`, no real LLM, no real GitHub).
@@ -3849,6 +3857,35 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** REAL Claude Code (Haiku) ×2 role panes, cheap interactive turns (<$0.05/run). Flaky-tolerant pre-PR tier (real LLM + real network) — run once, not looped (rule 4). Runtime-skipped (Decision 26) when the `claude` CLI/credentials or `GITHUB_TOKEN` are absent.
 - **Asserts:** after the fire the daemon registers the dispatched orchestration's role agents under the schedule name `github-issues` (precondition — proves the live clone + worktree + spawn happened); the dispatched ORCHESTRATION then surfaces LIVE as an orchestration TAB labelled `issue-work` (the fixture's `[[orchestrations]] name`) in the attached TUI's tab strip, with no reconnect/relaunch — RED today, because `spawn::spawn`'s orchestration branch does not call `surface_spawned_pane` and orchestration tabs are rebuilt only at hydration, so the role panes appear only as flat dashboard cards and no `issue-work` tab paints live. Best-effort (once GREEN, logged not gated): switching to the orchestration tab, the worker (delegated to by the orchestrator) lists the cloned repo's files including the committed sentinel `DISPATCH_E2E_SENTINEL.md`; and the fixture repo has no pushed `agent/issue-1` branch afterward (NO REMOTE WRITES).
 - **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/014 — A dispatch whose spawn FAILS leaves the issue completely unmarked — no label, no comment (PRD #421 M1.0 risk mitigation: a false claim on a failed dispatch would make the issue permanently un-dispatchable once the label is read back).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the fixture remote's orchestration role names a nonexistent binary (`dad-nonexistent-binary-421`, a single bare word so it is exec'd directly with no shell), so `spawn`'s `spawn_command` fails synchronously on exec resolution — deterministic, no timing/race dependency).
+- **Agent:** none (run-now; observes the created-then-orphaned worktree, the surfaced `IssueDispatchFailed`, and the stub's recorded `gh` invocations).
+- **Asserts:** the worktree is created (it precedes the spawn attempt) but the spawn fails and is surfaced as an `IssueDispatchFailed` for the issue; the stub's recorded `gh` calls carry NO `issue edit`/`issue comment` invocation for it.
+- **Does not assert:** N/A.
+- **Note:** RED-today caveat — since PRD #421's label/comment writes do not exist in ANY code path yet (not just the failure path), the "no label/comment" half of this assertion is vacuously true today, exactly like `scheduler/dispatch/012`'s own "GREEN as a regression guard, not RED-first" note. The `IssueDispatchFailed`-surfaces half IS newly exercised (a nonexistent-binary spawn failure has no prior coverage). This test earns its RED-vs-GREEN status once M1.0 lands: it must go GREEN if the coder writes the label AFTER a successful spawn, and stay a meaningful guard against a coder who (wrongly) writes it before checking spawn's result.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/015 — An issue already labelled `in-progress` is skipped even with BOTH other signals absent (no worktree on disk, no open PR) — the label read as a third idempotency signal (PRD #421 M1.2, RED until the label is read back).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub seeds the label via BOTH a `labels` field in the `gh issue list` response and a per-issue `gh issue view` fixture — `GhStub::set_issues_with_labels` — since M1.2's read mechanism is not yet decided and the test must not dictate it).
+- **Agent:** none (run-now; observes the (absence of an) on-disk worktree + orchestrator count).
+- **Asserts:** an issue pre-labelled `in-progress`, with no worktree and no open PR, is never dispatched (no worktree created, no orchestrator spawned) — proving the label alone excludes it.
+- **Does not assert:** the claimant-reporting text on the skip (covered by `scheduler/dispatch/016`); which of the two served read mechanisms (list-embedded vs. per-issue view) M1.2 actually uses.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/016 — An issue labelled `in-progress` by a human/external tool (no deck claim comment) skips identically to a deck-made claim, and the skip specifically reports that no claimant was recorded (PRD #421 M1.2 + claimant reporting, RED until both land).
+- **Layer:** L2 (as `scheduler/dispatch/015`; the seeded per-issue `gh issue view` fixture carries an empty `comments` array, so no claim comment is discoverable for the issue).
+- **Agent:** none (run-now; observes daemon stderr for the skip's rendered reason + the absent worktree).
+- **Asserts:** the skip is surfaced and its rendered text contains "no claimant" (loose substring), distinguishing an externally-applied label from one this deck itself claimed; the issue is not dispatched.
+- **Does not assert:** the exact claimant-known skip wording for comparison (covered by `scheduler/dispatch/017`'s distinctness check, using its own issue); the mechanism by which comments are queried.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/017 — Three of PRD #421's four skip causes (worktree exists, open PR, `in-progress` label) render DISTINGUISHABLY from one another — no two collapse to the same text once the issue number/branch are normalized out (PRD #421 M1.2 + M1.3, RED until both land).
+- **Layer:** L2 (as `scheduler/dispatch/001`; three issues in one repo — 31 no signal, 32 an open PR, 33 pre-labelled `in-progress` — fired twice: the first fire dispatches 31 (proving the flow ran) and skips 32/33; the second re-fires so 31's now-present worktree yields the worktree-exists cause. Each cause's rendered stderr line is captured, issue-number/branch stripped via `normalize_skip_line`, and compared pairwise).
+- **Agent:** none (run-now ×2; observes daemon stderr, diffed against a pre-second-fire snapshot so lines are unambiguously attributed to a specific fire).
+- **Asserts:** a skip line is rendered for EACH of the three causes (the label cause, issue 33, is the one expected to be silent today — RED); once normalized, no two of the three causes' rendered text are equal.
+- **Does not assert:** the fourth cause — a concurrent creator winning the `git worktree add` TOCTOU race (`WorktreeCreation::AlreadyClaimed` in `issue_dispatch_run.rs`) — deliberately left uncovered: it has no deterministic black-box trigger through this harness (forcing it needs either genuine concurrent fires racing on real subprocess timing, which cannot be tuned without a local test run this fork's tests forbid, or a production-side test seam this role may not add). Flagged to the orchestrator rather than guessed at.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi
