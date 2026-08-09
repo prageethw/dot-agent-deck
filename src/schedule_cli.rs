@@ -368,6 +368,7 @@ mod tests {
                 max_per_run: 2,
                 label: Some("agent-eligible".to_string()),
                 query: Some("is:open label:bug".to_string()),
+                triage: false,
             }),
         }
     }
@@ -440,6 +441,7 @@ mod tests {
             max_per_run: 1,
             label: Some("-rf".to_string()),
             query: None,
+            triage: false,
         });
         assert!(add(&mut tasks, args).is_err());
         assert!(tasks.is_empty());

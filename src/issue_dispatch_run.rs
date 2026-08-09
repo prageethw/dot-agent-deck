@@ -64,9 +64,10 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, TabMembership};
 use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
-    Claimant, DispatchDecision, IN_PROGRESS_LABEL, claim_comment_body, derive_issue_paths,
-    dispatch_decision, issue_comment_argv, issue_edit_add_label_argv, issue_list_argv,
-    issue_view_comments_argv, pr_list_for_issue_argv, substitute_issue_number,
+    Claimant, DispatchDecision, IN_PROGRESS_LABEL, TRIAGE_LABELS, claim_comment_body,
+    derive_issue_paths, dispatch_decision, issue_comment_argv, issue_edit_add_label_argv,
+    issue_list_argv, issue_view_comments_argv, label_create_argv, pr_list_for_issue_argv,
+    substitute_issue_number, triage_instruction,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnRequest, spawn};
@@ -241,6 +242,15 @@ pub async fn run_issue_dispatch(
         }
     };
 
+    // PRD #421 M2.0/M2.1 — opt-in: ensure the triage label vocabulary exists on
+    // the repo once per run, before any issue is considered (it's a repo-level
+    // concern, not a per-issue one). Best-effort like `claim_issue`: a `gh`
+    // failure here must not abort the run or turn a later successful dispatch
+    // into a failure.
+    if cfg.triage {
+        ensure_triage_labels(&cfg.repo).await;
+    }
+
     // S2 — `max_per_run` caps the issues CONSIDERED per run (not the number newly
     // dispatched): already-claimed issues inside the cap are skipped, yielding a
     // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
@@ -387,11 +397,20 @@ async fn dispatch_one_issue(
     // re-fire right after a tab close (PRD #120 B1 / dispatch/008) isn't skipped
     // behind the prior run's lingering delivery wait. The worktree-on-disk
     // idempotency signal still serializes overlapping fires safely.
+    // PRD #421 M2.2 — when triage is on, append the triage instruction to the
+    // substituted prompt so the dispatched agent applies its own labels. Only
+    // the issues actually dispatched here ever see it; a skipped issue never
+    // reaches this point.
+    let mut prompt = substitute_issue_number(prompt_template, issue);
+    if cfg.triage {
+        prompt.push_str("\n\n");
+        prompt.push_str(&triage_instruction());
+    }
     let req = SpawnRequest {
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
-        prompt: substitute_issue_number(prompt_template, issue),
+        prompt,
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
         // The spawn failed after the worktree was created/recorded: no agent
@@ -455,6 +474,25 @@ async fn claim_issue(repo: &str, issue: u64, task_name: &str) {
             error = %e,
             "issue-dispatch: failed to post the claim comment"
         );
+    }
+}
+
+/// PRD #421 M2.0: idempotently ensure the triage label vocabulary exists on
+/// `repo`. Best-effort per label, same discipline as [`claim_issue`]: a `gh`
+/// failure on one label is logged and skipped, never propagated — it must not
+/// abort the run, and a run with no labelling failure must never be reported
+/// as one either.
+async fn ensure_triage_labels(repo: &str) {
+    for label in TRIAGE_LABELS {
+        let argv = label_create_argv(repo, label);
+        if let Err(e) = run_status_args("gh", &argv).await {
+            tracing::warn!(
+                repo,
+                label,
+                error = %e,
+                "issue-dispatch: failed to ensure a triage label exists"
+            );
+        }
     }
 }
 

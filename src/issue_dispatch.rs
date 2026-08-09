@@ -458,6 +458,65 @@ pub fn claim_comment_body(claimant: &Claimant, host: &str, timestamp: &str) -> S
     )
 }
 
+// ---------------------------------------------------------------------------
+// PRD #421 M2.0/M2.1/M2.2 — triage label vocabulary + prompt instruction
+// ---------------------------------------------------------------------------
+
+/// The triage label vocabulary (M2.0), settling the PRD's own open
+/// label-naming question, hyphenated to match house style (`in-progress`,
+/// `ci-cd`). The deck ensures these exist (idempotently) and delivers them to
+/// a dispatched agent's prompt when [`crate::config::IssueDispatchConfig::triage`]
+/// is on; the deck itself never applies one to an issue — that is the spawned
+/// agent's job, via its own `gh` calls.
+pub const TRIAGE_LABELS: [&str; 7] = [
+    "priority-high",
+    "priority-medium",
+    "priority-low",
+    "size-high",
+    "size-medium",
+    "size-low",
+    "needs-triage",
+];
+
+/// Build the `gh label create` argv (arguments after `gh`) that idempotently
+/// ensures `label` exists on `repo`. `--force` updates the label in place if
+/// it is already there instead of erroring, which is enough on its own for
+/// idempotency — no separate list-then-create-missing step is needed.
+pub fn label_create_argv(repo: &str, label: &str) -> Vec<String> {
+    vec![
+        "label".to_string(),
+        "create".to_string(),
+        label.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--force".to_string(),
+        // M1: end-of-options marker (see `issue_list_argv`).
+        "--".to_string(),
+    ]
+}
+
+/// The triage instruction appended to a dispatched issue's prompt when triage
+/// is enabled (M2.2): names the full vocabulary and states the uncertainty
+/// rule — under uncertainty, apply `needs-triage` and leave priority unset
+/// rather than guess, because a wrong priority is indistinguishable from a
+/// considered one and so is worse than an absent one. Also notes the
+/// human-present bounded-question option from the PRD, while making clear the
+/// unattended path must never block a scheduled run on a prompt.
+pub fn triage_instruction() -> String {
+    format!(
+        "Triage this issue using the following labels: {labels}. Apply one size label \
+         (`size-high`, `size-medium`, or `size-low`) for how much work it looks like, and one \
+         priority label (`priority-high`, `priority-medium`, or `priority-low`) when you are \
+         confident in the ranking. If you are uncertain or not confident about the priority, \
+         apply `needs-triage` instead and leave priority unset rather than guess — a wrong \
+         priority is worse than no priority at all. If a human is present in this session you \
+         may instead ask a bounded question, e.g. \"priority for #<N>: high, medium, or low?\" \
+         — but never block an unattended, scheduled run on a prompt: apply `needs-triage` and \
+         continue.",
+        labels = TRIAGE_LABELS.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
