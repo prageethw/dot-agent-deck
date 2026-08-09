@@ -1397,33 +1397,80 @@ const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// to make the failure mode disappear.
 pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Issue #424 round 2 (auditor A3 / reviewer S3): floor/ceiling for
+/// [`spawn_readiness_buffer`]'s env override, mirroring the idiom this
+/// file's own doc already claimed to follow (`spawn::session_start_wait_
+/// timeout`, `src/spawn.rs`) but never actually applied — the override was
+/// unclamped. `=0` reopens both holes this PR closes: the readiness buffer
+/// itself, and the 10s-fallback path (`timeout_ready` in
+/// `deliver_orchestrator_prompt`) that now waits out the SAME buffer via
+/// `should_inject_spawn_time_prompt`'s `Some` arm. A value above the
+/// ceiling risks pushing the first write past [`AUTOMATIC_PROMPT_DEADLINE`]
+/// (60s) so the prompt is silently never written at all — 30s leaves a
+/// full deadline's worth of room for the write itself, one retry, and a
+/// hook round trip.
+const SPAWN_READINESS_BUFFER_MIN: std::time::Duration = std::time::Duration::from_millis(50);
+const SPAWN_READINESS_BUFFER_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Upstream #424 finding #1 — env override for [`SPAWN_TIME_READINESS_BUFFER`],
 /// in milliseconds via `DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS`. Falls back
 /// to `SPAWN_TIME_READINESS_BUFFER` when unset or not a valid non-negative
 /// integer, mirroring `spawn::reuse_debounce`'s / `spawn::session_start_wait_
-/// timeout`'s override idiom (parse, warn-and-default on a bad value).
+/// timeout`'s override idiom (parse, warn-and-default on a bad value) and,
+/// per issue #424 round 2, that idiom's clamp too (`[SPAWN_READINESS_BUFFER_
+/// MIN, SPAWN_READINESS_BUFFER_MAX]`).
 ///
 /// This is insurance, not the fix: raising a fixed buffer against an
 /// unbounded quantity (MCP server count, hook payload size, machine load)
 /// only moves the cliff further out — see finding #2's confirm-before-clear
 /// change, which is what actually converts a timing miss into a retry
 /// instead of a silent loss.
+///
+/// Issue #424 round 2 (auditor A7): this is read from `deliver_orchestrator_
+/// prompt` on every render frame (~62 Hz) while a role prompt is pending, so
+/// unlike `session_start_wait_timeout` (called once per spawn) a `warn!` on
+/// every call would flood `deck.log` with thousands of identical lines for
+/// the lifetime of one misconfigured orchestration. The env var itself is
+/// re-read and re-parsed on every call (existing behavior, pinned by
+/// `spawn_readiness_buffer_parses_env_override_default_and_invalid`, which
+/// flips the value mid-test and expects each call to see the new one) — only
+/// the WARN is deduplicated, via a process-lifetime "already told you" flag
+/// per failure kind, not the parse itself.
 pub fn spawn_readiness_buffer() -> std::time::Duration {
+    static INVALID_VALUE_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static OUT_OF_RANGE_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     let default = SPAWN_TIME_READINESS_BUFFER;
     let Ok(raw) = std::env::var("DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS") else {
         return default;
     };
     let Ok(ms) = raw.trim().parse::<u64>() else {
-        tracing::warn!(
-            value = %raw,
-            default_ms = default.as_millis(),
-            "DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS is not a valid \
-             non-negative integer number of milliseconds; using the default \
-             spawn readiness buffer"
-        );
+        if !INVALID_VALUE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                value = %raw,
+                default_ms = default.as_millis(),
+                "DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS is not a valid \
+                 non-negative integer number of milliseconds; using the default \
+                 spawn readiness buffer"
+            );
+        }
         return default;
     };
-    std::time::Duration::from_millis(ms)
+    let requested = std::time::Duration::from_millis(ms);
+    let clamped = requested.clamp(SPAWN_READINESS_BUFFER_MIN, SPAWN_READINESS_BUFFER_MAX);
+    if clamped != requested && !OUT_OF_RANGE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            requested_ms = requested.as_millis(),
+            clamped_ms = clamped.as_millis(),
+            min_ms = SPAWN_READINESS_BUFFER_MIN.as_millis(),
+            max_ms = SPAWN_READINESS_BUFFER_MAX.as_millis(),
+            "DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS is out of range; clamped"
+        );
+    }
+    clamped
 }
 
 /// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
@@ -1514,6 +1561,52 @@ struct PromptDelivery {
     delivery_id: String,
 }
 
+/// Issue #424 round 2: replaces the bare `std::time::Instant` round 1 stored
+/// in `orchestration_awaiting_confirmation` — that Instant was written and
+/// never read, so "confirmed" was a LEVEL sample of `SessionStatus::Thinking`
+/// with no happened-after relationship to the write (a stale/unrelated
+/// `Thinking` — boot-time misclassification, `permission.replied`,
+/// `PostCompact`, see `src/hook.rs:124,128,376-383,388` — confirmed
+/// anything). This carries what the check actually needs.
+#[derive(Clone, Copy)]
+struct AwaitingConfirmation {
+    /// When the write currently awaiting confirmation landed. Read by the
+    /// retry gate below to enforce [`CONFIRMATION_GRACE_PERIOD`] — the
+    /// Instant's actual use, this round.
+    since: std::time::Instant,
+    /// Was the pane's session ALREADY `Thinking` at the moment THIS write
+    /// landed? If so, an unchanged `Thinking` sample on a later frame is not
+    /// evidence of OUR submit — it predates the write and must never
+    /// confirm it (`orchestration/seed/004`). Captured once, at the first
+    /// write of this confirmation cycle, and carried through any retry.
+    pre_write_thinking: bool,
+    /// Has the one confirmation-retry this cycle is allowed already been
+    /// spent? The ledger backing a real delivery (`AgentPtyRegistry::
+    /// admit_delivery`) grants a same-`delivery_id` retry exactly one fresh
+    /// admission before re-caching; minting a fresh `delivery_id` per retry
+    /// (below) sidesteps that entirely, so this flag is what actually bounds
+    /// automatic retries to one — an unbounded retry loop would otherwise
+    /// resubmit the same prompt roughly every `CONFIRMATION_GRACE_PERIOD`
+    /// for the full 60s deadline, spamming the target with up to ~30
+    /// duplicate submissions instead of the one deliberate retry issue #424
+    /// round 2 asks for.
+    retried: bool,
+}
+
+/// Issue #424 round 2 (`orchestration/seed/006`): the plausible upper bound
+/// for a hook round trip on a loaded machine — the machines issue #424
+/// reproduces on. Reused for two purposes that are really the same bound
+/// wearing two hats: [`send_retry_delay`]'s existing exponential-backoff cap
+/// (unchanged at 2s — this just gives that cap a name and a reason), and the
+/// MINIMUM grace period a landed-but-unconfirmed write (`orchestration_
+/// awaiting_confirmation`) must sit before a confirmation-retry is even
+/// ATTEMPTED. The old code effectively used `send_retry_delay(1)` (500 ms)
+/// as that gate, which is shorter than a hook round trip can plausibly take
+/// under load — and once a same-`delivery_id` retry genuinely reaches the
+/// PTY (`daemon/protocol/002`'s fix), firing it that early duplicates the
+/// seed's execution rather than just wasting an RPC.
+const CONFIRMATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
 /// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
 /// 1 s, then capped at 2 s — so a permanent non-delivery settles into an
@@ -1524,9 +1617,9 @@ struct PromptDelivery {
 /// transition" bound from the finding: it keeps the catch-up latency small.
 fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const BASE_MS: u64 = 500;
-    const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
-    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift))
+        .min(CONFIRMATION_GRACE_PERIOD)
 }
 
 /// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
@@ -1811,9 +1904,13 @@ struct UiState {
     /// delivery, silently losing a CR that landed as a newline in the
     /// agent's input buffer. While an entry is present, `deliver_orchestrator_
     /// prompt` checks for confirmation before finalizing, and re-attempts the
-    /// write (subject to `send_retry_backoff`) if none has arrived. Cleared
-    /// on confirmation, abandonment, or deadline.
-    orchestration_awaiting_confirmation: HashMap<TabId, std::time::Instant>,
+    /// write (subject to `send_retry_backoff` and, issue #424 round 2,
+    /// [`CONFIRMATION_GRACE_PERIOD`] plus a one-retry budget — see
+    /// [`AwaitingConfirmation`]) if none has arrived. Cleared on
+    /// confirmation, abandonment, or deadline (round 2: a deadline reached
+    /// with an entry present finalizes as delivered-unconfirmed, not
+    /// abandoned — see `orchestration/seed/005`).
+    orchestration_awaiting_confirmation: HashMap<TabId, AwaitingConfirmation>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
     /// PRD #127 M3.1: mode `seed_prompt`s waiting for their agent pane to be
@@ -3307,6 +3404,37 @@ fn abandon_orchestrator_prompt(
     ui.status_message = Some((msg, now));
 }
 
+/// Issue #424 round 2: finalize an orchestrator role prompt as successfully
+/// DELIVERED — either a submit was genuinely observed for it (confirmed), or
+/// the deadline was reached after a write had genuinely landed
+/// (delivered-unconfirmed, `orchestration/seed/005`). Both mark the role
+/// `Working` — matching what `main` reported for a single successful
+/// delivery, never "not delivered" or "abandoned" — and close the re-entry
+/// gate. `status_message` is `Some` only for the unconfirmed case; a genuine
+/// confirmation doesn't need to say anything new.
+#[allow(clippy::too_many_arguments)]
+fn finalize_orchestrator_prompt_delivered(
+    ui: &mut UiState,
+    tab_id: TabId,
+    start_pane_id: &str,
+    orchestrator_prompt: &mut Option<String>,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    start_role_index: usize,
+    now: std::time::Instant,
+    status_message: Option<String>,
+) {
+    *orchestrator_prompt = None;
+    role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+    ui.orchestration_prompted.insert(tab_id);
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
+    ui.orchestration_awaiting_confirmation.remove(&tab_id);
+    if let Some(msg) = status_message {
+        ui.status_message = Some((msg, now));
+    }
+}
+
 /// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
 /// orchestrator start-role prompt for ONE orchestration tab. Extracted from the
 /// render loop with an INJECTED `now` so the deadline / terminal-outcome policy
@@ -3338,6 +3466,35 @@ fn deliver_orchestrator_prompt(
         .get(&tab_id)
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
+        // Issue #424 round 2 (`orchestration/seed/005`): a write that
+        // genuinely LANDED (an `orchestration_awaiting_confirmation` entry
+        // exists) must not be reported as loss just because a submit was
+        // never independently confirmed — bytes reached the PTY, which is
+        // exactly what `main` reported as success for a single delivery. Only
+        // a tab with NO landed write at all (no entry) is genuinely abandoned.
+        if ui.orchestration_awaiting_confirmation.contains_key(&tab_id) {
+            tracing::warn!(
+                pane_id = %start_pane_id,
+                tab_id,
+                "orchestrator prompt: deadline reached with a landed write still \
+                 unconfirmed; reporting delivered-unconfirmed rather than abandoning"
+            );
+            finalize_orchestrator_prompt_delivered(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                role_statuses,
+                start_role_index,
+                now,
+                Some(
+                    "Orchestrator prompt delivered but unconfirmed (no submit \
+                     observed before timeout)"
+                        .to_string(),
+                ),
+            );
+            return;
+        }
         tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
         abandon_orchestrator_prompt(
             ui,
@@ -3360,24 +3517,38 @@ fn deliver_orchestrator_prompt(
     // NO further write attempt; if still unconfirmed, fall through so the
     // write is retried like any other non-terminal outcome — "bytes written"
     // alone must never again be the last thing that happens to this prompt.
-    if ui.orchestration_awaiting_confirmation.contains_key(&tab_id) {
-        let confirmed = snapshot.sessions.values().any(|s| {
-            s.pane_id.as_deref() == Some(start_pane_id.as_str())
-                && s.status == SessionStatus::Thinking
-        });
+    //
+    // Issue #424 round 2 (`orchestration/seed/004`): `Thinking` alone is a
+    // LEVEL sample with no happened-after relationship to the write — a
+    // pre-existing `Thinking` (boot-time misclassification, `permission.
+    // replied`, `PostCompact`/`PostCompaction`; see `src/hook.rs:124,128,
+    // 376-383,388`) would otherwise confirm a write that never happened. Gate
+    // on `!pre_write_thinking`, captured once at the write that started this
+    // confirmation cycle: if the pane was ALREADY `Thinking` at that instant,
+    // an unchanged `Thinking` sample can never confirm it (there was no
+    // transition to attribute to us).
+    if let Some(awaiting) = ui.orchestration_awaiting_confirmation.get(&tab_id).copied() {
+        let confirmed = !awaiting.pre_write_thinking
+            && snapshot.sessions.values().any(|s| {
+                s.pane_id.as_deref() == Some(start_pane_id.as_str())
+                    && s.status == SessionStatus::Thinking
+            });
         if confirmed {
             tracing::info!(
                 pane_id = %start_pane_id,
                 tab_id,
                 "orchestrator prompt: delivery confirmed (submit observed)"
             );
-            *orchestrator_prompt = None;
-            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
-            ui.orchestration_prompted.insert(tab_id);
-            ui.send_retry_backoff.remove(start_pane_id.as_str());
-            ui.prompt_delivery.remove(start_pane_id.as_str());
-            ui.orchestration_ready_since.remove(&tab_id);
-            ui.orchestration_awaiting_confirmation.remove(&tab_id);
+            finalize_orchestrator_prompt_delivered(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                role_statuses,
+                start_role_index,
+                now,
+                None,
+            );
             return;
         }
     }
@@ -3406,7 +3577,19 @@ fn deliver_orchestrator_prompt(
         .send_retry_backoff
         .get(start_pane_id.as_str())
         .is_some_and(|s| now < s.next_attempt_at);
-    if !((agent_ready || timeout_ready) && buffer_elapsed && !backed_off) {
+    // Issue #424 round 2 (`orchestration/seed/006`): a write already landed
+    // and is awaiting confirmation — a confirmation-RETRY, not the original
+    // write. Hold it for `CONFIRMATION_GRACE_PERIOD` (longer than a
+    // plausible hook round trip) past `awaiting.since`, and never attempt
+    // more than the one retry this cycle budgets (`awaiting.retried`) — see
+    // [`AwaitingConfirmation`] for why an unbounded retry loop would spam
+    // the target with duplicate submissions instead.
+    let awaiting = ui.orchestration_awaiting_confirmation.get(&tab_id).copied();
+    let confirmation_retry_blocked = awaiting
+        .is_some_and(|a| a.retried || now.duration_since(a.since) < CONFIRMATION_GRACE_PERIOD);
+    if !((agent_ready || timeout_ready) && buffer_elapsed && !backed_off)
+        || confirmation_retry_blocked
+    {
         return;
     }
 
@@ -3414,6 +3597,24 @@ fn deliver_orchestrator_prompt(
     // captured at tab creation; capture lazily here only if that didn't happen.
     if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
         capture_prompt_delivery(ui, &start_pane_id, pane);
+    }
+    // Issue #424 round 2 (`daemon/protocol/002`): a confirmation-retry (an
+    // `awaiting` entry already exists — the check above already confirmed
+    // it is past its grace period and unspent) must NOT reuse the delivery_id
+    // the original write minted. The daemon's ledger
+    // (`AgentPtyRegistry::admit_delivery`) caches a completed `Applied`/
+    // `Queued` outcome by that id, so a same-id retry answers from cache and
+    // never reaches the PTY at all — the defect this round exists to fix.
+    // Minting a fresh id makes this retry a genuinely NEW admission: it is
+    // issued only here, after the confirmation check above found no submit,
+    // past the grace period, holding the SAME expected agent/session
+    // identity — a DELIBERATE retry, distinguishable from an accidental
+    // duplicate precisely by how it is gated, not by silently reusing
+    // whatever id happens to be on file.
+    if awaiting.is_some()
+        && let Some(existing) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
+    {
+        existing.delivery_id = mint_delivery_id(&start_pane_id);
     }
     let (expected_agent_id, expected_session_id, delivery_id) =
         match ui.prompt_delivery.get(start_pane_id.as_str()) {
@@ -3451,7 +3652,28 @@ fn deliver_orchestrator_prompt(
                 result = describe_send_result(result),
                 "orchestrator prompt: write applied; awaiting submit confirmation"
             );
-            ui.orchestration_awaiting_confirmation.insert(tab_id, now);
+            // Issue #424 round 2: `pre_write_thinking` is captured ONCE, at
+            // the first write of this confirmation cycle, and carried
+            // through the one retry the cycle budgets — a retry's own
+            // baseline must stay whatever it was before ANY write in this
+            // cycle, not get reset to "currently Thinking" on the retry
+            // itself. `retried` becomes `true` the moment this write is
+            // itself the retry (an entry already existed), spending the
+            // cycle's one-retry budget.
+            let pre_write_thinking = awaiting.map(|a| a.pre_write_thinking).unwrap_or_else(|| {
+                snapshot.sessions.values().any(|s| {
+                    s.pane_id.as_deref() == Some(start_pane_id.as_str())
+                        && s.status == SessionStatus::Thinking
+                })
+            });
+            ui.orchestration_awaiting_confirmation.insert(
+                tab_id,
+                AwaitingConfirmation {
+                    since: now,
+                    pre_write_thinking,
+                    retried: awaiting.is_some(),
+                },
+            );
             schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
         }
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
@@ -27304,6 +27526,10 @@ mod tests {
     /// parses a valid override, falls back to `SPAWN_TIME_READINESS_BUFFER`
     /// when unset, and falls back the same way (rather than panicking or
     /// propagating an error) on a non-numeric value.
+    ///
+    /// Issue #424 round 2 (auditor A3): also pins the clamp — `=0` must not
+    /// re-open the readiness-buffer hole this PR closes, and an absurdly
+    /// large value must not push delivery past `AUTOMATIC_PROMPT_DEADLINE`.
     #[test]
     fn spawn_readiness_buffer_parses_env_override_default_and_invalid() {
         // Serialize against any other test reading this process-global env var.
@@ -27340,6 +27566,28 @@ mod tests {
             spawn_readiness_buffer(),
             SPAWN_TIME_READINESS_BUFFER,
             "a non-numeric override must fall back to the default, not panic"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "0");
+        }
+        assert_eq!(
+            spawn_readiness_buffer(),
+            SPAWN_READINESS_BUFFER_MIN,
+            "0 must clamp to the floor, not re-open the readiness-buffer hole \
+             this PR closes"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "86400000");
+        }
+        assert_eq!(
+            spawn_readiness_buffer(),
+            SPAWN_READINESS_BUFFER_MAX,
+            "an absurd value must clamp to the ceiling, not push the first \
+             write past AUTOMATIC_PROMPT_DEADLINE"
         );
 
         // SAFETY: same lock; restore.
