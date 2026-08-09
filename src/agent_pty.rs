@@ -3116,46 +3116,26 @@ impl AgentPtyRegistry {
     ///   guard, so a concurrent duplicate blocks and replays this attempt's
     ///   result instead of double-submitting.
     ///
-    /// Issue #424 round 2 (`daemon/protocol/002`): a cached `Applied`/`Queued`
-    /// result used to replay FOREVER — the right protection for the ledger's
-    /// original scenario (a caller's own RPC response got lost in transit and
-    /// it immediately re-asks), but wrong for a caller that deliberately asks
-    /// AGAIN later because it independently knows the write was never
-    /// confirmed (issue #424's seed-delivery retry). Phase 1 now CONSUMES a
-    /// complete (`Applied`/`Queued`) result on replay: this read still
-    /// answers from cache (protecting the one immediate accidental
-    /// duplicate), but clears it, so the NEXT distinct call for this id is a
-    /// genuinely fresh admission rather than being silently swallowed for the
-    /// full 60s deadline. `Ambiguous` is deliberately EXCLUDED — a partial
-    /// write must never be blind-retried (it could duplicate whatever already
-    /// landed), so it stays cached until something makes an explicit
-    /// decision about it (mirrors `is_terminal_send_result` in `src/ui.rs`,
-    /// which already never auto-retries `Ambiguous`).
-    ///
-    /// Phase 3's post-lock recheck below deliberately does NOT consume: it
-    /// exists to protect genuinely CONCURRENT duplicates racing on the same
-    /// single-flight lock, and consuming there would let a third concurrent
-    /// caller proceed to a real second write once a second one had already
-    /// replayed — reopening exactly the double-submission this ledger exists
-    /// to prevent. Consuming is safe only in Phase 1, where each caller is a
-    /// separate, sequential top-level call (a genuine retry), not a
-    /// concurrent race.
+    /// Issue #424 round 2: `deliver_orchestrator_prompt`'s confirmation retry
+    /// mints a FRESH `delivery_id` per attempt (`src/ui.rs`), so a deliberate
+    /// re-ask never presents an id the ledger has already completed — it
+    /// never reaches the replay branch below at all. A cached `Applied`/
+    /// `Queued`/`Ambiguous` result therefore replays FOREVER, as PRD #20
+    /// R20-004 built it: the only caller that legitimately reuses a
+    /// `delivery_id` after completion is one whose own RPC response was lost
+    /// in transit, and it must keep replaying no matter how many times it
+    /// re-asks, or a second lost response after a same-id retry produces a
+    /// genuine duplicate write to the PTY.
     pub async fn admit_delivery(&self, delivery_id: &str, fingerprint: u64) -> DeliveryAdmission {
         // Phase 1 (sync): immediate replay/conflict check + get-or-create the
         // per-id single-flight lock.
         let lock = {
             let mut ledger = self.delivery_ledger.lock().unwrap();
-            if let Some(rec) = ledger.records.get_mut(delivery_id) {
+            if let Some(rec) = ledger.records.get(delivery_id) {
                 if rec.fingerprint != fingerprint {
                     return DeliveryAdmission::Conflict;
                 }
                 if let Some(result) = rec.result {
-                    if matches!(
-                        result,
-                        crate::event::SendResult::Applied | crate::event::SendResult::Queued
-                    ) {
-                        rec.result = None;
-                    }
                     ledger.touch(delivery_id);
                     return DeliveryAdmission::Replay(result);
                 }

@@ -1579,33 +1579,51 @@ struct AwaitingConfirmation {
     /// evidence of OUR submit — it predates the write and must never
     /// confirm it (`orchestration/seed/004`). Captured once, at the first
     /// write of this confirmation cycle, and carried through any retry.
+    /// Issue #424 round 3 (reviewer F3): cleared on a FALLING edge (the pane
+    /// observed NOT `Thinking`) so a genuinely later `Thinking` can still
+    /// confirm — see the check in `deliver_orchestrator_prompt`.
     pre_write_thinking: bool,
     /// Has the one confirmation-retry this cycle is allowed already been
-    /// spent? The ledger backing a real delivery (`AgentPtyRegistry::
-    /// admit_delivery`) grants a same-`delivery_id` retry exactly one fresh
-    /// admission before re-caching; minting a fresh `delivery_id` per retry
-    /// (below) sidesteps that entirely, so this flag is what actually bounds
-    /// automatic retries to one — an unbounded retry loop would otherwise
-    /// resubmit the same prompt roughly every `CONFIRMATION_GRACE_PERIOD`
-    /// for the full 60s deadline, spamming the target with up to ~30
-    /// duplicate submissions instead of the one deliberate retry issue #424
-    /// round 2 asks for.
+    /// spent? Minting a fresh `delivery_id` per retry (below) means the
+    /// daemon's ledger (`AgentPtyRegistry::admit_delivery`) can never dedupe
+    /// a confirmation-retry against the original write, so this flag is what
+    /// actually bounds automatic retries to one — an unbounded retry loop
+    /// would otherwise resubmit the same prompt roughly every
+    /// `CONFIRMATION_GRACE_PERIOD` for the full 60s deadline, spamming the
+    /// target with up to ~30 duplicate submissions instead of the one
+    /// deliberate retry issue #424 round 2 asks for. Issue #424 round 3
+    /// (reviewer F6 / auditor M1): set the moment a retry is ATTEMPTED, not
+    /// only when its outcome is observed as `Applied`/`Queued` — a lost
+    /// response or a retryable outcome must spend the budget too, or the
+    /// next frame mints yet another fresh id the ledger has never seen.
     retried: bool,
 }
 
 /// Issue #424 round 2 (`orchestration/seed/006`): the plausible upper bound
 /// for a hook round trip on a loaded machine — the machines issue #424
-/// reproduces on. Reused for two purposes that are really the same bound
-/// wearing two hats: [`send_retry_delay`]'s existing exponential-backoff cap
-/// (unchanged at 2s — this just gives that cap a name and a reason), and the
-/// MINIMUM grace period a landed-but-unconfirmed write (`orchestration_
-/// awaiting_confirmation`) must sit before a confirmation-retry is even
-/// ATTEMPTED. The old code effectively used `send_retry_delay(1)` (500 ms)
-/// as that gate, which is shorter than a hook round trip can plausibly take
-/// under load — and once a same-`delivery_id` retry genuinely reaches the
-/// PTY (`daemon/protocol/002`'s fix), firing it that early duplicates the
-/// seed's execution rather than just wasting an RPC.
+/// reproduces on. This is the MINIMUM grace period a landed-but-unconfirmed
+/// write (`orchestration_awaiting_confirmation`) must sit before a
+/// confirmation-retry is even ATTEMPTED. The old code effectively used
+/// `send_retry_delay(1)` (500 ms) as that gate, which is shorter than a hook
+/// round trip can plausibly take under load — and once a same-`delivery_id`
+/// retry genuinely reaches the PTY (`daemon/protocol/002`'s fix), firing it
+/// that early duplicates the seed's execution rather than just wasting an
+/// RPC.
+///
+/// Issue #424 round 3 (reviewer F9 / auditor N1): this used to alias
+/// [`SEND_RETRY_BACKOFF_CAP`] — one constant serving two genuinely
+/// independent knobs that happen to want the same 2s today. They move in
+/// opposite directions under pressure (raising this to accommodate slower
+/// hooks should not silently lengthen the backoff cap for the unrelated
+/// mode-seed path, and vice versa), so they are now two names for the same
+/// value rather than one name doing two jobs.
 const CONFIRMATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Issue #424 round 3 (reviewer F9 / auditor N1): the exponential-backoff
+/// cap for [`send_retry_delay`], split out from [`CONFIRMATION_GRACE_PERIOD`]
+/// — see that constant's doc for why. Same value (2s) as of this writing;
+/// that is a coincidence, not an invariant, so retune either independently.
+const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
 /// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
@@ -1619,7 +1637,7 @@ fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const BASE_MS: u64 = 500;
     let shift = attempts.saturating_sub(1).min(6);
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift))
-        .min(CONFIRMATION_GRACE_PERIOD)
+        .min(SEND_RETRY_BACKOFF_CAP)
 }
 
 /// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
@@ -3528,11 +3546,26 @@ fn deliver_orchestrator_prompt(
     // an unchanged `Thinking` sample can never confirm it (there was no
     // transition to attribute to us).
     if let Some(awaiting) = ui.orchestration_awaiting_confirmation.get(&tab_id).copied() {
-        let confirmed = !awaiting.pre_write_thinking
-            && snapshot.sessions.values().any(|s| {
-                s.pane_id.as_deref() == Some(start_pane_id.as_str())
-                    && s.status == SessionStatus::Thinking
-            });
+        let pane_thinking = snapshot.sessions.values().any(|s| {
+            s.pane_id.as_deref() == Some(start_pane_id.as_str())
+                && s.status == SessionStatus::Thinking
+        });
+        let confirmed = !awaiting.pre_write_thinking && pane_thinking;
+        // Issue #424 round 3 (reviewer F3): a `pre_write_thinking` baseline
+        // predates this write and must never confirm it — but it must not
+        // poison the ENTIRE 60s cycle either. Clear it on a FALLING edge (the
+        // pane observed NOT `Thinking`): any `Thinking` after that point is
+        // unambiguously new and free to confirm a later, genuine submit
+        // (e.g. Thinking → Idle → Thinking, the OpenCode boot-misclassification
+        // case `orchestration/seed/004` exists to defend against). A baseline
+        // whose status never changes — `seed/004`'s own fixture — never sees a
+        // falling edge, so it stays poisoned for the cycle exactly as before.
+        if awaiting.pre_write_thinking
+            && !pane_thinking
+            && let Some(entry) = ui.orchestration_awaiting_confirmation.get_mut(&tab_id)
+        {
+            entry.pre_write_thinking = false;
+        }
         if confirmed {
             tracing::info!(
                 pane_id = %start_pane_id,
@@ -3611,10 +3644,22 @@ fn deliver_orchestrator_prompt(
     // identity — a DELIBERATE retry, distinguishable from an accidental
     // duplicate precisely by how it is gated, not by silently reusing
     // whatever id happens to be on file.
-    if awaiting.is_some()
-        && let Some(existing) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
-    {
-        existing.delivery_id = mint_delivery_id(&start_pane_id);
+    if awaiting.is_some() {
+        if let Some(existing) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+            existing.delivery_id = mint_delivery_id(&start_pane_id);
+        }
+        // Issue #424 round 3 (reviewer F6 / auditor M1): spend the cycle's
+        // one-retry budget the moment a confirmation-retry is ATTEMPTED, not
+        // only when its outcome is observed as `Applied`/`Queued` below. A
+        // retry whose response is lost, or that lands a retryable
+        // (`NoLiveTarget`/`Stale`/`HistoryOnly`) or `Err` outcome, must not
+        // leave `retried` at `false` — otherwise the very next frame
+        // re-attempts under yet another fresh `delivery_id` the ledger has
+        // never seen and so cannot dedupe against, up to ~30 times before
+        // the deadline.
+        if let Some(entry) = ui.orchestration_awaiting_confirmation.get_mut(&tab_id) {
+            entry.retried = true;
+        }
     }
     let (expected_agent_id, expected_session_id, delivery_id) =
         match ui.prompt_delivery.get(start_pane_id.as_str()) {
@@ -3679,7 +3724,40 @@ fn deliver_orchestrator_prompt(
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
         // retry); a RETRYABLE liveness transition is retried under backoff,
         // bounded by the deadline checked at the top of this function.
+        //
+        // Issue #424 round 3 (reviewer F5): a terminal outcome on the
+        // CONFIRMATION-RETRY (e.g. an `Ambiguous` partial write) must not
+        // report loss when an EARLIER write in this same cycle already
+        // landed — `orchestration_awaiting_confirmation` holding the tab is
+        // exactly that fact. Abandoning here would tell the user "not
+        // delivered; abandoned" and leave the role at `Waiting` while the
+        // agent is genuinely working, the same false-loss report
+        // `orchestration/seed/005` exists to prevent on the deadline path.
         Ok(other) if is_terminal_send_result(other) => {
+            if ui.orchestration_awaiting_confirmation.contains_key(&tab_id) {
+                tracing::warn!(
+                    pane_id = %start_pane_id,
+                    tab_id,
+                    result = describe_send_result(other),
+                    "orchestrator prompt: confirmation-retry hit a terminal outcome \
+                     after an earlier write landed; reporting delivered-unconfirmed \
+                     rather than abandoning"
+                );
+                finalize_orchestrator_prompt_delivered(
+                    ui,
+                    tab_id,
+                    &start_pane_id,
+                    orchestrator_prompt,
+                    role_statuses,
+                    start_role_index,
+                    now,
+                    Some(format!(
+                        "Orchestrator prompt delivered but unconfirmed (retry {})",
+                        describe_send_result(other)
+                    )),
+                );
+                return;
+            }
             abandon_orchestrator_prompt(
                 ui,
                 tab_id,
