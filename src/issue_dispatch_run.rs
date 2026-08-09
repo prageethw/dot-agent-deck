@@ -12,15 +12,19 @@
 //!      clone is verified to be the right repo by its `origin` before being
 //!      touched (L3, fail-closed), and a refresh failure on it is non-fatal —
 //!      the run continues with the refs already on disk (S3).
-//!   2. enumerate the repo's open issues (`gh issue list`), capping at
-//!      `max_per_run` **in code** on the returned order — the issue list may
-//!      ignore `--limit`.
+//!   2. enumerate the repo's open issues (`gh issue list --json number,labels`),
+//!      capping at `max_per_run` **in code** on the returned order — the issue
+//!      list may ignore `--limit`. PRD #421 M1.2: the `labels` field rides along
+//!      on this ALREADY-MADE call, so the third idempotency signal below costs
+//!      no extra `gh` invocation for an issue that isn't labelled. See
+//!      [`list_open_issues`] / [`OpenIssue`].
 //!   3. **M2.2 + PRD #421 M1.2** — for each issue, decide dispatch-vs-skip from
 //!      the three idempotency signals (per-issue worktree already on disk; an
 //!      open PR whose head is `agent/issue-<n>`; the `in-progress` label,
 //!      honoured regardless of who applied it) via
-//!      [`crate::issue_dispatch::dispatch_decision`]. See [`read_issue_label_state`]
-//!      for the label/claimant read-back.
+//!      [`crate::issue_dispatch::dispatch_decision`]. Only when the label IS
+//!      present does a further `gh issue view --json comments` run, to look up
+//!      the claimant for the skip's rendered text — see [`fetch_claim_comment`].
 //!   4. **M2.2 / M2.3** — on dispatch, create the per-issue worktree on
 //!      `agent/issue-<n>` (creating the branch with `-b`, or attaching a branch
 //!      left behind by an earlier closed-without-PR run — B1) and [`spawn`] one
@@ -62,7 +66,7 @@ use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
     Claimant, DispatchDecision, IN_PROGRESS_LABEL, claim_comment_body, derive_issue_paths,
     dispatch_decision, issue_comment_argv, issue_edit_add_label_argv, issue_list_argv,
-    issue_view_argv, pr_list_for_issue_argv, substitute_issue_number,
+    issue_view_comments_argv, pr_list_for_issue_argv, substitute_issue_number,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnRequest, spawn};
@@ -249,7 +253,8 @@ pub async fn run_issue_dispatch(
             prompt_template,
             cfg,
             default_command.as_deref(),
-            issue,
+            issue.number,
+            issue.in_progress_label,
             &clone_dir,
             registry,
             worktrees,
@@ -261,7 +266,7 @@ pub async fn run_issue_dispatch(
             notifier.notify(NotifyEvent::IssueDispatchFailed {
                 task: task_name.to_string(),
                 repo: cfg.repo.clone(),
-                issue,
+                issue: issue.number,
                 message,
             });
         }
@@ -279,6 +284,7 @@ async fn dispatch_one_issue(
     cfg: &IssueDispatchConfig,
     default_command: Option<&str>,
     issue: u64,
+    label_in_progress: bool,
     clone_dir: &Path,
     registry: &Arc<AgentPtyRegistry>,
     worktrees: &WorktreeRegistry,
@@ -321,24 +327,30 @@ async fn dispatch_one_issue(
 
     // TERTIARY (PRD #421 M1.2) — the `in-progress` label, honoured regardless
     // of who applied it (human, external tool, another deck, or this one — no
-    // "is this my own claim?" comparison exists). A `gh` failure here
-    // propagates the same way the PR check's does, for the same reason:
-    // silently reading a failed read-back as "no label → dispatch" risks a
-    // duplicate dispatch.
-    let label_state = read_issue_label_state(&cfg.repo, issue).await?;
-
-    if dispatch_decision(worktree_exists, open_pr, label_state.in_progress)
-        == DispatchDecision::Skip
-    {
-        let reason = if open_pr {
-            SkipReason::OpenPr
-        } else {
-            SkipReason::Labelled {
-                claimant: label_state.claimant,
-            }
-        };
-        notify_skip(reason);
-        return Ok(());
+    // "is this my own claim?" comparison exists). `label_in_progress` already
+    // came for free off the `gh issue list --json number,labels` call this
+    // flow already made (see `list_open_issues`/`OpenIssue`) — no extra `gh`
+    // invocation, and critically, no NEW `gh` subcommand for an unlabelled
+    // issue to fail on.
+    match dispatch_decision(worktree_exists, open_pr, label_in_progress) {
+        DispatchDecision::Skip if open_pr => {
+            notify_skip(SkipReason::OpenPr);
+            return Ok(());
+        }
+        DispatchDecision::Skip => {
+            // The only remaining cause: the `in-progress` label (worktree_exists
+            // already returned above, open_pr is false in this arm). Only NOW —
+            // once we already know we are skipping — does a further `gh issue
+            // view --json comments` run, to look up the claimant for the
+            // rendered text (PRD #421 M1.3). Best-effort: a failure here must
+            // not turn an already-correct SKIP decision into a per-issue
+            // failure, so it degrades to "no claimant recorded" rather than
+            // propagating.
+            let claimant = fetch_claim_comment(&cfg.repo, issue).await;
+            notify_skip(SkipReason::Labelled { claimant });
+            return Ok(());
+        }
+        DispatchDecision::Dispatch => {}
     }
 
     // M2.2 — create the per-issue worktree on `agent/issue-<n>`. A concurrent
@@ -446,45 +458,30 @@ async fn claim_issue(repo: &str, issue: u64, task_name: &str) {
     }
 }
 
-/// PRD #421 M1.2/M1.3: parsed result of `gh issue view --json labels,comments`
-/// — the third idempotency signal (whether `in-progress` is already applied,
-/// regardless of who applied it) plus, when the label is present, whether the
-/// deck's own claim comment is discoverable among the issue's comments (used
-/// to distinguish a deck-made claim from one a human/external tool applied
-/// directly — `dispatch/016`'s "no claimant" text).
-struct IssueLabelState {
-    in_progress: bool,
-    claimant: Option<String>,
-}
-
 /// The literal prefix [`claim_comment_body`] always produces — used to
 /// recognize the deck's OWN claim comment among an issue's comments, as
 /// opposed to any other comment a human left.
 const CLAIM_COMMENT_PREFIX: &str = "Claimed by ";
 
-/// Read `issue`'s labels/comments via `gh issue view` and parse the M1.2/M1.3
-/// signal out of them.
-async fn read_issue_label_state(repo: &str, issue: u64) -> Result<IssueLabelState, String> {
-    let argv = issue_view_argv(repo, issue);
-    let stdout = run_capture("gh", &argv).await?;
-    parse_issue_label_state(&stdout)
+/// PRD #421 M1.3: look up the deck's own claim comment for an issue already
+/// known to carry the `in-progress` label — called ONLY from the label-skip
+/// arm of `dispatch_one_issue`, i.e. only when a skip is already decided.
+/// Best-effort: a `gh` failure here must not turn an already-correct SKIP
+/// decision into a per-issue failure, so any error degrades to `None` ("no
+/// claimant recorded") rather than propagating.
+async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<String> {
+    let argv = issue_view_comments_argv(repo, issue);
+    let stdout = run_capture("gh", &argv).await.ok()?;
+    parse_claim_comment(&stdout).ok().flatten()
 }
 
-/// Pure parse of `gh issue view --json labels,comments` output. Split out from
-/// [`read_issue_label_state`] so the JSON-shape logic is unit-testable without
-/// a subprocess.
-fn parse_issue_label_state(json: &str) -> Result<IssueLabelState, String> {
+/// Pure parse of `gh issue view --json comments` output into the deck's own
+/// claim-comment text, if discoverable. Split out from [`fetch_claim_comment`]
+/// so the JSON-shape logic is unit-testable without a subprocess.
+fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
-    let in_progress = value
-        .get("labels")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|labels| {
-            labels.iter().any(|l| {
-                l.get("name").and_then(serde_json::Value::as_str) == Some(IN_PROGRESS_LABEL)
-            })
-        });
-    let claimant = value
+    Ok(value
         .get("comments")
         .and_then(serde_json::Value::as_array)
         .and_then(|comments| {
@@ -493,11 +490,7 @@ fn parse_issue_label_state(json: &str) -> Result<IssueLabelState, String> {
                 .filter_map(|c| c.get("body").and_then(serde_json::Value::as_str))
                 .find(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
                 .map(str::to_string)
-        });
-    Ok(IssueLabelState {
-        in_progress,
-        claimant,
-    })
+        }))
 }
 
 /// Best-effort local hostname for the claim-comment body (PRD #421 M1.1) —
@@ -693,8 +686,19 @@ fn github_owner_name(origin: &str) -> Option<String> {
     ))
 }
 
-/// Enumerate the repo's open issue numbers in returned order.
-async fn list_open_issues(cfg: &IssueDispatchConfig) -> Result<Vec<u64>, String> {
+/// One entry from `gh issue list --json number,labels`: the issue number and
+/// whether it already carries the `in-progress` label (PRD #421 M1.2's list-
+/// embedded read mechanism — see `issue_list_argv`'s doc comment for why this
+/// rides along on the enumeration call rather than a separate `gh issue view`
+/// per candidate).
+struct OpenIssue {
+    number: u64,
+    in_progress_label: bool,
+}
+
+/// Enumerate the repo's open issues (number + `in-progress` label presence) in
+/// returned order.
+async fn list_open_issues(cfg: &IssueDispatchConfig) -> Result<Vec<OpenIssue>, String> {
     let argv = issue_list_argv(
         &cfg.repo,
         cfg.max_per_run,
@@ -702,7 +706,7 @@ async fn list_open_issues(cfg: &IssueDispatchConfig) -> Result<Vec<u64>, String>
         cfg.query.as_deref(),
     );
     let stdout = run_capture("gh", &argv).await?;
-    parse_issue_numbers(&stdout)
+    parse_open_issues(&stdout)
 }
 
 /// The secondary idempotency signal: whether an open PR's head is
@@ -715,7 +719,7 @@ async fn issue_has_open_pr(repo: &str, issue: u64) -> Result<bool, String> {
 
 /// N1: parse `gh pr list --json number` into "is there an open PR?". Malformed
 /// output (invalid JSON, or valid JSON that is NOT an array) PROPAGATES as an
-/// error — symmetric with [`parse_issue_numbers`] — so the per-issue boundary
+/// error — symmetric with [`parse_open_issues`] — so the per-issue boundary
 /// skips + logs the issue (fail-safe) rather than silently reading it as "no PR
 /// → dispatch", which would risk a duplicate dispatch.
 fn parse_open_pr_present(json: &str) -> Result<bool, String> {
@@ -938,10 +942,11 @@ fn attempt_worktree_cleanup(clone_dir: &Path, worktree_dir: &Path) -> bool {
     removed && !worktree_dir.exists()
 }
 
-/// Parse a `gh issue list --json number` array into issue numbers, in order.
-/// Entries missing a numeric `number` are skipped rather than failing the whole
-/// parse.
-fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
+/// Parse a `gh issue list --json number,labels` array into [`OpenIssue`]s, in
+/// order. Entries missing a numeric `number` are skipped rather than failing
+/// the whole parse; a missing/empty `labels` array (or one that doesn't name
+/// `in-progress`) reads as not-labelled.
+fn parse_open_issues(json: &str) -> Result<Vec<OpenIssue>, String> {
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("failed to parse `gh issue list` JSON: {e}"))?;
     let arr = value
@@ -949,7 +954,21 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
         .ok_or_else(|| "`gh issue list` did not return a JSON array".to_string())?;
     Ok(arr
         .iter()
-        .filter_map(|item| item.get("number").and_then(serde_json::Value::as_u64))
+        .filter_map(|item| {
+            let number = item.get("number").and_then(serde_json::Value::as_u64)?;
+            let in_progress_label = item
+                .get("labels")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|labels| {
+                    labels.iter().any(|l| {
+                        l.get("name").and_then(serde_json::Value::as_str) == Some(IN_PROGRESS_LABEL)
+                    })
+                });
+            Some(OpenIssue {
+                number,
+                in_progress_label,
+            })
+        })
         .collect())
 }
 
@@ -1232,62 +1251,62 @@ mod tests {
     use spec::spec;
 
     #[test]
-    fn parse_issue_numbers_reads_number_field_in_order() {
-        let json = r#"[{"number":7},{"number":8},{"number":3}]"#;
-        assert_eq!(parse_issue_numbers(json).unwrap(), vec![7, 8, 3]);
+    fn parse_open_issues_reads_number_and_labels_in_order() {
+        let json = r#"[{"number":7},{"number":8,"labels":[{"name":"in-progress"}]},{"number":3}]"#;
+        let issues = parse_open_issues(json).unwrap();
+        let got: Vec<(u64, bool)> = issues
+            .iter()
+            .map(|i| (i.number, i.in_progress_label))
+            .collect();
+        assert_eq!(got, vec![(7, false), (8, true), (3, false)]);
     }
 
     #[test]
-    fn parse_issue_numbers_empty_array() {
-        assert_eq!(parse_issue_numbers("[]\n").unwrap(), Vec::<u64>::new());
+    fn parse_open_issues_empty_array() {
+        assert!(parse_open_issues("[]\n").unwrap().is_empty());
     }
 
     #[test]
-    fn parse_issue_numbers_rejects_non_array() {
-        assert!(parse_issue_numbers("{}").is_err());
-        assert!(parse_issue_numbers("not json").is_err());
-    }
-
-    // --- PRD #421 M1.2/M1.3: `gh issue view` label/comment parsing ---
-
-    #[test]
-    fn parse_issue_label_state_no_label_no_comments() {
-        let state = parse_issue_label_state(r#"{"labels":[],"comments":[]}"#).unwrap();
-        assert!(!state.in_progress);
-        assert_eq!(state.claimant, None);
+    fn parse_open_issues_rejects_non_array() {
+        assert!(parse_open_issues("{}").is_err());
+        assert!(parse_open_issues("not json").is_err());
     }
 
     #[test]
-    fn parse_issue_label_state_labelled_no_claim_comment() {
-        // A human/external tool applied the label directly — the label is
-        // present but no comment matches the deck's own claim-comment prefix.
-        let json = r#"{"labels":[{"name":"in-progress"}],"comments":[{"body":"unrelated"}]}"#;
-        let state = parse_issue_label_state(json).unwrap();
-        assert!(state.in_progress);
-        assert_eq!(state.claimant, None);
+    fn parse_open_issues_other_labels_present_but_not_in_progress() {
+        let json = r#"[{"number":9,"labels":[{"name":"bug"},{"name":"priority:high"}]}]"#;
+        let issues = parse_open_issues(json).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(!issues[0].in_progress_label);
+    }
+
+    // --- PRD #421 M1.3: `gh issue view --json comments` claimant parsing ---
+
+    #[test]
+    fn parse_claim_comment_no_comments() {
+        assert_eq!(parse_claim_comment(r#"{"comments":[]}"#).unwrap(), None);
     }
 
     #[test]
-    fn parse_issue_label_state_labelled_with_claim_comment() {
-        let json = r#"{"labels":[{"name":"in-progress"}],"comments":[{"body":"Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z."}]}"#;
-        let state = parse_issue_label_state(json).unwrap();
-        assert!(state.in_progress);
+    fn parse_claim_comment_unrelated_comment_only() {
+        // A human/external tool applied the label directly — some comment may
+        // exist, but none matches the deck's own claim-comment prefix.
+        let json = r#"{"comments":[{"body":"unrelated"}]}"#;
+        assert_eq!(parse_claim_comment(json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_claim_comment_finds_deck_claim() {
+        let json = r#"{"comments":[{"body":"unrelated"},{"body":"Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z."}]}"#;
         assert_eq!(
-            state.claimant.as_deref(),
+            parse_claim_comment(json).unwrap().as_deref(),
             Some("Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z.")
         );
     }
 
     #[test]
-    fn parse_issue_label_state_other_labels_present_but_not_in_progress() {
-        let json = r#"{"labels":[{"name":"bug"},{"name":"priority:high"}],"comments":[]}"#;
-        let state = parse_issue_label_state(json).unwrap();
-        assert!(!state.in_progress);
-    }
-
-    #[test]
-    fn parse_issue_label_state_rejects_non_object() {
-        assert!(parse_issue_label_state("not json").is_err());
+    fn parse_claim_comment_rejects_non_object() {
+        assert!(parse_claim_comment("not json").is_err());
     }
 
     #[test]

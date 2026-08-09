@@ -118,10 +118,14 @@ pub fn sanitize_clone_segment(name: &str) -> String {
 /// Build the `gh issue list` argv — the arguments AFTER the `gh` program, i.e.
 /// what the fire-time flow passes to `Command::new("gh").args(..)`.
 ///
-/// Always lists OPEN issues as JSON carrying at least the issue `number`, capped
-/// at `max_per_run`. Appends `--label <label>` when a label filter is set and
-/// `--search <query>` when a raw query override is set; both are independent and
-/// omitted when `None` (the default = all open issues up to the cap).
+/// Always lists OPEN issues as JSON carrying the issue `number` AND `labels`,
+/// capped at `max_per_run`. `labels` rides along on this ALREADY-MADE call
+/// (PRD #421 M1.2) rather than costing a separate `gh issue view` per
+/// candidate — the read-back mechanism the PRD's catalog notes is
+/// deliberately left to the coder, and this is the one that costs nothing
+/// extra. Appends `--label <label>` when a label filter is set and
+/// `--search <query>` when a raw query override is set; both are independent
+/// and omitted when `None` (the default = all open issues up to the cap).
 pub fn issue_list_argv(
     repo: &str,
     max_per_run: usize,
@@ -136,7 +140,7 @@ pub fn issue_list_argv(
         "--state".to_string(),
         "open".to_string(),
         "--json".to_string(),
-        "number".to_string(),
+        "number,labels".to_string(),
         "--limit".to_string(),
         max_per_run.to_string(),
     ];
@@ -398,9 +402,11 @@ pub fn issue_comment_argv(repo: &str, issue: u64, body: &str) -> Vec<String> {
 }
 
 /// Build the `gh issue view` argv (arguments after `gh`) that reads back an
-/// issue's labels and comments — the M1.2 third idempotency signal and, when
-/// the `in-progress` label is present, the M1.3 claimant lookup.
-pub fn issue_view_argv(repo: &str, issue: u64) -> Vec<String> {
+/// issue's comments — the M1.3 claimant lookup, called ONLY once the
+/// `in-progress` label is already known present (from the `gh issue list`
+/// response `issue_list_argv` requests — see its doc comment), so an
+/// unlabelled issue never triggers this call at all.
+pub fn issue_view_comments_argv(repo: &str, issue: u64) -> Vec<String> {
     vec![
         "issue".to_string(),
         "view".to_string(),
@@ -408,7 +414,7 @@ pub fn issue_view_argv(repo: &str, issue: u64) -> Vec<String> {
         "--repo".to_string(),
         repo.to_string(),
         "--json".to_string(),
-        "labels,comments".to_string(),
+        "comments".to_string(),
         // M1: end-of-options marker (see `issue_list_argv`).
         "--".to_string(),
     ]
@@ -585,7 +591,7 @@ mod tests {
                 "--state",
                 "open",
                 "--json",
-                "number",
+                "number,labels",
                 "--limit",
                 "5",
                 "--",
@@ -605,7 +611,7 @@ mod tests {
                 "--state",
                 "open",
                 "--json",
-                "number",
+                "number,labels",
                 "--limit",
                 "3",
                 "--label",
@@ -627,7 +633,7 @@ mod tests {
                 "--state",
                 "open",
                 "--json",
-                "number",
+                "number,labels",
                 "--limit",
                 "10",
                 "--search",
@@ -649,7 +655,7 @@ mod tests {
                 "--state",
                 "open",
                 "--json",
-                "number",
+                "number,labels",
                 "--limit",
                 "2",
                 "--label",
@@ -822,9 +828,9 @@ mod tests {
     }
 
     #[test]
-    fn issue_view_argv_shape() {
+    fn issue_view_comments_argv_shape() {
         assert_eq!(
-            issue_view_argv("acme/widgets", 7),
+            issue_view_comments_argv("acme/widgets", 7),
             vec![
                 "issue",
                 "view",
@@ -832,7 +838,7 @@ mod tests {
                 "--repo",
                 "acme/widgets",
                 "--json",
-                "labels,comments",
+                "comments",
                 "--",
             ]
         );
