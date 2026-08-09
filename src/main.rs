@@ -395,12 +395,15 @@ enum WorktreeCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Remove every worktree that is merged and clean. A worktree the deck
-    /// can PROVE it created (a bare `git worktree add` it ran itself) is
-    /// removed by a bare `reclaim`, no `--yes` needed. One the deck cannot
-    /// prove it created is instead reported as reclaimable-pending-
-    /// confirmation and left alone unless `--yes` is passed — and once
-    /// passed, `--yes` removes it regardless of provenance, exactly like a
+    /// Remove every merged, clean worktree the deck can PROVE it created and
+    /// which holds no gitignored content; list the rest for confirmation. A
+    /// worktree the deck can prove it created (a bare `git worktree add` it
+    /// ran itself), with no gitignored content, is removed by a bare
+    /// `reclaim`, no `--yes` needed. One the deck cannot prove it created,
+    /// OR one that still holds gitignored content (e.g. `target/`, `.env`),
+    /// is instead reported as reclaimable-pending-confirmation and left
+    /// alone unless `--yes` is passed — and once passed, `--yes` removes it
+    /// regardless of provenance or ignored content, exactly like a
     /// deck-created one; the flag is the user vouching for what the pending
     /// report already showed them, not a request for the deck to trust more.
     /// A dirty worktree, an open/closed-unmerged PR, or an unresolvable PR
@@ -1705,16 +1708,17 @@ fn run_worktree_list_cli(json: bool) -> ExitCode {
 }
 
 /// `dot-agent-deck worktree reclaim [--yes]` — PRD #422. Removes every
-/// worktree the gate marks `remove` (deck-owned, merged PR, clean tree)
-/// unconditionally, and — only with `--yes` — also those it marks `ask`
-/// (merged and clean, but the deck cannot prove it created them); once
-/// `--yes` is passed, removal is unconditional on provenance, same as a
-/// deck-created worktree. Without `--yes`, `ask`-verdict worktrees are left
-/// alone and reported as a pending decision that leads the output, naming
-/// their exact paths and the ready-to-copy `--yes` command. Always exits
-/// successfully once it has finished examining and acting on every worktree;
-/// only a failure to enumerate worktrees at all (e.g. not a git repo) is
-/// reported as failure.
+/// worktree the gate marks `remove` (deck-owned, merged PR, clean tree, no
+/// gitignored content) unconditionally, and — only with `--yes` — also those
+/// it marks `ask` (merged and clean, but either the deck cannot prove it
+/// created them or the tree still holds gitignored content); once `--yes` is
+/// passed, removal is unconditional on provenance or ignored content, same
+/// as a deck-created worktree. Without `--yes`, `ask`-verdict worktrees are
+/// left alone and reported as a pending decision that leads the output,
+/// naming their exact paths and the ready-to-copy `--yes` command. Always
+/// exits successfully once it has finished examining and acting on every
+/// worktree; only a failure to enumerate worktrees at all (e.g. not a git
+/// repo) is reported as failure.
 fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
     use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
 
