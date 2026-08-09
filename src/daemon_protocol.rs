@@ -2457,37 +2457,40 @@ mod tests {
         }
     }
 
-    /// Scenario: submit the same shell command through the real delivery
-    /// ledger sequence (`admit_delivery` → `compute_write_and_submit_outcome`
-    /// → `record_delivery_outcome`) twice against a real `/bin/sh` PTY, using
-    /// the SAME `delivery_id` both times — exactly what a retried, unconfirmed
-    /// orchestrator/seed prompt does in production. The first submission must
-    /// land; the second (the retry) must ALSO land, proven by the command's
-    /// own output appearing twice in the PTY's scrollback.
+    /// Scenario: drive the real delivery ledger sequence (`admit_delivery` →
+    /// `compute_write_and_submit_outcome` → `record_delivery_outcome`)
+    /// against a real `/bin/sh` PTY and pin BOTH halves of the contract: a
+    /// retry that reuses the ORIGINAL `delivery_id` must replay forever and
+    /// never reach the PTY a second time (PRD #20 R20-004's guarantee), while
+    /// a retry that mints a FRESH `delivery_id` — what
+    /// `deliver_orchestrator_prompt` (`src/ui.rs`) actually does on every
+    /// confirmation retry — must reach the PTY every time. `/bin/sh` echoes
+    /// each execution's own output into scrollback, so a marker's occurrence
+    /// count is a direct, unambiguous proof of how many times the PTY was
+    /// actually written to — not an RPC count, not a mock's bookkeeping.
     ///
-    /// This is the non-negotiable test for issue #424 round 2: round 1's fix
-    /// (`src/ui.rs`, `deliver_orchestrator_prompt`) holds ONE `delivery_id`
-    /// across every retry of an unconfirmed seed/orchestrator prompt (minted
-    /// once at enqueue, reused until confirmation or the deadline).
-    /// `delivery_fingerprint` (`src/agent_pty.rs`) hashes only
-    /// `(expected_agent_id, pane_id, text)` — identical on every retry — so
-    /// `admit_delivery` finds the SAME record with a matching fingerprint and
-    /// a cached `Applied` result and returns `DeliveryAdmission::Replay`,
-    /// which `daemon_protocol.rs`'s dispatch answers from cache WITHOUT
-    /// calling `compute_write_and_submit_outcome`. The ledger has no TTL, so
-    /// this holds for the entire 60 s deadline: the prompt is written exactly
-    /// once, followed by silent no-op retries, then abandoned as "not
-    /// delivered" — a silent loss became a loud one.
+    /// Issue #424 round 2 corrected: `daemon_protocol_002` previously
+    /// asserted that a SAME-`delivery_id` retry must reach the PTY, and round
+    /// 2 relaxed `admit_delivery` to make that true by having Phase 1
+    /// CONSUME a cached `Applied`/`Queued` result on first replay. Both the
+    /// premise and the fix were wrong: `deliver_orchestrator_prompt` mints a
+    /// fresh `delivery_id` for every retry (`src/ui.rs:3617`), so it never
+    /// takes the relaxed branch at all — the relaxed branch was unreachable
+    /// by the path it was written for. Meanwhile it cost a real guarantee: a
+    /// THIRD admission of the same id, after the second consumed the cache,
+    /// falls through to a genuine second write — one write per `delivery_id`
+    /// forever degraded to two. This test pins the guarantee directly (three
+    /// admissions of the same id, only the first ever reaches the PTY) and
+    /// separately pins the mechanism that actually fixes #424 (a fresh id
+    /// per retry reaches the PTY) so the two are never conflated again.
     ///
-    /// Drives the REAL production sequence (`admit_delivery` /
-    /// `compute_write_and_submit_outcome` / `record_delivery_outcome`, via
-    /// `deliver_with_ledger` above) against a REAL `/bin/sh` PTY spawned
-    /// through `AgentPtyRegistry`, submitting the SAME shell command (so the
-    /// fingerprint is identical, matching a genuine retry) twice with the SAME
-    /// `delivery_id`. `/bin/sh` echoes each execution's output into
-    /// scrollback, so a marker's occurrence count is a direct, unambiguous
-    /// proof of how many times the PTY was actually written to — not an RPC
-    /// count, not a mock's bookkeeping.
+    /// No diagnostic probe: an earlier version of this test called
+    /// `admit_delivery` directly, ahead of the real retry, to assert its
+    /// admission kind. That probe itself CONSUMED the cached `Applied` (the
+    /// same Phase 1 codepath the retry goes through), so the test passed for
+    /// the wrong reason — the probe's own read was what freed the real retry
+    /// to proceed. The scrollback marker count is the only observable this
+    /// test relies on.
     ///
     /// PRD #42 build-windows: spawns a real PTY running `/bin/sh`, which does
     /// not exist on Windows — gated to Unix like its sibling
@@ -2501,19 +2504,18 @@ mod tests {
     #[cfg(unix)]
     #[spec("daemon/protocol/002")]
     #[test]
-    fn daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty() {
+    fn daemon_protocol_002_same_id_retry_replays_fresh_id_retry_reaches_pty() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("build ledger-retry runtime");
-        runtime.block_on(
-            daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty_inner(),
-        );
+        runtime
+            .block_on(daemon_protocol_002_same_id_retry_replays_fresh_id_retry_reaches_pty_inner());
     }
 
     #[cfg(unix)]
-    async fn daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty_inner() {
+    async fn daemon_protocol_002_same_id_retry_replays_fresh_id_retry_reaches_pty_inner() {
         let reg = Arc::new(AgentPtyRegistry::new());
         let pane_id = "pane-ledger-retry-424";
         // `stty -echo` before exec'ing the real shell: with echo ON (the
@@ -2548,14 +2550,6 @@ mod tests {
             expected_agent_id: Some(id.clone()),
             ..Default::default()
         };
-        // A stable command whose OWN output is the delivery marker — run
-        // twice, it must appear in scrollback twice IF (and only if) the PTY
-        // was actually written to twice.
-        let text = "printf 'SEED-424-DELIVERED\\n'";
-        // The SAME `delivery_id` for both attempts: this is exactly what
-        // `deliver_orchestrator_prompt` does — mint once at enqueue, hold and
-        // reuse across every retry until confirmation lands.
-        let delivery_id = "delivery-424-retry";
 
         async fn count_marker(registry: &AgentPtyRegistry, id: &str, marker: &str) -> usize {
             let snap = registry.snapshot(id).expect("snapshot");
@@ -2575,6 +2569,17 @@ mod tests {
             }
             count
         }
+        // Give a wrongly-proceeding admission time to actually reach the PTY
+        // before asserting it did not — the assertion needs to observe a bad
+        // write if one happens, not just outrun it.
+        async fn settled_marker_count(
+            registry: &AgentPtyRegistry,
+            id: &str,
+            marker: &str,
+        ) -> usize {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            count_marker(registry, id, marker).await
+        }
 
         // Wait for `stty -echo` to have applied before writing anything —
         // otherwise the very first submitted command races the mode switch.
@@ -2584,81 +2589,119 @@ mod tests {
             "precondition: the shell must signal readiness (echo disabled) before any write"
         );
 
-        // Attempt 1 — the original write. Must land.
-        let outcome1 = deliver_with_ledger(&reg, &state, pane_id, text, &extras, delivery_id)
+        // --- Half 1: a retry sharing the ORIGINAL delivery_id must replay
+        // forever, never reaching the PTY again (PRD #20 R20-004). Three
+        // admissions of the SAME id, not two: round 2's regression only
+        // shows up on the THIRD — the second consumes the cached result, the
+        // third then finds no cache and proceeds to a real second write.
+        let same_id = "delivery-424-same";
+        let same_marker = "SEED-424-SAME";
+        let same_text = "printf 'SEED-424-SAME\\n'";
+
+        let outcome1 = deliver_with_ledger(&reg, &state, pane_id, same_text, &extras, same_id)
             .await
-            .expect("first attempt (transport)");
+            .expect("same-id attempt 1 (the original write)");
         assert_eq!(
             outcome1,
             crate::event::SendResult::Applied,
-            "precondition: the first attempt must actually land"
+            "precondition: the original write must actually land"
         );
-        let count_after_first = wait_for_marker_count(&reg, &id, "SEED-424-DELIVERED", 1).await;
+        let count_after_first = wait_for_marker_count(&reg, &id, same_marker, 1).await;
         assert_eq!(
             count_after_first, 1,
-            "precondition: the first attempt's output must reach scrollback exactly once"
+            "precondition: the original write's output must reach scrollback exactly once"
         );
 
-        // Diagnostic, ahead of attempt 2: probe `admit_delivery` DIRECTLY
-        // (not through `deliver_with_ledger`) so the ledger's admission kind
-        // is asserted unambiguously, independent of anything the PTY/echo
-        // does to scrollback. Safe to call as a pure read: a delivery_id
-        // whose cached `result` is already `Some` returns `Replay` in
-        // `admit_delivery`'s Phase 1 with no state change beyond an LRU
-        // `touch` — it does not consume or disturb the record attempt 2
-        // will see.
-        let fingerprint = AgentPtyRegistry::delivery_fingerprint(
-            extras.expected_agent_id.as_deref(),
-            pane_id,
-            text,
-        );
-        match reg.admit_delivery(delivery_id, fingerprint).await {
-            crate::agent_pty::DeliveryAdmission::Replay(replayed) => {
-                assert_eq!(
-                    replayed,
-                    crate::event::SendResult::Applied,
-                    "ledger replay must return the cached Applied outcome"
-                );
-            }
-            crate::agent_pty::DeliveryAdmission::Proceed(_) => {
-                panic!(
-                    "admit_delivery returned Proceed for a delivery_id that already \
-                     cached an Applied outcome — the ledger's replay-on-repeat-id \
-                     behavior did not trigger for this delivery_id/fingerprint pair; \
-                     issue #424 round 2's premise (a same-delivery_id retry is \
-                     silently swallowed) does not hold as written here"
-                );
-            }
-            crate::agent_pty::DeliveryAdmission::Conflict => {
-                panic!(
-                    "admit_delivery returned Conflict for an identical \
-                     (expected_agent_id, pane_id, text) fingerprint — fingerprint \
-                     computation is not as deterministic as assumed"
-                );
-            }
-        }
-
-        // Attempt 2 — the CALLER's retry: same delivery_id, same fingerprint
-        // (identical agent/pane/text), because the confirmation-retry design
-        // holds identity across retries until CONFIRMATION, not until a write
-        // lands. This is the retry that must still reach the PTY.
-        let _outcome2 = deliver_with_ledger(&reg, &state, pane_id, text, &extras, delivery_id)
+        let outcome2 = deliver_with_ledger(&reg, &state, pane_id, same_text, &extras, same_id)
             .await
-            .expect("second attempt (the retry)");
-
-        let count_after_retry = wait_for_marker_count(&reg, &id, "SEED-424-DELIVERED", 2).await;
-
+            .expect("same-id attempt 2 (an accidental duplicate RPC)");
         assert_eq!(
-            count_after_retry, 2,
-            "a retry sharing the ORIGINAL delivery_id/fingerprint must still reach \
-             the PTY: only {count_after_retry} occurrence(s) of the marker reached \
-             scrollback, expected 2. The ledger's Applied-caches-as-terminal design \
-             (`admit_delivery` returning `Replay` once `record_delivery_outcome` has \
-             cached `Applied` for this id) makes the retry a silent no-op RPC \
-             instead of a write — issue #424 round 2's actual defect: round 1's \
-             fix (src/ui.rs, `deliver_orchestrator_prompt`) never reaches this far \
-             because it operates entirely client-side against `PaneController`, \
-             which has no ledger behind it at all"
+            outcome2,
+            crate::event::SendResult::Applied,
+            "a same-delivery_id replay must return the cached Applied outcome"
+        );
+        let count_after_second = settled_marker_count(&reg, &id, same_marker).await;
+        assert_eq!(
+            count_after_second, 1,
+            "a same-delivery_id replay must not write to the PTY a second time"
+        );
+
+        let outcome3 = deliver_with_ledger(&reg, &state, pane_id, same_text, &extras, same_id)
+            .await
+            .expect("same-id attempt 3 (a later confirmation-miss retry)");
+        assert_eq!(
+            outcome3,
+            crate::event::SendResult::Applied,
+            "a THIRD admission of the same delivery_id must also replay the cached outcome"
+        );
+        let count_after_third = settled_marker_count(&reg, &id, same_marker).await;
+        assert_eq!(
+            count_after_third, 1,
+            "a THIRD admission of the same delivery_id must still replay: only a \
+             single write should ever reach the PTY for one delivery_id, but \
+             {count_after_third} occurrence(s) of the marker reached scrollback. \
+             Round 2's regression: Phase 1 of `admit_delivery` consumes the cached \
+             `Applied` result on the SECOND admission (so the second call still \
+             replays, but clears the cache), which lets the THIRD admission find \
+             no cached result and proceed to a genuine second write — degrading \
+             the one-write-per-delivery_id guarantee (PRD #20 R20-004) to two \
+             writes total"
+        );
+
+        // --- Half 2: a retry that mints a FRESH delivery_id — exactly what
+        // `deliver_orchestrator_prompt` (src/ui.rs) does on every
+        // confirmation retry — must reach the PTY every time. Same
+        // fingerprint (same agent/pane/text) as a genuine retry of the same
+        // prompt, but a distinct id per attempt since each is a brand-new
+        // admission to the ledger.
+        let fresh_marker = "SEED-424-FRESH";
+        let fresh_text = "printf 'SEED-424-FRESH\\n'";
+
+        let fresh_outcome1 = deliver_with_ledger(
+            &reg,
+            &state,
+            pane_id,
+            fresh_text,
+            &extras,
+            "delivery-424-fresh-1",
+        )
+        .await
+        .expect("fresh-id attempt 1 (the original write)");
+        assert_eq!(
+            fresh_outcome1,
+            crate::event::SendResult::Applied,
+            "precondition: the original fresh-id write must actually land"
+        );
+        let fresh_count_after_first = wait_for_marker_count(&reg, &id, fresh_marker, 1).await;
+        assert_eq!(
+            fresh_count_after_first, 1,
+            "precondition: the original fresh-id write's output must reach scrollback exactly once"
+        );
+
+        let fresh_outcome2 = deliver_with_ledger(
+            &reg,
+            &state,
+            pane_id,
+            fresh_text,
+            &extras,
+            "delivery-424-fresh-2",
+        )
+        .await
+        .expect("fresh-id attempt 2 (the retry mechanism that actually fixes #424)");
+        assert_eq!(
+            fresh_outcome2,
+            crate::event::SendResult::Applied,
+            "a retry minting a FRESH delivery_id must land as a genuine new write"
+        );
+        let fresh_count_after_retry = wait_for_marker_count(&reg, &id, fresh_marker, 2).await;
+        assert_eq!(
+            fresh_count_after_retry, 2,
+            "a retry that mints a FRESH delivery_id for an identical fingerprint \
+             (same agent/pane/text) must reach the PTY: only \
+             {fresh_count_after_retry} occurrence(s) of the marker reached \
+             scrollback, expected 2. This is the mechanism \
+             `deliver_orchestrator_prompt` (src/ui.rs) actually uses to retry an \
+             unconfirmed delivery — a new id per attempt, never the same id twice"
         );
 
         reg.shutdown_all();
