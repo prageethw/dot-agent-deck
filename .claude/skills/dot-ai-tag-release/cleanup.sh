@@ -38,6 +38,11 @@ is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
 # actionable instead of just "something, somewhere, failed".
 pr_state_degraded=false
 degraded_reasons=""
+
+# A truncated MERGED-PR page is informational, not a degradation (fork issue
+# #152 S4) -- kept separate from `pr_state_degraded` so it never blocks
+# SKILL.md Step 6's "delete nothing until it comes back clean".
+merged_list_truncated=false
 mark_degraded() {
   pr_state_degraded=true
   if [ -n "${1:-}" ]; then
@@ -77,17 +82,49 @@ current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 
 # The MAIN working tree's own path — the root checkout, as opposed to any
-# linked worktree. `git worktree list --porcelain` always emits it as the
-# first `worktree ` line (there is no per-entry marker), and this is the
-# portable equivalent that does not depend on iteration order. Excluding by
-# this identity (rather than by matching branch name) means the root checkout
-# stays excluded no matter what branch it happens to be on (fork issue #140
-# target behaviour 1) — a name-based check only catches it while it sits on
-# `main`.
+# linked worktree. Excluding by this identity (rather than by matching branch
+# name) means the root checkout stays excluded no matter what branch it
+# happens to be on (fork issue #140 target behaviour 1) — a name-based check
+# only catches it while it sits on `main`.
+#
+# Two independent ways this derivation can go wrong (fork issue #152 S2),
+# both verified by direct measurement against a throwaway repo:
+#   1. Pre-2.31 git does not recognise `--path-format`, and unlike most
+#      subcommands `git rev-parse` echoes an unrecognised flag straight back
+#      instead of failing -- so `git_common_dir` ends up holding the flag
+#      text plus a relative `.git`, on two lines, exit 0. Fed unguarded to
+#      `dirname`, that two-line string is one argument starting with `--`,
+#      which `dirname` refuses (non-zero exit) -- and with no `||`/`if`
+#      guard on that assignment, `set -e` killed the whole script before any
+#      output was printed.
+#   2. A relocated git directory (`git init --separate-git-dir`, or an
+#      equivalent real-world setup) makes `git rev-parse --git-common-dir`
+#      succeed and return the RELOCATED directory's own absolute path --
+#      `dirname` of that is the relocated directory's PARENT, not the actual
+#      worktree. Silently wrong, no crash, no degradation.
+#
+# Both failure modes are handled the same way: derive a candidate, then
+# VERIFY it by asking git itself whether that candidate is genuinely a
+# working tree (`--is-inside-work-tree`, run FROM the candidate). A
+# crash-avoided-but-still-wrong candidate from failure mode 1, and the
+# wrong-parent candidate from failure mode 2, both fail this check and
+# degrade the run -- rather than either crashing with no output or silently
+# trusting a path that was never confirmed.
 git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")
 main_worktree_path=""
 if [ -n "$git_common_dir" ]; then
-  main_worktree_path=$(dirname "$git_common_dir")
+  candidate=""
+  if candidate=$(dirname "$git_common_dir" 2>/dev/null); then
+    if [ "$(git -C "$candidate" rev-parse --is-inside-work-tree 2>/dev/null || echo "")" != "true" ]; then
+      candidate=""
+    fi
+  else
+    candidate=""
+  fi
+  main_worktree_path="$candidate"
+fi
+if [ -z "$main_worktree_path" ]; then
+  mark_degraded "could not reliably determine the main working tree's own path (old git flag handling or a relocated git directory can make the derivation crash or silently resolve to the wrong path)"
 fi
 
 # --- Determine this fork's repository slugs (owner/repo) ---
@@ -120,7 +157,13 @@ if origin_url=$(git config --get remote.origin.url 2>/dev/null); then
   if is_owner_repo "$candidate"; then
     origin_slug="$candidate"
   else
-    mark_degraded "origin remote URL does not resolve to a GitHub owner/repo slug: $origin_url"
+    # Name the remote, never the URL: `slug_from_url`'s userinfo-stripping
+    # only fires on the github.com branch, so a non-github.com remote (a GHES
+    # host, say) can carry a raw, credential-bearing URL straight into this
+    # message -- and DEGRADED_REASONS: is printed to stdout on every run
+    # (fork issue #152 S1/S5). Inspect the URL with `git config --get
+    # remote.origin.url` directly instead.
+    mark_degraded "origin remote URL does not resolve to a GitHub owner/repo slug (run 'git config --get remote.origin.url' to inspect it)"
   fi
 else
   mark_degraded "origin remote is not configured"
@@ -132,7 +175,8 @@ if upstream_url=$(git config --get remote.upstream.url 2>/dev/null); then
   if is_owner_repo "$candidate"; then
     upstream_slug="$candidate"
   else
-    mark_degraded "upstream remote URL does not resolve to a GitHub owner/repo slug: $upstream_url"
+    # Same redaction as the origin branch above (fork issue #152 S1/S5).
+    mark_degraded "upstream remote URL does not resolve to a GitHub owner/repo slug (run 'git config --get remote.upstream.url' to inspect it)"
   fi
 fi
 # A missing `upstream` remote is left as-is here (empty, no `mark_degraded`
@@ -164,25 +208,51 @@ else
   # head names describe branches in the fork, not ours, so a merged fork PR for
   # `fix/thing` says nothing about our own `fix/thing`. Pinned to
   # `$origin_slug` (fork issue #140, D3) -- unpinned, `gh` resolves against
-  # this repo's parent. A full page (== the query's own `--limit`) can never
-  # be told apart from a page that was silently truncated, so it degrades too
-  # (target behaviour 4).
+  # this repo's parent.
+  #
+  # `--limit 200` bounds what THIS call fetches from the API; the
+  # `isCrossRepository` select then drops rows client-side, so counting
+  # survivors here (as the pre-#152 code did) counts AFTER the filter and can
+  # under-count a genuinely full raw page (fork issue #152 S3). A second
+  # query below asks for the COMPLEMENTARY partition -- cross-repo rows only,
+  # same `--limit` -- and its count is added back in: same-repo survivors +
+  # cross-repo survivors reconstructs the raw fetched-page size the two
+  # queries together saw, which is what determines whether the page could
+  # have been truncated.
+  merged_same_repo_count=0
   if capture_cmd gh pr list --state merged --limit 200 --repo "$origin_slug" \
                   --json headRefName,headRefOid,isCrossRepository \
                   --jq '.[] | select(.isCrossRepository | not) | [.headRefName, .headRefOid] | @tsv'; then
     merged_tsv=$(cat "$_stdout_file")
-    merged_count=$(awk 'END { print NR }' "$_stdout_file")
+    merged_same_repo_count=$(awk 'END { print NR }' "$_stdout_file")
     while IFS=$'\t' read -r name sha; do
       [ -z "$name" ] || [ -z "$sha" ] && continue
       line=$(printf '%s\t%s' "$name" "$sha")
       merged_shas_lines="${merged_shas_lines}${line}
 "
     done <<< "$merged_tsv"
-    if [ "$merged_count" -ge 200 ]; then
-      mark_degraded "gh pr list --state merged --repo $origin_slug returned a full page ($merged_count rows); results may be truncated"
-    fi
   else
     mark_degraded "gh pr list --state merged --repo $origin_slug failed: ${last_err:-unknown error}"
+  fi
+
+  merged_cross_repo_count=0
+  if capture_cmd gh pr list --state merged --limit 200 --repo "$origin_slug" \
+                  --json headRefName,headRefOid,isCrossRepository \
+                  --jq '.[] | select(.isCrossRepository) | [.headRefName, .headRefOid] | @tsv'; then
+    merged_cross_repo_count=$(awk 'END { print NR }' "$_stdout_file")
+  else
+    mark_degraded "gh pr list --state merged --repo $origin_slug (cross-repo count) failed: ${last_err:-unknown error}"
+  fi
+
+  merged_raw_count=$((merged_same_repo_count + merged_cross_repo_count))
+  if [ "$merged_raw_count" -ge 200 ]; then
+    # Fork issue #152 S4: at 200+ merged PRs this repo hits a full page on
+    # EVERY run (91/200 today), which would make `PR_STATE_DEGRADED=true`
+    # permanent and disable SKILL.md Step 6's "delete nothing until it comes
+    # back clean" for good. Truncation here only means a later merged branch
+    # goes unoffered (benign, under-offers) -- surface it informationally
+    # instead of degrading.
+    merged_list_truncated=true
   fi
 
   # Any open PR protects its head branch. Deleting the branch closes the PR, so
@@ -263,7 +333,7 @@ while IFS= read -r line; do
     "branch refs/heads/"*)
       br="${line#branch refs/heads/}"
       if [ "$wt_path" != "$current_worktree" ] && [ "$wt_path" != "$main_worktree_path" ] \
-        && [ "$br" != "fork-only" ] && is_merged "$br" "refs/heads/${br}"; then
+        && ! is_long_lived "$br" && is_merged "$br" "refs/heads/${br}"; then
         worktrees_out+=("${wt_path}${tab}${br}")
       fi
       ;;
@@ -303,6 +373,9 @@ if [ "$pr_state_degraded" = "true" ]; then
       [ -n "$reason" ] && echo "  ${reason}"
     done <<< "$degraded_reasons"
   fi
+fi
+if [ "$merged_list_truncated" = "true" ]; then
+  echo "MERGED_LIST_TRUNCATED=true"
 fi
 
 total=$(( ${#worktrees_out[@]} + ${#local_out[@]} + ${#remote_out[@]} ))
