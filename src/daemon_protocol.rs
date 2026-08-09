@@ -2572,12 +2572,47 @@ mod tests {
         // Give a wrongly-proceeding admission time to actually reach the PTY
         // before asserting it did not — the assertion needs to observe a bad
         // write if one happens, not just outrun it.
+        //
+        // Issue #424 round 4 (reviewer F16): a flat 150ms sleep has no
+        // headroom on a loaded CI runner and is biased toward MISSING a
+        // regression (too short) rather than flaking (too long) — the wrong
+        // direction for a negative assertion. Replaced with a positive,
+        // sentinel-based wait: issue one more REAL write to the SAME PTY
+        // (through the identical `deliver_with_ledger` path a genuine retry
+        // uses) and wait, with a real bounded timeout, for ITS OWN marker to
+        // reach scrollback. `/bin/sh` reads and executes one line at a time,
+        // so the sync write's bytes are only processed after every byte
+        // written before it — including any wrongly-issued duplicate write
+        // this helper is checking for. By the time the sync marker's output
+        // is observed, a bad write (if one happened) has already had its
+        // chance to run and print, no matter how slow the runner is.
         async fn settled_marker_count(
             registry: &AgentPtyRegistry,
+            state: &SharedState,
+            pane_id: &str,
+            extras: &WriteAndSubmitExtras,
             id: &str,
             marker: &str,
+            sync_tag: &str,
         ) -> usize {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            let sync_marker = format!("SYNC-424-{sync_tag}");
+            let sync_text = format!("printf '{sync_marker}\\n'");
+            deliver_with_ledger(
+                registry,
+                state,
+                pane_id,
+                &sync_text,
+                extras,
+                &format!("delivery-424-sync-{sync_tag}"),
+            )
+            .await
+            .expect("sentinel sync write must land");
+            let sync_count = wait_for_marker_count(registry, id, &sync_marker, 1).await;
+            assert_eq!(
+                sync_count, 1,
+                "precondition: the sentinel sync write ({sync_tag}) must itself \
+                 reach scrollback before the settle can be trusted"
+            );
             count_marker(registry, id, marker).await
         }
 
@@ -2620,7 +2655,16 @@ mod tests {
             crate::event::SendResult::Applied,
             "a same-delivery_id replay must return the cached Applied outcome"
         );
-        let count_after_second = settled_marker_count(&reg, &id, same_marker).await;
+        let count_after_second = settled_marker_count(
+            &reg,
+            &state,
+            pane_id,
+            &extras,
+            &id,
+            same_marker,
+            "after-second",
+        )
+        .await;
         assert_eq!(
             count_after_second, 1,
             "a same-delivery_id replay must not write to the PTY a second time"
@@ -2634,7 +2678,16 @@ mod tests {
             crate::event::SendResult::Applied,
             "a THIRD admission of the same delivery_id must also replay the cached outcome"
         );
-        let count_after_third = settled_marker_count(&reg, &id, same_marker).await;
+        let count_after_third = settled_marker_count(
+            &reg,
+            &state,
+            pane_id,
+            &extras,
+            &id,
+            same_marker,
+            "after-third",
+        )
+        .await;
         assert_eq!(
             count_after_third, 1,
             "a THIRD admission of the same delivery_id must still replay: only a \
