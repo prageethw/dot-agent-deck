@@ -1,13 +1,23 @@
 //! `dot-agent-deck worktree list|reclaim` — PRD #422.
 //!
-//! Reclaims a git worktree only when three gates all hold: its PR's state is
+//! Reclaims a git worktree only when two gates hold: its PR's state is
 //! `MERGED` (via `gh`, never git ancestry — squash-merges never enter `main`'s
-//! ancestry, so an ancestry check misses genuinely merged branches), the tree
-//! is clean (`git status --porcelain` empty — a merged branch's worktree can
-//! still hold uncommitted files that were never part of the PR), and the deck
-//! can prove it created the worktree (otherwise the tree is reported as
-//! reclaimable-pending-confirmation and removed only with `--yes`). The branch
-//! is never deleted, only the worktree directory.
+//! ancestry, so an ancestry check misses genuinely merged branches), and the
+//! tree is clean (`git status --porcelain` empty — a merged branch's worktree
+//! can still hold uncommitted files that were never part of the PR, and
+//! `--porcelain` never reports gitignored content, so a worktree still
+//! holding a `target/` or a `.env` also counts as "clean" here). A THIRD
+//! signal — whether the deck can prove it created the worktree, AND whether
+//! that clean tree still holds gitignored content — decides *how* a
+//! merged-and-clean worktree is removed: a deck-created worktree with no
+//! gitignored content is removed by a bare `reclaim`, with no `--yes` needed;
+//! a worktree the deck cannot prove it created, OR one that still holds
+//! gitignored content regardless of provenance, is instead reported as
+//! reclaimable-pending-confirmation, naming its exact path, and removed only
+//! once the user passes `--yes` — at which point it is removed regardless of
+//! provenance or ignored content, exactly like a deck-created one. `--yes`
+//! never asks the deck to trust more; it is the user vouching for what they
+//! were just shown. The branch is never deleted, only the worktree directory.
 //!
 //! Fail-closed throughout: an unresolvable PR state (missing `gh`, a spawn or
 //! parse error, or more than one PR matching the branch) means keep, never
@@ -31,8 +41,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// found via `git rev-parse --git-dir` run inside the worktree) — outside the
 /// working tree, so it never makes `git status --porcelain` report the
 /// worktree dirty, and it is removed automatically by `git worktree remove`.
-/// Writing this marker at worktree-creation time is out of scope for this
-/// task; only reading it is implemented here.
+/// Written by [`mark_worktree_owned`] at worktree-creation time
+/// (`issue_dispatch_run::create_worktree` / `create_worktree_sync`), read by
+/// [`ownership_of`].
 pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
 
 /// Resolved PR state for a worktree's branch, or why it could not be
@@ -154,6 +165,14 @@ pub struct WorktreeReport {
     pub verdict: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The worktree's real, byte-exact path (issue #144 finding 4) — never
+    /// serialized; `path` above (`to_string_lossy`) is what the JSON document
+    /// and the human report show. [`run_reclaim`] passes THIS to
+    /// [`remove_worktree_dir`] so a non-UTF-8 path can never cause `git
+    /// worktree remove` to be handed a different, lossily-mangled path that
+    /// happens to resolve to a different registered (or symlinked) worktree.
+    #[serde(skip)]
+    pub real_path: PathBuf,
 }
 
 /// Top-level `--json` document.
@@ -301,34 +320,148 @@ fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
     }
 }
 
-/// Whether the deck can prove it created `worktree_path`: the marker file
-/// exists in the worktree's own git metadata dir. Any failure to resolve that
-/// dir, or a missing marker, resolves to `Foreign` — unknown must never
-/// resolve to `Ours`.
-fn ownership_of(worktree_path: &Path) -> Ownership {
+/// Whether `worktree_path` holds any gitignored content, via `git status
+/// --porcelain --ignored=matching` (issue #144 finding 1): plain
+/// `--porcelain` never reports ignored files, so a worktree holding a
+/// multi-GB `target/`, a `.env`, or rule-15 `.dot-agent-deck/` scratch reads
+/// as `Cleanliness::Clean` even though deleting it destroys that content with
+/// no confirmation. This is used ONLY to demote an otherwise-`Remove`
+/// verdict to `Ask` — never to change cleanliness itself — so a spawn
+/// failure or non-zero exit fails closed to `true` (assume ignored content is
+/// present) rather than `false`: the failure mode of an over-cautious `Ask`
+/// is an extra `--yes`, never a silent deletion.
+fn has_ignored_content(worktree_path: &Path) -> bool {
+    let out = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["status", "--porcelain", "--ignored=matching"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => true,
+    }
+}
+
+/// Resolve *a* git-dir for `worktree_path` via `git rev-parse --git-dir` run
+/// inside it. `None` on any failure to spawn, a non-zero exit, or empty
+/// output — callers fail closed on `None`.
+///
+/// This trusts whatever `<worktree_path>/.git` (or an equivalent absolute
+/// `--git-dir`) currently redirects to, which is exactly the trust a single
+/// regular file inside the worktree's own working directory should never be
+/// given (issue #144 finding 2): `git status --porcelain` never reports
+/// `.git` itself, so a party who can write only that one file — no access to
+/// the repo's real `.git` required — can redirect it to a copied admin dir
+/// carrying a forged ownership marker. [`ownership_of`] is the only caller
+/// that treats this result as a security boundary, and it does so ONLY after
+/// additionally requiring the result to sit under the enumerating repo's own
+/// common dir (see [`resolve_common_dir`]) — a bare call to this function is
+/// not, by itself, safe to use for an ownership decision.
+fn resolve_git_dir(worktree_path: &Path) -> Option<PathBuf> {
     let out = Command::new("git")
         .current_dir(worktree_path)
         .args(["rev-parse", "--git-dir"])
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
-        _ => return Ownership::Foreign,
+        _ => return None,
     };
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if raw.is_empty() {
-        return Ownership::Foreign;
+        return None;
     }
     let git_dir = PathBuf::from(&raw);
-    let git_dir = if git_dir.is_absolute() {
+    Some(if git_dir.is_absolute() {
         git_dir
     } else {
         worktree_path.join(git_dir)
+    })
+}
+
+/// Resolve the ENUMERATING repo's own common git directory —
+/// `git -C repo_dir rev-parse --path-format=absolute --git-common-dir` — the
+/// directory under which every one of ITS linked worktrees' own admin dirs
+/// (`<common-dir>/worktrees/<name>`) must live, whether that common dir is
+/// the default `<repo>/.git` or a relocated `--separate-git-dir` store.
+/// `None` on any failure to spawn, a non-zero exit, or empty output — callers
+/// fail closed on `None`.
+fn resolve_common_dir(repo_dir: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .current_dir(repo_dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return None,
     };
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Whether the deck can prove it created `worktree_path`, examined as part of
+/// enumerating `repo_dir`: the marker file exists in the worktree's own git
+/// metadata dir, AND that metadata dir genuinely sits under `repo_dir`'s own
+/// common dir (`<common-dir>/worktrees/<name>` — issue #144 finding 2's
+/// containment check). Without the containment check, a worktree whose own
+/// `.git` file has been redirected (a single regular file inside the
+/// worktree's own directory — no access to the real `.git` required) to a
+/// copied admin dir carrying a forged marker would resolve `Ours`; requiring
+/// containment under THIS repo's own `<common-dir>/worktrees/` rejects that
+/// redirect while still accepting a legitimate `--separate-git-dir` layout,
+/// since the common dir there genuinely IS the relocated store. Any failure
+/// to resolve either directory, a missing marker, or a resolved git-dir
+/// outside containment all resolve to `Foreign` — unknown must never resolve
+/// to `Ours`.
+fn ownership_of(repo_dir: &Path, worktree_path: &Path) -> Ownership {
+    let (Some(git_dir), Some(common_dir)) =
+        (resolve_git_dir(worktree_path), resolve_common_dir(repo_dir))
+    else {
+        return Ownership::Foreign;
+    };
+    if !git_dir.starts_with(common_dir.join("worktrees")) {
+        return Ownership::Foreign;
+    }
     if git_dir.join(OWNER_MARKER_FILENAME).is_file() {
         Ownership::Ours
     } else {
         Ownership::Foreign
     }
+}
+
+/// Write the `dot-agent-deck-owner` marker for a worktree this process just
+/// created via `git worktree add` — the counterpart to [`ownership_of`], and
+/// the only writer of this marker anywhere in the tree. Callers: only
+/// `issue_dispatch_run::create_worktree` / `create_worktree_sync`, only
+/// immediately after a successful add, never for a pre-existing or foreign
+/// worktree.
+///
+/// Best-effort by design, not fail-hard: the marker is metadata for a LATER
+/// `reclaim` decision, not a precondition for the worktree being usable now.
+/// Callers log-and-continue on `Err` (mirroring `ensure_worktrees_excluded`'s
+/// established pattern in this crate) rather than failing the whole worktree
+/// creation over it — a worktree that fails to record its own ownership is
+/// still a perfectly good worktree; it only means a future `reclaim` will
+/// land it on `Ask` instead of `Remove` (annoying, never unsafe, since `Ask`
+/// is the fail-closed default `ownership_of` already returns for anything it
+/// can't prove).
+///
+/// No atomic write-then-rename: [`ownership_of`] only checks the marker's
+/// PRESENCE (`Path::is_file`), never its content, so there is no
+/// partially-written state a concurrent reader could observe as wrong — a
+/// short write from e.g. a disk-full mid-write still resolves to `Ours`
+/// exactly as a complete write would, and no other writer of this file
+/// exists to race against.
+pub(crate) fn mark_worktree_owned(worktree_path: &Path) -> Result<(), String> {
+    let git_dir = resolve_git_dir(worktree_path).ok_or_else(|| {
+        format!(
+            "could not resolve git-dir for {} via `git rev-parse --git-dir`",
+            worktree_path.display()
+        )
+    })?;
+    std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), "deck\n")
+        .map_err(|e| format!("failed to write ownership marker: {e}"))
 }
 
 /// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
@@ -374,14 +507,35 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 }
 
 /// `gh pr list --head <branch> --state all --repo <owner/name> --json
-/// state,headRefName` — `--state all` because `gh pr list` defaults to
-/// `--state open`, which makes every merged PR invisible; `--repo`, derived
-/// from `origin` via [`derive_repo_slug`], because letting `gh` infer it
-/// queries the upstream repo from a fork checkout with no default set.
+/// state,headRefName,headRepositoryOwner` — `--state all` because `gh pr
+/// list` defaults to `--state open`, which makes every merged PR invisible;
+/// `--repo`, derived from `origin` via [`derive_repo_slug`], because letting
+/// `gh` infer it queries the upstream repo from a fork checkout with no
+/// default set.
 ///
-/// Matches results on `headRefName` exactly (mitigates "a PR is matched to
-/// the wrong branch" from the PRD's risk list) and treats zero matches as
-/// `NoPr`, more than one as `Unresolvable` (ambiguous), never guessing.
+/// Matches results on `headRefName` AND `headRepositoryOwner.login` matching
+/// the `origin` slug's own owner (issue #144 finding 2): `headRefName` alone
+/// is not namespaced by head repository owner, so a merged PR opened from a
+/// DIFFERENT fork with the same head branch name would otherwise be
+/// attributed to an unrelated local branch of that name. The owner
+/// comparison is ASCII-case-insensitive (issue #144 finding 3 / NEW-1):
+/// GitHub logins are case-insensitive and ASCII-only, so a case-variant
+/// `origin` remote (`PrageethW` vs. the canonical `prageethw` `gh` returns)
+/// must still match. A reply missing the `headRepositoryOwner` field
+/// entirely (the shape `gh` can return once the head repo is no longer
+/// resolvable, e.g. a fork deleted after merge) is treated as a non-match,
+/// not a wildcard — an unverifiable owner must never be treated as a match,
+/// the same fail-closed stance every other branch of this gate takes.
+///
+/// The owner filter is applied as a SEPARATE pass over the `headRefName`
+/// matches, not fused into one `.filter()` chain (NEW-2): a `headRefName`
+/// match rejected ONLY on owner (the triangular / cross-fork-collision case)
+/// must be reported as `Unresolvable` naming the real cause, never as `NoPr`
+/// — `NoPr`'s "no pull request found for this branch" is false when a PR
+/// with that head ref genuinely exists and was found; it only wasn't
+/// confirmed as this repo's own. Zero `headRefName` matches at all resolve to
+/// `NoPr` (genuinely no PR exists); more than one surviving owner match
+/// resolves to `Unresolvable` (ambiguous), never guessing.
 fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     let repo_slug = match derive_repo_slug(repo_dir) {
         Some(slug) => slug,
@@ -393,6 +547,12 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             );
         }
     };
+    // `derive_repo_slug` returns "owner/name"; the owner half is what
+    // `headRepositoryOwner.login` must match.
+    let expected_owner = repo_slug
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .unwrap_or(repo_slug.as_str());
     let out = Command::new("gh")
         .current_dir(repo_dir)
         .args([
@@ -405,7 +565,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "--repo",
             &repo_slug,
             "--json",
-            "state,headRefName",
+            "state,headRefName,headRepositoryOwner",
         ])
         .output();
     let out = match out {
@@ -423,13 +583,28 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
         Ok(v) => v,
         Err(e) => return PrState::Unresolvable(format!("could not parse gh output: {e}")),
     };
-    let matching: Vec<&serde_json::Value> = entries
+    let name_matches: Vec<&serde_json::Value> = entries
         .iter()
         .filter(|v| v.get("headRefName").and_then(|h| h.as_str()) == Some(branch))
         .collect();
-    match matching.as_slice() {
-        [] => PrState::NoPr,
-        [one] => match one.get("state").and_then(|s| s.as_str()) {
+    let owner_matches: Vec<&serde_json::Value> = name_matches
+        .iter()
+        .copied()
+        .filter(|v| {
+            v.get("headRepositoryOwner")
+                .and_then(|o| o.get("login"))
+                .and_then(|l| l.as_str())
+                .is_some_and(|login| login.eq_ignore_ascii_case(expected_owner))
+        })
+        .collect();
+    match (owner_matches.as_slice(), name_matches.as_slice()) {
+        ([], []) => PrState::NoPr,
+        ([], _) => PrState::Unresolvable(format!(
+            "{} pull request(s) match branch {branch:?} but none has headRepositoryOwner \
+             {expected_owner:?} — the head repository owner could not be confirmed",
+            name_matches.len()
+        )),
+        ([one], _) => match one.get("state").and_then(|s| s.as_str()) {
             Some("MERGED") => PrState::Merged,
             Some("OPEN") => PrState::Open,
             Some("CLOSED") => PrState::ClosedUnmerged,
@@ -437,8 +612,8 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             None => PrState::Unresolvable("PR entry has no `state` field".to_string()),
         },
         _ => PrState::Unresolvable(format!(
-            "{} pull requests matched branch {branch:?}",
-            matching.len()
+            "{} pull requests matched branch {branch:?} and owner {expected_owner:?}",
+            owner_matches.len()
         )),
     }
 }
@@ -449,26 +624,36 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 ///
 /// PR state is resolved against each candidate's OWN path (`wt.path`), never
 /// `repo_dir` (the caller's cwd), consistently with `check_cleanliness(&wt.path)`
-/// and `ownership_of(&wt.path)`: every per-worktree property is read from the
-/// worktree it describes. One concrete case this affects: `remote.<name>.url`
-/// is a list-accumulating git config variable, and `git remote get-url`
-/// (called by [`derive_repo_slug`]) returns only the first value, so a
-/// worktree-scoped `origin` set via `extensions.worktreeConfig` never
-/// overrides one already defined in the common config — it only matters when
-/// the common config defines no `origin` at all. Resolving against `repo_dir`
-/// in that situation yields `Unresolvable`, keeping a worktree forever even
-/// though it is genuinely merged and clean; `worktree/reclaim/007` covers
-/// exactly this. (Resolving against the wrong repo in general would risk
-/// matching an unrelated same-named branch's PR, but that is not a reachable
-/// scenario via worktree-scoped remotes — the common config's value always
-/// wins.)
+/// and `ownership_of(repo_dir, &wt.path)`: every per-worktree property is read
+/// from the worktree it describes (`repo_dir` is still threaded into
+/// `ownership_of` — not as the thing being described, but as the enumerating
+/// repo whose common dir the worktree's admin dir must sit under; see
+/// `ownership_of`'s doc comment). One concrete case this affects:
+/// `remote.<name>.url` is a list-accumulating git config variable, and `git
+/// remote get-url` (called by [`derive_repo_slug`]) returns only the first
+/// value, so a worktree-scoped `origin` set via `extensions.worktreeConfig`
+/// never overrides one already defined in the common config — it only
+/// matters when the common config defines no `origin` at all. Resolving
+/// against `repo_dir` in that situation yields `Unresolvable`, keeping a
+/// worktree forever even though it is genuinely merged and clean;
+/// `worktree/reclaim/007` covers exactly this. (Resolving against the wrong
+/// repo in general would risk matching an unrelated same-named branch's PR,
+/// but that is not a reachable scenario via worktree-scoped remotes — the
+/// common config's value always wins.)
+///
+/// An otherwise-`Remove` verdict (merged, clean, ours) is additionally
+/// demoted to `Ask` when [`has_ignored_content`] finds gitignored content
+/// still present (issue #144 finding 1) — `Cleanliness::Clean` alone is not
+/// enough to remove unprompted, since `git status --porcelain` never reports
+/// ignored files. A `Foreign` worktree is already `Ask` regardless, so the
+/// check only runs when it can change the outcome.
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
     let raw = list_linked_worktrees(repo_dir)?;
     let mut reports = Vec::with_capacity(raw.len());
     for wt in raw {
         let cleanliness = check_cleanliness(&wt.path);
         let clean = cleanliness == Cleanliness::Clean;
-        let owned = ownership_of(&wt.path) == Ownership::Ours;
+        let owned = ownership_of(repo_dir, &wt.path) == Ownership::Ours;
         let ownership = if owned {
             Ownership::Ours
         } else {
@@ -479,6 +664,16 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
         };
         let verdict = decide(&pr_state, &cleanliness, ownership);
+        let verdict = if matches!(verdict, Verdict::Remove) && has_ignored_content(&wt.path) {
+            Verdict::Ask(
+                "reclaimable: PR is merged and the tree is clean, but the worktree still holds \
+                 gitignored content (e.g. target/, .env) that was never part of the merged PR"
+                    .to_string(),
+            )
+        } else {
+            verdict
+        };
+        let real_path = wt.path.clone();
         reports.push(WorktreeReport {
             path: wt.path.to_string_lossy().to_string(),
             branch: wt.branch,
@@ -487,6 +682,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             pr_state: pr_state.label().to_string(),
             reason: verdict.reason().map(str::to_string),
             verdict: verdict.label().to_string(),
+            real_path,
         });
     }
     Ok(reports)
@@ -522,14 +718,27 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
 }
 
 /// Physically remove a worktree directory, preserving its branch:
-/// `git -C <repo_dir> worktree remove <path>` — deliberately WITHOUT
+/// `git -C <repo_dir> worktree remove -- <path>` — deliberately WITHOUT
 /// `--force`, since [`examine_worktrees`] already gated on cleanliness; git's
 /// own refusal on an unexpectedly dirty tree is a second line of defense
-/// rather than something to override.
-fn remove_worktree_dir(repo_dir: &Path, worktree_path: &str) -> Result<(), String> {
+/// rather than something to override. The `--` separator (issue #144 finding
+/// 4) is not reachable today — every path here came from `git worktree list`,
+/// which always emits absolute paths, so none can start with `-` — but it
+/// costs nothing and removes the assumption.
+///
+/// Takes the real `Path`, never a lossily-converted string (issue #144
+/// finding 4): `git worktree remove` realpath/symlink-resolves its argument
+/// rather than string-matching it against the registry, so a lossy path that
+/// happens to resolve to a DIFFERENT registered worktree removes that one,
+/// not merely fails — passing the byte-exact path closes the divergence at
+/// its source instead of defending against it downstream. [`WorktreeReport`]
+/// still carries a lossy `path: String` for the report/JSON document; only
+/// this call site needs the exact bytes.
+fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path) -> Result<(), String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
-        .args(["worktree", "remove", worktree_path])
+        .args(["worktree", "remove", "--"])
+        .arg(worktree_path)
         .output()
         .map_err(|e| format!("failed to spawn `git worktree remove`: {e}"))?;
     if out.status.success() {
@@ -560,7 +769,7 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String>
 
     for r in reports {
         match r.verdict.as_str() {
-            "remove" => match remove_worktree_dir(repo_dir, &r.path) {
+            "remove" => match remove_worktree_dir(repo_dir, &r.real_path) {
                 Ok(()) => removed.push(r),
                 Err(e) => {
                     let mut r = r;
@@ -568,7 +777,7 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String>
                     kept.push(r);
                 }
             },
-            "ask" if yes => match remove_worktree_dir(repo_dir, &r.path) {
+            "ask" if yes => match remove_worktree_dir(repo_dir, &r.real_path) {
                 Ok(()) => removed.push(r),
                 Err(e) => {
                     let mut r = r;
@@ -593,7 +802,19 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String>
 /// discoverable only by reading past a report), names the exact worktree
 /// paths (not a count or category), defaults to keep, and ends with the
 /// exact `--yes` command that would proceed — one prompt for the whole batch,
-/// not one per worktree.
+/// not one per worktree. That command's warning is explicit that `--yes`
+/// removes worktrees in this state regardless of provenance (issue #144
+/// finding 1's documentation half) — the whole reason they are pending
+/// confirmation rather than already gone is that the deck cannot prove it
+/// created them (or that they still hold gitignored content), and `--yes`
+/// overrides exactly that, never anything else about the gate.
+///
+/// The wording deliberately does NOT say `--yes` acts on "them" — the exact
+/// set just printed (reviewer NEW-3): `--yes` re-runs [`run_reclaim`] /
+/// [`examine_worktrees`] from scratch and acts on whatever that run finds,
+/// not on this report's snapshot. Nothing requires a bare run to have
+/// happened first, and content can change between the two invocations, so
+/// promising "them" would overstate a binding this command does not have.
 pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     let mut out = String::new();
 
@@ -605,7 +826,11 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
         for r in &outcome.pending {
             out.push_str(&format!("  - {}\n", r.path));
         }
-        out.push_str("Run `dot-agent-deck worktree reclaim --yes` to remove them.\n\n");
+        out.push_str(
+            "Run `dot-agent-deck worktree reclaim --yes` to remove worktrees in this state, \
+             regardless of whether the deck created them. The set is re-evaluated on that \
+             run.\n\n",
+        );
     }
 
     if !outcome.removed.is_empty() {
@@ -742,10 +967,190 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            real_path: PathBuf::from("/repo/wt-a"),
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["schema_version"], 1);
         assert!(json.contains("wt-a"));
+    }
+
+    // -------------------------------------------------------------------
+    // Production creation-path coverage (issue #144): a worktree made via
+    // the deck's REAL `create_worktree_sync` (not the `mark_owned` test
+    // helper `tests/worktree_reclaim.rs` uses for its own fixtures) must be
+    // `Verdict::Remove` and be removed by a bare `reclaim`. This drives
+    // `resolve_pr_state`'s real `gh` call, which offers no argument to swap
+    // in a stub, so it needs a real (stubbed) `gh` on `PATH` -- unlike
+    // `tests/worktree_reclaim.rs`'s fixture, which scopes its stub `PATH` to
+    // a spawned `dot-agent-deck` *subprocess*'s own environment, an
+    // in-process unit test has no such boundary and must mutate this
+    // process's `PATH` directly. `GH_PATH_ENV_LOCK` below serializes that
+    // mutation against other tests IN THIS MODULE that do the same -- it
+    // does NOT make the mutation sound against production readers (see
+    // `PathEnvGuard::prepend`'s SAFETY comment and `hook.rs:585` for why
+    // `config.rs`'s `STATE_DIR_ENV_LOCK` is not a convention to cite as
+    // justification here).
+    // -------------------------------------------------------------------
+
+    use spec::spec;
+
+    /// Serializes tests in this module that mutate the process-global `PATH`
+    /// to stand a fake `gh` in front of `resolve_pr_state`'s real
+    /// `Command::new("gh")` call. Only this module's tests spawn `gh` at
+    /// all (`grep 'Command::new("gh")' src/*.rs`), so this lock only ever
+    /// needs to serialize against itself, but it stays cheap insurance
+    /// against a future sibling test doing the same.
+    static GH_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: prepends `bindir` to `PATH` (so the real `git` the
+    /// creation path also needs stays resolvable) and restores the prior
+    /// value on drop, even on panic. Callers must hold `GH_PATH_ENV_LOCK`
+    /// for this guard's entire lifetime.
+    struct PathEnvGuard {
+        prev_path: Option<String>,
+    }
+
+    impl PathEnvGuard {
+        fn prepend(bindir: &Path) -> Self {
+            let prev_path = std::env::var("PATH").ok();
+            let new_path = match &prev_path {
+                Some(p) => format!("{}:{p}", bindir.display()),
+                None => bindir.display().to_string(),
+            };
+            // SAFETY: sound only because `cargo nextest` gives each test its
+            // own process (see `.github/workflows/ci.yml`: nextest, NOT
+            // `cargo test`, which was tried and flaked for exactly this
+            // reason) -- with one test per process there is no second
+            // thread in this process to race the read side. GH_PATH_ENV_LOCK
+            // is NOT what makes this sound: it only serializes this
+            // module's own tests against EACH OTHER, and cannot serialize
+            // against libc's environ read on every `Command::spawn` in this
+            // process, which never takes this (or any) lock. That is the
+            // same objection upstream raised on vfarcic#419, and
+            // `hook.rs:585` already records it for this crate's other env
+            // locks -- this comment is not an endorsement of the pattern.
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+            Self { prev_path }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see PathEnvGuard::prepend.
+            unsafe {
+                match self.prev_path.take() {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// A real, minimal git repo (`main` branch, one seed commit, an `origin`
+    /// remote resolvable by `derive_repo_slug`) to drive the production
+    /// worktree-creation path against.
+    fn init_repo_with_origin(dir: &Path) {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/test-org/test-repo.git",
+            ],
+        );
+    }
+
+    /// Scenario: A worktree is created through the deck's own PRODUCTION
+    /// creation path (`issue_dispatch_run::create_worktree_sync`, the same
+    /// function the TUI's `SpawnPane` dispatch calls) against a real git
+    /// repo, with a MERGED PR fixture answered by a stub `gh`. It must
+    /// resolve to `Verdict::Remove` and actually be removed by a BARE
+    /// `reclaim` (no `--yes`) -- proving the creation path itself writes the
+    /// `dot-agent-deck-owner` marker, not that a test helper can fake one.
+    #[spec("worktree/reclaim/008")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_008_deck_created_worktree_is_removed_by_bare_reclaim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        // Unconditionally answers `gh pr list` with one canned MERGED reply.
+        // This test does not re-check `gh` invocation shape --
+        // `tests/worktree_reclaim.rs`'s fixture already pins that at the CLI
+        // layer -- it only needs a MERGED verdict to reach `Verdict::Remove`.
+        let branch = "feat/deck-created";
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let worktree_dir = scratch.path().join("wt-deck-created");
+        let creation =
+            crate::issue_dispatch_run::create_worktree_sync(&repo, &worktree_dir, branch)
+                .expect("create_worktree_sync must succeed against a real git repo");
+        assert_eq!(
+            creation,
+            crate::issue_dispatch_run::WorktreeCreation::Created,
+            "the production creation path must report Created for a fresh worktree dir, got {creation:?}"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "create_worktree_sync reported Created but the worktree directory is missing"
+        );
+
+        let outcome =
+            run_reclaim(&repo, false).expect("run_reclaim must succeed against a real git repo");
+        assert_eq!(
+            outcome.removed.len(),
+            1,
+            "a worktree created through the production creation path, with a MERGED PR and a \
+             clean tree, must be removed by a BARE `reclaim` (no --yes) -- this only holds once \
+             `create_worktree_sync` itself writes the ownership marker; got removed={:?} \
+             pending={:?} kept={:?}",
+            outcome.removed,
+            outcome.pending,
+            outcome.kept
+        );
+        assert!(
+            !worktree_dir.exists(),
+            "the worktree directory must actually be gone after the bare reclaim above, not \
+             merely reported as removed"
+        );
     }
 }
