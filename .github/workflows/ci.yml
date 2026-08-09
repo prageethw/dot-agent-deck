@@ -313,10 +313,21 @@ jobs:
   # the current Semgrep registry has no general bash/shell ruleset pack, only an
   # unrelated `reverse-shells` pack that happens to tag `bash` as a language.
   #
-  # `--no-error` is a deliberate first-rollout choice: this run establishes a
-  # baseline finding count. Findings still reach code scanning either way, so
-  # nothing is lost by not blocking yet. Flipping this to blocking (dropping
-  # `--no-error`) is a follow-up decision once the baseline is triaged.
+  # `--error` makes this job fail when the scan finds anything. It is safe to
+  # block on: `main` has no branch protection and nothing `needs:` this job, so
+  # a red semgrep run colours the board without gating a merge or the direct
+  # pushes release.yml/docs-publish.yml make to main. The SARIF still uploads on
+  # failure (`if: always()` below), so findings reach code scanning either way.
+  #
+  # Note `--no-error` is semgrep's DEFAULT for `semgrep scan` -- removing it
+  # would NOT have made this job blocking, which is what the pre-#146 comment
+  # here incorrectly claimed. Blocking requires `--error` explicitly.
+  #
+  # The three `rust.lang.security.*` excludes below zero the baseline that
+  # `--error` now enforces. Issue #146 triaged all 24 open findings from those
+  # rules: 0 true positives. They are API-name pattern matches with no taint
+  # analysis, so they cannot distinguish a security decision from an ordinary
+  # use of the same function.
   semgrep:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true'
@@ -336,13 +347,40 @@ jobs:
           # 209 of the first run's 286 findings, drowning everything else.
           # Excluding it is a readability decision, not a claim that the
           # `unsafe` code is audited.
+          #
+          # `current-exe` fires on every `std::env::current_exe()` call. Its
+          # threat model needs a privilege boundary this non-setuid, same-uid
+          # program does not have -- current_exe() is chosen over `$PATH`
+          # precisely because it is the MORE trustworthy of the two here
+          # (src/daemon_attach.rs:247; the `$PATH` alternative broke three
+          # times: 493248b, bbf2236, ea8c748). Issue #146 triaged all 13 open
+          # findings: 0 true positives.
+          #
+          # `args` fires on every `std::env::args()` call, but the rule is
+          # specifically about `argv[0]` being attacker-controllable. No site
+          # in this repo reads `argv[0]`; four of the five sites explicitly
+          # `.skip(1)`/`.nth(1)` past it. Issue #146 triaged all 5 open
+          # findings: 0 true positives.
+          #
+          # `temp-dir` fires on every `std::env::temp_dir()` call. Unlike the
+          # two rules above, this one's threat model CAN apply here -- a
+          # predictable name in a shared directory is a real hazard -- so this
+          # is a readability decision, not a claim the pattern is inapplicable.
+          # Issue #146 triaged all 6 open findings: all benign today (read-only
+          # use, or already behind tempfile's secure-creation path), but one
+          # (src/embedded_pane.rs:346) has the rule's exact shape and is benign
+          # only because nothing currently connects to that path -- unreached,
+          # not absent. Revisit if a future change makes that path load-bearing.
           semgrep scan \
             --config p/rust \
             --config p/github-actions \
             --config p/secrets \
             --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage \
+            --exclude-rule rust.lang.security.current-exe.current-exe \
+            --exclude-rule rust.lang.security.args.args \
+            --exclude-rule rust.lang.security.temp-dir.temp-dir \
             --sarif --output semgrep.sarif \
-            --no-error
+            --error
       - uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         if: always()
         with:
