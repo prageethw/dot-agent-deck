@@ -437,6 +437,14 @@ fn ownership_of(repo_dir: &Path, worktree_path: &Path) -> Ownership {
 /// immediately after a successful add, never for a pre-existing or foreign
 /// worktree.
 ///
+/// `creator` names the task or orchestration that created the worktree
+/// (issue #425) — e.g. `"issue-dispatch:<task>#<issue>"` or
+/// `"orchestration:<name>"`. It is sanitised via
+/// [`sanitize_marker_creator`] before being written, since it is
+/// user-controlled config (a task name from `.dot-agent-deck.toml`, or an
+/// orchestration tab name typed into the TUI) landing in a file this crate
+/// later reads back.
+///
 /// Best-effort by design, not fail-hard: the marker is metadata for a LATER
 /// `reclaim` decision, not a precondition for the worktree being usable now.
 /// Callers log-and-continue on `Err` (mirroring `ensure_worktrees_excluded`'s
@@ -452,16 +460,73 @@ fn ownership_of(repo_dir: &Path, worktree_path: &Path) -> Ownership {
 /// partially-written state a concurrent reader could observe as wrong — a
 /// short write from e.g. a disk-full mid-write still resolves to `Ours`
 /// exactly as a complete write would, and no other writer of this file
-/// exists to race against.
-pub(crate) fn mark_worktree_owned(worktree_path: &Path) -> Result<(), String> {
+/// exists to race against. This also means an older-build marker — the bare
+/// `"deck\n"` this function used to write before issue #425 — still resolves
+/// to `Ours`: [`ownership_of`] never inspects content, so a first line other
+/// than `deck` would be the only way to regress that, and this function
+/// always writes `deck` first for exactly that reason. Re-marking an
+/// already-marked worktree (idempotent by construction: `std::fs::write`
+/// truncates rather than appends) simply overwrites the identity line rather
+/// than accumulating one per call.
+pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result<(), String> {
     let git_dir = resolve_git_dir(worktree_path).ok_or_else(|| {
         format!(
             "could not resolve git-dir for {} via `git rev-parse --git-dir`",
             worktree_path.display()
         )
     })?;
-    std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), "deck\n")
+    let content = format!("deck\ncreated-by: {}\n", sanitize_marker_creator(creator));
+    std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), content)
         .map_err(|e| format!("failed to write ownership marker: {e}"))
+}
+
+/// Neutralise a creator identity before it is written into the
+/// `dot-agent-deck-owner` marker (issue #425). The marker's format is one
+/// field per line (`deck` on line 1, `created-by: <identity>` on line 2), so
+/// an embedded newline or carriage return in a hand-edited task name or
+/// TUI-typed orchestration name would otherwise inject a bogus extra line;
+/// collapsing both to a space keeps the two-line shape intact. Every other
+/// C0/DEL control character is dropped outright, since nothing about this
+/// name benefits from being reproduced byte-for-byte and a stray control
+/// character (that also can't render as anything a person would attribute
+/// meaning to) has no reason to survive into a file this crate keeps around
+/// indefinitely. Mirrors `issue_dispatch::sanitize_claimant_name`'s
+/// reasoning (PRD #421) for a different sink — a local file rather than a
+/// public GitHub comment — so no CommonMark-specific escaping (backticks,
+/// `@`-mentions) is needed here. Every real `created-by` value embeds a
+/// second colon after the prefix (`issue-dispatch:<task>#<issue>`,
+/// `orchestration:<name>`), so a future reader must strip the literal
+/// `created-by: ` prefix and treat the remainder as opaque, never
+/// `split(':')` — see the module-level format doc.
+///
+/// The result is trimmed and capped at [`MARKER_CREATOR_MAX_CHARS`],
+/// mirroring the length bound `scheduler::sanitize_claimant_for_render`
+/// already applies to its own mirror sink. An empty or all-control-character
+/// input — e.g. `validate_task` never checks `ScheduledTask.name`, so a
+/// blank task name is a loadable schedule — collapses to the literal
+/// `"unknown"` rather than leaving a bare `created-by: ` with no identity
+/// after the prefix.
+const MARKER_CREATOR_MAX_CHARS: usize = 200;
+
+fn sanitize_marker_creator(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    if trimmed.chars().count() > MARKER_CREATOR_MAX_CHARS {
+        let truncated: String = trimmed.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
@@ -1121,9 +1186,13 @@ mod tests {
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let worktree_dir = scratch.path().join("wt-deck-created");
-        let creation =
-            crate::issue_dispatch_run::create_worktree_sync(&repo, &worktree_dir, branch)
-                .expect("create_worktree_sync must succeed against a real git repo");
+        let creation = crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            branch,
+            "test-creator",
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
             crate::issue_dispatch_run::WorktreeCreation::Created,
@@ -1151,6 +1220,163 @@ mod tests {
             !worktree_dir.exists(),
             "the worktree directory must actually be gone after the bare reclaim above, not \
              merely reported as removed"
+        );
+    }
+
+    /// Scenario: `create_worktree_sync` (the sync creation path both the
+    /// TUI's `SpawnPane` dispatch and this module's own test above drive) is
+    /// asked to create a worktree with a specific creator identity. The
+    /// written marker must record that identity (issue #425), not just the
+    /// bare fact that a deck made it.
+    #[test]
+    fn mark_worktree_owned_records_creator_identity_sync_path() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let worktree_dir = scratch.path().join("wt-with-creator");
+        let creation = crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            "feat/creator-identity",
+            "issue-dispatch:my-task#42",
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
+        assert_eq!(
+            creation,
+            crate::issue_dispatch_run::WorktreeCreation::Created
+        );
+
+        let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
+        let content = std::fs::read_to_string(git_dir.join(OWNER_MARKER_FILENAME))
+            .expect("marker file must exist and be readable");
+        assert!(
+            content.starts_with("deck\n"),
+            "the bare `deck` first line must be preserved for older-reader compatibility, \
+             got {content:?}"
+        );
+        assert!(
+            content.contains("created-by: issue-dispatch:my-task#42"),
+            "the marker must record the creator identity, got {content:?}"
+        );
+    }
+
+    /// Scenario: a marker written by an OLDER build -- the literal
+    /// `"deck\n"` this crate wrote before issue #425, with no creator line
+    /// at all -- must still resolve as deck-owned. `ownership_of` only
+    /// checks the marker's PRESENCE, never its content, so this holds by
+    /// construction; this test pins that down explicitly rather than
+    /// leaving it implicit, since a future change to `ownership_of` that
+    /// started parsing content could silently stop reclaiming every
+    /// worktree marked before this change shipped.
+    #[test]
+    fn bare_deck_marker_from_older_build_still_reads_as_ours() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let worktree_dir = scratch.path().join("wt-old-marker");
+        let creation = crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            "feat/old-marker",
+            "whatever this build would have recorded",
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
+        assert_eq!(
+            creation,
+            crate::issue_dispatch_run::WorktreeCreation::Created
+        );
+
+        // Overwrite with the OLDER, bare-form marker content -- simulating a
+        // worktree marked by a build that predates issue #425.
+        let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
+        std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), "deck\n")
+            .expect("overwrite with bare older-build marker");
+
+        assert_eq!(
+            ownership_of(&repo, &worktree_dir),
+            Ownership::Ours,
+            "a bare `deck\\n` marker from an older build must still resolve as deck-owned"
+        );
+    }
+
+    /// Scenario: a creator identity containing newlines, carriage returns,
+    /// and other control characters -- a hand-edited `.dot-agent-deck.toml`
+    /// task name, or a TUI-typed orchestration name, both of which carry no
+    /// character restriction -- must not corrupt the marker's two-line
+    /// format or its content when written and read back.
+    #[test]
+    fn hostile_creator_name_is_sanitised_without_corrupting_the_marker() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let worktree_dir = scratch.path().join("wt-hostile-creator");
+        let hostile = "line-one\nline-two\rline-three\u{7}\u{1b}[31mred";
+        let creation = crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            "feat/hostile",
+            hostile,
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
+        assert_eq!(
+            creation,
+            crate::issue_dispatch_run::WorktreeCreation::Created
+        );
+
+        let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
+        let content = std::fs::read_to_string(git_dir.join(OWNER_MARKER_FILENAME))
+            .expect("marker file must exist and be readable");
+
+        assert_eq!(
+            content.lines().count(),
+            2,
+            "an embedded newline/carriage-return in the creator name must not add extra lines, \
+             got {content:?}"
+        );
+        assert!(
+            !content.contains('\u{7}') && !content.contains('\u{1b}'),
+            "control characters must be dropped, not reproduced verbatim, got {content:?}"
+        );
+        assert_eq!(
+            ownership_of(&repo, &worktree_dir),
+            Ownership::Ours,
+            "a marker written with a hostile creator name must still read as deck-owned"
+        );
+    }
+
+    /// Scenario: `sanitize_marker_creator` is fed an empty string, a
+    /// whitespace/control-only string, and a creator identity far longer
+    /// than the cap. The empty and all-stripped cases must both record an
+    /// explicit `"unknown"` rather than a blank identity after the
+    /// `created-by: ` prefix, and the over-length case must be truncated
+    /// at [`MARKER_CREATOR_MAX_CHARS`] rather than grow the marker file
+    /// without bound.
+    #[test]
+    fn sanitize_marker_creator_bounds_and_guards() {
+        assert_eq!(sanitize_marker_creator(""), "unknown");
+        assert_eq!(sanitize_marker_creator("   "), "unknown");
+        assert_eq!(sanitize_marker_creator("\u{7}\u{1b}"), "unknown");
+
+        let long = "a".repeat(MARKER_CREATOR_MAX_CHARS + 50);
+        let sanitized = sanitize_marker_creator(&long);
+        assert_eq!(
+            sanitized.chars().count(),
+            MARKER_CREATOR_MAX_CHARS + 1,
+            "must truncate to the cap plus the trailing ellipsis marker, got {} chars",
+            sanitized.chars().count()
+        );
+        assert!(
+            sanitized.ends_with('…'),
+            "an over-length creator name must be marked as truncated, got {sanitized:?}"
+        );
+
+        assert_eq!(
+            sanitize_marker_creator("  orchestration:worktree-demo  "),
+            "orchestration:worktree-demo",
+            "ordinary input must still be trimmed but otherwise passed through"
         );
     }
 }
