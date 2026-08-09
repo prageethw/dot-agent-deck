@@ -213,13 +213,14 @@ repo = "vfarcic/dot-ai"               # ONE repo, "owner/name"
 max_per_run = 5                       # hard cap on how many issues a single fire dispatches
 # label = "agent-eligible"            # optional: only issues carrying this label
 # query = "is:open no:assignee"       # optional: advanced gh search override
+# triage = true                       # optional: opt in to per-issue triage — see "Opt-in triage" below
 ```
 
 > **`command` is not used here**
 >
 > Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
 
-Rather than hand-write the sub-table, you can author the same task with the validated CLI — pass `--repo` (and the optional `--max-per-run` / `--label` / `--query`) and omit `--command`:
+Rather than hand-write the sub-table, you can author the same task with the validated CLI — pass `--repo` (and the optional `--max-per-run` / `--label` / `--query` / `--triage`) and omit `--command`:
 
 ```bash
 dot-agent-deck schedule add \
@@ -230,9 +231,12 @@ dot-agent-deck schedule add \
   --working-dir ~/dispatch \
   --prompt "Work on issue {{issue_number}}" \
   --label agent-eligible      # optional
+  --triage                    # optional — see "Opt-in triage" below
 ```
 
 A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates, writes the global config atomically, and triggers a live daemon reload — exactly as for a plain task.
+
+`--triage` is a bare flag (present = on) and, like `--max-per-run` / `--label` / `--query`, is only meaningful alongside `--repo`; it maps onto the `triage` field described below.
 
 ### What a fire does, issue by issue
 
@@ -255,14 +259,46 @@ Everything for a task lives under the task's own `working_dir` (the **workspace 
 | `<working_dir>/<name>/.worktrees/issue-<n>` | The **per-issue worktree** for issue `<n>`. |
 | `agent/issue-<n>` | The **branch** each worktree checks out. |
 
-### Idempotency: the worktree is the ledger
+### Idempotency: three signals, one explicit claim
 
-There is no separate state file — the **filesystem itself** records which issues are in flight, so re-running a dispatch (whether the cron fires again or you press **Run now**) does not double-dispatch work already underway. Before dispatching an issue, the task **skips** it when either:
+There is no separate state file. Before dispatching an issue, the task checks three signals, in order, and **skips** the issue if any one of them is true:
 
-- its `.worktrees/issue-<n>` worktree **already exists** (the primary signal), or
-- an **open PR** already has head branch `agent/issue-<n>` (the secondary signal — a deterministic check, not fuzzy `Closes #n` body parsing).
+1. its `.worktrees/issue-<n>` worktree **already exists on disk** (the primary signal — the filesystem itself records which issues are in flight, so re-running a dispatch, whether the cron fires again or you press **Run now**, does not double-dispatch work already underway);
+2. an **open PR** already has head branch `agent/issue-<n>` (the secondary signal — a deterministic check, not fuzzy `Closes #n` body parsing);
+3. the issue carries the **`in-progress` label** (the third signal, PRD #421).
 
-A skipped issue is logged/surfaced and left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
+The first two signals are **inferred** — they are side-effects of a dispatch having happened, read back off the filesystem or GitHub's PR state. The label is different: it is an **explicit claim**, and it is honoured no matter who applied it — this deck's own prior dispatch, a human working the issue by hand, or an external tool. Nothing compares "is this my own claim?"; the label alone is enough to skip.
+
+**On a successful dispatch** — after the worktree is created and the agent is spawned — the task writes the `in-progress` label onto the issue and appends a comment naming the **claimant**: the scheduled task's name, the host it ran on, and a timestamp. The label is the machine-readable signal dispatch actually gates on; the comment is the human-readable record of *who* made the claim. Provenance never changes the skip decision — it only makes an already-decided skip legible when you go looking at the issue.
+
+**A failed dispatch leaves the issue completely unmarked**, deliberately. Labelling before the outcome is known would let a failed dispatch produce a false claim — permanently un-dispatchable, since nothing would ever clear a label nobody is coming back to fix. The worktree/PR signals don't have this problem: a fire that fails after creating the worktree still leaves the worktree in place, so the *next* fire's worktree-exists check reclaims the same issue rather than skipping it forever.
+
+Skipping is always **reported** — as a deck notification — never silent: a stray `in-progress` label left by a human silently starves the backlog, and from the outside that looks like nothing happening rather than like an issue being deliberately excluded. Each skip names its cause. There are four causes; the label cause renders two ways depending on whether a claimant could be found:
+
+| Cause | Rendered reason |
+|---|---|
+| the worktree already exists | `the worktree already exists` |
+| an open PR already targets the branch | `an open PR already targets this branch` |
+| labelled `in-progress`, claimant known | ``labelled `in-progress` ({comment})`` |
+| labelled `in-progress`, no claimant recorded | ``labelled `in-progress`, no claimant recorded`` |
+| a concurrent dispatch won the race | `a concurrent dispatch claimed the worktree first` |
+
+The last row is a benign race, not a failure: two fires can both pass the idempotency check before either has created its worktree, and only one wins — the loser skips rather than erroring. "No claimant recorded" covers a best-effort claimant lookup (reading the issue's comments back to find the claim) that itself failed to find one — the label is still honoured as a claim; the skip is simply reported without saying who made it.
+
+A skipped issue is left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
+
+### Opt-in triage
+
+Set `triage = true` in the `[scheduled_tasks.issue_dispatch]` sub-table (or pass `--triage` to `schedule add`) to have each dispatched issue triaged by the agent working it, instead of landing with no priority/size signal at all. It is **off by default**.
+
+When triage is on, a fire first ensures a seven-label vocabulary exists on the repo (`gh label create --force`, so re-running is a no-op once they're there): `priority-high`, `priority-medium`, `priority-low`, `size-high`, `size-medium`, `size-low`, and `needs-triage`. It then appends a triage instruction to the prompt of **every issue it actually dispatches** — a skipped issue never sees it.
+
+**The deck itself never classifies anything.** The instruction asks the spawned agent to apply one size label and, when it can tell, one priority label, using its own `gh` calls — the same way it would apply any other label while working the issue. Under uncertainty the agent is instructed to apply `needs-triage` and leave priority unset rather than guess, because a **wrong** priority is worse than an **absent** one: an absent priority is visibly unclassified, while a wrong one is indistinguishable from a considered judgment until someone checks.
+
+Two things this deliberately does **not** do, so nobody infers a behavior that isn't there:
+
+- It does not triage your whole backlog — only the issues a fire actually dispatches ever get labeled or see the instruction.
+- Recording a priority does not currently affect dispatch order. `max_per_run` still takes issues in the order `gh` returns them; nothing sorts by `priority-*` yet.
 
 ### Cleanup: closing a tab removes its worktree
 
