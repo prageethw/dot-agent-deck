@@ -53,6 +53,27 @@ Automatic provisioning is now **fork #175**, which depends on this one. The spli
 
 Landing those separately means #175 builds on settled ground, and that if the wire change causes trouble there is a smaller thing to unpick. What ships here is still independently useful: unique orchestration names, and an answerable *"which worktrees are mine?"* — including after a restart.
 
+### What fork PR #173 already landed, and what it leaves
+
+**Update 2026-08-09.** While this PRD was being written, fork PR **#173** (`a6fee76`, tracking *upstream* issue #425) merged and independently built the **write half** of ownership. That is a help, not a collision — it settles the marker format question this PRD would otherwise have had to answer.
+
+Already on `main`:
+
+- **The marker format.** `mark_worktree_owned(worktree_path, creator)` writes `"deck\ncreated-by: <sanitized>\n"` — one field per line, with the bare `deck` first line kept so an older reader still sees a valid marker. Its doc is explicit about the read contract: *"a future reader must strip the literal `created-by: ` prefix and treat the remainder as opaque, never `split(':')`"*.
+- **`sanitize_marker_creator`** — drops C0/DEL controls, collapses newlines to spaces so the two-line shape survives, caps at 200 chars, and maps empty input to `"unknown"`.
+- **`creator` threaded through both creation paths** — `create_worktree` and `create_worktree_sync` in `src/issue_dispatch_run.rs` both take it.
+- **Issue-dispatch passes `issue-dispatch:<task>#<issue>`**, which matches this PRD's "the scheduled task's name on the dispatch path" exactly.
+
+**This PRD adopts that format rather than proposing another.** It is well-designed, documented, and already shipped.
+
+What it leaves for this PRD:
+
+1. **There is no read side.** Nothing parses `created-by:` back out, so ownership cannot yet be *queried* — only written.
+2. **The interactive path records the wrong identity for our purpose.** `src/ui.rs` passes `format!("orchestration:{}", orch_config.name)` — the canonical **config/type** name (`review`, `tdd-cycle`), shared by every orchestration of that type. Two live `review` orchestrations therefore record the *same* creator, which does not distinguish instances. That is not a defect in #173 — its stated scope is *"record which task created a worktree"*, provenance rather than instance identity, and it is honest about that. Making the value instance-unique is precisely what this PRD adds, and #173's own sanitizer doc anticipates it by naming *"a TUI-typed orchestration name"* as an input.
+3. **Nothing surfaces the owner** in `worktree list`.
+
+So Phase 2 shrinks: the format is settled and the plumbing exists. What remains is the read side, the right value, and the display.
+
 ### Why the marker decides and the name does not
 
 The naming convention exists for humans. It carries no authority, and that distinction is the entire safety argument.
@@ -132,9 +153,10 @@ That check was built to defeat a forged marker. It protects this case for free, 
 
 ### Phase 2: Ownership
 
-- [ ] **M2.0** — `mark_worktree_owned` records the owner (typed name, or the scheduled task's name on the dispatch path).
-- [ ] **M2.1** — `ownership_of` reports the owner. Containment and presence stay authoritative: an empty or unparseable marker resolves `Ours` with owner unknown.
-- [ ] **M2.2** — `worktree list` shows the owner; `--json` carries it; decide whether `SCHEMA_VERSION` moves.
+- [x] **M2.0** — ~~`mark_worktree_owned` records the owner~~ **done by fork PR #173** (`a6fee76`), including the format and the sanitizer. The dispatch path already passes the scheduled task's name.
+- [ ] **M2.1** — the interactive path passes the **typed unique name** instead of `orch_config.name`, so the recorded identity distinguishes live instances.
+- [ ] **M2.2** — a read side: parse `created-by:` back out per #173's stated contract (strip the literal prefix, treat the remainder as opaque, **never** `split(':')`). Containment and presence stay authoritative — an empty or prefix-less marker resolves `Ours` with owner unknown.
+- [ ] **M2.3** — `worktree list` shows the owner; `--json` carries it; decide whether `SCHEMA_VERSION` moves.
 
 ### Phase 3: Query
 
