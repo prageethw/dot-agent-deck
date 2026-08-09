@@ -129,12 +129,21 @@ fn signal_child_pgroup_or_fallback(
         // used by this codebase always returns `Some` in practice. The
         // `(0, i32::MAX]` boundary check is defense-in-depth against a future
         // portable-pty bug; on real Linux/macOS PIDs it never fails. The
-        // fallback below uses `portable_pty::Child::kill`, which sends SIGHUP
-        // — strictly weaker than the requested `signal` (typically SIGTERM or
-        // SIGKILL) and limited to the direct child (no process-group
-        // semantics, so descendants leak). The caller's subsequent
-        // `child.wait()` is unbounded — that's acceptable for the same "this
-        // branch is practically unreachable" reason.
+        // fallback below uses `portable_pty::Child::kill`, whose behavior
+        // depends on the concrete `Child` impl behind the trait object: for
+        // `StdChild` — the only production user of these paths — it is
+        // `std::process::Child::kill()`, a guarded SIGKILL (std
+        // short-circuits to `Ok(())` without signaling if the child has
+        // already been waited on). portable-pty's own PTY `Child` impl is
+        // different: a raw, unguarded `libc::kill(pid, SIGHUP)` that
+        // deliberately bypasses std's reaped-pid guard. Either way this
+        // fallback is limited to the direct child (no process-group
+        // semantics, so descendants leak) and carries no recycled-pid guard
+        // of its own — the forcing entry points' precondition that the
+        // caller must not have reaped `child` is what actually protects it
+        // here. The caller's subsequent `child.wait()` is unbounded — that's
+        // acceptable for the same "this branch is practically unreachable"
+        // reason.
         //
         // Auditor #5: emit a warn-level event so a descendant leak surfaced
         // via this fallback is at least observable.
@@ -228,6 +237,15 @@ pub fn terminate_child_with_grace_and_wait(
 /// that poll is exactly what let phase 3 derive a pgid from an
 /// already-reaped, potentially-recycled pid.
 ///
+/// **Precondition:** the caller must not already have reaped `child` (no
+/// prior `try_wait`/`wait` that returned `Ok(Some(_))`). Phase 3 derives the
+/// process-group id it signals from `child.process_id()`, which after a reap
+/// names a released, recyclable pid — calling this on an already-reaped
+/// child reintroduces fork #143 through the front door, and the natural way
+/// to reach for this function is exactly that: a caller that polled
+/// `try_wait`, saw the leader exit, and chose this variant specifically
+/// because it still forces the group kill for a surviving descendant.
+///
 /// The single-pane Ctrl+W / respawn path keeps calling the non-forcing
 /// function above unchanged — see its doc comment for why.
 pub fn terminate_child_with_grace_and_wait_forcing_group_backstop(
@@ -260,6 +278,15 @@ pub fn terminate_child_with_grace_and_wait_forcing_group_backstop(
 /// cannot outlive this call. The agent Ctrl+W / respawn paths are unaffected:
 /// they keep calling [`terminate_child_with_grace_and_wait`], which this
 /// function does not touch or share an implementation with.
+///
+/// **Precondition:** the caller must not already have reaped `child` (no
+/// prior `try_wait`/`wait` that returned `Ok(Some(_))`). Phase 3 derives the
+/// process-group id it signals from `child.process_id()`, which after a reap
+/// names a released, recyclable pid — calling this on an already-reaped
+/// child reintroduces fork #143 through the front door, and the natural way
+/// to reach for this function is exactly that: a caller that polled
+/// `try_wait`, saw the leader exit, and chose this variant specifically
+/// because it still forces the group kill for a surviving descendant.
 pub fn terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
@@ -274,10 +301,25 @@ pub fn terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
     // reaped pid is released back to the kernel for the next unrelated
     // `setsid`'d process (any deck-spawned agent pane included) to receive —
     // which phase 3 would then `killpg` by mistake. Leaving the child
-    // unreaped for the whole window costs nothing: an exited-but-unreaped
-    // child sits as a zombie, and a zombie's pid cannot be recycled, so it
-    // stays a safe, live target for phase 3's `killpg` whether or not it has
-    // already exited.
+    // unreaped for the whole window is what keeps phase 3's target safe: an
+    // exited-but-unreaped child sits as a zombie, and what actually stays
+    // reserved is the zombie's **process group**, not merely its pid — POSIX
+    // keeps a process group alive as long as any member is within its
+    // process lifetime, and a zombie still is. This is sound here only
+    // because `spawn_in_new_process_group`'s `setsid` makes this child's
+    // pgid equal its own pid, so "the pid can't be recycled" and "the pgid
+    // can't be reallocated" happen to describe the same guarantee — a future
+    // change that breaks pgid == pid would need to re-derive this reasoning
+    // against the pgid directly.
+    //
+    // This is not free: skipping the poll means this call always blocks the
+    // calling thread for the full `grace` (200ms on the only production
+    // caller, `run_status_sync`), rather than returning as soon as an exited
+    // `git` was observed. That cost only lands after
+    // `WORKTREE_GIT_TIMEOUT`/`WORKTREE_CLEANUP_TIMEOUT` has already elapsed
+    // with the render loop blocked, and the worst case actually improves:
+    // the old poll-then-sleep loop could overshoot the window by nearly a
+    // full 50ms cadence, where this is a deterministic bound.
     std::thread::sleep(grace);
 
     // Phase 3: SIGKILL backstop, always sent to the whole group — forcing,
@@ -323,9 +365,13 @@ fn terminate_child_with_grace_and_wait_impl(
         // kernel for the next unrelated `setsid`'d process to receive —
         // which the group signal below would then hit by mistake. So this
         // branch never polls: it sleeps out the grace window untouched (an
-        // exited-but-unreaped child sits as a zombie, and a zombie's pid
-        // cannot be recycled, so it is still a safe target whether or not it
-        // has already exited), sends the SIGKILL, and only then performs the
+        // exited-but-unreaped child sits as a zombie, and what actually
+        // stays reserved is the zombie's **process group**, not merely its
+        // pid — a zombie is still within its process lifetime, so POSIX
+        // keeps the group alive; `spawn_in_new_process_group`'s `setsid`
+        // makes this child's pgid equal its own pid, which is the only
+        // reason "pid can't be recycled" and "pgid can't be reallocated"
+        // coincide here), sends the SIGKILL, and only then performs the
         // single reaping wait.
         std::thread::sleep(grace);
         signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
