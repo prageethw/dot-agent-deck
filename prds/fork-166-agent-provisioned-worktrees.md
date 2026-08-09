@@ -1,4 +1,4 @@
-# PRD fork#166: Agent-provisioned worktrees with orchestration ownership — spin up autonomous work without a human creating worktrees
+# PRD fork#166: Unique orchestration names, and worktrees the agent provisions itself
 
 **GitHub Issue**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166)
 
@@ -6,54 +6,71 @@
 
 **Status**: Planning
 
-**Fork-only**: yes, and intended to stay so. Confirmed mechanically against `upstream/main`: `src/worktree_reclaim.rs` **does not exist** there and `worktree_slug` has **0** occurrences. The ownership half is built entirely on fork-only code. Per `docs/develop/upstream-contribution-policy.md`, that settles it — this is not an offer-later case.
+**Fork-only**, and intended to stay so. Confirmed mechanically against `upstream/main`: `src/worktree_reclaim.rs` **does not exist** there and `worktree_slug` has **0** occurrences. The ownership half is built entirely on fork-only code, so per `docs/develop/upstream-contribution-policy.md` this is not an offer-later case.
 
-**Related**: fork #144 (the ownership marker and its containment check — this PRD's foundation) · fork #122 (per-orchestration worktree creation, the mechanism this makes agent-callable) · PRD #422 (`worktree list` / `reclaim`, the command surface this extends) · PRD #140 (concurrent orchestration safety — **not** reversed by this PRD; see Out of Scope) · PRD #220 (dispatcher mode — the upstream cousin; its M1.1 naming question is adjacent and settled differently here) · fork #74 (the collision that motivates it) · PRD #421 (the provenance precedent)
+**Related**: fork #144 (the ownership marker and its containment check — the foundation) · fork #122 (per-orchestration worktree creation, and the hardened path validation reused here) · PRD #422 (`worktree list` / `reclaim`) · PRD #140 (per-tab routing identity; its `display_title` contract changes here) · PRD #120 (issue-dispatch, which already provisions its own worktrees) · PRD #220 (the upstream cousin; its M1.1 naming question is settled differently here) · fork #74 (the motivating collision) · PRD #421 (the provenance precedent, applied to a case it did not cover)
 
-**Filename convention note**: the first PRD named after a fork issue — every existing one cites `vfarcic`. A bare `166-` would be ambiguous against a future upstream #166, so fork-numbered PRDs take a `fork-<n>-` prefix.
+**Filename convention**: the first PRD named after a fork issue — every existing one cites `vfarcic`. A bare `166-` would be ambiguous against a future upstream #166, so fork-numbered PRDs take a `fork-<n>-` prefix.
 
 ## Problem Statement
 
-Creating a worktree is a **human step**, and CLAUDE.md rule 1 makes it a mandatory one: the orchestrator must run `git worktree add` by hand, unset the upstream, and state the absolute path, exact SHA and branch name in every task it delegates. Rule 16 exists because that supply obligation kept being forgotten.
+Creating a worktree is a **human step**, and CLAUDE.md rule 1 mandates it: the orchestrator runs `git worktree add` by hand, unsets the upstream, and states the absolute path, exact SHA and branch name in every task it delegates. Rule 16 exists because that supply obligation kept being forgotten.
 
-The cost is not ceremony — it is the documented failure. Fork #74: *"a second orchestration's task named no worktree path, so its worker found the first orchestration's existing branch and reasonably joined it — writing production code into a worktree it did not own, then pushing to it and cancelling the first orchestration's in-flight CI run."* That has happened more than once.
+The cost is the documented failure, fork **#74**: *"a second orchestration's task named no worktree path, so its worker found the first orchestration's existing branch and reasonably joined it — writing production code into a worktree it did not own, then pushing to it and cancelling the first orchestration's in-flight CI run."* More than once.
 
-**The goal is autonomous operation.** An orchestration should be able to start a new line of work without a human provisioning a directory for it first, and should be able to answer "which worktrees are mine?" rather than relying on a path someone typed into a task file.
+**The goal is autonomous operation** — spinning up agents without a human provisioning directories first. That needs two things the deck does not have: an orchestration that can create its own worktree, and an identity that says which worktrees are *its*.
 
 ### The workflow this serves
 
-1. Every orchestration starts from the deck's own checkout (`main`). That is intended, not a problem to be blocked.
-2. Each change — a PRD, a fix — gets **its own** worktree, created by the agent at the moment work starts.
-3. That worktree is tagged with the orchestration that created it.
-4. The orchestration can list what it owns, and work only on those.
-5. A worktree from a previous session whose ownership matches is **available again** — a restart resumes rather than orphans.
+1. Every orchestration starts from the deck's own checkout (`main`). **Intended** — not something to prevent.
+2. Each change gets **its own** worktree, created by the agent when work starts.
+3. That worktree belongs to the orchestration that created it.
+4. The orchestration can list what it owns, and works only on those.
+5. A worktree from an earlier session whose owner matches is **available again** — a restart resumes rather than orphans.
 
-Steps 2–5 have no product support today. Step 2 is manual; steps 3–5 do not exist.
+Step 2 is manual. Steps 3–5 do not exist.
+
+### The missing key: names are not identities
+
+The new-pane form already has a **Name** field, and for an orchestration it becomes `display_title` — which is explicitly decoration. `src/agent_pty.rs:337`: *"is title-only and never feeds delegate/role lookups."* `src/ui.rs:8264`: *"name to the tab TITLE only."* It is optional, and nothing prevents two tabs sharing one.
+
+So there is no answer to "which orchestration is this?" that survives a restart. `orchestration_id` is unique but **minted fresh on every tab open** (`mint_orchestration_id`), so a reopened tab would not recognise its own worktrees — breaking step 5 exactly when it matters. `name` + `orchestration_cwd` are identical for two tabs of one orchestration in one directory, which is the normal case here.
 
 ## Solution Overview
 
-Three additions, all on the existing `worktree` command surface.
+**Make the orchestration's name a real identity, and everything else follows.**
 
-1. **`worktree create` — agent-callable provisioning.** One call creates the worktree, attaches or creates its branch, and records ownership. The orchestrator calls it exactly as it already calls `delegate` and `work-done`, removing `git worktree add` from rule 1's manual burden.
-2. **Ownership recorded in the marker.** fork #144's `dot-agent-deck-owner` marker is written at creation but is empty. It gains the owning orchestration's identity.
-3. **`worktree list` reports and filters by owner.** It already reports ownership as `Ours`/`Foreign`; it gains *which* orchestration, and a way to ask for only mine.
+1. **A name is required, and must be unique** among live orchestrations.
+2. **The name is suggested** as the next free `<foldername>-orchestrator-N`, so accepting it is one keystroke.
+3. **The name is the ownership identity**, written into the marker of every worktree the orchestration creates.
+4. **Worktrees are named `<orchestration-name>-<change>`**, so the prefix is the owner and `ls` shows it at a glance.
+5. **The marker decides ownership, never the name.**
+6. **Provisioning is one step** — `delegate` creates the worktree; no separate verb to call first.
 
-### Authority is the marker; the name is only a convenience
+### Why the marker decides and the name does not
 
-Worktrees are named for legibility — a `<repo>-<orchestration>-<change>` shape makes it obvious at a glance in `ls` and in the tab strip which work belongs to which orchestration.
+The naming convention exists for humans. It carries no authority, and that distinction is the entire safety argument.
 
-**But the name never decides ownership.** Only the marker does. This distinction is the whole safety argument:
+**Name-based (prefix) ownership was considered and rejected.** It would adopt a worktree the deck did not create — a hand-made folder matching the pattern becomes `Ours`, and fork #144 makes `Ours` + merged + clean removable by a bare `reclaim` with **no prompt and no path shown**. That is the P1 fork #144 closed. Reopening it to save a file read is a bad trade.
 
-- **Name-based (prefix) ownership was considered and rejected.** It would adopt a worktree the deck did not create — a hand-made folder that happens to match the pattern becomes `Ours`, and fork #144 makes `Ours` + merged + clean removable by a bare `reclaim` with **no prompt and no path shown**. That is the P1 fork #144 closed. Reopening it to save a file read is a bad trade.
-- With the marker authoritative, a matching name on a folder the deck did not create is simply `Foreign`. Nothing is adopted, and the naming convention stays useful for humans.
+With the marker authoritative, a matching name on a folder the deck did not create is simply `Foreign`. Nothing is adopted, and the convention stays useful.
 
-### Identity must survive a restart
+### Promoting `display_title` is a contract change, not a rename
 
-The obvious identity — `orchestration_id` — is **wrong here**, and the reason is worth recording because it is not obvious: `mint_orchestration_id()` runs fresh on every tab open. A tab that closes and reopens would no longer recognise its own worktrees, so step 5 (resume) would break precisely when it matters.
+Using the typed Name as the identity means `display_title` stops being presentation-only. That contract is stated in PRD #140's own field docs and must be updated there, not silently contradicted.
 
-The identity written into the marker must therefore be the orchestration's **stable name/slug**, which does not change across restarts.
+Two consequences:
 
-Note this differs from PRD #421's conclusion for *issue claims*, and deliberately. There, provenance is reporting content and never a decision input, because a claim is authoritative regardless of who made it. Here, ownership genuinely **is** a decision input — "may this orchestration work here?" — so it needs an identity that means the same thing tomorrow. The two PRDs answer different questions; #421's reasoning is not being contradicted, it is being applied to a case it did not cover.
+- Every site that treats it as cosmetic needs checking. It is `Option<String>` with `skip_serializing_if`, deliberately, so older peers round-trip cleanly.
+- **This is a semantic break behind a stable wire** — the field's *shape* is unchanged, its *meaning* is not. CLAUDE.md rule 12 names exactly this case, so a `changelog.d/*.breaking.md` fragment applies, and whether `PROTOCOL_VERSION` moves must be answered rather than assumed.
+
+### Daemon-initiated orchestrations have a different identity, and that is fine
+
+Scheduled and issue-dispatch orchestrations set `display_title: None` (`src/issue_dispatch_run.rs:1552`, `:1646`; `src/spawn.rs:339`) — nobody types a name.
+
+They do not need one. **Issue-dispatch already provisions its own worktree** (`<clone>/.worktrees/issue-<n>`, branch `agent/issue-<n>`) and already writes the marker, keyed on the `ScheduledTask` name it also uses as the reuse key. That name is stable across restarts for the same reason a typed name is.
+
+So the owner recorded is the typed name for interactive orchestrations and the scheduled task's name for dispatched ones. Both are stable identifiers; only the source differs. The requirement in this PRD — *a name must exist and be unique* — is a constraint on the **interactive** path only.
 
 ### `main` is already protected, structurally
 
@@ -65,79 +82,86 @@ if !git_dir.starts_with(common_dir.join("worktrees")) {
 }
 ```
 
-The main checkout's git dir is `<repo>/.git`, which sits *above* `<repo>/.git/worktrees`, so it can never match — `main` always resolves `Foreign`. A second, independent protection: `mark_worktree_owned` is only ever called immediately after a successful `git worktree add`, "never for a pre-existing or foreign worktree", so no marker is written there in the first place.
+The main checkout's git dir is `<repo>/.git`, which sits *above* `<repo>/.git/worktrees`, so it can never match — `main` always resolves `Foreign`, whatever it is named. Independently, `mark_worktree_owned` runs only immediately after a successful `git worktree add`, "never for a pre-existing or foreign worktree", so no marker is written there.
 
-That check was built to defeat a forged marker. It protects this case for free, because "is this a real linked worktree of this repo?" is the same question either way.
+That check was built to defeat a forged marker. It protects this case for free, because *"is this a real linked worktree of this repo?"* is the same question either way.
 
 ## Scope
 
 ### In Scope
 
-- `worktree create` — agent-callable creation, branch attach-or-create, marker written with owner.
-- Owner identity in the marker; backward compatibility with existing empty markers.
-- `worktree list` reporting the owner and filtering to the caller's own.
-- The reuse rule: an ownership match means resume; no match means create a new one.
-- The `<repo>-<orchestration>-<change>` naming convention, as convention.
-- Docs, and the rule 1 amendment that follows from `git worktree add` no longer being a manual step.
+- A required, unique orchestration name on the interactive path, suggested as `<foldername>-orchestrator-N`.
+- Promoting `display_title` from presentation to identity, and updating PRD #140's contract wording.
+- Owner recorded in fork #144's marker; `ownership_of` reports it.
+- `delegate` provisioning `<orchestration-name>-<change>` in one step.
+- Listing the worktrees an orchestration owns, correct after a restart.
+- Amending CLAUDE.md rule 1 so manual `git worktree add` is replaced, keeping rule 16's supply obligations.
 
 ### Out of Scope
 
-- **Any restriction on where orchestration tabs start.** All orchestrations starting from `main` is the intended workflow. An earlier draft of this PRD proposed blocking a second orchestration in one directory; that was a misreading of the workflow and is withdrawn. **PRD #140's advisory stance stands unchanged.**
-- **Automatic worktree removal.** fork #122 deliberately never removes worktrees, because auto-removal risks destroying uncommitted work. `worktree reclaim` (PRD #422) remains the deliberate, gated path.
+- **Any restriction on where orchestration tabs start.** All orchestrations starting from `main` is the intended workflow. An earlier draft proposed blocking a second orchestration per directory; that was a misreading and is withdrawn. **PRD #140's advisory stance stands unchanged.**
+- **Automatic worktree removal.** fork #122 deliberately never removes worktrees; `reclaim` stays the gated path.
 - **Adopting worktrees the deck did not create.** Never, by any mechanism.
-- **Stopping an agent from `cd`-ing into another orchestration's worktree.** No deck-side check can see that; it is agent discipline, enforced by CLAUDE.md rule 1.
+- **Stopping an agent `cd`-ing into another orchestration's worktree.** No deck-side check can see that; it is agent discipline under rule 1.
 - **Namespacing `worker-task-<role>.md`** — see Risks.
 
 ## Success Criteria
 
-- An orchestration can provision a worktree for a new change **without a human running `git worktree add`**.
-- Every worktree it creates records it as owner; `worktree list` names that owner.
-- An orchestration can ask which worktrees are its own and get a correct answer **after a restart**.
-- A worktree created by a *different* orchestration is never reported as owned.
-- A worktree the deck did **not** create is never owned, whatever it is named.
-- `main` never appears as an owned worktree.
-- A worktree created before this ships still resolves `Ours`, and `reclaim` still auto-removes it.
-- CLAUDE.md rule 1's manual `git worktree add` step is replaced by the new call.
+- An orchestration provisions a worktree for a new change **without a human running `git worktree add`**.
+- Two live orchestrations cannot share a name.
+- The suggested name is accepted with one keystroke.
+- Every worktree an orchestration creates records it as owner; the owner is listable.
+- **After closing and reopening a tab with the same name, its earlier worktrees are still recognised as its own.**
+- A worktree created by a different orchestration is never owned. One the deck did not create is never owned, whatever it is named.
+- `main` never appears as owned.
+- A worktree created before this ships still resolves `Ours`, so `reclaim` keeps working on it.
+- CLAUDE.md rule 1's manual step is replaced.
 
 ## Milestones
 
-### Phase 1: Ownership identity
+### Phase 1: Name as identity
 
-- [ ] **M1.0** — `mark_worktree_owned` writes the owning orchestration's **stable** identity (plus instance id, host, timestamp for diagnosis).
-- [ ] **M1.1** — `ownership_of` reports the owner. Containment and presence remain authoritative — an empty or unparseable marker still resolves `Ours` with owner unknown, so every pre-existing worktree keeps working.
-- [ ] **M1.2** — `worktree list` shows the owner; `--json` carries it. Decide whether this needs a `SCHEMA_VERSION` bump.
+- [ ] **M1.0** — the interactive Name is required and refused if it matches a live orchestration; suggested as the next free `<foldername>-orchestrator-N`.
+- [ ] **M1.1** — `display_title` promoted to identity; PRD #140's field docs updated; every cosmetic-assumption site checked.
+- [ ] **M1.2** — rule 12 answered: `.breaking.md` fragment, and an explicit `PROTOCOL_VERSION` decision.
 
-### Phase 2: Agent-callable provisioning
+### Phase 2: Ownership
 
-- [ ] **M2.0** — `worktree create <change-slug>`: resolve the path, `git worktree add`, attach-or-create the branch, write the marker with owner, return the absolute path.
-- [ ] **M2.1** — reuse rule: an existing worktree whose marker names this orchestration is returned rather than re-created; one owned by another is refused with a clear reason.
-- [ ] **M2.2** — the `<repo>-<orchestration>-<change>` naming convention, reusing fork #122's hardened `resolve_orchestration_worktree_path` validation rather than a second path builder.
+- [ ] **M2.0** — `mark_worktree_owned` records the owner (typed name, or the scheduled task's name on the dispatch path).
+- [ ] **M2.1** — `ownership_of` reports the owner. Containment and presence stay authoritative: an empty or unparseable marker resolves `Ours` with owner unknown.
+- [ ] **M2.2** — `worktree list` shows the owner; `--json` carries it; decide whether `SCHEMA_VERSION` moves.
 
-### Phase 3: Query and adoption
+### Phase 3: Provisioning and query
 
-- [ ] **M3.0** — a way to ask "which worktrees do I own", answering correctly across restarts.
-- [ ] **M3.1** — docs; amend CLAUDE.md rule 1 so the manual `git worktree add` becomes the new call, keeping the supply obligations rule 16 requires.
+- [ ] **M3.0** — `delegate` creates `<orchestration-name>-<change>` in one step, reusing `resolve_orchestration_worktree_path`'s hardened validation and `create_worktree_sync` rather than a second implementation.
+- [ ] **M3.1** — an orchestration can list the worktrees it owns, correctly after a restart.
+- [ ] **M3.2** — an existing worktree owned by this orchestration is reused; one owned by another is refused with a reason naming the owner, not raw git output.
+
+### Phase 4: Ship
+
+- [ ] **M4.0** — docs; CLAUDE.md rule 1 amended; the deployment precondition below stated in the changelog.
 
 ## Key Files
 
-- `src/worktree_reclaim.rs` — `OWNER_MARKER_FILENAME`, `mark_worktree_owned`, `ownership_of`, `resolve_git_dir` / `resolve_common_dir` (the containment that protects `main`)
-- `src/issue_dispatch_run.rs` — `create_worktree` / `create_worktree_sync`, the existing creation path to reuse
-- `src/main.rs` — `WorktreeCmd` (`:393`), which already has `List` and `Reclaim`
-- `src/ui.rs` — `resolve_orchestration_worktree_path` (`:6627`), `validate_orchestration_worktree_slug` (`:6572`)
-- `src/project_config.rs` — `resolve_orchestration_name` (`:243`), the stable identity source
+- `src/ui.rs` — `FormField::Name` (`:822`), the orchestration `display_title` assignment (`:8264-8266`), `resolve_orchestration_worktree_path` (`:6627`), `validate_orchestration_worktree_slug` (`:6572`), `live_orchestration_cwds` (`:790` — the existing liveness query a uniqueness check can reuse)
+- `src/agent_pty.rs` — `TabMembership::Orchestration.display_title` (`:341`) and its contract docs
+- `src/worktree_reclaim.rs` — `OWNER_MARKER_FILENAME`, `mark_worktree_owned`, `ownership_of`, and the containment protecting `main`
+- `src/issue_dispatch_run.rs` — `create_worktree_sync`, and the `display_title: None` dispatch sites
+- `src/main.rs` — `WorktreeCmd` (`:393`)
+- `prds/140-orchestration-session-partitioning.md` — the `display_title` contract to update
 - `tests/CATALOG.md` — `worktree/reclaim/*`, `orchestration/worktree/*`
 
 ## Risks and Mitigations
 
-- **Existing markers are empty files.** If `ownership_of` required parseable content, every pre-existing deck worktree would silently flip to `Foreign` and `reclaim` would stop auto-removing anything. Mitigated by keeping presence authoritative and treating unparseable content as unknown owner. **Needs its own test** — it protects every worktree created before this ships.
-- **An identity that changes across restarts breaks resume.** The exact trap `orchestration_id` sets. Mitigated by using the stable name/slug, and by a test that resumes *after* a simulated restart rather than within one session.
-- **Ownership becoming a licence to delete.** Ownership here answers "may I work here?", not "may I remove this?". `reclaim`'s gates are unchanged, and this PRD adds no removal path.
-- **`worker-task-<role>.md` still collides per-directory.** `src/state.rs:2059` keys it by role alone — PRD #140's layer 2, still deferred. It only bites on the inline `--task` path; this fork's documented `--task-file` default supplies a unique slug per delegation. Since every orchestration in this workflow starts in `main`, two inline delegations to the same role could clobber each other. Out of scope, recorded so it is not mistaken for solved. (The `work-done` twin **is** fixed — `work_done_file_name(role, pane_id)` — though the collisions seen on 2026-08-09 came from a running daemon that predates that fix, not from a design gap.)
-- **Two orchestrations picking the same change slug.** Both resolve the same path; `git worktree add` refuses the second. Fail-safe, but the error should name the owner rather than surfacing raw git output.
+- **Deployment precondition: existing worktrees become obsolete.** They carry a marker but no owner, so no orchestration can claim them. **Drain them before shipping.** They must still resolve `Ours` so `reclaim` keeps working — obsolete for *ownership*, not for cleanup. This needs its own test; it protects every worktree created before this ships.
+- **An identity that changes across restarts breaks resume.** The trap `orchestration_id` sets. Mitigated by using the name, and by a test that resumes **after a simulated restart** — a same-session test would pass even with the broken design.
+- **Promoting `display_title` silently.** It is documented as cosmetic in PRD #140 and in the field's own docs. Mitigated by updating both, and by rule 12's `.breaking.md`.
+- **Ownership becoming a licence to delete.** Ownership answers "may I work here?", not "may I remove this?". `reclaim`'s gates are unchanged and this PRD adds no removal path.
+- **`worker-task-<role>.md` still collides per-directory.** `src/state.rs:2059` keys it by role alone — PRD #140's layer 2, still deferred. Since every orchestration here starts in `main`, two *inline* `--task` delegations to the same role could clobber each other; the fork's documented `--task-file` default supplies a unique slug, so the common path is unaffected. Recorded so it is not mistaken for solved. (Its `work-done` twin **is** fixed — `work_done_file_name(role, pane_id)`; the collisions seen 2026-08-09 came from a running daemon predating that fix.)
 
 ## Open Questions
 
-- **What exactly is the stable identity** — `resolve_orchestration_name`'s output (config name, or directory basename)? Two orchestrations in one directory with the same config name would share it. Since ownership *is* a decision input here, this needs a definite answer, not a convention.
-- **Does `worktree create` belong on the CLI, on `delegate`, or both?** A separate verb is explicit and testable; folding it into `delegate` makes the common path one call instead of two.
-- **Should an orchestration be able to adopt an unowned-but-deck-created worktree** (marker present, owner unknown — i.e. one created before this ships)? Permissive is friendlier and matches "previously pending worktrees become available"; strict is more predictable. Leaning permissive, since containment already proves the deck created it.
-- **`SCHEMA_VERSION`** — does adding an owner field to `worktree list --json` warrant a bump? The field is additive.
+- **Is uniqueness scoped to live orchestrations, or to all names ever used?** Live-only is simpler and matches the daemon's existing query, but it lets a name be reused after a tab closes — and that reuse is *exactly* how resume is meant to work. Leaning live-only, with resume as the intended consequence rather than a loophole.
+- **What happens to a running orchestration whose name is edited?** Simplest is that names are fixed at tab open.
+- **Should `<change>` be supplied or derived?** Supplied is explicit; derived from the task risks unstable or colliding slugs.
+- **`SCHEMA_VERSION`** for the added owner field in `worktree list --json` — the field is additive.
