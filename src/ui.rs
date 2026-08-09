@@ -29552,6 +29552,111 @@ mod tests {
         }
     }
 
+    /// Scenario: Two SEPARATE live orchestrations, both of the SAME config
+    /// type (`make_orchestration("review")`, dispatched independently), are
+    /// each spawned through the real `Action::SpawnPane` path against their
+    /// own sibling worktree. On `main` today the interactive path (this
+    /// file's `SpawnPane` handler) derives the ownership marker's creator
+    /// identity from `orch_config.name` alone
+    /// (`format!("orchestration:{}", orch_config.name)`), so two
+    /// `review`-type orchestrations both record the identical owner
+    /// `orchestration:review` -- their worktrees are indistinguishable by
+    /// owner. That is not a gap in #173: its scope is WHICH TASK created a
+    /// worktree (provenance), not WHICH INSTANCE. Fork #166 adds instance
+    /// identity, so the two recorded owners must differ. This pins the
+    /// PROPERTY (distinctness), not the spelling -- the fix is expected to
+    /// replace `orch_config.name` with a typed unique identity whose exact
+    /// string this test does not predict.
+    #[spec("worktree/reclaim/022")]
+    #[test]
+    fn worktree_reclaim_022_two_orchestrations_of_the_same_config_type_record_distinct_owners() {
+        fn spawn_and_read_owner(
+            tmp: &std::path::Path,
+            repo: &std::path::Path,
+            suffix: &str,
+        ) -> Option<String> {
+            let worktree = tmp.join(format!("repo-{suffix}"));
+            let config = make_orchestration("review");
+            let req = NewPaneRequest {
+                dir: repo.to_path_buf(),
+                name: String::new(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(config.clone()),
+                seed_prompt: None,
+                orchestration_worktree_path: Some(worktree.clone()),
+                orchestration_worktree_slug: None,
+                orchestration_worktree_error: None,
+            };
+
+            let pc = Arc::new(CapturingPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                &mut ui,
+                pc.as_ref(),
+                &state,
+                &mut tm,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 200, 50),
+            );
+
+            assert!(
+                worktree.is_dir(),
+                "SpawnPane must have created the worktree on disk at {}",
+                worktree.display()
+            );
+
+            crate::worktree_reclaim::owner_of(repo, &worktree)
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_022 fixture\n").expect("write README");
+        run_git(&["add", "-A"]);
+        // CI runners carry no global git identity; pin it inline so the
+        // commit succeeds regardless of host config.
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let owner_a = spawn_and_read_owner(tmp.path(), &repo, "instance-a");
+        let owner_b = spawn_and_read_owner(tmp.path(), &repo, "instance-b");
+
+        assert_ne!(
+            owner_a, owner_b,
+            "two live orchestrations of the same config type ('review') must record \
+             DISTINCT owners in their respective worktree markers, got {owner_a:?} and \
+             {owner_b:?} -- on main today both format `orchestration:{{name}}` from the \
+             shared config name, making per-instance ownership indistinguishable"
+        );
+    }
+
     /// Scenario: Call `resolve_orchestration_worktree_path` with four slugs,
     /// each violating exactly one rule of the #122/#123 audit's P1 fix — a
     /// path separator, the literal `..`, a leading dash, and a NUL control

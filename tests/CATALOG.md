@@ -799,11 +799,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the marker's on-disk byte format (only that it round-trips through `mark_worktree_owned`/`owner_of`); `WorktreeReport`/JSON surfacing (covered by `021`).
 - **Platform coverage:** mac+linux.
 
-##### worktree/reclaim/018 — An empty or pre-#166-legacy marker (the literal `"deck\n"` content `mark_worktree_owned` wrote before this PRD encoded a name) still resolves `Ownership::Ours`, but `owner_of` reports the owner as unknown (`None`) rather than guessing (fork #166 — protects every worktree created before this ships from silently becoming un-reclaimable).
+##### worktree/reclaim/018 — A pre-#166-legacy marker (the literal `"deck\n"` content `mark_worktree_owned` wrote before this PRD encoded a name) still resolves `Ownership::Ours`, but `owner_of` reports the owner as unknown (`None`) rather than guessing (fork #166 — protects every worktree created before this ships from silently becoming un-reclaimable).
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
-- **Agent:** none (two worktrees: one with the marker file written directly as the literal legacy bytes `"deck\n"`, one with a truly empty 0-byte marker — both bypass `mark_worktree_owned` so the fixture controls the exact on-disk content).
-- **Asserts:** for both worktrees, `ownership_of` still returns `Ownership::Ours` (the presence-only check `reclaim` depends on is unchanged) and `owner_of` returns `None`.
-- **Does not assert:** any other unparseable-content shape beyond empty and the one real legacy string; `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Agent:** none (a worktree with the marker file written directly as the literal legacy bytes `"deck\n"`, bypassing `mark_worktree_owned` so the fixture controls the exact on-disk content — the same fixture PR #173's own `bare_deck_marker_from_older_build_still_reads_as_ours` test uses).
+- **Asserts:** `ownership_of` still returns `Ownership::Ours` (the presence-only check `reclaim` depends on is unchanged, already pinned by #173's own test — asserted again here only as the precondition for the next line) and `owner_of` returns `None`.
+- **Does not assert:** the presence/`Ours` half in isolation — that is #173's `bare_deck_marker_from_older_build_still_reads_as_ours`, not duplicated here; any other unparseable-content shape (empty marker, etc.); `WorktreeReport`/JSON surfacing (covered by `021`).
 - **Platform coverage:** mac+linux.
 
 ##### worktree/reclaim/019 — `main` (the enumerating repo's own checkout, not a linked worktree) is never owned, even when its own directory is named to match the `<name>-<change>` convention and even with a marker planted directly in its own git-dir. Expected GREEN from the start — fork #144's existing containment check already guarantees this; no new ownership-identity code is needed to satisfy it.
@@ -826,6 +826,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** `examine_worktrees` returns a report whose `owner` field is `Some("orch-x")` for a worktree marked owned by that name; the report's serialized JSON (via `WorktreeListDocument`) contains `"owner":"orch-x"`.
 - **Does not assert:** the human-table (`format_list_human`) rendering, which this fork does not require to surface the owner; the `schema_version` bump question (the field is additive).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, as `008`).
+
+##### worktree/reclaim/022 — Two live orchestrations of the SAME config type (`review`) each record a DISTINCT owner in their own worktree's marker, not the identical `orchestration:review` string (fork #166 — instance identity, not just provenance).
+- **Layer:** fast synthetic real-dispatch integration, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`, following `orchestration/worktree/004`'s precedent (a real git repo, the real `Action::SpawnPane` dispatch, a fresh `TabManager`/`AppState` per spawn) — placed in `ui.rs` rather than `src/worktree_reclaim.rs` because the property under test is produced by `ui.rs`'s own `SpawnPane` handler (the `format!("orchestration:{}", orch_config.name)` creator-identity line), which no helper outside that file's private test module (`CapturingPaneController`, `default_ui`) can drive.
+- **Agent:** none.
+- **Asserts:** `crate::worktree_reclaim::owner_of` on the two independently-spawned worktrees returns two different values, both spawned from `make_orchestration("review")`.
+- **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to a typed unique identity, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
+- **Platform coverage:** mac+linux.
 
 
 ### Prompts
