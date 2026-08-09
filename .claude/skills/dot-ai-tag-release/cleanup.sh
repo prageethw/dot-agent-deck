@@ -15,20 +15,6 @@ set -euo pipefail
 
 tab="$(printf '\t')"
 
-# --- Determine the default branch ---
-default_branch="main"
-if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
-  default_branch="${ref#refs/remotes/origin/}"
-fi
-
-# Branches that are long-lived BY DESIGN and are never cleanup candidates,
-# whatever their merge state. `fork-only` is the fork's customisation stack:
-# after a sync `main` is reset to it, so it is trivially "merged" while being
-# the one branch that must never be deleted (docs/develop/fork-sync-workflow.md).
-long_lived="$default_branch
-fork-only"
-is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
-
 # --- Degradation tracking ---
 #
 # Any time the script cannot fully trust its own PR-state or ref-freshness
@@ -50,6 +36,31 @@ mark_degraded() {
 "
   fi
 }
+
+# --- Determine the default branch ---
+#
+# `refs/remotes/origin/HEAD` is unset on a routine `actions/checkout` clone,
+# or any `git remote add` + `git fetch` setup that never runs `remote
+# set-head`. B1's fix made default-branch protection NAME-based
+# (`is_long_lived` is built from `$default_branch`), so a silent `"main"`
+# guess here would leave that guard protecting a name that may not exist on a
+# repo whose real default is something else -- the B1 scenario through
+# another door (fork issue #152 R5 / A-N4). Degrade instead of guessing.
+default_branch=""
+if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
+  default_branch="${ref#refs/remotes/origin/}"
+else
+  default_branch="main"
+  mark_degraded "refs/remotes/origin/HEAD is not set; could not reliably determine the default branch (guessed '$default_branch', which may not exist or may not be the branch this repo actually protects)"
+fi
+
+# Branches that are long-lived BY DESIGN and are never cleanup candidates,
+# whatever their merge state. `fork-only` is the fork's customisation stack:
+# after a sync `main` is reset to it, so it is trivially "merged" while being
+# the one branch that must never be deleted (docs/develop/fork-sync-workflow.md).
+long_lived="$default_branch
+fork-only"
+is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
 
 # Two reusable scratch files for capturing a command's stdout and stderr
 # separately without a command-substitution subshell swallowing the reason
@@ -104,18 +115,26 @@ current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 #      worktree. Silently wrong, no crash, no degradation.
 #
 # Both failure modes are handled the same way: derive a candidate, then
-# VERIFY it by asking git itself whether that candidate is genuinely a
-# working tree (`--is-inside-work-tree`, run FROM the candidate). A
-# crash-avoided-but-still-wrong candidate from failure mode 1, and the
-# wrong-parent candidate from failure mode 2, both fail this check and
-# degrade the run -- rather than either crashing with no output or silently
-# trusting a path that was never confirmed.
+# VERIFY it by asking git itself whether that candidate is genuinely THIS
+# repository's own main working tree -- not merely "is this path inside SOME
+# working tree" (`--is-inside-work-tree` answers the latter, and git
+# discovers upward, so it silently returns true when the candidate happens to
+# sit inside a wholly unrelated repo -- the realistic case being a relocated
+# git dir stored under a dotfiles/notes `$HOME` that is itself a repo; fork
+# issue #152 R1 / A2, measured against a throwaway fixture). Comparing
+# `--show-toplevel` run FROM the candidate back against the candidate itself
+# answers the right question: it equals the candidate only when the candidate
+# truly is a working tree's own root. A crash-avoided-but-still-wrong
+# candidate from failure mode 1, the wrong-parent candidate from failure mode
+# 2, and the wrong-but-inside-another-repo candidate above all fail this
+# check and degrade the run -- rather than crashing with no output, or
+# silently trusting a path that was never confirmed to be THIS repo's own.
 git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")
 main_worktree_path=""
 if [ -n "$git_common_dir" ]; then
   candidate=""
   if candidate=$(dirname "$git_common_dir" 2>/dev/null); then
-    if [ "$(git -C "$candidate" rev-parse --is-inside-work-tree 2>/dev/null || echo "")" != "true" ]; then
+    if [ "$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null || echo "")" != "$candidate" ]; then
       candidate=""
     fi
   else
@@ -145,7 +164,15 @@ fi
 # rewriting (verified against git 2.55.0) and would silently derive an
 # `insteadOf`-configured mirror's slug instead of the intended GitHub one.
 is_owner_repo() {
-  grep -Eq -- '^[^/]+/[^/]+$' <<< "$1"
+  # An scp-style remote (`git@host:owner/repo.git`) has exactly one `/`, so a
+  # bare "two non-slash halves" pattern accepts the whole `user@host:owner/repo`
+  # string as a slug when `slug_from_url` doesn't recognise the host -- and
+  # that accepted slug is then interpolated into a `gh ... failed:` reason,
+  # disclosing an internal hostname and username on every run (fork issue
+  # #152 A3 / R-N1). GitHub owner/repo names are alnum plus `._-`; anchoring
+  # to that character class rejects `@`/`:` outright, before the slug ever
+  # reaches a `gh` call.
+  grep -Eq -- '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' <<< "$1"
 }
 slug_from_url() {
   sed -E 's#^(ssh://|git://|https?://)?([^@/]*@)?github\.com[:/]##; s#\.git$##' <<< "$1"
@@ -202,7 +229,7 @@ if [ -z "$origin_slug" ]; then
 elif ! command -v gh >/dev/null 2>&1; then
   mark_degraded "gh is not installed or not on PATH"
 else
-  # Head SHAs of merged same-repo PRs. Covers squash & rebase merges, where the
+  # Head SHAs of merged PRs. Covers squash & rebase merges, where the
   # branch's commits never land verbatim on the default branch and so are
   # invisible to an ancestry test. Cross-repo (fork) PRs are excluded: their
   # head names describe branches in the fork, not ours, so a merged fork PR for
@@ -210,23 +237,28 @@ else
   # `$origin_slug` (fork issue #140, D3) -- unpinned, `gh` resolves against
   # this repo's parent.
   #
-  # `--limit 200` bounds what THIS call fetches from the API; the
-  # `isCrossRepository` select then drops rows client-side, so counting
-  # survivors here (as the pre-#152 code did) counts AFTER the filter and can
-  # under-count a genuinely full raw page (fork issue #152 S3). A second
-  # query below asks for the COMPLEMENTARY partition -- cross-repo rows only,
-  # same `--limit` -- and its count is added back in: same-repo survivors +
-  # cross-repo survivors reconstructs the raw fetched-page size the two
-  # queries together saw, which is what determines whether the page could
-  # have been truncated.
-  merged_same_repo_count=0
+  # ONE query (fork issue #152 R2/R3/A1): `isCrossRepository` comes back as a
+  # third TSV field on every row, unfiltered, so `--limit 200` bounding what
+  # this call fetches and the truncation count below being over ALL returned
+  # rows (fork issue #152 S3) are the same page -- no reconstruction, no
+  # second round trip. Cross-repo rows are filtered out of
+  # `merged_shas_lines` here in the shell loop instead of by a separate `gh`
+  # query. This also closes two problems the prior two-query design had: that
+  # query existed only to count rows, yet its own failure (a secondary rate
+  # limit, say) called `mark_degraded` and blocked SKILL.md Step 6 on a query
+  # whose result feeds nothing else -- directly contradicting S4's premise
+  # that merged-page truncation must never block cleanup; and two separate API
+  # calls meant a PR merging between them could shift the second page and
+  # produce a wrong "not truncated" verdict.
+  merged_raw_count=0
   if capture_cmd gh pr list --state merged --limit 200 --repo "$origin_slug" \
                   --json headRefName,headRefOid,isCrossRepository \
-                  --jq '.[] | select(.isCrossRepository | not) | [.headRefName, .headRefOid] | @tsv'; then
+                  --jq '.[] | [.headRefName, .headRefOid, .isCrossRepository] | @tsv'; then
     merged_tsv=$(cat "$_stdout_file")
-    merged_same_repo_count=$(awk 'END { print NR }' "$_stdout_file")
-    while IFS=$'\t' read -r name sha; do
+    merged_raw_count=$(awk 'END { print NR }' "$_stdout_file")
+    while IFS=$'\t' read -r name sha cross_repo; do
       [ -z "$name" ] || [ -z "$sha" ] && continue
+      [ "$cross_repo" = "true" ] && continue
       line=$(printf '%s\t%s' "$name" "$sha")
       merged_shas_lines="${merged_shas_lines}${line}
 "
@@ -235,16 +267,6 @@ else
     mark_degraded "gh pr list --state merged --repo $origin_slug failed: ${last_err:-unknown error}"
   fi
 
-  merged_cross_repo_count=0
-  if capture_cmd gh pr list --state merged --limit 200 --repo "$origin_slug" \
-                  --json headRefName,headRefOid,isCrossRepository \
-                  --jq '.[] | select(.isCrossRepository) | [.headRefName, .headRefOid] | @tsv'; then
-    merged_cross_repo_count=$(awk 'END { print NR }' "$_stdout_file")
-  else
-    mark_degraded "gh pr list --state merged --repo $origin_slug (cross-repo count) failed: ${last_err:-unknown error}"
-  fi
-
-  merged_raw_count=$((merged_same_repo_count + merged_cross_repo_count))
   if [ "$merged_raw_count" -ge 200 ]; then
     # Fork issue #152 S4: at 200+ merged PRs this repo hits a full page on
     # EVERY run (91/200 today), which would make `PR_STATE_DEGRADED=true`
@@ -325,13 +347,28 @@ is_merged() {
 
 # --- Worktrees on merged branches (never the current worktree, the main
 # working tree, or a long-lived branch name) ---
+#
+# `-z` NUL-delimits each porcelain field instead of newline-terminating it
+# (fork issue #152 A-N2, subsumes S6's TAB handling). Default text mode emits
+# a path completely raw and unescaped, so a path containing a literal newline
+# splits a single "worktree <path>" line in two: a line-oriented `IFS= read
+# -r line` loop captures only the fragment before the embedded newline as
+# `wt_path`, the continuation matches no `case` arm below and is silently
+# dropped, and the following `branch refs/heads/...` line then pairs with
+# that TRUNCATED path -- which SKILL.md Step 6.1 hands straight to `git
+# worktree remove` as a wrong-target removal, not merely a display glitch. A
+# path can never contain a NUL byte, so splitting on NUL is unambiguous
+# regardless of what the path itself contains. Git terminates the last
+# record with an extra NUL too (mirroring the blank-line separator `-z`
+# replaces), so the final `read` below always completes on a delimiter
+# rather than losing data at EOF.
 worktrees_out=()
 wt_path=""
-while IFS= read -r line; do
-  case "$line" in
-    "worktree "*) wt_path="${line#worktree }" ;;
+while IFS= read -r -d '' field; do
+  case "$field" in
+    "worktree "*) wt_path="${field#worktree }" ;;
     "branch refs/heads/"*)
-      br="${line#branch refs/heads/}"
+      br="${field#branch refs/heads/}"
       if [ "$wt_path" != "$current_worktree" ] && [ "$wt_path" != "$main_worktree_path" ] \
         && ! is_long_lived "$br" && is_merged "$br" "refs/heads/${br}"; then
         worktrees_out+=("${wt_path}${tab}${br}")
@@ -339,7 +376,7 @@ while IFS= read -r line; do
       ;;
     "") wt_path="" ;;
   esac
-done < <(git worktree list --porcelain 2>/dev/null || true)
+done < <(git worktree list --porcelain -z 2>/dev/null || true)
 
 # --- Local branches that are merged (never current / long-lived) ---
 # A branch checked out in another worktree is still listed here; it is only
