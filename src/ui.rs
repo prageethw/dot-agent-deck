@@ -1568,21 +1568,62 @@ struct PromptDelivery {
 /// `Thinking` — boot-time misclassification, `permission.replied`,
 /// `PostCompact`, see `src/hook.rs:124,128,376-383,388` — confirmed
 /// anything). This carries what the check actually needs.
-#[derive(Clone, Copy)]
+///
+/// Issue #424 round 4 (reviewer F12, auditor F8): round 3's fix was a
+/// falling-edge clear on the LEVEL sample above, which is defeated by
+/// ordinary agent activity — `Thinking -> Working(tool call) -> Thinking`
+/// happens with no submit anywhere in it, since `EventType::ToolStart` sets
+/// `SessionStatus::Working` unconditionally (`src/state.rs:4020-4048`) — and
+/// is blind to SESSION identity, so a replacement session on the same pane
+/// (an agent crash/reload) confirms a write made to the session that died.
+/// Round 4 adds POSITIVE identification instead of patching the edge
+/// detector: `expected_session_id` pins confirmation to the exact session the
+/// write targeted (never a different session on the same pane), and
+/// `baseline_prompt` lets a later exact/prefix match of `last_user_prompt`
+/// against the sent text confirm delivery even when the LEVEL path stays
+/// poisoned for the whole cycle (see `pre_write_thinking` below — round 3's
+/// falling-edge clear is REMOVED, not patched: nothing but a genuine
+/// positively-identified submit can un-stick a cycle that started already
+/// `Thinking`).
+#[derive(Clone)]
 struct AwaitingConfirmation {
     /// When the write currently awaiting confirmation landed. Read by the
     /// retry gate below to enforce [`CONFIRMATION_GRACE_PERIOD`] — the
     /// Instant's actual use, this round.
     since: std::time::Instant,
-    /// Was the pane's session ALREADY `Thinking` at the moment THIS write
+    /// The `session_id` of the session `deliver_orchestrator_prompt` wrote
+    /// to (the one matching `start_pane_id` at the moment of the first write
+    /// in this confirmation cycle), or `None` if no session matched at that
+    /// moment. Both confirmation paths below (`pre_write_thinking`,
+    /// `baseline_prompt`) are checked ONLY against the session presently
+    /// holding this exact id — never any other session on the same pane.
+    /// Captured once, at the first write of the cycle, and carried through
+    /// any retry (never re-resolved to whatever session currently occupies
+    /// the pane), so a session that dies and is replaced mid-cycle cannot
+    /// have the replacement's own unrelated status/prompt attributed to the
+    /// original write (issue #424 round 4 F12's second route,
+    /// `orchestration/seed/007`).
+    expected_session_id: Option<String>,
+    /// Was the target session ALREADY `Thinking` at the moment THIS write
     /// landed? If so, an unchanged `Thinking` sample on a later frame is not
-    /// evidence of OUR submit — it predates the write and must never
-    /// confirm it (`orchestration/seed/004`). Captured once, at the first
-    /// write of this confirmation cycle, and carried through any retry.
-    /// Issue #424 round 3 (reviewer F3): cleared on a FALLING edge (the pane
-    /// observed NOT `Thinking`) so a genuinely later `Thinking` can still
-    /// confirm — see the check in `deliver_orchestrator_prompt`.
+    /// evidence of OUR submit — it predates the write and must never confirm
+    /// it via the LEVEL path alone (`orchestration/seed/004`, frames 1-3).
+    /// Captured once, at the first write of this confirmation cycle, and
+    /// carried through any retry. Unlike round 3, this is never cleared
+    /// during the cycle — a poisoned baseline stays poisoned for the LEVEL
+    /// path's purposes; the only way out is a positively-identified submit
+    /// via `baseline_prompt` below (`orchestration/seed/004`, frame 4).
     pre_write_thinking: bool,
+    /// The target session's `last_user_prompt` value at the moment THIS
+    /// write landed (`None` if it had never submitted anything), captured
+    /// once and carried through any retry — same lifetime as
+    /// `pre_write_thinking`. Confirmation via positive identification
+    /// requires the CURRENT value to both match the text we sent AND differ
+    /// from this baseline: matching alone is not enough, because a prior
+    /// cycle may already have left `last_user_prompt` equal to our text
+    /// before this write ever happened, and that leftover value must not
+    /// instantly confirm a NEW write that hasn't actually been submitted yet.
+    baseline_prompt: Option<String>,
     /// Has the one confirmation-retry this cycle is allowed already been
     /// spent? Minting a fresh `delivery_id` per retry (below) means the
     /// daemon's ledger (`AgentPtyRegistry::admit_delivery`) can never dedupe
@@ -1597,6 +1638,30 @@ struct AwaitingConfirmation {
     /// response or a retryable outcome must spend the budget too, or the
     /// next frame mints yet another fresh id the ledger has never seen.
     retried: bool,
+}
+
+/// Issue #424 round 4: does `observed` (a session's current
+/// `last_user_prompt`) positively identify a genuine submit of `sent` (the
+/// text we wrote to the pane)? Trimmed equality or a trimmed-prefix match
+/// (the seed is a one-line pointer; the agent's echoed/submitted text may
+/// carry leading/trailing whitespace or trailing artefacts) counts — a loose
+/// substring `contains` does not, since a short common substring can appear
+/// by coincidence. `baseline` is the SAME session's `last_user_prompt` at the
+/// moment our write landed: if the current value is unchanged from that
+/// baseline, it cannot be evidence of a NEW submit — it is a leftover from
+/// before this write even happened (see [`AwaitingConfirmation::baseline_prompt`]).
+fn prompt_text_confirms(observed: Option<&str>, sent: &str, baseline: Option<&str>) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    let observed_trimmed = observed.trim();
+    let sent_trimmed = sent.trim();
+    if sent_trimmed.is_empty() || observed_trimmed.is_empty() {
+        return false;
+    }
+    let matches_text =
+        observed_trimmed == sent_trimmed || observed_trimmed.starts_with(sent_trimmed);
+    matches_text && baseline != Some(observed_trimmed)
 }
 
 /// Issue #424 round 2 (`orchestration/seed/006`): the plausible upper bound
@@ -3527,49 +3592,55 @@ fn deliver_orchestrator_prompt(
 
     // Upstream #424 finding #2: a prior write LANDED (`Applied`/`Queued` —
     // bytes reached the PTY) but has not yet been CONFIRMED (a submit
-    // observed for this pane, via `SessionStatus::Thinking` — the only
-    // existing positional "a submit arrived" signal; `UserPromptSubmit`
-    // cannot carry our minted `delivery_id` since its payload originates in
-    // Claude, which never saw it). Check confirmation BEFORE re-entering the
+    // observed for this pane). Check confirmation BEFORE re-entering the
     // readiness/backoff/write machinery below: once confirmed, finalize with
     // NO further write attempt; if still unconfirmed, fall through so the
     // write is retried like any other non-terminal outcome — "bytes written"
     // alone must never again be the last thing that happens to this prompt.
     //
-    // Issue #424 round 2 (`orchestration/seed/004`): `Thinking` alone is a
-    // LEVEL sample with no happened-after relationship to the write — a
-    // pre-existing `Thinking` (boot-time misclassification, `permission.
-    // replied`, `PostCompact`/`PostCompaction`; see `src/hook.rs:124,128,
-    // 376-383,388`) would otherwise confirm a write that never happened. Gate
-    // on `!pre_write_thinking`, captured once at the write that started this
-    // confirmation cycle: if the pane was ALREADY `Thinking` at that instant,
-    // an unchanged `Thinking` sample can never confirm it (there was no
-    // transition to attribute to us).
-    if let Some(awaiting) = ui.orchestration_awaiting_confirmation.get(&tab_id).copied() {
-        let pane_thinking = snapshot.sessions.values().any(|s| {
-            s.pane_id.as_deref() == Some(start_pane_id.as_str())
-                && s.status == SessionStatus::Thinking
+    // Issue #424 round 4 (reviewer F12 / auditor F8): two independent routes
+    // let round 3's confirmation confirm a write that was never submitted.
+    // Both are closed by never consulting any session other than the exact
+    // one the write targeted (`expected_session_id`, captured once at the
+    // first write of the cycle — see [`AwaitingConfirmation`]):
+    //
+    // * LEVEL path (`pre_write_thinking`): a pre-existing `Thinking` (boot
+    //   misclassification, `permission.replied`, `PostCompact`; see
+    //   `src/hook.rs:124,128,376-383,388`) must never confirm a write that
+    //   never happened. Unlike round 3, this baseline is NEVER cleared
+    //   during the cycle — `Thinking -> Working(tool) -> Thinking` is
+    //   reachable in ordinary operation with no submit anywhere in it
+    //   (`EventType::ToolStart` sets `Working` unconditionally,
+    //   `src/state.rs:4020-4048`), so a falling edge is not evidence of
+    //   anything and round 3's clear-on-falling-edge let this exact sequence
+    //   confirm (`orchestration/seed/004`).
+    // * TEXT path (`prompt_text_confirms`): positive identification —
+    //   `last_user_prompt` now matches what we sent, and differs from what
+    //   it was when this write landed (so a leftover match from BEFORE the
+    //   write can't confirm it instantly). This is the only way out of a
+    //   cycle that started already `Thinking`, since the LEVEL path stays
+    //   poisoned for its whole duration.
+    if let Some(awaiting) = ui.orchestration_awaiting_confirmation.get(&tab_id).cloned() {
+        let target_session = awaiting
+            .expected_session_id
+            .as_deref()
+            .and_then(|sid| snapshot.sessions.get(sid));
+        let level_confirmed = !awaiting.pre_write_thinking
+            && target_session.is_some_and(|s| s.status == SessionStatus::Thinking);
+        let sent_prompt = orchestrator_prompt.as_deref().unwrap_or_default();
+        let text_confirmed = target_session.is_some_and(|s| {
+            prompt_text_confirms(
+                s.last_user_prompt.as_deref(),
+                sent_prompt,
+                awaiting.baseline_prompt.as_deref(),
+            )
         });
-        let confirmed = !awaiting.pre_write_thinking && pane_thinking;
-        // Issue #424 round 3 (reviewer F3): a `pre_write_thinking` baseline
-        // predates this write and must never confirm it — but it must not
-        // poison the ENTIRE 60s cycle either. Clear it on a FALLING edge (the
-        // pane observed NOT `Thinking`): any `Thinking` after that point is
-        // unambiguously new and free to confirm a later, genuine submit
-        // (e.g. Thinking → Idle → Thinking, the OpenCode boot-misclassification
-        // case `orchestration/seed/004` exists to defend against). A baseline
-        // whose status never changes — `seed/004`'s own fixture — never sees a
-        // falling edge, so it stays poisoned for the cycle exactly as before.
-        if awaiting.pre_write_thinking
-            && !pane_thinking
-            && let Some(entry) = ui.orchestration_awaiting_confirmation.get_mut(&tab_id)
-        {
-            entry.pre_write_thinking = false;
-        }
-        if confirmed {
+        if level_confirmed || text_confirmed {
             tracing::info!(
                 pane_id = %start_pane_id,
                 tab_id,
+                level_confirmed,
+                text_confirmed,
                 "orchestrator prompt: delivery confirmed (submit observed)"
             );
             finalize_orchestrator_prompt_delivered(
@@ -3617,8 +3688,9 @@ fn deliver_orchestrator_prompt(
     // more than the one retry this cycle budgets (`awaiting.retried`) — see
     // [`AwaitingConfirmation`] for why an unbounded retry loop would spam
     // the target with duplicate submissions instead.
-    let awaiting = ui.orchestration_awaiting_confirmation.get(&tab_id).copied();
+    let awaiting = ui.orchestration_awaiting_confirmation.get(&tab_id).cloned();
     let confirmation_retry_blocked = awaiting
+        .as_ref()
         .is_some_and(|a| a.retried || now.duration_since(a.since) < CONFIRMATION_GRACE_PERIOD);
     if !((agent_ready || timeout_ready) && buffer_elapsed && !backed_off)
         || confirmation_retry_blocked
@@ -3697,25 +3769,39 @@ fn deliver_orchestrator_prompt(
                 result = describe_send_result(result),
                 "orchestrator prompt: write applied; awaiting submit confirmation"
             );
-            // Issue #424 round 2: `pre_write_thinking` is captured ONCE, at
-            // the first write of this confirmation cycle, and carried
-            // through the one retry the cycle budgets — a retry's own
-            // baseline must stay whatever it was before ANY write in this
-            // cycle, not get reset to "currently Thinking" on the retry
-            // itself. `retried` becomes `true` the moment this write is
-            // itself the retry (an entry already existed), spending the
-            // cycle's one-retry budget.
-            let pre_write_thinking = awaiting.map(|a| a.pre_write_thinking).unwrap_or_else(|| {
-                snapshot.sessions.values().any(|s| {
-                    s.pane_id.as_deref() == Some(start_pane_id.as_str())
-                        && s.status == SessionStatus::Thinking
-                })
-            });
+            // Issue #424 round 2/4: `expected_session_id` / `pre_write_thinking` /
+            // `baseline_prompt` are captured ONCE, at the first write of this
+            // confirmation cycle, and carried through the one retry the cycle
+            // budgets — a retry must target the SAME session identity and
+            // keep whatever baseline it had before ANY write in this cycle,
+            // not re-resolve to whatever currently occupies the pane.
+            // `retried` becomes `true` the moment this write is itself the
+            // retry (an entry already existed), spending the cycle's
+            // one-retry budget.
+            let confirmation_target = snapshot
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some(start_pane_id.as_str()));
+            let (confirmation_session_id, pre_write_thinking, baseline_prompt) =
+                match awaiting.as_ref() {
+                    Some(a) => (
+                        a.expected_session_id.clone(),
+                        a.pre_write_thinking,
+                        a.baseline_prompt.clone(),
+                    ),
+                    None => (
+                        confirmation_target.map(|s| s.session_id.clone()),
+                        confirmation_target.is_some_and(|s| s.status == SessionStatus::Thinking),
+                        confirmation_target.and_then(|s| s.last_user_prompt.clone()),
+                    ),
+                };
             ui.orchestration_awaiting_confirmation.insert(
                 tab_id,
                 AwaitingConfirmation {
                     since: now,
+                    expected_session_id: confirmation_session_id,
                     pre_write_thinking,
+                    baseline_prompt,
                     retried: awaiting.is_some(),
                 },
             );
@@ -3733,8 +3819,18 @@ fn deliver_orchestrator_prompt(
         // delivered; abandoned" and leave the role at `Waiting` while the
         // agent is genuinely working, the same false-loss report
         // `orchestration/seed/005` exists to prevent on the deadline path.
+        //
+        // Issue #424 round 4 (reviewer F14): that reasoning does NOT extend
+        // to `WrongSession` — unlike `Ambiguous` (a partial write to the
+        // SAME live target), `WrongSession` is affirmative evidence the
+        // target session was REPLACED. Reporting it as delivered-unconfirmed
+        // would leave the role at `Working` forever after exactly the agent
+        // crash/reload issue #424 exists to catch, so it falls through to
+        // abandonment below instead, even with an earlier landed write.
         Ok(other) if is_terminal_send_result(other) => {
-            if ui.orchestration_awaiting_confirmation.contains_key(&tab_id) {
+            if other != SendResult::WrongSession
+                && ui.orchestration_awaiting_confirmation.contains_key(&tab_id)
+            {
                 tracing::warn!(
                     pane_id = %start_pane_id,
                     tab_id,
