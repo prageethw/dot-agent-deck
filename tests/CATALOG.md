@@ -792,6 +792,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact resulting `PrState`/verdict label (only the observable removal); non-ASCII/homoglyph login handling (GitHub logins are ASCII-only, so this is out of scope).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/017 — A worktree marked owned by orchestration `orch-x` via `mark_worktree_owned` reports that exact name back via a new `owner_of` query, and `ownership_of`'s existing `Ours`/`Foreign` bit still agrees it is owned (fork #166 M2.0/M2.1).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/008`'s precedent (a real git repo via `init_repo_with_origin`, a linked worktree via a real `git worktree add`).
+- **Agent:** none.
+- **Asserts:** `owner_of(repo, worktree)` returns `Some("orch-x")` after `mark_worktree_owned(worktree, "orch-x")`; `ownership_of(repo, worktree)` still returns `Ownership::Ours`.
+- **Does not assert:** the marker's on-disk byte format (only that it round-trips through `mark_worktree_owned`/`owner_of`); `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/018 — An empty or pre-#166-legacy marker (the literal `"deck\n"` content `mark_worktree_owned` wrote before this PRD encoded a name) still resolves `Ownership::Ours`, but `owner_of` reports the owner as unknown (`None`) rather than guessing (fork #166 — protects every worktree created before this ships from silently becoming un-reclaimable).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (two worktrees: one with the marker file written directly as the literal legacy bytes `"deck\n"`, one with a truly empty 0-byte marker — both bypass `mark_worktree_owned` so the fixture controls the exact on-disk content).
+- **Asserts:** for both worktrees, `ownership_of` still returns `Ownership::Ours` (the presence-only check `reclaim` depends on is unchanged) and `owner_of` returns `None`.
+- **Does not assert:** any other unparseable-content shape beyond empty and the one real legacy string; `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/019 — `main` (the enumerating repo's own checkout, not a linked worktree) is never owned, even when its own directory is named to match the `<name>-<change>` convention and even with a marker planted directly in its own git-dir. Expected GREEN from the start — fork #144's existing containment check already guarantees this; no new ownership-identity code is needed to satisfy it.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (a repo directory literally named `myorch-feature`, with `dot-agent-deck-owner` written directly into its own resolved git-dir).
+- **Asserts:** `ownership_of(repo, repo)` returns `Ownership::Foreign`.
+- **Does not assert:** the containment mechanism itself (already pinned by `014`/`015`); anything about `owner_of` (this test exercises only the pre-existing `Ownership`/`ownership_of` surface, deliberately unchanged by fork #166).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/020 — A worktree owned by orchestration `Y` reports `Y`, never a different name `X`; a directory carrying NO marker at all is never owned, whatever it is named (fork #166 — ownership is decided by the marker, never by a directory's name).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (one worktree marked owned by `"Y"`; one unmarked worktree deliberately named `X-decoy` to look like it belongs to a different orchestration's naming convention).
+- **Asserts:** `owner_of` on the first returns `Some("Y")` and is asserted `!= Some("X")`; on the second, `ownership_of` returns `Ownership::Foreign` and `owner_of` returns `None`, despite the `X`-matching name.
+- **Does not assert:** cross-repo collisions; more than two orchestration names at once.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/021 — `dot-agent-deck worktree list --json` carries the recorded owner name in each `WorktreeReport` entry (fork #166 M2.2).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/008`'s precedent for a stubbed `gh` reached via a `PATH` prepend (here answering unconditionally with an empty PR list — the reclaim verdict itself is not this test's concern).
+- **Agent:** none.
+- **Asserts:** `examine_worktrees` returns a report whose `owner` field is `Some("orch-x")` for a worktree marked owned by that name; the report's serialized JSON (via `WorktreeListDocument`) contains `"owner":"orch-x"`.
+- **Does not assert:** the human-table (`format_list_human`) rendering, which this fork does not require to surface the owner; the `schema_version` bump question (the field is additive).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, as `008`).
+
 
 ### Prompts
 

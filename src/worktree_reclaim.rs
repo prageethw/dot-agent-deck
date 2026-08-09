@@ -1029,6 +1029,12 @@ mod tests {
             branch: Some("feat/a".to_string()),
             clean: true,
             owned: true,
+            // fork #166: WorktreeReport grows an `owner` field alongside
+            // `owned` -- this literal is updated so the pre-existing test
+            // keeps compiling once that field lands; it isn't itself
+            // assertion coverage for the field's content (see
+            // worktree_reclaim_021 for that).
+            owner: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -1377,6 +1383,233 @@ mod tests {
             sanitize_marker_creator("  orchestration:worktree-demo  "),
             "orchestration:worktree-demo",
             "ordinary input must still be trimmed but otherwise passed through"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Fork #166: the owner recorded in the marker is queryable, not just a
+    // bare `Ours`/`Foreign` bit. `owner_of` is deliberately a NEW, separate
+    // function rather than a change to `Ownership`'s shape: embedding the
+    // name into `Ownership::Ours` would ripple into `decide`'s five
+    // existing pure-gate tests above (`decide_merged_clean_owned_removes`
+    // et al., which construct a bare `Ownership::Ours` with no payload) and
+    // into `decide`'s own match arms, none of which have anything to do
+    // with WHO owns a worktree -- only whether the deck can prove IT does.
+    // Keeping `Ownership`/`ownership_of` untouched means that blast radius
+    // is zero; `owner_of` layers the identity question on top.
+    // -------------------------------------------------------------------
+
+    /// A linked worktree via a real `git worktree add`, independent of the
+    /// deck's own creation path -- these tests only care about the marker
+    /// file's presence/content, not how the worktree came to exist.
+    fn add_worktree(repo: &Path, worktree_dir: &Path, branch: &str) {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &worktree_dir.display().to_string(),
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git worktree add failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Scenario: A worktree created via a real `git worktree add` has its
+    /// ownership marker written with an explicit orchestration name via
+    /// `mark_worktree_owned`. `owner_of` must report that exact name back,
+    /// and `ownership_of`'s existing `Ours`/`Foreign` bit must agree it is
+    /// owned -- the identity fork #166 exists to make queryable, not just a
+    /// bare yes/no.
+    #[spec("worktree/reclaim/017")]
+    #[test]
+    fn worktree_reclaim_017_owner_recorded_and_reported() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        let wt = scratch.path().join("wt-x");
+        add_worktree(&repo, &wt, "feat/x");
+
+        mark_worktree_owned(&wt, "orch-x").expect("mark_worktree_owned must succeed");
+
+        assert_eq!(
+            owner_of(&repo, &wt),
+            Some("orch-x".to_string()),
+            "a worktree marked owned by 'orch-x' must report exactly that name back"
+        );
+        assert_eq!(
+            ownership_of(&repo, &wt),
+            Ownership::Ours,
+            "the existing Ours/Foreign bit must still agree the worktree is owned"
+        );
+    }
+
+    /// Scenario: A worktree carries the bare `"deck\n"` marker with no
+    /// `created-by:` line -- the exact legacy content #173's own
+    /// `bare_deck_marker_from_older_build_still_reads_as_ours` test (above)
+    /// already pins as resolving `Ours`. That test covers the PRESENCE
+    /// half; #173 has no `owner_of` to cover the READ half, since that
+    /// function doesn't exist on its side of the fork. Same fixture,
+    /// different question: the same bare marker must report the owner as
+    /// unknown (`None`) rather than error or resolve `Foreign`. This is
+    /// what stops every worktree created before this ships from silently
+    /// becoming un-reclaimable.
+    #[spec("worktree/reclaim/018")]
+    #[test]
+    fn worktree_reclaim_018_legacy_marker_resolves_ours_owner_unknown() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let wt_legacy = scratch.path().join("wt-legacy");
+        add_worktree(&repo, &wt_legacy, "feat/legacy");
+        let git_dir_legacy = resolve_git_dir(&wt_legacy).expect("resolve git dir");
+        std::fs::write(git_dir_legacy.join(OWNER_MARKER_FILENAME), "deck\n").unwrap();
+
+        assert_eq!(
+            ownership_of(&repo, &wt_legacy),
+            Ownership::Ours,
+            "a pre-#166 marker (literal legacy content \"deck\\n\") must still resolve Ours"
+        );
+        assert_eq!(
+            owner_of(&repo, &wt_legacy),
+            None,
+            "a pre-#166 marker never encoded an owner name -- it must report unknown, not \
+             \"deck\""
+        );
+    }
+
+    /// Scenario: `main` itself -- the enumerating repo's own checkout, not a
+    /// linked worktree -- is checked for ownership, even after a marker is
+    /// planted directly in ITS `.git` directory and even when the repo's own
+    /// directory name matches the `<name>-<change>` convention this PRD
+    /// introduces for linked worktrees. It must resolve `Foreign`
+    /// regardless: fork #144's containment check already guarantees this
+    /// (the main checkout's git-dir sits ABOVE `.git/worktrees`, so it can
+    /// never satisfy the `starts_with` check) -- this is a regression guard
+    /// pinning that existing guarantee, not new behavior this PRD adds, and
+    /// it needs no new API to pass.
+    #[spec("worktree/reclaim/019")]
+    #[test]
+    fn worktree_reclaim_019_main_is_never_owned_even_if_named_like_a_worktree_or_marked() {
+        let scratch = tempfile::tempdir().unwrap();
+        // Deliberately named to match the `<name>-<change>` convention --
+        // containment must still reject it, since naming carries no
+        // authority (only the marker's location does).
+        let repo = scratch.path().join("myorch-feature");
+        init_repo_with_origin(&repo);
+
+        // Plant a marker directly in main's OWN git-dir (not under
+        // .git/worktrees/) -- if containment were ever weakened this would
+        // be exactly the forged-ownership shape it must still reject.
+        let git_dir = resolve_git_dir(&repo).expect("resolve git dir for main checkout");
+        std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), "deck\n").unwrap();
+
+        assert_eq!(
+            ownership_of(&repo, &repo),
+            Ownership::Foreign,
+            "main must never resolve Ours, even named like a worktree and even with a marker \
+             planted directly in its own git-dir"
+        );
+    }
+
+    /// Scenario: Three worktrees in one repo -- one marked owned by
+    /// orchestration `Y`, and one carrying NO marker at all but named as if
+    /// it belonged to `X` (`X-decoy`). `Y`'s worktree must report owner `Y`
+    /// (never `X`), and the unmarked, X-named directory must resolve
+    /// `Foreign`/unknown regardless of its name -- naming carries no
+    /// authority, only the marker's presence and content do.
+    #[spec("worktree/reclaim/020")]
+    #[test]
+    fn worktree_reclaim_020_ownership_is_per_owner_never_by_name() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let wt_y = scratch.path().join("wt-y-owned");
+        add_worktree(&repo, &wt_y, "feat/y-owned");
+        mark_worktree_owned(&wt_y, "Y").expect("mark_worktree_owned must succeed");
+
+        let owner = owner_of(&repo, &wt_y);
+        assert_eq!(
+            owner,
+            Some("Y".to_string()),
+            "a worktree marked owned by Y must report Y as owner"
+        );
+        assert_ne!(
+            owner,
+            Some("X".to_string()),
+            "a worktree owned by Y must never be reported as owned by a different name X"
+        );
+
+        // Named as if it belonged to X's `<name>-<change>` convention, but no
+        // marker was ever written -- ownership must not be inferred from the
+        // name.
+        let wt_no_marker = scratch.path().join("X-decoy");
+        add_worktree(&repo, &wt_no_marker, "feat/x-decoy");
+        assert_eq!(
+            ownership_of(&repo, &wt_no_marker),
+            Ownership::Foreign,
+            "a directory with no marker is never owned, whatever it is named"
+        );
+        assert_eq!(
+            owner_of(&repo, &wt_no_marker),
+            None,
+            "a directory with no marker has no owner, whatever it is named"
+        );
+    }
+
+    /// Scenario: A worktree owned by `orch-x` is examined through the real
+    /// `examine_worktrees` -> `WorktreeListDocument` path (`gh` stubbed to a
+    /// canned "no matching PR" reply -- the verdict itself is irrelevant
+    /// here, only the owner field is). The returned `WorktreeReport` must
+    /// carry the owner name, and it must survive JSON serialization -- what
+    /// `worktree list --json` actually prints.
+    #[spec("worktree/reclaim/021")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_021_worktree_list_json_carries_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let wt = scratch.path().join("wt-orch-x");
+        add_worktree(&repo, &wt, "feat/orch-x");
+        mark_worktree_owned(&wt, "orch-x").expect("mark_worktree_owned must succeed");
+
+        // `gh pr list` unconditionally answers "no matches" -- this test
+        // only cares about the owner field, not the reclaim verdict.
+        let gh_script = "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' '[]'\n    exit 0\nfi\nexit 1\n";
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].owner,
+            Some("orch-x".to_string()),
+            "the examined report must carry the owner name"
+        );
+
+        let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
+        assert!(
+            json.contains("\"owner\":\"orch-x\""),
+            "worktree list --json must carry the owner field, got: {json}"
         );
     }
 }
