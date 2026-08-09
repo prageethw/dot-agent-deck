@@ -126,9 +126,13 @@ fn resolve_git_dir(worktree_dir: &std::path::Path) -> PathBuf {
 /// the worktree path, not the fixture directory the deck was launched in.
 /// Also assert the `dot-agent-deck-owner` marker (issue #425) written into
 /// the worktree's git metadata dir records `created-by:
-/// orchestration:worktree-demo` — the string `src/ui.rs`'s
-/// `create_worktree_sync` call site actually derives from the fixture's own
-/// orchestration name, not a value handed to it as an argument.
+/// orchestration:<launch-dir-basename>` — on this keyboard path the Name
+/// field is never typed into, so it keeps the value
+/// `transition_after_dir_pick` (`src/ui.rs`) pre-filled it with: the basename
+/// of the launch directory the form was opened for. That typed-Name value
+/// takes precedence over `orch_config.name` at the `create_worktree_sync`
+/// call site, so it — not the fixture's config name `worktree-demo` — is the
+/// creator this path actually derives.
 #[spec("orchestration/worktree/005")]
 #[test]
 fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary() {
@@ -161,20 +165,31 @@ fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary(
     );
 
     // fork issue #425 follow-up: the Name field was never typed into on this
-    // keyboard path (Mode -> Name -> Tab straight to Worktree), so
-    // `create_worktree_sync`'s call site in `src/ui.rs` falls back to the
-    // canonical config name and derives `orchestration:worktree-demo` as the
-    // creator. Assert that DERIVED string, not one this test hands in.
+    // keyboard path (Mode -> Name -> Tab straight to Worktree), so it keeps
+    // its pre-filled value -- the launch directory's basename, set by
+    // `transition_after_dir_pick` (`src/ui.rs`) when the form opened. That
+    // typed-Name value takes precedence over `orch_config.name` at the
+    // `create_worktree_sync` call site (`src/ui.rs`), so the creator this
+    // path actually derives is `orchestration:<launch-dir basename>`, not the
+    // fixture's config name `worktree-demo`. Compute the expected basename
+    // from the launch dir this test itself set up, rather than hardcoding it.
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let expected_creator = format!("created-by: orchestration:{launch_dir_basename}");
     let git_dir = resolve_git_dir(&worktree);
     let marker = std::fs::read_to_string(
         git_dir.join(dot_agent_deck::worktree_reclaim::OWNER_MARKER_FILENAME),
     )
     .expect("ownership marker must exist and be readable in the worktree's git-dir");
     assert!(
-        marker.contains("created-by: orchestration:worktree-demo"),
+        marker.contains(&expected_creator),
         "the ownership marker written through the real keyboard path must \
-         record the creator `src/ui.rs` actually derives from the fixture's \
-         orchestration name, got {marker:?}"
+         record the creator `src/ui.rs` actually derives from the launch \
+         directory's basename (the Name field's pre-filled value), expected \
+         {expected_creator:?}, got {marker:?}"
     );
 
     let orchestrator_log = worktree.join("pwd-orchestrator.log");
