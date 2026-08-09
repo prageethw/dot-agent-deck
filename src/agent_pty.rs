@@ -3115,6 +3115,17 @@ impl AgentPtyRegistry {
     /// * otherwise → [`DeliveryAdmission::Proceed`] holding the single-flight
     ///   guard, so a concurrent duplicate blocks and replays this attempt's
     ///   result instead of double-submitting.
+    ///
+    /// Issue #424 round 2: `deliver_orchestrator_prompt`'s confirmation retry
+    /// mints a FRESH `delivery_id` per attempt (`src/ui.rs`), so a deliberate
+    /// re-ask never presents an id the ledger has already completed — it
+    /// never reaches the replay branch below at all. A cached `Applied`/
+    /// `Queued`/`Ambiguous` result therefore replays FOREVER, as PRD #20
+    /// R20-004 built it: the only caller that legitimately reuses a
+    /// `delivery_id` after completion is one whose own RPC response was lost
+    /// in transit, and it must keep replaying no matter how many times it
+    /// re-asks, or a second lost response after a same-id retry produces a
+    /// genuine duplicate write to the PTY.
     pub async fn admit_delivery(&self, delivery_id: &str, fingerprint: u64) -> DeliveryAdmission {
         // Phase 1 (sync): immediate replay/conflict check + get-or-create the
         // per-id single-flight lock.
