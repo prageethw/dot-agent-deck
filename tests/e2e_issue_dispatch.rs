@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
 use dot_agent_deck::daemon_protocol::AttachRequest;
-use dot_agent_deck::issue_dispatch::derive_issue_paths;
+use dot_agent_deck::issue_dispatch::{IN_PROGRESS_LABEL, derive_issue_paths};
 use spec::spec;
 
 // ---------------------------------------------------------------------------
@@ -73,43 +73,109 @@ if [ "$group" = "repo" ] && [ "$sub" = "clone" ]; then
     exec git clone --quiet "$GHSTUB_DIR/$key/remote" "$dest"
 fi
 
-# PRD #421: label-write (`issue edit --add-label ...`) / claim-comment
-# (`issue comment ...`) calls — already recorded above; accepted
-# unconditionally since no canned response is needed.
-if [ "$group" = "issue" ]; then
-    case "$sub" in
-        edit|comment) exit 0 ;;
-    esac
+# PRD #421 review fix: `gh label create <name> ...` is idempotent (real `gh`
+# passes `--force`, which overwrites rather than erroring on a collision), so
+# this always succeeds — AND it adds `<name>` to the repo's known label set,
+# tracked in `$GHSTUB_DIR/<key>/labels` (one name per line). `GhStub::seed_labels`
+# pre-populates the same file for a fixture that starts with labels already
+# present. This is what lets a create-then-add sequence succeed against the
+# tightened `issue edit --add-label` check below.
+if [ "$group" = "label" ] && [ "$sub" = "create" ]; then
+    name="$1"
+    shift
+    repo=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) shift; repo="$1" ;;
+            *) ;;
+        esac
+        shift
+    done
+    key=$(printf '%s' "$repo" | tr '/' '_')
+    if [ -n "$name" ] && [ -n "$key" ]; then
+        mkdir -p "$GHSTUB_DIR/$key"
+        labels_file="$GHSTUB_DIR/$key/labels"
+        grep -qxF "$name" "$labels_file" 2>/dev/null || printf '%s\n' "$name" >> "$labels_file"
+    fi
+    exit 0
 fi
 
-# PRD #421 M2.0: idempotent label-vocabulary creation (`gh label create
-# <name> ...`, any flags) / an optional list-then-create-missing mechanism
-# (`gh label list ...`) — the exact mechanism is the coder's choice, so both
-# are accepted unconditionally; `list` returns an empty array so a
-# list-then-create-missing implementation always finds all seven missing.
-if [ "$group" = "label" ]; then
-    case "$sub" in
-        create) exit 0 ;;
-        list)
-            printf '[]\n'
-            exit 0
-            ;;
-    esac
+# An optional list-then-create-missing mechanism (`gh label list ...`) — the
+# exact mechanism is the coder's choice, so this reports the CURRENT known
+# label set (same file `label create`/`GhStub::seed_labels` populate) rather
+# than an unconditional `[]`, so a list-then-create-missing implementation
+# sees accurate state.
+if [ "$group" = "label" ] && [ "$sub" = "list" ]; then
+    repo=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) shift; repo="$1" ;;
+            *) ;;
+        esac
+        shift
+    done
+    key=$(printf '%s' "$repo" | tr '/' '_')
+    labels_file="$GHSTUB_DIR/$key/labels"
+    if [ ! -s "$labels_file" ]; then
+        printf '[]\n'
+        exit 0
+    fi
+    out="["
+    first=1
+    while IFS= read -r l; do
+        [ -z "$l" ] && continue
+        if [ "$first" = 1 ]; then first=0; else out="$out,"; fi
+        out="$out{\"name\":\"$l\"}"
+    done < "$labels_file"
+    printf '%s]\n' "$out"
+    exit 0
 fi
 
 repo=""
 head=""
 issue_num=""
+add_label=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --repo) shift; repo="$1" ;;
         --head) shift; head="$1" ;;
+        --add-label) shift; add_label="$1" ;;
         [0-9]*) issue_num="$1" ;;
         *) ;;
     esac
     shift
 done
 key=$(printf '%s' "$repo" | tr '/' '_')
+labels_file="$GHSTUB_DIR/$key/labels"
+
+# PRD #421 review fix: real `gh issue edit --add-label <name>` resolves the
+# label name to an ID and hard-errors BEFORE any mutation when the repo does
+# not already carry that label (`cli/cli` v2.97.0, `api/queries_repo.go`,
+# `LabelsToIDs`) — this stub used to accept every `issue edit` unconditionally,
+# which hid the PRD #421 defect where nothing ever creates `in-progress`
+# before the unconditional claim tries to add it. Mirror the real failure:
+# succeed — and record the applied label to `$GHSTUB_DIR/<key>/applied-<n>`,
+# so a test can observe the SUCCESS of the add, not just that it was
+# attempted (attempts are already visible via the gh-calls.log recorded
+# above) — only when `$add_label` is already in `$labels_file`; otherwise
+# fail exactly like real `gh` would, with a similar error shape.
+if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
+    if [ -n "$add_label" ]; then
+        if [ -f "$labels_file" ] && grep -qxF "$add_label" "$labels_file"; then
+            printf '%s\n' "$add_label" >> "$GHSTUB_DIR/$key/applied-$issue_num"
+            exit 0
+        fi
+        echo "gh: GraphQL: Could not resolve to a Label with the name '$add_label'. (addLabelsToLabelable)" 1>&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# PRD #421: claim-comment (`issue comment ...`) calls — already recorded
+# above; accepted unconditionally since no canned response is needed.
+if [ "$group" = "issue" ] && [ "$sub" = "comment" ]; then
+    exit 0
+fi
 
 if [ "$group" = "issue" ] && [ "$sub" = "list" ]; then
     cat "$GHSTUB_DIR/$key/issues.json"
@@ -283,6 +349,32 @@ impl GhStub {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// PRD #421 review fix: seed `repo`'s pre-existing label set — the labels
+    /// a real repo already carries before this fire — so `gh issue edit
+    /// --add-label <name>` succeeds against `<name>` (mirroring real `gh`'s
+    /// label-name-to-ID resolution, which hard-errors on an unknown label).
+    /// `gh label create` (idempotent, `--force`) also appends to this same
+    /// set, so a create-then-add sequence succeeds without pre-seeding.
+    fn seed_labels(&self, repo: &str, labels: &[&str]) {
+        let rd = self.repo_dir(repo);
+        std::fs::create_dir_all(&rd).expect("create repo fixture dir");
+        let body: String = labels.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(rd.join("labels"), body).expect("write labels seed file");
+    }
+
+    /// PRD #421 review fix: whether a `gh issue edit --add-label <label>`
+    /// call for `issue` on `repo` SUCCEEDED against the tightened stub — i.e.
+    /// `label` was already in the repo's known label set at call time, so the
+    /// mutation genuinely went through (mirroring real `gh`). Distinct from
+    /// [`Self::gh_calls`], which records every invocation ATTEMPTED
+    /// regardless of outcome.
+    fn label_applied(&self, repo: &str, issue: u64, label: &str) -> bool {
+        std::fs::read_to_string(self.repo_dir(repo).join(format!("applied-{issue}")))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == label)
     }
 
     /// Make `gh pr list --head agent/issue-<n>` report an open PR (skip signal).
@@ -1356,19 +1448,24 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
 const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
      [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"dad-nonexistent-binary-421\"\nstart = true\n";
 
-/// Scenario: Fire an `issue_dispatch` task for one open issue with no other
-/// claim signal present. After the dispatch succeeds (worktree + orchestrator
-/// agent present, as in `scheduler/dispatch/001`), the stub `gh` log must show
-/// an `issue edit ... --add-label in-progress` invocation for the issue AND an
+/// Scenario: Fire an `issue_dispatch` task for one open issue on a repo that
+/// already carries the `in-progress` label (seeded via
+/// [`GhStub::seed_labels`], mirroring a repo where the label vocabulary
+/// pre-exists — see `scheduler/dispatch/020` for the counterpart where it
+/// doesn't). After the dispatch succeeds (worktree + orchestrator agent
+/// present, as in `scheduler/dispatch/001`), the stub `gh` log must show an
+/// `issue edit ... --add-label in-progress` invocation for the issue AND an
 /// `issue comment` invocation whose body names the claiming task
-/// (`ScheduledTask.name`, the scheduler-side claimant per PRD #421). Neither
-/// call exists in today's code, so this is RED.
+/// (`ScheduledTask.name`, the scheduler-side claimant per PRD #421) — and,
+/// because `in-progress` pre-existed, the add-label call must have actually
+/// SUCCEEDED, not merely been attempted.
 #[spec("scheduler/dispatch/010")]
 #[test]
 fn dispatch_010_success_writes_label_and_claim_comment() {
     let stub = GhStub::new();
     let repo = "acme/widgets";
     stub.add_repo(repo, true);
+    stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
     stub.set_issues(repo, &[7]);
 
     let work_td = tempfile::tempdir().expect("workspace tempdir");
@@ -1423,6 +1520,20 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     assert!(
         commented,
         "a successful dispatch must post a claim comment naming the claiming task (`dispatch-task`); observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    // The fixture pre-seeded `in-progress`, so the add-label call must have
+    // actually SUCCEEDED against the stub's real-`gh`-accurate label-name
+    // resolution — not merely been attempted (`labelled` above only proves
+    // the attempt, since the raw argv is logged before the stub decides
+    // whether to accept or reject it).
+    let applied = common::wait_until(Duration::from_secs(3), || {
+        stub.label_applied(repo, 7, IN_PROGRESS_LABEL)
+    });
+    assert!(
+        applied,
+        "the `in-progress` label write must SUCCEED when the label already exists on the repo; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
     );
 }
@@ -1840,13 +1951,14 @@ fn dispatch_018_triage_enabled_ensures_labels_and_prompts_agent() {
 }
 
 /// Scenario: Fire an `issue_dispatch` task WITHOUT `triage` set (the
-/// default, off) for one open issue. Assert no `gh label ...` invocation is
-/// ever recorded and the prompt delivered to the dispatched agent carries
-/// none of PRD #421 M2.0's seven triage-vocabulary terms — a regression
-/// guard against the triage feature leaking into the default dispatch path.
-/// GREEN-by-design today (vacuously true, exactly like
-/// `scheduler/dispatch/012`/`014`'s own notes): none of the triage behavior
-/// exists in ANY code path yet, so there is nothing to leak.
+/// default, off) for one open issue. Assert no `gh label ...` invocation
+/// naming one of the seven triage-vocabulary labels is ever recorded (the
+/// unconditional `in-progress` claim, PRD #421 M1.0, also uses the `label`
+/// command group via `gh label create`/`gh issue edit --add-label` when the
+/// review fix lands, and is deliberately exempt from this guard — it is not
+/// triage) and the prompt delivered to the dispatched agent carries none of
+/// PRD #421 M2.0's seven triage-vocabulary terms — a regression guard
+/// against the triage feature leaking into the default dispatch path.
 #[spec("scheduler/dispatch/019")]
 #[test]
 fn dispatch_019_triage_off_by_default_no_label_no_prompt_text() {
@@ -1895,14 +2007,102 @@ fn dispatch_019_triage_off_by_default_no_label_no_prompt_text() {
         );
     }
 
-    let label_group_calls: Vec<String> = stub
+    // Narrowed from "no `label` call at all" to "no `label` call naming the
+    // triage vocabulary" (PRD #421 review fix): the unconditional
+    // `in-progress` claim (M1.0) also uses the `label` command group
+    // (`gh label create`/`gh issue edit --add-label`) once the fix lands, but
+    // `in-progress` is NOT triage vocabulary — it is the claim, which is
+    // unconditional by design. This is a faithful expression of the test's
+    // original intent ("the triage feature does not leak into the default
+    // path"), not a weakening of it.
+    let vocabulary_label_calls: Vec<String> = stub
         .gh_calls()
         .into_iter()
-        .filter(|l| l.starts_with("label "))
+        .filter(|l| l.starts_with("label ") && TRIAGE_LABELS.iter().any(|label| l.contains(label)))
         .collect();
     assert!(
-        label_group_calls.is_empty(),
-        "triage is off by default — no `gh label ...` call may ever be made; observed: \
-         {label_group_calls:?}"
+        vocabulary_label_calls.is_empty(),
+        "triage is off by default — no `gh label ...` call may ever name the triage vocabulary; \
+         observed: {vocabulary_label_calls:?}"
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task into a repo whose `in-progress`
+/// label does NOT pre-exist — the PRD #421 review's own counterexample
+/// (`vfarcic/dot-ai`, the docs' own example target, carries none of the
+/// seven-label vocabulary and would silently no-op pre-fix; deliberately no
+/// [`GhStub::seed_labels`] call here, unlike `scheduler/dispatch/010`).
+/// Assert the dispatch still ends with the issue GENUINELY claimed: an
+/// `issue edit ... --add-label in-progress` call is attempted, and — the
+/// actual defect this test pins — the add-label call SUCCEEDS
+/// (`GhStub::label_applied`), which only happens if `in-progress` is ensured
+/// to exist before the add. RED today: nothing ensures `in-progress` exists
+/// first, so the tightened stub's real-`gh`-accurate rejection fires and the
+/// claim silently fails (swallowed into `tracing::warn!`, so the run still
+/// reports success).
+#[spec("scheduler/dispatch/020")]
+#[test]
+fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    // Deliberately no `stub.seed_labels(...)` call — `in-progress` does not
+    // exist on this repo yet, mirroring a fresh GitHub repo.
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "the dispatch must succeed even when `in-progress` doesn't pre-exist on the repo"
+    );
+
+    let attempted = common::wait_until(Duration::from_secs(10), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("edit")
+                && l.contains("--add-label")
+                && l.contains("in-progress")
+                && l.contains('7')
+        })
+    });
+    assert!(
+        attempted,
+        "expected an `issue edit --add-label in-progress` attempt for issue 7; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    let applied = common::wait_until(Duration::from_secs(5), || {
+        stub.label_applied(repo, 7, IN_PROGRESS_LABEL)
+    });
+    assert!(
+        applied,
+        "the `in-progress` label must be ENSURED to exist before being added, so the add-label \
+         call succeeds even on a repo that starts with none of the label vocabulary — but the \
+         tightened stub (modeling real `gh`'s label-name-to-ID resolution) rejected it because \
+         nothing created `in-progress` first; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
     );
 }
