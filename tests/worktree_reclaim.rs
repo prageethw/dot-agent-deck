@@ -702,39 +702,6 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
     );
 }
 
-/// Scenario: A hand-made worktree (no `dot-agent-deck-owner` marker) whose
-/// branch has a MERGED PR and whose tree is clean survives
-/// `worktree reclaim --yes`. This is issue #144 finding 1's failure scenario:
-/// a developer hand-creates a worktree for a branch whose PR later merges,
-/// leaves it clean, and runs `--yes` expecting it to clear only the deck's OWN
-/// leftovers -- not every worktree that happens to be merged and clean.
-#[spec("worktree/reclaim/008")]
-#[test]
-#[cfg(unix)]
-fn worktree_reclaim_008_hand_made_foreign_worktree_survives_yes() {
-    let fx = Fixture::new();
-    let wt = fx.add_worktree_with_commit("wt-hand-made", "feat/hand-made");
-    fx.set_pr_state("feat/hand-made", "MERGED");
-    // Deliberately NOT marked owned: this is exactly what a developer's own
-    // hand-created worktree looks like -- no `dot-agent-deck-owner` marker.
-
-    let out = fx.run(&["worktree", "reclaim", "--yes"]);
-    assert!(
-        out.status.success(),
-        "`worktree reclaim --yes` must succeed; got {:?} out={}",
-        out.status,
-        combined(&out)
-    );
-    assert!(
-        wt.exists(),
-        "a worktree the deck cannot prove it created must survive `--yes` -- the flag may only \
-         auto-remove worktrees the gate already resolved to a `remove` verdict (deck-owned); \
-         {} is gone\n{}",
-        wt.display(),
-        combined(&out)
-    );
-}
-
 /// Scenario: A local, UNMERGED worktree on branch `fix/typo` shares its name
 /// with a DIFFERENT fork's already-merged PR whose head branch is also called
 /// `fix/typo`. `resolve_pr_state` matches on `headRefName` alone, which is not
@@ -800,5 +767,61 @@ fn worktree_reclaim_010_missing_head_repository_owner_fails_closed_not_merged() 
          must never be treated as a match -- {} is gone\n{}",
         wt.display(),
         combined(&out)
+    );
+}
+
+/// Scenario: A FOREIGN worktree (no ownership marker) that is merged and
+/// clean is first left alone by a bare `reclaim` -- named in the pending list
+/// -- and then IS removed once the user runs `reclaim --yes`. This pins the
+/// batch-confirmation contract `--yes` actually has (issue #144 follow-up):
+/// it removes an `Ask`-verdict worktree whose path was already shown to the
+/// user, not only `Remove`-verdict (deck-owned) ones. An earlier version of
+/// this suite asserted the opposite -- that a hand-made foreign worktree must
+/// SURVIVE `--yes` -- which was withdrawn as a design mistake once this
+/// module's own doc comment and `format_reclaim_human`'s "Run ... --yes to
+/// remove them" message made clear that withholding removal here would leave
+/// the `"ask" if yes` branch in `run_reclaim` unreachable dead code.
+#[spec("worktree/reclaim/011")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_011_yes_removes_a_foreign_merged_clean_worktree_named_in_pending_first() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-foreign-yes", "feat/foreign-yes");
+    fx.set_pr_state("feat/foreign-yes", "MERGED");
+    // Deliberately NOT marked owned: `--yes` must still remove it, once its
+    // path has been shown to the user via a bare `reclaim` first.
+
+    let bare = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        bare.status.success(),
+        "a bare `worktree reclaim` must succeed; got {:?} out={}",
+        bare.status,
+        combined(&bare)
+    );
+    let bare_text = combined(&bare);
+    assert!(
+        bare_text.contains("wt-foreign-yes"),
+        "the bare run must name this worktree's exact path in the pending list before --yes \
+         is ever invoked; got:\n{bare_text}"
+    );
+    assert!(
+        wt.exists(),
+        "the bare run must not remove a foreign worktree on its own -- {} is gone\n{bare_text}",
+        wt.display()
+    );
+
+    let yes = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        yes.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        yes.status,
+        combined(&yes)
+    );
+    assert!(
+        !wt.exists(),
+        "`--yes` must remove a merged, clean, foreign worktree whose path was already shown to \
+         the user by the prior bare run -- {} still exists\n{}",
+        wt.display(),
+        combined(&yes)
     );
 }

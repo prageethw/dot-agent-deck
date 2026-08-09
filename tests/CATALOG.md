@@ -729,12 +729,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `reclaim` (removal) path for this fixture, or JSON output — same gate, already covered elsewhere (`002`, `006`); the "unrelated repo's coincidental MERGED PR" framing from the fix's own doc comment, which this suite could not reproduce (see the test's doc comment and `set_worktree_origin`) because it requires the common config to ALSO carry a resolvable `origin`, which the list-accumulation behavior above rules out.
 - **Platform coverage:** mac+linux.
 
-##### worktree/reclaim/008 — A hand-made worktree (no `dot-agent-deck-owner` marker) whose PR is MERGED and whose tree is clean survives `worktree reclaim --yes` (issue #144 finding 1).
-- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
-- **Agent:** none (a worktree deliberately left without an ownership marker — exactly what a developer's hand-created worktree looks like).
-- **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward. Pins the fix's second half: `--yes` may auto-remove only a `remove`-verdict (deck-owned) worktree, never an `ask`-verdict (foreign) one, even when merged and clean.
-- **Does not assert:** the `ask`-surface reporting shape (`005`, same fixture without `--yes`); that a deck-owned worktree IS removed under the same conditions (`002` already covers that, and doubles as the guard against a coder satisfying this test by making `--yes` a bare no-op, since `002`'s removal path is unconditional on the flag).
-- **Platform coverage:** mac+linux.
+##### worktree/reclaim/008 — A worktree created through the deck's own PRODUCTION creation path (`issue_dispatch_run::create_worktree_sync`) is `Verdict::Remove` and is removed by a BARE `reclaim` (no `--yes`), once that path writes the ownership marker (issue #144 finding 1, corrected).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — NOT `tests/worktree_reclaim.rs`. `create_worktree_sync` is `pub(crate)`, invisible to an external integration-test crate, so this is the only fast-tier seam that can call it directly rather than through the `mark_owned` test helper. Calls `issue_dispatch_run::create_worktree_sync` and `worktree_reclaim::run_reclaim` in-process against a real git repo and a stub `gh` reached via a `PATH` prepend on the current process, serialized by a test-only `GH_PATH_ENV_LOCK` mutex + RAII restore-on-drop guard (mirroring `config.rs`'s `STATE_DIR_ENV_LOCK`, the only other place in this crate mutates process env for a test). No `dot-agent-deck` binary subprocess, no PTY, no daemon.
+- **Agent:** none.
+- **Asserts:** `create_worktree_sync` reports `WorktreeCreation::Created` and the worktree directory exists; a subsequent bare `run_reclaim(repo, yes=false)` reports exactly one `removed` entry and the worktree directory is actually gone — reachable only if the production creation path itself wrote the `dot-agent-deck-owner` marker (there is no `mark_owned` call anywhere in this test), since `Verdict::Remove` requires `Ownership::Ours`.
+- **Does not assert:** `gh` invocation-shape correctness (`--repo`/`--state` presence, unknown-flag rejection) — the stub here answers unconditionally; that is pinned at the CLI layer by `tests/worktree_reclaim.rs`'s `Fixture`/`GH_STUB_SCRIPT` (`001`–`007`, `009`, `010`). Supersedes this catalog id's prior scenario ("a hand-made worktree survives `--yes`"), which encoded a withdrawn design decision — see `worktree/reclaim/011`, which now pins the corrected, opposite contract for that same hand-made-worktree shape.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`; the fixture shells to `git`/a stub `gh` and reads a Unix `PermissionsExt` mode bit, exactly as `worktree/reclaim/001`).
 
 ##### worktree/reclaim/009 — A local unmerged branch survives `worktree reclaim --yes` even when a DIFFERENT fork's already-merged PR shares its exact `headRefName` (issue #144 finding 2).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
@@ -748,6 +748,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (same fixture shape as `009`, but the PR fixture omits `headRepositoryOwner` entirely — the shape real `gh` can return when the head repository is no longer resolvable, e.g. a fork deleted after its PR merged).
 - **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward — an unverifiable head repository owner must fail closed to not-merged, never be treated as a match.
 - **Does not assert:** the exact resulting `PrState`/verdict label (only the observable non-removal).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/011 — A FOREIGN worktree (no ownership marker) that is merged and clean is named in the pending list by a bare `reclaim`, then IS removed once the user runs `reclaim --yes` (issue #144 follow-up: corrects a withdrawn design decision).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a worktree deliberately left without an ownership marker, PR fixture MERGED; `reclaim` is run twice against the same fixture — once bare, once with `--yes`).
+- **Asserts:** the bare run succeeds, names the worktree's exact path in its pending list, and leaves the worktree in place; the subsequent `--yes` run then removes it. Pins the corrected contract this suite's original `008` had backwards: `--yes` is the batch confirmation for an `Ask`-verdict (foreign) worktree whose path was already shown to the user, not something that must never touch a foreign worktree — withholding removal here would leave `run_reclaim`'s `"ask" if yes` branch unreachable dead code while `format_reclaim_human` kept telling users to run a flag that no longer did anything.
+- **Does not assert:** that a `Remove`-verdict (deck-owned) worktree is also removed under the same conditions — `002` already covers that, unconditionally on the flag; the ask-surface reporting shape in isolation without `--yes` — already covered by `005`.
 - **Platform coverage:** mac+linux.
 
 

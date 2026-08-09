@@ -748,4 +748,171 @@ mod tests {
         assert_eq!(parsed["schema_version"], 1);
         assert!(json.contains("wt-a"));
     }
+
+    // -------------------------------------------------------------------
+    // Production creation-path coverage (issue #144): a worktree made via
+    // the deck's REAL `create_worktree_sync` (not the `mark_owned` test
+    // helper `tests/worktree_reclaim.rs` uses for its own fixtures) must be
+    // `Verdict::Remove` and be removed by a bare `reclaim`. This drives
+    // `resolve_pr_state`'s real `gh` call, which offers no argument to swap
+    // in a stub, so it needs a real (stubbed) `gh` on `PATH` -- unlike
+    // `tests/worktree_reclaim.rs`'s fixture, which scopes its stub `PATH` to
+    // a spawned `dot-agent-deck` *subprocess*'s own environment, an
+    // in-process unit test has no such boundary and must mutate this
+    // process's `PATH` directly. `GH_PATH_ENV_LOCK` below serializes that
+    // mutation, mirroring `config.rs`'s `STATE_DIR_ENV_LOCK` -- the only
+    // other place in this crate needs the same kind of guard.
+    // -------------------------------------------------------------------
+
+    use spec::spec;
+
+    /// Serializes tests in this module that mutate the process-global `PATH`
+    /// to stand a fake `gh` in front of `resolve_pr_state`'s real
+    /// `Command::new("gh")` call. Only this module's tests spawn `gh` at
+    /// all (`grep 'Command::new("gh")' src/*.rs`), so this lock only ever
+    /// needs to serialize against itself, but it stays cheap insurance
+    /// against a future sibling test doing the same.
+    static GH_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: prepends `bindir` to `PATH` (so the real `git` the
+    /// creation path also needs stays resolvable) and restores the prior
+    /// value on drop, even on panic. Callers must hold `GH_PATH_ENV_LOCK`
+    /// for this guard's entire lifetime.
+    struct PathEnvGuard {
+        prev_path: Option<String>,
+    }
+
+    impl PathEnvGuard {
+        fn prepend(bindir: &Path) -> Self {
+            let prev_path = std::env::var("PATH").ok();
+            let new_path = match &prev_path {
+                Some(p) => format!("{}:{p}", bindir.display()),
+                None => bindir.display().to_string(),
+            };
+            // SAFETY: the caller holds GH_PATH_ENV_LOCK for this guard's
+            // lifetime, serializing every read/write of PATH this module's
+            // tests perform.
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+            Self { prev_path }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see PathEnvGuard::prepend.
+            unsafe {
+                match self.prev_path.take() {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// A real, minimal git repo (`main` branch, one seed commit, an `origin`
+    /// remote resolvable by `derive_repo_slug`) to drive the production
+    /// worktree-creation path against.
+    fn init_repo_with_origin(dir: &Path) {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/test-org/test-repo.git",
+            ],
+        );
+    }
+
+    /// Scenario: A worktree is created through the deck's own PRODUCTION
+    /// creation path (`issue_dispatch_run::create_worktree_sync`, the same
+    /// function the TUI's `SpawnPane` dispatch calls) against a real git
+    /// repo, with a MERGED PR fixture answered by a stub `gh`. It must
+    /// resolve to `Verdict::Remove` and actually be removed by a BARE
+    /// `reclaim` (no `--yes`) -- proving the creation path itself writes the
+    /// `dot-agent-deck-owner` marker, not that a test helper can fake one.
+    #[spec("worktree/reclaim/008")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_008_deck_created_worktree_is_removed_by_bare_reclaim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        // Unconditionally answers `gh pr list` with one canned MERGED reply.
+        // This test does not re-check `gh` invocation shape --
+        // `tests/worktree_reclaim.rs`'s fixture already pins that at the CLI
+        // layer -- it only needs a MERGED verdict to reach `Verdict::Remove`.
+        let branch = "feat/deck-created";
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let worktree_dir = scratch.path().join("wt-deck-created");
+        let creation =
+            crate::issue_dispatch_run::create_worktree_sync(&repo, &worktree_dir, branch)
+                .expect("create_worktree_sync must succeed against a real git repo");
+        assert_eq!(
+            creation,
+            crate::issue_dispatch_run::WorktreeCreation::Created,
+            "the production creation path must report Created for a fresh worktree dir, got {creation:?}"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "create_worktree_sync reported Created but the worktree directory is missing"
+        );
+
+        let outcome =
+            run_reclaim(&repo, false).expect("run_reclaim must succeed against a real git repo");
+        assert_eq!(
+            outcome.removed.len(),
+            1,
+            "a worktree created through the production creation path, with a MERGED PR and a \
+             clean tree, must be removed by a BARE `reclaim` (no --yes) -- this only holds once \
+             `create_worktree_sync` itself writes the ownership marker; got removed={:?} \
+             pending={:?} kept={:?}",
+            outcome.removed,
+            outcome.pending,
+            outcome.kept
+        );
+        assert!(
+            !worktree_dir.exists(),
+            "the worktree directory must actually be gone after the bare reclaim above, not \
+             merely reported as removed"
+        );
+    }
 }
