@@ -70,19 +70,28 @@ bash .claude/skills/dot-ai-tag-release/cleanup.sh
 Interpret the output:
 - If the output contains `PR_STATE_DEGRADED=true`, the PR-state or ref-freshness
   data this run relied on could not be fully trusted (a `gh` failure or absence, an
-  undetermined repository slug, a truncated result page, or a failed `git fetch`
-  — see the `DEGRADED_REASONS:` lines when present) — stop and do not delete
-  anything until you can re-run it clean, since an open-PR branch could
-  otherwise be offered unprotected.
+  undetermined repository slug, a truncated open-PR result page, a failed `git fetch`,
+  or an undeterminable main-worktree path — see the `DEGRADED_REASONS:` lines when
+  present) — stop and do not delete anything until you can re-run it clean, since an
+  open-PR branch could otherwise be offered unprotected.
+- If the output contains `MERGED_LIST_TRUNCATED=true`, the merged-PR query hit its
+  own page limit — this is informational, not a degradation: it only means a later
+  merged branch may not have been offered this run, never that something unsafe was
+  offered. Proceed normally.
 - If `NOTHING_TO_CLEAN=true`, tell the user there is nothing to clean and finish.
 - Otherwise present the `WORKTREES`, `LOCAL_BRANCHES`, and `REMOTE_BRANCHES` lists
   and ask the user to confirm before deleting anything. Each `WORKTREES:` entry
   is `path<TAB>branch` (a literal TAB, not `|` — a branch name may legally
-  contain `|`, which would make that separator ambiguous); split on the TAB to
-  get the `[worktree_path]` step 1 below removes.
+  contain `|`, which would make that separator ambiguous); a worktree's own path
+  can itself contain a TAB, but a branch name never can, so split on the LAST TAB
+  to get the `[worktree_path]` step 1 below removes. `cleanup.sh` reads
+  `git worktree list --porcelain -z` internally, so a path containing a raw
+  newline is no longer truncated (fork issue #152 A-N2) — but that also means
+  such an entry can visibly span more than one output line. Do not assume one
+  `WORKTREES:` entry is one line; if an entry looks unusual, inspect it closely
+  before running `git worktree remove` on it.
 
-**This step is destructive — always show the full list and get explicit
-confirmation first.** `.claude/skills/dot-ai-tag-release/cleanup.sh` already excludes: the ROOT checkout, by its own path — not by matching a branch name, so it stays excluded no matter what branch it happens to be on; `fork-only`, which is trivially "merged" into `main` immediately after every fork/upstream sync while being the one branch that must never be deleted (`docs/develop/fork-sync-workflow.md`); the worktree/local branch you are currently on; and any branch that backs an open PR on either this fork or upstream. The current-branch exclusion applies to the worktree and local-branch guards only — `REMOTE_BRANCHES:` does not exclude your current branch's own `origin/<branch>`, so it can still be offered there if merged.
+**This step is destructive — always show the full list and get explicit confirmation first.** Never touch the default branch (`DEFAULT_BRANCH`) — neither the root checkout nor any other worktree or branch backing it. `.claude/skills/dot-ai-tag-release/cleanup.sh` already excludes: the ROOT checkout, by its own path — not by matching a branch name, so it stays excluded no matter what branch it happens to be on; the default branch by name, so a second, LINKED worktree checked out on it is excluded too, not only the root checkout; `fork-only`, which is trivially "merged" into `main` immediately after every fork/upstream sync while being the one branch that must never be deleted (`docs/develop/fork-sync-workflow.md`); the worktree/local branch you are currently on; and any branch that backs an open PR on either this fork or upstream. The current-branch exclusion applies to the worktree and local-branch guards only — `REMOTE_BRANCHES:` does not exclude your current branch's own `origin/<branch>`, so it can still be offered there if merged.
 
 After confirmation, process the items **in this order**:
 
