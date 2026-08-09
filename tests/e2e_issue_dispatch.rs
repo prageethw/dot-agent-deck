@@ -1558,9 +1558,18 @@ fn normalize_skip_line(line: &str, issue: u64, branch: &str) -> String {
         .replace(branch, "BRANCH")
 }
 
-/// Find the first line of `text` containing `needle`, if any.
-fn find_line_containing<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
-    text.lines().find(|l| l.contains(needle))
+/// Find the first line of `text` naming `issue #<issue>` that is NOT the
+/// `IssueDispatched` success line — which ALSO contains that exact substring
+/// (`"... dispatched issue #<issue> of <repo> ..."`), so a caller looking for
+/// a SKIP/FAILURE line for a specific issue can't be fooled by a same-issue
+/// dispatch-success line elsewhere in the captured stderr. This distinction
+/// matters concretely: pre-fix, issue 33 (the label-only cause) dispatches
+/// instead of skipping, so a naive substring search for `"issue #33"` finds
+/// that dispatch line and wrongly reads as "a skip line for cause C exists".
+fn find_non_dispatch_line_for(text: &str, issue: u64) -> Option<&str> {
+    let needle = format!("issue #{issue}");
+    text.lines()
+        .find(|l| l.contains(&needle) && !l.contains("dispatched issue"))
 }
 
 /// Scenario: Drive THREE of PRD #421's four skip causes in one repo — issue 31
@@ -1613,8 +1622,8 @@ fn dispatch_017_skip_causes_render_distinguishably() {
         "issue 31 (no signal) must dispatch — the proxy for 'the first fire completed'"
     );
     let snapshot_1 = daemon.stderr_text();
-    let line_b = find_line_containing(&snapshot_1, "issue #32").unwrap_or_default();
-    let line_c = find_line_containing(&snapshot_1, "issue #33").unwrap_or_default();
+    let line_b = find_non_dispatch_line_for(&snapshot_1, 32).unwrap_or_default();
+    let line_c = find_non_dispatch_line_for(&snapshot_1, 33).unwrap_or_default();
 
     // Second fire: 31's worktree now exists → skipped (cause A). Captured from
     // the DELTA past snapshot_1 so it can't be confused with any line already
@@ -1630,7 +1639,7 @@ fn dispatch_017_skip_causes_render_distinguishably() {
     );
     let snapshot_2 = daemon.stderr_text();
     let delta_2 = &snapshot_2[snapshot_1.len()..];
-    let line_a = find_line_containing(delta_2, "issue #31").unwrap_or_default();
+    let line_a = find_non_dispatch_line_for(delta_2, 31).unwrap_or_default();
 
     // Each cause must actually have rendered SOMETHING — the label cause (C)
     // is the one expected to be empty today (M1.2 missing), which is exactly
