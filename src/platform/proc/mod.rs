@@ -647,10 +647,11 @@ mod tests {
     /// backgrounded descendant through the repo's own descendant scan (same
     /// mechanism as `009`, not inferred from the leader's exit),
     /// `terminate_child_with_grace_and_wait_forcing_group_backstop` runs with
-    /// a 200ms grace window, and both the leader (reaped inside the grace
-    /// window) and the resistant descendant (reaped only by the forced
-    /// SIGKILL backstop) are confirmed gone afterward via a bounded
-    /// `kill(pid, 0)` poll.
+    /// a 200ms grace window; both the leader and the resistant descendant are
+    /// only reaped/killed after that window elapses (fork #143: the forcing
+    /// branch no longer polls for an early exit, so it never reaps the
+    /// leader before sending the group SIGKILL), and both are confirmed gone
+    /// afterward via a bounded `kill(pid, 0)` poll.
     #[cfg(unix)]
     #[spec("orchestration/worktree/010")]
     #[test]
@@ -819,6 +820,102 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Fork issue #143: the forcing teardown paths must never derive a
+    /// process-group id from a child that has already been reaped —
+    /// `try_wait`'s underlying `waitpid(WNOHANG)` reaps as a side effect of
+    /// merely checking exit status, and a reaped pid can be recycled by the
+    /// kernel before the group signal goes out. The trigger is a
+    /// sub-millisecond race needing pid-space wraparound, so it cannot be
+    /// forced deterministically; what this pins instead is the ordering
+    /// property that makes the race structurally impossible: a reap
+    /// (`try_wait` or `wait`) never happens before the phase-3 group signal.
+    ///
+    /// Scenario: a fake `portable_pty::Child` with no real pid
+    /// (`process_id() -> None`, which routes every signal through the
+    /// observable `ChildKiller::kill` fallback instead of a real `killpg`,
+    /// so this needs no OS process at all) records every `try_wait`/`wait`/
+    /// `kill` call it receives, in call order, into a shared log.
+    /// `terminate_child_with_grace_and_wait_forcing_group_backstop` runs
+    /// against it with a short grace window; the log is then asserted to
+    /// contain no `try_wait` calls at all (the forcing path must not poll —
+    /// polling is exactly what reaps early) and exactly two `kill` calls
+    /// (phase 1's SIGTERM, then phase 3's forcing SIGKILL), both preceding
+    /// the single `wait` call that performs the actual reap.
+    #[cfg(unix)]
+    #[spec("orchestration/worktree/013")]
+    #[test]
+    fn worktree_013_forcing_backstop_never_reaps_before_sending_the_group_signal() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct OrderingProbeChild {
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl portable_pty::ChildKiller for OrderingProbeChild {
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.log.lock().unwrap().push("kill");
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(OrderingProbeChild {
+                    log: self.log.clone(),
+                })
+            }
+        }
+
+        impl portable_pty::Child for OrderingProbeChild {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                self.log.lock().unwrap().push("try_wait");
+                Ok(None)
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                self.log.lock().unwrap().push("wait");
+                Ok(portable_pty::ExitStatus::with_exit_code(0))
+            }
+            fn process_id(&self) -> Option<u32> {
+                // No real pid — forces `signal_child_pgroup_or_fallback`
+                // through the observable `ChildKiller::kill` fallback rather
+                // than a real `killpg`, so this test needs no OS process.
+                None
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut boxed_child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(OrderingProbeChild { log: log.clone() });
+        let group = AgentProcessGroup;
+
+        super::terminate_child_with_grace_and_wait_forcing_group_backstop(
+            &mut boxed_child,
+            std::time::Duration::from_millis(20),
+            &group,
+        );
+
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&"try_wait"),
+            "the forcing backstop must never poll `try_wait` — doing so would reap the direct \
+             child before phase 3 can safely derive a pgid from it; calls were: {calls:?}"
+        );
+        let last_kill = calls.iter().rposition(|c| *c == "kill");
+        let first_wait = calls.iter().position(|c| *c == "wait");
+        match (last_kill, first_wait) {
+            (Some(k), Some(w)) => assert!(
+                k < w,
+                "the reap (`wait`) must happen strictly after the last group signal (`kill`), \
+                 never before it; calls were: {calls:?}"
+            ),
+            _ => panic!("expected both a `kill` call and a `wait` call; calls were: {calls:?}"),
+        }
+        assert_eq!(
+            calls.iter().filter(|c| **c == "kill").count(),
+            2,
+            "expected exactly two signals (SIGTERM then the forcing SIGKILL); calls were: \
+             {calls:?}"
+        );
     }
 
     /// Fork issue #136 finding 2 (both the reviewer and the auditor, and the

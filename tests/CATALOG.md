@@ -2753,6 +2753,13 @@ without depending on the config struct API.
 - **Does not assert:** the real process-wide `MAX_OUTSTANDING_DETACHED_REAPS` value or the production static counter (deliberately: the cap and counter are passed in, not reached for, so this cannot interfere with any other test using the production path); a genuine `Builder::spawn` failure (not constructible without exhausting the OS thread supply; saturation exercises the same synchronous-fallback branch honestly, per the review); that a thread specifically performs the detached reap (implementation detail, as in `011`); the SIGTERM/poll/SIGKILL phases before the tail reap (unchanged, still covered by `010`/`011`); Windows (the shared cap/fallback function is exercised identically there in production, but this test targets the Unix-only test harness shape, matching `009`-`011`).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `009`-`011`).
 
+##### orchestration/worktree/013 — The forcing teardown paths never reap the direct child before sending the phase-3 group signal (fork #143: `try_wait`'s underlying `waitpid(WNOHANG)` reaps as a side effect of merely checking exit status, releasing the direct child's pid back to the kernel for recycling before `killpg` used it — a sub-millisecond race needing pid-space wraparound that cannot be forced deterministically, so this pins the ordering invariant that makes it structurally impossible instead).
+- **Layer:** L1 (pure — a hand-written `portable_pty::Child` stand-in with no real pid, recording every `try_wait`/`wait`/`kill` call into a shared log in call order; no real OS process, no daemon, no PTY, no `killpg`).
+- **Agent:** none.
+- **Asserts:** running `terminate_child_with_grace_and_wait_forcing_group_backstop` against the stand-in (20ms grace) produces a call log with zero `try_wait` calls (the forcing path must not poll — polling is exactly what reaps early) and exactly two `kill` calls (phase 1's SIGTERM, then phase 3's forcing SIGKILL), both occurring strictly before the single `wait` call that performs the actual reap.
+- **Does not assert:** the real pid-recycling race itself (not deterministically forceable — see the headline); the non-forcing `terminate_child_with_grace_and_wait` (unaffected by this fix, still covered by `009`); the detached-reap variant's own bounded-return property (unaffected by this fix, still covered by `011`); a real `killpg` call or process group (the stand-in's `process_id()` returns `None`, routing every signal through the `ChildKiller::kill` fallback so this test needs no OS process).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `009`-`012`).
+
 ### Session restore
 
 #### session/restore
