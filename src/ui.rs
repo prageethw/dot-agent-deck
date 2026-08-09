@@ -1431,6 +1431,47 @@ fn should_reassert_orchestrator_remit(status: &SessionStatus) -> bool {
     matches!(status, SessionStatus::Compacting)
 }
 
+/// Issue #423 F6 — pure policy: is the orchestrator start-role pane
+/// currently `Compacting`, looked up in an order-independent way? Mirrors
+/// the `.any()` pattern `deliver_orchestrator_prompt`'s own readiness check
+/// uses for this exact pane (`src/ui.rs`, the `agent_ready` computation)
+/// rather than `.find()` over a `HashMap`, whose iteration order is
+/// unspecified. `AppState::apply_event` (`src/state.rs`) documents that two
+/// sessions can legitimately co-reside on one `pane_id` — a placeholder
+/// (`agent_type: AgentType::None`) alongside the tagged real session — so
+/// this also excludes placeholders, the same filter every sibling call
+/// site applies, rather than letting a stale co-resident session mask or
+/// spoof the real agent's status.
+fn orchestrator_remit_pane_is_compacting<'a>(
+    mut sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> bool {
+    sessions.any(|s| {
+        s.pane_id.as_deref() == Some(start_pane_id)
+            && s.agent_type != AgentType::None
+            && should_reassert_orchestrator_remit(&s.status)
+    })
+}
+
+/// Issue #423 F7 — pure policy: the start role's displayed status after a
+/// (re-)delivered remit prompt. At spawn this slot is always `Waiting`, so
+/// the transition to `Working` is unconditional there; on a compaction
+/// re-assertion it may already hold a TERMINAL status set by something
+/// else entirely — `Done`, or `Failed` (the warm-reattach hydration path's
+/// "role died" marker, `TabManager::open_orchestration_tab_with_existing_role_panes`)
+/// — and a re-assertion re-arming the same gate has no business
+/// overwriting either.
+fn next_start_role_status_after_delivery(
+    current: OrchestrationRoleStatus,
+) -> OrchestrationRoleStatus {
+    match current {
+        OrchestrationRoleStatus::Done | OrchestrationRoleStatus::Failed => current,
+        OrchestrationRoleStatus::Waiting | OrchestrationRoleStatus::Working => {
+            OrchestrationRoleStatus::Working
+        }
+    }
+}
+
 /// Returns how long the human-typing dispatch should sleep before forwarding
 /// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
 /// event rather than fused to recent typing. Returns `Duration::ZERO` unless
@@ -1787,8 +1828,28 @@ struct UiState {
     /// Removed the moment the status is next observed as anything else,
     /// which re-arms detection for a possible later compaction.
     orchestration_remit_compacting: HashSet<TabId>,
-    /// Tracks when orchestration tabs were created (for delayed prompt injection).
-    orchestration_created_at: HashMap<TabId, std::time::Instant>,
+    /// Issue #423 F3 (rename): originally "when the orchestration tab was
+    /// created", used only to seed `deliver_orchestrator_prompt`'s
+    /// deadline/timeout checks. The remit re-assertion (F2/F4) re-anchors
+    /// this to the re-arm moment, so it now means "when the current prompt
+    /// DELIVERY ATTEMPT started" — both of its readers
+    /// (`AUTOMATIC_PROMPT_DEADLINE`, the 10s `SessionStart` fallback) are
+    /// already scoped to one attempt, so re-anchoring on every re-arm is
+    /// correct for both; there is no third reader that wants a true
+    /// creation timestamp. Renamed so the name doesn't lie to the next
+    /// consumer that wants tab age.
+    orchestration_prompt_anchor_at: HashMap<TabId, std::time::Instant>,
+    /// Issue #423 F2/F4: orchestration tab IDs whose start-role prompt was
+    /// permanently abandoned — a timed-out `AUTOMATIC_PROMPT_DEADLINE` or a
+    /// terminal `SendResult` (`abandon_orchestrator_prompt`). Once a tab is
+    /// in this set the remit re-arm gate below must never fire for it
+    /// again: an abandoned delivery has no in-flight attempt to protect
+    /// (so `orchestrator_prompt.is_none()` alone can't tell "delivered" and
+    /// "gave up" apart), and re-arming it would turn the deadline this set
+    /// exists to make permanent into an unbounded retry loop. Never
+    /// removed — bounded the same way as `orchestration_prompted` and its
+    /// siblings: `TabId` is a monotonic, never-reused `u32`.
+    orchestration_remit_abandoned: HashSet<TabId>,
     /// PRD #128 Direction B-1 — tracks the moment SessionStart was first
     /// observed for each orchestration tab's start-role pane. The role
     /// prompt is held until `SPAWN_TIME_READINESS_BUFFER` has elapsed
@@ -1982,7 +2043,8 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_remit_compacting: HashSet::new(),
-            orchestration_created_at: HashMap::new(),
+            orchestration_prompt_anchor_at: HashMap::new(),
+            orchestration_remit_abandoned: HashSet::new(),
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             pending_seed_prompts: Vec::new(),
@@ -3281,6 +3343,15 @@ fn is_terminal_send_result(result: SendResult) -> bool {
 /// its prompt (so the render-loop gate stops re-entering), drop its retry/
 /// delivery/ready-since state, and surface `msg`. Used on the deadline and on a
 /// terminal send outcome.
+///
+/// Issue #423 F4: inserting `tab_id` into `orchestration_remit_abandoned`
+/// here is load-bearing — it's what makes an abandoned delivery
+/// PERMANENTLY ineligible for the remit re-arm gate in the main render
+/// loop, rather than one `AUTOMATIC_PROMPT_DEADLINE` window away from
+/// firing again on the next compaction. Do not remove this insert as a
+/// "symmetry cleanup": once a tab id is in this set it is meant to stay
+/// there for the tab's whole lifetime, by design — that permanence is
+/// what bounds the retry chain.
 fn abandon_orchestrator_prompt(
     ui: &mut UiState,
     tab_id: TabId,
@@ -3293,6 +3364,7 @@ fn abandon_orchestrator_prompt(
     ui.send_retry_backoff.remove(start_pane_id);
     ui.prompt_delivery.remove(start_pane_id);
     ui.orchestration_ready_since.remove(&tab_id);
+    ui.orchestration_remit_abandoned.insert(tab_id);
     ui.status_message = Some((msg, now));
 }
 
@@ -3323,7 +3395,7 @@ fn deliver_orchestrator_prompt(
     // The old block had no orchestrator deadline at all, so a permanent
     // non-delivery retried one RPC every ~2s forever.
     if ui
-        .orchestration_created_at
+        .orchestration_prompt_anchor_at
         .get(&tab_id)
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
@@ -3344,7 +3416,7 @@ fn deliver_orchestrator_prompt(
     });
     let timeout_ready = !agent_ready
         && ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .get(&tab_id)
             .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
     if agent_ready {
@@ -3390,7 +3462,8 @@ fn deliver_orchestrator_prompt(
     ) {
         Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
             *orchestrator_prompt = None;
-            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+            role_statuses[start_role_index] =
+                next_start_role_status_after_delivery(role_statuses[start_role_index]);
             ui.orchestration_prompted.insert(tab_id);
             ui.send_retry_backoff.remove(start_pane_id.as_str());
             ui.prompt_delivery.remove(start_pane_id.as_str());
@@ -8475,7 +8548,7 @@ fn dispatch_action(
 
                             // Record creation time for delayed prompt injection fallback.
                             if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
-                                ui.orchestration_created_at
+                                ui.orchestration_prompt_anchor_at
                                     .insert(*id, std::time::Instant::now());
                             }
 
@@ -10409,7 +10482,7 @@ pub fn run_tui(
                                 // gate's 10s timeout fallback works for agents
                                 // that never signal `SessionStart`.
                                 if let Tab::Orchestration { id, .. } = tab_manager.active_tab() {
-                                    ui.orchestration_created_at
+                                    ui.orchestration_prompt_anchor_at
                                         .insert(*id, std::time::Instant::now());
                                 }
                                 // PRD #20 R20-003 (finding #5): capture the start
@@ -11261,28 +11334,67 @@ pub fn run_tui(
                 role_pane_ids,
                 start_role_index,
                 orchestrator_prompt,
+                config,
+                cwd,
                 ..
             } = tab
             {
                 let start_pane_id = role_pane_ids[*start_role_index].clone();
-                let is_compacting = snapshot
-                    .sessions
-                    .values()
-                    .find(|s| s.pane_id.as_deref() == Some(start_pane_id.as_str()))
-                    .is_some_and(|s| should_reassert_orchestrator_remit(&s.status));
+                // F6: order-independent lookup — see
+                // `orchestrator_remit_pane_is_compacting`'s doc comment for
+                // why `.find()` over `snapshot.sessions.values()` was wrong.
+                let is_compacting = orchestrator_remit_pane_is_compacting(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                );
 
                 if is_compacting {
+                    // F2: eligibility no longer requires
+                    // `orchestration_prompted.contains(id)`. That condition
+                    // is true only after THIS loop's own delivery path has
+                    // completed a delivery, which a warm-daemon reattach
+                    // (`TabManager::open_orchestration_tab_with_existing_role_panes`,
+                    // `orchestrator_prompt: None` from construction, design
+                    // decision 3: never replay on reconnect) never reaches —
+                    // so the re-arm gate could never pass for the exact
+                    // long-lived, detach/reattach sessions issue #423 is
+                    // stated to target. `orchestrator_prompt.is_none()`
+                    // alone already captures "no delivery attempt is
+                    // in-flight right now" for EVERY path — spawn-delivered,
+                    // reattached (never had one), or abandoned — so the only
+                    // thing still needed is excluding "abandoned" explicitly,
+                    // which `orchestration_remit_abandoned` now does (F4).
+                    //
+                    // Pi start roles are excluded on purpose (not by
+                    // accident of `orchestration_prompted` never being set
+                    // for them either): a Pi role's prompt is delivered
+                    // NATIVELY, daemon-side (PRD #201) — this gate's
+                    // mechanism is TUI-owned PTY keystroke injection via
+                    // `write_and_submit_to_pane_with_identity`, which is the
+                    // wrong delivery path for a role the TUI deliberately
+                    // never PTY-injects into at spawn either. A native
+                    // re-assertion mechanism for Pi is out of scope here.
+                    let start_role_is_pi = config
+                        .roles
+                        .get(*start_role_index)
+                        .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+                        .unwrap_or(false);
+
                     if !ui.orchestration_remit_compacting.contains(id)
-                        && ui.orchestration_prompted.contains(id)
                         && orchestrator_prompt.is_none()
+                        && !ui.orchestration_remit_abandoned.contains(id)
+                        && !start_role_is_pi
+                        // F1: re-run the spawn-time write-then-point pair
+                        // instead of injecting the bare pointer constant, so
+                        // a re-assertion (a) verifies the context file
+                        // exists before claiming delivery, and (b) refreshes
+                        // it from the tab's own `cwd`/`config` rather than
+                        // trusting a file some other process may have
+                        // pruned or a relative path the agent will resolve
+                        // from wherever it has since `cd`'d to.
+                        && let Some(prompt) = prepare_orchestrator_prompt(config, cwd)
                     {
-                        // Eligible only once the ORIGINAL spawn-time seed is
-                        // confirmed delivered (`orchestration_prompted` set,
-                        // `orchestrator_prompt` cleared to `None` by
-                        // `deliver_orchestrator_prompt`'s success arm) —
-                        // never re-arm on top of a still-pending initial
-                        // delivery, which would duplicate or lose it.
-                        *orchestrator_prompt = Some(ORCHESTRATOR_CONTEXT_POINTER.to_string());
+                        *orchestrator_prompt = Some(prompt);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
                         // `deliver_orchestrator_prompt` abandons once
@@ -11290,7 +11402,7 @@ pub fn run_tui(
                         // timestamp, and reusing the tab's original creation
                         // time would abandon a re-assertion on sight in any
                         // orchestration old enough to actually need one.
-                        ui.orchestration_created_at.insert(*id, orch_now);
+                        ui.orchestration_prompt_anchor_at.insert(*id, orch_now);
                     }
                     ui.orchestration_remit_compacting.insert(*id);
                 } else {
@@ -27346,6 +27458,91 @@ mod tests {
         assert!(!should_reassert_orchestrator_remit(&SessionStatus::Unknown));
     }
 
+    // Issue #423 F6 — pure policy: `orchestrator_remit_pane_is_compacting`
+    // must find the REAL, tagged session on the start-role pane and ignore
+    // (a) a co-resident placeholder on the SAME pane and (b) a Compacting
+    // session on a DIFFERENT pane. `AppState::apply_event` (`src/state.rs`)
+    // documents that two sessions can legitimately co-reside on one
+    // `pane_id`, so this pins the `.any()` lookup against exactly the
+    // divergence the order-dependent `.find()` it replaces was exposed to.
+    #[test]
+    fn remit_pane_compacting_ignores_placeholder_and_other_panes() {
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+
+        // Co-resident placeholder on the target pane, reporting Compacting —
+        // must not count; `agent_type: None` means no real agent produced it.
+        sessions.insert(
+            "placeholder".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::None,
+                ..make_session(SessionStatus::Compacting)
+            },
+        );
+        assert!(
+            !orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "a placeholder session (agent_type: None) must not count as compacting"
+        );
+
+        // A real, tagged session Compacting on a DIFFERENT pane must not
+        // count for "orch-pane" either.
+        sessions.insert(
+            "other-pane-session".to_string(),
+            SessionState {
+                pane_id: Some("other-pane".to_string()),
+                agent_type: AgentType::Codex,
+                ..make_session(SessionStatus::Compacting)
+            },
+        );
+        assert!(
+            !orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "a Compacting session on a different pane must not count"
+        );
+
+        // The REAL, tagged session co-resident on "orch-pane" alongside the
+        // placeholder, reporting Compacting, must count — order-independence
+        // (`.any()`, not `.find()`) is what makes this reliable regardless of
+        // which of the two entries the map happens to iterate first.
+        sessions.insert(
+            "orch-pane-real".to_string(),
+            SessionState {
+                pane_id: Some("orch-pane".to_string()),
+                agent_type: AgentType::Codex,
+                ..make_session(SessionStatus::Compacting)
+            },
+        );
+        assert!(
+            orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "the real tagged session on the target pane must count even with \
+             a co-resident placeholder present"
+        );
+    }
+
+    // Issue #423 F7 — pure policy: a (re-)delivered remit prompt sets the
+    // start role's displayed status to `Working` from `Waiting`/`Working`,
+    // but must never clobber a TERMINAL status (`Done`, or `Failed` — the
+    // warm-reattach hydration path's "role died" marker) a re-assertion has
+    // no business overwriting.
+    #[test]
+    fn next_start_role_status_preserves_terminal_statuses() {
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Waiting),
+            OrchestrationRoleStatus::Working
+        );
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Working),
+            OrchestrationRoleStatus::Working
+        );
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Done),
+            OrchestrationRoleStatus::Done
+        );
+        assert_eq!(
+            next_start_role_status_after_delivery(OrchestrationRoleStatus::Failed),
+            OrchestrationRoleStatus::Failed
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Idle ASCII art tests
     // -----------------------------------------------------------------------
@@ -30806,7 +31003,7 @@ mod tests {
         let mut ui = default_ui();
         let tab_id: TabId = 7;
         let created = std::time::Instant::now();
-        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_prompt_anchor_at.insert(tab_id, created);
         let now_past_deadline = created
             .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
             .expect("future instant");
@@ -30846,7 +31043,7 @@ mod tests {
         ));
         let mut ui2 = default_ui();
         let tab2: TabId = 8;
-        ui2.orchestration_created_at
+        ui2.orchestration_prompt_anchor_at
             .insert(tab2, std::time::Instant::now());
         ui2.orchestration_ready_since.insert(
             tab2,
