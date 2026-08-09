@@ -1397,10 +1397,39 @@ const SNAPSHOT_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// to make the failure mode disappear.
 pub const SPAWN_TIME_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Upstream #424 finding #1 — env override for [`SPAWN_TIME_READINESS_BUFFER`],
+/// in milliseconds via `DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS`. Falls back
+/// to `SPAWN_TIME_READINESS_BUFFER` when unset or not a valid non-negative
+/// integer, mirroring `spawn::reuse_debounce`'s / `spawn::session_start_wait_
+/// timeout`'s override idiom (parse, warn-and-default on a bad value).
+///
+/// This is insurance, not the fix: raising a fixed buffer against an
+/// unbounded quantity (MCP server count, hook payload size, machine load)
+/// only moves the cliff further out — see finding #2's confirm-before-clear
+/// change, which is what actually converts a timing miss into a retry
+/// instead of a silent loss.
+pub fn spawn_readiness_buffer() -> std::time::Duration {
+    let default = SPAWN_TIME_READINESS_BUFFER;
+    let Ok(raw) = std::env::var("DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS") else {
+        return default;
+    };
+    let Ok(ms) = raw.trim().parse::<u64>() else {
+        tracing::warn!(
+            value = %raw,
+            default_ms = default.as_millis(),
+            "DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS is not a valid \
+             non-negative integer number of milliseconds; using the default \
+             spawn readiness buffer"
+        );
+        return default;
+    };
+    std::time::Duration::from_millis(ms)
+}
+
 /// PRD #128 Direction B-1 — returns whether the spawn-time orchestrator
 /// role prompt should fire NOW. Returns `false` if `ready_since` is set
-/// but `SPAWN_TIME_READINESS_BUFFER` hasn't elapsed yet; `true` once it
-/// has. `ready_since == None` means the readiness gate isn't engaged yet
+/// but [`spawn_readiness_buffer`] hasn't elapsed yet; `true` once it has.
+/// `ready_since == None` means the readiness gate isn't engaged yet
 /// (caller drives that — e.g. the timeout-ready fallback path that
 /// ignores SessionStart and fires after 10 s); the helper returns `true`
 /// in that case so the caller's own gating wins.
@@ -1414,7 +1443,7 @@ pub fn should_inject_spawn_time_prompt(
     now: std::time::Instant,
 ) -> bool {
     match ready_since {
-        Some(t) => now.saturating_duration_since(t) >= SPAWN_TIME_READINESS_BUFFER,
+        Some(t) => now.saturating_duration_since(t) >= spawn_readiness_buffer(),
         None => true,
     }
 }
@@ -1775,6 +1804,16 @@ struct UiState {
     /// submit-CR-aware mode on slower environments. Cleared when the
     /// prompt finally fires (entry never re-added).
     orchestration_ready_since: HashMap<TabId, std::time::Instant>,
+    /// Upstream #424 finding #2: tab IDs whose start-role prompt has been
+    /// WRITTEN (`Applied`/`Queued` — bytes reached the PTY) but not yet
+    /// CONFIRMED (a submit observed for that pane, via `SessionStatus::
+    /// Thinking`). "Bytes written" alone used to be treated as terminal
+    /// delivery, silently losing a CR that landed as a newline in the
+    /// agent's input buffer. While an entry is present, `deliver_orchestrator_
+    /// prompt` checks for confirmation before finalizing, and re-attempts the
+    /// write (subject to `send_retry_backoff`) if none has arrived. Cleared
+    /// on confirmation, abandonment, or deadline.
+    orchestration_awaiting_confirmation: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
     /// PRD #127 M3.1: mode `seed_prompt`s waiting for their agent pane to be
@@ -1962,6 +2001,7 @@ impl UiState {
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             orchestration_ready_since: HashMap::new(),
+            orchestration_awaiting_confirmation: HashMap::new(),
             pending_dispatches: Vec::new(),
             pending_seed_prompts: Vec::new(),
             send_retry_backoff: HashMap::new(),
@@ -3263,6 +3303,7 @@ fn abandon_orchestrator_prompt(
     ui.send_retry_backoff.remove(start_pane_id);
     ui.prompt_delivery.remove(start_pane_id);
     ui.orchestration_ready_since.remove(&tab_id);
+    ui.orchestration_awaiting_confirmation.remove(&tab_id);
     ui.status_message = Some((msg, now));
 }
 
@@ -3309,6 +3350,38 @@ fn deliver_orchestrator_prompt(
         return;
     }
 
+    // Upstream #424 finding #2: a prior write LANDED (`Applied`/`Queued` —
+    // bytes reached the PTY) but has not yet been CONFIRMED (a submit
+    // observed for this pane, via `SessionStatus::Thinking` — the only
+    // existing positional "a submit arrived" signal; `UserPromptSubmit`
+    // cannot carry our minted `delivery_id` since its payload originates in
+    // Claude, which never saw it). Check confirmation BEFORE re-entering the
+    // readiness/backoff/write machinery below: once confirmed, finalize with
+    // NO further write attempt; if still unconfirmed, fall through so the
+    // write is retried like any other non-terminal outcome — "bytes written"
+    // alone must never again be the last thing that happens to this prompt.
+    if ui.orchestration_awaiting_confirmation.contains_key(&tab_id) {
+        let confirmed = snapshot.sessions.values().any(|s| {
+            s.pane_id.as_deref() == Some(start_pane_id.as_str())
+                && s.status == SessionStatus::Thinking
+        });
+        if confirmed {
+            tracing::info!(
+                pane_id = %start_pane_id,
+                tab_id,
+                "orchestrator prompt: delivery confirmed (submit observed)"
+            );
+            *orchestrator_prompt = None;
+            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+            ui.orchestration_prompted.insert(tab_id);
+            ui.send_retry_backoff.remove(start_pane_id.as_str());
+            ui.prompt_delivery.remove(start_pane_id.as_str());
+            ui.orchestration_ready_since.remove(&tab_id);
+            ui.orchestration_awaiting_confirmation.remove(&tab_id);
+            return;
+        }
+    }
+
     let agent_ready = snapshot.sessions.values().any(|s| {
         s.pane_id.as_deref() == Some(start_pane_id.as_str()) && s.agent_type != AgentType::None
     });
@@ -3317,14 +3390,18 @@ fn deliver_orchestrator_prompt(
             .orchestration_created_at
             .get(&tab_id)
             .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
-    if agent_ready {
+    // Upstream #424 finding #3: the 10s no-SessionStart fallback must still
+    // honor the readiness buffer instead of firing with a zero buffer the
+    // instant the 10s mark is crossed — the old code forced `buffer_elapsed
+    // = true` here unconditionally, so the agents LEAST likely to signal
+    // readiness (no SessionStart at all) got the MOST fragile delivery.
+    // Engaging `timeout_ready` now starts the same buffer wait a real
+    // SessionStart would, instead of bypassing it.
+    if agent_ready || timeout_ready {
         ui.orchestration_ready_since.entry(tab_id).or_insert(now);
     }
-    let buffer_elapsed = if timeout_ready {
-        true
-    } else {
-        should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
-    };
+    let buffer_elapsed =
+        should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now);
     let backed_off = ui
         .send_retry_backoff
         .get(start_pane_id.as_str())
@@ -3358,13 +3435,24 @@ fn deliver_orchestrator_prompt(
         expected_session_id.as_deref(),
         delivery_id.as_deref(),
     ) {
-        Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-            *orchestrator_prompt = None;
-            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
-            ui.orchestration_prompted.insert(tab_id);
-            ui.send_retry_backoff.remove(start_pane_id.as_str());
-            ui.prompt_delivery.remove(start_pane_id.as_str());
-            ui.orchestration_ready_since.remove(&tab_id);
+        Ok(result @ (SendResult::Applied | SendResult::Queued)) => {
+            // Upstream #424 finding #2: "bytes reached the PTY" is NOT
+            // confirmed delivery. Hold `prompt_delivery` / `send_retry_backoff`
+            // and record this write as awaiting confirmation instead of
+            // finalizing — the confirmation check above will either finalize
+            // on a later frame (once a submit is observed) or retry the write
+            // (still bounded by `AUTOMATIC_PROMPT_DEADLINE`, checked at the
+            // top of this function on every call). This is what converts a
+            // timing miss into a retry instead of a silent loss.
+            tracing::info!(
+                pane_id = %start_pane_id,
+                tab_id,
+                delivery_id = delivery_id.as_deref().unwrap_or(""),
+                result = describe_send_result(result),
+                "orchestrator prompt: write applied; awaiting submit confirmation"
+            );
+            ui.orchestration_awaiting_confirmation.insert(tab_id, now);
+            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
         }
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
         // retry); a RETRYABLE liveness transition is retried under backoff,
@@ -27210,6 +27298,57 @@ mod tests {
         let ready_since = now - SPAWN_TIME_READINESS_BUFFER;
         // `>=` boundary: exactly at the buffer should fire.
         assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    /// Upstream #424 finding #1: `DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS`
+    /// parses a valid override, falls back to `SPAWN_TIME_READINESS_BUFFER`
+    /// when unset, and falls back the same way (rather than panicking or
+    /// propagating an error) on a non-numeric value.
+    #[test]
+    fn spawn_readiness_buffer_parses_env_override_default_and_invalid() {
+        // Serialize against any other test reading this process-global env var.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const VAR: &str = "DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS";
+        let prev = std::env::var(VAR).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::remove_var(VAR);
+        }
+        assert_eq!(
+            spawn_readiness_buffer(),
+            SPAWN_TIME_READINESS_BUFFER,
+            "unset env var must default to SPAWN_TIME_READINESS_BUFFER"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "1234");
+        }
+        assert_eq!(
+            spawn_readiness_buffer(),
+            std::time::Duration::from_millis(1234),
+            "a valid override must apply"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "not-a-number");
+        }
+        assert_eq!(
+            spawn_readiness_buffer(),
+            SPAWN_TIME_READINESS_BUFFER,
+            "a non-numeric override must fall back to the default, not panic"
+        );
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
