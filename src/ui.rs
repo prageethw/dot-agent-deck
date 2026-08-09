@@ -30337,6 +30337,9 @@ mod tests {
         NoLiveTarget,
         Stale,
         WrongSession,
+        // Upstream #424: "bytes reached the PTY" — the outcome the current
+        // (buggy) code treats as terminal delivery.
+        Applied,
     }
 
     struct SendResultPaneController {
@@ -30406,6 +30409,7 @@ mod tests {
                 InjectedSendOutcome::NoLiveTarget => Ok(crate::event::SendResult::NoLiveTarget),
                 InjectedSendOutcome::Stale => Ok(crate::event::SendResult::Stale),
                 InjectedSendOutcome::WrongSession => Ok(crate::event::SendResult::WrongSession),
+                InjectedSendOutcome::Applied => Ok(crate::event::SendResult::Applied),
             }
         }
         fn write_and_submit_to_pane_with_identity(
@@ -30808,5 +30812,292 @@ mod tests {
         let acted =
             apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
         assert!(!acted, "a rejection while not in PaneInput must be ignored");
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream #424: a spawn-time role prompt can be silently lost. Current
+    // `deliver_orchestrator_prompt` treats `Ok(SendResult::Applied)` — bytes
+    // reached the PTY — as terminal delivery: it clears `orchestrator_prompt`,
+    // marks the role `Working`, and discards ALL retry state, before any
+    // submit has actually been observed for the pane. Each test below mirrors
+    // the render loop's own per-frame re-entry gate (`orchestrator_prompt.
+    // is_some() && !ui.orchestration_prompted.contains(id)`, `src/ui.rs`'s
+    // `for tab in tab_manager.tabs_mut() { ... }` block) inline, the same
+    // technique `deliver_orchestrator_prompt_bounds_deadline_and_terminal_
+    // outcomes` above uses to drive this seam with a controlled clock.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: drive `deliver_orchestrator_prompt` across two simulated
+    /// render frames with a pane controller that reports `Applied` (bytes
+    /// reached the PTY) and no submit ever follows. Pins upstream #424
+    /// finding #2 — the CURRENT code treats `Applied` as terminal delivery
+    /// and finalizes (marks the role `Working`, closes the re-entry gate)
+    /// before any submit has happened, so a CR that silently landed as a
+    /// newline in the agent's input buffer is never retried.
+    #[spec("orchestration/seed/001")]
+    #[test]
+    fn orchestration_seed_001_unconfirmed_applied_write_is_retried_not_finalized() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 424;
+        let write_time = std::time::Instant::now();
+        ui.orchestration_created_at.insert(tab_id, write_time);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            write_time
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-424".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-424".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-424".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+
+        // Frame 1: the write lands (`Applied`) but no submit follows.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time,
+            tab_id,
+            &["orch-pane-424".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        // With no confirming submit, the re-entry gate must stay OPEN so a
+        // later frame retries — "bytes reached the PTY" alone must not close
+        // it.
+        let gate_open_after_unconfirmed_write =
+            prompt.is_some() && !ui.orchestration_prompted.contains(&tab_id);
+        if gate_open_after_unconfirmed_write {
+            // Frame 2, comfortably after the write, still no submit observed.
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                write_time + std::time::Duration::from_secs(5),
+                tab_id,
+                &["orch-pane-424".to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+        }
+
+        assert!(
+            gate_open_after_unconfirmed_write
+                && attempts.load(Ordering::SeqCst) == 2
+                && role_statuses[0] != OrchestrationRoleStatus::Working,
+            "an Applied write with no confirming submit must not be treated as \
+             delivered: gate_open_after_unconfirmed_write={gate_open_after_unconfirmed_write} \
+             (orchestrator_prompt/orchestration_prompted must stay pending, not \
+             close on bytes-written alone), attempts={} (must retry to 2, not \
+             stay at 1), role_statuses[0]={:?} (must not be Working with no \
+             submit ever observed) — see upstream #424 finding #2 \
+             (`Ok(SendResult::Applied)` treated as terminal success in \
+             `deliver_orchestrator_prompt`)",
+            attempts.load(Ordering::SeqCst),
+            role_statuses[0]
+        );
+    }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` across two simulated
+    /// render frames: frame 1 performs an `Applied` write with no submit yet;
+    /// frame 2 simulates a REAL submit having landed for that pane — the
+    /// positional confirmation upstream #424's correction calls for (a
+    /// `UserPromptSubmit` hook maps to `EventType::Thinking`, `src/hook.rs:
+    /// 111`, which `AppState::apply_event` turns into `SessionStatus::
+    /// Thinking`, `src/state.rs` — the only existing "a submit arrived"
+    /// signal in the codebase). Pins the counterpart to `orchestration/
+    /// seed/001`: delivery must finalize exactly once, AFTER the submit is
+    /// observed, with no duplicate write — never before, and never twice.
+    #[spec("orchestration/seed/002")]
+    #[test]
+    fn orchestration_seed_002_confirmed_write_finalizes_once_no_duplicate() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 425;
+        let write_time = std::time::Instant::now();
+        ui.orchestration_created_at.insert(tab_id, write_time);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            write_time
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-425".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-425".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-425".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+
+        // Frame 1: the write lands (`Applied`); no submit has happened yet.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time,
+            tab_id,
+            &["orch-pane-425".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        // Symmetric with `orchestration/seed/001`: finalizing (Working)
+        // before any submit is observed is the same premature-finalization
+        // defect.
+        let finalized_before_confirmation = role_statuses[0] == OrchestrationRoleStatus::Working;
+
+        // A real submit for this pane now lands.
+        snapshot
+            .sessions
+            .get_mut("pane-orch-pane-425")
+            .expect("placeholder session")
+            .status = SessionStatus::Thinking;
+
+        let gate_open_before_confirmation_frame =
+            prompt.is_some() && !ui.orchestration_prompted.contains(&tab_id);
+        if gate_open_before_confirmation_frame {
+            // Frame 2, comfortably after the write, WITH confirmation now
+            // visible in the snapshot.
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                write_time + std::time::Duration::from_secs(5),
+                tab_id,
+                &["orch-pane-425".to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+        }
+
+        let no_duplicate_write = attempts.load(Ordering::SeqCst) == 1;
+        let finalized_after_confirmation = role_statuses[0] == OrchestrationRoleStatus::Working;
+        let gate_closed_after_confirmation =
+            prompt.is_none() && ui.orchestration_prompted.contains(&tab_id);
+
+        assert!(
+            !finalized_before_confirmation
+                && no_duplicate_write
+                && finalized_after_confirmation
+                && gate_closed_after_confirmation,
+            "a confirmed seed must finalize exactly once, AFTER the submit is \
+             observed, never before, and never with a duplicate write: \
+             finalized_before_confirmation={finalized_before_confirmation} (must \
+             be false — role_statuses[0] must not be Working until a submit is \
+             seen), attempts={} (must stay 1 — no duplicate write once \
+             confirmed), finalized_after_confirmation={finalized_after_confirmation} \
+             (must be true once confirmed), \
+             gate_closed_after_confirmation={gate_closed_after_confirmation} (must \
+             be true once confirmed) — see upstream #424 finding #2",
+            attempts.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Scenario: the 10s no-SessionStart fallback must still honor
+    /// `SPAWN_TIME_READINESS_BUFFER` instead of firing the write with a zero
+    /// buffer the instant the 10s mark is crossed. Pins upstream #424
+    /// finding #3 (`src/ui.rs:3263-3273`): `timeout_ready` currently forces
+    /// `buffer_elapsed = true` unconditionally, bypassing
+    /// `should_inject_spawn_time_prompt` entirely for agents that never
+    /// signal `SessionStart` — exactly the agents least likely to have a
+    /// stable submit-ready input by the time the write lands.
+    #[spec("orchestration/seed/003")]
+    #[test]
+    fn orchestration_seed_003_timeout_fallback_still_honors_readiness_buffer() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 426;
+        // No SessionStart ever arrives: the session's `agent_type` stays
+        // `AgentType::None`, so `agent_ready` is false every frame and only
+        // the 10s fallback can trigger delivery.
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-426".into());
+        snapshot.insert_placeholder_session("orch-pane-426".into(), None, None, None);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+
+        let created = std::time::Instant::now();
+        ui.orchestration_created_at.insert(tab_id, created);
+        // `orchestration_ready_since` is never set — SessionStart never
+        // fired, so nothing has engaged the readiness gate yet.
+
+        // The instant the 10s fallback threshold is crossed: the fix must
+        // NOT write here — it must treat this moment as the start of the
+        // buffer wait, exactly like a real SessionStart would.
+        let at_ten_seconds = created
+            .checked_add(std::time::Duration::from_secs(10) + std::time::Duration::from_millis(1))
+            .expect("ten-second instant");
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            at_ten_seconds,
+            tab_id,
+            &["orch-pane-426".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        let wrote_with_zero_buffer = attempts.load(Ordering::SeqCst) > 0;
+
+        if prompt.is_some() && !ui.orchestration_prompted.contains(&tab_id) {
+            // Well past the 10s mark PLUS a full readiness buffer: the write
+            // must now happen.
+            let after_fallback_buffer = at_ten_seconds
+                .checked_add(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(50))
+                .expect("post-buffer instant");
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                after_fallback_buffer,
+                tab_id,
+                &["orch-pane-426".to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+        }
+        let wrote_after_buffer_elapsed = attempts.load(Ordering::SeqCst) > 0;
+
+        assert!(
+            !wrote_with_zero_buffer && wrote_after_buffer_elapsed,
+            "the 10s no-SessionStart fallback must still honor \
+             SPAWN_TIME_READINESS_BUFFER instead of firing with a zero buffer: \
+             wrote_with_zero_buffer={wrote_with_zero_buffer} (must be false — no \
+             write at the exact instant the 10s mark is crossed), \
+             wrote_after_buffer_elapsed={wrote_after_buffer_elapsed} (must be \
+             true once the buffer has additionally elapsed past the 10s mark) \
+             — see upstream #424 finding #3 (src/ui.rs:3263-3273's \
+             `timeout_ready` => `buffer_elapsed = true` bypass)",
+        );
     }
 }

@@ -2730,6 +2730,29 @@ without depending on the config struct API.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
+#### orchestration/seed
+
+##### orchestration/seed/001 — An orchestrator role prompt whose write reports `Applied` (bytes reached the PTY) but is never followed by a real submit for that pane must be retried, not treated as delivered (upstream #424 finding #2).
+- **Layer:** L1 (in-process — drives `deliver_orchestrator_prompt` directly against a `SendResultPaneController` injected to report `Ok(SendResult::Applied)`, with an injected clock; same seam and technique as `deliver_orchestrator_prompt_bounds_deadline_and_terminal_outcomes` above; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** across two simulated render frames — frame 1 performs the `Applied` write, frame 2 runs 5s later with still no submit observed — the render loop's own per-frame re-entry gate (`orchestrator_prompt.is_some() && !ui.orchestration_prompted.contains(id)`, mirrored inline from the real call site in `src/ui.rs`) stays OPEN after the unconfirmed write instead of closing on bytes-written alone; a second write attempt actually occurs on frame 2 (`attempts == 2`); and the role's status never reports `Working` while no submit has ever been observed.
+- **Does not assert:** the confirmed-delivery / no-duplicate-write half (covered by `orchestration/seed/002`); the 10s no-SessionStart fallback's own buffer bypass (covered by `orchestration/seed/003`); a real PTY / real Claude Code submit-CR timing reproduction (covered at that layer by `tests/spawn_time_role_prompt_submit_after_session_start.rs`); the exact reconciliation mechanism the coder implements (left open, per the issue's own correction that `UserPromptSubmit` cannot carry a minted `delivery_id`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/seed/002 — Once a real submit for the pane IS observed, the orchestrator role prompt finalizes exactly once — never before the submit, and never with a duplicate write (upstream #424 finding #2, the guard against `001`'s fix turning into prompt spam).
+- **Layer:** L1 (in-process — drives `deliver_orchestrator_prompt` directly against a `SendResultPaneController`, with an injected clock and an `AppState` snapshot whose session status is mutated between frames to model a real submit; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** frame 1 performs an `Applied` write with no submit yet — the role's status must NOT already report `Working` at this point (symmetric with `001`'s premature-finalization defect); the session's status is then set to `SessionStatus::Thinking` (the daemon's own `UserPromptSubmit` → `EventType::Thinking` mapping, `src/hook.rs:111` / `src/state.rs`) modeling a real submit landing for that pane; frame 2 runs 5s later with that confirmation now visible in the snapshot — the role's status finalizes to `Working`, the re-entry gate closes (`orchestrator_prompt` is `None` and the tab is in `ui.orchestration_prompted`), and NO second write occurs (`attempts` stays at `1`).
+- **Does not assert:** the unconfirmed-retry half (covered by `orchestration/seed/001`); the 10s fallback (covered by `orchestration/seed/003`); that `SessionStatus::Thinking` is necessarily the exact signal the shipped fix reconciles against — it is the only existing positional "a submit arrived" signal in the codebase today and is used here as the most direct stand-in, per the issue's instruction to leave the reconciliation mechanism to the coder; a real PTY / real Claude Code submit-CR timing reproduction (`tests/spawn_time_role_prompt_submit_after_session_start.rs`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/seed/003 — The 10s no-`SessionStart` fallback must still honor `SPAWN_TIME_READINESS_BUFFER` instead of firing the write the instant the 10s mark is crossed (upstream #424 finding #3, `src/ui.rs:3263-3273`).
+- **Layer:** L1 (in-process — drives `deliver_orchestrator_prompt` directly against a `SendResultPaneController`, with an injected clock and a session whose `agent_type` stays `AgentType::None` throughout, so only the 10s fallback path can trigger delivery; no PTY, no daemon).
+- **Agent:** none.
+- **Asserts:** calling `deliver_orchestrator_prompt` at the exact instant the 10s no-`SessionStart` threshold is crossed writes NOTHING (`attempts == 0`) — the fallback must treat that moment as the start of the readiness buffer, not bypass it; calling it again once `SPAWN_TIME_READINESS_BUFFER` has additionally elapsed past that instant performs the write (`attempts > 0`).
+- **Does not assert:** the fast (`SessionStart`-signaled) readiness path's own buffer (covered by `tests/spawn_time_role_prompt_submit_after_session_start.rs` and the existing `should_inject_spawn_time_prompt` unit coverage); the unconfirmed-retry / confirmed-finalize halves (covered by `orchestration/seed/001`/`002`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/worktree
 
 ##### orchestration/worktree/001 — Submitting the orchestration form with a worktree slug typed in yields a request carrying the resolved sibling worktree path; a blank slug carries `None`, preserving today's exact behavior (fork #122 reopened — deliberately NOT PRD #220's shape).
