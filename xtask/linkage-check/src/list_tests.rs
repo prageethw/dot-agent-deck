@@ -889,6 +889,111 @@ mod tests {
         assert!(modified[1].body_changed);
     }
 
+    /// Fork #156 — a catalog id legitimately shared by tests in more than
+    /// one file (e.g. `mouse/form/001`, which real annotations five times
+    /// across `tests/e2e_mouse_form.rs` and `tests/render_form_buttons.rs`)
+    /// is silently collapsed to ONE `TestEntry` per id by
+    /// `collect_tests_from_sources`'s `BTreeMap::insert`, so whichever file
+    /// is processed LAST for that id wins and every earlier one is
+    /// discarded without a trace. The git-ref collector orders files via
+    /// `git ls-tree` (alphabetical); the on-disk collector orders them via
+    /// `std::fs::read_dir` (filesystem-dependent, not sorted) — nothing
+    /// guarantees the two agree. When they disagree, base and head keep
+    /// DIFFERENT winners for the same shared id even though every file
+    /// backing it is byte-identical between the two refs, and the id is
+    /// reported "Modified" — this is the mechanism behind the false
+    /// positives observed at PR #153's merge gate.
+    #[test]
+    fn compute_modified_does_not_flag_a_shared_spec_id_whose_every_file_is_unchanged() {
+        let file_a = (
+            "tests/e2e_a.rs".to_string(),
+            r#"
+                #[spec("shared/id/001")]
+                #[test]
+                /// Scenario: exercised from file A.
+                fn shared_001_from_a() { let x = 1; }
+            "#
+            .to_string(),
+        );
+        let file_b = (
+            "tests/e2e_b.rs".to_string(),
+            r#"
+                #[spec("shared/id/001")]
+                #[test]
+                /// Scenario: exercised from file B.
+                fn shared_001_from_b() { let x = 2; }
+            "#
+            .to_string(),
+        );
+
+        // Neither file's bytes differ between "base" and "head" — only the
+        // traversal order does, exactly as it legitimately can between
+        // `git ls-tree` order and `std::fs::read_dir` order.
+        let base = collect_tests_from_sources(&[file_a.clone(), file_b.clone()]).expect("parses");
+        let head = collect_tests_from_sources(&[file_b, file_a]).expect("parses");
+
+        let modified = compute_modified(&base, &head);
+        assert!(
+            modified.is_empty(),
+            "shared/id/001 reported modified even though every file backing it \
+             is byte-identical between base and head — only collector traversal \
+             order differed: {modified:?}"
+        );
+    }
+
+    /// Fork #156's symmetric direction, per the issue's own note: "a tool
+    /// that invents rows is equally untrustworthy when it reports
+    /// `_(none)_`". If the SAME file happens to win the shared-id collision
+    /// on both sides (traversal order agrees, unlike the test above), a
+    /// real edit to the OTHER file sharing that id is silently swallowed —
+    /// the report says nothing changed when something did.
+    #[test]
+    fn compute_modified_can_miss_a_genuine_change_hidden_behind_a_shared_spec_id() {
+        let file_a_before = (
+            "tests/e2e_a.rs".to_string(),
+            r#"
+                #[spec("shared/id/002")]
+                #[test]
+                /// Scenario: exercised from file A, original.
+                fn shared_002_from_a() { let x = 1; }
+            "#
+            .to_string(),
+        );
+        let file_a_after = (
+            "tests/e2e_a.rs".to_string(),
+            r#"
+                #[spec("shared/id/002")]
+                #[test]
+                /// Scenario: exercised from file A, CHANGED.
+                fn shared_002_from_a() { let x = 999; }
+            "#
+            .to_string(),
+        );
+        let file_b = (
+            "tests/e2e_b.rs".to_string(),
+            r#"
+                #[spec("shared/id/002")]
+                #[test]
+                /// Scenario: exercised from file B, never touched.
+                fn shared_002_from_b() { let x = 2; }
+            "#
+            .to_string(),
+        );
+
+        // Both base and head process A then B, so B wins the collision both
+        // times — A's real edit never surfaces in either map.
+        let base = collect_tests_from_sources(&[file_a_before, file_b.clone()]).expect("parses");
+        let head = collect_tests_from_sources(&[file_a_after, file_b]).expect("parses");
+
+        let modified = compute_modified(&base, &head);
+        assert!(
+            modified.iter().any(|m| m.spec_id == "shared/id/002"),
+            "file A's body genuinely changed under shared/id/002, but the \
+             shared-id collision hid it because file B won the slot on both \
+             sides, so the report would say `_(none)_`: {modified:?}"
+        );
+    }
+
     #[test]
     fn catalog_prose_delta_flags_changed_fields() {
         let mut base: BTreeMap<String, CatalogEntry> = BTreeMap::new();
