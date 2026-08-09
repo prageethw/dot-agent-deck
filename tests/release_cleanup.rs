@@ -122,6 +122,30 @@ fn run_git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Add a worktree on a NEW branch off `main`, add one commit, and
+/// fast-forward merge it back into `main` (pushing both `main` and the new
+/// branch). Shared by every fixture that needs a "genuinely merged feature
+/// worktree": [`build_repo_fixture`] (`feat/merged`, `feat/merged-2`) and
+/// [`build_fixture_default_branch_linked_worktree`] (`feat/merged`).
+fn add_merged_feature_worktree(
+    clone_dir: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    file_name: &str,
+) {
+    let wt_str = worktree_path.to_str().expect("worktree path is UTF-8");
+    run_git(
+        clone_dir,
+        &["worktree", "add", "-b", branch, wt_str, "main"],
+    );
+    std::fs::write(worktree_path.join(file_name), "merged\n").expect("write feature file");
+    run_git(worktree_path, &["add", file_name]);
+    run_git(worktree_path, &["commit", "-m", &format!("feat: {branch}")]);
+    run_git(clone_dir, &["merge", "--ff-only", branch]);
+    run_git(clone_dir, &["push", "origin", "main"]);
+    run_git(clone_dir, &["push", "origin", branch]);
+}
+
 /// Shared prelude for every fixture below: a bare `origin` and a clone with
 /// one commit on `main`, pushed, with `origin/HEAD` set. Returns `(origin
 /// bare dir, clone dir)`; callers add whatever remotes, branches, and
@@ -249,30 +273,12 @@ fn build_repo_fixture(upstream_url: Option<&str>) -> RepoFixture {
     run_git(&clone_dir, &["push", "origin", "fork-only"]);
 
     // `feat/merged`: a real feature branch, fast-forward merged into `main`.
-    let feat_merged_wt_str = feat_merged_worktree
-        .to_str()
-        .expect("feat/merged worktree path is UTF-8");
-    run_git(
+    add_merged_feature_worktree(
         &clone_dir,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "feat/merged",
-            feat_merged_wt_str,
-            "main",
-        ],
-    );
-    std::fs::write(feat_merged_worktree.join("feature.txt"), "merged\n")
-        .expect("write feature file");
-    run_git(&feat_merged_worktree, &["add", "feature.txt"]);
-    run_git(
         &feat_merged_worktree,
-        &["commit", "-m", "feat: merged work"],
+        "feat/merged",
+        "feature.txt",
     );
-    run_git(&clone_dir, &["merge", "--ff-only", "feat/merged"]);
-    run_git(&clone_dir, &["push", "origin", "main"]);
-    run_git(&clone_dir, &["push", "origin", "feat/merged"]);
     let feat_merged_sha = run_git(&clone_dir, &["rev-parse", "feat/merged"])
         .trim()
         .to_string();
@@ -284,30 +290,12 @@ fn build_repo_fixture(upstream_url: Option<&str>) -> RepoFixture {
     // some OTHER reason, so the corresponding negative assertions passed
     // vacuously even if the offering logic broke outright. This gives both
     // `WORKTREES:` and `LOCAL_BRANCHES:` a genuine positive entry.
-    let feat_merged_2_wt_str = feat_merged_2_worktree
-        .to_str()
-        .expect("feat/merged-2 worktree path is UTF-8");
-    run_git(
+    add_merged_feature_worktree(
         &clone_dir,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "feat/merged-2",
-            feat_merged_2_wt_str,
-            "main",
-        ],
-    );
-    std::fs::write(feat_merged_2_worktree.join("feature2.txt"), "merged2\n")
-        .expect("write second feature file");
-    run_git(&feat_merged_2_worktree, &["add", "feature2.txt"]);
-    run_git(
         &feat_merged_2_worktree,
-        &["commit", "-m", "feat: second merged work"],
+        "feat/merged-2",
+        "feature2.txt",
     );
-    run_git(&clone_dir, &["merge", "--ff-only", "feat/merged-2"]);
-    run_git(&clone_dir, &["push", "origin", "main"]);
-    run_git(&clone_dir, &["push", "origin", "feat/merged-2"]);
 
     // `feat/unmerged`: diverges from `main` and is never merged back — proves
     // the fix does not turn into "exclude everything".
@@ -489,30 +477,12 @@ fn build_fixture_default_branch_linked_worktree() -> DefaultBranchLinkedWorktree
 
     // A genuinely merged feature branch/worktree — the positive anchor.
     let feat_merged_worktree = root.path().join("wt-feat-merged");
-    let feat_merged_wt_str = feat_merged_worktree
-        .to_str()
-        .expect("feat/merged worktree path is UTF-8");
-    run_git(
+    add_merged_feature_worktree(
         &clone_dir,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "feat/merged",
-            feat_merged_wt_str,
-            "main",
-        ],
-    );
-    std::fs::write(feat_merged_worktree.join("feature.txt"), "merged\n")
-        .expect("write feature file");
-    run_git(&feat_merged_worktree, &["add", "feature.txt"]);
-    run_git(
         &feat_merged_worktree,
-        &["commit", "-m", "feat: merged work"],
+        "feat/merged",
+        "feature.txt",
     );
-    run_git(&clone_dir, &["merge", "--ff-only", "feat/merged"]);
-    run_git(&clone_dir, &["push", "origin", "main"]);
-    run_git(&clone_dir, &["push", "origin", "feat/merged"]);
 
     // A SECOND, LINKED worktree on the default branch itself. `clone_dir`
     // (the main working tree) is already on `main`, so this needs `--force`
@@ -650,7 +620,25 @@ fn build_fixture_separate_git_dir() -> MainWorktreeUndeterminableFixture {
         ],
     );
     run_git(&clone_dir, &["config", "commit.gpgsign", "false"]);
-    run_git(&clone_dir, &["remote", "add", "origin", origin_dir_str]);
+    // `origin` must parse cleanly as a GitHub owner/repo slug (same
+    // GitHub-shaped-URL + local `insteadOf` technique [`init_repo`] uses) —
+    // otherwise `origin`'s OWN slug-derivation failure (fork issue #140
+    // target behaviour 2) would independently set `PR_STATE_DEGRADED=true`
+    // regardless of the `--separate-git-dir` mechanism this fixture exists
+    // to isolate, and the test pinning S2 would pass for the WRONG reason.
+    let origin_override_url = format!("https://github.com/{FORK_SLUG}.git");
+    run_git(
+        &clone_dir,
+        &["remote", "add", "origin", &origin_override_url],
+    );
+    run_git(
+        &clone_dir,
+        &[
+            "config",
+            &format!("url.{origin_dir_str}.insteadOf"),
+            &origin_override_url,
+        ],
+    );
     std::fs::write(clone_dir.join("README.md"), "fixture\n").expect("write seed file");
     run_git(&clone_dir, &["add", "README.md"]);
     run_git(&clone_dir, &["commit", "-m", "initial"]);
@@ -1568,19 +1556,16 @@ fn release_cleanup_015_worktrees_exclude_a_linked_worktree_on_the_default_branch
 /// token on every single invocation. Also serves as S5: nothing in the
 /// pre-#152 suite asserted `DEGRADED_REASONS:` CONTENT at all, which is
 /// exactly why S1 shipped through a 14-test suite.
-#[test]
-fn release_cleanup_016_degraded_reason_never_leaks_origin_credentials() {
-    let secret = "s3cr3t-token";
-    let bad_url = format!("https://user:{secret}@github.enterprise.corp/o/r.git");
-    let fixture = build_minimal_repo(Some(&bad_url), None);
-    let gh = GhStub::new();
-    let out = run_cleanup(&fixture.dir, gh.path());
-
+/// Shared assertions for the three `release_cleanup_01{6,7,8}_...` tests
+/// below: the run must still degrade, `DEGRADED_REASONS:` must still name
+/// `remote_name`, and `secret` (plus the generic `user:` userinfo marker)
+/// must never reach stdout — fork issue #152 S1 / S5.
+fn assert_credential_never_leaked(out: &CleanupOutput, secret: &str, remote_name: &str) {
     assert!(
         out.degraded(),
-        "an `origin` URL that cannot be resolved to a GitHub owner/repo slug \
-         must still produce `PR_STATE_DEGRADED=true` (fork issue #140 target \
-         behaviour 2, unaffected by the redaction fix). Full \
+        "a `{remote_name}` URL that cannot be resolved to a GitHub owner/repo \
+         slug must still produce `PR_STATE_DEGRADED=true`, unaffected by the \
+         redaction fix (fork issue #140 target behaviours 2/3). Full \
          stdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
@@ -1588,7 +1573,8 @@ fn release_cleanup_016_degraded_reason_never_leaks_origin_credentials() {
     assert!(
         !out.stdout.contains(secret),
         "the raw credential (`{secret}`) must NEVER appear anywhere in \
-         stdout — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
+         stdout, even in part — fork issue #152 S1. Full \
+         stdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
     );
@@ -1603,13 +1589,24 @@ fn release_cleanup_016_degraded_reason_never_leaks_origin_credentials() {
     assert!(
         reasons
             .iter()
-            .any(|line| line.to_lowercase().contains("origin")),
-        "`DEGRADED_REASONS:` must still name `origin` as the offending \
-         remote even once the raw URL is redacted — an operator needs to \
-         know WHICH remote to fix. Full stdout:\n{}\nstderr:\n{}",
+            .any(|line| line.to_lowercase().contains(remote_name)),
+        "`DEGRADED_REASONS:` must still name `{remote_name}` as the \
+         offending remote even once the raw URL is redacted — an operator \
+         needs to know WHICH remote to fix. Full stdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
     );
+}
+
+#[test]
+fn release_cleanup_016_degraded_reason_never_leaks_origin_credentials() {
+    let secret = "s3cr3t-token";
+    let bad_url = format!("https://user:{secret}@github.enterprise.corp/o/r.git");
+    let fixture = build_minimal_repo(Some(&bad_url), None);
+    let gh = GhStub::new();
+    let out = run_cleanup(&fixture.dir, gh.path());
+
+    assert_credential_never_leaked(&out, secret, "origin");
 }
 
 /// Scenario: same as
@@ -1629,40 +1626,7 @@ fn release_cleanup_017_degraded_reason_never_leaks_upstream_credentials() {
     let gh = GhStub::new();
     let out = run_cleanup(&fixture.dir, gh.path());
 
-    assert!(
-        out.degraded(),
-        "an `upstream` URL that cannot be resolved to a GitHub owner/repo \
-         slug must still produce `PR_STATE_DEGRADED=true` (fork issue #140 \
-         target behaviour 3's 'present but unparseable' half, unaffected by \
-         the redaction fix). Full stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    assert!(
-        !out.stdout.contains(secret),
-        "the raw credential (`{secret}`) must NEVER appear anywhere in \
-         stdout — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    assert!(
-        !out.stdout.contains("user:"),
-        "the URL's userinfo (`user:`) must NEVER appear anywhere in stdout \
-         — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    let reasons = out.section("DEGRADED_REASONS:");
-    assert!(
-        reasons
-            .iter()
-            .any(|line| line.to_lowercase().contains("upstream")),
-        "`DEGRADED_REASONS:` must still name `upstream` as the offending \
-         remote even once the raw URL is redacted. Full \
-         stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
+    assert_credential_never_leaked(&out, secret, "upstream");
 }
 
 /// Scenario: `origin`'s credential-bearing URL carries a secret containing
@@ -1683,31 +1647,11 @@ fn release_cleanup_018_degraded_reason_never_leaks_a_slash_and_at_containing_sec
     let gh = GhStub::new();
     let out = run_cleanup(&fixture.dir, gh.path());
 
-    assert!(
-        out.degraded(),
-        "an `origin` URL that cannot be resolved to a GitHub owner/repo slug \
-         must still produce `PR_STATE_DEGRADED=true`. Full \
-         stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    assert!(
-        !out.stdout.contains(secret),
-        "the raw credential (`{secret}`, containing `/` and `@`) must NEVER \
-         appear anywhere in stdout, even in part — a redaction built on \
-         `slug_from_url`'s own `[^@/]*@` userinfo class would stop at the \
-         first `/` or `@` and leak the rest (fork issue #152 S1). Full \
-         stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
-    assert!(
-        !out.stdout.contains("user:"),
-        "the URL's userinfo (`user:`) must NEVER appear anywhere in stdout. \
-         Full stdout:\n{}\nstderr:\n{}",
-        out.stdout,
-        out.stderr
-    );
+    // A redaction built on `slug_from_url`'s own `[^@/]*@` userinfo class
+    // would stop at the first `/` or `@` and leak the rest of `secret` — the
+    // shared helper's `!out.stdout.contains(secret)` check is what catches
+    // that, since `secret` itself contains both.
+    assert_credential_never_leaked(&out, secret, "origin");
 }
 
 /// Scenario: the fixture's main working tree has had its `.git` directory
