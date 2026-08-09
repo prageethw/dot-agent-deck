@@ -2516,9 +2516,23 @@ mod tests {
     async fn daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty_inner() {
         let reg = Arc::new(AgentPtyRegistry::new());
         let pane_id = "pane-ledger-retry-424";
+        // `stty -echo` before exec'ing the real shell: with echo ON (the
+        // default), the raw bytes of a submitted command are themselves
+        // mirrored into scrollback by the kernel's line discipline BEFORE the
+        // shell ever runs them — since the marker text necessarily appears in
+        // the TYPED command too (`printf '<marker>\n'`), one real
+        // write+execute would already produce two occurrences (the echoed
+        // input, then the command's own output), making occurrence-count an
+        // unreliable proxy for "how many times did this actually execute".
+        // With echo off, only the command's OWN stdout ever reaches
+        // scrollback, so each real execution contributes exactly one
+        // occurrence — mirrors the raw-mode technique
+        // `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`
+        // uses for the same reason (there: unambiguous CR/LF; here:
+        // unambiguous occurrence count).
         let id = reg
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/sh"),
+                command: Some("stty -echo && printf 'READY-424\\n' && exec /bin/sh"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
                 ..SpawnOptions::default()
             })
@@ -2562,6 +2576,14 @@ mod tests {
             count
         }
 
+        // Wait for `stty -echo` to have applied before writing anything —
+        // otherwise the very first submitted command races the mode switch.
+        let ready = wait_for_marker_count(&reg, &id, "READY-424", 1).await;
+        assert_eq!(
+            ready, 1,
+            "precondition: the shell must signal readiness (echo disabled) before any write"
+        );
+
         // Attempt 1 — the original write. Must land.
         let outcome1 = deliver_with_ledger(&reg, &state, pane_id, text, &extras, delivery_id)
             .await
@@ -2576,6 +2598,45 @@ mod tests {
             count_after_first, 1,
             "precondition: the first attempt's output must reach scrollback exactly once"
         );
+
+        // Diagnostic, ahead of attempt 2: probe `admit_delivery` DIRECTLY
+        // (not through `deliver_with_ledger`) so the ledger's admission kind
+        // is asserted unambiguously, independent of anything the PTY/echo
+        // does to scrollback. Safe to call as a pure read: a delivery_id
+        // whose cached `result` is already `Some` returns `Replay` in
+        // `admit_delivery`'s Phase 1 with no state change beyond an LRU
+        // `touch` — it does not consume or disturb the record attempt 2
+        // will see.
+        let fingerprint = AgentPtyRegistry::delivery_fingerprint(
+            extras.expected_agent_id.as_deref(),
+            pane_id,
+            text,
+        );
+        match reg.admit_delivery(delivery_id, fingerprint).await {
+            crate::agent_pty::DeliveryAdmission::Replay(replayed) => {
+                assert_eq!(
+                    replayed,
+                    crate::event::SendResult::Applied,
+                    "ledger replay must return the cached Applied outcome"
+                );
+            }
+            crate::agent_pty::DeliveryAdmission::Proceed(_) => {
+                panic!(
+                    "admit_delivery returned Proceed for a delivery_id that already \
+                     cached an Applied outcome — the ledger's replay-on-repeat-id \
+                     behavior did not trigger for this delivery_id/fingerprint pair; \
+                     issue #424 round 2's premise (a same-delivery_id retry is \
+                     silently swallowed) does not hold as written here"
+                );
+            }
+            crate::agent_pty::DeliveryAdmission::Conflict => {
+                panic!(
+                    "admit_delivery returned Conflict for an identical \
+                     (expected_agent_id, pane_id, text) fingerprint — fingerprint \
+                     computation is not as deterministic as assumed"
+                );
+            }
+        }
 
         // Attempt 2 — the CALLER's retry: same delivery_id, same fingerprint
         // (identical agent/pane/text), because the confirmation-retry design
