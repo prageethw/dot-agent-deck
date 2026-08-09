@@ -165,6 +165,15 @@ pub struct WorktreeReport {
     pub verdict: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The identity [`owner_of`] read back from the marker, when the
+    /// worktree is `Ours` and the marker carries a `created-by:` line.
+    /// `None` for a `Foreign` worktree, and `None` for an `Ours` worktree
+    /// whose marker predates fork #166 (the bare `"deck\n"` legacy content)
+    /// — omitted from JSON entirely rather than serialized as `null`,
+    /// mirroring `reason` above, so an older client reading this document
+    /// still round-trips cleanly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// The worktree's real, byte-exact path (issue #144 finding 4) — never
     /// serialized; `path` above (`to_string_lossy`) is what the JSON document
     /// and the human report show. [`run_reclaim`] passes THIS to
@@ -428,6 +437,35 @@ fn ownership_of(repo_dir: &Path, worktree_path: &Path) -> Ownership {
     } else {
         Ownership::Foreign
     }
+}
+
+/// Read the `created-by:` identity back out of a worktree's ownership
+/// marker (issue #425's write side; fork #166's read side). Delegates the
+/// `Ours`/`Foreign` call entirely to [`ownership_of`] — containment and
+/// marker presence stay that function's sole authority, exactly as this
+/// module's doc requires, so a worktree that is `Foreign` (missing marker,
+/// forged `.git` redirect, unresolvable git-dir) always reports `None` here
+/// too, without this function re-deriving that decision itself.
+///
+/// For an `Ours` worktree, the marker is parsed per #173's own documented
+/// contract on [`sanitize_marker_creator`]: find the line starting with the
+/// literal `created-by: ` prefix, strip exactly that prefix, and return the
+/// remainder untouched. Never `split(':')` — every real value embeds a
+/// second colon (`issue-dispatch:<task>#<issue>`, `orchestration:<name>`),
+/// so splitting on it would truncate the identity at the first one. A
+/// pre-#166 marker (the bare `"deck\n"` an older build wrote) has no
+/// `created-by:` line at all and correctly resolves `None` — `Ours` with an
+/// unknown owner, not an error and not `Foreign`.
+pub(crate) fn owner_of(repo_dir: &Path, worktree_path: &Path) -> Option<String> {
+    if ownership_of(repo_dir, worktree_path) != Ownership::Ours {
+        return None;
+    }
+    let git_dir = resolve_git_dir(worktree_path)?;
+    let content = std::fs::read_to_string(git_dir.join(OWNER_MARKER_FILENAME)).ok()?;
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("created-by: "))
+        .map(str::to_string)
 }
 
 /// Write the `dot-agent-deck-owner` marker for a worktree this process just
@@ -738,6 +776,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         } else {
             verdict
         };
+        let owner = owner_of(repo_dir, &wt.path);
         let real_path = wt.path.clone();
         reports.push(WorktreeReport {
             path: wt.path.to_string_lossy().to_string(),
@@ -747,6 +786,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             pr_state: pr_state.label().to_string(),
             reason: verdict.reason().map(str::to_string),
             verdict: verdict.label().to_string(),
+            owner,
             real_path,
         });
     }

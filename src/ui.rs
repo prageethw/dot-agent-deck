@@ -8193,23 +8193,38 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
-                            // issue #425: name the orchestration that
-                            // created this worktree, using the canonical
-                            // config name (not the form name — see the
-                            // "do NOT overwrite orch_config.name" note
-                            // below) so the marker matches the identity the
-                            // daemon itself uses. `load_project_config`
-                            // normalises an empty `name` to the dir
-                            // basename at load time
+                            // fork #166: name the ownership marker's creator
+                            // with the typed instance Name (`req.name`, the
+                            // same value that becomes `display_title` below)
+                            // when one was typed, since that is what
+                            // distinguishes two live orchestrations of the
+                            // same config type. Fall back to the canonical
+                            // config name — as issue #425 originally did —
+                            // when no typed Name was given. Trimmed before
+                            // the blankness test (fork issue #174: a
+                            // whitespace-only name must fall back too, not
+                            // become the identity) rather than the bare
+                            // `is_empty()` #174 flags elsewhere. This
+                            // fallback is deliberate and interim: this PRD's
+                            // M1.0 will make the Name required and unique,
+                            // at which point the blank case becomes
+                            // unreachable, but M1.0 is not built yet.
+                            //
+                            // `load_project_config` normalises an empty
+                            // `name` to the dir basename at load time
                             // (`src/project_config.rs:268-272`, via
                             // `resolve_orchestration_name`), and this form's
                             // orchestration list comes from that same
-                            // loader — so `orch_config.name` is non-empty
-                            // by construction and this arm is unreachable
-                            // in production. It stays as defence-in-depth,
-                            // purely so a future constructor that bypasses
-                            // the loader can't write a bare `orchestration:`.
-                            let creator = if orch_config.name.is_empty() {
+                            // loader — so `orch_config.name` is non-empty by
+                            // construction and the inner `orch_config.name
+                            // .is_empty()` arm is unreachable in production.
+                            // It stays as defence-in-depth, purely so a
+                            // future constructor that bypasses the loader
+                            // can't write a bare `orchestration:`.
+                            let typed_name = req.name.trim();
+                            let creator = if !typed_name.is_empty() {
+                                format!("orchestration:{typed_name}")
+                            } else if orch_config.name.is_empty() {
                                 "orchestration:unknown".to_string()
                             } else {
                                 format!("orchestration:{}", orch_config.name)
