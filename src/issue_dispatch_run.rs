@@ -717,10 +717,32 @@ async fn create_worktree(
     // is unreachable on this path today; handled here only so the match stays
     // exhaustive if that ever changes.
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
-        AddOutcome::Created => WorktreeCreation::Created,
+        AddOutcome::Created => {
+            mark_worktree_owned_best_effort(worktree_dir);
+            WorktreeCreation::Created
+        }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
         AddOutcome::TimedOut => WorktreeCreation::TimedOut { cleaned_up: false },
     })
+}
+
+/// Write the `dot-agent-deck-owner` marker (issue #144 finding 1) for a
+/// worktree this call just created — best-effort, matching
+/// `ensure_worktrees_excluded`'s established pattern in this file: log at
+/// WARN and continue rather than failing the whole worktree creation. The
+/// expensive, valuable operation (`git worktree add` itself) already
+/// succeeded; a missing marker only means a future `reclaim` lands this
+/// worktree on `Ask` instead of `Remove` (annoying, never unsafe — see
+/// [`crate::worktree_reclaim::mark_worktree_owned`]'s doc comment).
+fn mark_worktree_owned_best_effort(worktree_dir: &Path) {
+    if let Err(e) = crate::worktree_reclaim::mark_worktree_owned(worktree_dir) {
+        tracing::warn!(
+            worktree = %worktree_dir.display(),
+            error = %e,
+            "issue-dispatch: could not write ownership marker; this worktree will require \
+             `reclaim --yes` instead of a bare `reclaim` later"
+        );
+    }
 }
 
 /// Sync twin of [`create_worktree`] for the TUI's synchronous `SpawnPane`
@@ -752,7 +774,10 @@ pub(crate) fn create_worktree_sync(
         WORKTREE_GIT_TIMEOUT,
     );
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
-        AddOutcome::Created => WorktreeCreation::Created,
+        AddOutcome::Created => {
+            mark_worktree_owned_best_effort(worktree_dir);
+            WorktreeCreation::Created
+        }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
         // Fork #122/#123 re-audit (P2): the add registered `worktree_dir`
         // before it was killed. Best-effort clean it up now, bounded by its

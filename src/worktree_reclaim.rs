@@ -1,13 +1,19 @@
 //! `dot-agent-deck worktree list|reclaim` — PRD #422.
 //!
-//! Reclaims a git worktree only when three gates all hold: its PR's state is
+//! Reclaims a git worktree only when two gates hold: its PR's state is
 //! `MERGED` (via `gh`, never git ancestry — squash-merges never enter `main`'s
-//! ancestry, so an ancestry check misses genuinely merged branches), the tree
-//! is clean (`git status --porcelain` empty — a merged branch's worktree can
-//! still hold uncommitted files that were never part of the PR), and the deck
-//! can prove it created the worktree (otherwise the tree is reported as
-//! reclaimable-pending-confirmation and removed only with `--yes`). The branch
-//! is never deleted, only the worktree directory.
+//! ancestry, so an ancestry check misses genuinely merged branches), and the
+//! tree is clean (`git status --porcelain` empty — a merged branch's worktree
+//! can still hold uncommitted files that were never part of the PR). A THIRD
+//! signal — whether the deck can prove it created the worktree — decides only
+//! *how* a merged-and-clean worktree is removed, never *whether*: a
+//! deck-created worktree is removed by a bare `reclaim`, with no `--yes`
+//! needed; a worktree the deck cannot prove it created is instead reported as
+//! reclaimable-pending-confirmation, naming its exact path, and removed only
+//! once the user passes `--yes` — at which point it is removed regardless of
+//! provenance, exactly like a deck-created one. `--yes` never asks the deck to
+//! trust more; it is the user vouching for what they were just shown. The
+//! branch is never deleted, only the worktree directory.
 //!
 //! Fail-closed throughout: an unresolvable PR state (missing `gh`, a spawn or
 //! parse error, or more than one PR matching the branch) means keep, never
@@ -31,8 +37,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// found via `git rev-parse --git-dir` run inside the worktree) — outside the
 /// working tree, so it never makes `git status --porcelain` report the
 /// worktree dirty, and it is removed automatically by `git worktree remove`.
-/// Writing this marker at worktree-creation time is out of scope for this
-/// task; only reading it is implemented here.
+/// Written by [`mark_worktree_owned`] at worktree-creation time
+/// (`issue_dispatch_run::create_worktree` / `create_worktree_sync`), read by
+/// [`ownership_of`].
 pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
 
 /// Resolved PR state for a worktree's branch, or why it could not be
@@ -301,34 +308,73 @@ fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
     }
 }
 
-/// Whether the deck can prove it created `worktree_path`: the marker file
-/// exists in the worktree's own git metadata dir. Any failure to resolve that
-/// dir, or a missing marker, resolves to `Foreign` — unknown must never
-/// resolve to `Ours`.
-fn ownership_of(worktree_path: &Path) -> Ownership {
+/// Resolve a worktree's own git metadata dir (`<repo>/.git/worktrees/<name>/`)
+/// via `git rev-parse --git-dir` run inside it. `None` on any failure to spawn,
+/// a non-zero exit, or empty output — callers fail closed on `None`.
+fn resolve_git_dir(worktree_path: &Path) -> Option<PathBuf> {
     let out = Command::new("git")
         .current_dir(worktree_path)
         .args(["rev-parse", "--git-dir"])
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
-        _ => return Ownership::Foreign,
+        _ => return None,
     };
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if raw.is_empty() {
-        return Ownership::Foreign;
+        return None;
     }
     let git_dir = PathBuf::from(&raw);
-    let git_dir = if git_dir.is_absolute() {
+    Some(if git_dir.is_absolute() {
         git_dir
     } else {
         worktree_path.join(git_dir)
-    };
-    if git_dir.join(OWNER_MARKER_FILENAME).is_file() {
-        Ownership::Ours
-    } else {
-        Ownership::Foreign
+    })
+}
+
+/// Whether the deck can prove it created `worktree_path`: the marker file
+/// exists in the worktree's own git metadata dir. Any failure to resolve that
+/// dir, or a missing marker, resolves to `Foreign` — unknown must never
+/// resolve to `Ours`.
+fn ownership_of(worktree_path: &Path) -> Ownership {
+    match resolve_git_dir(worktree_path) {
+        Some(git_dir) if git_dir.join(OWNER_MARKER_FILENAME).is_file() => Ownership::Ours,
+        _ => Ownership::Foreign,
     }
+}
+
+/// Write the `dot-agent-deck-owner` marker for a worktree this process just
+/// created via `git worktree add` — the counterpart to [`ownership_of`], and
+/// the only writer of this marker anywhere in the tree. Callers: only
+/// `issue_dispatch_run::create_worktree` / `create_worktree_sync`, only
+/// immediately after a successful add, never for a pre-existing or foreign
+/// worktree.
+///
+/// Best-effort by design, not fail-hard: the marker is metadata for a LATER
+/// `reclaim` decision, not a precondition for the worktree being usable now.
+/// Callers log-and-continue on `Err` (mirroring `ensure_worktrees_excluded`'s
+/// established pattern in this crate) rather than failing the whole worktree
+/// creation over it — a worktree that fails to record its own ownership is
+/// still a perfectly good worktree; it only means a future `reclaim` will
+/// land it on `Ask` instead of `Remove` (annoying, never unsafe, since `Ask`
+/// is the fail-closed default `ownership_of` already returns for anything it
+/// can't prove).
+///
+/// No atomic write-then-rename: [`ownership_of`] only checks the marker's
+/// PRESENCE (`Path::is_file`), never its content, so there is no
+/// partially-written state a concurrent reader could observe as wrong — a
+/// short write from e.g. a disk-full mid-write still resolves to `Ours`
+/// exactly as a complete write would, and no other writer of this file
+/// exists to race against.
+pub(crate) fn mark_worktree_owned(worktree_path: &Path) -> Result<(), String> {
+    let git_dir = resolve_git_dir(worktree_path).ok_or_else(|| {
+        format!(
+            "could not resolve git-dir for {} via `git rev-parse --git-dir`",
+            worktree_path.display()
+        )
+    })?;
+    std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), "deck\n")
+        .map_err(|e| format!("failed to write ownership marker: {e}"))
 }
 
 /// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
@@ -374,14 +420,23 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 }
 
 /// `gh pr list --head <branch> --state all --repo <owner/name> --json
-/// state,headRefName` — `--state all` because `gh pr list` defaults to
-/// `--state open`, which makes every merged PR invisible; `--repo`, derived
-/// from `origin` via [`derive_repo_slug`], because letting `gh` infer it
-/// queries the upstream repo from a fork checkout with no default set.
+/// state,headRefName,headRepositoryOwner` — `--state all` because `gh pr
+/// list` defaults to `--state open`, which makes every merged PR invisible;
+/// `--repo`, derived from `origin` via [`derive_repo_slug`], because letting
+/// `gh` infer it queries the upstream repo from a fork checkout with no
+/// default set.
 ///
-/// Matches results on `headRefName` exactly (mitigates "a PR is matched to
-/// the wrong branch" from the PRD's risk list) and treats zero matches as
-/// `NoPr`, more than one as `Unresolvable` (ambiguous), never guessing.
+/// Matches results on `headRefName` AND `headRepositoryOwner.login` matching
+/// the `origin` slug's own owner (issue #144 finding 2): `headRefName` alone
+/// is not namespaced by head repository owner, so a merged PR opened from a
+/// DIFFERENT fork with the same head branch name would otherwise be
+/// attributed to an unrelated local branch of that name. A reply missing the
+/// `headRepositoryOwner` field entirely (the shape `gh` can return once the
+/// head repo is no longer resolvable, e.g. a fork deleted after merge) is
+/// treated as a non-match, not a wildcard — an unverifiable owner must never
+/// be treated as a match, the same fail-closed stance every other branch of
+/// this gate takes. Zero matches resolve to `NoPr`, more than one to
+/// `Unresolvable` (ambiguous), never guessing.
 fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     let repo_slug = match derive_repo_slug(repo_dir) {
         Some(slug) => slug,
@@ -393,6 +448,12 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             );
         }
     };
+    // `derive_repo_slug` returns "owner/name"; the owner half is what
+    // `headRepositoryOwner.login` must match.
+    let expected_owner = repo_slug
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .unwrap_or(repo_slug.as_str());
     let out = Command::new("gh")
         .current_dir(repo_dir)
         .args([
@@ -405,7 +466,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "--repo",
             &repo_slug,
             "--json",
-            "state,headRefName",
+            "state,headRefName,headRepositoryOwner",
         ])
         .output();
     let out = match out {
@@ -426,6 +487,12 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     let matching: Vec<&serde_json::Value> = entries
         .iter()
         .filter(|v| v.get("headRefName").and_then(|h| h.as_str()) == Some(branch))
+        .filter(|v| {
+            v.get("headRepositoryOwner")
+                .and_then(|o| o.get("login"))
+                .and_then(|l| l.as_str())
+                == Some(expected_owner)
+        })
         .collect();
     match matching.as_slice() {
         [] => PrState::NoPr,
@@ -522,14 +589,17 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
 }
 
 /// Physically remove a worktree directory, preserving its branch:
-/// `git -C <repo_dir> worktree remove <path>` — deliberately WITHOUT
+/// `git -C <repo_dir> worktree remove -- <path>` — deliberately WITHOUT
 /// `--force`, since [`examine_worktrees`] already gated on cleanliness; git's
 /// own refusal on an unexpectedly dirty tree is a second line of defense
-/// rather than something to override.
+/// rather than something to override. The `--` separator (issue #144 finding
+/// 4) is not reachable today — every path here came from `git worktree list`,
+/// which always emits absolute paths, so none can start with `-` — but it
+/// costs nothing and removes the assumption.
 fn remove_worktree_dir(repo_dir: &Path, worktree_path: &str) -> Result<(), String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
-        .args(["worktree", "remove", worktree_path])
+        .args(["worktree", "remove", "--", worktree_path])
         .output()
         .map_err(|e| format!("failed to spawn `git worktree remove`: {e}"))?;
     if out.status.success() {
@@ -593,7 +663,11 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String>
 /// discoverable only by reading past a report), names the exact worktree
 /// paths (not a count or category), defaults to keep, and ends with the
 /// exact `--yes` command that would proceed — one prompt for the whole batch,
-/// not one per worktree.
+/// not one per worktree. That command's warning is explicit that `--yes`
+/// removes the named worktrees regardless of provenance (issue #144 finding
+/// 1's documentation half) — the whole reason they are pending confirmation
+/// rather than already gone is that the deck cannot prove it created them,
+/// and `--yes` overrides exactly that, never anything else about the gate.
 pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     let mut out = String::new();
 
@@ -605,7 +679,10 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
         for r in &outcome.pending {
             out.push_str(&format!("  - {}\n", r.path));
         }
-        out.push_str("Run `dot-agent-deck worktree reclaim --yes` to remove them.\n\n");
+        out.push_str(
+            "Run `dot-agent-deck worktree reclaim --yes` to remove them regardless of whether \
+             the deck created them.\n\n",
+        );
     }
 
     if !outcome.removed.is_empty() {
