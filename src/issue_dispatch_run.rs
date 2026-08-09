@@ -1,4 +1,5 @@
-//! Fire-time GitHub issue-dispatch flow (PRD #120, M2.1–M2.4 + M3.2 + M1.3).
+//! Fire-time GitHub issue-dispatch flow (PRD #120, M2.1–M2.4 + M3.2 + M1.3;
+//! PRD #421 M1.0–M1.3, the `in-progress` claim).
 //!
 //! This is the impure, daemon-side counterpart to the pure helpers in
 //! [`crate::issue_dispatch`]. On each fire of an `issue_dispatch` scheduled task
@@ -14,9 +15,12 @@
 //!   2. enumerate the repo's open issues (`gh issue list`), capping at
 //!      `max_per_run` **in code** on the returned order — the issue list may
 //!      ignore `--limit`.
-//!   3. **M2.2** — for each issue, decide dispatch-vs-skip from the two
-//!      idempotency signals (per-issue worktree already on disk; an open PR whose
-//!      head is `agent/issue-<n>`) via [`crate::issue_dispatch::dispatch_decision`].
+//!   3. **M2.2 + PRD #421 M1.2** — for each issue, decide dispatch-vs-skip from
+//!      the three idempotency signals (per-issue worktree already on disk; an
+//!      open PR whose head is `agent/issue-<n>`; the `in-progress` label,
+//!      honoured regardless of who applied it) via
+//!      [`crate::issue_dispatch::dispatch_decision`]. See [`read_issue_label_state`]
+//!      for the label/claimant read-back.
 //!   4. **M2.2 / M2.3** — on dispatch, create the per-issue worktree on
 //!      `agent/issue-<n>` (creating the branch with `-b`, or attaching a branch
 //!      left behind by an earlier closed-without-PR run — B1) and [`spawn`] one
@@ -27,12 +31,17 @@
 //!      [`WorktreeRegistry`] so closing the tab later removes the worktree (while
 //!      PRESERVING the clone). See [`record_worktree`] / [`take_worktree`] /
 //!      [`remove_worktree`].
-//!   6. **M3.2** — every issue runs inside its own error boundary: a failing
+//!   6. **PRD #421 M1.0/M1.1** — on a successful dispatch, claim the issue:
+//!      write the `in-progress` label and post a claim comment naming the
+//!      claiming task. See [`claim_issue`].
+//!   7. **M3.2** — every issue runs inside its own error boundary: a failing
 //!      issue (clone/worktree/`gh` error — e.g. the test stub's simulated
 //!      `pr list` failure) is surfaced through the notifier and the run CONTINUES
 //!      with the remaining issues. One issue never aborts the rest.
-//!   7. **M1.3** — per-issue success / skip / failure events are surfaced through
-//!      #127's existing [`Notifier`] seam (no parallel notification system).
+//!   8. **M1.3 + PRD #421 M1.3** — per-issue success / skip / failure events are
+//!      surfaced through #127's existing [`Notifier`] seam (no parallel
+//!      notification system); a skip always names which of the four causes
+//!      fired.
 //!
 //! All GitHub/git access goes through the `gh` / `git` binaries resolved from
 //! `PATH`, inheriting the daemon's environment — that is exactly what lets the
@@ -51,10 +60,11 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, TabMembership};
 use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
-    DispatchDecision, derive_issue_paths, dispatch_decision, issue_list_argv,
-    pr_list_for_issue_argv, substitute_issue_number,
+    Claimant, DispatchDecision, IN_PROGRESS_LABEL, claim_comment_body, derive_issue_paths,
+    dispatch_decision, issue_comment_argv, issue_edit_add_label_argv, issue_list_argv,
+    issue_view_argv, pr_list_for_issue_argv, substitute_issue_number,
 };
-use crate::scheduler::{Notifier, NotifyEvent};
+use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnRequest, spawn};
 
 // ---------------------------------------------------------------------------
@@ -277,29 +287,30 @@ async fn dispatch_one_issue(
 ) -> Result<(), String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
-    let notify_skip = || {
+    let notify_skip = |reason: SkipReason| {
         notifier.notify(NotifyEvent::IssueDispatchSkipped {
             task: task_name.to_string(),
             repo: cfg.repo.clone(),
             issue,
             branch: paths.branch.clone(),
+            reason,
         });
     };
 
     // M2.2 — idempotency BEFORE any work, evaluated as a SHORT-CIRCUIT on the
-    // two signals so the secondary check only runs when the primary leaves the
+    // three signals so a later check only runs when an earlier one leaves the
     // verdict open.
     //
     // PRIMARY (the worktree is the ledger): if the per-issue worktree already
     // exists the issue is already claimed — emit a SKIP and return IMMEDIATELY,
-    // WITHOUT consulting the open-PR signal. Probing `issue_has_open_pr` here
-    // would be both redundant (a present worktree skips regardless of the PR
-    // check) and a correctness hazard: a transient `gh pr list` failure would,
-    // via the per-issue error boundary, turn this clean SKIP into a spurious
-    // IssueDispatchFailed notification.
+    // WITHOUT consulting the open-PR or label signals. Probing either here
+    // would be both redundant (a present worktree skips regardless) and a
+    // correctness hazard: a transient `gh` failure would, via the per-issue
+    // error boundary, turn this clean SKIP into a spurious IssueDispatchFailed
+    // notification.
     let worktree_exists = paths.worktree_dir.exists();
     if worktree_exists {
-        notify_skip();
+        notify_skip(SkipReason::WorktreeExists);
         return Ok(());
     }
 
@@ -307,8 +318,26 @@ async fn dispatch_one_issue(
     // head is `agent/issue-<n>`. A `gh` failure here is a genuine per-issue
     // error (e.g. the stub's simulated API error) and propagates via `?`.
     let open_pr = issue_has_open_pr(&cfg.repo, issue).await?;
-    if dispatch_decision(worktree_exists, open_pr) == DispatchDecision::Skip {
-        notify_skip();
+
+    // TERTIARY (PRD #421 M1.2) — the `in-progress` label, honoured regardless
+    // of who applied it (human, external tool, another deck, or this one — no
+    // "is this my own claim?" comparison exists). A `gh` failure here
+    // propagates the same way the PR check's does, for the same reason:
+    // silently reading a failed read-back as "no label → dispatch" risks a
+    // duplicate dispatch.
+    let label_state = read_issue_label_state(&cfg.repo, issue).await?;
+
+    if dispatch_decision(worktree_exists, open_pr, label_state.in_progress)
+        == DispatchDecision::Skip
+    {
+        let reason = if open_pr {
+            SkipReason::OpenPr
+        } else {
+            SkipReason::Labelled {
+                claimant: label_state.claimant,
+            }
+        };
+        notify_skip(reason);
         return Ok(());
     }
 
@@ -323,12 +352,7 @@ async fn dispatch_one_issue(
         // identically to `AlreadyClaimed` (skip, not fail) only so the match
         // stays exhaustive and safe if that ever changes.
         WorktreeCreation::AlreadyClaimed | WorktreeCreation::TimedOut { .. } => {
-            notifier.notify(NotifyEvent::IssueDispatchSkipped {
-                task: task_name.to_string(),
-                repo: cfg.repo.clone(),
-                issue,
-                branch: paths.branch.clone(),
-            });
+            notify_skip(SkipReason::ConcurrentCreator);
             return Ok(());
         }
     }
@@ -372,7 +396,128 @@ async fn dispatch_one_issue(
         repo: cfg.repo.clone(),
         issue,
     });
+
+    // PRD #421 M1.0/M1.1 — claim the issue now that the dispatch has
+    // genuinely succeeded: write the `in-progress` label and post a claim
+    // comment naming the claiming task. Deliberately AFTER both worktree
+    // creation and spawn succeeded (`dispatch/014`): marking any earlier would
+    // make a FAILED dispatch leave a false claim, permanently un-dispatchable
+    // once M1.2 reads the label back. A `gh` failure here must not turn this
+    // already-successful dispatch into a per-issue failure — the per-issue
+    // error boundary would otherwise report an `IssueDispatchFailed` for a
+    // dispatch that genuinely worked, which is exactly the defect PRD #421's
+    // Risks section calls out — so `claim_issue` logs and moves on rather than
+    // propagating.
+    claim_issue(&cfg.repo, issue, task_name).await;
+
     Ok(())
+}
+
+/// PRD #421 M1.0/M1.1: write the `in-progress` label and post a claim comment
+/// naming `task_name` — the scheduler-side claimant (`ScheduledTask.name`),
+/// the only claimant this fire-time flow ever has. Best-effort: a `gh`
+/// failure here is logged, never propagated (see the call site's doc comment
+/// for why).
+async fn claim_issue(repo: &str, issue: u64, task_name: &str) {
+    let label_argv = issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL);
+    if let Err(e) = run_status_args("gh", &label_argv).await {
+        tracing::warn!(
+            repo,
+            issue,
+            error = %e,
+            "issue-dispatch: failed to write the in-progress label"
+        );
+    }
+
+    let host = local_hostname().await;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let claimant = Claimant::Task {
+        name: task_name.to_string(),
+    };
+    let body = claim_comment_body(&claimant, &host, &timestamp);
+    let comment_argv = issue_comment_argv(repo, issue, &body);
+    if let Err(e) = run_status_args("gh", &comment_argv).await {
+        tracing::warn!(
+            repo,
+            issue,
+            error = %e,
+            "issue-dispatch: failed to post the claim comment"
+        );
+    }
+}
+
+/// PRD #421 M1.2/M1.3: parsed result of `gh issue view --json labels,comments`
+/// — the third idempotency signal (whether `in-progress` is already applied,
+/// regardless of who applied it) plus, when the label is present, whether the
+/// deck's own claim comment is discoverable among the issue's comments (used
+/// to distinguish a deck-made claim from one a human/external tool applied
+/// directly — `dispatch/016`'s "no claimant" text).
+struct IssueLabelState {
+    in_progress: bool,
+    claimant: Option<String>,
+}
+
+/// The literal prefix [`claim_comment_body`] always produces — used to
+/// recognize the deck's OWN claim comment among an issue's comments, as
+/// opposed to any other comment a human left.
+const CLAIM_COMMENT_PREFIX: &str = "Claimed by ";
+
+/// Read `issue`'s labels/comments via `gh issue view` and parse the M1.2/M1.3
+/// signal out of them.
+async fn read_issue_label_state(repo: &str, issue: u64) -> Result<IssueLabelState, String> {
+    let argv = issue_view_argv(repo, issue);
+    let stdout = run_capture("gh", &argv).await?;
+    parse_issue_label_state(&stdout)
+}
+
+/// Pure parse of `gh issue view --json labels,comments` output. Split out from
+/// [`read_issue_label_state`] so the JSON-shape logic is unit-testable without
+/// a subprocess.
+fn parse_issue_label_state(json: &str) -> Result<IssueLabelState, String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
+    let in_progress = value
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|labels| {
+            labels.iter().any(|l| {
+                l.get("name").and_then(serde_json::Value::as_str) == Some(IN_PROGRESS_LABEL)
+            })
+        });
+    let claimant = value
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|comments| {
+            comments
+                .iter()
+                .filter_map(|c| c.get("body").and_then(serde_json::Value::as_str))
+                .find(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
+                .map(str::to_string)
+        });
+    Ok(IssueLabelState {
+        in_progress,
+        claimant,
+    })
+}
+
+/// Best-effort local hostname for the claim-comment body (PRD #421 M1.1) —
+/// untested by any e2e assertion (the catalog leaves host/timestamp formatting
+/// to the coder), so falling back on failure is fine. Goes through
+/// [`run_capture_args`] (already `tokio::process`-based) rather than a
+/// blocking `std::process::Command`, staying consistent with every other
+/// subprocess call on this async path.
+async fn local_hostname() -> String {
+    match run_capture_args("hostname", &[]).await {
+        Ok(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                "unknown-host".to_string()
+            } else {
+                s.to_string()
+            }
+        }
+        Err(_) => "unknown-host".to_string(),
+    }
 }
 
 /// S5: resolve the task's `working_dir` to an ABSOLUTE workspace root. The
@@ -1101,6 +1246,48 @@ mod tests {
     fn parse_issue_numbers_rejects_non_array() {
         assert!(parse_issue_numbers("{}").is_err());
         assert!(parse_issue_numbers("not json").is_err());
+    }
+
+    // --- PRD #421 M1.2/M1.3: `gh issue view` label/comment parsing ---
+
+    #[test]
+    fn parse_issue_label_state_no_label_no_comments() {
+        let state = parse_issue_label_state(r#"{"labels":[],"comments":[]}"#).unwrap();
+        assert!(!state.in_progress);
+        assert_eq!(state.claimant, None);
+    }
+
+    #[test]
+    fn parse_issue_label_state_labelled_no_claim_comment() {
+        // A human/external tool applied the label directly — the label is
+        // present but no comment matches the deck's own claim-comment prefix.
+        let json = r#"{"labels":[{"name":"in-progress"}],"comments":[{"body":"unrelated"}]}"#;
+        let state = parse_issue_label_state(json).unwrap();
+        assert!(state.in_progress);
+        assert_eq!(state.claimant, None);
+    }
+
+    #[test]
+    fn parse_issue_label_state_labelled_with_claim_comment() {
+        let json = r#"{"labels":[{"name":"in-progress"}],"comments":[{"body":"Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z."}]}"#;
+        let state = parse_issue_label_state(json).unwrap();
+        assert!(state.in_progress);
+        assert_eq!(
+            state.claimant.as_deref(),
+            Some("Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z.")
+        );
+    }
+
+    #[test]
+    fn parse_issue_label_state_other_labels_present_but_not_in_progress() {
+        let json = r#"{"labels":[{"name":"bug"},{"name":"priority:high"}],"comments":[]}"#;
+        let state = parse_issue_label_state(json).unwrap();
+        assert!(!state.in_progress);
+    }
+
+    #[test]
+    fn parse_issue_label_state_rejects_non_object() {
+        assert!(parse_issue_label_state("not json").is_err());
     }
 
     #[test]

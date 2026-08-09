@@ -1264,8 +1264,12 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     // The present worktree must short-circuit to an IssueDispatchSkipped notice.
     // (With the OLD code the PR-check error fires first and no skip is surfaced,
     // so this wait would time out — making the test RED against the regression.)
+    // PRD #421 M1.3: the skip line now names its cause ("the worktree already
+    // exists" for this cause), replacing the old reason-free "already-claimed"
+    // wording.
     let skipped = common::wait_until(Duration::from_secs(10), || {
-        daemon.stderr_contains("already-claimed issue #7")
+        daemon.stderr_contains("skipping issue #7 of acme/widgets")
+            && daemon.stderr_contains("the worktree already exists")
     });
     assert!(
         skipped,

@@ -70,14 +70,16 @@ pub enum NotifyEvent {
         repo: String,
         issue: u64,
     },
-    /// PRD #120 M1.3/M2.2: an issue was skipped because it is already claimed —
-    /// its per-issue worktree exists, or an open PR already targets `branch`
-    /// (`agent/issue-<n>`).
+    /// PRD #120 M1.3/M2.2 + PRD #421 M1.2/M1.3: an issue was skipped because it
+    /// is already claimed — `reason` names which of the four causes fired, so
+    /// no two skips ever render identically (a stray claim that can't be seen
+    /// silently starves the backlog).
     IssueDispatchSkipped {
         task: String,
         repo: String,
         issue: u64,
         branch: String,
+        reason: SkipReason,
     },
     /// PRD #120 M3.2: dispatching ONE issue failed (clone/worktree/`gh` error).
     /// The failing issue is abandoned; the rest of the run continues.
@@ -95,6 +97,53 @@ pub enum NotifyEvent {
         repo: String,
         message: String,
     },
+}
+
+/// PRD #421 M1.3: why an issue was skipped — the four causes `dispatch_decision`
+/// (worktree/PR/label) and the worktree-creation TOCTOU race recognize.
+/// `IssueDispatchSkipped` carries one so a skip can always say WHY it excluded
+/// an issue, not just THAT it did — an exclusion nobody can see is the actual
+/// hazard (a stray label, applied by anyone, silently starves the backlog).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The per-issue worktree already exists on disk — the primary
+    /// idempotency signal.
+    WorktreeExists,
+    /// An open PR's head branch is `agent/issue-<n>` — the secondary signal.
+    OpenPr,
+    /// The `in-progress` label is present (PRD #421 M1.2, the third signal),
+    /// honoured regardless of who applied it — there is no "is this my own
+    /// claim?" comparison. `claimant` carries the deck's own claim-comment text
+    /// when one is discoverable among the issue's comments; `None` when the
+    /// label was applied by a human or an external tool, or no claim comment
+    /// can be found (`dispatch/016`'s "no claimant" case).
+    Labelled { claimant: Option<String> },
+    /// A concurrent creator won the `git worktree add` TOCTOU race
+    /// (`WorktreeCreation::AlreadyClaimed`/`TimedOut`) — a benign race, not a
+    /// failure. Has no deterministic black-box trigger, so it is covered only
+    /// by the pure-data render test, not an e2e one (`dispatch/017`).
+    ConcurrentCreator,
+}
+
+/// Render `reason` as the tail of an `IssueDispatchSkipped` stderr line. Pure
+/// and unit-tested on its own — `dispatch/017` covers only three of the four
+/// causes end-to-end (the TOCTOU race has no deterministic black-box trigger),
+/// so this is what makes the PRD's "no two causes render identically" success
+/// criterion fully evidenced across all four.
+fn render_skip_reason(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::WorktreeExists => "the worktree already exists".to_string(),
+        SkipReason::OpenPr => "an open PR already targets this branch".to_string(),
+        SkipReason::Labelled {
+            claimant: Some(comment),
+        } => format!("labelled `in-progress` ({comment})"),
+        SkipReason::Labelled { claimant: None } => {
+            "labelled `in-progress`, no claimant recorded".to_string()
+        }
+        SkipReason::ConcurrentCreator => {
+            "a concurrent dispatch claimed the worktree first".to_string()
+        }
+    }
 }
 
 /// Default [`Notifier`] that logs to stderr. Stand-in until the PRD #126
@@ -137,9 +186,11 @@ impl Notifier for StderrNotifier {
                 repo,
                 issue,
                 branch,
+                reason,
             } => {
                 eprintln!(
-                    "[scheduler] task {task:?}: skipping already-claimed issue #{issue} of {repo} ({branch})"
+                    "[scheduler] task {task:?}: skipping issue #{issue} of {repo} ({branch}) — {}",
+                    render_skip_reason(&reason)
                 );
             }
             NotifyEvent::IssueDispatchFailed {
@@ -649,6 +700,36 @@ mod tests {
 
     fn local_at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    // PRD #421 M1.4: all four skip reasons render distinguishably. This is
+    // what makes the PRD's "no two causes render identically" success
+    // criterion fully evidenced for the fourth cause (`ConcurrentCreator`,
+    // the `git worktree add` TOCTOU race), which `dispatch/017` cannot cover
+    // end-to-end — it has no deterministic black-box trigger.
+    #[test]
+    fn skip_reasons_render_distinguishably() {
+        let reasons = [
+            SkipReason::WorktreeExists,
+            SkipReason::OpenPr,
+            SkipReason::Labelled { claimant: None },
+            SkipReason::Labelled {
+                claimant: Some("Claimed by scheduled task `dispatch-task`.".to_string()),
+            },
+            SkipReason::ConcurrentCreator,
+        ];
+        let rendered: Vec<String> = reasons.iter().map(render_skip_reason).collect();
+        for (i, a) in rendered.iter().enumerate() {
+            for (j, b) in rendered.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "skip reasons {:?} and {:?} must render distinguishably, both: {a:?}",
+                        reasons[i], reasons[j]
+                    );
+                }
+            }
+        }
     }
 
     /// A callback that bumps a counter each time it fires.

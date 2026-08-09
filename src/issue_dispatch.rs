@@ -336,20 +336,120 @@ pub enum DispatchDecision {
     Skip,
 }
 
-/// Decide dispatch-vs-skip from the two idempotency signals: the per-issue
-/// worktree already exists (primary), or an open PR's HEAD branch is
-/// `agent/issue-<n>` (secondary). Either being true means the issue is already
-/// claimed → [`DispatchDecision::Skip`]; only when both are false do we
-/// dispatch.
+/// Decide dispatch-vs-skip from the three idempotency signals: the per-issue
+/// worktree already exists (primary), an open PR's HEAD branch is
+/// `agent/issue-<n>` (secondary), or the `in-progress` label is present
+/// (tertiary, PRD #421 M1.2) — honoured regardless of who applied it. Any one
+/// being true means the issue is already claimed → [`DispatchDecision::Skip`];
+/// only when all three are false do we dispatch.
 pub fn dispatch_decision(
     worktree_exists: bool,
     open_pr_with_matching_head: bool,
+    label_in_progress: bool,
 ) -> DispatchDecision {
-    if worktree_exists || open_pr_with_matching_head {
+    if worktree_exists || open_pr_with_matching_head || label_in_progress {
         DispatchDecision::Skip
     } else {
         DispatchDecision::Dispatch
     }
+}
+
+// ---------------------------------------------------------------------------
+// PRD #421 M1.0/M1.1/M1.2 — claim label/comment argv + comment body
+// ---------------------------------------------------------------------------
+
+/// The label vocabulary's claim label, written on a successful dispatch (M1.0)
+/// and read back as the third idempotency signal (M1.2).
+pub const IN_PROGRESS_LABEL: &str = "in-progress";
+
+/// Build the `gh issue edit --add-label` argv (arguments after `gh`) that
+/// writes `label` onto `issue`.
+pub fn issue_edit_add_label_argv(repo: &str, issue: u64, label: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        issue.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--add-label".to_string(),
+        label.to_string(),
+        // M1: end-of-options marker (see `issue_list_argv`).
+        "--".to_string(),
+    ]
+}
+
+/// Build the `gh issue comment` argv (arguments after `gh`) that posts `body`
+/// as a new comment on `issue` — always APPENDED, never edited in place (PRD
+/// #421 M1.1: the only path that re-runs the dispatch-success flow for the
+/// same issue is a deliberate un-claim, usually a different claimant taking
+/// over, so editing in place would overwrite the previous claimant's record).
+pub fn issue_comment_argv(repo: &str, issue: u64, body: &str) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "comment".to_string(),
+        issue.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--body".to_string(),
+        body.to_string(),
+        // M1: end-of-options marker (see `issue_list_argv`).
+        "--".to_string(),
+    ]
+}
+
+/// Build the `gh issue view` argv (arguments after `gh`) that reads back an
+/// issue's labels and comments — the M1.2 third idempotency signal and, when
+/// the `in-progress` label is present, the M1.3 claimant lookup.
+pub fn issue_view_argv(repo: &str, issue: u64) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "view".to_string(),
+        issue.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--json".to_string(),
+        "labels,comments".to_string(),
+        // M1: end-of-options marker (see `issue_list_argv`).
+        "--".to_string(),
+    ]
+}
+
+/// The identity that claims an issue by posting a claim comment (PRD #421
+/// M1.1). Two write points exist with different claimants: scheduler-side
+/// dispatch (`issue_dispatch_run::dispatch_one_issue`, the only wired call
+/// site today) claims under [`Claimant::Task`] — `ScheduledTask.name`. A human
+/// orchestration would claim as [`Claimant::Instance`] —
+/// `OrchestrationIdentity::Instance { id, name }` — carrying both the name AND
+/// the id because the name alone is ambiguous (two tabs of the same
+/// orchestration in the same directory are two distinct routing groups); no
+/// current call site constructs this variant, so it is represented for
+/// completeness per the PRD but untested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claimant {
+    /// The scheduler-side dispatch: `ScheduledTask.name`.
+    Task { name: String },
+    /// A human orchestration: `OrchestrationIdentity::Instance { id, name }`.
+    Instance { id: String, name: String },
+}
+
+impl Claimant {
+    fn describe(&self) -> String {
+        match self {
+            Claimant::Task { name } => format!("scheduled task `{name}`"),
+            Claimant::Instance { id, name } => format!("orchestration `{name}` (`{id}`)"),
+        }
+    }
+}
+
+/// Render the claim-comment body posted on a successful dispatch (PRD #421
+/// M1.1): who claimed it, on which host, and when. `dispatch/010` asserts only
+/// that the body names the claiming task; the exact wording around
+/// host/timestamp beyond that is this function's choice.
+pub fn claim_comment_body(claimant: &Claimant, host: &str, timestamp: &str) -> String {
+    format!(
+        "Claimed by {} on `{host}` at {timestamp}.",
+        claimant.describe()
+    )
 }
 
 #[cfg(test)]
@@ -660,13 +760,106 @@ mod tests {
 
     #[test]
     fn dispatch_decision_truth_table() {
-        // Neither signal → dispatch.
-        assert_eq!(dispatch_decision(false, false), DispatchDecision::Dispatch);
-        // Worktree present (primary) → skip.
-        assert_eq!(dispatch_decision(true, false), DispatchDecision::Skip);
-        // Open PR on the head branch (secondary) → skip.
-        assert_eq!(dispatch_decision(false, true), DispatchDecision::Skip);
-        // Both → skip.
-        assert_eq!(dispatch_decision(true, true), DispatchDecision::Skip);
+        // PRD #421 M1.4: exhaustive over all 8 combinations of the 3 signals
+        // (worktree exists, open PR, `in-progress` label) — any one true means
+        // skip; only all-false dispatches.
+        for worktree_exists in [false, true] {
+            for open_pr in [false, true] {
+                for label in [false, true] {
+                    let expected = if worktree_exists || open_pr || label {
+                        DispatchDecision::Skip
+                    } else {
+                        DispatchDecision::Dispatch
+                    };
+                    assert_eq!(
+                        dispatch_decision(worktree_exists, open_pr, label),
+                        expected,
+                        "dispatch_decision({worktree_exists}, {open_pr}, {label})"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- PRD #421 M1.0/M1.1/M1.2: claim label/comment argv + comment body ---
+
+    #[test]
+    fn issue_edit_add_label_argv_shape() {
+        assert_eq!(
+            issue_edit_add_label_argv("acme/widgets", 7, IN_PROGRESS_LABEL),
+            vec![
+                "issue",
+                "edit",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--add-label",
+                "in-progress",
+                "--",
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_comment_argv_shape() {
+        assert_eq!(
+            issue_comment_argv(
+                "acme/widgets",
+                7,
+                "Claimed by scheduled task `dispatch-task`."
+            ),
+            vec![
+                "issue",
+                "comment",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--body",
+                "Claimed by scheduled task `dispatch-task`.",
+                "--",
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_view_argv_shape() {
+        assert_eq!(
+            issue_view_argv("acme/widgets", 7),
+            vec![
+                "issue",
+                "view",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--json",
+                "labels,comments",
+                "--",
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_comment_body_names_task_claimant() {
+        let claimant = Claimant::Task {
+            name: "dispatch-task".to_string(),
+        };
+        let body = claim_comment_body(&claimant, "host-1", "2026-08-09T00:00:00Z");
+        assert!(
+            body.contains("dispatch-task"),
+            "body must name the claiming task, got {body:?}"
+        );
+        assert!(body.contains("host-1"));
+        assert!(body.contains("2026-08-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn claim_comment_body_names_instance_claimant() {
+        let claimant = Claimant::Instance {
+            id: "abc123".to_string(),
+            name: "issue-work".to_string(),
+        };
+        let body = claim_comment_body(&claimant, "host-1", "2026-08-09T00:00:00Z");
+        assert!(body.contains("issue-work"));
+        assert!(body.contains("abc123"));
     }
 }
