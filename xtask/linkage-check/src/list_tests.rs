@@ -286,10 +286,22 @@ impl Ord for AllowlistChange {
 /// Parse a set of `(file_path, source_text)` pairs into the per-id
 /// inventory. The path is preserved verbatim so it can be displayed
 /// in the rendered report.
+///
+/// Fork #156: a catalog id can legitimately be backed by more than one
+/// `#[spec]` test across more than one file (e.g. `mouse/form/001`, real
+/// five times over across two files) — a supported pattern, not a defect.
+/// Collecting every backer per id (instead of overwriting on insert) and
+/// then merging them in a traversal-order-independent way is what makes a
+/// shared id's Modified/unmodified status depend only on the SET of
+/// backing tests, never on the order `sources` happened to be supplied
+/// in — which otherwise differs between the git-ref collector
+/// (`collect_tests_at_ref`, alphabetical via `git ls-tree`) and the
+/// on-disk collector (`collect_tests_on_disk`, unsorted via
+/// `std::fs::read_dir`).
 pub fn collect_tests_from_sources(
     sources: &[(String, String)],
 ) -> Result<BTreeMap<String, TestEntry>, String> {
-    let mut out: BTreeMap<String, TestEntry> = BTreeMap::new();
+    let mut raw: BTreeMap<String, Vec<TestEntry>> = BTreeMap::new();
     for (path, source) in sources {
         let parsed = match syn::parse_file(source) {
             Ok(p) => p,
@@ -300,19 +312,25 @@ pub fn collect_tests_from_sources(
         // `tabs/selection/*` unit tests in `src/tab.rs`) are found, not
         // just top-level test fns in `tests/`. Mirrors the docs
         // generator's `collect_spec_tests_from_items` walk.
-        collect_entries_from_items(&parsed.items, path, &mut out);
+        collect_entries_from_items(&parsed.items, path, &mut raw);
     }
-    Ok(out)
+    Ok(raw
+        .into_iter()
+        .map(|(id, entries)| (id, merge_entries(entries)))
+        .collect())
 }
 
 /// Recurse through `items`, recording every `#[spec]`-annotated fn into
 /// `out`. Items inside inline `Item::Mod { content: Some(_) }` are
 /// walked the same way; external `mod foo;` declarations (no inline
 /// body) are skipped — resolving them would need a separate file read.
+///
+/// Every backer for a given id is pushed, not just the last one seen —
+/// see `collect_tests_from_sources` for why.
 fn collect_entries_from_items(
     items: &[syn::Item],
     path: &str,
-    out: &mut BTreeMap<String, TestEntry>,
+    out: &mut BTreeMap<String, Vec<TestEntry>>,
 ) {
     for item in items {
         match item {
@@ -321,16 +339,13 @@ fn collect_entries_from_items(
                     let fn_name = item_fn.sig.ident.to_string();
                     let scenario = read_scenario_doc(&item_fn.attrs).unwrap_or_default();
                     let body_fingerprint = fingerprint_block(&item_fn.block);
-                    out.insert(
-                        spec_id.clone(),
-                        TestEntry {
-                            spec_id,
-                            fn_name,
-                            file: path.to_string(),
-                            scenario,
-                            body_fingerprint,
-                        },
-                    );
+                    out.entry(spec_id.clone()).or_default().push(TestEntry {
+                        spec_id,
+                        fn_name,
+                        file: path.to_string(),
+                        scenario,
+                        body_fingerprint,
+                    });
                 }
             }
             syn::Item::Mod(item_mod) => {
@@ -340,6 +355,51 @@ fn collect_entries_from_items(
             }
             _ => {}
         }
+    }
+}
+
+/// Combine every `#[spec]` test backing one catalog id into a single
+/// canonical `TestEntry` (fork #156). The single-backer case (the
+/// overwhelming majority of ids) returns that one entry untouched, so
+/// existing single-id inventory rows and their Scenario/body-fingerprint
+/// values are unaffected.
+///
+/// For a shared id, backers are sorted by `(file, fn_name)` BEFORE
+/// combining — a fixed, content-derived order, not the order `sources`
+/// happened to list them in — so two collectors that visit the same
+/// unchanged files in different orders (`git ls-tree` vs
+/// `std::fs::read_dir`) produce byte-identical merged entries and no
+/// phantom "Modified" row (the false-positive direction). The merged
+/// `scenario` and `body_fingerprint` fold in EVERY backer, not just one
+/// winner, so a real edit to any backer — even one that would have lost
+/// a last-insert-wins race — still changes the merged fingerprint (the
+/// false-negative direction: a tool that reports `_(none)_` while a real
+/// change hides behind a shared id is exactly as untrustworthy as one
+/// that invents rows).
+fn merge_entries(mut entries: Vec<TestEntry>) -> TestEntry {
+    if entries.len() == 1 {
+        return entries.remove(0);
+    }
+    entries.sort_by(|a, b| (&a.file, &a.fn_name).cmp(&(&b.file, &b.fn_name)));
+    let spec_id = entries[0].spec_id.clone();
+    let fn_name = entries[0].fn_name.clone();
+    let file = entries[0].file.clone();
+    let scenario = entries
+        .iter()
+        .map(|e| format!("{}: {}", e.file, e.scenario))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let body_fingerprint = entries
+        .iter()
+        .map(|e| format!("{}\u{0}{}", e.file, e.body_fingerprint))
+        .collect::<Vec<_>>()
+        .join("\u{1}");
+    TestEntry {
+        spec_id,
+        fn_name,
+        file,
+        scenario,
+        body_fingerprint,
     }
 }
 

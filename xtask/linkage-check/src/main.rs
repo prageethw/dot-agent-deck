@@ -4,8 +4,8 @@
 //! Invoked as `cargo xtask <subcommand>` (alias in `.cargo/config.toml`).
 //! Subcommands:
 //!
-//! - `linkage-check` (default) — performs the seven checks listed
-//!   in Decision 7 + Decision 30:
+//! - `linkage-check` (default) — performs the eight checks listed
+//!   in Decision 7 + Decision 30 (+ fork #148):
 //!
 //!   1. Every catalog ID has at least one `#[spec("...")]` referencing
 //!      it OR is on the allowlist (`m2.allowlist`).
@@ -21,6 +21,11 @@
 //!      The byte-identity diff against the on-disk `.md` is gone:
 //!      `.dot-agent-deck/` is gitignored dev-time state and would
 //!      not exist on a fresh clone.
+//!   8. No `##### <id>` catalog heading appears more than once
+//!      (fork #148). `parse_catalog_ids` counts headings per ID
+//!      rather than deduplicating into a set, so a repeat is
+//!      representable instead of silently collapsing to whichever
+//!      heading was parsed last.
 //!
 //! - `docs` — invokes the `xtask-docs` binary's logic (paired-`.md`
 //!   generator). Forwards remaining args.
@@ -55,7 +60,7 @@ fn main() -> ExitCode {
     // single `cargo xtask` alias can drive both linkage-check and
     // docs. `cargo xtask docs --tests` → docs generator;
     // anything else (including no first arg or `linkage-check`) →
-    // the seven Decision-7 / Decision-30 checks below.
+    // the eight Decision-7 / Decision-30 / fork #148 checks below.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("docs")) {
         return run_docs(&args[1..]);
@@ -92,10 +97,26 @@ fn main() -> ExitCode {
         }
     };
 
+    // Check 8 (fork #148): a catalog heading ID must not repeat. Two
+    // `##### <id>` headings sharing one ID used to be silently collapsed by
+    // `parse_catalog_ids`'s old `BTreeSet<String>` return type into a
+    // single entry indistinguishable from a non-duplicate — reproduced for
+    // real during the 2026-08-08/09 upstream sync, when `cargo xtask
+    // linkage-check` printed `ok` on a tree with two colliding
+    // `##### tabs/orchestration/011` headings.
+    for (id, count) in &catalog_ids {
+        if *count > 1 {
+            failures.push(format!(
+                "[8] catalog id `{id}` has {count} `##### {id}` headings in {} (duplicate heading, fork #148)",
+                catalog_path.display()
+            ));
+        }
+    }
+
     // Check 3: format regex on catalog IDs.
     let id_re = Regex::new(r"^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3}$")
         .expect("catalog ID format regex compiles");
-    for id in &catalog_ids {
+    for id in catalog_ids.keys() {
         if !id_re.is_match(id) {
             failures.push(format!(
                 "[3] catalog ID {id:?} does not match `<area>/<sub>/<NNN>`"
@@ -213,7 +234,7 @@ fn main() -> ExitCode {
         annotated_ids.insert(&ann.id);
 
         // Check 2: annotation references a real catalog ID.
-        if !catalog_ids.contains(&ann.id) {
+        if !catalog_ids.contains_key(&ann.id) {
             failures.push(format!(
                 "[2] {} carries #[spec({:?})] which is not in the catalog",
                 ann.file.display(),
@@ -259,7 +280,7 @@ fn main() -> ExitCode {
     // the allowlist (M2 ships only `dashboard/pane/004` and
     // `hooks/delivery/001`; M4+ ticks IDs off the allowlist as it
     // lands tests).
-    for id in &catalog_ids {
+    for id in catalog_ids.keys() {
         if annotated_ids.contains(id.as_str()) {
             continue;
         }
@@ -289,7 +310,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 7 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 8 rules)",
             catalog_ids.len(),
             annotations.len(),
             allowlist.len()
@@ -408,12 +429,19 @@ fn repo_root() -> PathBuf {
 /// occurrence of `##### <area>/<sub>/<NNN>` (the catalog entry header
 /// form). The deliberate-skips table at the bottom uses table rows,
 /// not headers, so it is excluded by construction.
-fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeSet<String>> {
+///
+/// Returns a count of headings per ID rather than a `BTreeSet<String>`
+/// (fork #148): a set collapses two headings sharing one ID into a
+/// single entry with no way to tell that happened, which is exactly
+/// the shape that let a real duplicate slip through as `ok` during the
+/// 2026-08-08/09 upstream sync. A count makes "this ID appeared twice"
+/// representable, so check 8 below can catch it.
+fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeMap<String, u32>> {
     let text = std::fs::read_to_string(catalog_path)?;
     let mut in_catalog = false;
     let header_re = Regex::new(r"^#####\s+([a-z][a-z0-9-]*/[a-z][a-z0-9-]*/\d{3})\b")
         .expect("catalog header regex compiles");
-    let mut ids: BTreeSet<String> = BTreeSet::new();
+    let mut ids: BTreeMap<String, u32> = BTreeMap::new();
     for line in text.lines() {
         if line.starts_with("## ") {
             in_catalog = line.starts_with("## Test Case Catalog");
@@ -423,7 +451,8 @@ fn parse_catalog_ids(catalog_path: &Path) -> std::io::Result<BTreeSet<String>> {
             continue;
         }
         if let Some(caps) = header_re.captures(line) {
-            ids.insert(caps.get(1).unwrap().as_str().to_string());
+            *ids.entry(caps.get(1).unwrap().as_str().to_string())
+                .or_insert(0) += 1;
         }
     }
     Ok(ids)
