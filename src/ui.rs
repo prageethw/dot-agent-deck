@@ -6470,6 +6470,13 @@ fn record_candidate(command: &str) -> Option<String> {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
+    // fork #166 reviewer F1: trimmed once here, at the single place every
+    // `NewPaneRequest.name` value is built, so every consumer of `req.name`
+    // downstream (the ownership marker's `creator`, and `display_title`, in
+    // `dispatch_action`) tests blankness and reads content from the same
+    // trimmed value — instead of two consumers independently deciding
+    // whether to trim and silently disagreeing on a whitespace-only Name.
+    let name = form.name.trim().to_string();
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
     // plain "schedule" option it is a throwaway single-agent authoring CARD, but
     // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead
@@ -6484,7 +6491,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         };
         return NewPaneRequest {
             dir: form.dir.clone(),
-            name: form.name.clone(),
+            name: name.clone(),
             command,
             mode_config: None,
             orchestration_config: None,
@@ -6528,7 +6535,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         // the working_dir line.
         return NewPaneRequest {
             dir: form.dir.clone(),
-            name: form.name.clone(),
+            name: name.clone(),
             command,
             mode_config: None,
             orchestration_config: None,
@@ -6543,7 +6550,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         resolve_orchestration_worktree_request(&form.dir, &form.worktree_slug);
     NewPaneRequest {
         dir: form.dir.clone(),
-        name: form.name.clone(),
+        name: name.clone(),
         command: form.command.clone(),
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
@@ -8194,14 +8201,17 @@ fn dispatch_action(
                                         .unwrap_or_default()
                                 });
                             // fork #166: name the ownership marker's creator
-                            // with the typed instance Name (`req.name`, the
-                            // same value that becomes `display_title` below)
-                            // when one was typed, since that is what
-                            // distinguishes two live orchestrations of the
-                            // same config type. Fall back to the canonical
-                            // config name — as issue #425 originally did —
-                            // when no typed Name was given. Trimmed before
-                            // the blankness test (fork issue #174: a
+                            // with the typed instance Name (`req.name` — the
+                            // same value that becomes `display_title` below,
+                            // trimmed once in `build_new_pane_request` so
+                            // both consumers test blankness and read content
+                            // from the identical value; reviewer F1) when
+                            // one was typed, since that is what distinguishes
+                            // two live orchestrations of the same config
+                            // type. Fall back to the canonical config name —
+                            // as issue #425 originally did — when no typed
+                            // Name was given. The blankness test below is on
+                            // an already-trimmed value (fork issue #174: a
                             // whitespace-only name must fall back too, not
                             // become the identity) rather than the bare
                             // `is_empty()` #174 flags elsewhere. This
@@ -8221,7 +8231,7 @@ fn dispatch_action(
                             // It stays as defence-in-depth, purely so a
                             // future constructor that bypasses the loader
                             // can't write a bare `orchestration:`.
-                            let typed_name = req.name.trim();
+                            let typed_name = req.name.as_str();
                             let creator = if !typed_name.is_empty() {
                                 format!("orchestration:{typed_name}")
                             } else if orch_config.name.is_empty() {
