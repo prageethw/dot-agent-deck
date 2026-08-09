@@ -8193,10 +8193,25 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
+                            // issue #425: name the orchestration that
+                            // created this worktree, using the canonical
+                            // config name (not the form name — see the
+                            // "do NOT overwrite orch_config.name" note
+                            // below) so the marker matches the identity the
+                            // daemon itself uses. `name` carries
+                            // `#[serde(default)]` and can be blank in
+                            // hand-edited config; record that honestly
+                            // rather than inventing one.
+                            let creator = if orch_config.name.is_empty() {
+                                "orchestration:unknown".to_string()
+                            } else {
+                                format!("orchestration:{}", orch_config.name)
+                            };
                             match crate::issue_dispatch_run::create_worktree_sync(
                                 &req.dir,
                                 worktree_path,
                                 &branch,
+                                &creator,
                             ) {
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::Created) => {
                                     worktree_path.display().to_string()
