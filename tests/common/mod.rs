@@ -4605,6 +4605,79 @@ impl DaemonProc {
         self.attach_and_wait_for_output(agent_id, input, Duration::from_secs(5))
     }
 
+    /// Attach to an agent's PTY stream and capture cumulative STREAM_OUT bytes
+    /// until output goes quiet for `quiet` (no new bytes since the last read)
+    /// or `timeout` elapses, then return everything captured as a lossy UTF-8
+    /// string. Unlike [`attach_and_wait_for_output`], which pays the full
+    /// `timeout` once per needle, this captures the delivered text ONCE so a
+    /// caller can run several `.contains()` checks against one snapshot (PRD
+    /// #421 `scheduler/dispatch/018`'s multi-term triage-vocabulary check).
+    /// Quiescence is only evaluated after the first byte arrives, so an
+    /// initial multi-second gap before delivery starts (the documented
+    /// `SessionStart` fallback wait) does not cut the capture short.
+    pub fn attach_and_capture_output(
+        &self,
+        agent_id: &str,
+        quiet: Duration,
+        timeout: Duration,
+    ) -> String {
+        use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, KIND_STREAM_OUT};
+        use std::io::Write;
+
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.attach_socket) else {
+            return String::new();
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+        let req = dot_agent_deck::daemon_protocol::AttachRequest::AttachStream {
+            id: agent_id.to_string(),
+        };
+        let payload = serde_json::to_vec(&req).expect("serialize AttachStream");
+        let mut header = [0u8; 5];
+        header[0] = KIND_REQ;
+        header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
+            return String::new();
+        }
+        let _ = stream.flush();
+
+        let mut acc: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + timeout;
+        let mut last_growth = Instant::now();
+        while Instant::now() < deadline {
+            let mut fh = [0u8; 5];
+            match std::io::Read::read_exact(&mut stream, &mut fh) {
+                Ok(()) => {}
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if !acc.is_empty() && last_growth.elapsed() >= quiet {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            }
+            let kind = fh[0];
+            let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+            let mut body = vec![0u8; len];
+            if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
+                break;
+            }
+            if kind == KIND_STREAM_OUT {
+                acc.extend_from_slice(&body);
+                last_growth = Instant::now();
+            } else if kind == KIND_RESP {
+                continue;
+            }
+        }
+        String::from_utf8_lossy(&acc).into_owned()
+    }
+
     /// Whether the captured daemon stderr currently contains `needle`.
     pub fn stderr_contains(&self, needle: &str) -> bool {
         std::fs::read_to_string(&self.stderr_path)

@@ -3888,6 +3888,22 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the fourth cause — a concurrent creator winning the `git worktree add` TOCTOU race (`WorktreeCreation::AlreadyClaimed` in `issue_dispatch_run.rs`) — deliberately left uncovered: it has no deterministic black-box trigger through this harness (forcing it needs either genuine concurrent fires racing on real subprocess timing, which cannot be tuned without a local test run this fork's tests forbid, or a production-side test seam this role may not add). Flagged to the orchestrator rather than guessed at.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/018 — Triage ENABLED (`triage = true`): a successful dispatch ensures PRD #421 M2.0's seven triage labels exist and the prompt delivered to the dispatched agent carries the full vocabulary plus the `needs-triage` uncertainty rule (PRD #421 M2.1/M2.2, RED — neither exists in any code path yet).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the fixture task's `[scheduled_tasks.issue_dispatch]` table carries `triage = true` — today `IssueDispatchConfig` has no `triage` field and no `deny_unknown_fields`, so the key parses cleanly and is silently ignored, making the RED about missing behavior, not a config error). The stub `gh` accepts any `gh label create`/`gh label list` invocation unconditionally (recorded verbatim, same discipline as the `issue edit`/`issue comment` stanza), so the label-create mechanism is not dictated.
+- **Agent:** none (run-now; observes the dispatched orchestrator agent's delivered prompt via a new `attach_and_capture_output` capture-once harness helper, plus the stub's recorded `gh` invocations).
+- **Asserts:** after a successful dispatch (worktree + orchestrator agent present, as in `scheduler/dispatch/001`), the recorded `gh` calls include a `label` COMMAND-GROUP invocation naming each of the seven vocabulary labels (`priority-high`, `priority-medium`, `priority-low`, `size-high`, `size-medium`, `size-low`, `needs-triage`); the prompt delivered to the dispatched agent contains all seven vocabulary terms AND states the uncertainty rule (loose keyword match: an "uncertain"/"not confident"/"unsure" term together with an "unset"/"no priority"/"leave priority" term).
+- **Does not assert:** that a spawned agent actually applies a correct priority/size label — that is LLM behavior, not deck behavior, and is not synthetically testable; the exact `gh label` mechanism (create vs. list-then-create-missing vs. `--force`); the exact prompt wording beyond the vocabulary + loose uncertainty-rule keywords.
+- **Note:** RED today — `triage` has no effect on any code path, so neither the `gh label` calls nor the prompt text exist.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/019 — Triage OFF by default (no `triage` key): no `gh label ...` call is ever made and the delivered prompt carries none of PRD #421 M2.0's seven triage-vocabulary terms — a regression guard against the triage feature leaking into the default dispatch path (PRD #421 M2.1/M2.2).
+- **Layer:** L2 (as `scheduler/dispatch/001`; plain `dispatch_task` with no `triage` key).
+- **Agent:** none (run-now; observes the dispatched orchestrator agent's delivered prompt via `attach_and_capture_output`, plus the stub's recorded `gh` invocations).
+- **Asserts:** after a successful dispatch, the delivered prompt contains none of the seven triage-vocabulary terms, and no recorded `gh` call belongs to the `label` command group.
+- **Does not assert:** N/A.
+- **Note:** GREEN-by-design today (vacuously true, exactly like `scheduler/dispatch/012`/`014`'s own notes) — none of the triage behavior exists in ANY code path yet, so there is nothing to leak. It earns its RED-vs-GREEN status as a meaningful guard once M2.1/M2.2 land: it must stay GREEN for a coder who correctly gates the new behavior on `triage`, and must go RED for one who doesn't.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).

@@ -82,6 +82,21 @@ if [ "$group" = "issue" ]; then
     esac
 fi
 
+# PRD #421 M2.0: idempotent label-vocabulary creation (`gh label create
+# <name> ...`, any flags) / an optional list-then-create-missing mechanism
+# (`gh label list ...`) — the exact mechanism is the coder's choice, so both
+# are accepted unconditionally; `list` returns an empty array so a
+# list-then-create-missing implementation always finds all seven missing.
+if [ "$group" = "label" ]; then
+    case "$sub" in
+        create) exit 0 ;;
+        list)
+            printf '[]\n'
+            exit 0
+            ;;
+    esac
+fi
+
 repo=""
 head=""
 issue_num=""
@@ -376,6 +391,40 @@ fn dispatch_task(
          \n"
     )
 }
+
+/// Like [`dispatch_task`] but with `triage = true` appended to the
+/// `[scheduled_tasks.issue_dispatch]` table (PRD #421 M2.0, opt-in). Today
+/// `IssueDispatchConfig` carries no `triage` field and no
+/// `deny_unknown_fields`, so this key parses cleanly and is silently
+/// ignored — the RED this produces is about missing BEHAVIOR, not a config
+/// parse error.
+fn dispatch_task_with_triage(
+    name: &str,
+    working_dir: &str,
+    prompt: &str,
+    repo: &str,
+    max_per_run: usize,
+) -> String {
+    format!(
+        "{}triage = true\n",
+        dispatch_task(name, working_dir, prompt, repo, max_per_run)
+    )
+}
+
+/// PRD #421 M2.0's seven-label triage vocabulary, hyphenated to match house
+/// style (`in-progress`, `ci-cd`) — settling the PRD's own open label-naming
+/// question. The deck ensures these exist (idempotently) and delivers them
+/// to the dispatched agent's prompt; the deck itself never applies one to an
+/// issue (that is the spawned agent's job, via its own `gh` calls).
+const TRIAGE_LABELS: [&str; 7] = [
+    "priority-high",
+    "priority-medium",
+    "priority-low",
+    "size-high",
+    "size-medium",
+    "size-low",
+    "needs-triage",
+];
 
 // ---------------------------------------------------------------------------
 // Observers
@@ -1682,5 +1731,178 @@ fn dispatch_017_skip_causes_render_distinguishably() {
         norm_b, norm_c,
         "cause B (open PR) and cause C (in-progress label) must render distinguishably; both \
          currently read: {norm_b:?}"
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task with `triage = true` for one open
+/// issue. After the dispatch succeeds (worktree + orchestrator agent
+/// present, as in `scheduler/dispatch/001`), the stub `gh` log must show a
+/// `gh label ...` invocation naming EACH of PRD #421 M2.0's seven triage
+/// labels (the create/list/force mechanism is the coder's choice — only that
+/// every label was requested), and the prompt DELIVERED to the dispatched
+/// agent (echoed by `cat`) must carry the full vocabulary plus the
+/// `needs-triage` uncertainty rule: under uncertainty, apply `needs-triage`
+/// and leave priority unset rather than guess. RED today: `triage` is not a
+/// recognized `IssueDispatchConfig` field (it parses and is silently
+/// ignored), so neither the label-ensure calls nor the prompt text exist in
+/// any code path yet.
+#[spec("scheduler/dispatch/018")]
+#[test]
+fn dispatch_018_triage_enabled_ensures_labels_and_prompts_agent() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task_with_triage(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+    let agent = daemon
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+        .unwrap_or_else(|| {
+            panic!(
+                "a triage-enabled dispatch must still succeed and spawn into {:?}",
+                paths.worktree_dir
+            )
+        });
+
+    // Labels ensured to exist: some `gh label ...` invocation names each of
+    // the seven vocabulary labels. Filtered on the `label` COMMAND GROUP
+    // (argv starts with "label "), not a loose substring match, so this
+    // can't be fooled by the unrelated `--add-label in-progress` FLAG on the
+    // already-shipped `gh issue edit` claim write (PRD #421 M1.0).
+    let label_group_calls = || -> Vec<String> {
+        stub.gh_calls()
+            .into_iter()
+            .filter(|l| l.starts_with("label "))
+            .collect()
+    };
+    let ensured = common::wait_until(Duration::from_secs(10), || {
+        let calls = label_group_calls();
+        TRIAGE_LABELS
+            .iter()
+            .all(|label| calls.iter().any(|l| l.contains(label)))
+    });
+    assert!(
+        ensured,
+        "triage=true must ensure all seven vocabulary labels exist via `gh label ...`; \
+         observed `gh label` calls:\n{}",
+        label_group_calls().join("\n")
+    );
+
+    // The delivered prompt must carry the full vocabulary and the
+    // uncertainty rule, captured once so multiple substrings can be checked
+    // against the same snapshot.
+    let delivered = daemon.attach_and_capture_output(&agent.id, Duration::from_millis(600), W);
+    for label in TRIAGE_LABELS {
+        assert!(
+            delivered.contains(label),
+            "the prompt delivered to the dispatched agent must carry the triage vocabulary, \
+             missing {label:?}; delivered:\n{delivered}"
+        );
+    }
+    let lower = delivered.to_lowercase();
+    let states_uncertainty = ["uncertain", "not confident", "unsure"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    let states_unset_priority = [
+        "unset",
+        "no priority",
+        "without a priority",
+        "leave priority",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw));
+    assert!(
+        states_uncertainty && states_unset_priority,
+        "the delivered prompt must state the uncertainty rule — under uncertainty apply \
+         `needs-triage` and leave priority unset rather than guess; delivered:\n{delivered}"
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task WITHOUT `triage` set (the
+/// default, off) for one open issue. Assert no `gh label ...` invocation is
+/// ever recorded and the prompt delivered to the dispatched agent carries
+/// none of PRD #421 M2.0's seven triage-vocabulary terms — a regression
+/// guard against the triage feature leaking into the default dispatch path.
+/// GREEN-by-design today (vacuously true, exactly like
+/// `scheduler/dispatch/012`/`014`'s own notes): none of the triage behavior
+/// exists in ANY code path yet, so there is nothing to leak.
+#[spec("scheduler/dispatch/019")]
+#[test]
+fn dispatch_019_triage_off_by_default_no_label_no_prompt_text() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    daemon
+        .run_now("dispatch-task")
+        .expect("run-now dispatch-task");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+    let agent = daemon
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+        .unwrap_or_else(|| {
+            panic!(
+                "dispatch must succeed with triage absent too, into {:?}",
+                paths.worktree_dir
+            )
+        });
+
+    let delivered = daemon.attach_and_capture_output(&agent.id, Duration::from_millis(600), W);
+    for label in TRIAGE_LABELS {
+        assert!(
+            !delivered.contains(label),
+            "triage is off by default — the delivered prompt must not carry the triage \
+             vocabulary, but found {label:?}; delivered:\n{delivered}"
+        );
+    }
+
+    let label_group_calls: Vec<String> = stub
+        .gh_calls()
+        .into_iter()
+        .filter(|l| l.starts_with("label "))
+        .collect();
+    assert!(
+        label_group_calls.is_empty(),
+        "triage is off by default — no `gh label ...` call may ever be made; observed: \
+         {label_group_calls:?}"
     );
 }
