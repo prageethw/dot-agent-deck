@@ -144,7 +144,16 @@ jobs:
       # Aligning the runners also makes a CI failure reproducible locally, which
       # neither of those was, and makes "green locally" mean the same thing as
       # "green in CI".
-      - run: cargo nextest run
+      #
+      # `--workspace`, NOT bare (fork #180). The root `Cargo.toml` is a
+      # non-virtual workspace (it carries its own `[package]` alongside
+      # `[workspace] members`), so a bare `cargo nextest run` tests only the
+      # root package — the `xtask/*` members, including `xtask-linkage-check`
+      # and its 46 `#[test]` fns, silently never ran, on any commit, with
+      # every check green throughout. `--workspace` also covers any future
+      # member automatically, which is the property that would have caught
+      # this the first time rather than needing a dedicated issue to find it.
+      - run: cargo nextest run --workspace
       # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
       # rule 7 fails the build if the Scenario comment is missing or the
       # generator fails"), and the build-macos/build-windows comment says these
@@ -252,7 +261,14 @@ jobs:
       # test-fast tier only (CLAUDE.md #5): protocol/state + L1 render tests.
       # No `e2e` feature (needs real agents + LLM APIs) and no linkage-check /
       # `cargo xtask docs` steps — those stay on the Linux job.
-      - run: cargo nextest run
+      #
+      # `--workspace` (fork #180, same reasoning as the Linux `build` job
+      # above): bare `cargo nextest run` skips the `xtask/*` members entirely
+      # because the root `Cargo.toml` is a non-virtual workspace. This is
+      # about `cargo nextest run` testing the xtask crates' own `#[test]` fns
+      # — separate from the `cargo xtask linkage-check` *binary* invocation,
+      # which correctly stays Linux-only per the comment above.
+      - run: cargo nextest run --workspace
 
   # macOS (host = aarch64-apple-darwin) compile + clippy + unit-test gate,
   # mirroring build-windows. macOS is otherwise built ONLY in the release
@@ -287,7 +303,11 @@ jobs:
       # Fork #117 widened the Linux job to lint test targets (including the
       # e2e-gated files); this job intentionally did not follow.
       - run: cargo clippy -- -D warnings
-      - run: cargo nextest run
+      # `--workspace` (fork #180): see the Linux `build` job's comment above
+      # `cargo nextest run --workspace` — the root workspace is non-virtual,
+      # so a bare invocation silently skipped the `xtask/*` members' own
+      # tests on every job, this one included.
+      - run: cargo nextest run --workspace
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
