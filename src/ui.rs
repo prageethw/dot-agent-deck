@@ -1419,6 +1419,18 @@ pub fn should_inject_spawn_time_prompt(
     }
 }
 
+/// Issue #423 — pure policy: does this `SessionStatus` observation for an
+/// orchestrator start-role pane warrant re-asserting the remit pointer?
+/// `Compacting` is the only status the daemon ever derives from
+/// `EventType::Compacting` (`AppState::apply_event`), so gating on the
+/// status here is equivalent to gating on the event type without the render
+/// loop needing its own copy of the raw event stream. Every other status —
+/// including the terminal `Error` and the forward-compat `Unknown` — must
+/// leave the remit alone.
+fn should_reassert_orchestrator_remit(status: &SessionStatus) -> bool {
+    matches!(status, SessionStatus::Compacting)
+}
+
 /// Returns how long the human-typing dispatch should sleep before forwarding
 /// `bytes` to the pane, to ensure an Enter keystroke arrives as a standalone
 /// event rather than fused to recent typing. Returns `Duration::ZERO` unless
@@ -1766,6 +1778,15 @@ struct UiState {
     stop_confirm_agent_count: usize,
     /// Orchestration tab IDs whose start-role prompt has already been injected.
     orchestration_prompted: HashSet<TabId>,
+    /// Issue #423: orchestration tab IDs whose start-role pane is currently
+    /// (as of the last frame checked) observed `Compacting`. Edge-triggers
+    /// the remit re-assertion — present means "already re-armed for this
+    /// compaction streak", so the render loop, which runs at ~62 Hz and may
+    /// see the same `Compacting` status for many consecutive frames, fires
+    /// the re-arm exactly once per streak rather than once per frame.
+    /// Removed the moment the status is next observed as anything else,
+    /// which re-arms detection for a possible later compaction.
+    orchestration_remit_compacting: HashSet<TabId>,
     /// Tracks when orchestration tabs were created (for delayed prompt injection).
     orchestration_created_at: HashMap<TabId, std::time::Instant>,
     /// PRD #128 Direction B-1 — tracks the moment SessionStart was first
@@ -1960,6 +1981,7 @@ impl UiState {
             stop_confirm_selected: 0,
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
+            orchestration_remit_compacting: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
@@ -2522,6 +2544,14 @@ fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
 // M6: Skill file auto-deployment
 // ---------------------------------------------------------------------------
 
+/// Issue #423: the one-liner seed pointer, shared between the spawn-time
+/// [`prepare_orchestrator_prompt`] and the compaction re-assertion in the
+/// main render loop, so the two can never drift apart. The durable content
+/// it points at (`.dot-agent-deck/orchestrator-context.md`) is written once
+/// at spawn and never needs rewriting for a re-assertion — only the pointer
+/// is redelivered.
+const ORCHESTRATOR_CONTEXT_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.";
+
 /// Write the orchestrator context to a file and return a one-liner to inject.
 /// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
 fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
@@ -2530,7 +2560,7 @@ fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Optio
     let file_path = dir.join("orchestrator-context.md");
     let content = build_orchestrator_context(config);
     std::fs::write(&file_path, &content).ok()?;
-    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
+    Some(ORCHESTRATOR_CONTEXT_POINTER.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -11208,6 +11238,67 @@ pub fn run_tui(
         // handling) lives in `deliver_orchestrator_prompt`, which takes an
         // injected `now` so it is unit-testable with a controlled clock.
         let orch_now = std::time::Instant::now();
+
+        // Issue #423: the orchestrator's remit is delivered once at spawn and
+        // never re-asserted, so role adherence decays across a long,
+        // compacted session — worst exactly when the roles matter most. On
+        // the frame the START ROLE's own pane is FIRST observed
+        // `Compacting` (an edge, not a level — see
+        // `orchestration_remit_compacting`'s doc comment, since this loop
+        // runs every frame at ~62 Hz and the status can stay `Compacting`
+        // for many consecutive frames), re-arm exactly the gate the
+        // spawn-time seed uses: put the pointer text back into
+        // `orchestrator_prompt` and drop the tab from `orchestration_prompted`
+        // so the delivery loop directly below re-enters
+        // `deliver_orchestrator_prompt` — reusing its readiness gating and
+        // `SendResult`-based delivery confirmation UNCHANGED, never a second
+        // delivery path. Scoped to the start role only: only
+        // `role_pane_ids[start_role_index]` is ever consulted, so a
+        // non-start role's compaction is invisible here.
+        for tab in tab_manager.tabs_mut() {
+            if let Tab::Orchestration {
+                id,
+                role_pane_ids,
+                start_role_index,
+                orchestrator_prompt,
+                ..
+            } = tab
+            {
+                let start_pane_id = role_pane_ids[*start_role_index].clone();
+                let is_compacting = snapshot
+                    .sessions
+                    .values()
+                    .find(|s| s.pane_id.as_deref() == Some(start_pane_id.as_str()))
+                    .is_some_and(|s| should_reassert_orchestrator_remit(&s.status));
+
+                if is_compacting {
+                    if !ui.orchestration_remit_compacting.contains(id)
+                        && ui.orchestration_prompted.contains(id)
+                        && orchestrator_prompt.is_none()
+                    {
+                        // Eligible only once the ORIGINAL spawn-time seed is
+                        // confirmed delivered (`orchestration_prompted` set,
+                        // `orchestrator_prompt` cleared to `None` by
+                        // `deliver_orchestrator_prompt`'s success arm) —
+                        // never re-arm on top of a still-pending initial
+                        // delivery, which would duplicate or lose it.
+                        *orchestrator_prompt = Some(ORCHESTRATOR_CONTEXT_POINTER.to_string());
+                        ui.orchestration_prompted.remove(id);
+                        // Re-anchor the delivery deadline to NOW:
+                        // `deliver_orchestrator_prompt` abandons once
+                        // `AUTOMATIC_PROMPT_DEADLINE` has elapsed since this
+                        // timestamp, and reusing the tab's original creation
+                        // time would abandon a re-assertion on sight in any
+                        // orchestration old enough to actually need one.
+                        ui.orchestration_created_at.insert(*id, orch_now);
+                    }
+                    ui.orchestration_remit_compacting.insert(*id);
+                } else {
+                    ui.orchestration_remit_compacting.remove(id);
+                }
+            }
+        }
+
         for tab in tab_manager.tabs_mut() {
             if let Tab::Orchestration {
                 id,
@@ -27232,6 +27323,27 @@ mod tests {
         let ready_since = now - SPAWN_TIME_READINESS_BUFFER;
         // `>=` boundary: exactly at the buffer should fire.
         assert!(should_inject_spawn_time_prompt(Some(ready_since), now));
+    }
+
+    // Issue #423 — orchestrator remit re-assertion trigger policy. Pure-data:
+    // only a `Compacting` status observation for the start-role pane should
+    // trigger re-assertion; every other status (including the terminal
+    // `Error` and the forward-compat `Unknown` catch-all) must not.
+    #[test]
+    fn remit_reassert_fires_only_for_compacting_status() {
+        assert!(should_reassert_orchestrator_remit(
+            &SessionStatus::Compacting
+        ));
+        assert!(!should_reassert_orchestrator_remit(
+            &SessionStatus::Thinking
+        ));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Working));
+        assert!(!should_reassert_orchestrator_remit(
+            &SessionStatus::WaitingForInput
+        ));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Idle));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Error));
+        assert!(!should_reassert_orchestrator_remit(&SessionStatus::Unknown));
     }
 
     // -----------------------------------------------------------------------
