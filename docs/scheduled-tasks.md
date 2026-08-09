@@ -288,6 +288,12 @@ The last row is a benign race, not a failure: two fires can both pass the idempo
 
 A skipped issue is left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
 
+**A claim is not a lock.** The race above is between two fires that share a workspace, and the worktree settles it — one wins, the other skips. A second race is not settled, and is worth stating plainly: if two deck instances with **independent workspaces** begin dispatching the same unclaimed issue at the same time, both read the issue list before either has written its claim, both find no worktree of their own, and both spawn. You get competing agents on one issue, two branches, and two claim comments.
+
+This is a constraint of the GitHub API rather than an oversight, and it cannot be fixed by reordering the calls. `POST /issues/:n/labels` is additive and idempotent with no conditional or compare-and-swap — two clients racing to apply `in-progress` both succeed — and assignees behave the same way. There is no ordering of label writes that produces mutual exclusion. Writing the claim *before* the spawn would not close the window either, and would trade it for a worse failure: a dispatch that then fails to spawn would leave a claim on an issue nobody is working, making it permanently un-dispatchable.
+
+So the `in-progress` claim closes the **sequential** case — a later run seeing a claim an earlier one left behind, which is the case that matters in practice, since independent decks are far more likely to fire minutes apart than in the same second. It does not close a genuine simultaneous race. Closing that would need an external lock, or a protocol that tolerates duplicates and reconciles them after the fact.
+
 ### Opt-in triage
 
 Set `triage = true` in the `[scheduled_tasks.issue_dispatch]` sub-table (or pass `--triage` to `schedule add`) to have each dispatched issue triaged by the agent working it, instead of landing with no priority/size signal at all. It is **off by default**.
