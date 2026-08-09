@@ -2417,6 +2417,192 @@ mod tests {
         reg.shutdown_all();
     }
 
+    /// Issue #424 round 2: mirrors the `Some(did) =>` idempotent-delivery arm
+    /// of the `WriteAndSubmit` dispatch (this file, the `admit_delivery` /
+    /// `compute_write_and_submit_outcome` / `record_delivery_outcome`
+    /// sequence a few hundred lines above `mod tests`) exactly, so this test
+    /// drives the SAME functions production hits rather than re-deriving the
+    /// sequence from scratch.
+    async fn deliver_with_ledger(
+        registry: &AgentPtyRegistry,
+        state: &SharedState,
+        pane_id: &str,
+        text: &str,
+        extras: &WriteAndSubmitExtras,
+        delivery_id: &str,
+    ) -> Result<crate::event::SendResult, String> {
+        let fingerprint = AgentPtyRegistry::delivery_fingerprint(
+            extras.expected_agent_id.as_deref(),
+            pane_id,
+            text,
+        );
+        match registry.admit_delivery(delivery_id, fingerprint).await {
+            crate::agent_pty::DeliveryAdmission::Replay(result) => Ok(result),
+            crate::agent_pty::DeliveryAdmission::Conflict => {
+                Err("delivery id reused with a conflicting payload/target".to_string())
+            }
+            crate::agent_pty::DeliveryAdmission::Proceed(permit) => {
+                match compute_write_and_submit_outcome(registry, state, pane_id, text, extras).await
+                {
+                    Ok(outcome) => {
+                        registry.record_delivery_outcome(&permit, outcome);
+                        Ok(outcome)
+                    }
+                    Err(e) => {
+                        registry.forget_delivery(&permit);
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scenario: submit the same shell command through the real delivery
+    /// ledger sequence (`admit_delivery` → `compute_write_and_submit_outcome`
+    /// → `record_delivery_outcome`) twice against a real `/bin/sh` PTY, using
+    /// the SAME `delivery_id` both times — exactly what a retried, unconfirmed
+    /// orchestrator/seed prompt does in production. The first submission must
+    /// land; the second (the retry) must ALSO land, proven by the command's
+    /// own output appearing twice in the PTY's scrollback.
+    ///
+    /// This is the non-negotiable test for issue #424 round 2: round 1's fix
+    /// (`src/ui.rs`, `deliver_orchestrator_prompt`) holds ONE `delivery_id`
+    /// across every retry of an unconfirmed seed/orchestrator prompt (minted
+    /// once at enqueue, reused until confirmation or the deadline).
+    /// `delivery_fingerprint` (`src/agent_pty.rs`) hashes only
+    /// `(expected_agent_id, pane_id, text)` — identical on every retry — so
+    /// `admit_delivery` finds the SAME record with a matching fingerprint and
+    /// a cached `Applied` result and returns `DeliveryAdmission::Replay`,
+    /// which `daemon_protocol.rs`'s dispatch answers from cache WITHOUT
+    /// calling `compute_write_and_submit_outcome`. The ledger has no TTL, so
+    /// this holds for the entire 60 s deadline: the prompt is written exactly
+    /// once, followed by silent no-op retries, then abandoned as "not
+    /// delivered" — a silent loss became a loud one.
+    ///
+    /// Drives the REAL production sequence (`admit_delivery` /
+    /// `compute_write_and_submit_outcome` / `record_delivery_outcome`, via
+    /// `deliver_with_ledger` above) against a REAL `/bin/sh` PTY spawned
+    /// through `AgentPtyRegistry`, submitting the SAME shell command (so the
+    /// fingerprint is identical, matching a genuine retry) twice with the SAME
+    /// `delivery_id`. `/bin/sh` echoes each execution's output into
+    /// scrollback, so a marker's occurrence count is a direct, unambiguous
+    /// proof of how many times the PTY was actually written to — not an RPC
+    /// count, not a mock's bookkeeping.
+    ///
+    /// PRD #42 build-windows: spawns a real PTY running `/bin/sh`, which does
+    /// not exist on Windows — gated to Unix like its sibling
+    /// `guarded_send_rechecks_live_attach_after_writer_lock` above.
+    // Decision 17 / linkage-check [4]: the checker's `fn_re` only matches a
+    // line starting with `fn` (not `async fn`), so a `#[spec]`-tagged
+    // `#[tokio::test] async fn` is invisible to it — mirrors the
+    // `pane_input_012`/`pane_input_015` split in `src/daemon_client.rs`
+    // (sync `#[test]` wrapper that builds a runtime and `block_on`s an
+    // `async fn ..._inner`) so the naming check actually sees this test.
+    #[cfg(unix)]
+    #[spec("daemon/protocol/002")]
+    #[test]
+    fn daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build ledger-retry runtime");
+        runtime.block_on(
+            daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty_inner(),
+        );
+    }
+
+    #[cfg(unix)]
+    async fn daemon_protocol_002_ledger_replay_swallows_seed_retry_never_reaching_pty_inner() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-ledger-retry-424";
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        // The pane is registered but carries no session, so `pane_writable`
+        // defaults to `Live` (mirrors `guarded_send_rechecks_live_attach_after_writer_lock`).
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: Some(id.clone()),
+            ..Default::default()
+        };
+        // A stable command whose OWN output is the delivery marker — run
+        // twice, it must appear in scrollback twice IF (and only if) the PTY
+        // was actually written to twice.
+        let text = "printf 'SEED-424-DELIVERED\\n'";
+        // The SAME `delivery_id` for both attempts: this is exactly what
+        // `deliver_orchestrator_prompt` does — mint once at enqueue, hold and
+        // reuse across every retry until confirmation lands.
+        let delivery_id = "delivery-424-retry";
+
+        async fn count_marker(registry: &AgentPtyRegistry, id: &str, marker: &str) -> usize {
+            let snap = registry.snapshot(id).expect("snapshot");
+            String::from_utf8_lossy(&snap).matches(marker).count()
+        }
+        async fn wait_for_marker_count(
+            registry: &AgentPtyRegistry,
+            id: &str,
+            marker: &str,
+            want: usize,
+        ) -> usize {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut count = count_marker(registry, id, marker).await;
+            while count < want && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                count = count_marker(registry, id, marker).await;
+            }
+            count
+        }
+
+        // Attempt 1 — the original write. Must land.
+        let outcome1 = deliver_with_ledger(&reg, &state, pane_id, text, &extras, delivery_id)
+            .await
+            .expect("first attempt (transport)");
+        assert_eq!(
+            outcome1,
+            crate::event::SendResult::Applied,
+            "precondition: the first attempt must actually land"
+        );
+        let count_after_first = wait_for_marker_count(&reg, &id, "SEED-424-DELIVERED", 1).await;
+        assert_eq!(
+            count_after_first, 1,
+            "precondition: the first attempt's output must reach scrollback exactly once"
+        );
+
+        // Attempt 2 — the CALLER's retry: same delivery_id, same fingerprint
+        // (identical agent/pane/text), because the confirmation-retry design
+        // holds identity across retries until CONFIRMATION, not until a write
+        // lands. This is the retry that must still reach the PTY.
+        let _outcome2 = deliver_with_ledger(&reg, &state, pane_id, text, &extras, delivery_id)
+            .await
+            .expect("second attempt (the retry)");
+
+        let count_after_retry = wait_for_marker_count(&reg, &id, "SEED-424-DELIVERED", 2).await;
+
+        assert_eq!(
+            count_after_retry, 2,
+            "a retry sharing the ORIGINAL delivery_id/fingerprint must still reach \
+             the PTY: only {count_after_retry} occurrence(s) of the marker reached \
+             scrollback, expected 2. The ledger's Applied-caches-as-terminal design \
+             (`admit_delivery` returning `Replay` once `record_delivery_outcome` has \
+             cached `Applied` for this id) makes the retry a silent no-op RPC \
+             instead of a write — issue #424 round 2's actual defect: round 1's \
+             fix (src/ui.rs, `deliver_orchestrator_prompt`) never reaches this far \
+             because it operates entirely client-side against `PaneController`, \
+             which has no ledger behind it at all"
+        );
+
+        reg.shutdown_all();
+    }
+
     #[tokio::test]
     async fn frame_round_trip() {
         let mut buf: Vec<u8> = Vec::new();
