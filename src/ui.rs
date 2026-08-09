@@ -8198,10 +8198,17 @@ fn dispatch_action(
                             // config name (not the form name — see the
                             // "do NOT overwrite orch_config.name" note
                             // below) so the marker matches the identity the
-                            // daemon itself uses. `name` carries
-                            // `#[serde(default)]` and can be blank in
-                            // hand-edited config; record that honestly
-                            // rather than inventing one.
+                            // daemon itself uses. `load_project_config`
+                            // normalises an empty `name` to the dir
+                            // basename at load time
+                            // (`src/project_config.rs:268-272`, via
+                            // `resolve_orchestration_name`), and this form's
+                            // orchestration list comes from that same
+                            // loader — so `orch_config.name` is non-empty
+                            // by construction and this arm is unreachable
+                            // in production. It stays as defence-in-depth,
+                            // purely so a future constructor that bypasses
+                            // the loader can't write a bare `orchestration:`.
                             let creator = if orch_config.name.is_empty() {
                                 "orchestration:unknown".to_string()
                             } else {

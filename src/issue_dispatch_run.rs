@@ -1744,6 +1744,7 @@ mod tests {
         git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
         git(&clone_dir, &["config", "user.email", "test@example.com"]);
         git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
         std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
         git(&clone_dir, &["add", "README.md"]);
         git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);

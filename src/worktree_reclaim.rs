@@ -493,15 +493,40 @@ pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result
 /// indefinitely. Mirrors `issue_dispatch::sanitize_claimant_name`'s
 /// reasoning (PRD #421) for a different sink — a local file rather than a
 /// public GitHub comment — so no CommonMark-specific escaping (backticks,
-/// `@`-mentions) is needed here.
+/// `@`-mentions) is needed here. Every real `created-by` value embeds a
+/// second colon after the prefix (`issue-dispatch:<task>#<issue>`,
+/// `orchestration:<name>`), so a future reader must strip the literal
+/// `created-by: ` prefix and treat the remainder as opaque, never
+/// `split(':')` — see the module-level format doc.
+///
+/// The result is trimmed and capped at [`MARKER_CREATOR_MAX_CHARS`],
+/// mirroring the length bound `scheduler::sanitize_claimant_for_render`
+/// already applies to its own mirror sink. An empty or all-control-character
+/// input — e.g. `validate_task` never checks `ScheduledTask.name`, so a
+/// blank task name is a loadable schedule — collapses to the literal
+/// `"unknown"` rather than leaving a bare `created-by: ` with no identity
+/// after the prefix.
+const MARKER_CREATOR_MAX_CHARS: usize = 200;
+
 fn sanitize_marker_creator(name: &str) -> String {
-    name.chars()
+    let cleaned: String = name
+        .chars()
         .filter_map(|c| match c {
             '\n' | '\r' => Some(' '),
             c if c.is_control() => None,
             c => Some(c),
         })
-        .collect()
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    if trimmed.chars().count() > MARKER_CREATOR_MAX_CHARS {
+        let truncated: String = trimmed.chars().take(MARKER_CREATOR_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Derive a `gh --repo owner/name` slug from the worktree's own `origin`
@@ -1319,6 +1344,39 @@ mod tests {
             ownership_of(&repo, &worktree_dir),
             Ownership::Ours,
             "a marker written with a hostile creator name must still read as deck-owned"
+        );
+    }
+
+    /// Scenario: `sanitize_marker_creator` is fed an empty string, a
+    /// whitespace/control-only string, and a creator identity far longer
+    /// than the cap. The empty and all-stripped cases must both record an
+    /// explicit `"unknown"` rather than a blank identity after the
+    /// `created-by: ` prefix, and the over-length case must be truncated
+    /// at [`MARKER_CREATOR_MAX_CHARS`] rather than grow the marker file
+    /// without bound.
+    #[test]
+    fn sanitize_marker_creator_bounds_and_guards() {
+        assert_eq!(sanitize_marker_creator(""), "unknown");
+        assert_eq!(sanitize_marker_creator("   "), "unknown");
+        assert_eq!(sanitize_marker_creator("\u{7}\u{1b}"), "unknown");
+
+        let long = "a".repeat(MARKER_CREATOR_MAX_CHARS + 50);
+        let sanitized = sanitize_marker_creator(&long);
+        assert_eq!(
+            sanitized.chars().count(),
+            MARKER_CREATOR_MAX_CHARS + 1,
+            "must truncate to the cap plus the trailing ellipsis marker, got {} chars",
+            sanitized.chars().count()
+        );
+        assert!(
+            sanitized.ends_with('…'),
+            "an over-length creator name must be marked as truncated, got {sanitized:?}"
+        );
+
+        assert_eq!(
+            sanitize_marker_creator("  orchestration:worktree-demo  "),
+            "orchestration:worktree-demo",
+            "ordinary input must still be trimmed but otherwise passed through"
         );
     }
 }
