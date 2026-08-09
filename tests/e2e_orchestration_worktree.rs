@@ -88,6 +88,33 @@ fn sibling_worktree_path(dir: &std::path::Path, slug: &str) -> PathBuf {
     dir.with_file_name(name)
 }
 
+/// Resolve `worktree_dir`'s git metadata dir via `git rev-parse --git-dir` —
+/// the same resolution `mark_worktree_owned` (`src/worktree_reclaim.rs`)
+/// uses to place the `dot-agent-deck-owner` marker outside the working
+/// tree, so writing it can never leave the worktree permanently dirty.
+/// Mirrors `create_worktree_records_creator_identity`'s helper
+/// (`src/issue_dispatch_run.rs`), which proves the same marker on the async
+/// path.
+fn resolve_git_dir(worktree_dir: &std::path::Path) -> PathBuf {
+    let out = std::process::Command::new("git")
+        .current_dir(worktree_dir)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .expect("git rev-parse --git-dir must spawn");
+    assert!(
+        out.status.success(),
+        "git rev-parse --git-dir failed in {worktree_dir:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let git_dir = PathBuf::from(raw);
+    if git_dir.is_absolute() {
+        git_dir
+    } else {
+        worktree_dir.join(git_dir)
+    }
+}
+
 /// Scenario: launch the deck in the `orch-worktree` fixture (a real git repo
 /// after `commit_fixture`), then drive the exact user-facing keyboard path:
 /// `Ctrl+n` -> directory picker (Space confirms cwd) -> new-pane form -> Right
@@ -97,6 +124,11 @@ fn sibling_worktree_path(dir: &std::path::Path, slug: &str) -> PathBuf {
 /// worktree directory exists on disk, and that BOTH role panes' `pwd` logs —
 /// written by each role's own shell command before it goes to sleep — report
 /// the worktree path, not the fixture directory the deck was launched in.
+/// Also assert the `dot-agent-deck-owner` marker (issue #425) written into
+/// the worktree's git metadata dir records `created-by:
+/// orchestration:worktree-demo` — the string `src/ui.rs`'s
+/// `create_worktree_sync` call site actually derives from the fixture's own
+/// orchestration name, not a value handed to it as an argument.
 #[spec("orchestration/worktree/005")]
 #[test]
 fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary() {
@@ -126,6 +158,23 @@ fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary(
          resolved sibling worktree {} on disk\n=== rendered grid ===\n{}",
         worktree.display(),
         deck.snapshot_grid()
+    );
+
+    // fork issue #425 follow-up: the Name field was never typed into on this
+    // keyboard path (Mode -> Name -> Tab straight to Worktree), so
+    // `create_worktree_sync`'s call site in `src/ui.rs` falls back to the
+    // canonical config name and derives `orchestration:worktree-demo` as the
+    // creator. Assert that DERIVED string, not one this test hands in.
+    let git_dir = resolve_git_dir(&worktree);
+    let marker = std::fs::read_to_string(
+        git_dir.join(dot_agent_deck::worktree_reclaim::OWNER_MARKER_FILENAME),
+    )
+    .expect("ownership marker must exist and be readable in the worktree's git-dir");
+    assert!(
+        marker.contains("created-by: orchestration:worktree-demo"),
+        "the ownership marker written through the real keyboard path must \
+         record the creator `src/ui.rs` actually derives from the fixture's \
+         orchestration name, got {marker:?}"
     );
 
     let orchestrator_log = worktree.join("pwd-orchestrator.log");
