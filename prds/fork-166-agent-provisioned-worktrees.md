@@ -45,7 +45,13 @@ So there is no answer to "which orchestration is this?" that survives a restart.
 3. **The name is the ownership identity**, written into the marker of every worktree the orchestration creates.
 4. **Worktrees are named `<orchestration-name>-<change>`**, so the prefix is the owner and `ls` shows it at a glance.
 5. **The marker decides ownership, never the name.**
-6. **Provisioning is one step** — `delegate` creates the worktree; no separate verb to call first.
+6. **Provisioning is one step** — `delegate` creates the worktree. **Split out to fork [#175](https://github.com/prageethw/dot-agent-deck/issues/175)**; see below.
+
+### Scope split: this PRD is the identity and ownership half
+
+Automatic provisioning is now **fork #175**, which depends on this one. The split is deliberate: this PRD carries the two risky parts — a **semantic break behind a stable wire** (promoting `display_title`, which triggers rule 12's cross-version manual test and a `.breaking.md` fragment) and an **audit sweep** of every existing test that submits an orchestration form, whose blast radius is not known up front.
+
+Landing those separately means #175 builds on settled ground, and that if the wire change causes trouble there is a smaller thing to unpick. What ships here is still independently useful: unique orchestration names, and an answerable *"which worktrees are mine?"* — including after a restart.
 
 ### Why the marker decides and the name does not
 
@@ -107,7 +113,6 @@ That check was built to defeat a forged marker. It protects this case for free, 
 
 ## Success Criteria
 
-- An orchestration provisions a worktree for a new change **without a human running `git worktree add`**.
 - Two live orchestrations cannot share a name.
 - The suggested name is accepted with one keystroke.
 - Every worktree an orchestration creates records it as owner; the owner is listable.
@@ -115,7 +120,7 @@ That check was built to defeat a forged marker. It protects this case for free, 
 - A worktree created by a different orchestration is never owned. One the deck did not create is never owned, whatever it is named.
 - `main` never appears as owned.
 - A worktree created before this ships still resolves `Ours`, so `reclaim` keeps working on it.
-- CLAUDE.md rule 1's manual step is replaced.
+(Replacing CLAUDE.md rule 1's manual `git worktree add` is fork #175's success criterion, not this PRD's — this one supplies the identity that makes it possible.)
 
 ## Milestones
 
@@ -131,15 +136,17 @@ That check was built to defeat a forged marker. It protects this case for free, 
 - [ ] **M2.1** — `ownership_of` reports the owner. Containment and presence stay authoritative: an empty or unparseable marker resolves `Ours` with owner unknown.
 - [ ] **M2.2** — `worktree list` shows the owner; `--json` carries it; decide whether `SCHEMA_VERSION` moves.
 
-### Phase 3: Provisioning and query
+### Phase 3: Query
 
-- [ ] **M3.0** — `delegate` creates `<orchestration-name>-<change>` in one step, reusing `resolve_orchestration_worktree_path`'s hardened validation and `create_worktree_sync` rather than a second implementation.
-- [ ] **M3.1** — an orchestration can list the worktrees it owns, correctly after a restart.
-- [ ] **M3.2** — an existing worktree owned by this orchestration is reused; one owned by another is refused with a reason naming the owner, not raw git output.
+- [ ] **M3.0** — an orchestration can list the worktrees it owns, **correctly after a restart**. This is the milestone the whole identity choice exists for.
 
 ### Phase 4: Ship
 
-- [ ] **M4.0** — docs; CLAUDE.md rule 1 amended; the deployment precondition below stated in the changelog.
+- [ ] **M4.0** — docs; the deployment precondition below stated in the changelog. CLAUDE.md rule 1's manual `git worktree add` stays for now — it is replaced by fork #175, not by this PRD.
+
+### Moved to fork #175
+
+Provisioning (`delegate` creating `<orchestration-name>-<change>` in one step), worktree reuse, and refusal when a target is owned by another orchestration. All depend on the identity and ownership this PRD establishes.
 
 ## Key Files
 
