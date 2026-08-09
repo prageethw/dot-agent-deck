@@ -330,8 +330,8 @@ fn is_repo_char(c: char) -> bool {
 // U5 — idempotency decision
 // ---------------------------------------------------------------------------
 
-/// Whether a candidate issue should be dispatched or skipped (PRD #120). The
-/// worktree is the ledger — no separate state file.
+/// Whether a candidate issue should be dispatched or skipped (PRD #120). No
+/// separate state file — three signals, one of them an explicit claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchDecision {
     /// Provision the worktree and spawn an agent for this issue.
@@ -366,19 +366,34 @@ pub fn dispatch_decision(
 /// and read back as the third idempotency signal (M1.2).
 pub const IN_PROGRESS_LABEL: &str = "in-progress";
 
+/// [`IN_PROGRESS_LABEL`]'s colour/description (PRD #421 review B1): the label
+/// is now ENSURED to exist before `claim_issue` adds it (see
+/// `issue_dispatch_run::ensure_claim_label`), unconditionally — unlike the
+/// opt-in triage vocabulary — because real `gh issue edit --add-label`
+/// resolves the name to an ID client-side and hard-errors before any mutation
+/// when the repo has never carried it, which otherwise makes the claim a
+/// complete, silent no-op on any such repo (reviewer F1 / auditor F1).
+pub const IN_PROGRESS_LABEL_COLOR: &str = "006b75";
+pub const IN_PROGRESS_LABEL_DESCRIPTION: &str =
+    "Claimed by an issue-dispatch task; do not dispatch again until this label is removed.";
+
 /// Build the `gh issue edit --add-label` argv (arguments after `gh`) that
-/// writes `label` onto `issue`.
+/// writes `label` onto `issue`. The issue number is a positional argument
+/// placed AFTER the `--` end-of-options marker — unlike `issue_list_argv`'s
+/// trailing `--` (which guards nothing because no positional follows it),
+/// this one genuinely does its job: nothing between `gh` and `--` can ever be
+/// reinterpreted as the positional, and nothing after `--` can be
+/// reinterpreted as a flag (reviewer F8 / auditor F2).
 pub fn issue_edit_add_label_argv(repo: &str, issue: u64, label: &str) -> Vec<String> {
     vec![
         "issue".to_string(),
         "edit".to_string(),
-        issue.to_string(),
         "--repo".to_string(),
         repo.to_string(),
         "--add-label".to_string(),
         label.to_string(),
-        // M1: end-of-options marker (see `issue_list_argv`).
         "--".to_string(),
+        issue.to_string(),
     ]
 }
 
@@ -387,17 +402,18 @@ pub fn issue_edit_add_label_argv(repo: &str, issue: u64, label: &str) -> Vec<Str
 /// #421 M1.1: the only path that re-runs the dispatch-success flow for the
 /// same issue is a deliberate un-claim, usually a different claimant taking
 /// over, so editing in place would overwrite the previous claimant's record).
+/// The issue number sits after the `--` end-of-options marker — see
+/// [`issue_edit_add_label_argv`]'s doc comment for why that placement matters.
 pub fn issue_comment_argv(repo: &str, issue: u64, body: &str) -> Vec<String> {
     vec![
         "issue".to_string(),
         "comment".to_string(),
-        issue.to_string(),
         "--repo".to_string(),
         repo.to_string(),
         "--body".to_string(),
         body.to_string(),
-        // M1: end-of-options marker (see `issue_list_argv`).
         "--".to_string(),
+        issue.to_string(),
     ]
 }
 
@@ -405,46 +421,71 @@ pub fn issue_comment_argv(repo: &str, issue: u64, body: &str) -> Vec<String> {
 /// issue's comments — the M1.3 claimant lookup, called ONLY once the
 /// `in-progress` label is already known present (from the `gh issue list`
 /// response `issue_list_argv` requests — see its doc comment), so an
-/// unlabelled issue never triggers this call at all.
+/// unlabelled issue never triggers this call at all. The issue number sits
+/// after the `--` end-of-options marker — see [`issue_edit_add_label_argv`]'s
+/// doc comment for why that placement matters.
 pub fn issue_view_comments_argv(repo: &str, issue: u64) -> Vec<String> {
     vec![
         "issue".to_string(),
         "view".to_string(),
-        issue.to_string(),
         "--repo".to_string(),
         repo.to_string(),
         "--json".to_string(),
         "comments".to_string(),
-        // M1: end-of-options marker (see `issue_list_argv`).
         "--".to_string(),
+        issue.to_string(),
     ]
 }
 
 /// The identity that claims an issue by posting a claim comment (PRD #421
-/// M1.1). Two write points exist with different claimants: scheduler-side
-/// dispatch (`issue_dispatch_run::dispatch_one_issue`, the only wired call
-/// site today) claims under [`Claimant::Task`] — `ScheduledTask.name`. A human
-/// orchestration would claim as [`Claimant::Instance`] —
-/// `OrchestrationIdentity::Instance { id, name }` — carrying both the name AND
-/// the id because the name alone is ambiguous (two tabs of the same
-/// orchestration in the same directory are two distinct routing groups); no
-/// current call site constructs this variant, so it is represented for
-/// completeness per the PRD but untested.
+/// M1.1). `run_issue_dispatch` has exactly one caller and claims under
+/// [`Claimant::Task`] — `ScheduledTask.name`; that is the only write point
+/// that exists today. A second variant for a human orchestration's own claim
+/// was previously represented here for completeness even though nothing
+/// constructed it — removed (fork #421 review E1) as speculative generality:
+/// a `pub` enum's dead variant is never flagged by `dead_code`, so its unit
+/// test was coverage over unreachable code that read as reassurance without
+/// providing any. When a second write point appears it will come with
+/// concrete requirements about what identity it carries; re-adding a variant
+/// then is a small change made with better information than exists now. See
+/// `prds/421-automatic-issue-labelling.md`'s "Decisions taken during
+/// implementation" for the full record of why only one write point exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claimant {
     /// The scheduler-side dispatch: `ScheduledTask.name`.
     Task { name: String },
-    /// A human orchestration: `OrchestrationIdentity::Instance { id, name }`.
-    Instance { id: String, name: String },
 }
 
 impl Claimant {
     fn describe(&self) -> String {
         match self {
-            Claimant::Task { name } => format!("scheduled task `{name}`"),
-            Claimant::Instance { id, name } => format!("orchestration `{name}` (`{id}`)"),
+            Claimant::Task { name } => {
+                format!("scheduled task `{}`", sanitize_claimant_name(name))
+            }
         }
     }
+}
+
+/// Neutralise a claimant-supplied task name for safe interpolation into a
+/// public GitHub comment (PRD #421 review C5 / auditor F3). `ScheduledTask.name`
+/// is hand-edited config with no character restriction, and the un-escaped
+/// backtick wrapper around it in `Claimant::describe` lets a name that itself
+/// contains a backtick close the code span early — after which a crafted
+/// `@`-mention notifies a real GitHub user, or an embedded newline forges a
+/// second, fabricated `Claimed by …` line (undermining the newest-claimant
+/// lookup this PRD relies on). Backticks are dropped rather than escaped — a
+/// backslash-escaped backtick does not render as literal inside a CommonMark
+/// code span — newlines/carriage returns collapse to a space, and every other
+/// C0/DEL control character is dropped outright.
+fn sanitize_claimant_name(name: &str) -> String {
+    name.chars()
+        .filter_map(|c| match c {
+            '`' => None,
+            '\n' | '\r' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 /// Render the claim-comment body posted on a successful dispatch (PRD #421
@@ -462,36 +503,95 @@ pub fn claim_comment_body(claimant: &Claimant, host: &str, timestamp: &str) -> S
 // PRD #421 M2.0/M2.1/M2.2 — triage label vocabulary + prompt instruction
 // ---------------------------------------------------------------------------
 
+/// A label's full canonical shape: name, colour (hex digits, no leading `#`),
+/// and description — everything `gh label create --force` needs for the call
+/// to be a genuine converge-to-declared-state operation rather than a
+/// colour-randomizing write (PRD #421 review B2 / reviewer F2, auditor F1):
+/// real `gh` assigns a RANDOM colour whenever `--color` is omitted, and
+/// `--force` then PATCHes that random colour onto the label even when it
+/// already exists — 96 rewrites/day against a maintainer's own taxonomy on a
+/// `*/15` cron.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelSpec {
+    pub name: &'static str,
+    pub color: &'static str,
+    pub description: &'static str,
+}
+
 /// The triage label vocabulary (M2.0), settling the PRD's own open
 /// label-naming question, hyphenated to match house style (`in-progress`,
 /// `ci-cd`). The deck ensures these exist (idempotently) and delivers them to
 /// a dispatched agent's prompt when [`crate::config::IssueDispatchConfig::triage`]
 /// is on; the deck itself never applies one to an issue — that is the spawned
-/// agent's job, via its own `gh` calls.
-pub const TRIAGE_LABELS: [&str; 7] = [
-    "priority-high",
-    "priority-medium",
-    "priority-low",
-    "size-high",
-    "size-medium",
-    "size-low",
-    "needs-triage",
+/// agent's job, via its own `gh` calls. Colours form two visually distinct
+/// ramps (red→green priority, blue size) plus a third hue for `needs-triage`,
+/// so `--force`'s repeated writes converge on something legible rather than
+/// re-randomizing (B2).
+pub const TRIAGE_LABELS: [LabelSpec; 7] = [
+    LabelSpec {
+        name: "priority-high",
+        color: "b60205",
+        description: "High priority — address soon.",
+    },
+    LabelSpec {
+        name: "priority-medium",
+        color: "fbca04",
+        description: "Medium priority.",
+    },
+    LabelSpec {
+        name: "priority-low",
+        color: "0e8a16",
+        description: "Low priority — can wait.",
+    },
+    LabelSpec {
+        name: "size-high",
+        color: "0052cc",
+        description: "Large amount of work.",
+    },
+    LabelSpec {
+        name: "size-medium",
+        color: "1d76db",
+        description: "Moderate amount of work.",
+    },
+    LabelSpec {
+        name: "size-low",
+        color: "c5def5",
+        description: "Small amount of work.",
+    },
+    LabelSpec {
+        name: "needs-triage",
+        color: "d4c5f9",
+        description: "Priority not yet determined.",
+    },
 ];
 
 /// Build the `gh label create` argv (arguments after `gh`) that idempotently
-/// ensures `label` exists on `repo`. `--force` updates the label in place if
-/// it is already there instead of erroring, which is enough on its own for
-/// idempotency — no separate list-then-create-missing step is needed.
-pub fn label_create_argv(repo: &str, label: &str) -> Vec<String> {
+/// ensures `label` exists on `repo` with the given `color`/`description`.
+/// `--force` updates the label in place if it is already there instead of
+/// erroring — genuinely idempotent now that an explicit `color`/`description`
+/// are always supplied (B2): without them `gh` assigns a random colour on
+/// every call and `--force` writes it over whatever was there.
+///
+/// The label name is positional and must come immediately after `create` —
+/// this shape is load-bearing for the L2 test stub's `gh`, which parses the
+/// name as its first argument regardless of what follows. No `--` end-of-
+/// options marker: with the positional necessarily BEFORE every flag, a
+/// trailing `--` (the pre-fix shape) protected nothing that followed it, and
+/// there is no flag-free arrangement that would let one placed correctly
+/// still leave the name where the stub (and `gh`'s own `label create <name>
+/// [flags]` usage) expects it (reviewer F8 / auditor F2, D5).
+pub fn label_create_argv(repo: &str, label: &str, color: &str, description: &str) -> Vec<String> {
     vec![
         "label".to_string(),
         "create".to_string(),
         label.to_string(),
         "--repo".to_string(),
         repo.to_string(),
+        "--color".to_string(),
+        color.to_string(),
+        "--description".to_string(),
+        description.to_string(),
         "--force".to_string(),
-        // M1: end-of-options marker (see `issue_list_argv`).
-        "--".to_string(),
     ]
 }
 
@@ -513,7 +613,11 @@ pub fn triage_instruction() -> String {
          may instead ask a bounded question, e.g. \"priority for #<N>: high, medium, or low?\" \
          — but never block an unattended, scheduled run on a prompt: apply `needs-triage` and \
          continue.",
-        labels = TRIAGE_LABELS.join(", ")
+        labels = TRIAGE_LABELS
+            .iter()
+            .map(|l| l.name)
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -855,12 +959,12 @@ mod tests {
             vec![
                 "issue",
                 "edit",
-                "7",
                 "--repo",
                 "acme/widgets",
                 "--add-label",
                 "in-progress",
                 "--",
+                "7",
             ]
         );
     }
@@ -876,12 +980,12 @@ mod tests {
             vec![
                 "issue",
                 "comment",
-                "7",
                 "--repo",
                 "acme/widgets",
                 "--body",
                 "Claimed by scheduled task `dispatch-task`.",
                 "--",
+                "7",
             ]
         );
     }
@@ -893,12 +997,31 @@ mod tests {
             vec![
                 "issue",
                 "view",
-                "7",
                 "--repo",
                 "acme/widgets",
                 "--json",
                 "comments",
                 "--",
+                "7",
+            ]
+        );
+    }
+
+    #[test]
+    fn label_create_argv_carries_color_and_description() {
+        assert_eq!(
+            label_create_argv("acme/widgets", IN_PROGRESS_LABEL, "006b75", "claim marker"),
+            vec![
+                "label",
+                "create",
+                "in-progress",
+                "--repo",
+                "acme/widgets",
+                "--color",
+                "006b75",
+                "--description",
+                "claim marker",
+                "--force",
             ]
         );
     }
@@ -918,13 +1041,28 @@ mod tests {
     }
 
     #[test]
-    fn claim_comment_body_names_instance_claimant() {
-        let claimant = Claimant::Instance {
-            id: "abc123".to_string(),
-            name: "issue-work".to_string(),
+    fn claim_comment_body_neutralizes_backtick_and_newline_in_task_name() {
+        // C5 / auditor F3: a backtick would close the surrounding code span
+        // early; a raw newline could then start a fabricated second line.
+        let claimant = Claimant::Task {
+            name: "x` cc @nobody\ninjected".to_string(),
         };
         let body = claim_comment_body(&claimant, "host-1", "2026-08-09T00:00:00Z");
-        assert!(body.contains("issue-work"));
-        assert!(body.contains("abc123"));
+        // Every backtick in the rendered body must be one of the two fixed
+        // wrapper pairs (around the host, around the sanitized name) — none
+        // contributed by the task name itself.
+        assert_eq!(
+            body.matches('`').count(),
+            4,
+            "task name must not be able to introduce extra backticks, got {body:?}"
+        );
+        assert!(
+            !body.contains('\n'),
+            "task name must not be able to introduce a raw newline, got {body:?}"
+        );
+        assert!(
+            !body.contains("x`"),
+            "the name's own backtick must not survive verbatim, got {body:?}"
+        );
     }
 }
