@@ -1100,11 +1100,22 @@ fn worktree_reclaim_014_forged_git_dir_redirect_is_not_treated_as_ours() {
         combined(&out)
     );
     let text = combined(&out);
+    // Deliberately more specific than "the worktree survived": survival alone
+    // does not prove `Ownership::Foreign` was resolved -- it would ALSO hold
+    // if ownership resolved `Ours` (verdict `Remove`) but the physical `git
+    // worktree remove` step itself failed for some unrelated reason, landing
+    // the report in `Kept` with a "removal failed: ..." reason instead of the
+    // pending-ask list. Requiring the pending-list header (mirroring `005`'s
+    // and `011`'s bare-run assertions) pins the SPECIFIC verdict this finding
+    // is about, not merely "nothing bad happened this time".
+    assert!(
+        text.contains("reclaimable pending confirmation"),
+        "the forged worktree must land specifically in the pending ASK list -- \
+         `Ownership::Foreign`, not merely survive via some other keep/failure path; got:\n{text}"
+    );
     assert!(
         text.contains("wt-forged"),
-        "the forged worktree must land in the pending ask list, naming its exact path -- \
-         surviving via some other reason would not prove the containment fix actually rejected \
-         the forged git-dir; got:\n{text}"
+        "the pending ask list must name the forged worktree's exact path; got:\n{text}"
     );
 }
 
