@@ -41,12 +41,26 @@ use spec::spec;
 
 const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 
-/// The synthetic orchestrator role script: declares itself live immediately
-/// (fast-path readiness for the spawn-time remit pointer), tees all stdin to
-/// `orchestrator-prompt.log` in the background so every delivered prompt
-/// leaves one matching line, then — only if the test writes the
-/// corresponding control file into the workdir — declares itself
-/// history-only and later live again. Mirrors the `emit_target` helper
+/// The synthetic orchestrator role script: a BACKGROUNDED subshell declares
+/// the role live immediately (fast-path readiness for the spawn-time remit
+/// pointer) and — only if the test writes the corresponding control file
+/// into the workdir — later declares history-only and then live again;
+/// meanwhile the FOREGROUND script body reads and logs every line delivered
+/// to its real stdin, however many arrive, to `orchestrator-prompt.log`.
+///
+/// The background/foreground split is load-bearing, not stylistic: a
+/// non-interactive POSIX shell reassigns an ASYNCHRONOUS (`&`) job's stdin to
+/// `/dev/null` unless that job never touches stdin at all, so an earlier
+/// version of this script that ran `cat >> orchestrator-prompt.log &` in the
+/// background silently read nothing — the delivered pointer landed on the
+/// real PTY (visible on the rendered grid) but never reached the log,
+/// producing a false RED against this file's own precondition assertion
+/// instead of the feature under test (caught reading PR #177's first CI run:
+/// all three tests failed at the identical precondition line with the
+/// pointer plainly visible in the failure's `Final grid` dump). The
+/// `emit_target` subshell below never reads stdin, so backgrounding IT is
+/// unaffected; the `read` loop stays in the foreground, so it keeps the
+/// real PTY stdin. Mirrors the `emit_target` helper
 /// `tests/e2e_pane_send_result.rs::pane_input_007` uses for the identical
 /// raw hook-socket `session_start` technique.
 const ORCHESTRATOR_REMIT_SCRIPT: &str = r#"#!/bin/sh
@@ -77,20 +91,20 @@ s.close()
 PY
 }
 
-cat >> orchestrator-prompt.log &
+(
+    emit_target live
+    touch initial-live-emitted
 
-emit_target live
-touch initial-live-emitted
+    while [ ! -f go-history-only ]; do sleep 0.05; done
+    emit_target history-only
+    touch history-only-emitted
 
-while [ ! -f go-history-only ]; do sleep 0.05; done
-emit_target history-only
-touch history-only-emitted
+    while [ ! -f go-live-again ]; do sleep 0.05; done
+    emit_target live
+    touch relive-emitted
+) &
 
-while [ ! -f go-live-again ]; do sleep 0.05; done
-emit_target live
-touch relive-emitted
-
-wait
+while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; done
 "#;
 
 #[cfg(unix)]
