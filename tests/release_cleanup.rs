@@ -42,6 +42,38 @@
 //! individual test doc comments below for which finding or target behaviour
 //! each one pins.
 //!
+//! Round 3 (fork issue #152) is a POST-MERGE reviewer + auditor pass on round
+//! 2 (PR #147) — Greptile was credit-limited on that PR and produced no
+//! genuine review (CLAUDE.md rule 8), so the pass landed too late to gate the
+//! merge. One blocker and five more should-fix items, several of them
+//! regressions introduced by round 2 itself:
+//!   - B1 (blocker): round 2 replaced `! is_long_lived "$br"` with a literal
+//!     `[ "$br" != "fork-only" ]` in the worktree loop, dropping the default
+//!     branch from that one guard even though the local/remote loops still
+//!     call `is_long_lived`. A LINKED worktree on the default branch now
+//!     passes every guard, and `git worktree remove` succeeds on it.
+//!   - S1: `DEGRADED_REASONS:` interpolates the raw remote URL on the
+//!     "doesn't resolve to a GitHub slug" path — `slug_from_url` only strips
+//!     userinfo when the URL matches `github.com` at all, so a
+//!     credential-bearing Enterprise remote leaks its token on every run.
+//!   - S2: the root-checkout path derivation (`git rev-parse --path-format`)
+//!     has no `mark_degraded` at all on failure, and a relocated `.git`
+//!     directory (`--separate-git-dir`) makes it silently compute the wrong
+//!     path rather than fail loudly.
+//!   - S3: `--limit 200` bounds what `gh` fetches, but the truncation count
+//!     is taken AFTER the client-side cross-repo filter, so a full page
+//!     containing cross-repo rows goes undetected.
+//!   - S4: a design change — at 200+ merged PRs the merged query returns a
+//!     full page on EVERY run, making `PR_STATE_DEGRADED=true` permanent.
+//!     Merged-query truncation now gets its own informational marker
+//!     (`MERGED_LIST_TRUNCATED=true`) instead of `PR_STATE_DEGRADED`; the
+//!     open-PR queries are unchanged (a truncated one could hide a live PR's
+//!     branch, so they keep degrading).
+//!   - S6: `git worktree list --porcelain` emits paths raw, so a worktree
+//!     path containing a TAB makes `path<TAB>branch` ambiguous to a naive
+//!     first-TAB split — SKILL.md says "split on the TAB", but the correct
+//!     parse (branch names can never contain one) is the LAST TAB.
+//!
 //! Fast tier on purpose: no daemon, no PTY, no TUI — just git plus a stub
 //! `gh` on `PATH`. Hermetic: `origin` is a local bare repo (no network), and
 //! the stub `gh` replaces the real one so CI's authenticated, real `gh`
@@ -168,6 +200,17 @@ struct RepoFixture {
     /// `feat/merged`'s current tip SHA — a real, but for `feat/unmerged`
     /// STALE, sha used to pin the Renovate branch-reuse negative case.
     feat_merged_sha: String,
+    /// `feat/tab-test`'s current tip SHA. `feat/tab-test` is checked out in
+    /// its own worktree whose PATH itself contains a literal TAB — fork
+    /// issue #152 S6: `git worktree list --porcelain` emits paths completely
+    /// unescaped (confirmed by direct measurement). That worktree is left
+    /// genuinely UNMERGED (never pushed, no ancestry to `main`), so it stays
+    /// invisible to every OTHER test in this file, which never seeds a
+    /// `merged.tsv` entry for it; only a test that seeds this SHA into a
+    /// stub `merged.tsv` response (the same squash/rebase-merge mechanism
+    /// `feat_unmerged_sha` exercises) makes it appear in `WORKTREES:` at
+    /// all.
+    tab_in_path_sha: String,
 }
 
 /// Shared body for [`build_fixture`] and [`build_fixture_with_upstream`] —
@@ -302,6 +345,34 @@ fn build_repo_fixture(upstream_url: Option<&str>) -> RepoFixture {
         &["worktree", "add", fork_only_wt_str, "fork-only"],
     );
 
+    // A worktree whose PATH contains a literal TAB, on its own diverging
+    // branch — never pushed, never merged into `main`, so it stays invisible
+    // to every OTHER test in this file (fork issue #152 S6).
+    let tab_in_path_worktree = root.path().join("wt-tab\t-inside");
+    let tab_in_path_wt_str = tab_in_path_worktree
+        .to_str()
+        .expect("tab-in-path worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/tab-test",
+            tab_in_path_wt_str,
+            "main",
+        ],
+    );
+    std::fs::write(tab_in_path_worktree.join("tabbed.txt"), "tab\n").expect("write tab-test file");
+    run_git(&tab_in_path_worktree, &["add", "tabbed.txt"]);
+    run_git(
+        &tab_in_path_worktree,
+        &["commit", "-m", "feat: worktree with a TAB in its path"],
+    );
+    let tab_in_path_sha = run_git(&clone_dir, &["rev-parse", "feat/tab-test"])
+        .trim()
+        .to_string();
+
     run_git(&clone_dir, &["fetch", "--prune", "--quiet", "origin"]);
 
     RepoFixture {
@@ -311,6 +382,7 @@ fn build_repo_fixture(upstream_url: Option<&str>) -> RepoFixture {
         feat_merged_worktree,
         feat_unmerged_sha,
         feat_merged_sha,
+        tab_in_path_sha,
     }
 }
 
@@ -389,6 +461,99 @@ fn build_fixture_root_on_merged_branch() -> RootOnMergedFixture {
     }
 }
 
+/// A fixture with a SECOND, LINKED worktree checked out on the default
+/// branch (`main`) itself — distinct from the main working tree — alongside
+/// a genuinely merged feature worktree. Fork issue #152 B1 (blocker): path
+/// identity (`$main_worktree_path`) only ever covers the MAIN working tree,
+/// so a linked worktree on `main` passes every existing guard and `git
+/// worktree remove` SUCCEEDS on it, unlike the root checkout —
+/// `cleanup.sh:281`/`:292` already call `is_long_lived` for the local/remote
+/// loops, so the worktree loop is the odd one out.
+struct DefaultBranchLinkedWorktreeFixture {
+    _root: tempfile::TempDir,
+    /// Where `cleanup.sh` is actually run from — neither the `main` worktree
+    /// nor the merged feature worktree (a genuinely merged, non-default-
+    /// branch feature worktree also exists in this fixture as the POSITIVE
+    /// anchor — fork issue #140 reviewer F6's lesson applies here too:
+    /// without one, "the `main` worktree never appears" would pass just as
+    /// well if the guard excluded every worktree outright — but its path is
+    /// not read back by name; the test observes it through `WORKTREES:`
+    /// instead), so the `main` worktree is excluded (or not) purely by the
+    /// guard under test, not by happening to be "the current worktree".
+    runner_worktree: PathBuf,
+}
+
+fn build_fixture_default_branch_linked_worktree() -> DefaultBranchLinkedWorktreeFixture {
+    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let (_origin_git_dir, clone_dir) = init_repo(root.path(), None);
+
+    // A genuinely merged feature branch/worktree — the positive anchor.
+    let feat_merged_worktree = root.path().join("wt-feat-merged");
+    let feat_merged_wt_str = feat_merged_worktree
+        .to_str()
+        .expect("feat/merged worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/merged",
+            feat_merged_wt_str,
+            "main",
+        ],
+    );
+    std::fs::write(feat_merged_worktree.join("feature.txt"), "merged\n")
+        .expect("write feature file");
+    run_git(&feat_merged_worktree, &["add", "feature.txt"]);
+    run_git(
+        &feat_merged_worktree,
+        &["commit", "-m", "feat: merged work"],
+    );
+    run_git(&clone_dir, &["merge", "--ff-only", "feat/merged"]);
+    run_git(&clone_dir, &["push", "origin", "main"]);
+    run_git(&clone_dir, &["push", "origin", "feat/merged"]);
+
+    // A SECOND, LINKED worktree on the default branch itself. `clone_dir`
+    // (the main working tree) is already on `main`, so this needs `--force`
+    // — a real `git worktree add ../deck-main main` from a checkout NOT
+    // currently on `main` needs no such flag; `--force` here is a fixture
+    // artifact of building both in the same clone, not part of the scenario
+    // under test.
+    let main_linked_worktree = root.path().join("wt-main");
+    let main_wt_str = main_linked_worktree
+        .to_str()
+        .expect("main worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &["worktree", "add", "--force", main_wt_str, "main"],
+    );
+
+    // A third worktree to actually run cleanup.sh from.
+    let runner_worktree = root.path().join("wt-runner");
+    let runner_wt_str = runner_worktree
+        .to_str()
+        .expect("runner worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "scratch/runner",
+            runner_wt_str,
+            "main",
+        ],
+    );
+
+    run_git(&clone_dir, &["fetch", "--prune", "--quiet", "origin"]);
+
+    DefaultBranchLinkedWorktreeFixture {
+        _root: root,
+        runner_worktree,
+    }
+}
+
 /// A minimal repo (one commit on `main`, no extra branches or worktrees) for
 /// the PR-state tests, which care about `slug_from_remote` and the `gh`
 /// queries it feeds — not the worktree/branch offering logic already
@@ -433,6 +598,87 @@ fn build_fixture_unparseable_upstream() -> MinimalRepo {
         Some(&format!("https://github.com/{FORK_SLUG}.git")),
         Some("not-a-valid-owner-repo-url"),
     )
+}
+
+/// A fixture whose main working tree's `.git` directory has been relocated
+/// via `git init --separate-git-dir` — fork issue #152 S2. `git rev-parse
+/// --path-format=absolute --git-common-dir` still succeeds (exit 0) and
+/// returns the RELOCATED common dir's own absolute path, but
+/// `cleanup.sh:87-90` then takes `dirname` of THAT to derive the main
+/// working tree's path — which, with a relocated git dir, is the relocated
+/// dir's PARENT, not the actual worktree (measured directly: confirmed
+/// `dirname` of the relocated common dir is the tempdir root, not
+/// `clone_dir`). This is the portable way to reach a wrong/unusable
+/// derivation without needing an old git binary (a genuinely unrecognized
+/// `--path-format` flag on git < 2.31 was probed separately — see the
+/// `work-done` report for what was measured). Not built on [`init_repo`]:
+/// that helper always does a plain `git init`, with no hook for relocating
+/// the git dir at creation time.
+struct MainWorktreeUndeterminableFixture {
+    _root: tempfile::TempDir,
+    /// A second, linked worktree — `cleanup.sh` must run from HERE, not the
+    /// main working tree itself, so the `$main_worktree_path` guard (not
+    /// merely the "am I the CURRENT worktree" check) is what is actually
+    /// exercised.
+    runner_worktree: PathBuf,
+}
+
+fn build_fixture_separate_git_dir() -> MainWorktreeUndeterminableFixture {
+    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let origin_dir = root.path().join("origin.git");
+    let clone_dir = root.path().join("clone");
+    let gitdir_elsewhere = root.path().join("gitdir-elsewhere");
+    let origin_dir_str = origin_dir.to_str().expect("origin path is UTF-8");
+    let clone_dir_str = clone_dir.to_str().expect("clone path is UTF-8");
+    let gitdir_str = gitdir_elsewhere
+        .to_str()
+        .expect("relocated git dir path is UTF-8");
+
+    run_git(
+        root.path(),
+        &["init", "--bare", "-b", "main", origin_dir_str],
+    );
+    run_git(
+        root.path(),
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            gitdir_str,
+            clone_dir_str,
+        ],
+    );
+    run_git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+    run_git(&clone_dir, &["remote", "add", "origin", origin_dir_str]);
+    std::fs::write(clone_dir.join("README.md"), "fixture\n").expect("write seed file");
+    run_git(&clone_dir, &["add", "README.md"]);
+    run_git(&clone_dir, &["commit", "-m", "initial"]);
+    run_git(&clone_dir, &["push", "origin", "main"]);
+    run_git(&clone_dir, &["remote", "set-head", "origin", "main"]);
+
+    let runner_worktree = root.path().join("wt-runner");
+    let runner_wt_str = runner_worktree
+        .to_str()
+        .expect("runner worktree path is UTF-8");
+    run_git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "scratch/runner",
+            runner_wt_str,
+            "main",
+        ],
+    );
+
+    run_git(&clone_dir, &["fetch", "--prune", "--quiet", "origin"]);
+
+    MainWorktreeUndeterminableFixture {
+        _root: root,
+        runner_worktree,
+    }
 }
 
 /// A generated stub `gh` binary. Every scenario response starts empty, so a
@@ -487,15 +733,36 @@ impl GhStub {
         self.write_response("open_upstream.tsv", &branches.join("\n"));
     }
 
-    /// `merged.tsv` lines are "name<TAB>sha", matching exactly what real
-    /// `gh`'s own `--jq '... | @tsv'` filter emits and what
-    /// `merged_sha_matches` reads as its needle (fork issue #140 reviewer F5
-    /// / T3): the squash/rebase path is only exercised through this, never
-    /// through the ancestry test.
+    /// The response the stub emits — "name<TAB>sha" — matches exactly what
+    /// real `gh`'s own `--jq '... | @tsv'` filter emits (post cross-repo
+    /// filtering) and what `merged_sha_matches` reads as its needle (fork
+    /// issue #140 reviewer F5 / T3): the squash/rebase path is only
+    /// exercised through this, never through the ancestry test. A thin
+    /// wrapper over [`set_merged_with_cross_repo`] with every entry marked
+    /// same-repo (`cross_repo = false`), for scenarios that don't care about
+    /// cross-repo filtering at all.
     fn set_merged(&self, entries: &[(&str, &str)]) {
+        let with_flag: Vec<(&str, &str, bool)> = entries
+            .iter()
+            .map(|(name, sha)| (*name, *sha, false))
+            .collect();
+        self.set_merged_with_cross_repo(&with_flag);
+    }
+
+    /// Like [`set_merged`], but each entry additionally carries whether it
+    /// is a CROSS-REPO (fork) PR. The stub itself applies exactly the same
+    /// `select(.isCrossRepository | not)` filter real `gh --jq` applies
+    /// server-side, so what `cleanup.sh` actually reads back is already
+    /// post-filter — the same as talking to the real `gh` binary. Fork issue
+    /// #152 S3: `--limit 200` bounds what `gh` FETCHES; the filter then
+    /// drops rows; a client-side row count taken from what `cleanup.sh`
+    /// receives can only ever count SURVIVORS, never the raw fetched-page
+    /// size, so a full page containing cross-repo rows must be reachable
+    /// here to prove that gap.
+    fn set_merged_with_cross_repo(&self, entries: &[(&str, &str, bool)]) {
         let body = entries
             .iter()
-            .map(|(name, sha)| format!("{name}\t{sha}"))
+            .map(|(name, sha, cross_repo)| format!("{name}\t{sha}\t{cross_repo}"))
             .collect::<Vec<_>>()
             .join("\n");
         self.write_response("merged.tsv", &body);
@@ -597,7 +864,7 @@ fn gh_stub_script(dir: &Path) -> String {
          \x20\x20{fork_slug})\n\
          \x20\x20\x20\x20case \"$state\" in\n\
          \x20\x20\x20\x20\x20\x20open) cat {open_fork_path} ;;\n\
-         \x20\x20\x20\x20\x20\x20merged) cat {merged_path} ;;\n\
+         \x20\x20\x20\x20\x20\x20merged) awk -F'\\t' '$3 != \"true\" {{ print $1 \"\\t\" $2 }}' {merged_path} ;;\n\
          \x20\x20\x20\x20esac\n\
          \x20\x20\x20\x20;;\n\
          \x20\x20{upstream_slug})\n\
@@ -676,6 +943,17 @@ impl CleanupOutput {
         self.stdout
             .lines()
             .any(|line| line.trim() == "PR_STATE_DEGRADED=true")
+    }
+
+    /// The INFORMATIONAL marker fork issue #152 S4 requires for a truncated
+    /// MERGED-PR query — deliberately separate from [`Self::degraded`]:
+    /// truncation there only means a branch goes unoffered (benign,
+    /// under-offers), so it must not make `PR_STATE_DEGRADED=true`
+    /// permanent once this repo crosses 200 merged PRs (91/200 today).
+    fn merged_truncated(&self) -> bool {
+        self.stdout
+            .lines()
+            .any(|line| line.trim() == "MERGED_LIST_TRUNCATED=true")
     }
 }
 
@@ -1033,30 +1311,116 @@ fn release_cleanup_010_present_but_unparseable_upstream_degrades() {
     );
 }
 
-/// Scenario: the stub `gh` returns exactly 200 merged-PR rows — a full page
-/// for `--limit 200`. Confirm this sets `PR_STATE_DEGRADED=true`, since a
-/// full page can never be distinguished from a page that was silently
-/// truncated — target behaviour 4 (fork issue #140).
+/// Scenario: two independent runs pin fork issue #152 S4's redesign of what
+/// a full `--limit`-bounded page means — this SUPERSEDES the original round
+/// 2 (fork issue #140 target behaviour 4) assertion for the MERGED half,
+/// which S4 identified as self-disabling by design. First run: the stub `gh`
+/// returns exactly 200 merged-PR rows (a full page for `--limit 200`) and
+/// nothing else. Confirms this does NOT set `PR_STATE_DEGRADED=true` — at
+/// 91/200 merged PRs today, this repo will eventually cross 200, at which
+/// point a full page would occur on EVERY run and the marker would become
+/// PERMANENT, disabling SKILL.md Step 6's "delete nothing until it comes
+/// back clean" for good. Truncation there only means a later merged branch
+/// goes unoffered (benign, under-offers), so it must instead be surfaced
+/// INFORMATIONALLY via `MERGED_LIST_TRUNCATED=true`. Second run: the stub
+/// `gh` returns exactly 1000 open-PR rows (a full page for `--limit 1000`).
+/// Confirms this STILL sets `PR_STATE_DEGRADED=true`, unchanged from fork
+/// issue #140 target behaviour 4 — a truncated OPEN-PR query is the
+/// direction that can offer a live PR's branch for deletion, which the
+/// script's own comment already calls out as the reason its limit is set
+/// higher than the merged query's.
 #[test]
-fn release_cleanup_011_full_page_merged_query_degrades() {
+fn release_cleanup_011_full_page_merged_is_informational_full_page_open_still_degrades() {
     let fixture = build_fixture();
-    let gh = GhStub::new();
-    let full_page: Vec<(String, String)> = (0..200)
+
+    let gh_merged = GhStub::new();
+    let full_merged_page: Vec<(String, String)> = (0..200)
         .map(|i| (format!("synthetic/{i}"), format!("{i:040x}")))
         .collect();
-    let full_page_refs: Vec<(&str, &str)> = full_page
+    let full_merged_refs: Vec<(&str, &str)> = full_merged_page
         .iter()
         .map(|(name, sha)| (name.as_str(), sha.as_str()))
         .collect();
-    gh.set_merged(&full_page_refs);
+    gh_merged.set_merged(&full_merged_refs);
+    let out_merged = run_cleanup(&fixture.feat_merged_worktree, gh_merged.path());
+    assert!(
+        !out_merged.degraded(),
+        "a full 200-row MERGED page ALONE must NOT set `PR_STATE_DEGRADED=true` \
+         (fork issue #152 S4) — at 200+ merged PRs this repo would otherwise hit \
+         a full page on every run, making the marker permanent and disabling \
+         SKILL.md Step 6 for good (91/200 merged today). Full \
+         stdout:\n{}\nstderr:\n{}",
+        out_merged.stdout,
+        out_merged.stderr
+    );
+    assert!(
+        out_merged.merged_truncated(),
+        "a full 200-row MERGED page must still be surfaced INFORMATIONALLY via \
+         `MERGED_LIST_TRUNCATED=true`, separate from `PR_STATE_DEGRADED` (fork \
+         issue #152 S4) — silently dropping the signal entirely would hide that \
+         a later merged branch may go unoffered. Full stdout:\n{}\nstderr:\n{}",
+        out_merged.stdout,
+        out_merged.stderr
+    );
+
+    let gh_open = GhStub::new();
+    let full_open_page: Vec<String> = (0..1000).map(|i| format!("synthetic-open/{i}")).collect();
+    let full_open_refs: Vec<&str> = full_open_page.iter().map(String::as_str).collect();
+    gh_open.set_open_fork(&full_open_refs);
+    let out_open = run_cleanup(&fixture.feat_merged_worktree, gh_open.path());
+    assert!(
+        out_open.degraded(),
+        "a full 1000-row OPEN page must still set `PR_STATE_DEGRADED=true` — \
+         unlike merged truncation, a truncated OPEN-PR query could hide a live \
+         PR's branch and offer it for deletion (fork issue #140 target \
+         behaviour 4, unchanged by fork issue #152 S4). Full \
+         stdout:\n{}\nstderr:\n{}",
+        out_open.stdout,
+        out_open.stderr
+    );
+}
+
+/// Scenario: the stub `gh` returns a genuinely FULL fetched page (200 raw
+/// rows for `--limit 200`) where 5 of those rows are CROSS-REPO and get
+/// filtered out server-side — exactly what real `gh --jq
+/// 'select(.isCrossRepository | not)'` does — leaving only 195 survivors.
+/// Confirms `MERGED_LIST_TRUNCATED=true` still appears (fork issue #152 S3):
+/// counting must happen against the RAW fetched-page size, not the
+/// post-filter survivor count `cleanup.sh` itself can see in its own
+/// stdout — a client-side survivor count of 195 is `< 200` and would never
+/// trip a naive `-ge 200` check, silently hiding that the underlying page
+/// was genuinely full. Also confirms this still does not set
+/// `PR_STATE_DEGRADED=true` (fork issue #152 S4 stays in force regardless of
+/// how the truncation was detected).
+#[test]
+fn release_cleanup_020_merged_page_truncation_counted_before_cross_repo_filter() {
+    let fixture = build_fixture();
+    let gh = GhStub::new();
+    let mut entries: Vec<(String, String, bool)> = (0..195)
+        .map(|i| (format!("synthetic/{i}"), format!("{i:040x}"), false))
+        .collect();
+    entries.extend((195..200).map(|i| (format!("fork/synthetic/{i}"), format!("{i:040x}"), true)));
+    let entries_refs: Vec<(&str, &str, bool)> = entries
+        .iter()
+        .map(|(name, sha, cross_repo)| (name.as_str(), sha.as_str(), *cross_repo))
+        .collect();
+    gh.set_merged_with_cross_repo(&entries_refs);
     let out = run_cleanup(&fixture.feat_merged_worktree, gh.path());
 
     assert!(
-        out.degraded(),
-        "a `gh pr list --state merged --limit 200 ...` response with exactly \
-         200 rows — a full page — must produce `PR_STATE_DEGRADED=true`, \
-         since later merged PRs on a truncated page would silently leave \
-         their branches unoffered (fork issue #140 target behaviour 4). Full \
+        out.merged_truncated(),
+        "a genuinely full 200-row fetched MERGED page, 5 of whose rows are \
+         cross-repo and get filtered out (195 survivors), must still be \
+         detected as truncated (fork issue #152 S3) — counting survivors \
+         AFTER the client-side `--jq` filter (the pre-#152 approach) can \
+         never see the raw fetched-page size. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.degraded(),
+        "merged-query truncation — however it is detected — must never set \
+         `PR_STATE_DEGRADED=true` (fork issue #152 S4). Full \
          stdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
@@ -1148,6 +1512,268 @@ fn release_cleanup_014_stale_merged_sha_does_not_offer_recreated_branch() {
         !out.remote_branches().contains(&"feat/unmerged".to_string()),
         "REMOTE_BRANCHES: same stale-sha check, for `origin/feat/unmerged`. \
          Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// Scenario: a SECOND, LINKED worktree sits on the default branch (`main`)
+/// itself, alongside a genuinely merged feature worktree, and `cleanup.sh`
+/// runs from neither. Confirms the linked `main` worktree is NEVER offered
+/// in `WORKTREES:` — fork issue #152 B1 (blocker): `cleanup.sh:265-266`
+/// dropped `! is_long_lived "$br"` in favor of a literal `[ "$br" !=
+/// "fork-only" ]`, so path identity (which only ever covers the MAIN working
+/// tree) is the sole remaining guard, and a linked worktree on `main` is not
+/// the main working tree — `git worktree remove` SUCCEEDS on it, unlike the
+/// root checkout, which is strictly worse than the original fork issue #140
+/// symptom. Keeps the genuinely merged feature worktree as a positive
+/// anchor — fork issue #140 reviewer F6's lesson applies here too: without
+/// it, "main never appears" would pass just as well if the guard excluded
+/// every worktree outright.
+#[test]
+fn release_cleanup_015_worktrees_exclude_a_linked_worktree_on_the_default_branch() {
+    let fixture = build_fixture_default_branch_linked_worktree();
+    let gh = GhStub::new();
+    let out = run_cleanup(&fixture.runner_worktree, gh.path());
+
+    assert!(
+        !out.worktree_branches().contains(&"main".to_string()),
+        "WORKTREES: a LINKED worktree checked out on the default branch \
+         (`main`) must never be offered — `git worktree remove` succeeds on \
+         it (unlike the root checkout), so offering it is strictly worse \
+         than the original fork issue #140 symptom (fork issue #152 B1). \
+         Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.worktree_branches().contains(&"feat/merged".to_string()),
+        "WORKTREES: a genuinely merged, non-default-branch feature worktree \
+         must still be offered — the fix must exclude the default branch \
+         specifically, not every worktree (positive anchor). Full \
+         stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// Scenario: `origin`'s remote URL is a credential-bearing, non-`github.com`
+/// URL (`https://user:SECRET@github.enterprise.corp/o/r.git`) — the
+/// "doesn't resolve to a GitHub slug" branch `slug_from_url` never strips
+/// userinfo from, since it only strips when the URL matches `github.com` at
+/// all. Confirms the run still degrades and still names `origin` as the
+/// offending remote, but the raw credential-bearing URL NEVER reaches
+/// stdout — fork issue #152 S1: any non-`github.com` host degrades on every
+/// run, so an Enterprise remote configured this way would otherwise leak its
+/// token on every single invocation. Also serves as S5: nothing in the
+/// pre-#152 suite asserted `DEGRADED_REASONS:` CONTENT at all, which is
+/// exactly why S1 shipped through a 14-test suite.
+#[test]
+fn release_cleanup_016_degraded_reason_never_leaks_origin_credentials() {
+    let secret = "s3cr3t-token";
+    let bad_url = format!("https://user:{secret}@github.enterprise.corp/o/r.git");
+    let fixture = build_minimal_repo(Some(&bad_url), None);
+    let gh = GhStub::new();
+    let out = run_cleanup(&fixture.dir, gh.path());
+
+    assert!(
+        out.degraded(),
+        "an `origin` URL that cannot be resolved to a GitHub owner/repo slug \
+         must still produce `PR_STATE_DEGRADED=true` (fork issue #140 target \
+         behaviour 2, unaffected by the redaction fix). Full \
+         stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains(secret),
+        "the raw credential (`{secret}`) must NEVER appear anywhere in \
+         stdout — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("user:"),
+        "the URL's userinfo (`user:`) must NEVER appear anywhere in stdout \
+         — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    let reasons = out.section("DEGRADED_REASONS:");
+    assert!(
+        reasons
+            .iter()
+            .any(|line| line.to_lowercase().contains("origin")),
+        "`DEGRADED_REASONS:` must still name `origin` as the offending \
+         remote even once the raw URL is redacted — an operator needs to \
+         know WHICH remote to fix. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// Scenario: same as
+/// [`release_cleanup_016_degraded_reason_never_leaks_origin_credentials`],
+/// but for `upstream` — `origin` derives cleanly (so the run's ONLY
+/// degradation source is `upstream`), and the credential-bearing URL is
+/// configured on `upstream` instead. Confirms the same content-leak and
+/// content-names-the-remote guarantees hold for `upstream` too — fork issue
+/// #152 S1 (both interpolation sites, `cleanup.sh:123` and `:135`, share the
+/// same bug).
+#[test]
+fn release_cleanup_017_degraded_reason_never_leaks_upstream_credentials() {
+    let secret = "s3cr3t-token";
+    let good_origin = format!("https://github.com/{FORK_SLUG}.git");
+    let bad_upstream = format!("https://user:{secret}@github.enterprise.corp/o/r.git");
+    let fixture = build_minimal_repo(Some(&good_origin), Some(&bad_upstream));
+    let gh = GhStub::new();
+    let out = run_cleanup(&fixture.dir, gh.path());
+
+    assert!(
+        out.degraded(),
+        "an `upstream` URL that cannot be resolved to a GitHub owner/repo \
+         slug must still produce `PR_STATE_DEGRADED=true` (fork issue #140 \
+         target behaviour 3's 'present but unparseable' half, unaffected by \
+         the redaction fix). Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains(secret),
+        "the raw credential (`{secret}`) must NEVER appear anywhere in \
+         stdout — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("user:"),
+        "the URL's userinfo (`user:`) must NEVER appear anywhere in stdout \
+         — fork issue #152 S1. Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    let reasons = out.section("DEGRADED_REASONS:");
+    assert!(
+        reasons
+            .iter()
+            .any(|line| line.to_lowercase().contains("upstream")),
+        "`DEGRADED_REASONS:` must still name `upstream` as the offending \
+         remote even once the raw URL is redacted. Full \
+         stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// Scenario: `origin`'s credential-bearing URL carries a secret containing
+/// BOTH `/` and `@` (an Azure-DevOps-PAT shape) — these defeat a naive
+/// userinfo-stripping regex like `slug_from_url`'s own `[^@/]*@` class,
+/// which stops at the first `/` or `@` it meets and would leave most of the
+/// secret exposed. Confirms the full secret still never reaches stdout —
+/// fork issue #152 S1: a fix that reuses `slug_from_url`'s existing
+/// character class for redaction (rather than simply naming the remote,
+/// never the URL) would pass
+/// [`release_cleanup_016_degraded_reason_never_leaks_origin_credentials`]
+/// while failing this one.
+#[test]
+fn release_cleanup_018_degraded_reason_never_leaks_a_slash_and_at_containing_secret() {
+    let secret = "sec/ret@part-9f3e";
+    let bad_url = format!("https://user:{secret}@github.enterprise.corp/o/r.git");
+    let fixture = build_minimal_repo(Some(&bad_url), None);
+    let gh = GhStub::new();
+    let out = run_cleanup(&fixture.dir, gh.path());
+
+    assert!(
+        out.degraded(),
+        "an `origin` URL that cannot be resolved to a GitHub owner/repo slug \
+         must still produce `PR_STATE_DEGRADED=true`. Full \
+         stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains(secret),
+        "the raw credential (`{secret}`, containing `/` and `@`) must NEVER \
+         appear anywhere in stdout, even in part — a redaction built on \
+         `slug_from_url`'s own `[^@/]*@` userinfo class would stop at the \
+         first `/` or `@` and leak the rest (fork issue #152 S1). Full \
+         stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("user:"),
+        "the URL's userinfo (`user:`) must NEVER appear anywhere in stdout. \
+         Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// Scenario: the fixture's main working tree has had its `.git` directory
+/// relocated via `git init --separate-git-dir`. `git rev-parse
+/// --path-format=absolute --git-common-dir` still succeeds (exit 0) and
+/// returns the RELOCATED common dir's own absolute path, but `dirname` of
+/// THAT is the relocated dir's PARENT, not the actual worktree (confirmed by
+/// direct measurement, not the old-git `--path-format`-unrecognized theory —
+/// see this task's `work-done` report for what was measured and why it
+/// settles the reviewer/auditor disagreement on `cleanup.sh:87-90`).
+/// `cleanup.sh` runs from a SEPARATE linked worktree, so the wrong
+/// derivation genuinely matters — not merely "am I the current worktree".
+/// Confirms the run sets `PR_STATE_DEGRADED=true` rather than silently
+/// trusting a main-worktree-path derivation that cannot be verified, or
+/// producing no output at all — fork issue #152 S2.
+#[test]
+fn release_cleanup_019_undeterminable_main_worktree_path_degrades() {
+    let fixture = build_fixture_separate_git_dir();
+    let gh = GhStub::new();
+    let out = run_cleanup(&fixture.runner_worktree, gh.path());
+
+    assert!(
+        out.degraded(),
+        "when the main working tree's own path cannot be trusted (here: a \
+         relocated `.git` directory via `--separate-git-dir`, which makes \
+         `dirname` of `git rev-parse --git-common-dir` compute the relocated \
+         dir's PARENT rather than the worktree), the script must set \
+         `PR_STATE_DEGRADED=true` rather than silently offering the main \
+         working tree for cleanup or producing no output at all (fork issue \
+         #152 S2). Full stdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+/// Scenario: a worktree whose PATH itself contains a literal TAB is checked
+/// out on its own branch (`feat/tab-test`), made to look squash/rebase
+/// merged via the same `merged.tsv` exact-SHA mechanism
+/// [`release_cleanup_013_squash_merged_branch_offered_via_exact_sha_match`]
+/// exercises. Confirms it still parses to the CORRECT branch name in
+/// `WORKTREES:` — fork issue #152 S6: `git worktree list --porcelain` emits
+/// paths completely unescaped, so a path containing a TAB makes
+/// `path<TAB>branch` ambiguous to a naive first-TAB split (SKILL.md says
+/// "split on the TAB", implying exactly that); branch names can never
+/// contain a TAB (a legal refname character it is not), so splitting on the
+/// LAST TAB — what this test harness's own `worktree_branches()` already
+/// does — is the unambiguous parse this pins as the correct contract for
+/// any consumer. NOTE for the `work-done` report: this specific assertion
+/// was measured to already pass against the CURRENT `cleanup.sh` and the
+/// CURRENT harness (both already use/tolerate a raw, unescaped TAB
+/// correctly) — it closes a previously ZERO-coverage gap rather than driving
+/// a `cleanup.sh` code fix. The remaining S6 action item (SKILL.md's "the
+/// TAB" wording) is documentation-only and left to the coder.
+#[test]
+fn release_cleanup_021_worktree_path_containing_a_tab_parses_to_the_correct_branch() {
+    let fixture = build_fixture();
+    let gh = GhStub::new();
+    gh.set_merged(&[("feat/tab-test", fixture.tab_in_path_sha.as_str())]);
+    let out = run_cleanup(&fixture.feat_merged_worktree, gh.path());
+
+    assert!(
+        out.worktree_branches()
+            .contains(&"feat/tab-test".to_string()),
+        "WORKTREES: a worktree whose PATH itself contains a literal TAB must \
+         still parse to its correct branch name (`feat/tab-test`) — fork \
+         issue #152 S6. Full stdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
     );
