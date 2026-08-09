@@ -648,7 +648,7 @@ mod tests {
     /// mechanism as `009`, not inferred from the leader's exit),
     /// `terminate_child_with_grace_and_wait_forcing_group_backstop` runs with
     /// a 200ms grace window; both the leader and the resistant descendant are
-    /// only reaped/killed after that window elapses (fork #143: the forcing
+    /// only reaped after that window elapses (fork #143: the forcing
     /// branch no longer polls for an early exit, so it never reaps the
     /// leader before sending the group SIGKILL), and both are confirmed gone
     /// afterward via a bounded `kill(pid, 0)` poll.
@@ -768,8 +768,10 @@ mod tests {
 
         impl portable_pty::Child for SlowReapChild {
             fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-                // Never reports exited via polling, so the caller always runs
-                // phase 3 and reaches the final reap.
+                // Unreachable since fork #143: the detached variant this
+                // test drives no longer polls `try_wait` at all during its
+                // grace phase, so this exists only to satisfy the `Child`
+                // trait and is never called here.
                 Ok(None)
             }
             fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
@@ -836,13 +838,24 @@ mod tests {
     /// (`process_id() -> None`, which routes every signal through the
     /// observable `ChildKiller::kill` fallback instead of a real `killpg`,
     /// so this needs no OS process at all) records every `try_wait`/`wait`/
-    /// `kill` call it receives, in call order, into a shared log.
-    /// `terminate_child_with_grace_and_wait_forcing_group_backstop` runs
-    /// against it with a short grace window; the log is then asserted to
-    /// contain no `try_wait` calls at all (the forcing path must not poll —
-    /// polling is exactly what reaps early) and exactly two `kill` calls
-    /// (phase 1's SIGTERM, then phase 3's forcing SIGKILL), both preceding
-    /// the single `wait` call that performs the actual reap.
+    /// `kill` call it receives, in call order, into a shared log. Both
+    /// forcing entry points the fix touched are driven against their own
+    /// instance of the stand-in:
+    /// `terminate_child_with_grace_and_wait_forcing_group_backstop`
+    /// (test-only) and
+    /// `terminate_child_with_grace_and_detached_reap_forcing_group_backstop`
+    /// (the one that ships, called from `issue_dispatch_run.rs`'s
+    /// worktree-timeout escalation) — the two bodies share no code, so a
+    /// `try_wait` poll reintroduced into either one is a live #143
+    /// recurrence and has to be caught here, not just on the twin that
+    /// happens to be test-only. Each log is asserted to contain no
+    /// `try_wait` calls at all (the forcing path must not poll — polling is
+    /// exactly what reaps early) and exactly two `kill` calls (phase 1's
+    /// SIGTERM, then phase 3's forcing SIGKILL), both preceding the single
+    /// `wait` call that performs the actual reap. The detached variant's
+    /// final `wait` runs on a background thread (fork #136), so that half
+    /// polls its log for the reap to land before asserting, rather than
+    /// racing the call's return against the background reap.
     #[cfg(unix)]
     #[spec("orchestration/worktree/013")]
     #[test]
@@ -883,39 +896,80 @@ mod tests {
             }
         }
 
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut boxed_child: Box<dyn portable_pty::Child + Send + Sync> =
-            Box::new(OrderingProbeChild { log: log.clone() });
+        // Shared by both halves below: the ordering invariant is identical
+        // for the sync and detached forcing entry points.
+        fn assert_ordering_invariant(calls: &[&'static str]) {
+            assert!(
+                !calls.contains(&"try_wait"),
+                "the forcing backstop must never poll `try_wait` — doing so would reap the \
+                 direct child before phase 3 can safely derive a pgid from it; calls were: \
+                 {calls:?}"
+            );
+            let last_kill = calls.iter().rposition(|c| *c == "kill");
+            let first_wait = calls.iter().position(|c| *c == "wait");
+            match (last_kill, first_wait) {
+                (Some(k), Some(w)) => assert!(
+                    k < w,
+                    "the reap (`wait`) must happen strictly after the last group signal \
+                     (`kill`), never before it; calls were: {calls:?}"
+                ),
+                _ => panic!("expected both a `kill` call and a `wait` call; calls were: {calls:?}"),
+            }
+            assert_eq!(
+                calls.iter().filter(|c| **c == "kill").count(),
+                2,
+                "expected exactly two signal attempts (phase 1's SIGTERM, then phase 3's \
+                 forcing SIGKILL) — with process_id() -> None both collapse into an \
+                 indistinguishable `kill` call, so this counts attempts, not confirmed signal \
+                 identity (see the CATALOG \"Does not assert\" entry); calls were: {calls:?}"
+            );
+        }
+
         let group = AgentProcessGroup;
 
+        // Half 1: the sync twin (test-only — no production caller; `010`
+        // covers it end to end against a real process).
+        let sync_log = Arc::new(Mutex::new(Vec::new()));
+        let mut boxed_child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(OrderingProbeChild {
+                log: sync_log.clone(),
+            });
         super::terminate_child_with_grace_and_wait_forcing_group_backstop(
             &mut boxed_child,
             std::time::Duration::from_millis(20),
             &group,
         );
+        assert_ordering_invariant(&sync_log.lock().unwrap().clone());
 
-        let calls = log.lock().unwrap().clone();
-        assert!(
-            !calls.contains(&"try_wait"),
-            "the forcing backstop must never poll `try_wait` — doing so would reap the direct \
-             child before phase 3 can safely derive a pgid from it; calls were: {calls:?}"
+        // Half 2: the detached twin — the one that actually ships. This is
+        // the half fork #143's exact defect would return through if phase 2
+        // ever regained a `try_wait` poll.
+        let detached_log = Arc::new(Mutex::new(Vec::new()));
+        let detached_child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(OrderingProbeChild {
+                log: detached_log.clone(),
+            });
+        super::terminate_child_with_grace_and_detached_reap_forcing_group_backstop(
+            detached_child,
+            std::time::Duration::from_millis(20),
+            &group,
         );
-        let last_kill = calls.iter().rposition(|c| *c == "kill");
-        let first_wait = calls.iter().position(|c| *c == "wait");
-        match (last_kill, first_wait) {
-            (Some(k), Some(w)) => assert!(
-                k < w,
-                "the reap (`wait`) must happen strictly after the last group signal (`kill`), \
-                 never before it; calls were: {calls:?}"
-            ),
-            _ => panic!("expected both a `kill` call and a `wait` call; calls were: {calls:?}"),
+        // The final `wait` runs on a detached thread (fork #136), so poll
+        // for it to land before asserting rather than racing the call's
+        // return against the background reap.
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let calls = detached_log.lock().unwrap().clone();
+            if calls.contains(&"wait") {
+                assert_ordering_invariant(&calls);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < confirm_deadline,
+                "the detached reap never completed; calls were: {calls:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(
-            calls.iter().filter(|c| **c == "kill").count(),
-            2,
-            "expected exactly two signals (SIGTERM then the forcing SIGKILL); calls were: \
-             {calls:?}"
-        );
     }
 
     /// Fork issue #136 finding 2 (both the reviewer and the auditor, and the
