@@ -736,11 +736,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** `gh` invocation-shape correctness (`--repo`/`--state` presence, unknown-flag rejection) — the stub here answers unconditionally; that is pinned at the CLI layer by `tests/worktree_reclaim.rs`'s `Fixture`/`GH_STUB_SCRIPT` (`001`–`007`, `009`, `010`). Supersedes this catalog id's prior scenario ("a hand-made worktree survives `--yes`"), which encoded a withdrawn design decision — see `worktree/reclaim/011`, which now pins the corrected, opposite contract for that same hand-made-worktree shape.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`; the fixture shells to `git`/a stub `gh` and reads a Unix `PermissionsExt` mode bit, exactly as `worktree/reclaim/001`).
 
-##### worktree/reclaim/009 — A local unmerged branch survives `worktree reclaim --yes` even when a DIFFERENT fork's already-merged PR shares its exact `headRefName` (issue #144 finding 2).
+##### worktree/reclaim/009 — A local unmerged branch survives `worktree reclaim --yes` even when a DIFFERENT fork's already-merged PR shares its exact `headRefName` (issue #144 finding 2), and the reported reason names the real cause rather than falsely claiming no PR exists (issue #144 follow-up, reviewer finding NEW-2).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
-- **Agent:** none (a deck-owned, clean worktree on a fresh branch carrying its own unmerged commit; the canned `gh` reply reports a MERGED PR for the same `headRefName` but a `headRepositoryOwner` that does not match this fixture's own `origin` owner).
-- **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward — `resolve_pr_state` must not attribute a same-named PR from a different fork's `headRepositoryOwner` to this local branch.
-- **Does not assert:** the exact resulting `PrState`/verdict label (only the observable non-removal); the ambiguity-guard path (`>1` match), which is a distinct, already-covered code path.
+- **Agent:** none (a deck-owned, clean worktree on a fresh branch carrying its own unmerged commit; the canned `gh` reply reports a MERGED PR for the same `headRefName` but a `headRepositoryOwner` that does not match this fixture's own `origin` owner — the exact shape a triangular, push-to-fork workflow produces on EVERY branch).
+- **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward — `resolve_pr_state` must not attribute a same-named PR from a different fork's `headRepositoryOwner` to this local branch. Additionally, the report must not contain the literal phrase "no pull request found for this branch" (a genuine `headRefName` match exists; reporting `NoPr` sends the user hunting a PR that is really there) and must name "owner" as the real cause.
+- **Does not assert:** the exact resulting `PrState`/verdict label beyond the reason-text checks above; the ambiguity-guard path (`>1` match), which is a distinct, already-covered code path; the exact wording of the reason beyond containing "owner" and excluding the "no pull request" phrase.
 - **Platform coverage:** mac+linux.
 
 ##### worktree/reclaim/010 — A local unmerged branch survives `worktree reclaim --yes` when the canned `gh` reply carries no `headRepositoryOwner` field at all (issue #144 finding 2, fail-closed case).
@@ -755,6 +755,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (a worktree deliberately left without an ownership marker, PR fixture MERGED; `reclaim` is run twice against the same fixture — once bare, once with `--yes`).
 - **Asserts:** the bare run succeeds, names the worktree's exact path in its pending list, and leaves the worktree in place; the subsequent `--yes` run then removes it. Pins the corrected contract this suite's original `008` had backwards: `--yes` is the batch confirmation for an `Ask`-verdict (foreign) worktree whose path was already shown to the user, not something that must never touch a foreign worktree — withholding removal here would leave `run_reclaim`'s `"ask" if yes` branch unreachable dead code while `format_reclaim_human` kept telling users to run a flag that no longer did anything.
 - **Does not assert:** that a `Remove`-verdict (deck-owned) worktree is also removed under the same conditions — `002` already covers that, unconditionally on the flag; the ask-surface reporting shape in isolation without `--yes` — already covered by `005`.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/012 — Gitignored content demotes an otherwise-`Remove` worktree to `Ask`: a bare `reclaim` must not silently delete it (auditor finding F1, P1).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, MERGED, `git status --porcelain`-clean worktree that also holds a directory matched by a committed `.gitignore` — the shape of a real, worked-in deck worktree's `target/`).
+- **Asserts:** first, a **fixture precondition** that `git status --porcelain` reports nothing despite the ignored content, so the test provably exercises the gate gap rather than an ordinary dirty-tree keep; then that the worktree directory still exists after a bare `reclaim`, and that the output names its exact path (landing on `Ask`, not silently surviving some other way).
+- **Does not assert:** the exact verdict label or reason wording; behaviour once `--yes` is passed (same batch-confirmation contract `011` already covers).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/013 — The SAME deck-owned/merged/clean shape as `012`, but with NO ignored content, is still removed by a bare `reclaim`, unprompted — proves the demotion discriminates rather than swallowing every worktree. Expected GREEN from the start.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none.
+- **Asserts:** the worktree directory is gone after a bare `reclaim`. Pairs with `012`: without this test, a fix could satisfy `012` by demoting every worktree to `Ask` regardless of content, defeating the ownership gate `008`/`011` already establish.
+- **Does not assert:** anything about the `012` fixture's ignored-content path itself.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/014 — A forged `.git` file redirect inside a worktree's own directory, pointing at a copied admin dir carrying the ownership marker with `commondir` kept honest, must NOT resolve `Ownership::Ours` (auditor finding F2, P2 — the #152-lineage class of trusting *a* git-dir rather than *this worktree's own*).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a merged, otherwise-unmarked worktree whose `.git` file — normally `gitdir: <repo>/.git/worktrees/<name>`, one regular file inside the worktree's own directory — is overwritten to redirect to a copied-and-forged admin dir elsewhere, carrying a forged `dot-agent-deck-owner` marker, a `commondir` pointing at the real repo's `.git`, and a `gitdir` back-pointer fixed to match).
+- **Asserts:** first, a **fixture precondition** that `git status --porcelain` reports nothing despite the tamper (the cleanliness gate is blind to `.git` itself), so the test provably exercises the forgery; then that the worktree directory still exists after a bare `reclaim`, and that the output names its exact path (landing on `Ask`, not removed unprompted).
+- **Does not assert:** the resolution mechanism the fix uses (only the observable verdict/survival) — the coder is free to implement the containment check any way that works; behaviour once `--yes` is passed.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/015 — A legitimate `--separate-git-dir` main-repo layout (a git-native way to relocate metadata, not a forgery) still resolves correctly and is reclaimed — proves a containment fix for `014` discriminates rather than rejecting every worktree whose common dir lives outside `<repo>/.git`. Expected GREEN from the start.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`, except the main repo is initialized with `git init --separate-git-dir=<store>` rather than a plain `git init`, so linked worktrees' admin dirs resolve under `<store>/worktrees/<name>`).
+- **Agent:** none (a deck-owned, merged, clean worktree, legitimately marked via the normal `mark_owned` helper — no forgery).
+- **Asserts:** the worktree directory is gone after a bare `reclaim`.
+- **Does not assert:** anything about the `014` fixture's forged-redirect path itself.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/016 — A `headRepositoryOwner.login` that differs from the local `origin` owner ONLY in case still resolves `Merged` and is reclaimed (auditor finding F3 / reviewer finding NEW-1, P2 — GitHub logins are ASCII and case-insensitive).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree; the canned `gh` reply's `headRepositoryOwner.login` is `"Test-Org"` against this fixture's own `origin` owner `"test-org"` — the shape GitHub itself returns for a remote a user typed with capitals, since GitHub resolves logins case-insensitively).
+- **Asserts:** the worktree directory is gone after a bare `reclaim` — a byte-exact comparison would discard the only matching PR and leave the worktree kept forever with a "no pull request found" reason.
+- **Does not assert:** the exact resulting `PrState`/verdict label (only the observable removal); non-ASCII/homoglyph login handling (GitHub logins are ASCII-only, so this is out of scope).
 - **Platform coverage:** mac+linux.
 
 
