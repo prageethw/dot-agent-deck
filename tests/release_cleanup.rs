@@ -643,10 +643,17 @@ fn build_fixture_unparseable_upstream() -> MinimalRepo {
 /// `remote set-head`. Fork issue #152 R5 / A-N4: `default_branch` currently
 /// falls back to the literal `"main"` in this state with no degradation, but
 /// B1's restored default-branch guard is NAME-based and now depends on that
-/// value being right.
+/// value being right. `origin` is given a GitHub-shaped URL (same
+/// `insteadOf` technique [`init_repo`] uses) rather than the bare repo's own
+/// local path — a local path fails `is_owner_repo` and would independently
+/// degrade the run for an UNRELATED reason (slug derivation, not
+/// `default_branch`), making the pinning test pass for the wrong reason.
 fn build_fixture_default_branch_undetermined() -> MinimalRepo {
     let root = tempfile::tempdir().expect("tempdir for git fixture root");
-    let (_origin_git_dir, clone_dir) = init_repo(root.path(), None);
+    let (_origin_git_dir, clone_dir) = init_repo(
+        root.path(),
+        Some(&format!("https://github.com/{FORK_SLUG}.git")),
+    );
     run_git(&clone_dir, &["remote", "set-head", "origin", "--delete"]);
     MinimalRepo {
         _root: root,
@@ -806,6 +813,10 @@ fn build_fixture_separate_git_dir_inside_another_repo() -> MainWorktreeInsideAno
         root.path(),
         &["init", "--bare", "-b", "main", origin_dir_str],
     );
+    // `git init --separate-git-dir` does not create the LEAF's parent
+    // directory itself — `outer/gitdirs` must already exist before `mygit`
+    // can be created inside it.
+    std::fs::create_dir_all(outer_dir.join("gitdirs")).expect("create gitdirs parent dir");
     run_git(
         root.path(),
         &[
