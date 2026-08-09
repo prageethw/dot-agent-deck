@@ -70,14 +70,16 @@ pub enum NotifyEvent {
         repo: String,
         issue: u64,
     },
-    /// PRD #120 M1.3/M2.2: an issue was skipped because it is already claimed —
-    /// its per-issue worktree exists, or an open PR already targets `branch`
-    /// (`agent/issue-<n>`).
+    /// PRD #120 M1.3/M2.2 + PRD #421 M1.2/M1.3: an issue was skipped because it
+    /// is already claimed — `reason` names which of the four causes fired, so
+    /// no two skips ever render identically (a stray claim that can't be seen
+    /// silently starves the backlog).
     IssueDispatchSkipped {
         task: String,
         repo: String,
         issue: u64,
         branch: String,
+        reason: SkipReason,
     },
     /// PRD #120 M3.2: dispatching ONE issue failed (clone/worktree/`gh` error).
     /// The failing issue is abandoned; the rest of the run continues.
@@ -95,6 +97,101 @@ pub enum NotifyEvent {
         repo: String,
         message: String,
     },
+    /// PRD #421 review C3: an issue was successfully DISPATCHED (the worktree
+    /// was created and the agent spawned — `IssueDispatched` already fired),
+    /// but writing the `in-progress` label or posting the claim comment
+    /// afterwards failed. Deliberately its own variant rather than folded
+    /// into `IssueDispatchFailed`: the dispatch genuinely succeeded, only the
+    /// claim could not be written — for example a read-only `gh` token, the
+    /// expected state on upgrade for anyone who configured this before the
+    /// claim existed (auditor F8). Left unreported, this failure is invisible
+    /// on the surface an operator actually watches and can produce exactly
+    /// the duplicate-dispatch-across-decks hazard PRD #421 exists to prevent.
+    IssueClaimFailed {
+        task: String,
+        repo: String,
+        issue: u64,
+        message: String,
+    },
+}
+
+/// PRD #421 M1.3: why an issue was skipped — the four causes `dispatch_decision`
+/// (worktree/PR/label) and the worktree-creation TOCTOU race recognize.
+/// `IssueDispatchSkipped` carries one so a skip can always say WHY it excluded
+/// an issue, not just THAT it did — an exclusion nobody can see is the actual
+/// hazard (a stray label, applied by anyone, silently starves the backlog).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The per-issue worktree already exists on disk — the primary
+    /// idempotency signal.
+    WorktreeExists,
+    /// An open PR's head branch is `agent/issue-<n>` — the secondary signal.
+    OpenPr,
+    /// The `in-progress` label is present (PRD #421 M1.2, the third signal),
+    /// honoured regardless of who applied it — there is no "is this my own
+    /// claim?" comparison. `claimant` carries the deck's own claim-comment text
+    /// when one is discoverable among the issue's comments; `None` when the
+    /// label was applied by a human or an external tool, or no claim comment
+    /// can be found (`dispatch/016`'s "no claimant" case).
+    Labelled { claimant: Option<String> },
+    /// A concurrent creator won the `git worktree add` TOCTOU race
+    /// (`WorktreeCreation::AlreadyClaimed`/`BranchExists`) — a benign race, not
+    /// a failure. Has no deterministic black-box trigger, so it is covered only
+    /// by the pure-data render test, not an e2e one (`dispatch/017`).
+    ConcurrentCreator,
+}
+
+/// Render `reason` as the tail of an `IssueDispatchSkipped` stderr line. Pure
+/// and unit-tested on its own — `dispatch/017` covers only three of the four
+/// causes end-to-end (the TOCTOU race has no deterministic black-box trigger),
+/// so this is what makes the PRD's "no two causes render identically" success
+/// criterion fully evidenced across all four.
+fn render_skip_reason(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::WorktreeExists => "the worktree already exists".to_string(),
+        SkipReason::OpenPr => "an open PR already targets this branch".to_string(),
+        SkipReason::Labelled {
+            claimant: Some(comment),
+        } => format!(
+            "labelled `in-progress` ({})",
+            sanitize_claimant_for_render(comment)
+        ),
+        SkipReason::Labelled { claimant: None } => {
+            "labelled `in-progress`, no claimant recorded".to_string()
+        }
+        SkipReason::ConcurrentCreator => {
+            "a concurrent dispatch claimed the worktree first".to_string()
+        }
+    }
+}
+
+/// PRD #421 review C6 (auditor F4): `claimant`, when present, is a GitHub
+/// comment body pulled from an issue on the WATCHED repo — controlled by
+/// anyone who can comment there, not by this deck — and rendered straight
+/// into the daemon's stderr/log via [`StderrNotifier`], the only place in
+/// this change where genuinely untrusted remote data reaches a local output
+/// sink. Strip every C0/DEL control character (this removes ANSI escape
+/// sequences too, since ESC is `0x1B`), collapse newlines/carriage returns to
+/// a single space so one comment can't forge additional log lines, and cap
+/// the length so a GitHub comment body (up to ~65 KB) can't flood the log.
+const CLAIMANT_RENDER_MAX_CHARS: usize = 200;
+
+fn sanitize_claimant_for_render(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.chars().count() > CLAIMANT_RENDER_MAX_CHARS {
+        let truncated: String = trimmed.chars().take(CLAIMANT_RENDER_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Default [`Notifier`] that logs to stderr. Stand-in until the PRD #126
@@ -137,9 +234,11 @@ impl Notifier for StderrNotifier {
                 repo,
                 issue,
                 branch,
+                reason,
             } => {
                 eprintln!(
-                    "[scheduler] task {task:?}: skipping already-claimed issue #{issue} of {repo} ({branch})"
+                    "[scheduler] task {task:?}: skipping issue #{issue} of {repo} ({branch}) — {}",
+                    render_skip_reason(&reason)
                 );
             }
             NotifyEvent::IssueDispatchFailed {
@@ -156,6 +255,16 @@ impl Notifier for StderrNotifier {
                 message,
             } => {
                 eprintln!("[scheduler] task {task:?}: repo {repo} dispatch error: {message}");
+            }
+            NotifyEvent::IssueClaimFailed {
+                task,
+                repo,
+                issue,
+                message,
+            } => {
+                eprintln!(
+                    "[scheduler] task {task:?}: issue #{issue} of {repo} was dispatched, but the claim could not be written: {message}"
+                );
             }
         }
     }
@@ -649,6 +758,65 @@ mod tests {
 
     fn local_at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    // PRD #421 M1.4: all four skip reasons render distinguishably. This is
+    // what makes the PRD's "no two causes render identically" success
+    // criterion fully evidenced for the fourth cause (`ConcurrentCreator`,
+    // the `git worktree add` TOCTOU race), which `dispatch/017` cannot cover
+    // end-to-end — it has no deterministic black-box trigger.
+    #[test]
+    fn skip_reasons_render_distinguishably() {
+        let reasons = [
+            SkipReason::WorktreeExists,
+            SkipReason::OpenPr,
+            SkipReason::Labelled { claimant: None },
+            SkipReason::Labelled {
+                claimant: Some("Claimed by scheduled task `dispatch-task`.".to_string()),
+            },
+            SkipReason::ConcurrentCreator,
+        ];
+        let rendered: Vec<String> = reasons.iter().map(render_skip_reason).collect();
+        for (i, a) in rendered.iter().enumerate() {
+            for (j, b) in rendered.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "skip reasons {:?} and {:?} must render distinguishably, both: {a:?}",
+                        reasons[i], reasons[j]
+                    );
+                }
+            }
+        }
+    }
+
+    // PRD #421 review C6 / auditor F4: an ANSI escape, a raw newline, and an
+    // over-length claimant body must not survive into the rendered skip line
+    // — an attacker who can comment on the watched repo controls this text
+    // completely (`CLAIM_COMMENT_PREFIX` is matched against, not verified as
+    // this deck's own).
+    #[test]
+    fn labelled_skip_reason_sanitizes_hostile_claimant_text() {
+        let hostile = format!(
+            "Claimed by \x1b[31mred\x1b[0m\nSecond forged line{}",
+            "!".repeat(400)
+        );
+        let rendered = render_skip_reason(&SkipReason::Labelled {
+            claimant: Some(hostile),
+        });
+        assert!(
+            !rendered.contains('\x1b'),
+            "rendered skip line must not contain a raw ESC byte, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\n'),
+            "rendered skip line must not contain a raw newline, got {rendered:?}"
+        );
+        assert!(
+            rendered.chars().count() < 300,
+            "rendered skip line must be bounded, got {} chars",
+            rendered.chars().count()
+        );
     }
 
     /// A callback that bumps a counter each time it fires.
