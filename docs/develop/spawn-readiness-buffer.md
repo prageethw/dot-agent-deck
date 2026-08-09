@@ -6,7 +6,7 @@ Overrides `SPAWN_TIME_READINESS_BUFFER` (`src/ui.rs`), the delay the TUI waits a
 
 ## Who reads it
 
-`spawn_readiness_buffer()` is the sole production reader, called from `deliver_orchestrator_prompt` on every render frame (~62Hz) while a role prompt is pending. The env var is re-read and re-parsed on **every call** — only the warning below is deduplicated, not the parse itself.
+`spawn_readiness_buffer()` is read through `should_inject_spawn_time_prompt`, which has two production call sites: the spawn-time seed path (`src/ui.rs:3423`) and `deliver_orchestrator_prompt` (`src/ui.rs:3785`), the latter running on every render frame (~62Hz) while a role prompt is pending. The env var is re-read and re-parsed on **every call** — only the warning below is deduplicated, not the parse itself.
 
 ## Format and clamp
 

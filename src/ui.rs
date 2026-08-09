@@ -3883,15 +3883,34 @@ fn deliver_orchestrator_prompt(
             // not re-resolve to whatever currently occupies the pane.
             // `retried` becomes `true` the moment this write is itself the
             // retry (an entry already existed), spending the cycle's
-            // one-retry budget.
+            // one-retry budget. The one exception: a carried `None` is not an
+            // identity to protect (round 4 final review F3) — it means the
+            // first write found no session on the pane at all (the 10s
+            // no-`SessionStart` fallback), so it is re-resolved here instead
+            // of dooming the whole cycle to never confirm.
+            //
+            // `.find()` over the `HashMap` without excluding placeholders was
+            // round 4's own version of the anti-pattern issue #423 F6 already
+            // fixed at `orchestrator_remit_pane_is_compacting`: iteration
+            // order is unspecified and a placeholder (`agent_type:
+            // AgentType::None`) can legitimately co-reside on the same pane
+            // as the real session (round 4 final review F1). Filter
+            // placeholders out and select deterministically by
+            // `last_activity`, mirroring `AppState::agent_writable`.
             let confirmation_target = snapshot
                 .sessions
                 .values()
-                .find(|s| s.pane_id.as_deref() == Some(start_pane_id.as_str()));
+                .filter(|s| {
+                    s.pane_id.as_deref() == Some(start_pane_id.as_str())
+                        && s.agent_type != AgentType::None
+                })
+                .max_by_key(|s| s.last_activity);
             let (confirmation_session_id, pre_write_thinking, baseline_prompt) =
                 match awaiting.as_ref() {
                     Some(a) => (
-                        a.expected_session_id.clone(),
+                        a.expected_session_id
+                            .clone()
+                            .or_else(|| confirmation_target.map(|s| s.session_id.clone())),
                         a.pre_write_thinking,
                         a.baseline_prompt.clone(),
                     ),
