@@ -827,11 +827,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the human-table (`format_list_human`) rendering, which this fork does not require to surface the owner; the `schema_version` bump question (the field is additive).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, as `008`).
 
-##### worktree/reclaim/022 — Two live orchestrations of the SAME config type (`review`) each record a DISTINCT owner in their own worktree's marker, not the identical `orchestration:review` string (fork #166 — instance identity, not just provenance).
+##### worktree/reclaim/022 — Two live orchestrations of the SAME config type (`review`) but with DISTINCT typed names each record a DISTINCT owner in their own worktree's marker, not the identical `orchestration:review` string (fork #166 — instance identity, not just provenance).
 - **Layer:** fast synthetic real-dispatch integration, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`, following `orchestration/worktree/004`'s precedent (a real git repo, the real `Action::SpawnPane` dispatch, a fresh `TabManager`/`AppState` per spawn) — placed in `ui.rs` rather than `src/worktree_reclaim.rs` because the property under test is produced by `ui.rs`'s own `SpawnPane` handler (the `format!("orchestration:{}", orch_config.name)` creator-identity line), which no helper outside that file's private test module (`CapturingPaneController`, `default_ui`) can drive.
 - **Agent:** none.
-- **Asserts:** `crate::worktree_reclaim::owner_of` on the two independently-spawned worktrees returns two different values, both spawned from `make_orchestration("review")`.
-- **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to a typed unique identity, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
+- **Asserts:** `crate::worktree_reclaim::owner_of` on the two independently-spawned worktrees returns two different values, both spawned from `make_orchestration("review")` but given the distinct typed names `review-orchestrator-1` and `review-orchestrator-2` — the precondition M1.0 makes required (Name is required and unique), so an empty or shared name is not a reachable fixture state.
+- **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to the typed unique name, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
 - **Platform coverage:** mac+linux.
 
 

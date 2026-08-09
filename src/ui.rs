@@ -29553,33 +29553,38 @@ mod tests {
     }
 
     /// Scenario: Two SEPARATE live orchestrations, both of the SAME config
-    /// type (`make_orchestration("review")`, dispatched independently), are
-    /// each spawned through the real `Action::SpawnPane` path against their
-    /// own sibling worktree. On `main` today the interactive path (this
-    /// file's `SpawnPane` handler) derives the ownership marker's creator
-    /// identity from `orch_config.name` alone
-    /// (`format!("orchestration:{}", orch_config.name)`), so two
+    /// type (`make_orchestration("review")`, dispatched independently) but
+    /// each given a DISTINCT typed Name -- the state M1.0 makes required and
+    /// unique, so this is the only fixture shape M1.0 permits -- are each
+    /// spawned through the real `Action::SpawnPane` path against their own
+    /// sibling worktree. On `main` today the interactive path (this file's
+    /// `SpawnPane` handler) derives the ownership marker's creator identity
+    /// from `orch_config.name` alone (`format!("orchestration:{}",
+    /// orch_config.name)`), ignoring the typed Name entirely, so two
     /// `review`-type orchestrations both record the identical owner
-    /// `orchestration:review` -- their worktrees are indistinguishable by
-    /// owner. That is not a gap in #173: its scope is WHICH TASK created a
-    /// worktree (provenance), not WHICH INSTANCE. Fork #166 adds instance
-    /// identity, so the two recorded owners must differ. This pins the
-    /// PROPERTY (distinctness), not the spelling -- the fix is expected to
-    /// replace `orch_config.name` with a typed unique identity whose exact
-    /// string this test does not predict.
+    /// `orchestration:review` even though their typed Names differ -- their
+    /// worktrees are indistinguishable by owner. That is not a gap in #173:
+    /// its scope is WHICH TASK created a worktree (provenance), not WHICH
+    /// INSTANCE. Fork #166 adds instance identity, so the two recorded
+    /// owners must differ. This pins the PROPERTY (distinctness), not the
+    /// spelling -- the fix is expected to replace `orch_config.name` with
+    /// the typed unique identity whose exact string this test does not
+    /// predict.
     #[spec("worktree/reclaim/022")]
     #[test]
-    fn worktree_reclaim_022_two_orchestrations_of_the_same_config_type_record_distinct_owners() {
+    fn worktree_reclaim_022_two_orchestrations_of_the_same_config_type_with_distinct_names_record_distinct_owners()
+     {
         fn spawn_and_read_owner(
             tmp: &std::path::Path,
             repo: &std::path::Path,
             suffix: &str,
+            name: &str,
         ) -> Option<String> {
             let worktree = tmp.join(format!("repo-{suffix}"));
             let config = make_orchestration("review");
             let req = NewPaneRequest {
                 dir: repo.to_path_buf(),
-                name: String::new(),
+                name: name.to_string(),
                 command: String::new(),
                 mode_config: None,
                 orchestration_config: Some(config.clone()),
@@ -29645,8 +29650,10 @@ mod tests {
             "init",
         ]);
 
-        let owner_a = spawn_and_read_owner(tmp.path(), &repo, "instance-a");
-        let owner_b = spawn_and_read_owner(tmp.path(), &repo, "instance-b");
+        let owner_a =
+            spawn_and_read_owner(tmp.path(), &repo, "instance-a", "review-orchestrator-1");
+        let owner_b =
+            spawn_and_read_owner(tmp.path(), &repo, "instance-b", "review-orchestrator-2");
 
         assert_ne!(
             owner_a, owner_b,
