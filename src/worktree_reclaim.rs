@@ -481,9 +481,16 @@ const MARKER_READ_MAX_BYTES: u64 = 4096;
 /// Unlike the writer, the bytes read back here are NOT trusted: this file
 /// can be replaced by anything with write access to the worktree's admin
 /// dir, so [`sanitize_marker_creator`] — the writer's own sanitizer — is
-/// applied to the parsed value before it is returned, closing off unescaped
-/// control characters and invisible Unicode (U+200B, U+202E) reaching a
-/// future rendered `worktree list` column or a `jq -r` pipeline today. An
+/// applied to the parsed value before it is returned. It filters
+/// `char::is_control()` (Unicode category Cc: `\n`, `\r`, and other C0/C1
+/// controls) only. It does **not** filter category-Cf invisible formatting
+/// characters such as U+200B (zero-width space), U+202E (RTL override) or
+/// U+FEFF (BOM) — those sit outside `White_Space` too (which stops at
+/// U+200A), so they survive both the sanitizer and `.trim()` and can reach a
+/// future rendered `worktree list` column or a `jq -r` pipeline unfiltered.
+/// This is latent today (no consumer renders `owner` yet) and becomes live
+/// once M2.3 adds a human-facing `OWNER` column — see fork #166 N2/auditor
+/// re-audit; closing the Cf gap itself is deliberately out of scope here. An
 /// empty value after stripping the prefix and trimming becomes `None`
 /// (unknown), never `Some("")` — `sanitize_marker_creator`'s own "unknown"
 /// floor means the writer can never produce an empty owner, so a `Some("")`
@@ -494,7 +501,7 @@ const MARKER_READ_MAX_BYTES: u64 = 4096;
 /// with an unknown owner, not an error.
 fn read_marker_owner(marker_path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(marker_path).ok()?;
-    if metadata.len() > MARKER_READ_MAX_BYTES {
+    if !metadata.is_file() || metadata.len() > MARKER_READ_MAX_BYTES {
         return None;
     }
     let content = std::fs::read_to_string(marker_path).ok()?;
@@ -510,21 +517,30 @@ fn read_marker_owner(marker_path: &Path) -> Option<String> {
 /// marker (issue #425's write side; fork #166's read side). Resolves and
 /// containment-checks the worktree's git-dir via [`owned_git_dir`] — the
 /// same resolution [`ownership_of`] uses — so a `Foreign` worktree (missing
-/// marker, forged `.git` redirect, unresolvable git-dir) always reports
+/// marker, forged `.git` redirect, unresolvable git-dir) usually reports
 /// `None` here too, and the directory that passed containment is the exact
-/// directory [`read_marker_owner`] reads from.
+/// directory [`read_marker_owner`] reads from. That is not unconditional,
+/// though: because this is a second, independent [`owned_git_dir`]
+/// resolution rather than a shared one (see below), the auditor measured 24
+/// of 120 adversarial cases landing `owned=false` from [`ownership_of`]
+/// alongside a non-`None` `owner` from this function (fork #166 N3) — the
+/// two disagreeing rather than both reporting unknown. That disagreement is
+/// accepted as cosmetic for now (no consumer treats `owner`'s mere presence
+/// as an ownership signal), but is a contract worth pinning explicitly
+/// before M1.0 makes this identity load-bearing.
 ///
 /// [`examine_worktrees`] calls this immediately after [`ownership_of`], with
 /// no I/O of any kind — no `gh` call, no other filesystem work — in between,
 /// specifically so the two independent [`owned_git_dir`] resolutions they
 /// each perform sit back-to-back rather than spanning the seconds-wide `gh`
 /// network call that used to separate them (reviewer F5). That is a
-/// narrowed window, not a closed one: this is still a second, independent
-/// resolution rather than one shared evaluation, so a write landing in the
-/// microseconds between the two `git rev-parse` spawns can still make
-/// `owned` and `owner` disagree in principle. Collapsing them into one
-/// evaluation would need `owner_of`'s public signature to change to accept
-/// an already-resolved git-dir, which would also change what
+/// narrowed window, not a closed one: each [`owned_git_dir`] call spawns two
+/// `git rev-parse` subprocesses ([`resolve_git_dir`] and
+/// [`resolve_common_dir`]), so the two back-to-back calls here span **four**
+/// spawns, not two, and the window is wide enough that the auditor measured
+/// a hostile flipper winning it 54 of 120 times (45%). Collapsing them into
+/// one evaluation would need `owner_of`'s public signature to change to
+/// accept an already-resolved git-dir, which would also change what
 /// `worktree/reclaim/017`–`022` call — out of scope for this round.
 pub(crate) fn owner_of(repo_dir: &Path, worktree_path: &Path) -> Option<String> {
     let git_dir = owned_git_dir(repo_dir, worktree_path)?;

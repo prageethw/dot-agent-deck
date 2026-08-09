@@ -6476,6 +6476,11 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
     // `dispatch_action`) tests blankness and reads content from the same
     // trimmed value — instead of two consumers independently deciding
     // whether to trim and silently disagreeing on a whitespace-only Name.
+    // This guarantee holds only by convention — `build_new_pane_request` is
+    // the sole `NewPaneRequest` constructor today, not an enforced
+    // invariant — so a future second constructor that skips this trim would
+    // reintroduce #174 at a site that no longer defends itself (fork #166
+    // N4).
     let name = form.name.trim().to_string();
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
     // plain "schedule" option it is a throwaway single-agent authoring CARD, but
