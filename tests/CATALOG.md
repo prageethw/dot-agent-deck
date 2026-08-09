@@ -799,6 +799,48 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact resulting `PrState`/verdict label (only the observable removal); non-ASCII/homoglyph login handling (GitHub logins are ASCII-only, so this is out of scope).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/017 — A worktree marked owned by orchestration `orch-x` via `mark_worktree_owned` reports that exact name back via a new `owner_of` query, and `ownership_of`'s existing `Ours`/`Foreign` bit still agrees it is owned (fork #166 M2.0/M2.1).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/008`'s precedent (a real git repo via `init_repo_with_origin`, a linked worktree via a real `git worktree add`).
+- **Agent:** none.
+- **Asserts:** `owner_of(repo, worktree)` returns `Some("orch-x")` after `mark_worktree_owned(worktree, "orch-x")`; `ownership_of(repo, worktree)` still returns `Ownership::Ours`.
+- **Does not assert:** the marker's on-disk byte format (only that it round-trips through `mark_worktree_owned`/`owner_of`); `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/018 — A pre-#166-legacy marker (the literal `"deck\n"` content `mark_worktree_owned` wrote before this PRD encoded a name) still resolves `Ownership::Ours`, but `owner_of` reports the owner as unknown (`None`) rather than guessing (fork #166 — protects every worktree created before this ships from silently becoming un-reclaimable).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (a worktree with the marker file written directly as the literal legacy bytes `"deck\n"`, bypassing `mark_worktree_owned` so the fixture controls the exact on-disk content — the same fixture PR #173's own `bare_deck_marker_from_older_build_still_reads_as_ours` test uses).
+- **Asserts:** `ownership_of` still returns `Ownership::Ours` (the presence-only check `reclaim` depends on is unchanged, already pinned by #173's own test — asserted again here only as the precondition for the next line) and `owner_of` returns `None`.
+- **Does not assert:** the presence/`Ours` half in isolation — that is #173's `bare_deck_marker_from_older_build_still_reads_as_ours`, not duplicated here; any other unparseable-content shape (empty marker, etc.); `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/019 — `main` (the enumerating repo's own checkout, not a linked worktree) is never owned, even when its own directory is named to match the `<name>-<change>` convention and even with a marker planted directly in its own git-dir. Expected GREEN from the start — fork #144's existing containment check already guarantees this; no new ownership-identity code is needed to satisfy it.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (a repo directory literally named `myorch-feature`, with `dot-agent-deck-owner` written directly into its own resolved git-dir).
+- **Asserts:** `ownership_of(repo, repo)` returns `Ownership::Foreign`.
+- **Does not assert:** the containment mechanism itself (already pinned by `014`/`015`); anything about `owner_of` (this test exercises only the pre-existing `Ownership`/`ownership_of` surface, deliberately unchanged by fork #166).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/020 — A worktree owned by orchestration `Y` reports `Y`, never a different name `X`; a directory carrying NO marker at all is never owned, whatever it is named (fork #166 — ownership is decided by the marker, never by a directory's name).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (one worktree marked owned by `"Y"`; one unmarked worktree deliberately named `X-decoy` to look like it belongs to a different orchestration's naming convention).
+- **Asserts:** `owner_of` on the first returns `Some("Y")` and is asserted `!= Some("X")`; on the second, `ownership_of` returns `Ownership::Foreign` and `owner_of` returns `None`, despite the `X`-matching name.
+- **Does not assert:** cross-repo collisions; more than two orchestration names at once.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/021 — `dot-agent-deck worktree list --json` carries the recorded owner name in each `WorktreeReport` entry (fork #166 M2.2).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/008`'s precedent for a stubbed `gh` reached via a `PATH` prepend (here answering unconditionally with an empty PR list — the reclaim verdict itself is not this test's concern).
+- **Agent:** none.
+- **Asserts:** `examine_worktrees` returns a report whose `owner` field is `Some("orch-x")` for a worktree marked owned by that name; the report's serialized JSON (via `WorktreeListDocument`) contains `"owner":"orch-x"`.
+- **Does not assert:** the human-table (`format_list_human`) rendering, which this fork does not require to surface the owner; the `schema_version` bump question (the field is additive).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, as `008`).
+
+##### worktree/reclaim/022 — Two live orchestrations of the SAME config type (`review`) but with DISTINCT typed names each record a DISTINCT owner in their own worktree's marker, not the identical `orchestration:review` string (fork #166 — instance identity, not just provenance).
+- **Layer:** fast synthetic real-dispatch integration, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`, following `orchestration/worktree/004`'s precedent (a real git repo, the real `Action::SpawnPane` dispatch, a fresh `TabManager`/`AppState` per spawn) — placed in `ui.rs` rather than `src/worktree_reclaim.rs` because the property under test is produced by `ui.rs`'s own `SpawnPane` handler (the `format!("orchestration:{}", orch_config.name)` creator-identity line), which no helper outside that file's private test module (`CapturingPaneController`, `default_ui`) can drive.
+- **Agent:** none.
+- **Asserts:** `crate::worktree_reclaim::owner_of` on the two independently-spawned worktrees returns two different values, both spawned from `make_orchestration("review")` but given the distinct typed names `review-orchestrator-1` and `review-orchestrator-2` — the precondition M1.0 makes required (Name is required and unique), so an empty or shared name is not a reachable fixture state.
+- **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to the typed unique name, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
+- **Platform coverage:** mac+linux.
+
 
 ### Prompts
 
@@ -2901,6 +2943,29 @@ without depending on the config struct API.
 - **Asserts:** running both forcing entry points this fix touched — `terminate_child_with_grace_and_wait_forcing_group_backstop` (test-only) and `terminate_child_with_grace_and_detached_reap_forcing_group_backstop` (the one that ships, called from `issue_dispatch_run.rs`'s worktree-timeout escalation) — against independent instances of the stand-in (20ms grace) each produces a call log with zero `try_wait` calls (the forcing path must not poll — polling is exactly what reaps early) and exactly two `kill` calls (phase 1's SIGTERM, then phase 3's forcing SIGKILL), both occurring strictly before the single `wait` call that performs the actual reap; the detached half's `wait` runs on a background thread (fork #136), so that half polls the log for the reap to land before asserting.
 - **Does not assert:** the real pid-recycling race itself (not deterministically forceable — see the headline); the non-forcing `terminate_child_with_grace_and_wait` (unaffected by this fix, still covered by `009`); the detached variant's own bounded-return *latency* property (that's `011`'s job — this test pins the detached variant's reap *ordering*, not how quickly it returns); a real `killpg` call or process group (the stand-in's `process_id()` returns `None`, routing every signal through the `ChildKiller::kill` fallback so this test needs no OS process, and no pid recycling is exercised at all); signal identity — with `process_id() -> None` both SIGTERM and SIGKILL collapse into the same unqualified `kill` call, so "two kill calls" proves two signal *attempts*, not confirmed SIGTERM-then-SIGKILL identity (`009`/`010` pin that against real processes).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `009`-`012`).
+
+#### orchestration/remit
+
+##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness; the daemon's own `AppState::apply_event` and `deliver_orchestrator_prompt` render-loop path handle the injected event and the redelivery for real).
+- **Agent:** none (`remit-reassert-orchestration` fixture — the `orchestrator` start role runs a synthetic script that declares itself live over the raw hook socket at boot and tees its stdin to `orchestrator-prompt.log`; `worker` is a plain `cat` stub; no LLM tokens spent).
+- **Asserts:** after the spawn-time remit pointer (`Read .dot-agent-deck/orchestrator-context.md`) delivers once (confirmed via the log), injecting a synthetic `Compacting` `AgentEvent` for the SAME start-role pane/agent identity — confirmed applied via the daemon's own `ListAgents` live-status join before proceeding — causes the log to show the pointer a second time within 10s.
+- **Does not assert:** that the trigger is scoped to compaction alone versus any other event type (that is the coder's pure-data unit test, per this PRD's task split); the guard against firing on a non-start-role pane (`002`); the readiness-gating/delivery-confirmation discipline of the re-assertion itself (`003`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the fixture script's `emit_target` helper is a POSIX shell function calling `python3`).
+
+##### orchestration/remit/002 — A `Compacting` event on a non-start `worker` role's pane re-asserts nothing, while the same event on the orchestrator start role in the same orchestration still re-asserts (upstream issue #423's settled scope: the orchestrator start role only).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`remit-reassert-orchestration` fixture, as `001`).
+- **Asserts:** after the spawn-time remit pointer delivers once, injecting `Compacting` for the non-start `worker` role's pane/agent identity does not push the start role's delivery log to a second `Read .dot-agent-deck/orchestrator-context.md` line within a 900ms bounded wait; injecting `Compacting` immediately afterward for the orchestrator START role's own identity, in the SAME orchestration, DOES push the log to a second line within 10s — the positive control that makes the negative check meaningful rather than a vacuous pass against an unimplemented feature.
+- **Does not assert:** a genuinely non-orchestration (plain agent/mode) pane's compaction re-asserting nothing — deliberately not exercised here since the worker-role case already proves the guard does not key off "any pane in the orchestration" and the settled scope names only the start role as a trigger; the readiness-gating/delivery-confirmation discipline of the re-assertion itself (`003`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`).
+
+##### orchestration/remit/003 — A re-assertion triggered while the start-role pane is history-only does not write blindly: the pointer stays undelivered (with the same `History-only session cannot accept live input` feedback the spawn-time seed already surfaces for a non-applied `SendResult`) until the pane later reports itself live again, at which point the deferred re-assertion completes (upstream issue #423, the case the task calls out as mattering most — a blind write here would reintroduce issue #424's exact bug inside a feature whose entire purpose is reliability).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`remit-reassert-orchestration` fixture; the orchestrator role's script additionally toggles its own declared liveness live -> history-only -> live on cue from control files the test writes into the fixture workdir).
+- **Asserts:** with the start-role pane confirmed history-only, injecting `Compacting` for its identity does not push the delivery log to a second line within a 900ms bounded wait, and the rendered grid surfaces `History-only session cannot accept live input` within 5s; once the SAME pane subsequently reports itself live again, the log reaches a second `Read .dot-agent-deck/orchestrator-context.md` line within 10s — proving the re-assertion is gated on confirmed delivery rather than a direct, unconfirmed pane write. Deliberately asserts only on the rendered grid and the delivery-log line count — both pre-existing, stable observables — never on an internal helper or `SendResult` variant introduced by the concurrently in-flight `fix/424-seed-delivery-confirmation` branch, so this test's correctness does not depend on which internal shape #424 lands in.
+- **Does not assert:** the pure liveness-toggle mechanism in isolation (covered generally by `prompt/pane-input/007`'s identical `emit_target` technique at spawn time); #424's own internal retry/backoff bookkeeping (out of scope by design, per the task's decoupling requirement); a genuinely dropped/lost re-assertion attempt distinct from a merely-deferred one (not constructible without the coder's implementation to compare against).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`002`).
 
 ### Session restore
 
