@@ -221,8 +221,35 @@ impl Fixture {
         path
     }
 
-    /// Canned `gh pr list --head <branch>` reply.
+    /// Canned `gh pr list --head <branch>` reply. `headRepositoryOwner` is set
+    /// to `"test-org"`, matching `Fixture::new`'s own `origin` remote
+    /// (`test-org/test-repo`) -- so every existing caller of this helper keeps
+    /// describing a legitimate same-repo merged PR once `resolve_pr_state`
+    /// starts requiring the head repository owner to match (issue #144
+    /// finding 2). Callers exercising a DIFFERENT owner (a genuinely
+    /// different fork, or a worktree-scoped remote pointing elsewhere) use
+    /// [`Fixture::set_pr_state_with_head_owner`] instead.
     fn set_pr_state(&self, branch: &str, state: &str) {
+        self.set_pr_state_with_head_owner(branch, state, "test-org");
+    }
+
+    /// Same as [`Fixture::set_pr_state`], but with an explicit
+    /// `headRepositoryOwner.login` value -- for a PR opened from a fork whose
+    /// owner differs from this fixture's own `origin` remote.
+    fn set_pr_state_with_head_owner(&self, branch: &str, state: &str, head_owner: &str) {
+        let key = branch.replace('/', "_");
+        let body = format!(
+            r#"[{{"state":"{state}","headRefName":"{branch}","headRepositoryOwner":{{"login":"{head_owner}"}}}}]"#
+        );
+        std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
+    }
+
+    /// Same as [`Fixture::set_pr_state`], but the canned reply carries NO
+    /// `headRepositoryOwner` key at all -- the shape real `gh` can return
+    /// when the head repository can no longer be resolved (e.g. a fork
+    /// deleted after its PR merged). Used to pin the fail-closed path: an
+    /// unverifiable owner must never be treated as a match.
+    fn set_pr_state_no_owner_field(&self, branch: &str, state: &str) {
         let key = branch.replace('/', "_");
         let body = format!(r#"[{{"state":"{state}","headRefName":"{branch}"}}]"#);
         std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
@@ -624,7 +651,11 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
     // matter what this worktree's own PR actually is.
     git(&fx.repo, &["remote", "remove", "origin"]);
     fx.set_worktree_origin(&wt, "https://github.com/other-org/other-repo.git");
-    fx.set_pr_state("feat/own-remote", "MERGED");
+    // headRepositoryOwner must match the WORKTREE's own derived slug
+    // ("other-org"), not this fixture's default ("test-org") -- the whole
+    // point of this test is that PR state is resolved against the
+    // worktree's own remote.
+    fx.set_pr_state_with_head_owner("feat/own-remote", "MERGED", "other-org");
 
     let out = fx.run(&["worktree", "list"]);
     assert!(
@@ -668,5 +699,106 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
          actually carry the `remove` verdict the column above claims; got reason column {:?} \
          from line:\n{line}\nfull output:\n{text}",
         fields[6]
+    );
+}
+
+/// Scenario: A hand-made worktree (no `dot-agent-deck-owner` marker) whose
+/// branch has a MERGED PR and whose tree is clean survives
+/// `worktree reclaim --yes`. This is issue #144 finding 1's failure scenario:
+/// a developer hand-creates a worktree for a branch whose PR later merges,
+/// leaves it clean, and runs `--yes` expecting it to clear only the deck's OWN
+/// leftovers -- not every worktree that happens to be merged and clean.
+#[spec("worktree/reclaim/008")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_008_hand_made_foreign_worktree_survives_yes() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-hand-made", "feat/hand-made");
+    fx.set_pr_state("feat/hand-made", "MERGED");
+    // Deliberately NOT marked owned: this is exactly what a developer's own
+    // hand-created worktree looks like -- no `dot-agent-deck-owner` marker.
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a worktree the deck cannot prove it created must survive `--yes` -- the flag may only \
+         auto-remove worktrees the gate already resolved to a `remove` verdict (deck-owned); \
+         {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
+/// Scenario: A local, UNMERGED worktree on branch `fix/typo` shares its name
+/// with a DIFFERENT fork's already-merged PR whose head branch is also called
+/// `fix/typo`. `resolve_pr_state` matches on `headRefName` alone, which is not
+/// namespaced by head repository owner, so the other fork's MERGED state would
+/// otherwise be attributed to this local branch. The worktree is deck-owned
+/// and clean, so only the PR-state gate can save it: `worktree reclaim --yes`
+/// must not remove it.
+#[spec("worktree/reclaim/009")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_009_cross_fork_branch_name_collision_is_not_treated_as_merged() {
+    let fx = Fixture::new();
+    // A NEW branch carrying its own commit: genuinely unmerged locally.
+    let wt = fx.add_worktree_with_commit("wt-collision", "fix/typo");
+    fx.mark_owned(&wt); // owned and clean: only PR state can still save it
+    // A merged PR from a DIFFERENT fork ("other-fork", not this fixture's own
+    // "test-org") whose head branch happens to be named identically.
+    fx.set_pr_state_with_head_owner("fix/typo", "MERGED", "other-fork");
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a same-named branch from a DIFFERENT fork's merged PR must not be attributed to this \
+         local branch -- headRefName alone is not namespaced by head repository owner -- \
+         {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
+/// Scenario: Mirrors `009`, but the canned `gh` reply carries no
+/// `headRepositoryOwner` field at all -- the shape real `gh` can return when
+/// the head repository can no longer be resolved (e.g. a fork deleted after
+/// its PR merged). The gate must fail closed to NOT-merged when it cannot
+/// verify the head repository owner, exactly as every other unresolvable path
+/// in this gate keeps rather than guesses.
+#[spec("worktree/reclaim/010")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_010_missing_head_repository_owner_fails_closed_not_merged() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-no-owner-field", "fix/deleted-fork");
+    fx.mark_owned(&wt); // owned and clean: only PR state can still save it
+    // No `headRepositoryOwner` field in the canned reply at all.
+    fx.set_pr_state_no_owner_field("fix/deleted-fork", "MERGED");
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a PR reply missing `headRepositoryOwner` must fail closed -- an unverifiable owner \
+         must never be treated as a match -- {} is gone\n{}",
+        wt.display(),
+        combined(&out)
     );
 }

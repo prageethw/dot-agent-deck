@@ -729,6 +729,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the `reclaim` (removal) path for this fixture, or JSON output — same gate, already covered elsewhere (`002`, `006`); the "unrelated repo's coincidental MERGED PR" framing from the fix's own doc comment, which this suite could not reproduce (see the test's doc comment and `set_worktree_origin`) because it requires the common config to ALSO carry a resolvable `origin`, which the list-accumulation behavior above rules out.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/008 — A hand-made worktree (no `dot-agent-deck-owner` marker) whose PR is MERGED and whose tree is clean survives `worktree reclaim --yes` (issue #144 finding 1).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a worktree deliberately left without an ownership marker — exactly what a developer's hand-created worktree looks like).
+- **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward. Pins the fix's second half: `--yes` may auto-remove only a `remove`-verdict (deck-owned) worktree, never an `ask`-verdict (foreign) one, even when merged and clean.
+- **Does not assert:** the `ask`-surface reporting shape (`005`, same fixture without `--yes`); that a deck-owned worktree IS removed under the same conditions (`002` already covers that, and doubles as the guard against a coder satisfying this test by making `--yes` a bare no-op, since `002`'s removal path is unconditional on the flag).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/009 — A local unmerged branch survives `worktree reclaim --yes` even when a DIFFERENT fork's already-merged PR shares its exact `headRefName` (issue #144 finding 2).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree on a fresh branch carrying its own unmerged commit; the canned `gh` reply reports a MERGED PR for the same `headRefName` but a `headRepositoryOwner` that does not match this fixture's own `origin` owner).
+- **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward — `resolve_pr_state` must not attribute a same-named PR from a different fork's `headRepositoryOwner` to this local branch.
+- **Does not assert:** the exact resulting `PrState`/verdict label (only the observable non-removal); the ambiguity-guard path (`>1` match), which is a distinct, already-covered code path.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/010 — A local unmerged branch survives `worktree reclaim --yes` when the canned `gh` reply carries no `headRepositoryOwner` field at all (issue #144 finding 2, fail-closed case).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (same fixture shape as `009`, but the PR fixture omits `headRepositoryOwner` entirely — the shape real `gh` can return when the head repository is no longer resolvable, e.g. a fork deleted after its PR merged).
+- **Asserts:** `worktree reclaim --yes` exits successfully and the worktree directory still exists afterward — an unverifiable head repository owner must fail closed to not-merged, never be treated as a match.
+- **Does not assert:** the exact resulting `PrState`/verdict label (only the observable non-removal).
+- **Platform coverage:** mac+linux.
+
 
 ### Prompts
 
