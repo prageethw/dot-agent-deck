@@ -11897,8 +11897,31 @@ pub fn run_tui(
                         .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
                         .unwrap_or(false);
 
+                    // Issue #424 coupling: after #424, a write that has
+                    // LANDED (bytes reached the PTY) no longer clears
+                    // `orchestrator_prompt` by itself — it waits for an
+                    // independent confirmation signal (or the deadline) to
+                    // finalize. So `orchestrator_prompt.is_none()` alone no
+                    // longer means "no delivery in flight"; it means "no
+                    // delivery in flight AND the last one was confirmed or
+                    // timed out" — a materially stronger condition this gate
+                    // was never written to require. A landed-but-unconfirmed
+                    // write (`orchestration_awaiting_confirmation` holds an
+                    // entry) is, for RE-ARM purposes, equivalent to what
+                    // `main`'s `is_none()` already treated as done, so it
+                    // must not block a NEW compaction cycle from re-arming —
+                    // a compaction is new information (the context was just
+                    // truncated) and is an argument for re-asserting MORE,
+                    // not less. A write that has NOT yet landed (armed but
+                    // still probing readiness/backoff/retryable outcomes) is
+                    // still genuinely in-flight and must keep blocking
+                    // re-arm — `orchestration/remit/003`'s deferred-delivery
+                    // (history-only) phase depends on exactly that.
+                    let no_delivery_pending = orchestrator_prompt.is_none()
+                        || ui.orchestration_awaiting_confirmation.contains_key(id);
+
                     if !ui.orchestration_remit_compacting.contains(id)
-                        && orchestrator_prompt.is_none()
+                        && no_delivery_pending
                         && !ui.orchestration_remit_abandoned.contains(id)
                         && !start_role_is_pi
                         // F1: re-run the spawn-time write-then-point pair
@@ -11911,6 +11934,26 @@ pub fn run_tui(
                         // from wherever it has since `cd`'d to.
                         && let Some(prompt) = prepare_orchestrator_prompt(config, cwd)
                     {
+                        // This re-arm may be SUPERSEDING a still-open cycle
+                        // that already landed a write and is only waiting on
+                        // confirmation — possibly holding a spent one-retry
+                        // budget, a captured delivery identity, or a
+                        // scheduled backoff for it. None of that belongs to
+                        // the NEW cycle this re-arm starts, so clear it
+                        // explicitly rather than let it leak in: a stale
+                        // `retried = true` would silently disable the new
+                        // cycle's own one retry, and a stale
+                        // `expected_session_id` would let a confirmation
+                        // meant for the OLD write confirm this one instead.
+                        // This is deliberately a fresh cycle, not a retry of
+                        // the old one — the same retry-vs-re-arm distinction
+                        // that already shaped the ledger (round 2) and the
+                        // grace period (round 3) of #424.
+                        ui.orchestration_awaiting_confirmation.remove(id);
+                        ui.send_retry_backoff.remove(start_pane_id.as_str());
+                        ui.prompt_delivery.remove(start_pane_id.as_str());
+                        ui.orchestration_ready_since.remove(id);
+
                         *orchestrator_prompt = Some(prompt);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
