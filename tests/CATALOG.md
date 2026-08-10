@@ -841,6 +841,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to the typed unique name, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/023 — Two markers written directly via `mark_worktree_owned` for two DIFFERENT worktrees of the SAME repo, using the exact owner strings the interactive path records for two live orchestrations of the SAME config type (`review`) in the SAME directory, report DISTINCT owners back via `owner_of` (fork#192 — the unit-level complement to `worktree/reclaim/022`'s real-dispatch pin of the same success criterion).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/017`'s precedent (a real git repo via `init_repo_with_origin`, two linked worktrees via real `git worktree add`).
+- **Agent:** none.
+- **Asserts:** `mark_worktree_owned(wt_a, "orchestration:review-orchestrator-1")` and `mark_worktree_owned(wt_b, "orchestration:review-orchestrator-2")` on two worktrees of the same repo each round-trip through `owner_of` to their own exact string, and the two owners are `assert_ne!`.
+- **Does not assert:** the interactive `SpawnPane` handler that derives these owner strings from the typed Name (covered end-to-end by `worktree/reclaim/022`, `src/ui.rs`); `mark_worktree_owned`/`owner_of` themselves, which are unchanged by fork#192 and already covered by `017`/`020`.
+- **Platform coverage:** mac+linux.
 
 ### Prompts
 
@@ -2621,6 +2627,20 @@ without depending on the config struct API.
 - **Asserts:** when the new-pane form's Name field defaults to the worktree basename (`dot-agent-deck-prd-113-foo`) while the config name is `dot-agent-deck`, every role pane's `TabMembership::Orchestration.name` (the IDENTITY the daemon's `lookup_orchestration_role` compares) equals the canonical config name `dot-agent-deck` — so the role resolves and `clear = true` respawn fires — while the tab TITLE (`Tab::Orchestration.name`) still shows the basename. Pre-fix the PRD #107 SpawnPane override copies the basename into `orch_config.name`, so the identity is the basename and the lookup misses.
 - **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
 - **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/002 — Selecting the form's orchestration (Right arrow) suggests `<folder>-orchestrator-1` in the Name field in place of the bare directory basename it was pre-filled with, when no orchestration is live yet; a single further keystroke (Enter, no character typed) accepts it as-is at submit (fork#192 M1.0).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces today; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"` (the basename pre-fill) and one orchestration, after a Right-arrow selects that orchestration, has `form.name == "myproj-orchestrator-1"`, not `"myproj"`; submitting from there (Enter Mode→Name, Enter to submit) with no further edit yields `Action::SpawnPane` carrying `req.name == "myproj-orchestrator-1"` unchanged.
+- **Does not assert:** the daemon round-trip `live_orchestration_cwds()`/`transition_after_dir_pick` performs to learn live names (not unit-testable without a live daemon — covered informally by `orchestration/identity/004`'s real-binary path); rendering of the suggestion (no L1 render seam asserts the Name field's literal text here).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/004 — Driving the real binary through TWO orchestration opens in the SAME directory, each accepting the form's suggested Name with a single Enter (no character typed), lands both as visible tabs with DISTINCT labels (`<basename>-orchestrator-1`, `<basename>-orchestrator-2`) — never the identical basename-derived title recorded twice, the fork #74 collision fork#192 exists to stop (fork#192 M1.0).
+- **Layer:** L2 (PTY-attached real binary via `TuiDeck`; stand-in `cat` agent, no real LLM tokens spent, no credentials required).
+- **Agent:** none (both roles of the `orch-deck` fixture run `cat`).
+- **Asserts:** after opening the fixture's one orchestration twice from the Dashboard (`Ctrl+n` → confirm dir → select orchestration → accept the suggested Name unedited → submit), the rendered tab strip contains both `" <basename>-orchestrator-1 "` and `" <basename>-orchestrator-2 "` as distinct substrings, where `<basename>` is the real launch directory's basename read from `TuiDeck::workdir()`.
+- **Does not assert:** the suggestion/refusal MECHANISMS in isolation (covered by `orchestration/identity/002`/`003`); worktree creation (no worktree slug is typed on this path); ownership marker content (covered by `worktree/reclaim/022`/`023`).
+- **Platform coverage:** mac+linux (PTY-attached, `#[cfg(feature = "e2e")]`, as the other `e2e_orchestration_*.rs` files).
 
 #### orchestration/guard
 

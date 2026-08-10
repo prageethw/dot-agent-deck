@@ -30209,6 +30209,52 @@ mod tests {
         }
     }
 
+    /// Scenario: Build the new-pane form the way `transition_after_dir_pick`
+    /// does today — the Name field pre-filled with the bare directory
+    /// basename `myproj` — then select the form's one orchestration (Right
+    /// arrow). With no orchestration live yet, selecting it must suggest
+    /// `myproj-orchestrator-1` in the Name field in place of the bare
+    /// basename (fork#192 M1.0). A single further keystroke (Enter, no
+    /// character typed) then accepts that suggestion as-is at submit.
+    #[spec("orchestration/identity/002")]
+    #[test]
+    fn identity_002_selecting_orchestration_suggests_orchestrator_1_and_one_keystroke_accepts_it() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            // The bare basename `transition_after_dir_pick` pre-fills today.
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-1",
+            "selecting the orchestration with none live yet must suggest N=1, \
+             not keep the bare basename pre-fill"
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        // One further keystroke — no characters typed — submits the
+        // suggestion as-is.
+        let result = handle_new_pane_form_key(enter, &mut ui);
+
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.name, "myproj-orchestrator-1",
+                "the accepted name must be the suggestion, untouched"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
+    }
+
     /// Scenario: Build the new-pane form for an orchestration with a
     /// worktree slug typed in, then submit it. The resulting request must
     /// carry the resolved sibling worktree path (`<dir>-<slug>`, next to the
