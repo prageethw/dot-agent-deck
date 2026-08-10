@@ -2050,6 +2050,82 @@ struct AwaitingConfirmation {
     retried: bool,
 }
 
+/// Fork #188 — the four real states of one orchestration tab's automatic
+/// start-role prompt delivery cycle, named so the compiler tells "no
+/// delivery attempt is in flight" apart from "a write landed but is
+/// unconfirmed" apart from "the cycle just ended", instead of every call
+/// site spelling its own combination of `orchestrator_prompt.is_none()` and
+/// `orchestration_awaiting_confirmation.contains_key(...)` and meaning a
+/// different one of these by hand. Issue #188 records that same distinction
+/// being gotten right, then wrong, then right again three times inside
+/// issue #424 alone, each time as an expression that was correct when
+/// written and became wrong once the state machine gained a phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryPhase {
+    /// No prompt queued for this tab and no write is awaiting confirmation.
+    /// The tab has either never started a delivery cycle, or its last one
+    /// just finalized — see [`Finalized`](DeliveryPhase::Finalized) for why
+    /// those two are not distinguishable from this state alone.
+    Idle,
+    /// A prompt is queued (`orchestrator_prompt.is_some()`) and no write
+    /// from the current cycle has landed yet — still waiting on readiness,
+    /// backoff, or a retryable send outcome. The one phase in which an
+    /// interrupting re-arm is unsafe (issue #423): there is no landed write
+    /// yet for a fresh cycle to supersede, so `orchestration/remit/003`'s
+    /// deferred-delivery phase depends on this blocking re-arm.
+    Armed,
+    /// A write LANDED for this tab (bytes reached the PTY — `Applied`/
+    /// `Queued`) but no independent submit confirmation has been observed
+    /// yet — `orchestration_awaiting_confirmation` holds an entry. Safe to
+    /// let a re-arm supersede: a compaction is new information and an
+    /// argument for reasserting MORE, not less (issue #423).
+    Landed,
+    /// The cycle just ended — confirmed, delivered-unconfirmed, or
+    /// abandoned (`finalize_orchestrator_prompt_delivered` /
+    /// `abandon_orchestrator_prompt`, which each log this variant at the
+    /// moment they finalize). Not a phase [`delivery_phase`] ever RETURNS
+    /// from stored state: finalizing a cycle clears the exact same state
+    /// that distinguishes [`Idle`](DeliveryPhase::Idle), so the instant a
+    /// cycle finalizes it becomes observably identical to a tab that never
+    /// started one. This variant names the transition itself, for the two
+    /// functions that perform it, rather than a state re-derivable later
+    /// from `UiState`.
+    Finalized,
+}
+
+/// Computes the [`DeliveryPhase`] for one orchestration tab from the two
+/// pieces of state that distinguish it: whether a prompt is currently
+/// queued, and whether a write from the current cycle has LANDED
+/// (`orchestration_awaiting_confirmation` holds an entry for the tab). Pure
+/// and side-effect-free so every call site asks the SAME question the SAME
+/// way, rather than each re-deriving its own boolean spelling of it.
+fn delivery_phase(orchestrator_prompt: &Option<String>, landed: bool) -> DeliveryPhase {
+    match (orchestrator_prompt.is_some(), landed) {
+        (true, false) => DeliveryPhase::Armed,
+        (_, true) => DeliveryPhase::Landed,
+        (false, false) => DeliveryPhase::Idle,
+    }
+}
+
+/// Fork #188 M1: clears every piece of per-cycle delivery state for one
+/// orchestration tab's start-role pane, replacing the three previously
+/// open-coded clear sites (`abandon_orchestrator_prompt`,
+/// `finalize_orchestrator_prompt_delivered`, and the remit re-arm gate)
+/// that each cleared this same subset by hand — a piece of state added to a
+/// future cycle can now be missed at most once, not up to three times.
+///
+/// Deliberately does NOT touch `orchestrator_prompt` itself, nor
+/// `orchestration_prompted` / `orchestration_remit_abandoned`: those carry
+/// the meaning specific to WHY the cycle ended (finalized vs abandoned vs
+/// freshly re-armed with a NEW prompt already in hand) and are the caller's
+/// to set, not this helper's.
+fn reset_delivery_cycle(ui: &mut UiState, tab_id: TabId, start_pane_id: &str) {
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
+    ui.orchestration_awaiting_confirmation.remove(&tab_id);
+}
+
 /// Issue #424 round 4: does `observed` (a session's current
 /// `last_user_prompt`) positively identify a genuine submit of `sent` (the
 /// text we wrote to the pane)? Trimmed equality or a trimmed-prefix match
@@ -2408,8 +2484,11 @@ struct UiState {
     /// terminal `SendResult` (`abandon_orchestrator_prompt`). Once a tab is
     /// in this set the remit re-arm gate below must never fire for it
     /// again: an abandoned delivery has no in-flight attempt to protect
-    /// (so `orchestrator_prompt.is_none()` alone can't tell "delivered" and
-    /// "gave up" apart), and re-arming it would turn the deadline this set
+    /// (so fork #188's `DeliveryPhase` alone can't tell "delivered" and
+    /// "gave up" apart either — both collapse to the same `Idle`-equivalent
+    /// phase once `orchestrator_prompt` and the confirmation entry are
+    /// cleared, which is exactly why this set exists as separate,
+    /// permanent memory), and re-arming it would turn the deadline this set
     /// exists to make permanent into an unbounded retry loop. Never
     /// removed — bounded the same way as `orchestration_prompted` and its
     /// siblings: `TabId` is a monotonic, never-reused `u32`.
@@ -3768,11 +3847,14 @@ fn abandon_orchestrator_prompt(
     now: std::time::Instant,
     msg: String,
 ) {
+    tracing::debug!(
+        pane_id = %start_pane_id,
+        tab_id,
+        phase = ?DeliveryPhase::Finalized,
+        "orchestrator prompt: delivery cycle finalized (abandoned)"
+    );
     *orchestrator_prompt = None;
-    ui.send_retry_backoff.remove(start_pane_id);
-    ui.prompt_delivery.remove(start_pane_id);
-    ui.orchestration_ready_since.remove(&tab_id);
-    ui.orchestration_awaiting_confirmation.remove(&tab_id);
+    reset_delivery_cycle(ui, tab_id, start_pane_id);
     ui.orchestration_remit_abandoned.insert(tab_id);
     ui.status_message = Some((msg, now));
 }
@@ -3799,14 +3881,17 @@ fn finalize_orchestrator_prompt_delivered(
     now: std::time::Instant,
     status_message: Option<String>,
 ) {
+    tracing::debug!(
+        pane_id = %start_pane_id,
+        tab_id,
+        phase = ?DeliveryPhase::Finalized,
+        "orchestrator prompt: delivery cycle finalized (delivered)"
+    );
     *orchestrator_prompt = None;
     role_statuses[start_role_index] =
         next_start_role_status_after_delivery(role_statuses[start_role_index]);
     ui.orchestration_prompted.insert(tab_id);
-    ui.send_retry_backoff.remove(start_pane_id);
-    ui.prompt_delivery.remove(start_pane_id);
-    ui.orchestration_ready_since.remove(&tab_id);
-    ui.orchestration_awaiting_confirmation.remove(&tab_id);
+    reset_delivery_cycle(ui, tab_id, start_pane_id);
     if let Some(msg) = status_message {
         ui.status_message = Some((msg, now));
     }
@@ -3849,7 +3934,11 @@ fn deliver_orchestrator_prompt(
         // never independently confirmed — bytes reached the PTY, which is
         // exactly what `main` reported as success for a single delivery. Only
         // a tab with NO landed write at all (no entry) is genuinely abandoned.
-        if ui.orchestration_awaiting_confirmation.contains_key(&tab_id) {
+        if delivery_phase(
+            &*orchestrator_prompt,
+            ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+        ) == DeliveryPhase::Landed
+        {
             tracing::warn!(
                 pane_id = %start_pane_id,
                 tab_id,
@@ -12586,9 +12675,9 @@ pub fn run_tui(
                     // decision 3: never replay on reconnect) never reaches —
                     // so the re-arm gate could never pass for the exact
                     // long-lived, detach/reattach sessions issue #423 is
-                    // stated to target. `orchestrator_prompt.is_none()`
-                    // alone already captures "no delivery attempt is
-                    // in-flight right now" for EVERY path — spawn-delivered,
+                    // stated to target. `DeliveryPhase::Idle` (fork #188)
+                    // already captures "no delivery attempt is in-flight
+                    // right now" for EVERY path — spawn-delivered,
                     // reattached (never had one), or abandoned — so the only
                     // thing still needed is excluding "abandoned" explicitly,
                     // which `orchestration_remit_abandoned` now does (F4).
@@ -12612,24 +12701,28 @@ pub fn run_tui(
                     // LANDED (bytes reached the PTY) no longer clears
                     // `orchestrator_prompt` by itself — it waits for an
                     // independent confirmation signal (or the deadline) to
-                    // finalize. So `orchestrator_prompt.is_none()` alone no
-                    // longer means "no delivery in flight"; it means "no
-                    // delivery in flight AND the last one was confirmed or
-                    // timed out" — a materially stronger condition this gate
-                    // was never written to require. A landed-but-unconfirmed
-                    // write (`orchestration_awaiting_confirmation` holds an
-                    // entry) is, for RE-ARM purposes, equivalent to what
-                    // `main`'s `is_none()` already treated as done, so it
-                    // must not block a NEW compaction cycle from re-arming —
-                    // a compaction is new information (the context was just
-                    // truncated) and is an argument for re-asserting MORE,
-                    // not less. A write that has NOT yet landed (armed but
+                    // finalize. So a bare `orchestrator_prompt.is_none()`
+                    // check no longer means "no delivery in flight"; fork
+                    // #188's `DeliveryPhase` now makes the two questions this
+                    // gate used to conflate visibly different: a
+                    // landed-but-unconfirmed write (`DeliveryPhase::Landed`)
+                    // is, for RE-ARM purposes, equivalent to `DeliveryPhase::
+                    // Idle`/`Finalized` — it must not block a NEW compaction
+                    // cycle from re-arming, since a compaction is new
+                    // information (the context was just truncated) and an
+                    // argument for re-asserting MORE, not less. Only
+                    // `DeliveryPhase::Armed` (no write has landed yet —
                     // still probing readiness/backoff/retryable outcomes) is
                     // still genuinely in-flight and must keep blocking
                     // re-arm — `orchestration/remit/003`'s deferred-delivery
                     // (history-only) phase depends on exactly that.
-                    let no_delivery_pending = orchestrator_prompt.is_none()
-                        || ui.orchestration_awaiting_confirmation.contains_key(id);
+                    let no_delivery_pending = !matches!(
+                        delivery_phase(
+                            &*orchestrator_prompt,
+                            ui.orchestration_awaiting_confirmation.contains_key(id),
+                        ),
+                        DeliveryPhase::Armed
+                    );
 
                     if !ui.orchestration_remit_compacting.contains(id)
                         && no_delivery_pending
@@ -12660,10 +12753,7 @@ pub fn run_tui(
                         // the old one — the same retry-vs-re-arm distinction
                         // that already shaped the ledger (round 2) and the
                         // grace period (round 3) of #424.
-                        ui.orchestration_awaiting_confirmation.remove(id);
-                        ui.send_retry_backoff.remove(start_pane_id.as_str());
-                        ui.prompt_delivery.remove(start_pane_id.as_str());
-                        ui.orchestration_ready_since.remove(id);
+                        reset_delivery_cycle(&mut ui, *id, start_pane_id.as_str());
 
                         *orchestrator_prompt = Some(prompt);
                         ui.orchestration_prompted.remove(id);
