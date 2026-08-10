@@ -124,7 +124,20 @@ jobs:
       # dependency features and no `src/**` file reads `feature = "e2e"`, so
       # turning it on cannot change how the lib and bins compile. One command
       # therefore covers both, and no separate default-feature run is needed.
-      - run: cargo clippy --all-targets --features e2e -- -D warnings
+      #
+      # `--workspace`, NOT bare (fork #185). The root `Cargo.toml` is a
+      # non-virtual workspace (it carries its own `[package]` alongside
+      # `[workspace] members`), so without `--workspace` or `-p` Cargo treats
+      # the root package as "the current package" and clippy never even
+      # compiles the `xtask/*` members (`xtask/docs`, `xtask/linkage-check`,
+      # `xtask/spec`), let alone lints them. `--all-targets` and `--workspace`
+      # widen two different axes of the same blind spot: the former widens
+      # *which targets* within a package are linted, the latter widens *which
+      # packages* are linted at all — fork #117 fixed the first axis on this
+      # line, fork #185 fixes the second. `cargo nextest run --workspace`
+      # below already carries the same flag for the identical reason (fork
+      # #180); clippy had silently kept the gap `nextest` closed.
+      - run: cargo clippy --workspace --all-targets --features e2e -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
