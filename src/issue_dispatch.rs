@@ -528,6 +528,27 @@ pub fn label_create_argv(repo: &str, label: &str, color: &str, description: &str
     ]
 }
 
+/// Build the `gh label create` argv for the `in-progress` claim label,
+/// WITHOUT `--force` (upstream #471 review decision): the claim label is a
+/// common name a repo plausibly already carries under its own colour and
+/// description, and `--force`'s PATCH-if-exists semantics would rewrite both
+/// on every dispatch run — up to 96×/day on a `*/15` cron. Create it when
+/// absent; leave it completely alone when present. `color`/`description`
+/// still ride along so a first-time create is never a colour-randomizing
+/// call.
+///
+/// TODO(coder, upstream #471): this is a compile-only stub that currently
+/// delegates to [`label_create_argv`] and therefore still carries `--force`;
+/// give it its own argv (same shape, minus the trailing `--force` element).
+pub fn claim_label_create_argv(
+    repo: &str,
+    label: &str,
+    color: &str,
+    description: &str,
+) -> Vec<String> {
+    label_create_argv(repo, label, color, description)
+}
+
 /// The triage instruction appended to a dispatched issue's prompt when triage
 /// is enabled (M2.2): names the full vocabulary and states the uncertainty
 /// rule — under uncertainty, apply `needs-triage` and leave priority unset
@@ -941,20 +962,60 @@ mod tests {
     }
 
     #[test]
-    fn label_create_argv_carries_color_and_description() {
+    fn label_create_argv_for_triage_label_carries_force() {
+        // upstream #471 review decision: the seven triage labels are the
+        // deck's own vocabulary, so `--force` (with an explicit color and
+        // description) stays — converging them on the deck's colours is the
+        // intended behaviour.
+        let spec = TRIAGE_LABELS[0];
         assert_eq!(
-            label_create_argv("acme/widgets", IN_PROGRESS_LABEL, "006b75", "claim marker"),
+            label_create_argv("acme/widgets", spec.name, spec.color, spec.description),
             vec![
                 "label",
                 "create",
-                "in-progress",
+                spec.name,
                 "--repo",
                 "acme/widgets",
                 "--color",
-                "006b75",
+                spec.color,
                 "--description",
-                "claim marker",
+                spec.description,
                 "--force",
+            ]
+        );
+    }
+
+    #[test]
+    fn claim_label_create_argv_omits_force_but_keeps_color_and_description() {
+        // upstream #471 review decision: the `in-progress` claim label is
+        // create-if-missing, never re-converged, because a repo plausibly
+        // already carries its own `in-progress` label with its own colour
+        // and description that must not be overwritten on every dispatch
+        // run. Dropping `--force` must not become "create it with a random
+        // colour" — color/description still ride along for a first-time
+        // create.
+        let argv = claim_label_create_argv(
+            "acme/widgets",
+            IN_PROGRESS_LABEL,
+            IN_PROGRESS_LABEL_COLOR,
+            IN_PROGRESS_LABEL_DESCRIPTION,
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--force"),
+            "claim label argv must not carry --force, got {argv:?}"
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "label",
+                "create",
+                IN_PROGRESS_LABEL,
+                "--repo",
+                "acme/widgets",
+                "--color",
+                IN_PROGRESS_LABEL_COLOR,
+                "--description",
+                IN_PROGRESS_LABEL_DESCRIPTION,
             ]
         );
     }
