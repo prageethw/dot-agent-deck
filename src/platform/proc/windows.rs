@@ -695,8 +695,11 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 ///
 /// Fork issue #160: reports [`super::ProcessTableOutcome::Unsupported`] rather
 /// than the Unix backend's [`super::ProcessTableOutcome::Failed`] — this is
-/// permanent for the process's whole lifetime, not a transient sample miss, so
-/// the daemon's poll can skip the tick without ever warning about it.
+/// permanent for the process's whole lifetime, not a transient sample miss.
+/// Fork issue #160 F7: the daemon's poll (`run_shell_activity_monitor` in
+/// `src/daemon.rs`) logs one `info!` line the first time it sees this and
+/// then ends the poll outright, rather than continuing to wake every 500ms
+/// to learn a fact that cannot change.
 pub async fn process_table_async() -> Result<Vec<super::ProcessInfo>, super::ProcessTableOutcome> {
     Err(super::ProcessTableOutcome::Unsupported)
 }

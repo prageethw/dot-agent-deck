@@ -1164,18 +1164,23 @@ async fn run_shell_activity_monitor(
     // cadence itself is left unchanged deliberately, so M5 measures what
     // actually shipped.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
-    // Fork issue #160 F6: how often a *sustained* run of `Failed` samples
-    // still gets a log line after the first (transition) one. At the 500ms
-    // cadence this is ~10s between lines while contention persists — loud
-    // enough that a chronically failing machine is still visible, quiet
+    // Fork issue #160 F6 / N4: how often a *sustained* run of `Failed`
+    // samples still gets a log line after the first (transition) one. Under
+    // budget exhaustion each failed tick costs the 500ms poll interval plus
+    // the full `PS_SAMPLE_BUDGET` (~2.5s total —
+    // `docs/develop/shell-activity-signal.md` derives the same figure), so
+    // 20 ticks is ~50s between lines while contention persists, not ~10s —
+    // loud enough that a chronically failing machine is still visible, quiet
     // enough that it cannot become a per-tick flood (see the match arm
     // below).
     const FAILURE_LOG_EVERY: u32 = 20;
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // Fork issue #160 F6: counts an unbroken run of `Failed` samples, next to
-    // `last_known` since both are this loop's only persistent state. Reset to
-    // 0 on any success so the *next* failure after a success is always
-    // logged as a fresh transition.
+    // `last_known` since both are this loop's only persistent state. Fork
+    // issue #160 A3: reset to 0 only once a tick actually classifies a pane
+    // (a non-empty snapshot below) — an `Ok` table sample where every row
+    // goes unconfirmed is the same degradation this counter exists to
+    // surface, one level down, so it must not be read as a success either.
     let mut consecutive_process_table_failures: u32 = 0;
 
     loop {
@@ -1208,10 +1213,12 @@ async fn run_shell_activity_monitor(
         // `process-table sample exceeded its budget` line the capture itself
         // already emits with no "shell activity" context attached).
         let table = match crate::platform::proc::process_table_async().await {
-            Ok(table) => {
-                consecutive_process_table_failures = 0;
-                table
-            }
+            // Fork issue #160 A3: do NOT reset `consecutive_process_table_failures`
+            // here — `Ok` only proves the two `ps` invocations completed, not
+            // that anything in `table` was classifiable. The reset moves to
+            // just after `snapshot` is computed below, conditioned on it
+            // actually containing a classified pane.
+            Ok(table) => table,
             Err(crate::platform::proc::ProcessTableOutcome::Unsupported) => {
                 // Fork issue #160 F7: `Unsupported` is documented as
                 // permanent for the life of the process (see
@@ -1266,6 +1273,15 @@ async fn run_shell_activity_monitor(
             &table,
             crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES,
         );
+        // Fork issue #160 A3: reset here, not on a bare `Ok` above — an empty
+        // snapshot means every row this tick went unconfirmed (a degraded
+        // sample that still returned `Ok`), and that must count toward
+        // `consecutive_process_table_failures` the same as an explicit
+        // `Failed`, not silently look healthy because the two `ps` calls
+        // themselves happened to complete.
+        if !snapshot.is_empty() {
+            consecutive_process_table_failures = 0;
+        }
         let seen: std::collections::HashSet<&str> = snapshot
             .iter()
             .map(|(pane_id, _)| pane_id.as_str())

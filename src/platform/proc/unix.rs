@@ -477,7 +477,7 @@ const PS_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="];
 /// production caller polls every 500 ms, so a wedged `ps` costs at most one
 /// extra sample's worth of staleness per tick instead of parking the poll (and,
 /// before the async move below, a Tokio worker) forever.
-pub(crate) const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
+pub const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Run `program args…` with its stdout captured, abandoning it if it has not
 /// finished within `budget`. `None` means "no usable output": spawn failed, the

@@ -44,16 +44,22 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::event::EventType;
 use dot_agent_deck::platform::proc::{
-    MEASURED_SHELL_TOOL_SHAPES, descendant_shell_activity, descendants, process_table,
+    MEASURED_SHELL_TOOL_SHAPES, PS_SAMPLE_BUDGET, descendant_shell_activity, descendants,
+    process_table,
 };
 use spec::spec;
 
-/// Fork issue #160 F5: mirrors `tests/shell_activity.rs`'s
-/// `PROCESS_TABLE_POLL_WINDOW` — real headroom beyond `unix.rs`'s
-/// `PS_SAMPLE_BUDGET` (2s, not `pub`) so a single timed-out `process_table()`
-/// sample leaves room for a retry rather than failing the test outright. See
-/// [`poll_process_table`].
-const PROCESS_TABLE_SAMPLE_WINDOW: Duration = Duration::from_secs(8);
+/// Fork issue #160 F5 / item 2: mirrors `tests/shell_activity.rs`'s
+/// `PROCESS_TABLE_POLL_WINDOW` — real headroom beyond `unix.rs`'s real
+/// [`PS_SAMPLE_BUDGET`] (now `pub`) so a single timed-out `process_table()`
+/// sample leaves room for a retry rather than failing the test outright.
+/// This is a separate test binary from `tests/shell_activity.rs` (this file
+/// is `e2e`-gated, that one is fast-tier), so the two cannot share a `const`
+/// directly — both derive from the same real `PS_SAMPLE_BUDGET` instead of
+/// each hard-coding its own multiple of it, which is what let this window
+/// drift to a bare `8` disconnected from the constant it was meant to track.
+/// See [`poll_process_table`].
+const PROCESS_TABLE_SAMPLE_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 4);
 
 /// Fork issue #160 F5: `process_table()` returning `None` is a transient,
 /// load-caused sample miss, not evidence of anything about the process tree

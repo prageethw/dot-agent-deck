@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 #[cfg(unix)]
-use dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
+use dot_agent_deck::platform::proc::{CLAUDE_BASH_TOOL_SHAPE, PS_SAMPLE_BUDGET};
 use dot_agent_deck::platform::proc::{
     ProcessInfo, descendant_shell_activity, descendants, process_table,
 };
@@ -48,14 +48,14 @@ use dot_agent_deck::platform::proc::{ProcessTableOutcome, process_table_async};
 use spec::spec;
 
 /// Fork issue #160: every deadline below that polls [`process_table`] must
-/// leave real headroom beyond `unix.rs`'s `PS_SAMPLE_BUDGET` (currently 2s,
-/// not `pub` so it can't be referenced directly from this integration test
-/// crate — keep this mirror in sync with it, `PS_SAMPLE_BUDGET_SECS_MIRROR`
-/// below). A deadline equal to the budget gives a single timed-out sample
-/// zero room for a retry, which is exactly what made
-/// `shell_activity_001`/`_004` fail intermittently in CI under machine load:
-/// one `ps` call consumed the whole polling window and there was no time
-/// left to try again.
+/// leave real headroom beyond `unix.rs`'s real [`PS_SAMPLE_BUDGET`] (now
+/// `pub`, so this derives from the actual constant rather than a hand-kept
+/// mirror of its value — fork issue #160 item 2, closing the drift risk
+/// mechanically instead of by comment discipline). A deadline equal to the
+/// budget gives a single timed-out sample zero room for a retry, which is
+/// exactly what made `shell_activity_001`/`_004` fail intermittently in CI
+/// under machine load: one `ps` call consumed the whole polling window and
+/// there was no time left to try again.
 ///
 /// `#[cfg(unix)]`: only `Duration`/`Instant` are imported under that gate
 /// above, and `process_table()` only ever returns real data on Unix — it is
@@ -63,21 +63,7 @@ use spec::spec;
 /// `#[cfg(unix)]` entirely; an ungated use of `Duration` here fails to
 /// compile on Windows.
 #[cfg(unix)]
-const PS_SAMPLE_BUDGET_SECS_MIRROR: u64 = 2;
-
-#[cfg(unix)]
-const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET_SECS_MIRROR * 4);
-
-/// Fork issue #160 F1: the leading `sleep` in `shell_activity_004`'s script,
-/// before it spawns the detached target, must comfortably exceed one
-/// exhausted [`PS_SAMPLE_BUDGET_SECS_MIRROR`] — otherwise the very first
-/// falling-edge sample can time out, the target can already exist by the
-/// time a retry succeeds, and no widened deadline can fix that: the assertion
-/// would be polling for a state that has already stopped being true. Derived
-/// from the same mirror as [`PROCESS_TABLE_POLL_WINDOW`] so the two cannot
-/// drift apart.
-#[cfg(unix)]
-const SCRIPT_IDLE_WINDOW_SECS: u64 = PS_SAMPLE_BUDGET_SECS_MIRROR + 1;
+const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 4);
 
 /// Fork issue #160 F2: the trailing `sleep` in `shell_activity_004`'s script,
 /// after the detached target is killed, keeps the pane's own shell (and so
@@ -533,17 +519,57 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// RAII guard for the trigger file that gates `shell_activity_004`'s script
+/// (fork issue #160 item 1): the pane's script blocks in a POSIX
+/// `until [ -f … ]` poll loop until this file exists, so the idle window
+/// before the detached target launches is unbounded rather than a fixed
+/// `sleep` gambling that its duration outlasts one exhausted
+/// [`PS_SAMPLE_BUDGET`] sample. `release` is only called after the test has
+/// *actually observed* the idle reading, so no timing constant is
+/// load-bearing for F1 any more. Cleans up on drop, including on an early
+/// panic, so a failed run does not leave a stale file behind in
+/// `env::temp_dir()`.
+#[cfg(unix)]
+struct TriggerFile(std::path::PathBuf);
+
+#[cfg(unix)]
+impl TriggerFile {
+    /// `name` must already be unique per test run — the caller derives it
+    /// from this process's own pid.
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(name);
+        // Best-effort: a stale file left by a previous aborted run under the
+        // same name would release the script immediately instead of gating
+        // it, silently defeating the whole point of the trigger.
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+
+    /// Releases the pane's script by creating the file it polls for.
+    fn release(&self) {
+        std::fs::write(&self.0, b"")
+            .unwrap_or_else(|e| panic!("write trigger file {:?}: {e}", self.0));
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TriggerFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Scenario: spawns a real PTY pane running `/bin/sh` through
 /// `AgentPtyRegistry::spawn_agent` (the same registry path a real agent pane
 /// uses), tagged `agent_type: Some(AgentType::ClaudeCode)` so the shape
 /// catalog actually reaches the scan (`shell_tool_shape_key` filters by
-/// agent kind before the classifier ever sees a shape), whose script sleeps
-/// briefly and then has a `python3` child call `os.setsid()` and `execv`
-/// into `/bin/sleep` — a genuine `setsid`-detached, marker-tagged,
-/// Bash-tool-argv-shaped process on pipes, off the pane's PTY entirely,
-/// exactly the topology `status/shell-activity/386-argv-notes.md` measured
-/// for a real Claude Bash-tool child and the one #370's own test never
-/// exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
+/// agent kind before the classifier ever sees a shape), whose script blocks
+/// on [`TriggerFile`] before it spawns a `python3` child that calls
+/// `os.setsid()` and `execv`s into `/bin/sleep` — a genuine `setsid`-detached,
+/// marker-tagged, Bash-tool-argv-shaped process on pipes, off the pane's PTY
+/// entirely, exactly the topology `status/shell-activity/386-argv-notes.md`
+/// measured for a real Claude Bash-tool child and the one #370's own test
+/// never exercised. Polls `shell_foreground_busy_snapshot(&[CLAUDE_BASH_TOOL_SHAPE])`
 /// and asserts the pane reads idle before the detached child appears, busy
 /// while it lives — independently confirmed via `process_table()` +
 /// `descendants()` that the found descendant has no controlling terminal, is
@@ -555,13 +581,14 @@ impl Drop for KillOnDrop {
 fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
     const PANE_ID: &str = "shell-activity-004-pane";
     let marker = format!("shell-activity-004-target-{}", std::process::id());
-    // Fork issue #160 F1: the leading `sleep {SCRIPT_IDLE_WINDOW_SECS}`
-    // guarantees an observable idle window before the detached child
-    // appears — long enough to comfortably outlast one exhausted
-    // `PS_SAMPLE_BUDGET_SECS_MIRROR`, so a failed first falling-edge sample
-    // still leaves the pane genuinely idle for the retry loop below to
-    // observe, rather than racing a target that may already exist by the
-    // time a retry succeeds. The python3 one-liner setsid()'s itself
+    let trigger = TriggerFile::new(&format!("dot-agent-deck-{marker}-trigger"));
+    // Fork issue #160 F1: the script blocks in a POSIX `until [ -f … ]` poll
+    // loop (0.05s granularity, negligible next to the process-table budget)
+    // until `trigger`'s path exists, so the idle window before the detached
+    // child launches is unbounded — the test below only calls
+    // `trigger.release()` once it has actually observed the pane reading
+    // idle, rather than racing a fixed-duration sleep against one exhausted
+    // `PS_SAMPLE_BUDGET` sample. The python3 one-liner setsid()'s itself
     // (detaching from the pane's controlling terminal and becoming its own
     // session leader, exactly as Claude Code's Bash-tool child does) and
     // execv's into `/bin/sleep 30` with an argv crafted to carry the
@@ -578,9 +605,11 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     // would report `None` forever rather than the `Some(false)` being
     // asserted.
     let command = format!(
-        "sleep {SCRIPT_IDLE_WINDOW_SECS}; python3 -c \"import os; os.setsid(); \
+        "until [ -f '{trigger_path}' ]; do sleep 0.05; done; \
+         python3 -c \"import os; os.setsid(); \
          os.execv('/bin/sleep', ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; \
-         sleep {SCRIPT_TRAILING_WINDOW_SECS}"
+         sleep {SCRIPT_TRAILING_WINDOW_SECS}",
+        trigger_path = trigger.0.display(),
     );
 
     let registry = AgentPtyRegistry::new();
@@ -620,20 +649,20 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
             .map(|(_, busy)| busy)
     };
 
-    // Falling edge before the rising edge: the script hasn't launched the
-    // detached child yet, so the pane must read idle.
+    // Falling edge before the rising edge: the script is blocked on
+    // `trigger`, which is not yet released, so the detached child cannot
+    // possibly have appeared — this is no longer a race against a state that
+    // might stop being true while the loop waits (fork issue #160 F1); it
+    // only needs to tolerate a transient process-table sample failure.
     //
     // Fork issue #160: `busy_for_pane` returns `None` when the underlying
     // sample fails (budget exceeded under load) — `shell_foreground_busy_snapshot`
     // calls the SYNCHRONOUS `process_table()` (`agent_pty.rs`), not
     // `process_table_async`; the async form has no caller in this test file.
-    // This loop already treats `None` as "keep polling" — that part was
-    // never wrong. What was wrong is the window: at exactly `PS_SAMPLE_BUDGET`
-    // it gave a single timed-out sample no time left to retry. Widening the
-    // deadline to `PROCESS_TABLE_POLL_WINDOW` alone is not what fixes this
-    // loop, though — see `SCRIPT_IDLE_WINDOW_SECS` above: the loop also needs
-    // the state it is asserting (idle) to still be true by the time a retry
-    // can observe it, which the widened deadline cannot provide on its own.
+    // A failure to observe the idle reading within the deadline below still
+    // fails the test with the message on the `assert_eq!`, rather than
+    // hanging silently — the loop's own deadline is the timeout, and the
+    // assertion after it is what turns a timeout into a clear failure.
     let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
@@ -646,11 +675,22 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
         "an idle shell with no detached descendant yet must not read busy"
     );
 
+    // Fork issue #160 F1: only now — with the idle reading actually
+    // observed, not merely assumed to hold for some guessed duration —
+    // release the script to launch the detached target. The window before
+    // this point was unbounded, so no timing constant was load-bearing for
+    // it.
+    trigger.release();
+
     // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
-    // Needs headroom for both the script's own leading
-    // `sleep {SCRIPT_IDLE_WINDOW_SECS}` + python/execv startup AND at least
-    // one retried process-table sample, so this window adds a margin on top
-    // of `PROCESS_TABLE_POLL_WINDOW` rather than reusing it as-is.
+    // Fork issue #160 N1: needs headroom for the script's `until` poll
+    // granularity (0.05s) + python3/execv startup AND at least one retried
+    // process-table sample, so this window adds a margin on top of
+    // `PROCESS_TABLE_POLL_WINDOW` rather than reusing it as-is. There is no
+    // fixed-duration leading sleep any more (item 1 above removed it), so
+    // unlike the pre-fix `+ 2s` this margin has nothing left to silently
+    // drift out of sync with — it is sized for the short post-release
+    // startup cost alone.
     let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW + Duration::from_secs(2);
     let mut state = busy_for_pane(&registry);
     while state != Some(true) && Instant::now() < deadline {
