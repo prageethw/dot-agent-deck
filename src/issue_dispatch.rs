@@ -64,7 +64,7 @@ pub struct IssuePaths {
 }
 
 /// The deterministic per-issue branch name: `agent/issue-<n>`. This is the
-/// idempotency key the secondary PR check (U4 `pr_list_for_issue_argv`) matches
+/// idempotency key the tertiary PR check (U4 `pr_list_for_issue_argv`) matches
 /// on, so it is exposed on its own.
 pub fn issue_branch(issue_number: u64) -> String {
     format!("agent/issue-{issue_number}")
@@ -160,7 +160,7 @@ pub fn issue_list_argv(
     argv
 }
 
-/// Build the `gh pr list` argv (arguments after `gh`) for the secondary
+/// Build the `gh pr list` argv (arguments after `gh`) for the tertiary
 /// idempotency check: an OPEN PR whose HEAD branch is `agent/issue-<n>` means
 /// the issue is already in flight. Keying on the deterministic head branch is
 /// more reliable than parsing `Closes #n` from PR bodies (PRD #120).
@@ -274,11 +274,11 @@ pub enum DispatchDecision {
 }
 
 /// Decide dispatch-vs-skip from the three idempotency signals: the per-issue
-/// worktree already exists (primary), an open PR's HEAD branch is
-/// `agent/issue-<n>` (secondary), or the `in-progress` label is present
-/// (tertiary, PRD #421 M1.2) — honoured regardless of who applied it. Any one
-/// being true means the issue is already claimed → [`DispatchDecision::Skip`];
-/// only when all three are false do we dispatch.
+/// worktree already exists (primary), the `in-progress` label is present
+/// (secondary, PRD #421 M1.2) — honoured regardless of who applied it — or an
+/// open PR's HEAD branch is `agent/issue-<n>` (tertiary). Any one being true
+/// means the issue is already claimed → [`DispatchDecision::Skip`]; only when
+/// all three are false do we dispatch.
 pub fn dispatch_decision(
     worktree_exists: bool,
     open_pr_with_matching_head: bool,
@@ -306,6 +306,14 @@ pub const IN_PROGRESS_LABEL: &str = "in-progress";
 /// resolves the name to an ID client-side and hard-errors before any mutation
 /// when the repo has never carried it, which otherwise makes the claim a
 /// complete, silent no-op on any such repo (reviewer F1 / auditor F1).
+///
+/// "Unconditionally" describes WHEN the ensure call runs (every fire,
+/// regardless of `cfg.triage`) — not what it does to an existing label. That
+/// part changed (upstream #471 review decision): the ensure call now uses
+/// [`claim_label_create_argv`], which creates the label when absent and
+/// otherwise leaves its colour/description exactly as they are — unlike
+/// [`label_create_argv`]'s `--force`, which the triage vocabulary still uses
+/// to converge on the deck's own values (see the rationale on [`LabelSpec`]).
 pub const IN_PROGRESS_LABEL_COLOR: &str = "006b75";
 pub const IN_PROGRESS_LABEL_DESCRIPTION: &str =
     "Claimed by an issue-dispatch task; do not dispatch again until this label is removed.";
@@ -444,6 +452,16 @@ pub fn claim_comment_body(claimant: &Claimant, host: &str, timestamp: &str) -> S
 /// `--force` then PATCHes that random colour onto the label even when it
 /// already exists — 96 rewrites/day against a maintainer's own taxonomy on a
 /// `*/15` cron.
+///
+/// This type, and the `--force`-converges rationale above, is scoped to
+/// [`TRIAGE_LABELS`] — the deck's own vocabulary, where repeatedly
+/// overwriting to a declared colour/description is the intended behaviour
+/// (see [`TRIAGE_LABELS`]'s own doc). It does NOT speak for the `in-progress`
+/// claim label (upstream #471 review decision): that label is create-if-
+/// missing via [`claim_label_create_argv`], deliberately WITHOUT `--force`,
+/// because a repo plausibly already carries its own `in-progress` label
+/// under a colour/description of its own choosing that must survive every
+/// dispatch run rather than being converged onto the deck's values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LabelSpec {
     pub name: &'static str,
@@ -537,16 +555,29 @@ pub fn label_create_argv(repo: &str, label: &str, color: &str, description: &str
 /// still ride along so a first-time create is never a colour-randomizing
 /// call.
 ///
-/// TODO(coder, upstream #471): this is a compile-only stub that currently
-/// delegates to [`label_create_argv`] and therefore still carries `--force`;
-/// give it its own argv (same shape, minus the trailing `--force` element).
+/// Same shape as [`label_create_argv`] minus the trailing `--force` element
+/// — deliberately duplicated rather than built by stripping `--force` off
+/// that function's result, so each stays a plain, independently readable
+/// argv builder. Without `--force`, real `gh` FAILS this call once the label
+/// already exists; the caller (`issue_dispatch_run::ensure_claim_label`) is
+/// responsible for treating that specific, expected failure as success.
 pub fn claim_label_create_argv(
     repo: &str,
     label: &str,
     color: &str,
     description: &str,
 ) -> Vec<String> {
-    label_create_argv(repo, label, color, description)
+    vec![
+        "label".to_string(),
+        "create".to_string(),
+        label.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--color".to_string(),
+        color.to_string(),
+        "--description".to_string(),
+        description.to_string(),
+    ]
 }
 
 /// The triage instruction appended to a dispatched issue's prompt when triage
@@ -555,8 +586,11 @@ pub fn claim_label_create_argv(
 /// rather than guess, because a wrong priority is indistinguishable from a
 /// considered one and so is worse than an absent one. Also notes the
 /// human-present bounded-question option from the PRD, while making clear the
-/// unattended path must never block a scheduled run on a prompt.
-pub fn triage_instruction() -> String {
+/// unattended path must never block a scheduled run on a prompt. `issue` is
+/// the real issue number being dispatched, substituted into the bounded-
+/// question example so the agent sees a concrete number rather than a
+/// placeholder it would otherwise have to guess how to fill in itself.
+pub fn triage_instruction(issue: u64) -> String {
     format!(
         "Triage this issue using the following labels: {labels}. Apply one size label \
          (`size-high`, `size-medium`, or `size-low`) for how much work it looks like, and one \
@@ -564,7 +598,7 @@ pub fn triage_instruction() -> String {
          confident in the ranking. If you are uncertain or not confident about the priority, \
          apply `needs-triage` instead and leave priority unset rather than guess — a wrong \
          priority is worse than no priority at all. If a human is present in this session you \
-         may instead ask a bounded question, e.g. \"priority for #<N>: high, medium, or low?\" \
+         may instead ask a bounded question, e.g. \"priority for #{issue}: high, medium, or low?\" \
          — but never block an unattended, scheduled run on a prompt: apply `needs-triage` and \
          continue.",
         labels = TRIAGE_LABELS

@@ -67,10 +67,10 @@ use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
     Claimant, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
-    IN_PROGRESS_LABEL_DESCRIPTION, TRIAGE_LABELS, claim_comment_body, derive_issue_paths,
-    dispatch_decision, issue_comment_argv, issue_edit_add_label_argv, issue_list_argv,
-    issue_view_comments_argv, label_create_argv, pr_list_for_issue_argv, substitute_issue_number,
-    triage_instruction,
+    IN_PROGRESS_LABEL_DESCRIPTION, TRIAGE_LABELS, claim_comment_body, claim_label_create_argv,
+    derive_issue_paths, dispatch_decision, issue_comment_argv, issue_edit_add_label_argv,
+    issue_list_argv, issue_view_comments_argv, label_create_argv, pr_list_for_issue_argv,
+    substitute_issue_number, triage_instruction,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnRequest, spawn};
@@ -516,7 +516,7 @@ async fn dispatch_one_issue(
     let mut prompt = substitute_issue_number(prompt_template, issue);
     if cfg.triage {
         prompt.push_str("\n\n");
-        prompt.push_str(&triage_instruction());
+        prompt.push_str(&triage_instruction(issue));
     }
     let req = SpawnRequest {
         task_name: task_name.to_string(),
@@ -609,20 +609,33 @@ async fn claim_issue(repo: &str, issue: u64, task_name: &str, notifier: &dyn Not
     }
 }
 
-/// PRD #421 review fix B1: idempotently ensure [`IN_PROGRESS_LABEL`] exists on
-/// `repo`, UNCONDITIONALLY (called once per run regardless of `cfg.triage` —
-/// see the call site). Same best-effort discipline as [`ensure_triage_labels`]:
-/// a `gh` failure here is logged and the run continues; the label being
-/// missing is instead caught (and now reported, via C3) when `claim_issue`'s
-/// own add-label call fails.
+/// PRD #421 review fix B1 (upstream #471 review decision): idempotently
+/// ensure [`IN_PROGRESS_LABEL`] exists on `repo`, UNCONDITIONALLY (called once
+/// per run regardless of `cfg.triage` — see the call site), via
+/// [`claim_label_create_argv`] — create-if-missing, no `--force` — rather
+/// than [`ensure_triage_labels`]'s converge-with-`--force` call: a repo
+/// plausibly already carries its own `in-progress` label under its own
+/// colour/description, and dropping `--force` protects that from being
+/// rewritten on every dispatch run (up to 96×/day on a `*/15` cron).
+///
+/// Without `--force`, `gh label create` FAILS when the label already
+/// exists — which, after the first successful create, is the steady state on
+/// every subsequent run, not a genuine problem. [`is_claim_label_already_exists`]
+/// recognizes that specific failure and treats it as success, silently; any
+/// other failure (no permission, network, bad repo, ...) is still logged
+/// exactly as before. The label being missing entirely is separately caught
+/// (and reported, via C3) when `claim_issue`'s own add-label call fails.
 async fn ensure_claim_label(repo: &str) {
-    let argv = label_create_argv(
+    let argv = claim_label_create_argv(
         repo,
         IN_PROGRESS_LABEL,
         IN_PROGRESS_LABEL_COLOR,
         IN_PROGRESS_LABEL_DESCRIPTION,
     );
     if let Err(e) = run_status_args("gh", &argv).await {
+        if is_claim_label_already_exists(&e) {
+            return;
+        }
         tracing::warn!(
             repo,
             label = IN_PROGRESS_LABEL,
@@ -630,6 +643,27 @@ async fn ensure_claim_label(repo: &str) {
             "issue-dispatch: failed to ensure the in-progress claim label exists"
         );
     }
+}
+
+/// Whether `message` — [`run_status_args`]'s formatted error string for a
+/// failed `claim_label_create_argv` call — is `gh`'s already-exists
+/// rejection rather than a genuine failure.
+///
+/// TEXTUAL match, not a status code: `run_status_args` only returns a
+/// `String` built from the captured stderr, so there is no structured exit
+/// code or JSON to branch on here. `gh`'s `label create` (cli/cli's
+/// `pkg/cmd/label/create.go`) detects the HTTP 422 name-collision from the
+/// GitHub API and reports it as: `label with name "<name>" already exists;
+/// use `--force` to update its color and description`. Matching the
+/// substring `"already exists"` is a real fragility this function does not
+/// hide: that wording is `gh`'s own CLI output, not a documented/stable
+/// contract, and a future `gh` release could change it without notice — this
+/// would silently stop recognizing the steady state, and the benign
+/// already-exists case would start logging a warning again (noisy, but not
+/// incorrect: a genuine failure is never swallowed by this drifting the
+/// other way).
+fn is_claim_label_already_exists(message: &str) -> bool {
+    message.contains("already exists")
 }
 
 /// PRD #421 M2.0: idempotently ensure the triage label vocabulary exists on
@@ -939,7 +973,7 @@ async fn list_open_issues(cfg: &IssueDispatchConfig) -> Result<Vec<OpenIssue>, S
     parse_open_issues(&stdout)
 }
 
-/// The secondary idempotency signal: whether an open PR's head is
+/// The tertiary idempotency signal: whether an open PR's head is
 /// `agent/issue-<n>`. A non-empty `gh pr list` JSON array means yes.
 async fn issue_has_open_pr(repo: &str, issue: u64) -> Result<bool, String> {
     let argv = pr_list_for_issue_argv(repo, issue);
@@ -1151,6 +1185,24 @@ mod tests {
             .map(|i| (i.number, i.in_progress_label))
             .collect();
         assert_eq!(got, vec![(7, false), (8, true), (3, false)]);
+    }
+
+    // --- upstream #471: claim label already-exists detection ---
+
+    #[test]
+    fn is_claim_label_already_exists_recognizes_ghs_error_text() {
+        let message = "`gh label create in-progress --repo acme/widgets --color 006b75 \
+                        --description desc` failed (exit status: 1): label with name \
+                        \"in-progress\" already exists; use `--force` to update its color \
+                        and description";
+        assert!(is_claim_label_already_exists(message));
+    }
+
+    #[test]
+    fn is_claim_label_already_exists_rejects_unrelated_failure() {
+        let message = "`gh label create in-progress --repo acme/widgets --color 006b75 \
+                        --description desc` failed (exit status: 1): HTTP 401: Bad credentials";
+        assert!(!is_claim_label_already_exists(message));
     }
 
     #[test]
