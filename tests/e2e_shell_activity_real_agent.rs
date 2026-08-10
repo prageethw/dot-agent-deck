@@ -44,9 +44,49 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::event::EventType;
 use dot_agent_deck::platform::proc::{
-    MEASURED_SHELL_TOOL_SHAPES, descendant_shell_activity, descendants, process_table,
+    MEASURED_SHELL_TOOL_SHAPES, PS_SAMPLE_BUDGET, descendant_shell_activity, descendants,
+    process_table,
 };
 use spec::spec;
+
+/// Fork issue #160 F5 / item 2: mirrors `tests/shell_activity.rs`'s
+/// `PROCESS_TABLE_POLL_WINDOW` — real headroom beyond `unix.rs`'s real
+/// [`PS_SAMPLE_BUDGET`] (now `pub`) so a single timed-out `process_table()`
+/// sample leaves room for a retry rather than failing the test outright.
+/// This is a separate test binary from `tests/shell_activity.rs` (this file
+/// is `e2e`-gated, that one is fast-tier), so the two cannot share a `const`
+/// directly — both derive from the same real `PS_SAMPLE_BUDGET` instead of
+/// each hard-coding its own multiple of it, which is what let this window
+/// drift to a bare `8` disconnected from the constant it was meant to track.
+/// See [`poll_process_table`].
+const PROCESS_TABLE_SAMPLE_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 4);
+
+/// Fork issue #160 F5: `process_table()` returning `None` is a transient,
+/// load-caused sample miss, not evidence of anything about the process tree
+/// — bounded retry rather than a one-shot `.expect()`. The one-shot form used
+/// to be justified by "the caller already proved a sample succeeded moments
+/// ago", which assumes sample failures are independent; they are not, they
+/// are load-caused, and this same PR's own new docs
+/// (`docs/develop/shell-activity-signal.md`) say the condition can "persist
+/// for as long as the contention does" — a success at t and a failure at
+/// t+20ms are entirely compatible under sustained contention.
+fn poll_process_table(context: &str) -> Vec<dot_agent_deck::platform::proc::ProcessInfo> {
+    let table_cell = std::cell::RefCell::new(None);
+    let sampled = common::wait_until(PROCESS_TABLE_SAMPLE_WINDOW, || {
+        let Some(table) = process_table() else {
+            return false;
+        };
+        *table_cell.borrow_mut() = Some(table);
+        true
+    });
+    assert!(
+        sampled,
+        "process_table() produced no sample within {PROCESS_TABLE_SAMPLE_WINDOW:?} ({context})"
+    );
+    table_cell
+        .into_inner()
+        .expect("wait_until reported success so table_cell must be set")
+}
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const PANE_NAME_SUFFIX: &str = "shell-activity-005-haiku";
@@ -390,7 +430,9 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // own spawned agent — `setsid` changes session/group, never `ppid`) so a
     // concurrently running e2e test's own ping or MCP servers can never be
     // mistaken for this one's.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    let table = poll_process_table(
+        "scoped to this test's own process tree, right after the native Idle landed",
+    );
     let root_pid = std::process::id() as i32;
     let shell_row = descendants(&table, root_pid)
         .into_iter()
@@ -550,7 +592,8 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // before the badge check), and run the descendant-scan classifier
     // directly against this live table — the M2 fixture claim proven against
     // a live process table rather than a captured one.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    let table =
+        poll_process_table("re-sampling to confirm the Claude agent's children are still alive");
     let still_alive: Vec<&str> = descendants(&table, claude_pid)
         .into_iter()
         .map(|p| p.argv.as_str())
