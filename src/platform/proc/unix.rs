@@ -185,13 +185,25 @@ fn signal_child_pgroup_or_fallback(
 /// `setsid`, which is what makes this pid equal its own pgid).
 ///
 /// Returns `Ok(true)` once `pid` has exited, `Ok(false)` while it is still
-/// running. A `waitid` failure (`ECHILD` if `pid` was already reaped by
-/// something else, or any other error) is returned as `Err` rather than
-/// guessed at — the caller is expected to treat that conservatively (stop
-/// polling this pid) and let whatever unconditional signal-and-reap step
-/// runs after the grace window handle it regardless, the same way
-/// [`terminate_child_with_grace_and_wait_impl`]'s non-forcing branch treats
-/// its own `try_wait` error as "stop polling" via `Err(_) => break`.
+/// running. A `waitid` failure is returned as `Err` rather than guessed at;
+/// the caller distinguishes `ECHILD` (meaning `pid` was already reaped by
+/// something else) from any other error, since only `ECHILD` legitimately
+/// means "stop polling" — see this function's precondition below.
+///
+/// # Precondition: the caller must be the sole reaper of `pid`
+///
+/// The pid-recycling safety this function exists to provide (fork #163)
+/// depends entirely on **nothing else in this process reaping `pid` between
+/// this peek and the caller's own unconditional signal-and-reap step**. As
+/// of this writing that holds: there is no wildcard `waitpid(-1, …)`
+/// anywhere in the process, `SIGCHLD` is never set to `SIG_IGN`, no
+/// exit-watcher thread calls `wait()` on an agent's child, and tokio's
+/// process driver only reaps children it owns via per-pid `try_wait`, never
+/// a wildcard wait. If a future change introduces any of those — a
+/// `waitpid(-1)` reaper, a `SIG_IGN` on `SIGCHLD`, or a per-agent wait
+/// thread — this function's `ECHILD` arm silently stops being "already
+/// reaped, safe to signal anyway" and starts being exactly the recycled-pid
+/// hazard fork #163 was about, with no test or comment left to object.
 pub fn peek_child_exited_without_reaping(pid: u32) -> std::io::Result<bool> {
     // SAFETY: `waitid` is async-signal-safe. `info` is zeroed before the
     // call because a successful `WNOHANG` call that finds no reportable

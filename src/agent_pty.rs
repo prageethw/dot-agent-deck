@@ -4650,26 +4650,38 @@ fn observe_exit_without_reaping(child: &mut Box<dyn portable_pty::Child + Send +
             // window should reap.
             return false;
         };
-        match crate::platform::proc::peek_child_exited_without_reaping(pid) {
-            Ok(exited) => exited,
-            Err(e) => {
-                // Auditor F3: the old `try_wait`-based loop treated this
-                // arm (canonically `ECHILD`, meaning something else already
-                // reaped this pid) as "still running" and kept polling it
-                // for the rest of the grace window to no purpose — the
-                // sibling non-forcing loop at `unix.rs:400` already treats
-                // an error as "stop polling" (`Err(_) => break`). Do the
-                // same here: stop re-peeking this agent and let phase 3's
-                // now-unconditional signal-and-reap handle it regardless,
-                // logging so a real failure here isn't silent.
-                tracing::warn!(
-                    pid,
-                    error = %e,
-                    "peek_child_exited_without_reaping failed during graceful shutdown; \
-                     treating this agent as observed-exited so phase 2 stops re-polling it — \
-                     phase 3 still signals and reaps it unconditionally regardless"
-                );
-                true
+        loop {
+            match crate::platform::proc::peek_child_exited_without_reaping(pid) {
+                Ok(exited) => break exited,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Auditor F1: this comment previously read every error,
+                    // including a plain `EINTR`, as "already reaped, stop
+                    // polling". That was correct against the earlier
+                    // skip-based design (`be1fde4`), where phase 3 ran only
+                    // for agents phase 2 had *not* observed exiting, so
+                    // re-polling a genuinely-gone pid to no purpose was the
+                    // failure mode to avoid. Phase 3 is now unconditional,
+                    // which flips the calculus: continuing to poll is the
+                    // only thing preserving the grace window, so collapsing
+                    // it on a transient error throws away exactly what this
+                    // rework exists to give agents. `ECHILD` is the one
+                    // error that still means "already reaped by something
+                    // else" (see the precondition on
+                    // `peek_child_exited_without_reaping`), so it alone
+                    // stops polling here; any other error is treated as
+                    // still-running so the grace window survives it. Safety
+                    // is unaffected either way — phase 3 signals and reaps
+                    // unconditionally regardless of what phase 2 concluded.
+                    let is_echild = e.raw_os_error() == Some(libc::ECHILD);
+                    tracing::warn!(
+                        pid,
+                        error = %e,
+                        echild = is_echild,
+                        "peek_child_exited_without_reaping failed during graceful shutdown"
+                    );
+                    break is_echild;
+                }
             }
         }
     }
@@ -7970,7 +7982,10 @@ mod spawn_tests {
                 .unwrap()
                 .agents
                 .insert("solo-never-exits".to_string(), agent);
-            registry.shutdown_all_graceful(Duration::from_millis(300));
+            let grace = Duration::from_millis(300);
+            let started = Instant::now();
+            registry.shutdown_all_graceful(grace);
+            let elapsed = started.elapsed();
 
             let calls = log.lock().unwrap().clone();
             assert_eq!(
@@ -7980,6 +7995,20 @@ mod spawn_tests {
                  phase 3's SIGKILL — both real killpg calls, invisible to this log once \
                  process_id() is Some) and reaped via exactly one `wait`, never via the reaping \
                  `try_wait`; calls were: {calls:?}"
+            );
+            // Auditor F2: pins the `Ok(false)` half of the peek's contract,
+            // which nothing else here does — every other assertion in this
+            // test still passes if the peek always reported `exited` or
+            // always errored. This agent traps `TERM` and cannot exit, so
+            // correct behavior must burn the full grace window; a peek that
+            // wrongly reports it as exited (F1's failure mode) breaks phase
+            // 2 out early and collapses `elapsed` to near zero, failing this
+            // lower-bound assertion deterministically.
+            assert!(
+                elapsed >= grace,
+                "a peek that never observes this SIGTERM-resistant agent as exited must burn \
+                 the full {grace:?} grace window before phase 3 signals it — got {elapsed:?}, \
+                 which means phase 2 broke out early"
             );
             // A broken SIGKILL would leave `wait()` blocked on a live,
             // SIGTERM-resistant process rather than failing this
