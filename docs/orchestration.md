@@ -416,7 +416,7 @@ Run with `--mine` from inside an orchestration pane, it lists only the worktrees
 dot-agent-deck worktree list --mine
 ```
 
-This works immediately after a daemon restart: ownership is matched by comparing the worktree's on-disk marker against the pane's own `DOT_AGENT_DECK_WORKTREE_OWNER` environment variable (set automatically in every orchestration pane, mirroring `DOT_AGENT_DECK_PANE_ID`), never by asking the daemon. Run outside an orchestration pane, `--mine` fails loudly rather than falling back to "everything" or silently printing "none" — a wrong answer here would hand one orchestration another's worktrees.
+This works immediately after a daemon restart: ownership is matched by comparing the worktree's on-disk marker against the pane's own `DOT_AGENT_DECK_WORKTREE_OWNER` environment variable (set automatically in every **freshly-created** orchestration pane, mirroring `DOT_AGENT_DECK_PANE_ID`), never by asking the daemon. A pane restored from a saved session does not carry this variable — restore has no way to know whether the orchestration ever created a worktree, so it assigns no identity rather than guessing one; `--mine` from a restored orchestration therefore fails loudly, the same as from outside any orchestration pane. Run outside a fresh orchestration pane, `--mine` fails loudly rather than falling back to "everything" or silently printing "none" — a wrong answer here would hand one orchestration another's worktrees.
 
 ### Same-directory orchestrations are discouraged
 

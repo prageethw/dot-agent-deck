@@ -1740,7 +1740,15 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
         }
     };
     if let Some(owner) = &owner_filter {
-        reports.retain(|r| r.owner.as_deref() == Some(owner.as_str()));
+        // PR #215 fixup (reviewer F4 / auditor L1 item 3): `owned` must be a
+        // conjunct, not just a non-`None` `owner`. `owner_of`'s own doc
+        // records that `owned=false` can land alongside a non-`None`
+        // `owner` (two independent `owned_git_dir` resolutions), and
+        // explicitly accepted that divergence as cosmetic ONLY because "no
+        // consumer treats `owner`'s mere presence as an ownership signal."
+        // `--mine` is now such a consumer, so the conjunct restores the
+        // precondition that comment relies on.
+        reports.retain(|r| r.owned && r.owner.as_deref() == Some(owner.as_str()));
     }
 
     if json {
@@ -1755,6 +1763,19 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             }
         }
     } else {
+        // PR #215 fixup (reviewer F7 / auditor L1): a filtered-to-empty
+        // `--mine` used to fall through to `format_list_human`'s generic
+        // "no worktrees found", which conflates "this repo has no
+        // worktrees" with "none are yours" and with "yours failed to
+        // match" -- the last of which is a wrong answer arriving
+        // silently, against this feature's own fail-loud bar. Name the
+        // identity that was filtered on instead.
+        if reports.is_empty()
+            && let Some(owner) = &owner_filter
+        {
+            println!("no worktrees owned by {owner}");
+            return ExitCode::SUCCESS;
+        }
         print!("{}", format_list_human(&reports));
         ExitCode::SUCCESS
     }

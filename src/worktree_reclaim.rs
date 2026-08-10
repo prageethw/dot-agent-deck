@@ -487,10 +487,18 @@ const MARKER_READ_MAX_BYTES: u64 = 4096;
 /// characters such as U+200B (zero-width space), U+202E (RTL override) or
 /// U+FEFF (BOM) — those sit outside `White_Space` too (which stops at
 /// U+200A), so they survive both the sanitizer and `.trim()` and can reach a
-/// future rendered `worktree list` column or a `jq -r` pipeline unfiltered.
-/// This is latent today (no consumer renders `owner` yet) and becomes live
-/// once M2.3 adds a human-facing `OWNER` column — see fork #166 N2/auditor
-/// re-audit; closing the Cf gap itself is deliberately out of scope here. An
+/// rendered `worktree list` column or a `jq -r` pipeline unfiltered.
+///
+/// PR #215 fixup (reviewer L3 / auditor L3): this used to say the gap was
+/// latent because no consumer rendered `owner` yet, and becomes live once
+/// M2.3 adds a human-facing `OWNER` column. **This PR is M2.3's display
+/// half** — `format_list_human` now emits the OWNER column — so the gap is
+/// live as of this SHA, not latent. Its effect is bounded to display
+/// spoofing in that one cell: `format_reclaim_human` does not render
+/// `owner`, so a `created-by:` value carrying U+202E cannot reach the
+/// removal-confirmation surface, only make the OWNER column (and,
+/// depending on the terminal, the rest of that row) render reversed.
+/// Closing the Cf gap itself remains out of scope here. An
 /// empty value after stripping the prefix and trimming becomes `None`
 /// (unknown), never `Some("")` — `sanitize_marker_creator`'s own "unknown"
 /// floor means the writer can never produce an empty owner, so a `Some("")`
@@ -524,10 +532,16 @@ fn read_marker_owner(marker_path: &Path) -> Option<String> {
 /// resolution rather than a shared one (see below), the auditor measured 24
 /// of 120 adversarial cases landing `owned=false` from [`ownership_of`]
 /// alongside a non-`None` `owner` from this function (fork #166 N3) — the
-/// two disagreeing rather than both reporting unknown. That disagreement is
-/// accepted as cosmetic for now (no consumer treats `owner`'s mere presence
-/// as an ownership signal), but is a contract worth pinning explicitly
-/// before M1.0 makes this identity load-bearing.
+/// two disagreeing rather than both reporting unknown.
+///
+/// PR #215 fixup (reviewer F4 / auditor L1 item 3): this used to say the
+/// disagreement was accepted as cosmetic because "no consumer treats
+/// `owner`'s mere presence as an ownership signal." That is no longer
+/// true — `worktree list --mine` (`src/main.rs::run_worktree_list_cli`) is
+/// exactly such a consumer as of this PR, and now filters on `r.owned &&
+/// r.owner == Some(..)` rather than `owner` alone, so a foreign worktree
+/// whose marker happens to read back a matching identity is excluded
+/// rather than reported as mine.
 ///
 /// [`examine_worktrees`] calls this immediately after [`ownership_of`], with
 /// no I/O of any kind — no `gh` call, no other filesystem work — in between,
@@ -639,7 +653,17 @@ pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result
 /// after the prefix.
 const MARKER_CREATOR_MAX_CHARS: usize = 200;
 
-fn sanitize_marker_creator(name: &str) -> String {
+/// `pub(crate)`, not private: PR #215 fixup (reviewer F3 / auditor L2) calls
+/// this from `ui.rs::orchestration_creator_string` too, so the marker write
+/// and the `DOT_AGENT_DECK_WORKTREE_OWNER` env var are the same sanitized
+/// value rather than one raw and one sanitized. This function is a fixed
+/// point (`f(f(x)) == f(x)` for every input — verified: the truncation
+/// branch drops exactly the trailing `…` it just appended before
+/// re-appending an identical one, and every other transform is already
+/// idempotent), so `mark_worktree_owned` re-applying it to an
+/// already-sanitized value is harmless rather than a second, diverging
+/// derivation.
+pub(crate) fn sanitize_marker_creator(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter_map(|c| match c {

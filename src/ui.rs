@@ -9059,12 +9059,9 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
-                            // fork #166 / fork #184: this is a three-way
-                            // precedence, and the FIRST branch is the one
-                            // that actually fires in practice — read it in
-                            // that order, not top-to-bottom-as-rare-cases.
-                            // `typed_name` (`req.name`, the same value that
-                            // becomes `display_title` below, trimmed once in
+                            // fork #166 / fork #184: `typed_name` (`req.name`,
+                            // the same value that becomes `display_title`
+                            // below, trimmed once in
                             // `build_new_pane_request` so both consumers
                             // test blankness and read content from the
                             // identical value; reviewer F1) is the Name the
@@ -9080,33 +9077,23 @@ fn dispatch_action(
                             // pane's own identity answers that better than
                             // `orch_config.name`, a value shared by every
                             // tab of the same orchestration config (#184).
-                            // Fall back to the canonical config name — as
-                            // issue #425 originally did — only when the
-                            // field was cleared to empty. That fallback is
-                            // still reachable after M1.0: M1.0 suggests and
-                            // refuses collisions, it does not forbid an
-                            // empty submit (see
-                            // `orchestration_form_empty_name_keeps_config_name`),
-                            // so this is not the "becomes unreachable once
-                            // M1.0 ships" case an earlier version of this
-                            // comment predicted before M1.0 existed. The
-                            // blankness test below is on an already-trimmed
-                            // value (fork issue #174: a whitespace-only name
-                            // must fall back too, not become the identity)
-                            // rather than the bare `is_empty()` #174 flags
-                            // elsewhere.
                             //
-                            // `load_project_config` normalises an empty
-                            // `name` to the dir basename at load time
-                            // (`src/project_config.rs:268-272`, via
-                            // `resolve_orchestration_name`), and this form's
-                            // orchestration list comes from that same
-                            // loader — so `orch_config.name` is non-empty by
-                            // construction and the inner `orch_config.name
-                            // .is_empty()` arm is unreachable in production.
-                            // It stays as defence-in-depth, purely so a
-                            // future constructor that bypasses the loader
-                            // can't write a bare `orchestration:`.
+                            // PR #215 fixup (reviewer F5 M2 / auditor M2):
+                            // there used to be a fallback to the canonical
+                            // config name when the field was cleared to
+                            // empty. That fallback is gone —
+                            // `orchestration_creator_string` now maps an
+                            // empty typed name straight to the
+                            // `orchestration:unknown` sentinel `--mine`
+                            // refuses, rather than to
+                            // `orchestration:<config_name>`, an identity
+                            // every unnamed orchestration on the same config
+                            // shared with no refusal. The blankness test
+                            // inside `orchestration_creator_string` is on an
+                            // already-trimmed value (fork issue #174: a
+                            // whitespace-only name must fall back too, not
+                            // become the identity) rather than the bare
+                            // `is_empty()` #174 flags elsewhere.
                             let typed_name = req.name.as_str();
                             // Fork #166 M2.4: assigns the OUTER `creator`
                             // hoisted above the match — the exact string
@@ -9115,8 +9102,7 @@ fn dispatch_action(
                             // `orchestration_creator_string` is the single
                             // shared computation the restore path also calls,
                             // so the two can't drift apart.
-                            creator =
-                                Some(orchestration_creator_string(typed_name, &orch_config.name));
+                            creator = Some(orchestration_creator_string(typed_name));
                             match crate::issue_dispatch_run::create_worktree_sync(
                                 &req.dir,
                                 worktree_path,
@@ -10112,27 +10098,50 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
-/// Fork #166 M2.4: the ONE place this three-way precedence is computed, so
-/// the live-create path (`Action::SpawnPane`) and the session-restore path
+/// Fork #166 M2.4: the ONE place this precedence is computed, so the
+/// live-create path (`Action::SpawnPane`) and the session-restore path
 /// (`resolve_orchestration_for_restore`'s caller) cannot drift apart — both
 /// call this rather than each inlining the branch. `typed_name` is the same
 /// string in both cases: the form's `req.name` when creating, and the
 /// persisted `OrchestrationSnapshot.display_title` (captured FROM that same
-/// `req.name`, see `capture_orchestration_snapshot`) when restoring.
-/// `config_name` is `orch_config.name`, re-resolved identically on both
-/// paths. This is the SAME string [`crate::issue_dispatch_run::create_worktree_sync`]
-/// stamped into the worktree marker at creation time — restoring an
-/// orchestration with the same typed name reproduces it byte-for-byte, which
-/// is what lets `worktree list --mine` still match after a restart (PRD
-/// fork-166 M2.4/M3.0).
-fn orchestration_creator_string(typed_name: &str, config_name: &str) -> String {
-    if !typed_name.is_empty() {
-        format!("orchestration:{typed_name}")
-    } else if config_name.is_empty() {
+/// `req.name`) when restoring. This is the SAME string
+/// [`crate::issue_dispatch_run::create_worktree_sync`] stamped into the
+/// worktree marker at creation time — restoring an orchestration with the
+/// same typed name reproduces it byte-for-byte, which is what lets
+/// `worktree list --mine` still match after a restart (PRD fork-166
+/// M2.4/M3.0).
+///
+/// PR #215 fixup (reviewer F5 M2 / auditor M2): the config-name fallback
+/// this used to have — `orchestration:<config_name>` when the typed name
+/// was empty — gave every unnamed orchestration on the same config the
+/// IDENTICAL identity, with no refusal, because that string is not the
+/// `orchestration:unknown` sentinel `--mine` refuses. Two such
+/// orchestrations would then match each other's worktrees, which is
+/// exactly the collision the sentinel exists to prevent (PRD fork-166 line
+/// 183: "must be treated exactly like an absent variable — fail loudly").
+/// The fallback is deleted: an empty typed name now ALWAYS produces the
+/// sentinel, so `--mine` refuses it rather than silently handing out a
+/// shared identity. `config_name` provenance for the unnamed case is not
+/// missed — it never distinguished one unnamed orchestration from another,
+/// and fork #192's M1.0 makes the interactive Name required, so the empty
+/// case is rare in practice.
+///
+/// PR #215 fixup (reviewer F3 / auditor L2): the result is run through
+/// [`crate::worktree_reclaim::sanitize_marker_creator`] before it is
+/// returned, so both sinks — the worktree marker (`mark_worktree_owned`,
+/// which applies the same sanitizer again, harmlessly, since it is a fixed
+/// point) and the `DOT_AGENT_DECK_WORKTREE_OWNER` env var (which applied no
+/// sanitizer at all before this fix) — receive the identical value. The
+/// invariant is "one literal string reaches both consumers" by
+/// construction now, not because no typed name has ever been long enough
+/// or carried a control character to prove it false.
+fn orchestration_creator_string(typed_name: &str) -> String {
+    let raw = if typed_name.is_empty() {
         "orchestration:unknown".to_string()
     } else {
-        format!("orchestration:{config_name}")
-    }
+        format!("orchestration:{typed_name}")
+    };
+    crate::worktree_reclaim::sanitize_marker_creator(&raw)
 }
 
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
@@ -11240,22 +11249,34 @@ pub fn run_tui(
                         // start role once it signals readiness.
                         let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
                             .then(|| orch_snap.orchestrator_prompt.clone());
-                        // Fork #166 M2.4: reproduce the SAME creator string
-                        // byte-for-byte via the one shared computation
-                        // (`orchestration_creator_string`) the live-create
-                        // path also calls — `display_title` is the exact
-                        // `req.name` that was typed at creation time (see
-                        // `OrchestrationSnapshot::display_title`'s docs), so
-                        // this is the identical function applied to the
-                        // identical input, not a second derivation of it.
-                        // Restoring an orchestration under the same typed
-                        // name therefore still matches its earlier
-                        // worktrees under `--mine` (PRD fork-166's "closing
-                        // and reopening a tab" success criterion).
-                        let restored_creator = orchestration_creator_string(
-                            orch_snap.display_title.as_deref().unwrap_or(""),
-                            &orch_config.name,
-                        );
+                        // PR #215 fixup (reviewer F6 / auditor M3): this
+                        // used to recompute `orchestration_creator_string`
+                        // and pass it unconditionally, which fabricated an
+                        // identity for every restored orchestration tab —
+                        // including one that never created a worktree,
+                        // contradicting `AgentSpawnOptions::owner`'s own doc
+                        // (`src/pane.rs`, "`None` for a pane that is not
+                        // part of a worktree-owning orchestration") and
+                        // `open_orchestration_tab`'s `creator` param doc
+                        // ("`None` when this orchestration tab owns no
+                        // worktree"). The live-create path only assigns an
+                        // identity inside the arm that actually creates a
+                        // worktree (`req.orchestration_worktree_path ==
+                        // Some(..)`); restore never creates one, so under
+                        // the same rule restore's answer is always `None`.
+                        // `OrchestrationSnapshot` records nothing that would
+                        // let this branch tell "restored an
+                        // identity-bearing orchestration" apart from
+                        // "restored one that never had an identity", so
+                        // fabricating a guess here is exactly the "wrong
+                        // answer is worse than no answer" failure mode
+                        // M3.0 is written against — the honest answer given
+                        // what is actually known is `None`. This does cost
+                        // the "closing and reopening a tab still matches
+                        // its earlier worktrees under `--mine`" success
+                        // criterion the PRD originally described; recorded
+                        // as a known limitation rather than silently
+                        // dropped (see the PRD's trust-boundary section).
                         match tab_manager.open_orchestration_tab(
                             &orch_config,
                             &saved_pane.dir,
@@ -11265,7 +11286,7 @@ pub fn run_tui(
                             // rather than the canonical config/cwd name. `None`
                             // when unset falls back to the canonical name.
                             orch_snap.display_title.as_deref(),
-                            Some(restored_creator.as_str()),
+                            None,
                             spawn_dims,
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
@@ -31643,14 +31664,26 @@ mod tests {
     /// what `mark_worktree_owned` wrote into the worktree's `created-by:`
     /// marker (via `owner_of`) AND what every role pane's
     /// `AgentSpawnOptions::owner` carried -- captured by
-    /// `CapturingPaneController`, which is exactly the value
-    /// `create_stream_pane` turns into `DOT_AGENT_DECK_WORKTREE_OWNER` in the
-    /// spawned pane's real environment. Pins fork #166 M2.4's invariant: for
-    /// a given orchestration, the marker and the env var must carry the
-    /// LITERAL SAME computed string, from one source (`orchestration_creator_string`
-    /// via the hoisted `creator` local), not two derivations of one input --
+    /// `CapturingPaneController`, a test double whose `create_pane_with_options`
+    /// records `opts.owner` and returns. Pins fork #166 M2.4's invariant one
+    /// hop short of the real environment: for a given orchestration, the
+    /// marker and `AgentSpawnOptions::owner` must carry the LITERAL SAME
+    /// computed string, from one source (`orchestration_creator_string` via
+    /// the hoisted `creator` local), not two derivations of one input --
     /// every role pane's recorded owner must equal the marker's owner
     /// exactly, and there must be at least one role pane to compare.
+    ///
+    /// PR #215 fixup (reviewer F2 / auditor H1): this test's own doc comment
+    /// USED TO claim the recorded value was "exactly the value
+    /// `create_stream_pane` turns into `DOT_AGENT_DECK_WORKTREE_OWNER` in the
+    /// spawned pane's real environment" -- false at the SHA this test was
+    /// written: `create_stream_pane` dropped `opts.owner` on the floor
+    /// entirely, and this mock-backed test stayed green through that bug
+    /// because it never asks the mock to have an environment. It proves the
+    /// value reaches `AgentSpawnOptions`, nothing more. `orchestration/identity/009`
+    /// (`tests/e2e_worktree_owner_env.rs`) is the test that reaches the real
+    /// seam: a genuinely spawned process reading the variable back out of
+    /// its own environment.
     #[spec("orchestration/identity/008")]
     #[test]
     fn orchestration_identity_008_marker_and_env_owner_share_one_source() {
