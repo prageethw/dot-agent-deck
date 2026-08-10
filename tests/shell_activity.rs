@@ -603,6 +603,13 @@ impl TriggerFile {
 fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
     const PANE_ID: &str = "shell-activity-004-pane";
     let marker = format!("shell-activity-004-target-{}", std::process::id());
+    // Must be declared before `registry` below: drop order is reverse
+    // declaration order, so declaring `trigger` first makes `registry` drop
+    // (and SIGKILL the pane's process group via `shutdown_all`) before the
+    // trigger file is removed — reversed, the trigger would disappear first
+    // and a shell still polling `until [ -f … ]` would keep spinning until
+    // `TRIGGER_POLL_ITERATION_BOUND` (fork issue #160 A5, PR #206 round-3
+    // verification).
     let trigger = TriggerFile::new();
     // Fork issue #160 F1: the script blocks in a POSIX `until [ -f … ]` poll
     // loop (0.05s granularity, negligible next to the process-table budget)

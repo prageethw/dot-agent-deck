@@ -1176,11 +1176,22 @@ async fn run_shell_activity_monitor(
     const FAILURE_LOG_EVERY: u32 = 20;
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // Fork issue #160 F6: counts an unbroken run of `Failed` samples, next to
-    // `last_known` since both are this loop's only persistent state. Fork
-    // issue #160 A3: reset to 0 only once a tick actually classifies a pane
-    // (a non-empty snapshot below) — an `Ok` table sample where every row
-    // goes unconfirmed is the same degradation this counter exists to
-    // surface, one level down, so it must not be read as a success either.
+    // `last_known` since both are this loop's only persistent state.
+    //
+    // Fork issue #160 Q1 (PR #206 round-3 verification): this is a
+    // three-way count, not a two-way one. A tick that actually classifies a
+    // pane (non-empty `statuses` below) resets it — a healthy tick. A tick
+    // that classifies nothing because every *candidate* pane went
+    // unconfirmed (`statuses` empty, `candidates > 0`) increments it — the
+    // same degradation as an explicit `Failed`, one level down. A tick that
+    // classifies nothing because there was nothing to classify (`statuses`
+    // and `candidates` both empty — the steady state of an idle deck, true
+    // from the moment the daemon starts and every time the last pane
+    // closes) leaves it untouched: no opinion, neither success nor failure.
+    // An earlier version of this comment claimed a bare non-empty check was
+    // the whole story; it was wrong in both directions — see PR #206 round-3
+    // verification, finding Q1, for the false-negative (idle deck) and
+    // false-positive (multi-pane partial degradation) cases it missed.
     let mut consecutive_process_table_failures: u32 = 0;
 
     loop {
@@ -1273,16 +1284,39 @@ async fn run_shell_activity_monitor(
             &table,
             crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES,
         );
-        // Fork issue #160 A3: reset here, not on a bare `Ok` above — an empty
-        // snapshot means every row this tick went unconfirmed (a degraded
-        // sample that still returned `Ok`), and that must count toward
-        // `consecutive_process_table_failures` the same as an explicit
-        // `Failed`, not silently look healthy because the two `ps` calls
-        // themselves happened to complete.
-        if !snapshot.is_empty() {
+        // Fork issue #160 Q1 (PR #206 round-3 verification): three-way, not
+        // `!snapshot.statuses.is_empty()`. That bare check reads a healthy
+        // idle deck — zero live panes, `candidates == 0`, true from daemon
+        // start and every time the last pane closes — as an unbroken run of
+        // failures that never resets, silently breaking F6's "first failure
+        // after a success is always logged" guarantee and turning
+        // `consecutive_failures` into a false number on any chronically
+        // idle-but-healthy machine. `candidates` (the live, addressable
+        // panes the scan actually attempted) is what distinguishes "nothing
+        // to classify" from "everything went unconfirmed":
+        if !snapshot.statuses.is_empty() {
+            // At least one pane classified this tick — healthy, reset.
             consecutive_process_table_failures = 0;
+        } else if snapshot.candidates > 0 {
+            // Every candidate pane went unconfirmed even though the table
+            // sample itself succeeded — the same degradation as an explicit
+            // `Failed`, one level down, so count and log it the same way.
+            consecutive_process_table_failures += 1;
+            if consecutive_process_table_failures == 1
+                || consecutive_process_table_failures.is_multiple_of(FAILURE_LOG_EVERY)
+            {
+                tracing::warn!(
+                    consecutive_failures = consecutive_process_table_failures,
+                    "shell-activity poll: process-table sample succeeded but every \
+                     candidate pane went unconfirmed this tick — pane statuses will not \
+                     update until a pane classifies"
+                );
+            }
         }
+        // else: no candidates at all (an idle deck) — no opinion, leave the
+        // counter untouched. Neither a success nor a failure happened.
         let seen: std::collections::HashSet<&str> = snapshot
+            .statuses
             .iter()
             .map(|(pane_id, _)| pane_id.as_str())
             .collect();
@@ -1292,7 +1326,7 @@ async fn run_shell_activity_monitor(
         // busy/idle reading.
         last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
 
-        for (pane_id, busy) in snapshot {
+        for (pane_id, busy) in snapshot.statuses {
             let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
 
             // Cheap path, and the overwhelmingly common one: a pane whose scan

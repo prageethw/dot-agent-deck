@@ -2168,6 +2168,27 @@ impl Default for AgentPtyRegistry {
     }
 }
 
+/// Result of [`AgentPtyRegistry::shell_foreground_busy_snapshot_in`].
+///
+/// Fork issue #160 Q1 (PR #206 round-3 verification): a bare `Vec` of
+/// `statuses` cannot distinguish an idle deck (no live pane was ever a
+/// candidate for classification — every daemon starts in this state, and any
+/// deck returns to it whenever the last pane closes) from a degraded one
+/// (every candidate pane went unconfirmed). Both produce an empty `statuses`
+/// vec; only `candidates` tells them apart. See the daemon's poll loop,
+/// which is the only production caller, for how the two counts are combined
+/// into a three-way discriminator.
+pub struct ShellForegroundBusySnapshot {
+    /// `(pane_id, busy)` for every pane the scan actually classified this
+    /// tick.
+    pub statuses: Vec<(String, bool)>,
+    /// How many live, addressable panes (a known `pane_id_env` and a live
+    /// child pid) were *candidates* for classification this tick, whether or
+    /// not the scan could actually classify them. Zero candidates means
+    /// there was nothing to classify — not degradation, just an idle deck.
+    pub candidates: usize,
+}
+
 impl AgentPtyRegistry {
     pub fn new() -> Self {
         Self {
@@ -4126,6 +4147,7 @@ impl AgentPtyRegistry {
             return Vec::new();
         };
         self.shell_foreground_busy_snapshot_in(&table, shapes)
+            .statuses
     }
 
     /// [`Self::shell_foreground_busy_snapshot`] against a table the caller
@@ -4134,18 +4156,32 @@ impl AgentPtyRegistry {
     /// this classification (Greptile P2 on upstream PR #390).
     ///
     /// Pure classification: no subprocess, no I/O, one registry lock.
+    ///
+    /// Fork issue #160 Q1 (PR #206 round-3 verification): returns
+    /// [`ShellForegroundBusySnapshot`] rather than a bare `Vec` because the
+    /// daemon's poll loop needs `candidates` alongside `statuses` to tell an
+    /// idle deck from a degraded one — see that type's doc comment.
     pub fn shell_foreground_busy_snapshot_in(
         &self,
         table: &[crate::platform::proc::ProcessInfo],
         shapes: &[crate::platform::proc::ShellToolShape],
-    ) -> Vec<(String, bool)> {
+    ) -> ShellForegroundBusySnapshot {
         let inner = self.inner.lock().unwrap();
-        inner
+        let mut candidates = 0usize;
+        let statuses = inner
             .agents
             .values()
             .filter(|agent| !agent.exited.load(Ordering::SeqCst))
             .filter_map(|agent| {
                 let pane_id = agent.pane_id_env.clone()?;
+                // A candidate: a live, addressable pane the scan could in
+                // principle classify. Counted before the classification
+                // itself can fail it (shape veto, missing session id, …) so
+                // the count answers "was there anything to classify", not
+                // "did classification succeed".
+                if agent.child.process_id().is_some() {
+                    candidates += 1;
+                }
                 let key = shell_tool_shape_key(agent.agent_type.as_ref());
                 let for_pane: Vec<crate::platform::proc::ShellToolShape> = shapes
                     .iter()
@@ -4155,7 +4191,11 @@ impl AgentPtyRegistry {
                 let busy = agent.shell_activity_in(table, &for_pane)?;
                 Some((pane_id, busy))
             })
-            .collect()
+            .collect();
+        ShellForegroundBusySnapshot {
+            statuses,
+            candidates,
+        }
     }
 
     /// PRD #370 M2 test-only seam: `inner` is private (by design — every
