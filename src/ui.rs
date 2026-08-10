@@ -8944,25 +8944,42 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
-                            // fork #166: name the ownership marker's creator
-                            // with the typed instance Name (`req.name` — the
-                            // same value that becomes `display_title` below,
-                            // trimmed once in `build_new_pane_request` so
-                            // both consumers test blankness and read content
-                            // from the identical value; reviewer F1) when
-                            // one was typed, since that is what distinguishes
-                            // two live orchestrations of the same config
-                            // type. Fall back to the canonical config name —
-                            // as issue #425 originally did — when no typed
-                            // Name was given. The blankness test below is on
-                            // an already-trimmed value (fork issue #174: a
-                            // whitespace-only name must fall back too, not
-                            // become the identity) rather than the bare
-                            // `is_empty()` #174 flags elsewhere. This
-                            // fallback is deliberate and interim: this PRD's
-                            // M1.0 will make the Name required and unique,
-                            // at which point the blank case becomes
-                            // unreachable, but M1.0 is not built yet.
+                            // fork #166 / fork #184: this is a three-way
+                            // precedence, and the FIRST branch is the one
+                            // that actually fires in practice — read it in
+                            // that order, not top-to-bottom-as-rare-cases.
+                            // `typed_name` (`req.name`, the same value that
+                            // becomes `display_title` below, trimmed once in
+                            // `build_new_pane_request` so both consumers
+                            // test blankness and read content from the
+                            // identical value; reviewer F1) is the Name the
+                            // user typed or accepted into this specific
+                            // pane/tab. fork#192's M1.0 pre-fills it with a
+                            // suggested `<foldername>-orchestrator-N` and
+                            // refuses a submit colliding with a live
+                            // orchestration, so a non-empty, DISTINCT typed
+                            // name is what a user submits in the common
+                            // case — this is a deliberate choice, not an
+                            // accident it happens to fall into: the marker
+                            // records WHICH tab owns the worktree, and the
+                            // pane's own identity answers that better than
+                            // `orch_config.name`, a value shared by every
+                            // tab of the same orchestration config (#184).
+                            // Fall back to the canonical config name — as
+                            // issue #425 originally did — only when the
+                            // field was cleared to empty. That fallback is
+                            // still reachable after M1.0: M1.0 suggests and
+                            // refuses collisions, it does not forbid an
+                            // empty submit (see
+                            // `orchestration_form_empty_name_keeps_config_name`),
+                            // so this is not the "becomes unreachable once
+                            // M1.0 ships" case an earlier version of this
+                            // comment predicted before M1.0 existed. The
+                            // blankness test below is on an already-trimmed
+                            // value (fork issue #174: a whitespace-only name
+                            // must fall back too, not become the identity)
+                            // rather than the bare `is_empty()` #174 flags
+                            // elsewhere.
                             //
                             // `load_project_config` normalises an empty
                             // `name` to the dir basename at load time

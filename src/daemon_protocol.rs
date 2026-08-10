@@ -218,6 +218,31 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`] now
 /// enforces this constant on the local path too, so a bump refuses BOTH
 /// pairings rather than only the SSH one.
+/// fork#192 M1.2: NOT bumped for the `display_title` promotion. Weighed the
+/// bump explicitly, per the module doc's own test above ("bump when a
+/// change would cause an older or newer peer to mis-parse a frame") —
+/// `display_title` is unchanged on the wire (still `Option<String>` with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]`; no
+/// `KIND_*` code, no field rename, no non-forward-compatible schema
+/// change), so no peer at any version fails to parse a frame carrying it.
+/// What changed is only that this TUI now reads the field for a second
+/// purpose (the new-pane uniqueness check), which the wire format cannot
+/// see and a version comparison cannot express as a parse failure.
+///
+/// A real mixed-version failure mode still exists and is NOT invisible —
+/// it is just not a decode-safety one, so `ensure_compatible_daemon_or_die`
+/// refusing the pairing outright would be the wrong tool: an older daemon,
+/// or any peer that still treats `display_title` as droppable decoration,
+/// yields fewer titles to `live_orchestration_cwds_and_titles()`, so the
+/// uniqueness check sees fewer live names and can suggest or accept one
+/// that is genuinely taken. That is the same shape of trade-off already
+/// established for Finding #6's guarded-send capability above (semantic
+/// change, decoupled from the version number, covered by a `.breaking.md`
+/// fragment and a manual cross-version test rather than a bump) — and the
+/// consequence here is bounded the same way the validation posture in
+/// `src/agent_pty.rs` reasons about it: a stale-name miss in a form
+/// suggestion, not routing corruption or a decode panic. See
+/// `changelog.d/192.breaking.md` for the mixed-version write-up.
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious

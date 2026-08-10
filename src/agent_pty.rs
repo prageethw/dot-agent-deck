@@ -333,10 +333,22 @@ pub enum TabMembership {
         /// new-pane form. Carried through the daemon round-trip so a
         /// detach/reattach restores the displayed tab TITLE instead of
         /// recomputing it from `resolve_orchestration_name` (config name or
-        /// cwd basename). The orchestration IDENTITY stays in `name` — this
-        /// is title-only and never feeds delegate/role lookups. `None` (the
-        /// common case for daemon-initiated/scheduled orchestrations and
-        /// older clients) means the title falls back to the canonical name.
+        /// cwd basename). The orchestration IDENTITY used by
+        /// `lookup_orchestration_role`/delegate routing stays in `name` —
+        /// this field still never feeds those lookups. That half of "title-
+        /// only" is still true; the other half is not: fork#192 M1.0 reads
+        /// this field (via `live_orchestration_cwds_and_titles`, applying
+        /// the same `filter(nonempty).unwrap_or(name)` fallback
+        /// `TabManager::open_orchestration_tab` uses for the tab TITLE) to
+        /// decide whether a new-pane submit is refused as a duplicate name.
+        /// It is no longer purely cosmetic — a wrong value here can make
+        /// the uniqueness check miss a live collision (see
+        /// `validate_orchestration_surface` and `validate_tab_membership`
+        /// below, which is where that consequence is weighed explicitly).
+        /// `None` (the common case for daemon-initiated/scheduled
+        /// orchestrations and older clients, which type no name — PRD
+        /// fork#192) means the title, and the uniqueness check, both fall
+        /// back to the canonical `name`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_title: Option<String>,
         /// PRD #140 M1.0: a per-TAB instance token, minted once when the
@@ -349,7 +361,12 @@ pub enum TabMembership {
         /// Distinct from the other three identity-ish fields: `name` is the
         /// CONFIG identity (which orchestration this is), `orchestration_cwd`
         /// is the DIRECTORY disambiguator (round-11 auditor #C), and
-        /// `display_title` is presentation-only. Neither `name` nor
+        /// `display_title` is the user-facing INSTANCE identity (fork#192 —
+        /// "which one", not "which config"), fed to the uniqueness check
+        /// but never to routing. This token is the ROUTING disambiguator:
+        /// unlike `display_title`, it decides which panes cross-deliver
+        /// delegate/work-done, so it has no cosmetic fallback (see its own
+        /// validation below). Neither `name` nor
         /// `orchestration_cwd` distinguishes two tabs of the SAME
         /// orchestration opened from the SAME directory — that pair produces
         /// byte-identical `(name, cwd)` identities and the daemon
@@ -477,23 +494,45 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         // could otherwise smuggle escape sequences through it.
         //
         // An invalid token REJECTS the whole membership rather than being
-        // nulled out the way `display_title` is. `display_title` is cosmetic
-        // with a defined fallback; the instance token is a ROUTING key, and
-        // silently dropping it would merge two same-`(name, cwd)` tabs back
-        // into one routing group — reintroducing exactly the cross-delivery
-        // this PRD fixes, invisibly.
+        // nulled out the way `display_title` is. `display_title` has a safe
+        // fallback (below); the instance token is a ROUTING key with none,
+        // and silently dropping it would merge two same-`(name, cwd)` tabs
+        // back into one routing group — reintroducing exactly the
+        // cross-delivery this PRD fixes, invisibly.
         if let Some(id) = orchestration_id.as_deref()
             && !is_valid_display_name(id)
         {
             return None;
         }
         // display_title flows to the tab label exactly like name/role_name,
-        // so it needs the same control-byte guard. But it's purely
-        // cosmetic with a defined `None` fallback (the title reverts to the
-        // canonical resolved name), so an invalid value is nulled out
-        // rather than rejecting the whole membership — dropping the
-        // orchestration tab over a bad cosmetic string would be a worse
-        // outcome than losing the custom title (Greptile PR #160 P1).
+        // so it needs the same control-byte guard. fork#192 re-decided this
+        // explicitly rather than inheriting it: `display_title` is no
+        // longer purely cosmetic (it now feeds the new-pane uniqueness
+        // check, see the field's own doc comment above), so keeping the
+        // null-and-fall-back-to-`name` behaviour here is a DECISION, not a
+        // leftover. Rejecting the whole membership instead — matching
+        // `orchestration_id` above — was considered and rejected: unlike
+        // the instance token, this is not a routing key, so an invalid
+        // value cannot cause cross-delivery; the worst case is that the
+        // uniqueness check at the NEXT new-pane form-open compares against
+        // the reverted `name` instead of the real title and can miss a
+        // collision — reproducing the pre-fork#192 "every orchestration in
+        // this dir gets the same suggested name" state for that one
+        // orchestration, not a data-loss or routing bug. Rejecting the
+        // whole membership would drop an entire LIVE orchestration tab
+        // (kill a running session) to guard a UI suggestion, which is a
+        // strictly worse outcome for a bounded, already-tolerated gap.
+        // Sanitizing instead of nulling (stripping the invalid bytes and
+        // keeping the rest) was also considered: it would narrow the gap
+        // but adds a second string-transform path for a value that can
+        // only carry control bytes here via wire corruption or a hostile
+        // same-user peer, not through the form (`build_new_pane_request`
+        // trims but does not need to strip control bytes, since ordinary
+        // keyboard/paste input reaching `NewPaneFormState` doesn't produce
+        // them). Kept null-and-keep (Greptile PR #160 P1's original call)
+        // for that reason. A behaviour change here (reject or sanitize)
+        // would need its own spec — this PRD keeps the fallback as-is, so
+        // none is added.
         if display_title
             .as_deref()
             .is_some_and(|t| !is_valid_display_name(t))
@@ -605,10 +644,13 @@ pub fn is_windows_absolute_path(value: &str) -> bool {
 ///   the same control-byte/ANSI guard. `name` is the tab IDENTITY + bucket key
 ///   with no safe fallback → an invalid value rejects the whole surface. A role
 ///   whose non-empty `role_name` carries control bytes is dropped (its slot
-///   falls back to a `role-{i}` placeholder). `display_title` is purely
-///   cosmetic with a defined `None` fallback (→ `name`), so an invalid value is
-///   nulled out rather than rejecting the surface (matches
-///   [`validate_tab_membership`]).
+///   falls back to a `role-{i}` placeholder). `display_title` now also feeds
+///   the new-pane uniqueness check (fork#192), so it is not purely cosmetic
+///   any more, but it still has a safe fallback (→ `name`) and is not a
+///   routing key — an invalid value is nulled out rather than rejecting the
+///   surface, the same re-decided (not inherited) trade-off as
+///   [`validate_tab_membership`], whose null-and-keep site documents the
+///   reasoning in full.
 /// - **L2:** `cwd` drives `load_project_config` and is the bucket key, so it
 ///   must be a valid ABSOLUTE orchestration cwd → reject otherwise.
 ///
@@ -628,8 +670,15 @@ pub fn validate_orchestration_surface(
     if !is_valid_orchestration_cwd(&surface.cwd) {
         return None;
     }
-    // Cosmetic title with a defined `None` fallback: null it out on a bad value
-    // rather than dropping the orchestration tab over a bad label string.
+    // fork#192: no longer purely cosmetic (feeds the new-pane uniqueness
+    // check), but still not a routing key and still has a safe fallback
+    // (→ `name`) — kept null-and-keep rather than reject-the-surface for
+    // the same reasoning as `validate_tab_membership`'s equivalent site
+    // (src/agent_pty.rs, the null-out arm next to the `orchestration_id`
+    // reject arm): the worst case is a stale-name miss in the uniqueness
+    // suggestion at the next form-open, not routing corruption, and that
+    // is a strictly smaller cost than dropping an entire live
+    // orchestration tab over a bad label string.
     if surface
         .display_title
         .as_deref()
@@ -5159,8 +5208,10 @@ mod spawn_tests {
         assert_eq!(validated.roles.len(), 1);
     }
 
-    // M1: display_title is cosmetic with a defined `None` fallback (→ name), so
-    // an invalid value is nulled out — the surface is preserved.
+    // fork#192 M1.1: display_title now feeds the uniqueness check too, but
+    // still has a safe fallback (→ name) and isn't a routing key, so an
+    // invalid value is nulled out rather than rejecting the surface — see
+    // the reasoning at the null-out site in validate_orchestration_surface.
     #[test]
     fn validate_orchestration_surface_nulls_out_display_title_with_control_bytes() {
         let mut surface = well_formed_surface();
