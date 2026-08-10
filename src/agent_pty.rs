@@ -7915,10 +7915,45 @@ mod spawn_tests {
             std::process::Command::new("true")
         }
 
-        fn command_ignores_sigterm() -> std::process::Command {
+        // Builds the SIGTERM-resistant stand-in's command together with a
+        // readiness marker: the shell installs its trap, then announces
+        // that fact by creating `marker` before it execs into `sleep 300`.
+        // Without this, phase 1's SIGTERM can reach the child before
+        // `/bin/sh` has reached the `trap` builtin, killing it for real and
+        // making the whole test setup racy rather than the code under test.
+        // `tempfile::tempdir` hands back a unique directory per call, so
+        // concurrent test invocations can never see each other's marker;
+        // the `TempDir` guard is returned alongside so callers keep it
+        // alive for as long as the marker might still be read.
+        fn command_ignores_sigterm() -> (std::process::Command, tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("create tempdir for trap-ready marker");
+            let marker = dir.path().join("trap-ready");
             let mut command = std::process::Command::new("sh");
-            command.args(["-c", "trap '' TERM; exec sleep 300"]);
-            command
+            command.args([
+                "-c",
+                &format!("trap '' TERM; : > \"{}\"; exec sleep 300", marker.display()),
+            ]);
+            (command, dir, marker)
+        }
+
+        // Blocks until the stand-in from `command_ignores_sigterm` has
+        // installed its trap and announced readiness, so nothing below
+        // starts timing or signals the child before that is true. The
+        // bound is a failure deadline, not a settle time: reaching it means
+        // the shell genuinely never got there (or died first), not that
+        // the number needs tuning.
+        fn wait_for_trap_ready(marker: &std::path::Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stand-in never installed its SIGTERM trap: marker {} did not appear \
+                     within {:?}",
+                    marker.display(),
+                    Duration::from_secs(10)
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
 
         // SAFETY: signal 0 sends nothing; it only probes whether `pid`
@@ -7974,7 +8009,9 @@ mod spawn_tests {
         // just reintroduce fork #133's orphan-descendant gap). Already
         // true today; must keep being true after the rework.
         {
-            let (agent, log, pid) = real_stand_in_agent(command_ignores_sigterm());
+            let (command, _marker_dir, marker) = command_ignores_sigterm();
+            let (agent, log, pid) = real_stand_in_agent(command);
+            wait_for_trap_ready(&marker);
             let registry = AgentPtyRegistry::new();
             registry
                 .inner
@@ -8034,8 +8071,10 @@ mod spawn_tests {
         // between the agents and their per-agent phase-2 state across two
         // separate loops.
         {
+            let (command_b, _marker_dir_b, marker_b) = command_ignores_sigterm();
             let (agent_a, log_a, pid_a) = real_stand_in_agent(command_exits_promptly());
-            let (agent_b, log_b, pid_b) = real_stand_in_agent(command_ignores_sigterm());
+            let (agent_b, log_b, pid_b) = real_stand_in_agent(command_b);
+            wait_for_trap_ready(&marker_b);
             let registry = AgentPtyRegistry::new();
             {
                 let mut inner = registry.inner.lock().unwrap();
