@@ -77,6 +77,22 @@ const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET
 #[cfg(unix)]
 const SCRIPT_TRAILING_WINDOW_SECS: u64 = PROCESS_TABLE_POLL_WINDOW.as_secs() + 7;
 
+/// Fork issue #160 A5: backstops the pane script's `until [ -f … ]` poll loop
+/// (0.05s granularity — 20 iterations/sec) so an orphaned shell cannot spin
+/// forever. `TriggerFile::drop` only runs on unwind; it does **not** run on
+/// nextest's `terminate-after` SIGKILL, on Ctrl-C, or on an OOM kill, so
+/// without a backstop a shell orphaned on one of those paths would poll at
+/// 20 Hz indefinitely, outliving the test process. Derived as `4 *
+/// PROCESS_TABLE_POLL_WINDOW` (32s at the current 8s window) rather than a
+/// bare literal, so it moves if that constant ever does. It cannot fire
+/// during a legitimate run: the falling-edge loop that must observe the idle
+/// reading before `trigger.release()` is ever called bounds its own wait to
+/// `PROCESS_TABLE_POLL_WINDOW` — a single poll window, a quarter of this
+/// backstop — so by the time `release()` runs there is still 3x
+/// `PROCESS_TABLE_POLL_WINDOW` of headroom left on this loop's own budget.
+#[cfg(unix)]
+const TRIGGER_POLL_ITERATION_BOUND: u64 = PROCESS_TABLE_POLL_WINDOW.as_secs() * 4 * 20;
+
 // ---------------------------------------------------------------------------
 // Real-process half (Unix only — spawns and setsid()'s a genuine grandchild).
 // ---------------------------------------------------------------------------
@@ -522,40 +538,46 @@ impl Drop for KillOnDrop {
 /// RAII guard for the trigger file that gates `shell_activity_004`'s script
 /// (fork issue #160 item 1): the pane's script blocks in a POSIX
 /// `until [ -f … ]` poll loop until this file exists, so the idle window
-/// before the detached target launches is unbounded rather than a fixed
+/// before the detached target launches is bounded only by
+/// [`TRIGGER_POLL_ITERATION_BOUND`] (fork issue #160 A5) rather than a fixed
 /// `sleep` gambling that its duration outlasts one exhausted
 /// [`PS_SAMPLE_BUDGET`] sample. `release` is only called after the test has
-/// *actually observed* the idle reading, so no timing constant is
-/// load-bearing for F1 any more. Cleans up on drop, including on an early
-/// panic, so a failed run does not leave a stale file behind in
-/// `env::temp_dir()`.
+/// *actually observed* the idle reading, so no timing constant below that
+/// backstop is load-bearing for F1 any more.
+///
+/// Fork issue #160 A6: the trigger lives inside its own `tempfile::TempDir`
+/// rather than a pid-derived name under the shared `env::temp_dir()` — a
+/// unique, freshly created, `0700` directory has no predictable path for a
+/// local attacker to plant a file or symlink at ahead of time (CWE-377 /
+/// CWE-59), which removes the pid-derivation and the defensive pre-removal
+/// the old scheme needed along with the hazard itself. `TempDir`'s own
+/// `Drop` — which runs on unwind, exactly as the removed manual `Drop` did;
+/// this workspace sets no `panic = "abort"` profile — recursively removes
+/// the directory and the trigger file inside it together, so a failed run
+/// leaves nothing behind.
 #[cfg(unix)]
-struct TriggerFile(std::path::PathBuf);
-
-#[cfg(unix)]
-impl TriggerFile {
-    /// `name` must already be unique per test run — the caller derives it
-    /// from this process's own pid.
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(name);
-        // Best-effort: a stale file left by a previous aborted run under the
-        // same name would release the script immediately instead of gating
-        // it, silently defeating the whole point of the trigger.
-        let _ = std::fs::remove_file(&path);
-        Self(path)
-    }
-
-    /// Releases the pane's script by creating the file it polls for.
-    fn release(&self) {
-        std::fs::write(&self.0, b"")
-            .unwrap_or_else(|e| panic!("write trigger file {:?}: {e}", self.0));
-    }
+struct TriggerFile {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
 }
 
 #[cfg(unix)]
-impl Drop for TriggerFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+impl TriggerFile {
+    fn new() -> Self {
+        let dir =
+            tempfile::TempDir::new().unwrap_or_else(|e| panic!("create trigger tempdir: {e}"));
+        let path = dir.path().join("trigger");
+        Self { _dir: dir, path }
+    }
+
+    /// Releases the pane's script by creating the file it polls for.
+    /// Level-triggered (file existence, not a one-shot signal): if this runs
+    /// before the shell has even reached its `until` loop, the file already
+    /// exists by the time the shell gets there, so there is no lost-wakeup
+    /// race (fork #160 round-3 verification, Q2).
+    fn release(&self) {
+        std::fs::write(&self.path, b"")
+            .unwrap_or_else(|e| panic!("write trigger file {:?}: {e}", self.path));
     }
 }
 
@@ -581,35 +603,36 @@ impl Drop for TriggerFile {
 fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
     const PANE_ID: &str = "shell-activity-004-pane";
     let marker = format!("shell-activity-004-target-{}", std::process::id());
-    let trigger = TriggerFile::new(&format!("dot-agent-deck-{marker}-trigger"));
+    let trigger = TriggerFile::new();
     // Fork issue #160 F1: the script blocks in a POSIX `until [ -f … ]` poll
     // loop (0.05s granularity, negligible next to the process-table budget)
     // until `trigger`'s path exists, so the idle window before the detached
-    // child launches is unbounded — the test below only calls
-    // `trigger.release()` once it has actually observed the pane reading
-    // idle, rather than racing a fixed-duration sleep against one exhausted
-    // `PS_SAMPLE_BUDGET` sample. The python3 one-liner setsid()'s itself
-    // (detaching from the pane's controlling terminal and becoming its own
-    // session leader, exactly as Claude Code's Bash-tool child does) and
-    // execv's into `/bin/sleep 30` with an argv crafted to carry the
-    // measured Bash-tool shape (`shell-snapshots/snapshot-` and `&& eval `)
-    // so the argv cross-check is exercised against a real process, not just
-    // a fixture string. 30s is a generous backstop bound in case the test
-    // panics before the explicit kill below runs; `KillOnDrop` and the
-    // explicit kill both aim to end it long before that. Fork issue #160
-    // F2: the trailing `sleep {SCRIPT_TRAILING_WINDOW_SECS}` keeps the
-    // pane's own shell alive (and so its registry entry) past
-    // `PROCESS_TABLE_POLL_WINDOW` following the detached child's death —
-    // without real margin over that window the shell can exit, and so leave
-    // the snapshot, before the closing falling-edge loop's deadline, which
-    // would report `None` forever rather than the `Some(false)` being
-    // asserted.
+    // child launches is bounded only by `TRIGGER_POLL_ITERATION_BOUND` (fork
+    // issue #160 A5) — the test below only calls `trigger.release()` once it
+    // has actually observed the pane reading idle, rather than racing a
+    // fixed-duration sleep against one exhausted `PS_SAMPLE_BUDGET` sample.
+    // The python3 one-liner setsid()'s itself (detaching from the pane's
+    // controlling terminal and becoming its own session leader, exactly as
+    // Claude Code's Bash-tool child does) and execv's into `/bin/sleep 30`
+    // with an argv crafted to carry the measured Bash-tool shape
+    // (`shell-snapshots/snapshot-` and `&& eval `) so the argv cross-check is
+    // exercised against a real process, not just a fixture string. 30s is a
+    // generous backstop bound in case the test panics before the explicit
+    // kill below runs; `KillOnDrop` and the explicit kill both aim to end it
+    // long before that. Fork issue #160 F2: the trailing `sleep
+    // {SCRIPT_TRAILING_WINDOW_SECS}` keeps the pane's own shell alive (and so
+    // its registry entry) past `PROCESS_TABLE_POLL_WINDOW` following the
+    // detached child's death — without real margin over that window the
+    // shell can exit, and so leave the snapshot, before the closing
+    // falling-edge loop's deadline, which would report `None` forever rather
+    // than the `Some(false)` being asserted.
     let command = format!(
-        "until [ -f '{trigger_path}' ]; do sleep 0.05; done; \
+        "i=0; until [ -f '{trigger_path}' ] || [ \"$i\" -ge {TRIGGER_POLL_ITERATION_BOUND} ]; \
+         do sleep 0.05; i=$((i + 1)); done; \
          python3 -c \"import os; os.setsid(); \
          os.execv('/bin/sleep', ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; \
          sleep {SCRIPT_TRAILING_WINDOW_SECS}",
-        trigger_path = trigger.0.display(),
+        trigger_path = trigger.path.display(),
     );
 
     let registry = AgentPtyRegistry::new();
@@ -672,7 +695,10 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     assert_eq!(
         state,
         Some(false),
-        "an idle shell with no detached descendant yet must not read busy"
+        "must observe the pane reading idle (Some(false)) within {PROCESS_TABLE_POLL_WINDOW:?} \
+         before releasing the trigger — got {state:?}, meaning either every process-table \
+         sample failed within the deadline (None) or the pane read busy (Some(true)) despite \
+         the detached target not having been released yet"
     );
 
     // Fork issue #160 F1: only now — with the idle reading actually
