@@ -6,6 +6,7 @@
 //! cases exercise the same warning decision used by the interactive flow.
 
 use dot_agent_deck::ui::render_new_pane_orchestration_guard_to_buffer;
+use dot_agent_deck::ui::render_new_pane_orchestration_name_collision_to_buffer;
 use spec::spec;
 
 fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
@@ -60,5 +61,37 @@ fn guard_001_warns_for_same_cwd_live_orchestration_only() {
     assert!(
         collision.contains("[Submit]"),
         "the warning is non-blocking: the form must retain its Submit action, got:\n{collision}"
+    );
+}
+
+/// Scenario: Render the new-pane form with an orchestration selected and its
+/// typed Name colliding with a name a live orchestration already holds. The
+/// refusal must render on the SAME guard seam `guard/001` uses, but — unlike
+/// `guard/001`'s non-blocking same-cwd warning, which still permits submit —
+/// it must BLOCK: no `[Submit]` action. A distinct typed name renders the
+/// form normally, `[Submit]` intact (fork#192 M1.0).
+#[spec("orchestration/guard/002")]
+#[test]
+fn guard_002_name_collision_blocks_submit_distinct_name_does_not() {
+    let colliding = buffer_text(&render_new_pane_orchestration_name_collision_to_buffer(
+        "review-orchestrator-1",
+        &["review-orchestrator-1"],
+        100,
+        28,
+    ));
+    assert!(
+        !colliding.contains("[Submit]"),
+        "a name a live orchestration already holds must block Submit, got:\n{colliding}"
+    );
+
+    let distinct = buffer_text(&render_new_pane_orchestration_name_collision_to_buffer(
+        "review-orchestrator-2",
+        &["review-orchestrator-1"],
+        100,
+        28,
+    ));
+    assert!(
+        distinct.contains("[Submit]"),
+        "a distinct typed name must not be blocked, got:\n{distinct}"
     );
 }

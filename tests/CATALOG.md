@@ -2635,6 +2635,13 @@ without depending on the config struct API.
 - **Does not assert:** the daemon round-trip `live_orchestration_cwds()`/`transition_after_dir_pick` performs to learn live names (not unit-testable without a live daemon — covered informally by `orchestration/identity/004`'s real-binary path); rendering of the suggestion (no L1 render seam asserts the Name field's literal text here).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/003 — With `<folder>-orchestrator-1` already live (injected via a new test-only `NewPaneFormState::with_live_orchestration_names` builder), selecting the orchestration suggests `<folder>-orchestrator-2` next, skipping the taken slot; submitting a name a live orchestration already holds is REFUSED — no `Action::SpawnPane`, form stays open (fork#192 M1.0).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, as `orchestration/identity/002`).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"`, one orchestration, and `with_live_orchestration_names(vec!["myproj-orchestrator-1".into()])`, after a Right-arrow selects the orchestration, has `form.name == "myproj-orchestrator-2"`; overwriting the Name field back to the taken `"myproj-orchestrator-1"` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane`, and `ui.mode` stays `UiMode::NewPaneForm`.
+- **Does not assert:** the exact refusal UI copy/rendering (covered by `orchestration/guard/002`); what N is counted over across multiple cwds (PRD's own open question, scoped global-over-live).
+- **Platform coverage:** mac+linux+windows.
+
 ##### orchestration/identity/004 — Driving the real binary through TWO orchestration opens in the SAME directory, each accepting the form's suggested Name with a single Enter (no character typed), lands both as visible tabs with DISTINCT labels (`<basename>-orchestrator-1`, `<basename>-orchestrator-2`) — never the identical basename-derived title recorded twice, the fork #74 collision fork#192 exists to stop (fork#192 M1.0).
 - **Layer:** L2 (PTY-attached real binary via `TuiDeck`; stand-in `cat` agent, no real LLM tokens spent, no credentials required).
 - **Agent:** none (both roles of the `orch-deck` fixture run `cat`).
@@ -2649,6 +2656,13 @@ without depending on the config struct API.
 - **Agent:** none (the render seam supplies synthetic live-daemon orchestration cwd records).
 - **Asserts:** an orchestration selected for a cwd matching an existing live orchestration renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh cwd renders neither warning substring.
 - **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/002 — A name collision (the typed Name matches a name a live orchestration already holds) renders a BLOCKING refusal on the same guard seam `guard/001` uses — no `[Submit]` action — distinct in kind from `guard/001`'s non-blocking warning, which still permits submit; a distinct typed name renders normally (fork#192 M1.0).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_orchestration_name_collision_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (the render seam supplies a synthetic typed Name plus synthetic live-orchestration names).
+- **Asserts:** a typed Name equal to an entry in the live-orchestration-names list renders WITHOUT `[Submit]` anywhere in the buffer; a typed Name absent from that list renders WITH `[Submit]`.
+- **Does not assert:** exact refusal copy or styling; the Name-field text content itself; the suggestion logic that produces a non-colliding name in the first place (`orchestration/identity/002`/`003`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout

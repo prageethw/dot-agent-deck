@@ -30255,6 +30255,61 @@ mod tests {
         }
     }
 
+    /// Scenario: With `myproj-orchestrator-1` already live (a name a running
+    /// orchestration in the same folder currently holds, injected via the
+    /// test-only `with_live_orchestration_names` builder that mirrors
+    /// `with_live_orchestration_cwds`), selecting the form's orchestration
+    /// must suggest `myproj-orchestrator-2`, skipping the taken slot
+    /// (fork#192 M1.0). Then simulate a stale/resubmitted taken name still
+    /// sitting in the Name field and confirm submit is REFUSED — no
+    /// `Action::SpawnPane`, and the form stays open — rather than silently
+    /// recording a second orchestration under an identical owner.
+    #[spec("orchestration/identity/003")]
+    #[test]
+    fn identity_003_next_open_suggests_orchestrator_2_and_refuses_a_taken_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-2",
+            "with -orchestrator-1 already live, selecting the orchestration must \
+             suggest N=2, skipping the taken slot"
+        );
+
+        // Simulate a stale/resubmitted taken name still sitting in the field
+        // (e.g. the user typed over the suggestion with a value someone
+        // else's live orchestration already holds).
+        ui.new_pane_form.as_mut().unwrap().name = "myproj-orchestrator-1".to_string();
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting a name a live orchestration already holds must be refused, got {result:?}"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused submit must keep the form open, not close it"
+        );
+    }
+
     /// Scenario: Build the new-pane form for an orchestration with a
     /// worktree slug typed in, then submit it. The resulting request must
     /// carry the resolved sibling worktree path (`<dir>-<slug>`, next to the
