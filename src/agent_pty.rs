@@ -5106,6 +5106,7 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use spec::spec;
     use std::time::Duration;
 
     // ---------------------------------------------------------------------
@@ -7629,5 +7630,195 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("some-other-pane"), None);
         reg.close_agent(&id).expect("close the orchestrator stub");
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
+    }
+
+    /// Fork issue #163: `shutdown_all_graceful`'s phase 2 polls every
+    /// agent's child with `try_wait`, whose underlying `waitpid(WNOHANG)`
+    /// reaps as a side effect of merely checking exit status — releasing
+    /// that agent's pid back to the kernel, where it can be recycled by an
+    /// unrelated process before phase 3 runs. Phase 3 then iterates every
+    /// agent unconditionally and derives a pgid from whatever pid is still
+    /// stored, even for an agent phase 2 already reaped — so a `killpg`
+    /// meant for a dead agent can land on whatever now owns that recycled
+    /// pid's group. The trigger (the kernel recycling a freed pid within
+    /// the up-to-3s grace window) needs pid-space wraparound and cannot be
+    /// forced deterministically — same framing as
+    /// `orchestration/worktree/013`, which pins the sibling bug fork #143
+    /// fixed the same way. What this pins instead is the ordering
+    /// invariant that makes the race structurally impossible: an agent
+    /// whose `try_wait` has already reported it exited must receive no
+    /// further `kill`/`wait` call afterward.
+    ///
+    /// Scenario: two independent single-agent registries are each seeded
+    /// directly with one hand-built `RunningAgent` wrapping a fake
+    /// `portable_pty::Child` stand-in (no real pid, so every signal routes
+    /// through the observable `ChildKiller::kill` fallback instead of a
+    /// real `killpg` — no OS process needed) that logs every
+    /// `try_wait`/`wait`/`kill` call it receives. The first agent's
+    /// `try_wait` reports exited on its very first call, so phase 2 reaps
+    /// it immediately; the second agent's `try_wait` always reports
+    /// still-running, so it legitimately rides out the grace window and
+    /// gets force-killed in phase 3. `shutdown_all_graceful` runs against
+    /// each registry in turn and each agent's call log is asserted
+    /// afterward. (Two independent single-agent registries, not one
+    /// shared two-agent registry, deliberately: phase 2's `.all()`
+    /// short-circuits on the first not-yet-exited agent it iterates, and
+    /// `HashMap` iteration order is unspecified, so a shared registry
+    /// would make which agent phase 2 actually reaches order-dependent —
+    /// i.e. flaky.)
+    #[cfg(unix)]
+    #[spec("lifecycle/shutdown-graceful/001")]
+    #[test]
+    fn shutdown_graceful_001_phase_three_never_signals_an_agent_phase_two_already_reaped() {
+        #[derive(Debug)]
+        struct OrderingProbeChild {
+            log: Arc<Mutex<Vec<&'static str>>>,
+            exited: bool,
+        }
+
+        impl portable_pty::ChildKiller for OrderingProbeChild {
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.log.lock().unwrap().push("kill");
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(OrderingProbeChild {
+                    log: self.log.clone(),
+                    exited: self.exited,
+                })
+            }
+        }
+
+        impl portable_pty::Child for OrderingProbeChild {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                self.log.lock().unwrap().push("try_wait");
+                if self.exited {
+                    Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                self.log.lock().unwrap().push("wait");
+                Ok(portable_pty::ExitStatus::with_exit_code(0))
+            }
+            fn process_id(&self) -> Option<u32> {
+                // No real pid — forces `signal_child_pgroup_or_fallback`
+                // through the observable `ChildKiller::kill` fallback
+                // rather than a real `killpg`, matching
+                // `orchestration/worktree/013`'s stand-in — this test needs
+                // no OS process and exercises no real pid recycling at all.
+                None
+            }
+        }
+
+        // Builds a `RunningAgent` around a fresh `OrderingProbeChild`. The
+        // master/writer come from a real (but otherwise unused) pty pair —
+        // `shutdown_all_graceful` never touches them, but `RunningAgent`
+        // has no lighter-weight way to satisfy those fields.
+        fn stand_in_agent(exited: bool) -> (RunningAgent, Arc<Mutex<Vec<&'static str>>>) {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(OrderingProbeChild {
+                log: log.clone(),
+                exited,
+            });
+            let pty_system = NativePtySystem::default();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open a real pty for the stand-in's unused master/writer");
+            let writer = pair.master.take_writer().expect("take_writer");
+            let agent = RunningAgent {
+                child,
+                process_group: crate::platform::proc::AgentProcessGroup,
+                master: pair.master,
+                writer: Arc::new(AsyncMutex::new(writer)),
+                bus: Arc::new(AgentBus::new()),
+                pane_id_env: None,
+                display_name: None,
+                cwd: None,
+                tab_membership: None,
+                agent_type: None,
+                spawn_agent_type: None,
+                spawn_env: Vec::new(),
+                pty_rows: 24,
+                pty_cols: 80,
+                exited: Arc::new(AtomicBool::new(false)),
+                pending_seed: None,
+                seed_delivered_native: false,
+            };
+            (agent, log)
+        }
+
+        fn kill_count(calls: &[&'static str]) -> usize {
+            calls.iter().filter(|c| **c == "kill").count()
+        }
+
+        // Agent that exits promptly: phase 2's very first poll reaps it.
+        // Today's bug: phase 3 still unconditionally derives a pgid from
+        // (and signals) this already-reaped agent — a second `kill` plus a
+        // `wait` land in its log below, which must not happen.
+        {
+            let (agent, log) = stand_in_agent(true);
+            let registry = AgentPtyRegistry::new();
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .insert("solo-exits-promptly".to_string(), agent);
+            registry.shutdown_all_graceful(Duration::from_millis(200));
+
+            let calls = log.lock().unwrap().clone();
+            assert!(
+                calls.contains(&"try_wait"),
+                "phase 2 must poll the agent at least once for this scenario to be meaningful; \
+                 calls were: {calls:?}"
+            );
+            assert_eq!(
+                kill_count(&calls),
+                1,
+                "an agent phase 2 has already reaped must be signalled only once — phase 1's \
+                 SIGTERM — and never again in phase 3; calls were: {calls:?}"
+            );
+            assert!(
+                !calls.contains(&"wait"),
+                "phase 3 must not reap (call `wait` on) an agent phase 2 already reaped; calls \
+                 were: {calls:?}"
+            );
+        }
+
+        // Control: an agent that never exits cannot be reaped by phase 2,
+        // so it must still legitimately receive phase 3's forcing SIGKILL
+        // and be reaped — proves the fix discriminates by reaped-state
+        // rather than silencing phase 3 for every agent (which would just
+        // trade this bug for fork #133's orphan-descendant gap).
+        {
+            let (agent, log) = stand_in_agent(false);
+            let registry = AgentPtyRegistry::new();
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .insert("solo-never-exits".to_string(), agent);
+            registry.shutdown_all_graceful(Duration::from_millis(80));
+
+            let calls = log.lock().unwrap().clone();
+            assert_eq!(
+                kill_count(&calls),
+                2,
+                "an agent phase 2 never reaps must still be signalled twice — phase 1's SIGTERM \
+                 and phase 3's forcing SIGKILL; calls were: {calls:?}"
+            );
+            assert!(
+                calls.contains(&"wait"),
+                "phase 3 must still reap an agent it force-killed; calls were: {calls:?}"
+            );
+        }
     }
 }
