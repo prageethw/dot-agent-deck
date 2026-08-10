@@ -42,24 +42,54 @@ use dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
 use dot_agent_deck::platform::proc::{
     ProcessInfo, descendant_shell_activity, descendants, process_table,
 };
+#[cfg(windows)]
+use dot_agent_deck::platform::proc::{ProcessTableOutcome, process_table_async};
 
 use spec::spec;
 
 /// Fork issue #160: every deadline below that polls [`process_table`] must
 /// leave real headroom beyond `unix.rs`'s `PS_SAMPLE_BUDGET` (currently 2s,
 /// not `pub` so it can't be referenced directly from this integration test
-/// crate — keep this comment in sync with it). A deadline equal to the
-/// budget gives a single timed-out sample zero room for a retry, which is
-/// exactly what made `shell_activity_001`/`_004` fail intermittently in CI
-/// under machine load: one `ps` call consumed the whole polling window and
-/// there was no time left to try again.
+/// crate — keep this mirror in sync with it, `PS_SAMPLE_BUDGET_SECS_MIRROR`
+/// below). A deadline equal to the budget gives a single timed-out sample
+/// zero room for a retry, which is exactly what made
+/// `shell_activity_001`/`_004` fail intermittently in CI under machine load:
+/// one `ps` call consumed the whole polling window and there was no time
+/// left to try again.
 ///
 /// `#[cfg(unix)]`: only `Duration`/`Instant` are imported under that gate
-/// above (`process_table()` itself is Windows-only in the sense that it
-/// always returns `None` there, so these polling tests are `#[cfg(unix)]`
-/// entirely) — an ungated use of `Duration` here fails to compile on Windows.
+/// above, and `process_table()` only ever returns real data on Unix — it is
+/// an unconditional `None` on Windows — so these polling tests are
+/// `#[cfg(unix)]` entirely; an ungated use of `Duration` here fails to
+/// compile on Windows.
 #[cfg(unix)]
-const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(8);
+const PS_SAMPLE_BUDGET_SECS_MIRROR: u64 = 2;
+
+#[cfg(unix)]
+const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET_SECS_MIRROR * 4);
+
+/// Fork issue #160 F1: the leading `sleep` in `shell_activity_004`'s script,
+/// before it spawns the detached target, must comfortably exceed one
+/// exhausted [`PS_SAMPLE_BUDGET_SECS_MIRROR`] — otherwise the very first
+/// falling-edge sample can time out, the target can already exist by the
+/// time a retry succeeds, and no widened deadline can fix that: the assertion
+/// would be polling for a state that has already stopped being true. Derived
+/// from the same mirror as [`PROCESS_TABLE_POLL_WINDOW`] so the two cannot
+/// drift apart.
+#[cfg(unix)]
+const SCRIPT_IDLE_WINDOW_SECS: u64 = PS_SAMPLE_BUDGET_SECS_MIRROR + 1;
+
+/// Fork issue #160 F2: the trailing `sleep` in `shell_activity_004`'s script,
+/// after the detached target is killed, keeps the pane's own shell (and so
+/// its registry entry) alive long enough for the closing falling-edge loop to
+/// find it. **Invariant: script window > poll window.** Once the shell exits,
+/// `shell_foreground_busy_snapshot_in` filters it out of the snapshot and
+/// `busy_for_pane` returns `None` forever — no amount of extra deadline can
+/// observe a pane that has already left the table. Derived from
+/// [`PROCESS_TABLE_POLL_WINDOW`] with real margin rather than hard-coded
+/// separately, so the invariant cannot silently stop holding.
+#[cfg(unix)]
+const SCRIPT_TRAILING_WINDOW_SECS: u64 = PROCESS_TABLE_POLL_WINDOW.as_secs() + 7;
 
 // ---------------------------------------------------------------------------
 // Real-process half (Unix only — spawns and setsid()'s a genuine grandchild).
@@ -525,23 +555,32 @@ impl Drop for KillOnDrop {
 fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
     const PANE_ID: &str = "shell-activity-004-pane";
     let marker = format!("shell-activity-004-target-{}", std::process::id());
-    // `sleep 0.3` guarantees an observable idle window before the detached
-    // child appears; the python3 one-liner setsid()'s itself (detaching from
-    // the pane's controlling terminal and becoming its own session leader,
-    // exactly as Claude Code's Bash-tool child does) and execv's into
-    // `/bin/sleep 30` with an argv crafted to carry the measured Bash-tool
-    // shape (`shell-snapshots/snapshot-` and `&& eval `) so the argv
-    // cross-check is exercised against a real process, not just a fixture
-    // string. 30s is a generous backstop bound in case the test panics
-    // before the explicit kill below runs; `KillOnDrop` and the explicit
-    // kill both aim to end it long before that. The trailing `sleep 5` keeps
-    // the pane's own shell alive (and so its registry entry) past the
-    // detached child's death — without it the shell has nothing left to run
-    // and exits the instant the killed child is reaped, so the pane
-    // disappears from the snapshot instead of reading idle.
+    // Fork issue #160 F1: the leading `sleep {SCRIPT_IDLE_WINDOW_SECS}`
+    // guarantees an observable idle window before the detached child
+    // appears — long enough to comfortably outlast one exhausted
+    // `PS_SAMPLE_BUDGET_SECS_MIRROR`, so a failed first falling-edge sample
+    // still leaves the pane genuinely idle for the retry loop below to
+    // observe, rather than racing a target that may already exist by the
+    // time a retry succeeds. The python3 one-liner setsid()'s itself
+    // (detaching from the pane's controlling terminal and becoming its own
+    // session leader, exactly as Claude Code's Bash-tool child does) and
+    // execv's into `/bin/sleep 30` with an argv crafted to carry the
+    // measured Bash-tool shape (`shell-snapshots/snapshot-` and `&& eval `)
+    // so the argv cross-check is exercised against a real process, not just
+    // a fixture string. 30s is a generous backstop bound in case the test
+    // panics before the explicit kill below runs; `KillOnDrop` and the
+    // explicit kill both aim to end it long before that. Fork issue #160
+    // F2: the trailing `sleep {SCRIPT_TRAILING_WINDOW_SECS}` keeps the
+    // pane's own shell alive (and so its registry entry) past
+    // `PROCESS_TABLE_POLL_WINDOW` following the detached child's death —
+    // without real margin over that window the shell can exit, and so leave
+    // the snapshot, before the closing falling-edge loop's deadline, which
+    // would report `None` forever rather than the `Some(false)` being
+    // asserted.
     let command = format!(
-        "sleep 0.3; python3 -c \"import os; os.setsid(); os.execv('/bin/sleep', \
-         ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; sleep 5"
+        "sleep {SCRIPT_IDLE_WINDOW_SECS}; python3 -c \"import os; os.setsid(); \
+         os.execv('/bin/sleep', ['shell-snapshots/snapshot- && eval {marker}', '30'])\"; \
+         sleep {SCRIPT_TRAILING_WINDOW_SECS}"
     );
 
     let registry = AgentPtyRegistry::new();
@@ -585,11 +624,16 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     // detached child yet, so the pane must read idle.
     //
     // Fork issue #160: `busy_for_pane` returns `None` when the underlying
-    // `process_table_async` sample fails (budget exceeded under load), and
-    // this loop already treats `None` as "keep polling" — that part was
+    // sample fails (budget exceeded under load) — `shell_foreground_busy_snapshot`
+    // calls the SYNCHRONOUS `process_table()` (`agent_pty.rs`), not
+    // `process_table_async`; the async form has no caller in this test file.
+    // This loop already treats `None` as "keep polling" — that part was
     // never wrong. What was wrong is the window: at exactly `PS_SAMPLE_BUDGET`
-    // it gave a single timed-out sample no time left to retry, so widen it to
-    // `PROCESS_TABLE_POLL_WINDOW` for real headroom.
+    // it gave a single timed-out sample no time left to retry. Widening the
+    // deadline to `PROCESS_TABLE_POLL_WINDOW` alone is not what fixes this
+    // loop, though — see `SCRIPT_IDLE_WINDOW_SECS` above: the loop also needs
+    // the state it is asserting (idle) to still be true by the time a retry
+    // can observe it, which the widened deadline cannot provide on its own.
     let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
@@ -603,10 +647,10 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     );
 
     // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
-    // Needs headroom for both the script's own `sleep 0.3` + python/execv
-    // startup AND at least one retried process-table sample, so this window
-    // adds a margin on top of `PROCESS_TABLE_POLL_WINDOW` rather than reusing
-    // it as-is.
+    // Needs headroom for both the script's own leading
+    // `sleep {SCRIPT_IDLE_WINDOW_SECS}` + python/execv startup AND at least
+    // one retried process-table sample, so this window adds a margin on top
+    // of `PROCESS_TABLE_POLL_WINDOW` rather than reusing it as-is.
     let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW + Duration::from_secs(2);
     let mut state = busy_for_pane(&registry);
     while state != Some(true) && Instant::now() < deadline {
@@ -625,13 +669,27 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     // Independent oracle: confirm this is genuinely the topology #370 could
     // never see, not just that the snapshot happened to say `true`.
     //
-    // Fork issue #160: unlike `busy_for_pane`'s loop above, this is a single
-    // one-shot call with no retry loop around it — a `None` here (budget
-    // exceeded) genuinely deserves to fail the test rather than be silently
-    // retried, since by this point `state == Some(true)` already proved a
-    // process-table sample succeeded moments ago. `.expect()` stays; only the
-    // *polled* deadlines above needed retry-on-`None` semantics.
-    let table = process_table().expect("process_table() must enumerate on unix");
+    // Fork issue #160 F5: this used to be a single one-shot `.expect()`,
+    // justified by "`state == Some(true)` already proved a sample succeeded
+    // moments ago" — sound only if sample failures are independent. They are
+    // not: they are load-caused, and this same PR's own new docs
+    // (`docs/develop/shell-activity-signal.md`) say the condition can
+    // "persist for as long as the contention does". A success at t and a
+    // failure at t+20ms are entirely compatible under sustained contention,
+    // so this gets the same bounded retry the polled loops above use rather
+    // than trusting a moments-ago success.
+    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
+    let mut table = process_table();
+    while table.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        table = process_table();
+    }
+    let table = table.unwrap_or_else(|| {
+        panic!(
+            "process_table() produced no sample within {PROCESS_TABLE_POLL_WINDOW:?}, even \
+             though a shell-activity sample succeeded moments ago"
+        )
+    });
     let own_row = table
         .iter()
         .find(|p| p.pid == shell_pid)
@@ -697,7 +755,18 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
 /// `foreground_pgid`'s `None` contract). Calls the not-yet-written
 /// `process_table()` and asserts it reports `None` rather than a table, so
 /// an accidental future Windows implementation is caught here rather than
-/// shipping unverified.
+/// shipping unverified. Fork issue #160 F9: also asserts the async form
+/// reports `ProcessTableOutcome::Unsupported` — until this test, that
+/// contract had zero coverage, so a future Windows backend that started
+/// returning `Failed` instead would silently turn the daemon's
+/// silent-continue branch into a per-tick warning storm with nothing here to
+/// catch it.
+//
+// Written as a sync `#[test]` driving an explicit multi-thread runtime
+// rather than `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties
+// each `#[spec(...)]` to the next plain `fn` definition and does not
+// recognize a `#[tokio::test] async fn` — see `tests/rehydration.rs`'s
+// `live_007` for the same pattern.
 #[cfg(windows)]
 #[spec("status/shell-activity/001")]
 #[test]
@@ -706,5 +775,16 @@ fn shell_activity_001_process_table_is_none_on_windows() {
         process_table(),
         None,
         "process_table() must be None on Windows, matching foreground_pgid's existing contract"
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    assert_eq!(
+        rt.block_on(process_table_async()),
+        Err(ProcessTableOutcome::Unsupported),
+        "process_table_async() must report Unsupported on Windows — permanent for the \
+         process's life, distinct from a transient Failed sample"
     );
 }

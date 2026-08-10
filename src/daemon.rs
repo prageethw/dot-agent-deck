@@ -1164,7 +1164,19 @@ async fn run_shell_activity_monitor(
     // cadence itself is left unchanged deliberately, so M5 measures what
     // actually shipped.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    // Fork issue #160 F6: how often a *sustained* run of `Failed` samples
+    // still gets a log line after the first (transition) one. At the 500ms
+    // cadence this is ~10s between lines while contention persists — loud
+    // enough that a chronically failing machine is still visible, quiet
+    // enough that it cannot become a per-tick flood (see the match arm
+    // below).
+    const FAILURE_LOG_EVERY: u32 = 20;
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // Fork issue #160 F6: counts an unbroken run of `Failed` samples, next to
+    // `last_known` since both are this loop's only persistent state. Reset to
+    // 0 on any success so the *next* failure after a success is always
+    // logged as a fresh transition.
+    let mut consecutive_process_table_failures: u32 = 0;
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -1196,13 +1208,48 @@ async fn run_shell_activity_monitor(
         // `process-table sample exceeded its budget` line the capture itself
         // already emits with no "shell activity" context attached).
         let table = match crate::platform::proc::process_table_async().await {
-            Ok(table) => table,
-            Err(crate::platform::proc::ProcessTableOutcome::Unsupported) => continue,
-            Err(crate::platform::proc::ProcessTableOutcome::Failed) => {
-                tracing::warn!(
-                    "shell-activity poll: process-table sample failed this tick — pane statuses \
-                     will not update until a sample succeeds"
+            Ok(table) => {
+                consecutive_process_table_failures = 0;
+                table
+            }
+            Err(crate::platform::proc::ProcessTableOutcome::Unsupported) => {
+                // Fork issue #160 F7: `Unsupported` is documented as
+                // permanent for the life of the process (see
+                // `ProcessTableOutcome`'s doc comment) — there is nothing to
+                // gain from waking every 500ms to learn it again, and never
+                // saying so leaves a Windows deployment with no line
+                // anywhere explaining why this signal never fires. One line
+                // at the point this is first (and only ever) discovered,
+                // then end the poll outright rather than `continue`ing
+                // forever.
+                tracing::info!(
+                    "shell-activity poll: process-table sampling is unsupported on this \
+                     platform — this signal will never fire here, so the poll is ending \
+                     instead of waking every 500ms to learn a fact that cannot change"
                 );
+                return;
+            }
+            Err(crate::platform::proc::ProcessTableOutcome::Failed) => {
+                consecutive_process_table_failures += 1;
+                // Fork issue #160 F6: unrate-limited, this fired every tick
+                // under exactly the sustained-contention condition it exists
+                // to report, and additively — `capture_bounded_async`
+                // already emits a `process-table sample exceeded its budget`
+                // line per failed capture, so a chronically loaded machine
+                // got two lines per tick. Log the TRANSITION (the first
+                // failure right after a success) and then only every
+                // `FAILURE_LOG_EVERY`th consecutive failure after that, so a
+                // chronically failing machine still shows up in the log
+                // without drowning it.
+                if consecutive_process_table_failures == 1
+                    || consecutive_process_table_failures.is_multiple_of(FAILURE_LOG_EVERY)
+                {
+                    tracing::warn!(
+                        consecutive_failures = consecutive_process_table_failures,
+                        "shell-activity poll: process-table sample failed this tick — pane \
+                         statuses will not update until a sample succeeds"
+                    );
+                }
                 continue;
             }
         };
