@@ -53,6 +53,12 @@ use spec::spec;
 /// exactly what made `shell_activity_001`/`_004` fail intermittently in CI
 /// under machine load: one `ps` call consumed the whole polling window and
 /// there was no time left to try again.
+///
+/// `#[cfg(unix)]`: only `Duration`/`Instant` are imported under that gate
+/// above (`process_table()` itself is Windows-only in the sense that it
+/// always returns `None` there, so these polling tests are `#[cfg(unix)]`
+/// entirely) — an ungated use of `Duration` here fails to compile on Windows.
+#[cfg(unix)]
 const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(8);
 
 // ---------------------------------------------------------------------------
