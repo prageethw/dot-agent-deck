@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: M1.0/M1.1 implemented and merged into the PR; M1.2 documentation delivered; M1.2's cross-version manual test still outstanding (see the note under M1.2 below). M2.0 (offer upstream) not yet started.
+**Status**: M1.0, M1.1 and M1.2 are all complete (see the note under M1.2 below for how the cross-version manual test ran and what it found). M2.0 (offer upstream) not yet started.
 
 **Parent**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166) — this PRD carves out its parked **Phase 1** (M1.0/M1.1/M1.2). Sibling of [fork #175](https://github.com/prageethw/dot-agent-deck/issues/175), which carved out provisioning.
 
@@ -119,7 +119,7 @@ Unchanged from fork#166 and restated so it is not re-litigated: fork #144's cont
 
 - [x] `changelog.d/192.breaking.md` fragment.
 - [x] An explicit `PROTOCOL_VERSION` decision, recorded with its reasoning whichever way it goes.
-- [ ] **The cross-version manual test run: previous-release daemon + this branch's TUI, confirming a delegate still routes and hooks still arrive.** Deliberately left unticked — this is the orchestrator's step (rule 1: the coder role does not run it), and it has not run as of this fix round. Left unticked rather than silently deferred: per fork#192 review F5, running it against `v0.36.1` or later is not expected to reproduce the mixed-version gap the fragment originally described — every release since PRD #107 already round-trips `display_title` — so the test's value now is confirming the delegate/hooks path still works, not falsifying the `PROTOCOL_VERSION` decision.
+- [x] **The cross-version manual test run: previous-release daemon + this branch's TUI, confirming a delegate still routes and hooks still arrive.** Run against the previous release, `v0.36.1`, paired with this branch's TUI (`35f3659`) in an isolated sandbox. All four checks — handshake, delegate routing, hook (work-done) round-trip, and the fork#192-specific uniqueness check seeing the old daemon's orchestration — passed. The handshake and uniqueness checks were observed live in the running TUI; the delegate-routing and hook-round-trip checks are evidenced from the sandbox daemon's log after the verifying session crashed mid-run, not observed live — both are real evidence, but the write-up labels which is which. Full detail, quoted log lines, and the per-item verdicts: `/Users/prageeth.warnak/workspace/ai/dot-agent-deck/.dot-agent-deck/fork192-crossversion-findings.md` (root-checkout, gitignored). As anticipated by fork#192 review F5 (below), running against `v0.36.1` did not reproduce the mixed-version gap the changelog fragment originally described — the new uniqueness check *did* see the old daemon's orchestration, so that hypothesis did not fire. The test's value was confirming the delegate/hooks path and the uniqueness check work end to end across the version boundary, which is exactly what it confirmed.
 
 ### M2.0 — Offer upstream (trigger, not intention)
 
