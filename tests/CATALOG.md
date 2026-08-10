@@ -3202,6 +3202,13 @@ without depending on the config struct API.
 - **Does not assert:** the caller's `session_warnings` push or the plain-dashboard-pane fallback itself (`run_tui`, exercised end to end by `session/restore/009`/`010`'s L2 drift coverage, which predate this worktree-specific removal scenario); that the deck ever auto-removes a worktree (it does not — product decision); real `git worktree remove`.
 - **Platform coverage:** mac+linux+windows.
 
+##### session/restore/017 — A worktree-owner identity persisted in an `OrchestrationSnapshot` survives a full write → read → restore round trip: TOML serialize/deserialize, then `open_orchestration_tab` with the recovered value passed through, exactly as the daemon-empty restore branch calls it (fork #166 M3.0 / PR #215 fixup).
+- **Layer:** L1 (in-process — real `toml::to_string_pretty`/`toml::from_str` for the write/read half, then `resolve_orchestration_for_restore` against a real `.dot-agent-deck.toml` on disk and `TabManager::open_orchestration_tab` against a `CapturingPaneController` for the restore half; no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** a `SavedSession` whose orchestration pane's `OrchestrationSnapshot` carries `owner: Some("orchestration:my-feature")` round-trips that value unchanged through TOML serialize→deserialize (the real `session.toml` write/read path), and that feeding the recovered snapshot's `owner` through `open_orchestration_tab` as the `creator` argument — matching the production restore call in `run_tui` (`orch_snap.owner.as_deref()`) — records the identical string on every spawned role pane's `AgentSpawnOptions::owner`. Pins the milestone's headline claim: an orchestration tab, closed and reopened, restores under the SAME identity it stamped, so `--mine` still matches its earlier worktrees.
+- **Does not assert:** the `None`-owner case (an orchestration that owned no worktree restores with no identity — implicit in `session/restore/015`/`016`'s snapshots, which all set `owner: None`); a pre-M3.0 snapshot with no `owner` key at all deserializing to `None` (covered by `config/saved-session/001`); the live-create path that first populates `owner` onto the snapshot when the tab is opened (not independently pinned — `orchestration_identity_008` and `orchestration_identity_009` cover the same `creator` local reaching the marker/env, but not this specific snapshot-field write); real daemon/PTY spawn.
+- **Platform coverage:** mac+linux+windows.
+
 ### Live session status on reconnect (PRD #162)
 
 These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.
@@ -3346,11 +3353,11 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 
 #### config/saved-session
 
-##### config/saved-session/001 — An `OrchestrationSnapshot` on a saved pane round-trips through TOML, and a legacy snapshot without the field still parses (PRD #89 Phase 2b M2b.2).
+##### config/saved-session/001 — An `OrchestrationSnapshot` on a saved pane, including its `owner` identity field, round-trips through TOML, and both a fully-legacy snapshot and a pre-`owner`-field snapshot still parse (PRD #89 Phase 2b M2b.2; `owner` coverage added fork #166 M3.0 / PR #215 fixup).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession` / `SavedPane` / `OrchestrationSnapshot`; no TUI harness, no I/O).
 - **Agent:** none.
-- **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`) serializes to TOML and deserializes back with every field intact; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the field existed.
-- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot); any TUI rendering.
+- **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`, `owner: Some("orchestration:tdd-cycle")`) serializes to TOML and deserializes back with every field intact, `owner` included; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the block existed; (c) a `session.toml` string WITH an `[panes.orchestration]` block but no `owner` key (a snapshot written before that field existed) still parses, with `owner == None` — forward-compat for the field individually.
+- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); the restore branch passing `owner` through to a spawned pane (`session/restore/017`); capture (populating the fields when writing the snapshot); any TUI rendering.
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)

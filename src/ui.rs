@@ -9317,6 +9317,15 @@ fn dispatch_action(
                                         // under the user's name, not the
                                         // canonical config/cwd name.
                                         display_title: display_title.clone(),
+                                        // Fork #166 M3.0 / PR #215 fixup: the
+                                        // same computed `creator` string that
+                                        // went into the worktree marker and
+                                        // every role pane's
+                                        // `DOT_AGENT_DECK_WORKTREE_OWNER`
+                                        // above — not a re-derivation — so
+                                        // restore can pass it through rather
+                                        // than fabricate or drop it.
+                                        owner: creator.clone(),
                                     }),
                                 },
                             );
@@ -11249,34 +11258,31 @@ pub fn run_tui(
                         // start role once it signals readiness.
                         let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
                             .then(|| orch_snap.orchestrator_prompt.clone());
-                        // PR #215 fixup (reviewer F6 / auditor M3): this
-                        // used to recompute `orchestration_creator_string`
-                        // and pass it unconditionally, which fabricated an
-                        // identity for every restored orchestration tab —
-                        // including one that never created a worktree,
-                        // contradicting `AgentSpawnOptions::owner`'s own doc
-                        // (`src/pane.rs`, "`None` for a pane that is not
-                        // part of a worktree-owning orchestration") and
-                        // `open_orchestration_tab`'s `creator` param doc
-                        // ("`None` when this orchestration tab owns no
-                        // worktree"). The live-create path only assigns an
-                        // identity inside the arm that actually creates a
-                        // worktree (`req.orchestration_worktree_path ==
-                        // Some(..)`); restore never creates one, so under
-                        // the same rule restore's answer is always `None`.
-                        // `OrchestrationSnapshot` records nothing that would
-                        // let this branch tell "restored an
-                        // identity-bearing orchestration" apart from
-                        // "restored one that never had an identity", so
-                        // fabricating a guess here is exactly the "wrong
-                        // answer is worse than no answer" failure mode
-                        // M3.0 is written against — the honest answer given
-                        // what is actually known is `None`. This does cost
-                        // the "closing and reopening a tab still matches
-                        // its earlier worktrees under `--mine`" success
-                        // criterion the PRD originally described; recorded
-                        // as a known limitation rather than silently
-                        // dropped (see the PRD's trust-boundary section).
+                        // PR #215 fixup (reviewer F6 / auditor M3) used to
+                        // recompute `orchestration_creator_string` and pass
+                        // it unconditionally here, fabricating an identity
+                        // for every restored orchestration tab — including
+                        // one that never created a worktree. That was fixed
+                        // by passing `None` unconditionally instead, which
+                        // was honest but cost the "closing and reopening a
+                        // tab still matches its earlier worktrees under
+                        // `--mine`" success criterion the PRD exists for.
+                        //
+                        // Fork #166 M3.0 follow-up: `OrchestrationSnapshot`
+                        // now records the exact `owner` string the live path
+                        // stamped (`None` when the orchestration owned no
+                        // worktree) — see `src/config.rs`'s field doc — so
+                        // this branch can PASS THROUGH the saved value
+                        // rather than re-derive or drop it. An orchestration
+                        // that owned no worktree restores with `None`,
+                        // exactly as before; one that did restores with the
+                        // identical string it stamped, so `--mine` matches.
+                        // A snapshot written before this field existed has
+                        // no `owner`, so it deserializes to `None` and
+                        // restores with no identity — the same honest
+                        // "refuse loudly" outcome as before, not a silent
+                        // wrong answer, for exactly the tabs that predate
+                        // this fix.
                         match tab_manager.open_orchestration_tab(
                             &orch_config,
                             &saved_pane.dir,
@@ -11286,7 +11292,7 @@ pub fn run_tui(
                             // rather than the canonical config/cwd name. `None`
                             // when unset falls back to the canonical name.
                             orch_snap.display_title.as_deref(),
-                            None,
+                            orch_snap.owner.as_deref(),
                             spawn_dims,
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
@@ -31877,6 +31883,7 @@ mod tests {
             project_path: worktree_str.clone(),
             started_role_indices: Vec::new(),
             display_title: None,
+            owner: None,
         };
 
         let (orch_config, start_idx) = resolve_orchestration_for_restore(&snap, &worktree_str)
@@ -31932,6 +31939,7 @@ mod tests {
             project_path: worktree_str.clone(),
             started_role_indices: Vec::new(),
             display_title: None,
+            owner: None,
         };
 
         let result = resolve_orchestration_for_restore(&snap, &worktree_str);
@@ -31946,6 +31954,99 @@ mod tests {
             "the resolve error must name the orchestration so session_warnings \
              surfaces something the user can act on: {err:?}"
         );
+    }
+
+    /// Scenario: Build a `SavedSession` whose orchestration pane carries an
+    /// `OrchestrationSnapshot` with `owner: Some("orchestration:my-feature")`
+    /// — the identity fork #166 M2.4 stamps into the worktree marker and
+    /// every role pane's env var at creation time — serialize it to TOML and
+    /// deserialize it back (the real `session.toml` write/read path), then
+    /// feed the recovered snapshot's `owner` through `open_orchestration_tab`
+    /// exactly as the daemon-empty restore branch in `run_tui` does
+    /// (`orch_snap.owner.as_deref()` as the `creator` argument). Every
+    /// spawned role pane's `AgentSpawnOptions::owner` (captured by
+    /// `CapturingPaneController`) must carry the identical string — proving
+    /// the identity survives a full write → read → restore round trip
+    /// instead of being fabricated or dropped, which is M3.0's headline
+    /// claim (PR #215 fixup).
+    #[spec("session/restore/017")]
+    #[test]
+    fn restore_017_persisted_owner_survives_write_read_restore_round_trip() {
+        let tmp = tempdir().expect("tempdir");
+        let worktree = tmp.path().join("dot-agent-deck-my-feature");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+        write_restore_fixture_config(&worktree, "restore-worktree");
+        let worktree_str = worktree.display().to_string();
+
+        let owner = "orchestration:my-feature".to_string();
+        let session = config::SavedSession {
+            panes: vec![config::SavedPane {
+                dir: worktree_str.clone(),
+                name: "orchestrator".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+                orchestration: Some(config::OrchestrationSnapshot {
+                    version: 1,
+                    roles: vec!["coder".to_string(), "reviewer".to_string()],
+                    start_role_index: 0,
+                    orchestrator_prompt: String::new(),
+                    config_name: "restore-worktree".to_string(),
+                    project_path: worktree_str.clone(),
+                    started_role_indices: Vec::new(),
+                    display_title: None,
+                    owner: Some(owner.clone()),
+                }),
+            }],
+            last_command: None,
+        };
+
+        // The real write → read path: TOML serialize, then deserialize back,
+        // exactly like `SavedSession::save`/`SavedSession::load`.
+        let toml_str = toml::to_string_pretty(&session).expect("serialize session");
+        let loaded: config::SavedSession = toml::from_str(&toml_str).expect("deserialize session");
+        let snap = loaded.panes[0]
+            .orchestration
+            .as_ref()
+            .expect("orchestration snapshot must round-trip as Some")
+            .clone();
+        assert_eq!(
+            snap.owner.as_deref(),
+            Some(owner.as_str()),
+            "the owner field must survive the TOML round trip unchanged"
+        );
+
+        let (orch_config, _start_idx) = resolve_orchestration_for_restore(&snap, &worktree_str)
+            .expect("resolve_orchestration_for_restore must succeed for a live worktree");
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (_, role_pane_ids) = tm
+            .open_orchestration_tab(
+                &orch_config,
+                &worktree_str,
+                None,
+                None,
+                snap.owner.as_deref(),
+                (24, 80),
+            )
+            .expect("open_orchestration_tab");
+
+        let recorded = pc.recorded_owners();
+        assert_eq!(
+            recorded.len(),
+            role_pane_ids.len(),
+            "one recorded owner per spawned role pane"
+        );
+        assert!(!recorded.is_empty(), "must spawn at least one role pane");
+        for (i, recorded_owner) in recorded.iter().enumerate() {
+            assert_eq!(
+                recorded_owner.as_deref(),
+                Some(owner.as_str()),
+                "role pane {i}'s AgentSpawnOptions::owner must be the persisted \
+                 identity passed through from the snapshot, not fabricated or \
+                 dropped; got {recorded_owner:?}"
+            );
+        }
     }
 
     /// Scenario: Open an orchestration with an initial start-role agent, then
