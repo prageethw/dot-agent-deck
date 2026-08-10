@@ -52,6 +52,31 @@ git reset --hard fork-only
 git push --force origin main   # force-with-lease won't help here: we didn't fetch origin, so its tracking ref for main may be stale
 ```
 
+### A sync PR gets no CI automatically — dispatch it by hand
+
+**This is the one class of PR that cannot self-trigger CI, and it is the class where CI matters most**, because a sync PR carries an entire upstream rebase and every conflict resolution in it.
+
+`pull_request` workflows check out `refs/pull/<n>/merge`. GitHub cannot compute that ref while a PR is `CONFLICTING`, so **it never creates the run at all** — no error, and nothing on the PR indicating an absence. A sync PR is `CONFLICTING` against `main` for its whole life by construction: `main` is only reset to `fork-only` at the *last* step of the procedure above, so until then the two branches have genuinely divergent histories.
+
+Confirmed by controlled experiment on 2026-08-10 (fork issue [#150](https://github.com/prageethw/dot-agent-deck/issues/150)): one branch, three successive heads, mergeability the only variable. Both `MERGEABLE` heads got `CI` and `E2E`; the `CONFLICTING` head got neither. It also matches PR #141's full history, where every `CI`/`E2E` run was `event=workflow_dispatch` and every automatic run was `PR Labeler`.
+
+**`pull_request_target` workflows keep firing**, because they run against the base ref and need no merge commit. So `PR Labeler` still appears on the PR and the checks list is not empty — the PR does not look inert, and the missing runs are visible only if you know which workflow names to expect.
+
+So after **every** push to a sync branch, dispatch both workflows explicitly:
+
+```bash
+gh workflow run ci.yml  --repo prageethw/dot-agent-deck --ref <branch>
+gh workflow run e2e.yml --repo prageethw/dot-agent-deck --ref <branch>
+```
+
+and confirm a run actually exists for the new head SHA rather than assuming one was created:
+
+```bash
+gh run list --repo prageethw/dot-agent-deck --branch <branch> --json workflowName,event,headSha
+```
+
+This is CLAUDE.md rule 5's push-and-wait loop failing open: the rule routes all test runs to CI, and here the thing being waited for is never created.
+
 **This rewrites history on both branches, intentionally.** The rebase gives `fork-only`'s commits new SHAs, and `main` is force-pushed to match. That is expected for this workflow, not an accident. Anyone holding a stale local clone of either branch must **hard-reset to the new history** after a sync (`git fetch && git reset --hard origin/<branch>`) — a plain `git pull` will produce a tangled merge, not the intended state.
 
 ## The current `fork-only` stack
