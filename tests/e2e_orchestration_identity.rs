@@ -46,6 +46,14 @@ fn identity_004_two_orchestration_opens_land_as_distinctly_named_tabs() {
     let work = deck.workdir().to_path_buf();
     deck.wait_for_string("No active sessions");
 
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let first_label = format!(" {launch_dir_basename}-orchestrator-1 ");
+    let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
+
     open_orchestration(&deck);
     deck.wait_for_string(" worker "); // first orchestration deck is up
 
@@ -55,15 +63,13 @@ fn identity_004_two_orchestration_opens_land_as_distinctly_named_tabs() {
     deck.wait_for_string("session(s)");
 
     open_orchestration(&deck);
-    deck.wait_for_string(" worker "); // second orchestration deck is up
-
-    let launch_dir_basename = work
-        .file_name()
-        .expect("launch dir must have a basename")
-        .to_string_lossy()
-        .into_owned();
-    let first_label = format!(" {launch_dir_basename}-orchestrator-1 ");
-    let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
+    // fork#192 review F7: waiting on " worker " here was vacuous — the grid
+    // already shows it from the FIRST orchestration's panes before the
+    // second has even opened (the fixture's second role is literally named
+    // "worker"), so the wait was satisfiable by stale content and returned
+    // before the second open actually finished. Wait on what the test
+    // actually asserts instead — both a correct barrier and a stronger check.
+    deck.wait_for_string(&second_label); // second orchestration deck is up, distinctly labeled
 
     let grid = deck.snapshot_grid();
     assert!(

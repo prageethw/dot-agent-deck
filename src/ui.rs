@@ -30551,6 +30551,408 @@ mod tests {
         );
     }
 
+    /// Scenario: Type into the new-pane form's Name field far past the
+    /// daemon's `is_valid_display_name` byte cap (`DISPLAY_NAME_MAX_LEN`,
+    /// `src/agent_pty.rs`) — simulating a pasted GitHub-issue-title-shaped
+    /// name, the exact kind of thing a human names an orchestration after.
+    /// Confirm the field itself stops accepting bytes at the cap, that the
+    /// resulting name is still a well-formed display name, and that a name
+    /// sitting exactly at the cap still round-trips into the uniqueness
+    /// check when a live orchestration already holds the identical string
+    /// (fork#192 review F1). Today the field has no cap: an over-long paste
+    /// reaches the daemon, gets nulled by spawn-time validation, and the
+    /// orchestration silently drops out of the uniqueness universe —
+    /// reopening the fork #74 collision with no hostile peer needed.
+    #[spec("orchestration/identity/005")]
+    #[test]
+    fn identity_005_name_field_is_bounded_to_the_daemons_display_name_cap() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+        // Land on Name directly — no orchestration selected yet, so no
+        // suggestion overwrites what we're about to type.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui); // Mode -> Name
+
+        // Simulate a paste well past the cap.
+        let pasted: String = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 40);
+        for c in pasted.chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+
+        let name = ui.new_pane_form.as_ref().unwrap().name.clone();
+        assert!(
+            name.len() <= crate::agent_pty::DISPLAY_NAME_MAX_LEN,
+            "the Name field must stop accepting input at DISPLAY_NAME_MAX_LEN \
+             ({} bytes), got {} bytes — a name this long is nulled by the \
+             daemon's spawn-time validation and silently drops out of the \
+             uniqueness universe (fork#192 review F1)",
+            crate::agent_pty::DISPLAY_NAME_MAX_LEN,
+            name.len()
+        );
+        assert!(
+            crate::agent_pty::is_valid_display_name(&name),
+            "a Name the form actually let the user type must survive the \
+             daemon's own validator, got {name:?}"
+        );
+
+        // A name sitting exactly at the cap must still round-trip into the
+        // uniqueness check: if a live orchestration already holds that exact
+        // (capped) string, submitting it again must collide.
+        ui.new_pane_form
+            .as_mut()
+            .unwrap()
+            .live_orchestration_names
+            .push(name.clone());
+        // Select the orchestration directly (bypassing the arrow-key path,
+        // which would overwrite `name` with a fresh suggestion) so
+        // `name_collision()` — which requires a selected orchestration —
+        // applies to the capped name we just typed.
+        ui.new_pane_form.as_mut().unwrap().selection_index = 1;
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "a name at the cap must still be recognized by the uniqueness \
+             gate when a live orchestration already holds the identical string"
+        );
+    }
+
+    /// Scenario: Two RED cases pinning that the uniqueness gate normalizes
+    /// on the SAME trim the sink (`build_new_pane_request`) applies, not a
+    /// looser comparison (fork#192 audit F1). (a) A live orchestration holds
+    /// `myproj-orchestrator-1`; typing that name plus one trailing space
+    /// must still collide — `build_new_pane_request` trims before storing,
+    /// so an untrimmed gate lets the space through as a one-keypress bypass
+    /// of both submit doors. (b) A directory whose basename carries a
+    /// leading space (` myproj`) must still suggest the trimmed name's next
+    /// free slot — `suggest_orchestration_name` trims `base` before
+    /// comparing, so a stray space in the directory name doesn't make every
+    /// open from that directory silently reoffer an already-taken identity.
+    #[spec("orchestration/identity/006")]
+    #[test]
+    fn identity_006_gate_and_sink_normalize_the_same_way() {
+        // (a) live name + trailing space must still collide.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj-orchestrator-1 ".to_string(), // taken name + one trailing space
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+        ui.new_pane_form.as_mut().unwrap().selection_index = 1;
+
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "a live-held name plus a trailing space must still collide — the \
+             sink trims before storing, so an untrimmed gate is a \
+             one-keypress bypass (fork#192 audit F1a)"
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting a live-held name plus a trailing space must be \
+             refused, got {result:?}"
+        );
+
+        // (b) a whitespace-padded directory basename must not make the
+        // suggestion loop blind to an already-taken (trimmed) identity.
+        let padded_dir_form = NewPaneFormState::new(
+            PathBuf::from("/tmp/ myproj"), // basename " myproj" carries a leading space
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        // The trimmed identity a previous open from this same directory
+        // already recorded.
+        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+
+        assert_eq!(
+            padded_dir_form.suggest_orchestration_name(),
+            "myproj-orchestrator-2",
+            "the suggestion must trim the directory basename before \
+             comparing — otherwise ' myproj-orchestrator-1' never matches \
+             the trimmed stored identity 'myproj-orchestrator-1' and every \
+             open from a whitespace-padded directory silently reoffers the \
+             identical taken name (fork#192 audit F1b)"
+        );
+    }
+
+    /// Scenario: A user selects an orchestration (Name gets suggested),
+    /// tabs to Name, backspaces the suggestion out and types a deliberate
+    /// name, then Shift+Tabs back to Mode to double-check the selection —
+    /// pressing Left then Right, landing back on the same orchestration
+    /// without retyping anything. The user-typed name must survive that
+    /// round-trip: it is what lands in the tab title and the worktree
+    /// ownership marker (fork#192 review F4 / audit F7). Today
+    /// `suggest_name_if_orchestration_selected` overwrites unconditionally
+    /// on every selection landing, silently destroying it. A SEPARATE case
+    /// in the same test pins the flip side as a regression guard: a
+    /// still-untouched suggestion (the user never typed into Name) must
+    /// keep being replaced when a later selection lands with a different
+    /// candidate available — the fix must not freeze the suggestion outright.
+    #[spec("orchestration/identity/007")]
+    #[test]
+    fn identity_007_selection_change_preserves_a_typed_name_but_still_updates_a_suggestion() {
+        // A user-typed name survives a selection round-trip.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration -> suggests "myproj-orchestrator-1"
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui); // Mode -> Name
+
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0.."myproj-orchestrator-1".len() {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "hotfix-triage".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "hotfix-triage",
+            "sanity: the typed name must be in the field before the round-trip"
+        );
+
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        handle_new_pane_form_key(backtab, &mut ui); // Name -> Mode
+
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(left, &mut ui); // -> "No mode"; no orchestration selected, no-op
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "hotfix-triage",
+            "landing on a plain option must not touch a user-typed name"
+        );
+
+        handle_new_pane_form_key(right, &mut ui); // back onto the orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "hotfix-triage",
+            "landing on an orchestration again must not silently destroy a \
+             name the user actually typed — it is what lands in the tab \
+             title and the worktree ownership marker (fork#192 review F4 / \
+             audit F7)"
+        );
+
+        // Regression guard: an untouched suggestion must still be replaced
+        // when a later selection lands with a different candidate available
+        // — the fix above must not freeze the Name field outright.
+        let mut ui2 = default_ui();
+        ui2.mode = UiMode::NewPaneForm;
+        ui2.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+        handle_new_pane_form_key(right, &mut ui2); // select -> suggestion skips the taken slot
+        assert_eq!(
+            ui2.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-2",
+            "sanity: initial suggestion must skip the taken slot"
+        );
+
+        // Nothing was typed into Name — it still holds the untouched
+        // suggestion. Widen the live-name universe (as a later form-open
+        // would observe) directly on the form, then land off and back onto
+        // the orchestration without retyping.
+        ui2.new_pane_form
+            .as_mut()
+            .unwrap()
+            .live_orchestration_names
+            .push("myproj-orchestrator-2".to_string());
+        handle_new_pane_form_key(left, &mut ui2); // -> "No mode"
+        handle_new_pane_form_key(right, &mut ui2); // -> orchestration reselected
+
+        assert_eq!(
+            ui2.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-3",
+            "an untouched suggestion must still be replaced on a later \
+             selection landing, skipping the now-taken slot — the fix for \
+             the typed-name case above must not freeze the field outright"
+        );
+    }
+
+    /// Scenario: Render the new-pane form with an orchestration selected,
+    /// once with its typed Name colliding with a live orchestration and
+    /// once with a distinct name, driving the private `render_new_pane_form`
+    /// directly (via a `TestBackend`) so the click-hit-test rects it returns
+    /// are available — the public buffer-only seam this test previously used
+    /// (`render_new_pane_orchestration_name_collision_to_buffer`) discards
+    /// them. On collision, `[Submit]` must render (present, not removed —
+    /// removing it slides `[Cancel]` into `[Submit]`'s former screen
+    /// position, turning a muscle-memory click into a destructive cancel —
+    /// fork#192 review F3) but must be excluded from the click rects
+    /// (present-but-INERT, the same mechanism `render_modal_button_row`
+    /// already uses for any disabled button). `[Cancel]`'s rect must be
+    /// identical between the two renders. The collision must also render
+    /// the blocking-refusal copy, not merely omit a button with no
+    /// explanation (fork#192 review F8).
+    #[spec("orchestration/guard/002")]
+    #[test]
+    fn guard_002_name_collision_blocks_submit_distinct_name_does_not() {
+        fn render(name: &str, live: &[&str]) -> (String, FormClickTargets) {
+            let mut form = NewPaneFormState::new(
+                PathBuf::from("/work/collision-check"),
+                name.to_string(),
+                "mycmd".to_string(),
+                Vec::new(),
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(live.iter().map(|s| s.to_string()).collect());
+            form.selection_index = 1; // the only orchestration
+
+            let backend = TestBackend::new(100, 28);
+            let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+            let mut targets = None;
+            terminal
+                .draw(|frame| {
+                    targets = Some(render_new_pane_form(frame, &form));
+                })
+                .expect("TestBackend draw should succeed");
+            let text = buffer_to_string(terminal.backend().buffer());
+            (
+                text,
+                targets.expect("render_new_pane_form must run inside draw"),
+            )
+        }
+
+        let (colliding_text, (_, _, colliding_buttons)) =
+            render("review-orchestrator-1", &["review-orchestrator-1"]);
+        let (distinct_text, (_, _, distinct_buttons)) =
+            render("review-orchestrator-2", &["review-orchestrator-1"]);
+
+        assert!(
+            colliding_text.contains("[Submit]"),
+            "a name collision must still render [Submit] — present, not \
+             removed — so [Cancel] doesn't slide into its screen position, \
+             got:\n{colliding_text}"
+        );
+        assert!(
+            colliding_text.contains("already in use"),
+            "the collision must render the blocking-refusal copy, not \
+             merely hide Submit with no explanation, got:\n{colliding_text}"
+        );
+        assert!(
+            !colliding_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, Action::FormSubmit)),
+            "a colliding [Submit] must be rendered INERT — excluded from \
+             the click hit-test rects — not merely dimmed cosmetically"
+        );
+
+        let colliding_cancel = colliding_buttons
+            .iter()
+            .find(|(action, _)| matches!(action, Action::FormCancel))
+            .map(|(_, rect)| *rect)
+            .expect("[Cancel] must always be clickable");
+        let distinct_cancel = distinct_buttons
+            .iter()
+            .find(|(action, _)| matches!(action, Action::FormCancel))
+            .map(|(_, rect)| *rect)
+            .expect("[Cancel] must always be clickable");
+        assert_eq!(
+            colliding_cancel, distinct_cancel,
+            "[Cancel]'s screen position must not move between the colliding \
+             and non-colliding renders — a moved Cancel is exactly the \
+             muscle-memory misclick hazard this pin exists to catch"
+        );
+
+        assert!(
+            distinct_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, Action::FormSubmit)),
+            "a distinct typed name must not be blocked, got:\n{distinct_text}"
+        );
+    }
+
+    /// Scenario: Dispatch the real `Action::FormSubmit` — the SAME
+    /// production `dispatch_action` arm the mouse-click `[Submit]` button
+    /// routes through — against a form whose typed Name collides with a
+    /// live orchestration. `identity/003` only exercises the Enter-key
+    /// door; nothing before this test drives the CLICK door (fork#192
+    /// review F9). The click door's own `name_collision()` guard is
+    /// defense-in-depth for a state the render seam is meant to make
+    /// unreachable — pin that it independently refuses the submit (no pane
+    /// spawned, the form stays open) so a future drift between the render
+    /// guard and the dispatch guard is caught here even if the render-layer
+    /// inertness (`orchestration/guard/002`) ever regressed.
+    #[spec("orchestration/guard/003")]
+    #[test]
+    fn guard_003_form_submit_click_door_refuses_a_colliding_name() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj-orchestrator-1".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+        form.selection_index = 1; // the only orchestration, already selected
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(form);
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::FormSubmit,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "a colliding name must not spawn any pane via the [Submit] click door"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused click-door submit must keep the form open, not close it"
+        );
+        assert!(
+            ui.new_pane_form.is_some(),
+            "the form must not be taken/dropped on a refused click-door submit"
+        );
+    }
+
     /// Scenario: Build the new-pane form for an orchestration with a
     /// worktree slug typed in, then submit it. The resulting request must
     /// carry the resolved sibling worktree path (`<dir>-<slug>`, next to the
