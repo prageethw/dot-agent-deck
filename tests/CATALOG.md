@@ -2260,6 +2260,20 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/002 — Selecting the form's orchestration (Right arrow) suggests `<folder>-orchestrator-1` in the Name field in place of the bare directory basename it was pre-filled with, when no orchestration is live yet; a single further keystroke (Enter, no character typed) accepts it as-is at submit.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces today; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"` (the basename pre-fill) and one orchestration, after a Right-arrow selects that orchestration, has `form.name == "myproj-orchestrator-1"`, not `"myproj"`; submitting from there (Enter Mode→Name, Enter to submit) with no further edit yields `Action::SpawnPane` carrying `req.name == "myproj-orchestrator-1"` unchanged.
+- **Does not assert:** the daemon round-trip `live_orchestration_cwds_and_titles()`/`transition_after_dir_pick` performs to learn live names (not unit-testable without a live daemon); rendering of the suggestion (no L1 render seam asserts the Name field's literal text here).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/003 — With `<folder>-orchestrator-1` already live (injected via a test-only `NewPaneFormState::with_live_orchestration_names` builder), selecting the orchestration suggests `<folder>-orchestrator-2` next, skipping the taken slot; submitting a name a live orchestration already holds is REFUSED — no `Action::SpawnPane`, form stays open.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, as `orchestration/identity/002`).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"`, one orchestration, and `with_live_orchestration_names(vec!["myproj-orchestrator-1".into()])`, after a Right-arrow selects the orchestration, has `form.name == "myproj-orchestrator-2"`; overwriting the Name field back to the taken `"myproj-orchestrator-1"` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane`, and `ui.mode` stays `UiMode::NewPaneForm`.
+- **Does not assert:** the exact refusal UI copy/rendering; what N is counted over across multiple cwds (scoped global-over-live); a real-binary/PTY-attached end-to-end pass (no L2 test accompanies this port).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
