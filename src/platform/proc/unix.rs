@@ -678,7 +678,16 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 /// returns to the caller but leaves the blocking thread wedged on the same `ps`
 /// forever, consuming a pool slot per poll, whereas dropping the async future
 /// kills and reaps the child (`kill_on_drop`).
-pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+///
+/// Fork issue #160: returns [`super::ProcessTableOutcome::Failed`] rather than
+/// a bare `None` when the sample does not produce a table — Unix always
+/// *attempts* the sample, so it is never [`super::ProcessTableOutcome::Unsupported`]
+/// here (that variant is the Windows backend's alone). The underlying capture
+/// already `tracing::warn!`s the proximate cause (budget exceeded, non-zero
+/// exit, spawn failure); this return value is what lets the daemon's poll
+/// itself log loudly at the point the signal actually degrades, instead of
+/// only in a lower-level log line with no "shell activity" context attached.
+pub async fn process_table_async() -> Result<Vec<super::ProcessInfo>, super::ProcessTableOutcome> {
     // One deadline for the whole sample — see the blocking twin.
     let deadline = std::time::Instant::now() + PS_SAMPLE_BUDGET;
     sample_table_async(
@@ -689,6 +698,7 @@ pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
         getsid_or_negative,
     )
     .await
+    .ok_or(super::ProcessTableOutcome::Failed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1069,10 @@ mod tests {
         let own_pid = std::process::id() as i32;
         for (label, table) in [
             ("sync", process_table()),
-            ("async", process_table_async().await),
+            // `.ok()`: this test only cares that a live machine enumerates,
+            // not about the `Failed`/`Unsupported` distinction fork issue
+            // #160 added to the async form's error type.
+            ("async", process_table_async().await.ok()),
         ] {
             let table = table.unwrap_or_else(|| panic!("{label} sample must enumerate on unix"));
             let own = table

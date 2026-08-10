@@ -1176,18 +1176,35 @@ async fn run_shell_activity_monitor(
         // client requests and shutdown scheduled on it — not merely this
         // signal.
         //
-        // **A sample that timed out or failed means `None` — "no opinion" —
-        // and must NEVER be read as "no pane is busy".** This is the one
-        // non-obvious decision in the change, so it lives here at the call
-        // site: `continue` skips the whole tick, deliberately leaving
-        // `last_known` untouched so a failed sample is a true no-op. Folding a
-        // failed sample into an empty snapshot instead would clear the
+        // **A sample that timed out or failed means "no opinion" — and must
+        // NEVER be read as "no pane is busy".** This is the one non-obvious
+        // decision in the change, so it lives here at the call site:
+        // `continue` skips the whole tick, deliberately leaving `last_known`
+        // untouched so a failed sample is a true no-op. Folding a failed
+        // sample into an empty snapshot instead would clear the
         // edge-detection state and, on the next successful tick, re-emit a
         // fresh `ShellIdle` for panes that never stopped being busy — silently
         // flipping busy panes to `Idle`, which is exactly the stale-status bug
         // PRD #386 exists to close, reintroduced through a different door.
-        let Some(table) = crate::platform::proc::process_table_async().await else {
-            continue;
+        //
+        // Fork issue #160: `process_table_async` now distinguishes *why* —
+        // `Unsupported` (Windows; permanent, never worth a log line on every
+        // 500ms tick) from `Failed` (this attempt's `ps` exceeded its budget
+        // or errored; transient, and worth a loud, poll-level warning so a
+        // machine chronically failing this sample is visible at the point
+        // that actually degrades a pane's status, not only in the lower-level
+        // `process-table sample exceeded its budget` line the capture itself
+        // already emits with no "shell activity" context attached).
+        let table = match crate::platform::proc::process_table_async().await {
+            Ok(table) => table,
+            Err(crate::platform::proc::ProcessTableOutcome::Unsupported) => continue,
+            Err(crate::platform::proc::ProcessTableOutcome::Failed) => {
+                tracing::warn!(
+                    "shell-activity poll: process-table sample failed this tick — pane statuses \
+                     will not update until a sample succeeds"
+                );
+                continue;
+            }
         };
 
         // PRD #386 M3: the CATALOG of measured shapes, not a set applied to

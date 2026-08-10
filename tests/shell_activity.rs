@@ -45,6 +45,16 @@ use dot_agent_deck::platform::proc::{
 
 use spec::spec;
 
+/// Fork issue #160: every deadline below that polls [`process_table`] must
+/// leave real headroom beyond `unix.rs`'s `PS_SAMPLE_BUDGET` (currently 2s,
+/// not `pub` so it can't be referenced directly from this integration test
+/// crate — keep this comment in sync with it). A deadline equal to the
+/// budget gives a single timed-out sample zero room for a retry, which is
+/// exactly what made `shell_activity_001`/`_004` fail intermittently in CI
+/// under machine load: one `ps` call consumed the whole polling window and
+/// there was no time left to try again.
+const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(8);
+
 // ---------------------------------------------------------------------------
 // Real-process half (Unix only — spawns and setsid()'s a genuine grandchild).
 // ---------------------------------------------------------------------------
@@ -196,14 +206,20 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
 
     // Poll: `mid`'s pre_exec fork/setsid/exec races this thread, so give the
     // OS a moment to make `target` observable in the process table.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    //
+    // Fork issue #160: a `None` sample (the budget exceeded, or `ps` failed)
+    // is not evidence the target is absent — it is no data at all — so it
+    // must keep polling within the window rather than panic on the first
+    // miss, which is what `process_table().expect(...)` used to do here.
+    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
     let mut found: Option<ProcessInfo> = None;
     while found.is_none() && Instant::now() < deadline {
-        let table = process_table().expect("process_table() must enumerate on unix");
-        found = descendants(&table, root_pid)
-            .into_iter()
-            .find(|p| p.pid == spawned.target_pid)
-            .cloned();
+        if let Some(table) = process_table() {
+            found = descendants(&table, root_pid)
+                .into_iter()
+                .find(|p| p.pid == spawned.target_pid)
+                .cloned();
+        }
         if found.is_none() {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -211,8 +227,8 @@ fn shell_activity_001_finds_a_real_detached_grandchild_as_a_descendant() {
 
     let target = found.unwrap_or_else(|| {
         panic!(
-            "target pid {} never appeared as a descendant of test pid {root_pid} within 2s",
-            spawned.target_pid
+            "target pid {} never appeared as a descendant of test pid {root_pid} within {:?}",
+            spawned.target_pid, PROCESS_TABLE_POLL_WINDOW
         )
     });
 
@@ -561,7 +577,14 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
 
     // Falling edge before the rising edge: the script hasn't launched the
     // detached child yet, so the pane must read idle.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    //
+    // Fork issue #160: `busy_for_pane` returns `None` when the underlying
+    // `process_table_async` sample fails (budget exceeded under load), and
+    // this loop already treats `None` as "keep polling" — that part was
+    // never wrong. What was wrong is the window: at exactly `PS_SAMPLE_BUDGET`
+    // it gave a single timed-out sample no time left to retry, so widen it to
+    // `PROCESS_TABLE_POLL_WINDOW` for real headroom.
+    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -574,7 +597,11 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     );
 
     // Rising edge: the detached, setsid()'d, Bash-tool-shaped child appears.
-    let deadline = Instant::now() + Duration::from_secs(4);
+    // Needs headroom for both the script's own `sleep 0.3` + python/execv
+    // startup AND at least one retried process-table sample, so this window
+    // adds a margin on top of `PROCESS_TABLE_POLL_WINDOW` rather than reusing
+    // it as-is.
+    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW + Duration::from_secs(2);
     let mut state = busy_for_pane(&registry);
     while state != Some(true) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -591,6 +618,13 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
 
     // Independent oracle: confirm this is genuinely the topology #370 could
     // never see, not just that the snapshot happened to say `true`.
+    //
+    // Fork issue #160: unlike `busy_for_pane`'s loop above, this is a single
+    // one-shot call with no retry loop around it — a `None` here (budget
+    // exceeded) genuinely deserves to fail the test rather than be silently
+    // retried, since by this point `state == Some(true)` already proved a
+    // process-table sample succeeded moments ago. `.expect()` stays; only the
+    // *polled* deadlines above needed retry-on-`None` semantics.
     let table = process_table().expect("process_table() must enumerate on unix");
     let own_row = table
         .iter()
@@ -630,7 +664,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     unsafe {
         libc::kill(target.pid, libc::SIGKILL);
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + PROCESS_TABLE_POLL_WINDOW;
     let mut state = busy_for_pane(&registry);
     while state != Some(false) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));

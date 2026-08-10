@@ -45,6 +45,30 @@ pub use scan::{
     descendant_shell_activity, descendants,
 };
 
+/// Why one [`process_table_async`] sample did not produce a table (fork issue
+/// #160) — the distinction [`process_table`]'s plain `Option` cannot make.
+///
+/// A caller that polls repeatedly (the daemon's shell-activity monitor is the
+/// only one today) needs to tell these apart: `Unsupported` never changes —
+/// retrying next tick is pointless and logging every tick is pure noise —
+/// while `Failed` is an environmental, transient condition (this attempt's
+/// `ps` exceeded its budget, exited non-zero, or produced nothing parseable)
+/// that a later sample may well not repeat. Collapsing both into one `None`,
+/// as [`process_table`] still does for its wider set of callers, is what let
+/// budget exhaustion masquerade as "nothing to report" instead of "the sample
+/// failed" — see `docs/develop/shell-activity-signal.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTableOutcome {
+    /// This platform cannot enumerate processes at all (Windows today; see
+    /// [`process_table`]'s doc comment). Permanent for the life of the
+    /// process — never worth retrying or warning about on every tick.
+    Unsupported,
+    /// This platform can answer in general, but this particular sample did
+    /// not produce a table. Transient: the budget, the `ps` invocation, and
+    /// machine load all vary sample to sample.
+    Failed,
+}
+
 /// Result of delivering the daemon-stop graceful signal to a PID via
 /// [`terminate_pid`].
 ///

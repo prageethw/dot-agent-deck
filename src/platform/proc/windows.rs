@@ -690,10 +690,15 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 
 /// The async form the daemon's shell-activity poll calls (see the Unix backend,
 /// where it exists to keep a slow `ps` off a Tokio worker). Windows has no
-/// sample to take at all, so this is the same unconditional `None` — there is
-/// nothing to await and nothing that can block.
-pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
-    None
+/// sample to take at all, so this is the same unconditional non-answer — there
+/// is nothing to await and nothing that can block.
+///
+/// Fork issue #160: reports [`super::ProcessTableOutcome::Unsupported`] rather
+/// than the Unix backend's [`super::ProcessTableOutcome::Failed`] — this is
+/// permanent for the process's whole lifetime, not a transient sample miss, so
+/// the daemon's poll can skip the tick without ever warning about it.
+pub async fn process_table_async() -> Result<Vec<super::ProcessInfo>, super::ProcessTableOutcome> {
+    Err(super::ProcessTableOutcome::Unsupported)
 }
 
 // ---------------------------------------------------------------------------
