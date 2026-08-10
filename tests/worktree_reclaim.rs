@@ -323,6 +323,23 @@ impl Fixture {
         std::fs::write(git_dir.join("dot-agent-deck-owner"), "deck\n").expect("write owner marker");
     }
 
+    /// Like [`Fixture::mark_owned`], but writes the full fork #166 marker
+    /// format -- `"deck\ncreated-by: <creator>\n"`, matching
+    /// `src/worktree_reclaim.rs`'s `mark_worktree_owned` byte-for-byte --
+    /// carrying an explicit `created-by:` identity rather than the bare
+    /// legacy content. Written directly to the worktree's admin dir, not
+    /// through any `dot-agent-deck` process: this stands in for a marker a
+    /// PRIOR, now-exited orchestration process wrote, which is exactly the
+    /// shape `--mine` must match against with no shared in-memory state.
+    fn mark_owned_with_creator(&self, worktree: &Path, creator: &str) {
+        let git_dir = worktree_git_dir(worktree);
+        std::fs::write(
+            git_dir.join("dot-agent-deck-owner"),
+            format!("deck\ncreated-by: {creator}\n"),
+        )
+        .expect("write owner marker with creator");
+    }
+
     /// The scratch tempdir's own root -- for fixtures that need to place a
     /// file OUTSIDE the repo/worktree tree, such as the forged admin dir
     /// below.
@@ -389,6 +406,37 @@ impl Fixture {
             .env("GHSTUB_DIR", &self.ghstub)
             .output()
             .expect("run dot-agent-deck")
+    }
+
+    /// Like [`Fixture::run`], but explicitly controls
+    /// `DOT_AGENT_DECK_WORKTREE_OWNER` on the spawned subprocess's
+    /// environment rather than leaving it to whatever this test process
+    /// happens to have -- `Some(v)` sets it to exactly `v`; `None` removes
+    /// it, guaranteeing absence regardless of the ambient environment this
+    /// test binary runs under. Each call spawns a genuinely fresh OS
+    /// process (`Command::new` below), sharing no memory, no daemon, and no
+    /// cache with this test process or with any earlier call -- the shape
+    /// `--mine`'s restart-correctness claim depends on.
+    fn run_with_owner(&self, args: &[&str], owner: Option<&str>) -> std::process::Output {
+        let path = format!(
+            "{}:{}",
+            self.bindir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        cmd.current_dir(&self.repo)
+            .args(args)
+            .env("PATH", path)
+            .env("GHSTUB_DIR", &self.ghstub);
+        match owner {
+            Some(v) => {
+                cmd.env("DOT_AGENT_DECK_WORKTREE_OWNER", v);
+            }
+            None => {
+                cmd.env_remove("DOT_AGENT_DECK_WORKTREE_OWNER");
+            }
+        }
+        cmd.output().expect("run dot-agent-deck")
     }
 }
 
@@ -1188,5 +1236,169 @@ fn worktree_reclaim_016_case_variant_head_owner_still_resolves_merged() {
          comparison silently discarded the only matching PR)\n{}",
         wt.display(),
         combined(&out)
+    );
+}
+
+/// Scenario: Two worktrees of the same repo are marked owned by two DIFFERENT
+/// orchestrations. With `DOT_AGENT_DECK_WORKTREE_OWNER` set to one of them,
+/// `worktree list --mine` must list the worktree that orchestration owns and
+/// must NOT list the other, same-repo worktree owned by a different
+/// orchestration (fork #166 M3.0 -- the happy path the whole milestone is
+/// for).
+#[spec("worktree/reclaim/025")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_025_mine_keeps_own_and_excludes_other_owner() {
+    let fx = Fixture::new();
+    let wt_mine = fx.add_worktree_with_commit("wt-mine", "feat/mine");
+    fx.set_pr_state("feat/mine", "OPEN");
+    fx.mark_owned_with_creator(&wt_mine, "orchestration:me");
+
+    let wt_other = fx.add_worktree_with_commit("wt-other-owned", "feat/other-owned");
+    fx.set_pr_state("feat/other-owned", "OPEN");
+    fx.mark_owned_with_creator(&wt_other, "orchestration:someone-else");
+
+    let out = fx.run_with_owner(&["worktree", "list", "--mine"], Some("orchestration:me"));
+    assert!(
+        out.status.success(),
+        "`worktree list --mine` must succeed once an owner identity is known via \
+         DOT_AGENT_DECK_WORKTREE_OWNER; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("wt-mine"),
+        "`--mine` must list a worktree owned by the exact identity in \
+         DOT_AGENT_DECK_WORKTREE_OWNER; got:\n{text}"
+    );
+    assert!(
+        !text.contains("wt-other-owned"),
+        "`--mine` must exclude a same-repo worktree owned by a DIFFERENT orchestration -- \
+         handing it over would be the fork #74 collision this PRD exists to prevent; got:\n{text}"
+    );
+}
+
+/// Scenario: A worktree's ownership marker is written directly to disk --
+/// standing in for a PRIOR, now-exited orchestration process, since there is
+/// no CLI command that creates a worktree and no daemon involved in `--mine`
+/// at all. `worktree list --mine` is then run in a brand-new subprocess
+/// (`Fixture::run_with_owner` always spawns a fresh OS process) that shares
+/// no memory, no daemon, and no cache with whatever wrote the marker -- only
+/// the on-disk marker and the env var are available to it. The fresh process
+/// must still report the worktree as mine: this is M3.0's actual claim
+/// ("correctly after a restart"), and restart-correctness must fall out of
+/// matching two plain strings, never out of anything held in memory.
+#[spec("worktree/reclaim/026")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_026_mine_matches_after_simulated_restart() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-restart", "feat/restart");
+    fx.set_pr_state("feat/restart", "OPEN");
+
+    // Written as a plain filesystem operation, not through any
+    // dot-agent-deck process -- nothing here is "in memory" for a later
+    // `--mine` invocation to have shared access to.
+    fx.mark_owned_with_creator(&wt, "orchestration:restart-survivor");
+
+    // A brand-new subprocess, spawned independently, with no daemon running
+    // and no knowledge of when or how the marker above was written.
+    let out = fx.run_with_owner(
+        &["worktree", "list", "--mine"],
+        Some("orchestration:restart-survivor"),
+    );
+    assert!(
+        out.status.success(),
+        "`worktree list --mine` must succeed in a fresh process against a marker written \
+         earlier by a different process; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("wt-restart"),
+        "a fresh process must still match a marker written by an earlier, unrelated process -- \
+         `--mine` must depend only on the on-disk marker and the env var, never on in-memory \
+         state a restart would lose; got:\n{text}"
+    );
+}
+
+/// Scenario: With `DOT_AGENT_DECK_WORKTREE_OWNER` entirely ABSENT, `worktree
+/// list --mine` must fail loudly -- non-zero exit, and a message naming what
+/// is missing. It must NOT fall back to listing every worktree (that would
+/// hand one orchestration another's worktrees) and must NOT silently print an
+/// empty list as if the answer were "none owned" (fork #166 M3.0 -- a wrong
+/// answer here is worse than no answer).
+#[spec("worktree/reclaim/027")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_027_mine_fails_loudly_when_owner_env_absent() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-someones", "feat/someones");
+    fx.set_pr_state("feat/someones", "OPEN");
+    fx.mark_owned_with_creator(&wt, "orchestration:someone");
+
+    let out = fx.run_with_owner(&["worktree", "list", "--mine"], None);
+    assert!(
+        !out.status.success(),
+        "`--mine` with DOT_AGENT_DECK_WORKTREE_OWNER absent must fail loudly (non-zero exit), \
+         never succeed by falling back to \"everything\" or \"nothing\"; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("DOT_AGENT_DECK_WORKTREE_OWNER"),
+        "the failure must name the missing variable so the caller knows what to supply; \
+         got:\n{text}"
+    );
+    assert!(
+        !text.contains("wt-someones"),
+        "an absent owner identity must never be treated as \"list everything\" -- got:\n{text}"
+    );
+}
+
+/// Scenario: With `DOT_AGENT_DECK_WORKTREE_OWNER` set to the literal
+/// `orchestration:unknown` sentinel -- the value `src/ui.rs` writes when no
+/// typed name was available at spawn -- `worktree list --mine` must refuse
+/// exactly as it does when the variable is absent entirely (`027`). The
+/// sentinel is never a real identity: two nameless orchestrations must never
+/// be treated as matching each other's worktrees just because they share the
+/// same placeholder string (fork #166 M2.4/M3.0).
+#[spec("worktree/reclaim/028")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_028_mine_refuses_the_unknown_sentinel() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-nameless", "feat/nameless");
+    fx.set_pr_state("feat/nameless", "OPEN");
+    // Written by a DIFFERENT nameless orchestration that also fell back to
+    // the sentinel -- if `--mine` ever matched sentinel-to-sentinel, this is
+    // the worktree it would wrongly hand over.
+    fx.mark_owned_with_creator(&wt, "orchestration:unknown");
+
+    let out = fx.run_with_owner(
+        &["worktree", "list", "--mine"],
+        Some("orchestration:unknown"),
+    );
+    assert!(
+        !out.status.success(),
+        "`--mine` with the owner env set to the `orchestration:unknown` sentinel must refuse \
+         exactly as it does when the variable is absent -- a sentinel is never an identity; got \
+         {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("DOT_AGENT_DECK_WORKTREE_OWNER") || text.to_lowercase().contains("unknown"),
+        "the failure must name what is wrong (the missing/sentinel identity), not fail silently; \
+         got:\n{text}"
+    );
+    assert!(
+        !text.contains("wt-nameless"),
+        "two nameless orchestrations sharing the `orchestration:unknown` sentinel must never be \
+         treated as matching -- got:\n{text}"
     );
 }

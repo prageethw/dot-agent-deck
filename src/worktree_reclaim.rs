@@ -1795,4 +1795,77 @@ mod tests {
              must record distinct owners in their own worktree markers"
         );
     }
+
+    /// Scenario: `format_list_human` renders two `WorktreeReport`s -- one
+    /// carrying a known owner, one carrying `None` (the shape a pre-#166
+    /// legacy marker or a `Foreign` worktree produces) -- and the resulting
+    /// human table must carry an OWNER column: the exact owner string for
+    /// the first row, and the existing `DASH` placeholder for the second.
+    /// `reason` is deliberately `Some(..)` on both reports so the table's
+    /// only unexplained dash is the owner column under test, not a
+    /// pre-existing dash from an absent reason.
+    #[spec("worktree/reclaim/024")]
+    #[test]
+    fn worktree_reclaim_024_format_list_human_renders_owner_column() {
+        let reports = vec![
+            WorktreeReport {
+                path: "/repo/wt-owned".to_string(),
+                branch: Some("feat/owned".to_string()),
+                clean: true,
+                owned: true,
+                owner: Some("orchestration:owner-x".to_string()),
+                pr_state: "merged".to_string(),
+                verdict: "remove".to_string(),
+                reason: Some("ready to remove".to_string()),
+                real_path: PathBuf::from("/repo/wt-owned"),
+            },
+            WorktreeReport {
+                path: "/repo/wt-legacy".to_string(),
+                branch: Some("feat/legacy".to_string()),
+                clean: true,
+                owned: true,
+                owner: None,
+                pr_state: "merged".to_string(),
+                verdict: "remove".to_string(),
+                reason: Some("ready to remove".to_string()),
+                real_path: PathBuf::from("/repo/wt-legacy"),
+            },
+        ];
+
+        let out = format_list_human(&reports);
+        let mut lines = out.lines();
+        let header = lines
+            .next()
+            .expect("format_list_human must emit a header line");
+        let header_fields: Vec<&str> = header.split('\t').collect();
+        let owner_idx = header_fields
+            .iter()
+            .position(|f| *f == "OWNER")
+            .unwrap_or_else(|| {
+                panic!(
+                    "format_list_human's header must carry an OWNER column; got header: {header:?}"
+                )
+            });
+
+        let owned_row = lines
+            .next()
+            .expect("format_list_human must emit a row for the owned report");
+        let owned_fields: Vec<&str> = owned_row.split('\t').collect();
+        assert_eq!(
+            owned_fields.get(owner_idx),
+            Some(&"orchestration:owner-x"),
+            "the OWNER column must carry the report's owner string; got row: {owned_row:?}"
+        );
+
+        let legacy_row = lines
+            .next()
+            .expect("format_list_human must emit a row for the legacy (owner-unknown) report");
+        let legacy_fields: Vec<&str> = legacy_row.split('\t').collect();
+        assert_eq!(
+            legacy_fields.get(owner_idx),
+            Some(&DASH),
+            "the OWNER column must render the existing DASH placeholder for a report whose \
+             owner is None; got row: {legacy_row:?}"
+        );
+    }
 }

@@ -848,6 +848,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the interactive `SpawnPane` handler that derives these owner strings from the typed Name (covered end-to-end by `worktree/reclaim/022`, `src/ui.rs`); `mark_worktree_owned`/`owner_of` themselves, which are unchanged by fork#192 and already covered by `017`/`020`.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/024 — `format_list_human` renders an OWNER column: the marker identity for an owned worktree, and the existing `DASH` placeholder for one whose marker carries no `created-by:` line (fork #166 M2.3, the human-table half).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — no fixture repo needed, two `WorktreeReport` literals constructed directly.
+- **Agent:** none.
+- **Asserts:** the header row of `format_list_human`'s output carries a field literally equal to `"OWNER"`; at that same column index, a report with `owner: Some("orchestration:owner-x")` renders that exact string, and a report with `owner: None` renders the existing `DASH` (`"-"`) placeholder. Both reports carry a non-`None` `reason`, so the only unexplained dash in either row is the owner column under test.
+- **Does not assert:** the OWNER column's position relative to the other columns (only that one exists and both rows' entries can be read from it); `worktree list --json`'s owner field (already covered by `021`); the `--mine` filter (covered by `025`–`028`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/025 — With `DOT_AGENT_DECK_WORKTREE_OWNER` set, `worktree list --mine` keeps a worktree whose owner equals it and excludes a same-repo worktree owned by a different orchestration (fork #166 M3.0 — the happy path).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with `DOT_AGENT_DECK_WORKTREE_OWNER` set explicitly on the spawned subprocess's environment rather than left to the ambient one.
+- **Agent:** none (two worktrees of the same repo, each marked owned by a distinct `orchestration:<name>` creator via the full fork #166 marker format).
+- **Asserts:** `--mine`, run with the env var set to one worktree's exact owner string, succeeds and names that worktree; it does not name the other, same-repo worktree owned by a different orchestration.
+- **Does not assert:** behaviour when the env var is absent or set to the `orchestration:unknown` sentinel (covered by `027`/`028`); restart/process-independence (covered by `026`); the OWNER column's rendering (covered by `024`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/026 — A marker written directly to disk, standing in for a prior orchestration process, is matched by `worktree list --mine` run in a brand-new subprocess with no shared in-memory state — the milestone's actual "correct after a restart" claim (fork #166 M3.0).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the ownership marker written via a plain filesystem call rather than through any `dot-agent-deck` invocation, and `--mine` run via a fresh `Command::new` subprocess spawn.
+- **Agent:** none.
+- **Asserts:** `--mine`, run in a fresh subprocess against a marker written earlier and independently, with the env var set to the exact owner string in that marker, succeeds and names the worktree.
+- **Does not assert:** the exclusion half (covered by `025`); any daemon or in-process cache (`--mine` has no daemon dependency at all, by design — see the PRD's M2.4 "why an env var" rationale).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/027 — With `DOT_AGENT_DECK_WORKTREE_OWNER` entirely absent, `--mine` fails loudly: non-zero exit and a message naming what is missing — never falling back to "everything" or silently printing "nothing" (fork #166 M3.0).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly removed from the spawned subprocess's environment regardless of the ambient one.
+- **Agent:** none (one owned worktree present, so a silent-empty-list failure mode and a silent-list-everything failure mode are both distinguishable from the correct refusal).
+- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the output does not name the worktree present in the fixture (rules out the "list everything" failure mode).
+- **Does not assert:** the exact wording of the failure message beyond naming the missing variable; the `orchestration:unknown` sentinel case (covered by `028`, deliberately a separate spec since a wrong answer here hands one orchestration another's worktrees per fork #74).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/028 — With `DOT_AGENT_DECK_WORKTREE_OWNER` set to the literal `orchestration:unknown` sentinel, `--mine` refuses exactly as it does when the variable is absent — two nameless orchestrations must never match each other's worktrees (fork #166 M2.4/M3.0).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly set to the sentinel string.
+- **Agent:** none (the fixture worktree is marked owned by the SAME sentinel string, so a wrong sentinel-matches-sentinel implementation would wrongly hand it over).
+- **Asserts:** the process exits non-zero, exactly as `027`'s absent-variable case; the output names the problem (the variable or the word "unknown"); the output does not name the sentinel-owned worktree present in the fixture.
+- **Does not assert:** the absent-variable case itself (covered by `027`); any handling of a non-sentinel, genuinely-set owner (covered by `025`/`026`).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
