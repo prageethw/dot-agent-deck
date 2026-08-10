@@ -4,11 +4,11 @@
 
 **Priority**: High
 
-**Status**: Planning
+**Status** *(updated 2026-08-10, verified against `main` @ `2d89c30` rather than from these checkboxes)*: **Phase 1 complete** — shipped via the carved-out PRD [fork#192](https://github.com/prageethw/dot-agent-deck/issues/192) (PR #193, merged `7426b25`), **released in v0.37.0**. **Phase 2 complete except M2.3's display half** — the marker write, the interactive typed-name value and the read side are all on `main`; `worktree list --json` already carries `owner`, but nothing renders it in the human table. **Phase 3 (M3.0) is blocked** on a newly-identified supply gap, now tracked as **M2.4** below. **Phase 4 pending.**
 
 **Fork-only**, and intended to stay so. Confirmed mechanically against `upstream/main`: `src/worktree_reclaim.rs` **does not exist** there and `worktree_slug` has **0** occurrences. The ownership half is built entirely on fork-only code, so per `docs/develop/upstream-contribution-policy.md` this is not an offer-later case.
 
-**Related**: fork #144 (the ownership marker and its containment check — the foundation) · fork #122 (per-orchestration worktree creation, and the hardened path validation reused here) · PRD #422 (`worktree list` / `reclaim`) · PRD #140 (per-tab routing identity; its `display_title` contract changes here) · PRD #120 (issue-dispatch, which already provisions its own worktrees) · PRD #220 (the upstream cousin; its M1.1 naming question is settled differently here) · fork #74 (the motivating collision) · PRD #421 (the provenance precedent, applied to a case it did not cover)
+**Related**: fork [#192](https://github.com/prageethw/dot-agent-deck/issues/192) (Phase 1 carved out and **shipped** — names as instance identity, released in v0.37.0) · fork [#201](https://github.com/prageethw/dot-agent-deck/issues/201) (the residual #192 left open: uniqueness is advisory against a form-open snapshot) · fork #144 (the ownership marker and its containment check — the foundation) · fork #122 (per-orchestration worktree creation, and the hardened path validation reused here) · PRD #422 (`worktree list` / `reclaim`) · PRD #140 (per-tab routing identity; its `display_title` contract changes here) · PRD #120 (issue-dispatch, which already provisions its own worktrees) · PRD #220 (the upstream cousin; its M1.1 naming question is settled differently here) · fork #74 (the motivating collision) · PRD #421 (the provenance precedent, applied to a case it did not cover)
 
 **Filename convention**: the first PRD named after a fork issue — every existing one cites `vfarcic`. A bare `166-` would be ambiguous against a future upstream #166, so fork-numbered PRDs take a `fork-<n>-` prefix.
 
@@ -74,6 +74,8 @@ What it leaves for this PRD:
 
 So Phase 2 shrinks: the format is settled and the plumbing exists. What remains is the read side, the right value, and the display.
 
+**Update 2026-08-10 — two of those three are now done, via fork#192.** Item 1 (no read side) is closed by `read_marker_owner`/`owner_of`. Item 2 (wrong identity) is closed on the normal path: `src/ui.rs:9103` now passes the typed name, though the `orch_config.name` fallback at `:9107` and the `orchestration:unknown` fallback at `:9105` both still exist. Item 3 (nothing surfaces the owner) is **half** closed — `--json` carries it, the human table does not. What that left unnoticed until now is that none of the three was the actual blocker for Phase 3: **the running orchestration has no way to know its own owner string**, which is M2.4.
+
 ### Why the marker decides and the name does not
 
 The naming convention exists for humans. It carries no authority, and that distinction is the entire safety argument.
@@ -135,6 +137,7 @@ That check was built to defeat a forged marker. It protects this case for free, 
 ## Success Criteria
 
 - Two live orchestrations cannot share a name.
+- **An orchestration can determine its own identity at runtime.** *(Added 2026-08-10.)* Every criterion below assumes this and none of them stated it, which is exactly how the gap survived into implementation planning — see M2.4.
 - The suggested name is accepted with one keystroke.
 - Every worktree an orchestration creates records it as owner; the owner is listable.
 - **After closing and reopening a tab with the same name, its earlier worktrees are still recognised as its own.**
@@ -147,20 +150,45 @@ That check was built to defeat a forged marker. It protects this case for free, 
 
 ### Phase 1: Name as identity
 
-- [ ] **M1.0** — the interactive Name is required and refused if it matches a live orchestration; suggested as the next free `<foldername>-orchestrator-N`.
-- [ ] **M1.1** — `display_title` promoted to identity; PRD #140's field docs updated; every cosmetic-assumption site checked.
-- [ ] **M1.2** — rule 12 answered: `.breaking.md` fragment, and an explicit `PROTOCOL_VERSION` decision.
+**All of Phase 1 shipped via PRD [fork#192](https://github.com/prageethw/dot-agent-deck/issues/192)**, not on this PRD's own branch — carved out precisely because it carried the two risky parts. PR #193, merged `7426b25`, released in **v0.37.0**.
+
+- [x] **M1.0** — the interactive Name is required and refused if it matches a live orchestration; suggested as the next free `<foldername>-orchestrator-N`. **Done (fork#192).** The refusal renders on PRD #140's existing guard seam; the liveness query was extended to carry names, so it costs no extra daemon round-trip.
+- [x] **M1.1** — `display_title` promoted to identity; PRD #140's field docs updated; every cosmetic-assumption site checked. **Done (fork#192).**
+- [x] **M1.2** — rule 12 answered: `.breaking.md` fragment, and an explicit `PROTOCOL_VERSION` decision. **Done (fork#192).** `changelog.d/192.breaking.md` shipped; `PROTOCOL_VERSION` deliberately **not** bumped (the wire shape is unchanged, so no peer can mis-parse a frame) and the cross-version manual test ran against `v0.36.1` with all four items passing.
+
+**Known residual from M1.0, tracked as fork [#201](https://github.com/prageethw/dot-agent-deck/issues/201):** the uniqueness refusal reads a snapshot of live names taken once when the form opens and never refreshed. Two forms open *concurrently* can still be suggested — and both submit — the same name, and nothing at the marker write enforces uniqueness either. That concurrent case is the one fork #74 was actually about, so Phase 1 narrows the collision rather than closing it.
 
 ### Phase 2: Ownership
 
 - [x] **M2.0** — ~~`mark_worktree_owned` records the owner~~ **done by fork PR #173** (`a6fee76`), including the format and the sanitizer. The dispatch path already passes the scheduled task's name.
-- [ ] **M2.1** — the interactive path passes the **typed unique name** instead of `orch_config.name`, so the recorded identity distinguishes live instances.
-- [ ] **M2.2** — a read side: parse `created-by:` back out per #173's stated contract (strip the literal prefix, treat the remainder as opaque, **never** `split(':')`). Containment and presence stay authoritative — an empty or prefix-less marker resolves `Ours` with owner unknown.
-- [ ] **M2.3** — `worktree list` shows the owner; `--json` carries it; decide whether `SCHEMA_VERSION` moves.
+- [x] **M2.1** — the interactive path passes the **typed unique name** instead of `orch_config.name`, so the recorded identity distinguishes live instances. **Done (fork#192).** `src/ui.rs:9103` builds `format!("orchestration:{typed_name}")` and `:9109` passes it to `create_worktree_sync`. **Two fallbacks remain and matter:** `orchestration:unknown` (`:9105`) when no name is available, and `orchestration:<orch_config.name>` (`:9107`) — the config/type name this milestone was written to replace. The typed-name branch is the normal path now, but the config-name branch was not deleted, so "instead of `orch_config.name`" is true of the common case rather than of every case.
+- [x] **M2.2** — a read side: parse `created-by:` back out per #173's stated contract (strip the literal prefix, treat the remainder as opaque, **never** `split(':')`). Containment and presence stay authoritative — an empty or prefix-less marker resolves `Ours` with owner unknown. **Done (fork#192).** `read_marker_owner` (`src/worktree_reclaim.rs:502`, `strip_prefix("created-by: ")` at `:510`) and `owner_of` (`:545`).
+- [ ] **M2.3** — `worktree list` shows the owner; `--json` carries it; decide whether `SCHEMA_VERSION` moves. **Half done.** The **JSON half already shipped**: `WorktreeReport.owner` exists as `Option<String>` with `skip_serializing_if`, omitted entirely rather than serialized as `null` so an older client round-trips cleanly. What remains is the **human table** — `format_list_human` (`:900`) emits `PATH BRANCH PR CLEAN OWNED VERDICT REASON` and no OWNER column; `:491` says so outright: *"latent today (no consumer renders `owner` yet)"*. **`SCHEMA_VERSION` decision: it stays at `1`** — the `owner` field shipped *at* schema 1 and is additive-optional, so bumping now would announce a change that already happened silently. This milestone asked for a decision, not necessarily a move.
+
+- [ ] **M2.4 — supply the owner identity to the running orchestration** *(added 2026-08-10; not in the original plan)*. **M3.0 cannot be built without it**, and nothing in this PRD previously said so.
+
+    **The gap, as measured.** An orchestration cannot learn its own identity at runtime. `DOT_AGENT_DECK_AGENT_ID` and `DOT_AGENT_DECK_PANE_ID` (`src/agent_pty.rs:41`, `:56`) are the *only* identity in a pane's environment; both are small daemon-scoped integers (observed as `6`) that **recycle across a daemon restart**, and nothing carries the owner string to a pane. So `worktree list --mine` has no way to compute "mine". This is a CLAUDE.md rule 16 shape — a consumed value with no named supplier — and it is the same wall CLAUDE.md rule 23 hit, which is why that rule anchors issue claims to worktree paths rather than to orchestration names.
+
+    **The owner string is namespaced by producer, and exact-matching depends on knowing that.** `owner_of` returns the whole `created-by:` remainder verbatim and never splits on `:`, so ownership is an exact string comparison against a value whose *shape depends on which path created the worktree*:
+
+    | Producer | Owner string | Source |
+    |---|---|---|
+    | Interactive orchestration | `orchestration:<typed_name>` | `src/ui.rs:9103` |
+    | Issue-dispatch | `issue-dispatch:<task_name>#<issue>` | `src/issue_dispatch_run.rs:402` |
+
+    Earlier sections of this PRD describe both producers correctly but read as though there is one uniform identity. There is not, and M3.0's *"correct after a restart"* is meaningless without saying **which string** is being matched.
+
+    **The fix.** Inject `DOT_AGENT_DECK_WORKTREE_OWNER` into every pane, carrying **the exact creator string this orchestration stamps when it creates a worktree** — `orchestration:<typed_name>` interactively, the `issue-dispatch:<task>#<n>` string on the dispatch path. One source for both sides, so marker and filter cannot drift. Named for what it carries, not for one producer: calling it `…_ORCHESTRATION` would misdescribe it the moment a dispatched orchestration used it.
+
+    **Decided consequences.** A **dispatched** orchestration therefore also matches the worktree it is running in, because that is the same string — M3.0's promise must hold for dispatched work, which is the autonomous case this PRD exists to serve. And `orchestration:unknown` (`src/ui.rs:9105`) is a **sentinel, never an identity**: two nameless orchestrations would otherwise match each other's worktrees and each be handed the other's work, so it must be treated exactly like an absent variable — fail loudly.
+
+    **Open, and to be settled before implementation:** whether the daemon already holds the creator string at spawn for both paths, or whether it must be threaded into `SpawnRequest`/`RoleSpawn` (`src/spawn.rs:74`, `:152`). The dispatch path computes its creator at `src/issue_dispatch_run.rs:402`, well before spawn, so this is threading an existing value rather than deriving a new one — but if the wire shape moves, rule 12 applies and the bump is minor rather than patch.
 
 ### Phase 3: Query
 
-- [ ] **M3.0** — an orchestration can list the worktrees it owns, **correctly after a restart**. This is the milestone the whole identity choice exists for.
+- [ ] **M3.0** — an orchestration can list the worktrees it owns, **correctly after a restart**. This is the milestone the whole identity choice exists for. **Depends on M2.4.** Shipped as `worktree list --mine`, filtering `owner_of` == `DOT_AGENT_DECK_WORKTREE_OWNER`. With no identity available — variable absent, or set to the `orchestration:unknown` sentinel — it **fails loudly and explains why**, never silently returning everything or nothing; a wrong answer here hands one orchestration another's worktree. Restart-correctness falls out of the design rather than needing machinery: both sides derive from the same stable string and nothing depends on in-memory state.
+
+    **Scope of the query surface: `--mine` only.** No `--owner <name>`, and no `reclaim --mine`. This PRD's *"reports and filters by owner"* is satisfied by the OWNER column (M2.3) plus self-filtering — every other owner becomes visible, so filtering on an arbitrary one is a `grep`. `reclaim` in particular is the destructive path whose gating fork #144 hardened deliberately; widening it belongs with fork #175's provisioning work, not here.
 
 ### Phase 4: Ship
 
@@ -174,9 +202,10 @@ Provisioning (`delegate` creating `<orchestration-name>-<change>` in one step), 
 
 - `src/ui.rs` — `FormField::Name` (`:822`), the orchestration `display_title` assignment (`:8264-8266`), `resolve_orchestration_worktree_path` (`:6627`), `validate_orchestration_worktree_slug` (`:6572`), `live_orchestration_cwds` (`:790` — the existing liveness query a uniqueness check can reuse)
 - `src/agent_pty.rs` — `TabMembership::Orchestration.display_title` (`:341`) and its contract docs
-- `src/worktree_reclaim.rs` — `OWNER_MARKER_FILENAME`, `mark_worktree_owned`, `ownership_of`, and the containment protecting `main`
-- `src/issue_dispatch_run.rs` — `create_worktree_sync`, and the `display_title: None` dispatch sites
-- `src/main.rs` — `WorktreeCmd` (`:393`)
+- `src/worktree_reclaim.rs` — `OWNER_MARKER_FILENAME`, `mark_worktree_owned` (`:602`), `ownership_of`, and the containment protecting `main`; plus the read side and display seam this PRD finishes: `read_marker_owner` (`:502`), `owner_of` (`:545`), `WorktreeReport.owner` (`:168`), `format_list_human` (`:900` — where the OWNER column goes), `SCHEMA_VERSION` (`:37`)
+- `src/issue_dispatch_run.rs` — `create_worktree_sync` (`:1058`), `mark_worktree_owned_best_effort` (`:1036`), the `issue-dispatch:<task>#<issue>` creator (`:402`), and the `display_title: None` dispatch sites
+- `src/main.rs` — `WorktreeCmd::List` (`:393`, where `--mine` goes), dispatch (`:1235`), `run_worktree_list_cli` (`:1672`)
+- `src/agent_pty.rs` — the env-var pattern M2.4 follows: `DOT_AGENT_DECK_PANE_ID` (`:41`), `DOT_AGENT_DECK_AGENT_ID` (`:56`), and the scrub-then-overlay block (`:1073`–`:1079`) that stops a daemon launched inside another deck's pane leaking a stale value
 - `prds/140-orchestration-session-partitioning.md` — the `display_title` contract to update
 - `tests/CATALOG.md` — `worktree/reclaim/*`, `orchestration/worktree/*`
 
@@ -193,4 +222,4 @@ Provisioning (`delegate` creating `<orchestration-name>-<change>` in one step), 
 - **Is uniqueness scoped to live orchestrations, or to all names ever used?** Live-only is simpler and matches the daemon's existing query, but it lets a name be reused after a tab closes — and that reuse is *exactly* how resume is meant to work. Leaning live-only, with resume as the intended consequence rather than a loophole.
 - **What happens to a running orchestration whose name is edited?** Simplest is that names are fixed at tab open.
 - **Should `<change>` be supplied or derived?** Supplied is explicit; derived from the task risks unstable or colliding slugs.
-- **`SCHEMA_VERSION`** for the added owner field in `worktree list --json` — the field is additive.
+- ~~**`SCHEMA_VERSION`** for the added owner field in `worktree list --json` — the field is additive.~~ **Settled 2026-08-10: it stays at `1`.** The `owner` field shipped *at* schema 1 with `skip_serializing_if`, so it is already absent-not-null for older clients; bumping now would announce a change that has already happened silently. See M2.3.
