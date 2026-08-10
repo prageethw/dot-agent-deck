@@ -406,6 +406,18 @@ git worktree add ../myproject-feature-x -b feature-x
 
 If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.com/vfarcic/dot-ai)), ask an agent in the deck to run it and it creates the worktree and branch for you. Then open a new orchestration tab with `Ctrl+n` and point the directory field at the worktree.
 
+### Listing worktrees by owner
+
+`dot-agent-deck worktree list` shows every linked worktree with its resolved PR state, cleanliness, and gate verdict, including an OWNER column naming which orchestration created it (a dash when the worktree predates this feature, or was not created by the deck).
+
+Run with `--mine` from inside an orchestration pane, it lists only the worktrees *that orchestration* created — useful for an autonomous agent that needs to enumerate its own work without seeing every other orchestration's worktrees too:
+
+```bash
+dot-agent-deck worktree list --mine
+```
+
+This works immediately after a daemon restart: ownership is matched by comparing the worktree's on-disk marker against the pane's own `DOT_AGENT_DECK_WORKTREE_OWNER` environment variable (set automatically in every orchestration pane, mirroring `DOT_AGENT_DECK_PANE_ID`), never by asking the daemon. Run outside an orchestration pane, `--mine` fails loudly rather than falling back to "everything" or silently printing "none" — a wrong answer here would hand one orchestration another's worktrees.
+
 ### Same-directory orchestrations are discouraged
 
 Opening a second orchestration in a directory that already runs one is allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:

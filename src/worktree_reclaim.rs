@@ -902,15 +902,16 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
         return "no worktrees found\n".to_string();
     }
     let mut out = String::new();
-    out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tVERDICT\tREASON\n");
+    out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tOWNER\tVERDICT\tREASON\n");
     for r in reports {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             r.path,
             cell(&r.branch),
             r.pr_state,
             if r.clean { "yes" } else { "no" },
             if r.owned { "yes" } else { "no" },
+            cell(&r.owner),
             r.verdict,
             r.reason.as_deref().unwrap_or(DASH),
         ));

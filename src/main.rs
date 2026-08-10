@@ -399,6 +399,14 @@ enum WorktreeCmd {
         /// instead of the human table.
         #[arg(long)]
         json: bool,
+        /// Fork #166 M3.0: list only worktrees this orchestration created,
+        /// determined by matching each worktree's marker owner against
+        /// `DOT_AGENT_DECK_WORKTREE_OWNER`. Fails loudly (non-zero exit) if
+        /// the variable is absent or set to the `orchestration:unknown`
+        /// sentinel, rather than silently returning everything or nothing —
+        /// a wrong answer here hands one orchestration another's worktree.
+        #[arg(long)]
+        mine: bool,
     },
     /// Remove every merged, clean worktree the deck can PROVE it created and
     /// which holds no gitignored content; list the rest for confirmation. A
@@ -1232,7 +1240,7 @@ fn main() -> ExitCode {
             }
         },
         Some(Commands::Worktree { cmd }) => match cmd {
-            WorktreeCmd::List { json } => run_worktree_list_cli(json),
+            WorktreeCmd::List { json, mine } => run_worktree_list_cli(json, mine),
             WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
         },
         Some(Commands::Connect { name }) => run_connect(name),
@@ -1669,15 +1677,52 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
     }
 }
 
-/// `dot-agent-deck worktree list [--json]` — PRD #422. Pure CLI-subprocess
-/// operation over `git`/`gh` in the current directory's repo — no daemon
-/// involved, so unlike the `daemon status`/`daemon stop` wrappers below this
-/// is plain synchronous code, no `#[tokio::main]`. Row shaping and the gate
-/// itself live in [`dot_agent_deck::worktree_reclaim`]; this wrapper only
-/// translates the outcome into stdout/stderr text and an exit code.
-fn run_worktree_list_cli(json: bool) -> ExitCode {
+/// Fork #166 M2.4's `orchestration:unknown` sentinel — the value `src/ui.rs`
+/// writes into `DOT_AGENT_DECK_WORKTREE_OWNER` when no typed orchestration
+/// name was available at spawn. It is never a real identity: two nameless
+/// orchestrations sharing it would otherwise match each other's worktrees,
+/// so `worktree list --mine` must refuse it exactly like an absent variable.
+const ORCHESTRATION_UNKNOWN_SENTINEL: &str = "orchestration:unknown";
+
+/// `dot-agent-deck worktree list [--json] [--mine]` — PRD #422, `--mine` added
+/// by fork #166 M3.0. Pure CLI-subprocess operation over `git`/`gh` in the
+/// current directory's repo — no daemon involved, so unlike the `daemon
+/// status`/`daemon stop` wrappers below this is plain synchronous code, no
+/// `#[tokio::main]`. `--mine` must keep this property (M3.0's own
+/// correctness bar is "correct immediately after a daemon restart"), so it
+/// filters on the on-disk marker owner against `DOT_AGENT_DECK_WORKTREE_OWNER`
+/// rather than querying the daemon. Row shaping and the gate itself live in
+/// [`dot_agent_deck::worktree_reclaim`]; this wrapper only translates the
+/// outcome into stdout/stderr text and an exit code.
+fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
+    use dot_agent_deck::agent_pty::DOT_AGENT_DECK_WORKTREE_OWNER;
     use dot_agent_deck::worktree_reclaim::{
         WorktreeListDocument, examine_worktrees, format_list_human,
+    };
+
+    let owner_filter = if mine {
+        match std::env::var(DOT_AGENT_DECK_WORKTREE_OWNER) {
+            Ok(v) if v == ORCHESTRATION_UNKNOWN_SENTINEL => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set to the \
+                     `{ORCHESTRATION_UNKNOWN_SENTINEL}` sentinel, which is never a real \
+                     identity -- refusing rather than matching another nameless orchestration's \
+                     worktrees"
+                );
+                return ExitCode::FAILURE;
+            }
+            Ok(v) => Some(v),
+            Err(_) => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is not set -- cannot \
+                     determine which worktrees belong to this orchestration; supply it or drop \
+                     --mine"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
     };
 
     let cwd = match std::env::current_dir() {
@@ -1687,13 +1732,16 @@ fn run_worktree_list_cli(json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let reports = match examine_worktrees(&cwd) {
+    let mut reports = match examine_worktrees(&cwd) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("worktree list: {e}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(owner) = &owner_filter {
+        reports.retain(|r| r.owner.as_deref() == Some(owner.as_str()));
+    }
 
     if json {
         match serde_json::to_string(&WorktreeListDocument::new(reports)) {

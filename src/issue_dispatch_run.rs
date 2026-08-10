@@ -444,6 +444,10 @@ async fn dispatch_one_issue(
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
         prompt,
+        // Fork #166 M2.4: the SAME string just written into the worktree's
+        // `created-by:` marker above (`create_worktree`), not a second
+        // derivation of it.
+        owner: Some(creator),
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
         // The spawn failed after the worktree was created/recorded: no agent

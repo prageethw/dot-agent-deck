@@ -833,8 +833,9 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
     let fields: Vec<&str> = line.split('\t').collect();
     assert_eq!(
         fields.len(),
-        7,
-        "unexpected `worktree list` row shape; got fields {fields:?} from line:\n{line}"
+        8,
+        "unexpected `worktree list` row shape (fork #166 M2.3 added an OWNER column between \
+         OWNED and VERDICT); got fields {fields:?} from line:\n{line}"
     );
     assert_eq!(
         fields[2], "merged",
@@ -845,19 +846,19 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
         fields[2]
     );
     assert_eq!(
-        fields[5], "remove",
+        fields[6], "remove",
         "a MERGED, clean, deck-owned worktree resolved against its OWN remote must be `remove` \
          -- resolving against the caller's cwd instead (no origin there at all) would fail \
          closed to `keep`, permanently refusing to reclaim a worktree that IS actually merged; \
          got verdict column {:?} from line:\n{line}\nfull output:\n{text}",
-        fields[5]
+        fields[6]
     );
     assert_eq!(
-        fields[6], "-",
+        fields[7], "-",
         "a `remove` verdict carries no reason; anything else here would mean this row does not \
          actually carry the `remove` verdict the column above claims; got reason column {:?} \
          from line:\n{line}\nfull output:\n{text}",
-        fields[6]
+        fields[7]
     );
 }
 

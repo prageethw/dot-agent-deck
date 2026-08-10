@@ -55,6 +55,21 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 
+/// Fork #166 M2.4: the exact creator string this orchestration stamped into
+/// its own worktree markers, injected into every pane so `worktree list
+/// --mine` can determine "mine" without a daemon round-trip. Carries
+/// `orchestration:<typed_name>` on the interactive path or
+/// `issue-dispatch:<task>#<issue>` on the dispatch path — the SAME computed
+/// string [`crate::worktree_reclaim::mark_worktree_owned`] writes into the
+/// marker, never a second derivation of it (a daemon-side reconstruction
+/// from `TabMembership`/`display_title` diverges from the sentinel case and
+/// produces a silently wrong, non-sentinel owner string — see PRD
+/// fork-166's M2.4). Same drift-safety pattern as
+/// [`DOT_AGENT_DECK_PANE_ID`] and [`DOT_AGENT_DECK_AGENT_ID`]: the spawn-side
+/// injector, the daemon scrub site in [`spawn`], and the `worktree list
+/// --mine` reader in `main.rs` all reference this one symbol.
+pub const DOT_AGENT_DECK_WORKTREE_OWNER: &str = "DOT_AGENT_DECK_WORKTREE_OWNER";
+
 /// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
 ///
 /// The daemon injects its OWN bound hook-socket path into every agent it
@@ -1077,6 +1092,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // unfiltered inherit would tag every spawned agent with the
     // parent deck's id and the hook script would misroute events.
     cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
+    // Fork #166 M2.4: same scrub-then-overlay rule for the worktree-owner
+    // identity. Without this, a daemon launched from inside one
+    // orchestration's pane would leak that orchestration's owner string into
+    // every agent a DIFFERENT nested orchestration spawns from it — the same
+    // class of bug the two scrubs above already exist to prevent.
+    cmd.env_remove(DOT_AGENT_DECK_WORKTREE_OWNER);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.

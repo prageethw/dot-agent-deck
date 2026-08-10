@@ -2705,6 +2705,13 @@ without depending on the config struct API.
 - **Does not assert:** the chip-click arm (`Action::FormSelectMode`, `src/ui.rs:9744`) that calls the same `suggest_name_if_orchestration_selected` — same production function as the keyboard path, not independently pinned; persistence of the distinction across a form rebuild (there is none — the state lives only in the live `NewPaneFormState`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/008 — For a given live orchestration, the string `mark_worktree_owned` writes into the worktree's `created-by:` marker and the string every role pane's `AgentSpawnOptions::owner` carries (what becomes `DOT_AGENT_DECK_WORKTREE_OWNER` in that pane's real environment) are the LITERAL SAME computed string, from one source — not two derivations of one input (fork #166 M2.4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`, driving the real `Action::SpawnPane` path (as `orchestration/identity/001`/`022`) against a real git repo + worktree via `CapturingPaneController`, extended to record `AgentSpawnOptions::owner` per spawned pane.
+- **Agent:** none.
+- **Asserts:** after a live orchestration spawn, `owner_of(repo, worktree)` (the marker read-back) is `Some`; every role pane's recorded `owner` equals that exact value; at least one role pane was spawned to compare.
+- **Does not assert:** the sentinel/absent-variable refusal behaviour of `worktree list --mine` itself (covered by `worktree/reclaim/027`/`028`); the issue-dispatch path's equivalent invariant (`issue-dispatch:<task>#<issue>` is threaded through the same `SpawnRequest::owner` field in-process, in the same function that writes the marker — not independently pinned here); session-restore's recomputation via `orchestration_creator_string` (same shared function as the live-create path, exercised informally by manual restart testing per the PRD's M2.4 risk note, not by an automated spec).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
