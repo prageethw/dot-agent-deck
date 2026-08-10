@@ -841,6 +841,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to the typed unique name, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/023 — Two markers written directly via `mark_worktree_owned` for two DIFFERENT worktrees of the SAME repo, using the exact owner strings the interactive path records for two live orchestrations of the SAME config type (`review`) in the SAME directory, report DISTINCT owners back via `owner_of` (fork#192 — the unit-level complement to `worktree/reclaim/022`'s real-dispatch pin of the same success criterion).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/017`'s precedent (a real git repo via `init_repo_with_origin`, two linked worktrees via real `git worktree add`).
+- **Agent:** none.
+- **Asserts:** `mark_worktree_owned(wt_a, "orchestration:review-orchestrator-1")` and `mark_worktree_owned(wt_b, "orchestration:review-orchestrator-2")` on two worktrees of the same repo each round-trip through `owner_of` to their own exact string, and the two owners are `assert_ne!`.
+- **Does not assert:** the interactive `SpawnPane` handler that derives these owner strings from the typed Name (covered end-to-end by `worktree/reclaim/022`, `src/ui.rs`); `mark_worktree_owned`/`owner_of` themselves, which are unchanged by fork#192 and already covered by `017`/`020`.
+- **Platform coverage:** mac+linux.
 
 ### Prompts
 
@@ -2622,6 +2628,48 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/002 — Selecting the form's orchestration (Right arrow) suggests `<folder>-orchestrator-1` in the Name field in place of the bare directory basename it was pre-filled with, when no orchestration is live yet; a single further keystroke (Enter, no character typed) accepts it as-is at submit (fork#192 M1.0).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces today; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"` (the basename pre-fill) and one orchestration, after a Right-arrow selects that orchestration, has `form.name == "myproj-orchestrator-1"`, not `"myproj"`; submitting from there (Enter Mode→Name, Enter to submit) with no further edit yields `Action::SpawnPane` carrying `req.name == "myproj-orchestrator-1"` unchanged.
+- **Does not assert:** the daemon round-trip `live_orchestration_cwds_and_titles()`/`transition_after_dir_pick` performs to learn live names (not unit-testable without a live daemon — covered informally by `orchestration/identity/004`'s real-binary path); rendering of the suggestion (no L1 render seam asserts the Name field's literal text here).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/003 — With `<folder>-orchestrator-1` already live (injected via a new test-only `NewPaneFormState::with_live_orchestration_names` builder), selecting the orchestration suggests `<folder>-orchestrator-2` next, skipping the taken slot; submitting a name a live orchestration already holds is REFUSED — no `Action::SpawnPane`, form stays open (fork#192 M1.0).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, as `orchestration/identity/002`).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"`, one orchestration, and `with_live_orchestration_names(vec!["myproj-orchestrator-1".into()])`, after a Right-arrow selects the orchestration, has `form.name == "myproj-orchestrator-2"`; overwriting the Name field back to the taken `"myproj-orchestrator-1"` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane`, and `ui.mode` stays `UiMode::NewPaneForm`.
+- **Does not assert:** the exact refusal UI copy/rendering (covered by `orchestration/guard/002`); what N is counted over across multiple cwds (PRD's own open question, scoped global-over-live).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/004 — Driving the real binary through TWO orchestration opens in the SAME directory, each accepting the form's suggested Name with a single Enter (no character typed), lands both as visible tabs with DISTINCT labels (`<basename>-orchestrator-1`, `<basename>-orchestrator-2`) — never the identical basename-derived title recorded twice, the fork #74 collision fork#192 exists to stop (fork#192 M1.0).
+- **Layer:** L2 (PTY-attached real binary via `TuiDeck`; stand-in `cat` agent, no real LLM tokens spent, no credentials required).
+- **Agent:** none (both roles of the `orch-deck` fixture run `cat`).
+- **Asserts:** after opening the fixture's one orchestration twice from the Dashboard (`Ctrl+n` → confirm dir → select orchestration → accept the suggested Name unedited → submit), the rendered tab strip contains both `" <basename>-orchestrator-1 "` and `" <basename>-orchestrator-2 "` as distinct substrings, where `<basename>` is the real launch directory's basename read from `TuiDeck::workdir()`. The second wait barrier is `wait_for_string(&second_label)` itself (fork#192 review round 2 F7 — the prior `wait_for_string(" worker ")` was vacuous there: the Dashboard already shows " worker " from the FIRST orchestration's panes before the second open even starts, since the fixture's second role is literally named "worker").
+- **Does not assert:** the suggestion/refusal MECHANISMS in isolation (covered by `orchestration/identity/002`/`003`); worktree creation (no worktree slug is typed on this path); ownership marker content (covered by `worktree/reclaim/022`/`023`).
+- **Platform coverage:** mac+linux (PTY-attached, `#[cfg(feature = "e2e")]`, as the other `e2e_orchestration_*.rs` files).
+
+##### orchestration/identity/005 — The Name field stops accepting input at the daemon's `DISPLAY_NAME_MAX_LEN` (128-byte) cap, so a name the form lets the user type always survives `is_valid_display_name`; a name at the cap still round-trips into the uniqueness check against an identical live name (fork#192 review round 2, F1).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** typing (via repeated `KeyCode::Char` events, simulating a paste) `DISPLAY_NAME_MAX_LEN + 40` bytes into a focused, empty Name field yields `form.name.len() <= DISPLAY_NAME_MAX_LEN`; the resulting name satisfies `crate::agent_pty::is_valid_display_name`; and with that exact string pushed into `live_orchestration_names` and the form's one orchestration selected directly, `form.name_collision()` is true.
+- **Does not assert:** WHERE the cap is enforced (keystroke-time rejection vs. submit-time truncation are both consistent with the assertions here); the daemon-side `spawn_agent` null-and-keep path itself (`src/agent_pty.rs`, unit-covered separately); multi-byte/Unicode boundary truncation (the paste here is single-byte ASCII, matching the reviewer's own GitHub-issue-title example).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/006 — The uniqueness gate (`name_collision`) and the suggestion loop (`suggest_orchestration_name`) normalize on the SAME trim the sink (`build_new_pane_request`) applies — not a looser, untrimmed comparison (fork#192 audit F1).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` and the form's builder methods directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** (a) with `myproj-orchestrator-1` live, a form whose typed Name is `"myproj-orchestrator-1 "` (that exact string plus one trailing space) reports `name_collision() == true`, and submitting it via `handle_new_pane_form_key` (Enter, Enter) does NOT yield `Action::SpawnPane`; (b) a form built for directory `/tmp/ myproj` (basename carries a leading space) with `myproj-orchestrator-1` already live (the TRIMMED identity a previous open recorded) has `suggest_orchestration_name() == "myproj-orchestrator-2"`, not a candidate built from the untrimmed basename.
+- **Does not assert:** the click-door (`Action::FormSubmit`) refusal for the same untrimmed-name case (covered generically by `orchestration/guard/003`, using a plain taken name rather than a whitespace variant); marker-truncation collisions past 200 chars (audit F8, out of scope — subsumed by `orchestration/identity/005`'s 128-byte cap).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/007 — Landing on an orchestration must not silently destroy a Name the user actually typed; a still-untouched suggestion must keep being replaced on a later landing (fork#192 review F4 / audit F7).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly through the Right/Tab/Backspace/Char/BackTab/Left key sequence a real user's round-trip produces; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** selecting the form's one orchestration (Right), tabbing to Name, backspacing out the suggestion and typing `"hotfix-triage"`, then Shift+Tabbing back to Mode and pressing Left (lands on "No mode", a no-op landing) then Right again (lands back on the orchestration) leaves `form.name == "hotfix-triage"` — unchanged by either landing. A SEPARATE case in the same test: with `myproj-orchestrator-1` live, selecting the orchestration leaves the field holding the untouched suggestion `myproj-orchestrator-2`; widening `live_orchestration_names` to also include `myproj-orchestrator-2` (simulating what a later daemon read would show) and repeating the Left/Right landing updates the field to `myproj-orchestrator-3` — an untouched suggestion still gets replaced.
+- **Does not assert:** the chip-click arm (`Action::FormSelectMode`, `src/ui.rs:9744`) that calls the same `suggest_name_if_orchestration_selected` — same production function as the keyboard path, not independently pinned; persistence of the distinction across a form rebuild (there is none — the state lives only in the live `NewPaneFormState`).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
@@ -2629,6 +2677,22 @@ without depending on the config struct API.
 - **Agent:** none (the render seam supplies synthetic live-daemon orchestration cwd records).
 - **Asserts:** an orchestration selected for a cwd matching an existing live orchestration renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh cwd renders neither warning substring.
 - **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/002 — A name collision (the typed Name matches a name a live orchestration already holds) renders a BLOCKING refusal on the same guard seam `guard/001` uses; `[Submit]` renders present-but-INERT rather than removed, and `[Cancel]`'s clickable rect does not overlap it; a distinct typed name renders normally (fork#192 M1.0; contract corrected twice in review round 2 — see below).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving the private `render_new_pane_form` directly through a `TestBackend` to access the click-hit-test rects it returns; no PTY, no subprocess). **Moved from `tests/render_orchestration_guard.rs`** (fork#192 review round 2, F3/F8) — the public buffer-only seam `render_new_pane_orchestration_name_collision_to_buffer` this test previously used discards those rects, which the corrected contract needs.
+- **Agent:** none (a synthetic typed Name plus synthetic live-orchestration names, as before).
+- **Asserts:** on collision, the rendered buffer contains `[Submit]` (present, not removed) AND the blocking-refusal copy (`"already in use"`, `NAME_COLLISION_WARNING`); the click-hit-test rects `render_new_pane_form` returns do NOT contain an `Action::FormSubmit` entry (inert — excluded from hit-testing, the same mechanism `render_modal_button_row` already applies to any disabled button); WITHIN that same colliding render, `[Cancel]`'s clickable rect does not intersect `[Submit]`'s on-screen rect (located by scanning the rendered text grid, since an inert button carries no click rect). A distinct typed name's rects DO contain `Action::FormSubmit`.
+- **Does not assert:** exact refusal copy beyond the `"already in use"` needle; the Name-field text content itself; the suggestion logic that produces a non-colliding name in the first place (`orchestration/identity/002`/`003`); the `Action::FormSubmit` DISPATCH-level guard (covered by `orchestration/guard/003`); any invariance of the modal's size or `[Cancel]`'s position across the colliding vs. distinct-name renders (withdrawn — see below).
+- **CORRECTED CONTRACT (fork#192 review round 2, reviewer F3):** the original assertion was `[Submit]` GONE from the row entirely. `render_modal_button_row` lays buttons out left-aligned, so removing `[Submit]` slides `[Cancel]` into `[Submit]`'s exact former screen cells — a muscle-memory click on where Submit has always been now hits the destructive Cancel instead, discarding the whole form. The render seam already has an inert-but-visible mechanism for exactly this (a disabled button renders dimmed and is excluded from the click rects); the corrected contract uses that instead of removing the button. Precedent for revising a catalog assertion in place: `worktree/reclaim/008`.
+- **CORRECTED CONTRACT, second pass (fork#192 review round 2, tester self-correction after the coder's fix round):** the first corrected contract still compared `[Cancel]`'s rect ACROSS the colliding and distinct-name renders and asserted equality. That comparison is wrong, not the production behavior: the two renders are legitimately different-sized popups — the collision's `NAME_COLLISION_WARNING` feeds both `desired_w` and `desired_h` (`src/ui.rs`'s `modal_rect` call site), which the distinct-name render never shows, so `modal_rect` re-centers differently. PRD #140's existing same-cwd warning reflows the modal the same way; this codebase deliberately does not guarantee modal-centring invariance under a warning appearing. The actual hazard (reviewer F3) never depended on cross-render position match — with `[Submit]` present-but-inert it still holds its row slot and lays out before `[Cancel]`, so `[Cancel]` structurally cannot occupy `[Submit]`'s cells regardless of the popup's size or position. The contract now pins that directly: WITHIN the colliding render, `[Cancel]`'s rect must not intersect `[Submit]`'s rect. Same precedent as the first correction: `worktree/reclaim/008`.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/003 — The `Action::FormSubmit` click door independently refuses a colliding name — defense-in-depth for a state the render seam (`orchestration/guard/002`) is meant to make unreachable (fork#192 review F9).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, dispatching the real `Action::FormSubmit` through the production `dispatch_action` against a `CapturingPaneController`; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** dispatching `Action::FormSubmit` against a form whose typed Name (`myproj-orchestrator-1`) matches a live orchestration name results in zero recorded orchestration identities on the `CapturingPaneController` (no pane spawned), `ui.mode` still `UiMode::NewPaneForm`, and `ui.new_pane_form` still `Some` (not taken).
+- **Does not assert:** the render-layer inertness of the `[Submit]` button itself (covered by `orchestration/guard/002`); the Enter-key submit door (covered by `orchestration/identity/003`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout

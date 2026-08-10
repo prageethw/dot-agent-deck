@@ -1748,4 +1748,51 @@ mod tests {
             "worktree list --json must carry the owner field, got: {json}"
         );
     }
+
+    /// Scenario: Two markers are written directly via `mark_worktree_owned`
+    /// for two DIFFERENT worktrees of the SAME repo, using the owner strings
+    /// the interactive `SpawnPane` path records for two live orchestrations
+    /// of the SAME config type (`review`) opened in the SAME directory --
+    /// `orchestration:review-orchestrator-1` and
+    /// `orchestration:review-orchestrator-2`, the shape fork#192 M1.0's
+    /// suggested naming produces. `owner_of` must report each worktree's own
+    /// distinct owner back. This is the unit-level complement to
+    /// `orchestration/worktree/004`'s (`src/ui.rs`) real-dispatch pin of the
+    /// same success criterion: `mark_worktree_owned`/`owner_of` are
+    /// unchanged by fork#192, so this documents that the low-level storage
+    /// already supports the property the interactive path depends on.
+    #[spec("worktree/reclaim/023")]
+    #[test]
+    fn worktree_reclaim_023_same_config_type_same_directory_records_distinct_owners() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let wt_a = scratch.path().join("repo-review-orchestrator-1");
+        add_worktree(&repo, &wt_a, "feat/review-orchestrator-1");
+        mark_worktree_owned(&wt_a, "orchestration:review-orchestrator-1")
+            .expect("mark_worktree_owned must succeed");
+
+        let wt_b = scratch.path().join("repo-review-orchestrator-2");
+        add_worktree(&repo, &wt_b, "feat/review-orchestrator-2");
+        mark_worktree_owned(&wt_b, "orchestration:review-orchestrator-2")
+            .expect("mark_worktree_owned must succeed");
+
+        let owner_a = owner_of(&repo, &wt_a);
+        let owner_b = owner_of(&repo, &wt_b);
+
+        assert_eq!(
+            owner_a,
+            Some("orchestration:review-orchestrator-1".to_string())
+        );
+        assert_eq!(
+            owner_b,
+            Some("orchestration:review-orchestrator-2".to_string())
+        );
+        assert_ne!(
+            owner_a, owner_b,
+            "two orchestrations of the same config type in the same directory \
+             must record distinct owners in their own worktree markers"
+        );
+    }
 }

@@ -62,3 +62,10 @@ fn guard_001_warns_for_same_cwd_live_orchestration_only() {
         "the warning is non-blocking: the form must retain its Submit action, got:\n{collision}"
     );
 }
+
+// `orchestration/guard/002` moved into `src/ui.rs`'s own `#[cfg(test)] mod
+// tests` (fork#192 review round 2, F3/F8): the corrected contract needs the
+// click-hit-test rects `render_new_pane_form` returns to pin that a colliding
+// `[Submit]` is present-but-INERT (excluded from the rects, not merely
+// removed from the row) and that `[Cancel]`'s rect doesn't move — neither is
+// reachable through this file's buffer-only public seam.
