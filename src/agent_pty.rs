@@ -4549,11 +4549,35 @@ impl AgentPtyRegistry {
         // the grace window elapses. Polling avoids the obvious "sleep for
         // grace then SIGKILL" alternative — agents that exit promptly
         // don't have to wait around for the slowest sibling.
+        //
+        // Fork issue #163: `try_wait`'s underlying `waitpid(WNOHANG)` reaps
+        // as a side effect of merely checking exit status, releasing that
+        // agent's pid back to the kernel — where it can be recycled by an
+        // unrelated process before phase 3 runs. `reaped` records, per
+        // agent, which ones *this loop itself* has already observed
+        // exiting, so phase 3 can skip re-deriving a pgid from (and
+        // signalling) a pid it no longer owns. This discriminates on "did
+        // phase 2 actually reap this one", not on "does this one look
+        // dead" — an agent phase 2 never observes exiting is untouched
+        // here and still gets phase 3's forcing SIGKILL against its live
+        // group, so a same-group descendant that outlives its leader is
+        // still reached (see `shutdown_graceful_001`'s control scenario).
+        // Once an agent is marked reaped it is skipped for the rest of
+        // this loop too, so its child is never polled a second time.
+        let mut reaped = vec![false; agents.len()];
         let deadline = std::time::Instant::now() + grace;
         loop {
-            let all_exited = agents
-                .iter_mut()
-                .all(|a| matches!(a.child.try_wait(), Ok(Some(_))));
+            let mut all_exited = true;
+            for (agent, agent_reaped) in agents.iter_mut().zip(reaped.iter_mut()) {
+                if *agent_reaped {
+                    continue;
+                }
+                if matches!(agent.child.try_wait(), Ok(Some(_))) {
+                    *agent_reaped = true;
+                } else {
+                    all_exited = false;
+                }
+            }
             if all_exited {
                 break;
             }
@@ -4563,13 +4587,19 @@ impl AgentPtyRegistry {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
-        // is no-op-safe on an already-exited child (ESRCH is logged-but-
-        // ignored and `wait` returns the cached status), so this loop is
-        // safe to run unconditionally. On Windows this is where the
-        // `TerminateJobObject` backstop for each agent's descendant tree runs
-        // (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort only.
-        for mut agent in agents {
+        // Phase 3: SIGKILL any survivor and reap. Agents phase 2 already
+        // reaped are skipped entirely (fork #163) — `force_kill_child_and_wait`
+        // derives its kill target from the child's pid/handle at call time,
+        // and calling it on an already-reaped agent would signal whatever
+        // now holds that recycled identity rather than the exited agent's
+        // own (already-empty) group. On Windows this is where the
+        // `TerminateJobObject` backstop for each surviving agent's
+        // descendant tree runs (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT`
+        // is best-effort only.
+        for (mut agent, agent_reaped) in agents.into_iter().zip(reaped) {
+            if agent_reaped {
+                continue;
+            }
             crate::platform::proc::force_kill_child_and_wait(
                 &mut agent.child,
                 &agent.process_group,
