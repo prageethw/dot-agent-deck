@@ -229,20 +229,34 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// purpose (the new-pane uniqueness check), which the wire format cannot
 /// see and a version comparison cannot express as a parse failure.
 ///
-/// A real mixed-version failure mode still exists and is NOT invisible —
-/// it is just not a decode-safety one, so `ensure_compatible_daemon_or_die`
-/// refusing the pairing outright would be the wrong tool: an older daemon,
-/// or any peer that still treats `display_title` as droppable decoration,
-/// yields fewer titles to `live_orchestration_cwds_and_titles()`, so the
-/// uniqueness check sees fewer live names and can suggest or accept one
-/// that is genuinely taken. That is the same shape of trade-off already
-/// established for Finding #6's guarded-send capability above (semantic
-/// change, decoupled from the version number, covered by a `.breaking.md`
-/// fragment and a manual cross-version test rather than a bump) — and the
-/// consequence here is bounded the same way the validation posture in
-/// `src/agent_pty.rs` reasons about it: a stale-name miss in a form
-/// suggestion, not routing corruption or a decode panic. See
-/// `changelog.d/192.breaking.md` for the mixed-version write-up.
+/// Re-examined per fork#192 review F5: the mixed-version failure mode this
+/// paragraph originally argued from — "an older daemon, or any peer that
+/// still treats `display_title` as droppable decoration, yields fewer
+/// titles" — cannot occur, so it is not the reason not to bump.
+/// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`]
+/// refuses on `probe.response.server_version != Some(PROTOCOL_VERSION)` —
+/// EXACT equality, not a floor — so only a daemon that already reports
+/// protocol 7 can pair at all; a genuinely older peer never reaches the
+/// point where its handling of `display_title` matters. `display_title`
+/// itself predates protocol 7 by two months (landed 2026-06-14 in
+/// `8b863b0`, PRD #107 / PR #160; `PROTOCOL_VERSION = 7` landed
+/// 2026-08-09, and the previous release `v0.36.1` already carries it), so
+/// every daemon that CAN pass the handshake has round-tripped the field
+/// the whole time it has existed. The not-bumping decision is still
+/// correct — more clearly so than the reasoning that used to sit here: a
+/// bump here would refuse only pairings that already handle `display_title`
+/// correctly.
+///
+/// The "fewer titles reach the uniqueness check" failure shape IS real; it
+/// just arrives from a same-version cause, not a cross-version one. The
+/// daemon's own spawn-time validation (`validate_tab_membership` /
+/// `validate_orchestration_surface` in `src/agent_pty.rs`) nulls an
+/// invalid `display_title` and keeps the membership, regardless of which
+/// protocol version either peer runs — and the downstream effect of that
+/// miss is not merely a stale form suggestion: it is two worktrees
+/// recording byte-identical `created-by:` ownership markers, the exact
+/// fork #74 condition this PRD exists to prevent (fork#192 audit F2). See
+/// `changelog.d/192.breaking.md` for the corrected mixed-version write-up.
 pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious

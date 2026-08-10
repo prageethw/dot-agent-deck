@@ -632,10 +632,19 @@ const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// INFORMATIONAL HINT — currently just [`live_orchestration_cwds_and_titles`],
 /// which runs on the `Ctrl+n` form-open key path. A local unix-socket round-trip against a
 /// healthy daemon completes in well under a millisecond, so 250 ms is orders of
-/// magnitude of headroom while capping the worst case (wedged daemon, socket
-/// file present but nothing draining it) at a quarter second instead of
-/// [`DAEMON_REQUEST_TIMEOUT`]'s five. Blowing the deadline fails OPEN — the form
-/// opens with no warning rather than freezing.
+/// magnitude of headroom while capping the worst case at a quarter second
+/// instead of [`DAEMON_REQUEST_TIMEOUT`]'s five. Blowing the deadline fails
+/// OPEN — the form opens with no warning rather than freezing.
+///
+/// fork#192 audit F4: "capping the worst case" is only true for a SILENT
+/// peer (a wedged daemon, socket file present but nothing draining it) —
+/// `set_timeouts` sets `SO_RCVTIMEO`/`SO_SNDTIMEO` on the socket, which is a
+/// PER-SYSCALL timeout, not a total deadline. A peer that dribbles one byte
+/// every 200ms keeps `read_exact` alive past this constant indefinitely.
+/// Same-uid threat model only (the attach socket is `0o600` under a
+/// per-user directory), so this is not fixed here — filed upstream as
+/// [vfarcic/dot-agent-deck#478](https://github.com/vfarcic/dot-agent-deck/issues/478)
+/// alongside the missing `MAX_FRAME_LEN` check below.
 const DAEMON_HINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Send a one-shot `AttachRequest` to the local daemon over the attach socket
@@ -679,6 +688,13 @@ fn send_daemon_request_blocking_with_timeout(
             resp_header[0]
         )));
     }
+    // fork#192 audit F4: unlike `daemon_protocol::read_frame`, this reader
+    // applies no `MAX_FRAME_LEN` bound before allocating — a peer answering
+    // with a forged length prefix (e.g. `0xFFFFFFFF`) triggers an ~4 GiB
+    // allocation before a single body byte is read. Same-uid threat model
+    // only (see `DAEMON_HINT_TIMEOUT`'s doc comment above); not fixed here,
+    // filed upstream as
+    // [vfarcic/dot-agent-deck#478](https://github.com/vfarcic/dot-agent-deck/issues/478).
     let len = u32::from_be_bytes([
         resp_header[1],
         resp_header[2],
@@ -803,6 +819,20 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
 /// form-open for the whole default deadline. The warning/suggestion/refusal are
 /// all best-effort hints, never a correctness gate — routing does not consult
 /// them — so a slow or down daemon fails open and the form opens instantly.
+///
+/// fork#192 audit F6: unlike the daemon's `StartAgent` ingest
+/// (`validate_tab_membership`/`validate_orchestration_surface`,
+/// `src/agent_pty.rs`) and the TUI hydration path (`sanitize_record_tab_membership`,
+/// `src/daemon_client.rs`), this path deserializes `AttachResponse` straight
+/// into consumption — it never validates `cwd`/`display_title`/`name`. That
+/// is safe TODAY only by accident of the current consumers: both values
+/// returned below are compared as plain `String`s (`name_collision`,
+/// `suggest_orchestration_name`) or `std::fs::canonicalize`d, and
+/// `NAME_COLLISION_WARNING` is a static literal, so no attacker-controlled
+/// byte from this response ever reaches the terminal. A future consumer
+/// added to either returned list inherits an unvalidated string — compare
+/// only, never render, without first routing through the same sanitizers
+/// the other two paths use.
 fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
@@ -941,6 +971,19 @@ struct NewPaneFormState {
     /// filesystem). Empty (the `new` default) means "nothing known live" — the
     /// suggestion starts at `-orchestrator-1` and nothing is ever refused.
     live_orchestration_names: Vec<String>,
+    /// fork#192 review F4 / audit F7: whether the Name field still holds a
+    /// value [`Self::suggest_name_if_orchestration_selected`] itself wrote
+    /// (or the untouched construction-time pre-fill), as opposed to
+    /// something the user typed. `true` from `new` (the bare directory
+    /// basename `transition_after_dir_pick` pre-fills is fair game to
+    /// replace with a suggestion) and after every suggestion overwrite;
+    /// cleared to `false` by any keystroke that edits Name directly
+    /// (`KeyCode::Char`/`KeyCode::Backspace` while Name is focused). Selection
+    /// changes only overwrite the field while this is `true` — landing on an
+    /// orchestration must not silently destroy a name the user actually
+    /// typed, since it is what lands in the tab title and the worktree
+    /// ownership marker.
+    name_is_suggestion: bool,
     /// Fork #122: the typed slug for the orchestration's own worktree. Empty
     /// (the `new` default) means no worktree — panes spawn in `dir`, today's
     /// exact behavior. Only meaningful when an orchestration is selected.
@@ -1032,6 +1075,10 @@ impl NewPaneFormState {
             // nothing is known live, so the suggestion starts at
             // `-orchestrator-1` and nothing is ever refused.
             live_orchestration_names: Vec::new(),
+            // fork#192 review F4 / audit F7: an untyped construction-time
+            // value (the bare basename pre-fill) is fair game to overwrite
+            // with the first suggestion.
+            name_is_suggestion: true,
             // Fork #122: no worktree by default — preserves today's behavior.
             worktree_slug: String::new(),
         }
@@ -1070,23 +1117,40 @@ impl NewPaneFormState {
     /// `-orchestrator-1` in two different directories at once (PRD decision,
     /// not reopened here).
     fn suggest_orchestration_name(&self) -> String {
+        // fork#192 audit F1b: trim the basename before comparing — the sink
+        // (`build_new_pane_request`) stores `form.name.trim()`, so an
+        // untrimmed basename (e.g. a directory named ` myproj`) never
+        // matches the trimmed stored identity and every open from that
+        // directory silently reoffers an already-taken name.
         let base = self
             .dir
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|n| n.to_string_lossy().trim().to_string())
             .unwrap_or_default();
-        let mut n: usize = 1;
-        loop {
+        // fork#192 audit F5: a `HashSet` turns each membership check into
+        // O(1) instead of an O(K) linear scan, making the whole suggestion
+        // loop O(K) instead of O(K^2).
+        let live: HashSet<&str> = self
+            .live_orchestration_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // fork#192 review F14: bounded to `live.len() + 1` candidates rather
+        // than an open `loop` — with K distinct live titles, at most K of
+        // the K+1 candidates `-orchestrator-1..=K+1` can be blocking, so one
+        // is always free (pigeonhole) and termination no longer depends on
+        // reasoning about the caller's data. Makes form-open O(K) on a
+        // malformed/hostile `ListAgents` response instead of unbounded.
+        let bound = live.len() + 1;
+        for n in 1..=bound {
             let candidate = format!("{base}-orchestrator-{n}");
-            if !self
-                .live_orchestration_names
-                .iter()
-                .any(|l| l == &candidate)
-            {
+            if !live.contains(candidate.as_str()) {
                 return candidate;
             }
-            n += 1;
         }
+        // Unreachable in practice per the pigeonhole argument above; kept as
+        // a defensive fallback rather than `unreachable!()`.
+        format!("{base}-orchestrator-{}", bound + 1)
     }
 
     /// fork#192 M1.0: overwrite the Name field with the next free suggested
@@ -1094,8 +1158,16 @@ impl NewPaneFormState {
     /// every path that can change `selection_index` (arrow keys, click). A
     /// no-op when the current selection isn't an orchestration (a plain
     /// mode/card/authoring option keeps whatever the user already typed).
+    ///
+    /// fork#192 review F4 / audit F7: only overwrites while
+    /// [`Self::name_is_suggestion`] is still `true` — a user-typed name
+    /// (any Name-field keystroke clears the flag) survives a later
+    /// selection landing, since it is what lands in the tab title and the
+    /// worktree ownership marker. An untouched suggestion keeps being
+    /// replaced, so the live-name universe widening between two selections
+    /// still skips a slot that became taken in between.
     fn suggest_name_if_orchestration_selected(&mut self) {
-        if self.selected_orchestration().is_some() {
+        if self.selected_orchestration().is_some() && self.name_is_suggestion {
             self.name = self.suggest_orchestration_name();
         }
     }
@@ -1106,11 +1178,20 @@ impl NewPaneFormState {
     /// uniqueness constraint. Drives the blocking refusal at submit and the
     /// `[Submit]`-button-gone render on the guard seam.
     fn name_collision(&self) -> bool {
+        // fork#192 audit F1a: compare on the same trim the sink
+        // (`build_new_pane_request`) applies before storing — an untrimmed
+        // gate against trimmed stored identities is a one-keypress bypass
+        // (type the taken name plus a trailing space). Audit F8 is the same
+        // root cause one layer down, at the marker: `sanitize_marker_creator`
+        // (`src/worktree_reclaim.rs`) also normalizes differently than this
+        // gate (200-char truncation, embedded-newline-to-space collapsing),
+        // so two names this gate treats as distinct can still collapse to
+        // one `created-by:` value. Not fixed here — the general rule this
+        // fix and F8 both point at is that the gate must ultimately compare
+        // POST-`sanitize_marker_creator` values, not just post-trim ones.
+        let trimmed = self.name.trim();
         self.selected_orchestration().is_some()
-            && self
-                .live_orchestration_names
-                .iter()
-                .any(|l| l == &self.name)
+            && self.live_orchestration_names.iter().any(|l| l == trimmed)
     }
 
     /// Fork #122 test-only seam: attach a typed worktree slug without
@@ -1195,6 +1276,10 @@ impl NewPaneFormState {
             // orchestration either, so there is never a name to suggest or
             // collide.
             live_orchestration_names: Vec::new(),
+            // fork#192 review F4 / audit F7: unreachable on a locked
+            // schedule form (no orchestration to select), but the value
+            // must still be set.
+            name_is_suggestion: true,
             // Fork #122: the locked schedule form can't select an
             // orchestration, so there is never a worktree slug to type.
             worktree_slug: String::new(),
@@ -7508,6 +7593,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 FormField::Name | FormField::Command | FormField::WorktreeSlug
             ) =>
         {
+            // fork#192 review F4 / audit F7: any direct edit to Name marks
+            // it user-typed, so a later selection landing won't overwrite it.
+            if form.focused == FormField::Name {
+                form.name_is_suggestion = false;
+            }
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
@@ -7522,6 +7612,22 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 FormField::Name | FormField::Command | FormField::WorktreeSlug
             ) =>
         {
+            // fork#192 review F1: cap Name at the daemon's own
+            // `DISPLAY_NAME_MAX_LEN` so a paste can never produce a value
+            // `is_valid_display_name` rejects — an over-long name was
+            // nulled at spawn-time validation and silently dropped out of
+            // the uniqueness universe, reopening the fork #74 collision
+            // with no hostile peer needed.
+            if form.focused == FormField::Name
+                && form.name.len() + c.len_utf8() > crate::agent_pty::DISPLAY_NAME_MAX_LEN
+            {
+                return Action::Continue;
+            }
+            // fork#192 review F4 / audit F7: any direct edit to Name marks
+            // it user-typed, so a later selection landing won't overwrite it.
+            if form.focused == FormField::Name {
+                form.name_is_suggestion = false;
+            }
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
@@ -17552,18 +17658,18 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         }
     }
 
-    // [Submit] / [Cancel] buttons on the reserved row. fork#192 M1.0: a name
-    // collision drops [Submit] from the row entirely (not merely disabled —
-    // `render_modal_button_row` still paints a disabled button's label
-    // dimmed, and the refusal must not even show the action as available).
-    let buttons: Vec<Button> = if name_collision {
-        vec![Button::new("Cancel", "", Action::FormCancel, true)]
-    } else {
-        vec![
-            Button::new("Submit", "", Action::FormSubmit, true),
-            Button::new("Cancel", "", Action::FormCancel, true),
-        ]
-    };
+    // [Submit] / [Cancel] buttons on the reserved row. fork#192 review F3:
+    // a name collision renders [Submit] DISABLED rather than dropping it
+    // from the row — `render_modal_button_row` already paints a disabled
+    // button dimmed and excludes its rect from the click hit-test
+    // (present-but-INERT), which keeps [Cancel] in its ordinary second slot
+    // instead of sliding it into [Submit]'s former screen position. Removing
+    // the button entirely turned a muscle-memory click on the old [Submit]
+    // location into a destructive [Cancel] that discards the whole form.
+    let buttons: Vec<Button> = vec![
+        Button::new("Submit", "", Action::FormSubmit, !name_collision),
+        Button::new("Cancel", "", Action::FormCancel, true),
+    ];
     let btn_row = Rect {
         x: row_x,
         y: line_y(submit_line_idx),

@@ -516,23 +516,31 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         // value cannot cause cross-delivery; the worst case is that the
         // uniqueness check at the NEXT new-pane form-open compares against
         // the reverted `name` instead of the real title and can miss a
-        // collision — reproducing the pre-fork#192 "every orchestration in
-        // this dir gets the same suggested name" state for that one
-        // orchestration, not a data-loss or routing bug. Rejecting the
-        // whole membership would drop an entire LIVE orchestration tab
-        // (kill a running session) to guard a UI suggestion, which is a
-        // strictly worse outcome for a bounded, already-tolerated gap.
+        // collision — and that miss is not merely a stale-name suggestion
+        // quality gap: it can produce two live orchestrations in the same
+        // directory whose worktrees record byte-identical `created-by:`
+        // ownership markers, the exact fork #74 condition this PRD exists
+        // to prevent (fork#192 audit F2). Rejecting the whole membership
+        // would drop an entire LIVE orchestration tab (kill a running
+        // session) to guard a UI suggestion, which is a strictly worse
+        // outcome for a bounded, already-tolerated gap.
         // Sanitizing instead of nulling (stripping the invalid bytes and
         // keeping the rest) was also considered: it would narrow the gap
-        // but adds a second string-transform path for a value that can
-        // only carry control bytes here via wire corruption or a hostile
-        // same-user peer, not through the form (`build_new_pane_request`
-        // trims but does not need to strip control bytes, since ordinary
-        // keyboard/paste input reaching `NewPaneFormState` doesn't produce
-        // them). Kept null-and-keep (Greptile PR #160 P1's original call)
-        // for that reason. A behaviour change here (reject or sanitize)
-        // would need its own spec — this PRD keeps the fallback as-is, so
-        // none is added.
+        // but adds a second string-transform path for a value that can only
+        // fail `is_valid_display_name` via the form on the LENGTH axis
+        // (`> DISPLAY_NAME_MAX_LEN` bytes) — and that axis is now bounded:
+        // `handle_new_pane_form_key`'s `KeyCode::Char` arm caps the Name
+        // field at `DISPLAY_NAME_MAX_LEN` bytes (fork#192 review F1), so an
+        // ordinary paste can no longer produce an over-long name. The
+        // control-byte axis remains reachable only via wire corruption or a
+        // hostile same-user peer, not through the form: keyboard/paste
+        // input reaching `NewPaneFormState` arrives as `KeyCode::Char`
+        // events, which crossterm never raises for raw control bytes (a
+        // literal newline in a paste surfaces as `KeyCode::Enter`, not
+        // `KeyCode::Char('\n')`). Kept null-and-keep (Greptile PR #160 P1's
+        // original call) for that reason. A behaviour change here (reject
+        // or sanitize) would need its own spec — this PRD keeps the
+        // fallback as-is, so none is added.
         if display_title
             .as_deref()
             .is_some_and(|t| !is_valid_display_name(t))
@@ -675,9 +683,12 @@ pub fn validate_orchestration_surface(
     // (→ `name`) — kept null-and-keep rather than reject-the-surface for
     // the same reasoning as `validate_tab_membership`'s equivalent site
     // (src/agent_pty.rs, the null-out arm next to the `orchestration_id`
-    // reject arm): the worst case is a stale-name miss in the uniqueness
-    // suggestion at the next form-open, not routing corruption, and that
-    // is a strictly smaller cost than dropping an entire live
+    // reject arm): the worst case is a miss in the uniqueness suggestion at
+    // the next form-open, not routing corruption — but that miss can
+    // produce two live orchestrations in the same directory recording
+    // byte-identical `created-by:` ownership markers, the exact fork #74
+    // condition this PRD exists to prevent (fork#192 audit F2), and that
+    // is still a strictly smaller cost than dropping an entire live
     // orchestration tab over a bad label string.
     if surface
         .display_title

@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Planning
+**Status**: M1.0/M1.1 implemented and merged into the PR; M1.2 documentation delivered; M1.2's cross-version manual test still outstanding (see the note under M1.2 below). M2.0 (offer upstream) not yet started.
 
 **Parent**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166) — this PRD carves out its parked **Phase 1** (M1.0/M1.1/M1.2). Sibling of [fork #175](https://github.com/prageethw/dot-agent-deck/issues/175), which carved out provisioning.
 
@@ -105,21 +105,21 @@ Unchanged from fork#166 and restated so it is not re-litigated: fork #144's cont
 
 ### M1.0 — Name as a unique, suggested identity
 
-- [ ] The form suggests the next free `<foldername>-orchestrator-N` in place of the bare basename.
-- [ ] A name held by a live orchestration is refused at submit, with the refusal rendered on the existing guard seam.
-- [ ] The liveness query carries names, not only cwds.
+- [x] The form suggests the next free `<foldername>-orchestrator-N` in place of the bare basename.
+- [x] A name held by a live orchestration is refused at submit, with the refusal rendered on the existing guard seam.
+- [x] The liveness query carries names, not only cwds.
 
 ### M1.1 — `display_title` promoted to identity
 
-- [ ] PRD #140's field docs and `src/agent_pty.rs`'s contract comments updated.
-- [ ] Every cosmetic-assumption site audited, `validate_orchestration_surface`'s null-and-keep fallback re-decided explicitly.
-- [ ] fork #184's comment corrected in the same pass.
+- [x] PRD #140's field docs and `src/agent_pty.rs`'s contract comments updated.
+- [x] Every cosmetic-assumption site audited, `validate_orchestration_surface`'s null-and-keep fallback re-decided explicitly.
+- [x] fork #184's comment corrected in the same pass.
 
 ### M1.2 — Rule 12 answered
 
-- [ ] `changelog.d/192.breaking.md` fragment.
-- [ ] An explicit `PROTOCOL_VERSION` decision, recorded with its reasoning whichever way it goes.
-- [ ] The cross-version manual test run: previous-release daemon + this branch's TUI, confirming a delegate still routes and hooks still arrive.
+- [x] `changelog.d/192.breaking.md` fragment.
+- [x] An explicit `PROTOCOL_VERSION` decision, recorded with its reasoning whichever way it goes.
+- [ ] **The cross-version manual test run: previous-release daemon + this branch's TUI, confirming a delegate still routes and hooks still arrive.** Deliberately left unticked — this is the orchestrator's step (rule 1: the coder role does not run it), and it has not run as of this fix round. Left unticked rather than silently deferred: per fork#192 review F5, running it against `v0.36.1` or later is not expected to reproduce the mixed-version gap the fragment originally described — every release since PRD #107 already round-trips `display_title` — so the test's value now is confirming the delegate/hooks path still works, not falsifying the `PROTOCOL_VERSION` decision.
 
 ### M2.0 — Offer upstream (trigger, not intention)
 
@@ -145,10 +145,10 @@ Keep the form-level change a **clean separable commit** so the offer is a cherry
 - **A semantic break behind a stable wire is invisible to CI.** Nothing in the fast tier can see that a field's *meaning* moved. **Mitigation:** M1.2's cross-version manual test is the only thing that can, and it is a milestone rather than a checklist line.
 - **Breaking dispatched orchestrations.** They carry `display_title: None` by design. **Mitigation:** a success criterion of its own, and the uniqueness constraint is scoped to the interactive path in as many words.
 - **Regressing PRD #107.** The title-vs-identity split is easy to collapse while promoting the title. **Mitigation:** `orchestration/identity/001` already pins it; it must keep passing unmodified, and any change to it is a signal, not a chore.
-- **The suggestion racing itself.** Two forms open at once could both be suggested `-orchestrator-2`. The refusal at submit is the backstop; the suggestion is a convenience, not a lock.
+- **The suggestion racing itself, and the refusal is NOT the backstop for it.** `name_collision()` reads `live_orchestration_names`, a snapshot taken once at form-open from a single `ListAgents` round-trip and never refreshed. Two forms open at once both snapshot the same live set, both get suggested `-orchestrator-2`, and neither submit sees the other — the refusal only catches a name that was already taken *when this particular form opened*, which the suggestion has already avoided. Nothing at the marker-write layer enforces uniqueness either, so both writes succeed. **This is the concurrent case fork #74 is actually about**, and #192 does not close it — it makes the common single-form case correct and makes identities distinguishable once they exist. Documented rather than silently accepted: [fork #201](https://github.com/prageethw/dot-agent-deck/issues/201) records the gap and the options for closing it (re-query at submit, a daemon-side claim, or enforcement at the marker). Not implemented here — out of scope for this PRD.
 
 ## Open Questions
 
 - **Does `PROTOCOL_VERSION` move?** M1.2 must answer rather than assume. The wire shape does not change, which argues no; the meaning does, which is what rule 12 says to weigh.
-- **What is `N` counted over — live orchestrations in this cwd, or all live orchestrations?** Per-cwd reads more naturally (`worker-agent-deck-orchestrator-2` is the second one *here*), but two directories would then both offer `-orchestrator-1`. Since uniqueness is what the name is for, global-over-live is the safer default.
+- **What is `N` counted over — live orchestrations in this cwd, or all live orchestrations?** Per-cwd reads more naturally (`worker-agent-deck-orchestrator-2` is the second one *here*), so global-over-live is the safer default: uniqueness is what the name is for, and a per-cwd counter could suggest `N=1` in two different directories that then happen to share a basename later (e.g. after a rename), producing a real collision. **Correction (fork#192 review F15):** the shipped design does *not* stop two *distinct-basename* directories from both offering `-orchestrator-1` — `suggest_orchestration_name` builds `{this-form's-basename}-orchestrator-{n}` and checks only that exact candidate string against the global list, so `myproj-orchestrator-1` and `otherproj-orchestrator-1` never collide and both directories do in fact offer `N=1`. The global counter only bites — as intended — when two directories share a basename, which is exactly the case a per-cwd counter would get wrong.
 - **What happens to a name whose tab closes while a second form is open?** Live-scoped uniqueness means it becomes free mid-form. Harmless — the refusal is evaluated at submit.
