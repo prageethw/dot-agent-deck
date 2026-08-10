@@ -69,15 +69,26 @@ fn restore_018_owner_reaches_every_restored_role_panes_real_environment() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let worktree = tmp.path().join("dot-agent-deck-restore-018");
     std::fs::create_dir_all(&worktree).expect("create worktree dir");
+    // `open_orchestration_tab` spawns non-start roles BEFORE the start role
+    // (`src/tab.rs`'s fork #92 P1 spawn-order comment), so `worker` here is
+    // actually the FIRST child forked. A bare `echo` exits within
+    // milliseconds, and `AgentPtyRegistry::agent_records()` filters out
+    // exited entries entirely (`agent_records_filters_exited_entries`) — a
+    // process that has already exited and been filtered is indistinguishable
+    // from one that was never spawned. The trailing `sleep 30` keeps each
+    // child alive long enough for `wait_for_agent_where`'s poll to observe it
+    // as a live registry entry, mirroring why `orchestration/identity/009`'s
+    // single-role variant gets away with a bare `echo` (no second role's
+    // spawn work delays its poll) while this two-role test cannot.
     let toml = "[[orchestrations]]\n\
                 name = \"restore-018-fixture\"\n\n\
                 [[orchestrations.roles]]\n\
                 name = \"orchestrator\"\n\
-                command = \"echo ROLE-orchestrator-OWNER-IS:$DOT_AGENT_DECK_WORKTREE_OWNER:OWNER-END\"\n\
+                command = \"echo ROLE-orchestrator-OWNER-IS:$DOT_AGENT_DECK_WORKTREE_OWNER:OWNER-END; sleep 30\"\n\
                 start = true\n\n\
                 [[orchestrations.roles]]\n\
                 name = \"worker\"\n\
-                command = \"echo ROLE-worker-OWNER-IS:$DOT_AGENT_DECK_WORKTREE_OWNER:OWNER-END\"\n";
+                command = \"echo ROLE-worker-OWNER-IS:$DOT_AGENT_DECK_WORKTREE_OWNER:OWNER-END; sleep 30\"\n";
     std::fs::write(worktree.join(".dot-agent-deck.toml"), toml)
         .expect("write fixture .dot-agent-deck.toml");
     let worktree_str = worktree.display().to_string();
