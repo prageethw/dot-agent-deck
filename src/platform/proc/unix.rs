@@ -172,6 +172,55 @@ fn signal_child_pgroup_or_fallback(
     true
 }
 
+/// Fork issue #163 rework: observe whether the process named by `pid` has
+/// exited, **without reaping it**. `try_wait`'s underlying `waitpid(WNOHANG)`
+/// reaps as a side effect of merely checking, which releases the pid back to
+/// the kernel for recycling before the caller gets a chance to signal its
+/// group — the exact hazard this issue is about. `libc::waitid` with
+/// `WNOWAIT` reports the same exit `try_wait` would, but leaves the process a
+/// zombie, which keeps its process group reserved for as long as the caller
+/// needs it (POSIX keeps a process group alive while any member is within
+/// its process lifetime, and a zombie still is — see
+/// `signal_child_pgroup_or_fallback` and `spawn_in_new_process_group`'s
+/// `setsid`, which is what makes this pid equal its own pgid).
+///
+/// Returns `Ok(true)` once `pid` has exited, `Ok(false)` while it is still
+/// running. A `waitid` failure (`ECHILD` if `pid` was already reaped by
+/// something else, or any other error) is returned as `Err` rather than
+/// guessed at — the caller is expected to treat that conservatively (stop
+/// polling this pid) and let whatever unconditional signal-and-reap step
+/// runs after the grace window handle it regardless, the same way
+/// [`terminate_child_with_grace_and_wait_impl`]'s non-forcing branch treats
+/// its own `try_wait` error as "stop polling" via `Err(_) => break`.
+pub fn peek_child_exited_without_reaping(pid: u32) -> std::io::Result<bool> {
+    // SAFETY: `waitid` is async-signal-safe. `info` is zeroed before the
+    // call because a successful `WNOHANG` call that finds no reportable
+    // state change is documented to leave `si_pid` untouched rather than
+    // zeroing it itself (a known kernel quirk, not specific to this
+    // codebase) — zeroing here first is what makes `si_pid() == pid` a
+    // reliable "did anything happen" signal instead of stale stack memory.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `&mut info` is a valid, uniquely-owned `siginfo_t` for the
+    // duration of this call; `WNOWAIT` means the kernel only reports state,
+    // it does not reap, so this cannot race any other reaper of `pid`.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `info` was just populated by the successful `waitid` call
+    // above (or left at its zeroed default when nothing changed), and
+    // `si_pid` is the field `waitid`'s `SIGCHLD`-shaped report always uses.
+    let observed_pid = unsafe { info.si_pid() };
+    Ok(observed_pid == pid as libc::pid_t)
+}
+
 /// Forcefully terminate the child *and every descendant in its process group*
 /// with SIGKILL and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can

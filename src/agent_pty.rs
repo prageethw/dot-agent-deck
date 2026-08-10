@@ -4504,12 +4504,27 @@ impl AgentPtyRegistry {
 
     /// PRD #92 F1: graceful shutdown of every agent in the registry. Sends
     /// SIGTERM to each child, waits up to `grace` for them to exit (polling
-    /// `try_wait` so an early exiter isn't penalised by the wall-clock
-    /// deadline), then SIGKILLs anything that's still alive. Idempotent —
-    /// a second call (e.g. from a second `KIND_SHUTDOWN` arriving during
-    /// teardown, or from a SIGTERM-triggered drop path racing the protocol
-    /// handler) returns immediately so we don't fight ourselves for
-    /// ownership of each `Child`.
+    /// a non-reaping peek so an early exiter isn't penalised by the
+    /// wall-clock deadline), then unconditionally SIGKILLs and reaps every
+    /// agent's process group/job, whether or not phase 2 observed it exit.
+    /// Idempotent — a second call (e.g. from a second `KIND_SHUTDOWN`
+    /// arriving during teardown, or from a SIGTERM-triggered drop path
+    /// racing the protocol handler) returns immediately so we don't fight
+    /// ourselves for ownership of each `Child`.
+    ///
+    /// Fork issue #163 rework (PR #207 review + audit): an earlier version
+    /// of this function tracked which agents phase 2's `try_wait` reaped
+    /// and skipped exactly those in phase 3. That saved a redundant signal,
+    /// but `try_wait`'s reap releases the agent's pid back to the kernel —
+    /// on Unix that let phase 3 skip precisely the agents fork #133's
+    /// descendant-kill guarantee exists to protect, and skipping was wrong
+    /// on Windows for an unrelated reason (phase 3 there targets a Job
+    /// Object *handle*, which cannot be recycled, so the skip bought no
+    /// safety and cost the only `TerminateJobObject` backstop on this
+    /// path). Phase 2 now observes exit without reaping — see
+    /// [`crate::platform::proc::peek_child_exited_without_reaping`] — so
+    /// phase 3 can stay unconditional on every platform: it always reaches
+    /// every agent, whether or not phase 2 saw it exit.
     ///
     /// The Drop impl still calls [`shutdown_all`] for the SIGKILL-without-grace
     /// path — that path is reached on idle shutdown and test cleanup where
@@ -4545,35 +4560,35 @@ impl AgentPtyRegistry {
             );
         }
 
-        // Phase 2: poll each child's `try_wait` until all have exited or
-        // the grace window elapses. Polling avoids the obvious "sleep for
-        // grace then SIGKILL" alternative — agents that exit promptly
-        // don't have to wait around for the slowest sibling.
+        // Phase 2: poll each child's exit status until all have exited or
+        // the grace window elapses, so agents that exit promptly don't have
+        // to wait around for the slowest sibling (the early break below is
+        // load-bearing: `shutdown_graceful_001` asserts a registry that has
+        // already exited returns in well under `grace`). The poll itself
+        // must never reap — see `observe_exit_without_reaping` — so phase 3
+        // can stay unconditional (fork issue #163) without re-deriving a
+        // pgid from a pid phase 2 already released.
         //
-        // Fork issue #163: `try_wait`'s underlying `waitpid(WNOHANG)` reaps
-        // as a side effect of merely checking exit status, releasing that
-        // agent's pid back to the kernel — where it can be recycled by an
-        // unrelated process before phase 3 runs. `reaped` records, per
-        // agent, which ones *this loop itself* has already observed
-        // exiting, so phase 3 can skip re-deriving a pgid from (and
-        // signalling) a pid it no longer owns. This discriminates on "did
-        // phase 2 actually reap this one", not on "does this one look
-        // dead" — an agent phase 2 never observes exiting is untouched
-        // here and still gets phase 3's forcing SIGKILL against its live
-        // group, so a same-group descendant that outlives its leader is
-        // still reached (see `shutdown_graceful_001`'s control scenario).
-        // Once an agent is marked reaped it is skipped for the rest of
-        // this loop too, so its child is never polled a second time.
-        let mut reaped = vec![false; agents.len()];
+        // Reviewer P2-3: this loop polls every not-yet-exited agent every
+        // round rather than short-circuiting at the first one still
+        // running (the pre-#163 code's `.all()` did short-circuit, which
+        // made which agents got polled on a *timeout* break depend on
+        // `HashMap` iteration order). That no longer has any bearing on
+        // correctness now that phase 3 never skips an agent based on what
+        // phase 2 observed — it only affects how promptly the early break
+        // above can trigger — but is worth stating since the earlier,
+        // now-superseded fix changed this same loop and never recorded it
+        // anywhere a future reader would see it.
+        let mut observed_exited = vec![false; agents.len()];
         let deadline = std::time::Instant::now() + grace;
         loop {
             let mut all_exited = true;
-            for (agent, agent_reaped) in agents.iter_mut().zip(reaped.iter_mut()) {
-                if *agent_reaped {
+            for (agent, exited) in agents.iter_mut().zip(observed_exited.iter_mut()) {
+                if *exited {
                     continue;
                 }
-                if matches!(agent.child.try_wait(), Ok(Some(_))) {
-                    *agent_reaped = true;
+                if observe_exit_without_reaping(&mut agent.child) {
+                    *exited = true;
                 } else {
                     all_exited = false;
                 }
@@ -4587,19 +4602,18 @@ impl AgentPtyRegistry {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Phase 3: SIGKILL any survivor and reap. Agents phase 2 already
-        // reaped are skipped entirely (fork #163) — `force_kill_child_and_wait`
-        // derives its kill target from the child's pid/handle at call time,
-        // and calling it on an already-reaped agent would signal whatever
-        // now holds that recycled identity rather than the exited agent's
-        // own (already-empty) group. On Windows this is where the
-        // `TerminateJobObject` backstop for each surviving agent's
-        // descendant tree runs (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT`
-        // is best-effort only.
-        for (mut agent, agent_reaped) in agents.into_iter().zip(reaped) {
-            if agent_reaped {
-                continue;
-            }
+        // Phase 3: SIGKILL every agent's process group/job and reap it,
+        // unconditionally — regardless of what phase 2 observed. On Unix
+        // this is safe to do even for an agent phase 2 saw exit, because
+        // phase 2 never reaped it: the zombie (and therefore its process
+        // group, which equals its own pid — `spawn_in_new_process_group`'s
+        // `setsid`) is still reserved, so `force_kill_child_and_wait` can't
+        // land on a recycled pid (fork #163). On Windows this is where the
+        // `TerminateJobObject` backstop for each agent's descendant tree
+        // runs (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort
+        // only, and unlike a pid, a Job Object handle is never recyclable,
+        // so there was never a reason to skip it here.
+        for mut agent in agents {
             crate::platform::proc::force_kill_child_and_wait(
                 &mut agent.child,
                 &agent.process_group,
@@ -4607,6 +4621,61 @@ impl AgentPtyRegistry {
         }
 
         self.change_notify.notify_one();
+    }
+}
+
+/// Phase 2 helper for [`AgentPtyRegistry::shutdown_all_graceful`]: report
+/// whether `child` has exited, without reaping it — reaping is what fork
+/// issue #163 is about, and phase 3 depends on nothing in the grace window
+/// having reaped anything (see that function's doc comment).
+///
+/// Unix routes through [`crate::platform::proc::peek_child_exited_without_reaping`],
+/// a non-reaping `libc::waitid(WNOWAIT)` peek keyed on the real pid. There is
+/// deliberately no Windows counterpart in the `platform::proc` seam: Windows
+/// phase 3 targets a Job Object handle rather than a pid, so nothing there
+/// can be recycled by an intervening reap, and Windows's `try_wait` (a
+/// `GetExitCodeProcess` query) was never unsafe to call in the grace window
+/// to begin with.
+fn observe_exit_without_reaping(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(pid) = child.process_id() else {
+            // No pid to peek — practically unreachable in production (see
+            // `signal_child_pgroup_or_fallback`'s doc comment), and safe
+            // either way: without a pid, phase 3's `force_kill_child_and_wait`
+            // can't derive a pgid to signal in the first place, so there is
+            // no recycled-pid hazard for this agent regardless of what
+            // phase 2 does. Treat as still-running rather than falling
+            // back to the reaping `try_wait` — nothing in this grace
+            // window should reap.
+            return false;
+        };
+        match crate::platform::proc::peek_child_exited_without_reaping(pid) {
+            Ok(exited) => exited,
+            Err(e) => {
+                // Auditor F3: the old `try_wait`-based loop treated this
+                // arm (canonically `ECHILD`, meaning something else already
+                // reaped this pid) as "still running" and kept polling it
+                // for the rest of the grace window to no purpose — the
+                // sibling non-forcing loop at `unix.rs:400` already treats
+                // an error as "stop polling" (`Err(_) => break`). Do the
+                // same here: stop re-peeking this agent and let phase 3's
+                // now-unconditional signal-and-reap handle it regardless,
+                // logging so a real failure here isn't silent.
+                tracing::warn!(
+                    pid,
+                    error = %e,
+                    "peek_child_exited_without_reaping failed during graceful shutdown; \
+                     treating this agent as observed-exited so phase 2 stops re-polling it — \
+                     phase 3 still signals and reaps it unconditionally regardless"
+                );
+                true
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(child.try_wait(), Ok(Some(_)))
     }
 }
 
