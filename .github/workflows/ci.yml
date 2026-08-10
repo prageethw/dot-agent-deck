@@ -128,9 +128,16 @@ jobs:
       # `--workspace`, NOT bare (fork #185). The root `Cargo.toml` is a
       # non-virtual workspace (it carries its own `[package]` alongside
       # `[workspace] members`), so without `--workspace` or `-p` Cargo treats
-      # the root package as "the current package" and clippy never even
-      # compiles the `xtask/*` members (`xtask/docs`, `xtask/linkage-check`,
-      # `xtask/spec`), let alone lints them. `--all-targets` and `--workspace`
+      # the root package as "the current package" and the three `xtask/*`
+      # members go unlinted. Two of them were still COMPILED, and only one
+      # was fully invisible — which is where the damage landed. `spec` and
+      # `xtask-docs` are `[dev-dependencies]` of the root, so `--all-targets`
+      # already built them: compiled-but-unlinted. `xtask-linkage-check` is a
+      # dependency of nothing, so the bare command never compiled it at all —
+      # and that is the crate the resident `unnecessary_sort_by` lived in.
+      # Don't flatten those two failures into "never even compiled"; this
+      # comment said exactly that until #185's own review caught it.
+      # `--all-targets` and `--workspace`
       # widen two different axes of the same blind spot: the former widens
       # *which targets* within a package are linted, the latter widens *which
       # packages* are linted at all — fork #117 fixed the first axis on this
