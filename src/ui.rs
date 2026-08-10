@@ -30918,10 +30918,18 @@ mod tests {
     /// position, turning a muscle-memory click into a destructive cancel —
     /// fork#192 review F3) but must be excluded from the click rects
     /// (present-but-INERT, the same mechanism `render_modal_button_row`
-    /// already uses for any disabled button). `[Cancel]`'s rect must be
-    /// identical between the two renders. The collision must also render
-    /// the blocking-refusal copy, not merely omit a button with no
-    /// explanation (fork#192 review F8).
+    /// already uses for any disabled button). The hazard is pinned WITHIN
+    /// the colliding render — `[Cancel]`'s clickable rect must not overlap
+    /// inert `[Submit]`'s screen position — rather than by comparing
+    /// `[Cancel]`'s rect across the colliding and distinct-name renders:
+    /// those are two different-sized popups by design (the collision's
+    /// warning widens/heightens `desired_w`/`desired_h`, same as PRD #140's
+    /// existing same-cwd warning), so a cross-render position match would
+    /// pin modal-centring invariance under a warning appearing, which this
+    /// codebase deliberately does not provide (fork#192 review round 2,
+    /// F3/F8 correction). The collision must also render the
+    /// blocking-refusal copy, not merely omit a button with no explanation
+    /// (fork#192 review F8).
     #[spec("orchestration/guard/002")]
     #[test]
     fn guard_002_name_collision_blocks_submit_distinct_name_does_not() {
@@ -30949,6 +30957,32 @@ mod tests {
                 text,
                 targets.expect("render_new_pane_form must run inside draw"),
             )
+        }
+
+        // Locate a label's on-screen `Rect` by scanning the rendered text
+        // grid for it directly — needed for `[Submit]` here because an
+        // inert button is (by design) excluded from the click-rect list
+        // this test otherwise reads from, so its position isn't available
+        // any other way. Column indices come from `.chars()`, not byte
+        // offsets, so a multi-byte border glyph earlier on the line can't
+        // shift the result.
+        fn rect_of_text(text: &str, needle: &str) -> Rect {
+            let needle: Vec<char> = needle.chars().collect();
+            for (y, line) in text.lines().enumerate() {
+                let chars: Vec<char> = line.chars().collect();
+                if let Some(x) = chars
+                    .windows(needle.len())
+                    .position(|window| window == needle.as_slice())
+                {
+                    return Rect {
+                        x: x as u16,
+                        y: y as u16,
+                        width: needle.len() as u16,
+                        height: 1,
+                    };
+                }
+            }
+            panic!("{needle:?} not found in rendered text:\n{text}");
         }
 
         let (colliding_text, (_, _, colliding_buttons)) =
@@ -30980,16 +31014,16 @@ mod tests {
             .find(|(action, _)| matches!(action, Action::FormCancel))
             .map(|(_, rect)| *rect)
             .expect("[Cancel] must always be clickable");
-        let distinct_cancel = distinct_buttons
-            .iter()
-            .find(|(action, _)| matches!(action, Action::FormCancel))
-            .map(|(_, rect)| *rect)
-            .expect("[Cancel] must always be clickable");
-        assert_eq!(
-            colliding_cancel, distinct_cancel,
-            "[Cancel]'s screen position must not move between the colliding \
-             and non-colliding renders — a moved Cancel is exactly the \
-             muscle-memory misclick hazard this pin exists to catch"
+        let colliding_submit_rect = rect_of_text(&colliding_text, "[Submit]");
+        assert!(
+            !colliding_cancel.intersects(colliding_submit_rect),
+            "[Cancel] at {colliding_cancel:?} must not overlap the inert \
+             [Submit] at {colliding_submit_rect:?} within the SAME \
+             (colliding) render — an overlap is exactly the muscle-memory \
+             misclick hazard this pin exists to catch: with [Submit] \
+             present but laid out first, [Cancel] structurally cannot slide \
+             into its cells regardless of the popup's size or position, \
+             got:\n{colliding_text}"
         );
 
         assert!(
