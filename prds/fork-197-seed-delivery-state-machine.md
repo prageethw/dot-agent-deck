@@ -4,7 +4,18 @@
 
 **Priority**: High
 
-**Status**: Planning
+**Status**: In progress — test plan approved and the two open mechanism choices decided (see *Decisions taken*). M1 starting; M2–M4 not started.
+
+## Decisions taken
+
+Both were left open by this document for the implementer to choose. The user has now decided them, so they are no longer open questions and the implementer should not re-litigate either.
+
+- **M3 → a submission event, not a per-cycle nonce.** Confirmation compares against a *submission event* rather than diffing `last_user_prompt`'s value. The nonce alternative is rejected on exactly the ground this PRD's own Risks section raises: the remit pointer is user-visible text in the pane, and a varying token in it is a UX regression.
+- **M4 → submit-only, not clear-then-rewrite.** A confirmation-retry sends a bare CR rather than text plus CR, since `Applied` already means the bytes reached the PTY. This avoids inventing an agent-agnostic composer-clear primitive that claude/opencode/codex/pi do not share.
+
+  **This makes the lost-write risk live, not hypothetical**, which the Risks section anticipated: if the bytes were genuinely lost downstream, a bare CR does nothing and the deadline finalizes as *delivered-unconfirmed* — the exact silent-loss symptom upstream #424 exists to catch. So extending `orchestration/seed/005` for the lost-write half is **mandatory** under this choice, not optional, and it is the single most important thing for review and audit to probe.
+
+  It also keeps the rule 12 answer unchanged: submit-only needs no new pane RPC, so no `PROTOCOL_VERSION` bump and no cross-version manual run. Had clear-then-rewrite been chosen, the composer-clear primitive would have made this a contract change. **Re-answer if the implementation ends up needing a new RPC anyway.**
 
 **Fork-only**, and currently intended to stay so. Verified mechanically against `upstream/main`: `orchestration_awaiting_confirmation`, `CONFIRMATION_GRACE_PERIOD`, `prompt_text_confirms` and `AwaitingConfirmation` all have **0** occurrences there. Upstream issue #424 is still OPEN — upstream carries the original problem and never received the fix, so there is nothing there to fix. This becomes an upstream offer only if `46b64f0` is eventually contributed, which is better done with this PRD already folded into it.
 
@@ -71,7 +82,9 @@ No change to `PROTOCOL_VERSION` is anticipated: this is TUI-side delivery logic,
 
 **M3 — Confirmation for repeated text (closes #187).** Make TEXT confirmation fire on a genuine resubmission of identical text, then remove LEVEL. Unblocks #423's re-assertion, which today either confirms on a `PostCompact` that is not a submit (right outcome, wrong reason) or waits out the 60 s deadline.
 
-**M4 — Non-duplicating retry (closes #194).** A retry after a `Landed` write must not deliver the prompt text a second time, **and** a genuinely lost write must still get a real retry. Both halves are required — satisfying one alone regresses the other. Two candidate mechanisms, for the implementer to choose on evidence: *submit-only* (send a bare CR; trivially satisfies the first half, risks the second if the bytes never landed) or *clear-then-rewrite* (correct either way, but needs an agent-agnostic composer-clear primitive that claude/opencode/codex/pi do not share).
+**M4 — Non-duplicating retry (closes #194).** A retry after a `Landed` write must not deliver the prompt text a second time, **and** a genuinely lost write must still get a real retry. Both halves are required — satisfying one alone regresses the other. **Decided: submit-only** — send a bare CR, since `Applied` already means the bytes reached the PTY. See *Decisions taken* for why, and for the mandatory `orchestration/seed/005` extension that choice carries. The rejected alternative was *clear-then-rewrite*, which is correct either way but needs an agent-agnostic composer-clear primitive that claude/opencode/codex/pi do not share.
+
+**Open implementation question the implementer must report rather than resolve silently:** it is not established that a submit-without-text can be expressed through the existing pane API at all. `write_and_submit_to_pane_with_identity` takes text, and `prompt_text_confirms` rejects empty strings. Whether a bare CR rides the existing primitive or needs a new one is unresolved — and if it needs a new pane RPC, that re-opens the rule 12 contract question above.
 
 Order is load-bearing: M1 first so M2–M4 are written in phase terms. M2–M4 are then independent of each other.
 
@@ -79,7 +92,7 @@ Order is load-bearing: M1 first so M2–M4 are written in phase terms. M2–M4 a
 
 Extend the existing `orchestration/seed/*` L1 family (`004`–`010`), which already drives `deliver_orchestrator_prompt` directly against a `SendResultPaneController` with an injected clock — the right harness, already built.
 
-- **M1**: no new tests; the existing family passing unchanged *is* the assertion.
+- **M1**: the existing family passing unchanged is the primary assertion — M1 is a refactor with no behaviour change, which CLAUDE.md rule 4 does not require a new test for. **One exception, added when the test plan was approved:** a new `orchestration/seed/012` pinning that `reset_delivery_cycle()` clears *every* per-cycle field, so a fresh cycle mints a fresh `delivery_id` and gets a real write rather than a ledger replay. It exists because "a fifth piece of state is silently forgotten at one of the three clear sites" is the precise failure M1 is meant to prevent, and the existing family cannot detect it — the round-4 review had to verify all six pieces by hand.
 - **M2**: a mode-seed test asserting an `Applied` write is not treated as delivered, and that the 10 s fallback waits out the readiness buffer.
 - **M3**: a second delivery cycle on one tab with byte-identical prompt text, asserting a genuine submit confirms. **This test goes RED today** — known-failing behaviour, not a coverage gap.
 - **M4**: frame 1 lands an `Applied` write; frame 2, past the grace period with no submit observed, retries **without** the prompt text reaching the pane twice. Extend `orchestration/seed/005` for the lost-write half.
