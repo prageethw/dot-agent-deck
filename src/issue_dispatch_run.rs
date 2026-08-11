@@ -496,8 +496,10 @@ async fn dispatch_one_issue(
     // (`scheduler/dispatch/021`), never the scheduled task that fired it. The
     // anchor itself (CLAUDE.md rule 23) is THIS issue's own dispatched
     // worktree's absolute path plus its branch (`paths.worktree_dir` /
-    // `paths.branch`) — the one the spawned agent actually runs in — never a
-    // host or a digest; the task/orchestration name is decoration only.
+    // `paths.branch`) — the one the spawned agent actually runs in — plus
+    // the claiming host (round-3 audit A1, `issue/claim/016`) that every
+    // `Identity::Worktree` constructor resolves automatically; never a
+    // digest. The task/orchestration name is decoration only.
     let identity = match &handle.kind {
         SpawnKind::Orchestration { name } => {
             Identity::orchestration(name, &paths.worktree_dir, &paths.branch)
@@ -532,10 +534,16 @@ async fn dispatch_one_issue(
 /// the bound spawn handle's identity (an orchestration's own typed name, or
 /// `task_name`#`issue` for a single-agent dispatch; see the call site).
 ///
-/// Three writes, in order: label (unchanged since PRD #421), assignee
-/// (skipped entirely when `login` is `None` — no resolved human to assign),
-/// then the comment (always posted, appended never edited in place — the log
-/// is the history).
+/// Three writes, in order: the comment (always posted, appended never edited
+/// in place — the log is the history), then the label (unchanged since PRD
+/// #421), then the assignee (skipped entirely when `login` is `None` — no
+/// resolved human to assign). Comment-FIRST, mirroring `issue_claim::do_claim`
+/// (auditor A8, round-3 hardening): the OLD label-then-comment order could
+/// leave the issue LABELLED with no discoverable comment if the comment
+/// write failed after the label write already landed. The prior claimant's
+/// login (for the assignee's replace-to-one) is resolved before ANY of these
+/// three writes, so it always reads the ACTUAL prior holder, never this
+/// run's own just-posted comment.
 ///
 /// Best-effort in the sense that mattered from the start (never propagated,
 /// never turns a successful dispatch into `IssueDispatchFailed` — see the
@@ -562,6 +570,37 @@ async fn claim_issue(
     login: Option<&str>,
     notifier: &dyn Notifier,
 ) {
+    // PRD fork#235 M2: `prior` is the login parsed from the newest EXISTING
+    // claim comment — the deck's own receipt for what it assigned last, not
+    // an assumption about who currently holds the GitHub-native assignee
+    // field. Resolved FIRST, before this run posts its own comment below —
+    // reading it any later would find this run's own just-posted comment
+    // instead of the actual prior holder's.
+    let prior_login = if login.is_some() {
+        fetch_claim_comment(repo, issue).await.and_then(|c| c.login)
+    } else {
+        None
+    };
+
+    // Auditor A8: `issue_claim::do_claim`'s comment-FIRST, label-SECOND
+    // ordering fix (reviewer/auditor F4) landed on the CLI path only. The
+    // OLD label-then-comment order here could leave the issue LABELLED with
+    // no discoverable comment if the comment write failed AFTER the label
+    // write already landed — `ClaimDecision::RefuseNoIdentity`'s wedge state
+    // (`issue/claim/013`'s escape hatch recovers it, but avoiding it is
+    // better than merely recovering from it). Mirror the same order here.
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let body = claim_comment_body(identity, &timestamp, login, None);
+    let comment_argv = issue_comment_argv(repo, issue, &body);
+    if let Err(e) = run_status_args("gh", &comment_argv).await {
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            message: format!("failed to post the claim comment: {e}"),
+        });
+    }
+
     let label_argv = issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL);
     if let Err(e) = run_status_args("gh", &label_argv).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
@@ -573,13 +612,14 @@ async fn claim_issue(
     }
 
     if let Some(login) = login {
-        // PRD fork#235 M2: `prior` is the login parsed from the newest
-        // existing claim comment — the deck's own receipt for what it
-        // assigned last, not an assumption about who currently holds the
-        // GitHub-native assignee field.
-        let prior_login = fetch_claim_comment(repo, issue).await.and_then(|c| c.login);
-        let assignee_argv =
-            issue_edit_assignee_argv(repo, issue, Some(login), prior_login.as_deref());
+        // Reviewer R3 / auditor A8 (`issue/claim/019`): mirror
+        // `issue_claim::do_claim`'s same-identity-refresh fix
+        // (`issue/claim/011`) — a same-login `--add-assignee X
+        // --remove-assignee X` pair nets the issue UNASSIGNED under real
+        // `gh`'s add-then-remove ordering. That fix landed on the CLI path
+        // only; this is the dispatch path's own copy of the same defect.
+        let remove = prior_login.as_deref().filter(|prior| *prior != login);
+        let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), remove);
         if let Err(e) = run_status_args("gh", &assignee_argv).await {
             notifier.notify(NotifyEvent::IssueClaimFailed {
                 task: task_name.to_string(),
@@ -588,18 +628,6 @@ async fn claim_issue(
                 message: format!("failed to write the assignee: {e}"),
             });
         }
-    }
-
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let body = claim_comment_body(identity, &timestamp, login, None);
-    let comment_argv = issue_comment_argv(repo, issue, &body);
-    if let Err(e) = run_status_args("gh", &comment_argv).await {
-        notifier.notify(NotifyEvent::IssueClaimFailed {
-            task: task_name.to_string(),
-            repo: repo.to_string(),
-            issue,
-            message: format!("failed to post the claim comment: {e}"),
-        });
     }
 }
 

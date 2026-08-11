@@ -476,6 +476,18 @@ pub enum Identity {
     Worktree {
         path: PathBuf,
         branch: String,
+        /// The claiming machine's own hostname (round-3 audit A1): without
+        /// this, two decks on two DIFFERENT physical machines whose
+        /// worktrees happen to share an absolute path (ordinary under
+        /// Codespaces/devcontainers' `/workspaces/<repo>` convention) compare
+        /// EQUAL and both take the idempotent-refresh row — #74 verbatim.
+        /// Always populated fresh (via [`crate::issue_dispatch_run::local_hostname`])
+        /// by every constructor below; a [`ParsedClaim`] reconstructed from a
+        /// comment with no discoverable host clause (an older-shaped or
+        /// hand-typed comment) simply omits it from the compared string,
+        /// which can then never equal a freshly-resolved caller's identity —
+        /// failing closed rather than assuming same-host.
+        host: String,
         label: Option<String>,
     },
     /// A human claiming outside any worktree: `human:<login>@<host>`. `login`
@@ -484,14 +496,28 @@ pub enum Identity {
     Human { login: String, host: String },
 }
 
+/// Best-effort canonicalisation for an [`Identity::Worktree`]'s `path`
+/// (round-3 audit R2/A6), applied HERE — the one place every constructor
+/// below funnels through — so the CLI's physical `getcwd()`-derived path and
+/// the dispatch path's lexical, possibly symlink-containing configured path
+/// always converge on the same string without either call site needing to
+/// remember to normalise itself. Falls back to the given path unchanged when
+/// canonicalization fails (a synthetic/non-existent path in a unit test, or
+/// a real filesystem error) — an identity is still buildable, it just can no
+/// longer promise the normalized form.
+fn canonicalize_identity_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl Identity {
     /// Build a bare [`Identity::Worktree`] with no decorative label — the CLI
     /// `issue claim` path (`src/issue_claim.rs`), which resolves purely from
     /// `git` (round 3 reads no marker, so it has no name to decorate with).
     pub fn worktree(path: &Path, branch: &str) -> Self {
         Identity::Worktree {
-            path: path.to_path_buf(),
+            path: canonicalize_identity_path(path),
             branch: branch.to_string(),
+            host: crate::issue_dispatch_run::local_hostname(),
             label: None,
         }
     }
@@ -503,8 +529,9 @@ impl Identity {
     /// untrusted text landing in a public GitHub comment.
     pub fn orchestration(name: &str, worktree_path: &Path, branch: &str) -> Self {
         Identity::Worktree {
-            path: worktree_path.to_path_buf(),
+            path: canonicalize_identity_path(worktree_path),
             branch: branch.to_string(),
+            host: crate::issue_dispatch_run::local_hostname(),
             label: Some(format!(
                 "the orchestration `{}`",
                 sanitize_claimant_name(name)
@@ -517,8 +544,9 @@ impl Identity {
     /// the same reason as [`Identity::orchestration`]'s `name`.
     pub fn issue_dispatch(task: &str, issue: u64, worktree_path: &Path, branch: &str) -> Self {
         Identity::Worktree {
-            path: worktree_path.to_path_buf(),
+            path: canonicalize_identity_path(worktree_path),
             branch: branch.to_string(),
+            host: crate::issue_dispatch_run::local_hostname(),
             label: Some(format!(
                 "the issue-dispatch task `{}` (issue #{issue})",
                 sanitize_claimant_name(task)
@@ -539,13 +567,21 @@ impl Identity {
 impl std::fmt::Display for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // The compared string names ONLY the anchor (path + branch) —
-            // `label` is decoration and must never affect comparison
+            // The compared string names the anchor (path + branch) PLUS the
+            // claiming host (round-3 audit A1) — `label` is decoration and
+            // must never affect comparison
             // (`identity_comparison_is_on_the_whole_string_not_the_name_alone`
             // pins this: two callers sharing a `label` but rooted in
-            // different worktrees must still compare unequal).
-            Identity::Worktree { path, branch, .. } => {
-                write!(f, "worktree:{}@{branch}", path.display())
+            // different worktrees must still compare unequal). `|` separates
+            // the host from `path@branch` — distinct from the pre-existing
+            // `@` separator so a host can never be misread as part of the
+            // branch, and not a control character, so
+            // [`sanitize_claimant_name`] never mangles it when this string
+            // is later echoed into a "taking over from" tail.
+            Identity::Worktree {
+                path, branch, host, ..
+            } => {
+                write!(f, "worktree:{}@{branch}|{host}", path.display())
             }
             Identity::Human { login, host } => write!(f, "human:{login}@{host}"),
         }
@@ -664,15 +700,31 @@ pub struct ParsedClaim {
 /// literal text between `working` and the backtick differs):
 ///   - Human: ``@<login> working from `<host>` at <ts>[, taking over from
 ///     <tail>].``
-///   - Worktree: ``<decoration>working `<path>` on branch `<branch>` at
-///     <ts>[, for @<login>][, taking over from <tail>].``
+///   - Worktree: ``<decoration>working `<path>` on branch `<branch>`[ on host
+///     <host>] at <ts>[, for @<login>][, taking over from <tail>].``
 pub fn parse_claim_fields(raw: &str) -> Option<ParsedClaim> {
     let rest = raw.strip_prefix(CLAIM_COMMENT_PREFIX)?;
+    let line = claim_line(rest);
 
-    if let Some(after_at) = rest.strip_prefix('@') {
+    if let Some(after_at) = line.strip_prefix('@') {
         return parse_human_claim(after_at, raw);
     }
-    parse_worktree_claim(rest, raw)
+    parse_worktree_claim(line, raw)
+}
+
+/// Bound one claim's own text (round-3 audit: reviewer/auditor found the
+/// SAME "scan the whole remaining body" shape independently in the
+/// timestamp search AND the login search — `issue/claim/012`). A forged
+/// SECOND `Claimed by` line injected across a raw newline must never be
+/// reachable by any field's sub-search, so every sub-search below operates
+/// on THIS bounded slice rather than the unbounded rest of the comment.
+/// Bounded at whichever comes first: the next newline, or (defence in depth,
+/// even absent a newline) the next literal [`CLAIM_COMMENT_PREFIX`]
+/// occurrence.
+fn claim_line(rest: &str) -> &str {
+    let newline_at = rest.find('\n').unwrap_or(rest.len());
+    let next_claim_at = rest.find(CLAIM_COMMENT_PREFIX).unwrap_or(rest.len());
+    &rest[..newline_at.min(next_claim_at)]
 }
 
 /// Parse the human-form claim body (everything after the `Claimed by @`
@@ -717,14 +769,35 @@ fn parse_worktree_claim(rest: &str, raw: &str) -> Option<ParsedClaim> {
     let branch = after_branch_marker[..branch_end].to_string();
     let after_branch = &after_branch_marker[branch_end + 1..];
 
-    let timestamp = extract_timestamp(after_branch)?;
+    // The host clause (round-3 audit A1) is OPTIONAL: present only in a
+    // comment posted by this round's own writer (`claim_comment_body`),
+    // never in an older-shaped or hand-typed comment. When absent, the
+    // reconstructed identity carries NO host component at all — it can then
+    // never compare equal to a freshly-resolved caller identity (which
+    // always knows its own host), refusing rather than assuming same-host
+    // (`issue/claim/016`). Not backtick-wrapped: the host is locally
+    // resolved, never attacker-influenceable (this PRD's Threat model
+    // excludes a hostile local process), so it needs no code-span escaping.
+    let host_marker = " on host ";
+    let (host_suffix, after_host_or_branch) = match after_branch.strip_prefix(host_marker) {
+        Some(after_host) => {
+            let host_end = after_host.find(" at ")?;
+            (
+                format!("|{}", &after_host[..host_end]),
+                &after_host[host_end..],
+            )
+        }
+        None => (String::new(), after_branch),
+    };
+
+    let timestamp = extract_timestamp(after_host_or_branch)?;
     let login = rest.find(", for @").map(|idx| {
         let after = &rest[idx + ", for @".len()..];
         let end = after.find(',').unwrap_or(after.len());
         after[..end].trim_end_matches('.').to_string()
     });
     Some(ParsedClaim {
-        identity: format!("worktree:{path}@{branch}"),
+        identity: format!("worktree:{path}@{branch}{host_suffix}"),
         timestamp,
         login,
         raw: raw.to_string(),
@@ -841,12 +914,26 @@ pub fn claim_comment_body(
         Identity::Worktree {
             path,
             branch,
+            host,
             label,
         } => {
             let label = label.as_deref().unwrap_or("the orchestration");
+            // Round-3 audit A3 (`issue/claim/020`): `path` and `branch` can
+            // both be attacker-influenceable with NO forged comment involved
+            // at all — a scheduled-task NAME reaches `path` via
+            // `sanitize_clone_segment`, which strips only `/ \ \0 ..`, not
+            // backticks, and a raw git branch name is not restricted from
+            // containing one either. Sanitize both, exactly like a claimant
+            // NAME, before they go inside their own backtick-wrapped span —
+            // otherwise an embedded backtick closes that span early and
+            // whatever follows (an `@mention`, a forged `Claimed by` line)
+            // renders as LIVE markdown. Sanitizing here (not in the stored
+            // `Identity`) leaves the compared identity string untouched.
+            let path_str = sanitize_claimant_name(&path.display().to_string());
+            let branch_str = sanitize_claimant_name(branch);
             format!(
-                "{CLAIM_COMMENT_PREFIX}{label} working `{}` on branch `{branch}` at {timestamp}",
-                path.display()
+                "{CLAIM_COMMENT_PREFIX}{label} working `{path_str}` on branch `{branch_str}` on \
+                 host {host} at {timestamp}"
             )
         }
         Identity::Human { login, host } => {
@@ -1499,14 +1586,21 @@ mod tests {
 
     #[test]
     fn identity_renders_each_form() {
+        // Round-3 audit A1: `Identity::Worktree` always carries the local
+        // machine's own host (see the field's doc) as part of the compared
+        // string, so the expected strings below reference the SAME
+        // `local_hostname()` this process would resolve, rather than a
+        // hardcoded value — the assertion must hold on every machine, not
+        // just the one it was written on.
+        let host = crate::issue_dispatch_run::local_hostname();
         assert_eq!(
             Identity::orchestration("orch-A", Path::new("/work/wt-a"), "branch-a").to_string(),
-            "worktree:/work/wt-a@branch-a"
+            format!("worktree:/work/wt-a@branch-a|{host}")
         );
         assert_eq!(
             Identity::issue_dispatch("dispatch-task", 7, Path::new("/work/wt"), "branch-x")
                 .to_string(),
-            "worktree:/work/wt@branch-x"
+            format!("worktree:/work/wt@branch-x|{host}")
         );
         assert_eq!(
             Identity::human("alice", "host-1").to_string(),

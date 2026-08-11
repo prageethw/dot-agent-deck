@@ -173,10 +173,46 @@ fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
                     cwd.display()
                 ));
             }
-            let branch = resolve_branch(cwd)?;
-            Ok(Identity::worktree(cwd, &branch))
+            // Round-3 audit R1/A5 (`issue/claim/017`): anchor on the
+            // worktree ROOT, never `cwd` verbatim — otherwise a claim from
+            // `<wt>/src` resolves a DIFFERENT identity than one from `<wt>`
+            // itself, splitting one actor into as many identities as it has
+            // subdirectories, contradicting CLAUDE.md rule 1's "every pane
+            // in one worktree shares that worktree's identity".
+            let root = resolve_worktree_root(cwd)?;
+            let branch = resolve_branch(&root)?;
+            Ok(Identity::worktree(&root, &branch))
         }
     }
+}
+
+/// Resolve `cwd`'s worktree ROOT via `git rev-parse --show-toplevel` — the
+/// other half of round 3's identity anchor alongside [`resolve_branch`].
+/// Works identically from the worktree root or any subdirectory of it (git
+/// resolves the toplevel relative to the repo, not the caller's own `cwd`),
+/// which is exactly why anchoring on this rather than `cwd` verbatim fixes
+/// `issue/claim/017`.
+fn resolve_worktree_root(cwd: &Path) -> Result<std::path::PathBuf, String> {
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| format!("failed to run `git rev-parse --show-toplevel`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git rev-parse --show-toplevel` failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err(format!(
+            "`git rev-parse --show-toplevel` returned empty output in {}",
+            cwd.display()
+        ));
+    }
+    Ok(std::path::PathBuf::from(root))
 }
 
 /// Resolve `cwd`'s current branch via `git rev-parse --abbrev-ref HEAD` — the
@@ -371,9 +407,15 @@ pub fn run_issue_claim(
             holder,
             takeover_requested,
         } => {
+            // Auditor A4 (`issue/claim/021`): `holder` above is already
+            // sanitized via `sanitize_claimant_name` (in `decide_claim`),
+            // but `timestamp` is a SIBLING field parsed from the same
+            // untrusted comment and reaches this same operator-facing
+            // refusal message — sanitize it too, rather than re-deciding
+            // per field what the parser boundary (item 1) already settles.
             let since = held
                 .as_ref()
-                .map(|h| format!(" since {}", h.timestamp))
+                .map(|h| format!(" since {}", sanitize_claimant_name(&h.timestamp)))
                 .unwrap_or_default();
             let instruction = if takeover_requested {
                 "`--takeover` alone does not release it — this is deliberate friction, so an \
