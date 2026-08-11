@@ -137,6 +137,14 @@ fn make_rule(binary_path: &str, hook_type: &str) -> Value {
 /// containing whitespace (e.g. `/Applications/My Deck/dot-agent-deck`) written
 /// unquoted splits into extra shell tokens and the command no longer parses to
 /// the intended argv.
+///
+/// Claude Code invokes the hook command line via the platform's native shell —
+/// `cmd.exe` on Windows, a different shell with different quoting rules — so
+/// this is `#[cfg(unix)]` here; see the `#[cfg(windows)]` sibling below. POSIX
+/// single quotes are not a `cmd.exe` quoting mechanism: `cmd.exe` treats `'`
+/// as a literal character, so wrapping a Windows path in single quotes names a
+/// file that does not exist rather than quoting it.
+#[cfg(unix)]
 fn shell_quote_if_needed(path: &str) -> String {
     fn is_safe(b: u8) -> bool {
         b.is_ascii_alphanumeric()
@@ -152,13 +160,43 @@ fn shell_quote_if_needed(path: &str) -> String {
     }
 }
 
-/// Undo [`shell_quote_if_needed`]: strip a single-quoted wrapper and unescape
-/// `'\''` back to `'`, or return `exe` unchanged if it was never quoted.
-fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
-    match exe.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        Some(inner) => std::borrow::Cow::Owned(inner.replace(r"'\''", "'")),
-        None => std::borrow::Cow::Borrowed(exe),
+/// Double-quote `path` for `cmd.exe` only when it contains a character outside
+/// a conservative safe set; otherwise return it unchanged. `~` is NOT special
+/// to `cmd.exe` (unlike POSIX, where it triggers home-directory expansion), so
+/// it is in the safe set here — a real Windows temp path such as
+/// `C:\Users\RUNNER~1\...\dot-agent-deck` needs no quoting at all. `%` and `!`
+/// ARE `cmd.exe`-special (variable expansion) and are deliberately left out of
+/// the safe set, unlike the POSIX helper above.
+#[cfg(windows)]
+fn shell_quote_if_needed(path: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'\\' | b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b',' | b'~'
+            )
     }
+    if !path.is_empty() && path.bytes().all(is_safe) {
+        path.to_string()
+    } else {
+        format!("\"{}\"", path.replace('"', "\\\""))
+    }
+}
+
+/// Undo [`shell_quote_if_needed`]: strip a single- or double-quoted wrapper
+/// and unescape it back to the raw path, or return `exe` unchanged if it was
+/// never quoted. Tries BOTH quoting forms regardless of platform — not just
+/// the one this platform's writer produces — so a settings file written on
+/// one platform and read on another is not stranded, mirroring `_009`'s
+/// "a historical unquoted rule must still be recognised" principle.
+fn unquote_if_needed(exe: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(inner) = exe.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return std::borrow::Cow::Owned(inner.replace(r"'\''", "'"));
+    }
+    if let Some(inner) = exe.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return std::borrow::Cow::Owned(inner.replace("\\\"", "\""));
+    }
+    std::borrow::Cow::Borrowed(exe)
 }
 
 /// Ensure `settings["hooks"]` is an object and return a mutable reference to it.
