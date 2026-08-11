@@ -2222,11 +2222,14 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
 /// Scenario: Fire an `issue_dispatch` task against a fixture repo whose
 /// `.dot-agent-deck.toml` opens an ORCHESTRATION tab (`ORCH_TOML`'s
 /// `dispatch-orch`). Assert the posted claim comment names the
-/// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, not the
-/// scheduled task's name (`claim-task-021`, the `ScheduledTask.name` PRD
-/// #421 used exclusively) — PRD fork#235 round 3's identity itself is the
-/// dispatched worktree's absolute path plus its branch (CLAUDE.md rule 23)
-/// regardless of which spawn kind fired it; what differs between an
+/// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, and
+/// separately anchors on the round-3 identity — the dispatched worktree's
+/// absolute path plus its branch (CLAUDE.md rule 23) — regardless of which
+/// spawn kind fired it. Does NOT assert the scheduled task's name
+/// (`claim-task-021`) is absent from the comment: `derive_issue_paths` keys
+/// the clone directory on the task name for every `SpawnKind`, so the raw
+/// worktree path this test also requires present legitimately contains
+/// `claim-task-021` as a path segment — what differs between an
 /// orchestration dispatch and a single-agent one (`scheduler/dispatch/010`)
 /// is only which name is rendered as decoration.
 #[spec("scheduler/dispatch/021")]
@@ -2285,16 +2288,20 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
         stub.gh_calls().join("\n")
     );
 
-    let named_task_instead = stub
+    let named_orchestration = stub
         .gh_calls()
         .iter()
-        .any(|l| l.contains("issue") && l.contains("comment") && l.contains("claim-task-021"));
+        .any(|l| l.contains("issue") && l.contains("comment") && l.contains("dispatch-orch"));
     assert!(
-        !named_task_instead,
-        "the claim comment must name the ORCHESTRATION, not the SCHEDULED TASK \
-         (`claim-task-021`) that fired it — PRD #421 named the task exclusively; fork#235 \
-         M1/M2 derives the claimant from the bound spawn handle's `SpawnKind` instead; observed \
-         gh calls:\n{}",
+        named_orchestration,
+        "the claim comment must name the ORCHESTRATION (`dispatch-orch`) as decoration \
+         alongside the round-3 identity anchor asserted above — PRD #421 named the scheduled \
+         task exclusively; fork#235 M1/M2 derives the claimant's decoration from the bound \
+         spawn handle's `SpawnKind` instead. This does NOT assert the scheduled task's name \
+         (`claim-task-021`) is absent from the comment: `derive_issue_paths` keys the clone \
+         directory on the task name for every `SpawnKind`, so the worktree path asserted above \
+         legitimately contains `claim-task-021` as a path segment — asserting its absence would \
+         contradict the path assertion; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
     );
 }
