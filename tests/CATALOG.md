@@ -4353,6 +4353,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (run-now; observes the dispatched single-agent card, the stub's recorded `gh` invocations, `GhStub::label_applied`, `GhStub::assignees`, and the daemon's stderr).
 - **Asserts:** the dispatch succeeds as normal (worktree + single-agent card present); the `in-progress` label write still SUCCEEDS; a claim comment is still posted; the issue's assignee list stays empty throughout; the daemon's stderr never reports issue 51 as failed.
 - **Does not assert:** the exact wording of the best-effort warning surfaced for the skipped assignee write; the successful-login assignee path (covered by `scheduler/dispatch/010`).
+- **Note:** GREEN today, not RED-first — like `scheduler/dispatch/012`/`014`/`019`. `claim_issue` does not yet call `gh api user` or write an assignee at all, so "no assignee, dispatch not reported failed" holds trivially against current code; it becomes a genuine regression guard once M2's assignee write lands (`scheduler/dispatch/010`'s RED half).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi
