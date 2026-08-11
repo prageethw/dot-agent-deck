@@ -1334,16 +1334,22 @@ async fn run_shell_activity_monitor(
             .chain(snapshot.unconfirmed.iter().map(String::as_str))
             .collect();
         pane_unconfirmed_streaks.retain(|pane_id, _| live_candidates.contains(pane_id.as_str()));
-        let seen: std::collections::HashSet<&str> = snapshot
-            .statuses
-            .iter()
-            .map(|(pane_id, _)| pane_id.as_str())
-            .collect();
         // Drop panes that disappeared from the registry since the last poll
         // (closed / respawned) so a later reuse of the same pane id starts
         // edge-detection from a clean slate instead of inheriting a stale
         // busy/idle reading.
-        last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
+        //
+        // Fork issue #160's audit (A8): key this on `live_candidates`
+        // (classified ∪ unconfirmed), not on `statuses` (classified) alone.
+        // The per-row fail-safe added by this PR makes an unreadable
+        // candidate session id yield `None` — unconfirmed — more often than
+        // it used to yield `Some(false)`, so keying `retain` on classified
+        // panes only dropped an unconfirmed pane's edge-detection entry on
+        // every tick it stayed unconfirmed. Its next classified tick then
+        // read as a fresh "changed" edge and took the broadcast + write-lock
+        // path instead of the cheap `!changed && !busy` one, for a pane that
+        // never actually stopped being idle.
+        last_known.retain(|pane_id, _| live_candidates.contains(pane_id.as_str()));
 
         for (pane_id, busy) in snapshot.statuses {
             let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);

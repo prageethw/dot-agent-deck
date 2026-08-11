@@ -547,14 +547,29 @@ pub const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
 /// leaving it untruncated. That row finishes well inside the time budget, so
 /// only a byte cap catches it.
 ///
-/// 256 KiB. Chosen to sit strictly below the pathological row — the cap fires
-/// partway through ingesting it, not after the whole payload has already
-/// landed in memory — while staying well clear of a healthy `ps -A -w -w`
-/// sample, which is normally tens of KB to (on a genuinely process-heavy
-/// desktop, measured locally at ~1,200 processes) a couple hundred KB. This is
-/// the one number to retune if a real deployment's healthy sample turns out to
-/// sit closer to it than expected; nothing else depends on the exact value.
-pub const PS_SAMPLE_BYTE_CAP: u64 = 256 * 1024;
+/// 4 MiB. **The job of this constant is bounding worst-case allocation from
+/// N rows × `ARG_MAX` (roughly 1 MiB/process on macOS, ~2 MiB on Linux — i.e.
+/// hundreds of MB to GB, unbounded) down to a fixed ceiling — not sitting just
+/// below any one pathological row.** The cap fires on the *cumulative* size of
+/// a sample, so any value under ~490 KB already catches the 300 KB row
+/// measured above once combined with a normal process table; a tighter cap
+/// buys no extra protection against that row and only spends headroom against
+/// healthy output. fork issue #160's audit measured 1.20–1.38× headroom for
+/// the previous 256 KiB value on two ordinary desktops (macOS, ~1,050–1,174
+/// processes) — a healthy but busy host, especially Linux, where `ps -A` also
+/// enumerates thousands of kernel threads, or a host running this repo's own
+/// `cargo -j16` build with its long `rustc`/JVM/`docker run` argv rows, can
+/// cross a tight cap on entirely healthy output and go permanently dark (the
+/// cap is a persistent property of the host, not a transient spike, so it
+/// then fails on every subsequent tick). 4 MiB is ~21x the largest healthy
+/// sample measured on either machine, comfortably above a kernel-thread-heavy
+/// Linux host, while remaining a hard, small, transient allocation (one
+/// sample at a time, dropped once parsed). If this needs retuning, retune it
+/// upward for headroom against healthy output, not downward toward the
+/// pathological-row size — 1 MiB is the floor worth accepting, and even that
+/// sits at exactly one macOS `ARG_MAX`, i.e. within reach of a single
+/// process.
+pub const PS_SAMPLE_BYTE_CAP: u64 = 4 * 1024 * 1024;
 
 /// Run `program args…` with its stdout captured, abandoning it if it has not
 /// finished within `budget` or its stdout exceeds [`PS_SAMPLE_BYTE_CAP`].
@@ -570,6 +585,39 @@ pub const PS_SAMPLE_BYTE_CAP: u64 = 256 * 1024;
 /// `Read::take`) rather than draining to EOF — an over-cap producer is left
 /// blocked on its own write() once the cap is hit, which the main loop's
 /// `cap_rx` check kills promptly instead of waiting out the whole time budget.
+///
+/// Shared with [`capture_bounded_async`]: a run of consecutive size-cap trips
+/// (fork issue #160's audit, A3). The size-cap `warn!` used to fire
+/// unrate-limited on every trip — cheaper to trigger than the budget timeout
+/// (~50ms vs the full [`PS_SAMPLE_BUDGET`]) and, unlike a timeout, a
+/// persistent property of the host rather than a transient spike, so a
+/// chronically over-cap machine wrote ~1.8 lines/s indefinitely into
+/// `deck.log`, which PRD #170 keeps synchronous, unrotated and unbounded (see
+/// `src/main.rs`'s `init_logging_from_env`). Rate-limited to the same shape
+/// as the daemon's own failure logging in `run_shell_activity_monitor`
+/// (`FAILURE_LOG_EVERY`): log the transition into "over cap" and then only
+/// every [`SIZE_CAP_WARN_EVERY`]th trip after that. A single process-global
+/// counter is enough — `sample_table_async` short-circuits so only one
+/// capture is in flight at a time in the daemon's own poll — and it is reset
+/// on every capture that returns a usable sample.
+static SIZE_CAP_TRIP_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const SIZE_CAP_WARN_EVERY: u32 = 20;
+
+/// Bumps the size-cap trip streak and reports whether this trip should be
+/// logged — the transition (first trip after a success) and every
+/// [`SIZE_CAP_WARN_EVERY`]th trip after that.
+fn should_log_size_cap_trip() -> bool {
+    let streak = SIZE_CAP_TRIP_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    streak == 1 || streak.is_multiple_of(SIZE_CAP_WARN_EVERY)
+}
+
+/// Resets the size-cap trip streak — called whenever a capture returns a
+/// usable sample, so the next trip after a healthy run logs again as a fresh
+/// transition rather than continuing a stale streak.
+fn reset_size_cap_trip_streak() {
+    SIZE_CAP_TRIP_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<String> {
     use std::io::Read;
 
@@ -602,11 +650,25 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
     let deadline = std::time::Instant::now() + budget;
     let status = loop {
         if let Ok(true) = cap_rx.try_recv() {
-            tracing::warn!(
-                program,
-                cap = PS_SAMPLE_BYTE_CAP,
-                "process-table sample exceeded its size cap — killing it and reporting no sample"
-            );
+            // Fork issue #160's audit (A7): the read stops at `CAP + 1`
+            // bytes (see `Read::take` above), so the observed length is
+            // always exactly that one value and carries no information
+            // beyond "over cap" — logging it would not tell an operator
+            // whether they are at cap+1 or several MB over. Reading further
+            // just to measure the overshoot would give up the bound this
+            // cap exists to enforce, so instead point at the command that
+            // measures the true size out-of-band.
+            if should_log_size_cap_trip() {
+                tracing::warn!(
+                    program,
+                    cap = PS_SAMPLE_BYTE_CAP,
+                    hint = "observed size cannot be reported without exceeding the cap; run \
+                            `ps -A -w -w -o pid=,ppid=,tty=,args= | wc -c` to measure the true \
+                            sample size",
+                    "process-table sample exceeded its size cap — killing it and reporting no \
+                     sample"
+                );
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -614,7 +676,16 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
-            Err(_) => break None,
+            Err(_) => {
+                // Fork issue #160's audit (A6): every other exit from this
+                // loop kills before reaping so a SIGKILL cannot land on a
+                // recycled pid — this arm was the one exception, leaving a
+                // live `ps` and, once it exits on its own, a zombie entry.
+                // Symmetric with the size-cap and budget-overrun arms above.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
@@ -642,6 +713,7 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
     if !status?.success() {
         return None;
     }
+    reset_size_cap_trip_streak();
     Some(String::from_utf8_lossy(&stdout).into_owned())
 }
 
@@ -658,12 +730,22 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
 /// which is exactly the gap #212 closes. Reads are capped at
 /// `PS_SAMPLE_BYTE_CAP + 1` bytes via `AsyncReadExt::take`, matching the sync
 /// form's shape — see [`process_table_async`].
+///
+/// `budget` bounds the ENTIRE call — spawn, read and the final wait —
+/// matching the sync form's single `deadline` loop, which already covers all
+/// three. Fork issue #160's audit (A4): an earlier version of this function
+/// wrapped only the read in `timeout`, leaving the final `wait()` unbounded —
+/// a child that reached stdout EOF without exiting (wedged in `D` state,
+/// `SIGSTOP`ed) parked this function, and with it the daemon's whole poll,
+/// forever. Keep the wait inside the bounded region if this is ever edited
+/// again.
 async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
     use tokio::io::AsyncReadExt;
 
     if budget.is_zero() {
         return None;
     }
+    let started = std::time::Instant::now();
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
@@ -680,39 +762,92 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
         return None;
     };
 
+    // Fork issue #160's audit (A5): propagate a read error via `?` rather
+    // than discarding it with `let _ = …` — a discarded error left `buf`
+    // holding a partial read that then passed the cap check and the exit
+    // status check and was parsed as a COMPLETE table, silently dropping
+    // whichever rows never made it into the pipe. That is precisely the
+    // confident false idle this whole change exists to prevent, reached
+    // through the one path that used to fail open instead of closed. The old
+    // `Command::output()` call this replaced returned a `Result` and the
+    // prior code did `output.ok()?`, so this restores that behaviour rather
+    // than introducing new policy.
     let read_capped = async {
         let mut buf = Vec::new();
         let mut limited = (&mut pipe).take(PS_SAMPLE_BYTE_CAP + 1);
-        let _ = limited.read_to_end(&mut buf).await;
-        buf
+        limited.read_to_end(&mut buf).await.ok()?;
+        Some(buf)
     };
 
-    let Ok(stdout) = tokio::time::timeout(budget, read_capped).await else {
-        tracing::warn!(
-            program,
-            ?budget,
-            "process-table sample exceeded its budget — killing it and reporting no sample"
-        );
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return None;
+    let stdout = match tokio::time::timeout(budget, read_capped).await {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            tracing::warn!(
+                program,
+                "process-table sample's read failed — reporting no sample rather than a \
+                 partial table"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                program,
+                ?budget,
+                "process-table sample exceeded its budget — killing it and reporting no sample"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
     };
 
     if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
-        tracing::warn!(
-            program,
-            cap = PS_SAMPLE_BYTE_CAP,
-            "process-table sample exceeded its size cap — killing it and reporting no sample"
-        );
+        // See A7/A3's rationale on `should_log_size_cap_trip` above the sync
+        // form: the observed length here is likewise always exactly
+        // `CAP + 1` (see `Read::take` in `read_capped` above), so it is not
+        // worth reporting on its own, and the trip is rate-limited the same
+        // way `capture_bounded`'s is.
+        if should_log_size_cap_trip() {
+            tracing::warn!(
+                program,
+                cap = PS_SAMPLE_BYTE_CAP,
+                hint = "observed size cannot be reported without exceeding the cap; run `ps -A \
+                        -w -w -o pid=,ppid=,tty=,args= | wc -c` to measure the true sample size",
+                "process-table sample exceeded its size cap — killing it and reporting no sample"
+            );
+        }
         let _ = child.kill().await;
         let _ = child.wait().await;
         return None;
     }
 
-    let status = child.wait().await.ok()?;
+    // Fork issue #160's audit (A4): bound the final wait with whatever budget
+    // remains rather than awaiting it unconditionally — see the doc comment
+    // above. `saturating_sub` floors at zero rather than panicking if the
+    // spawn+read already consumed the whole budget; a zero-duration timeout
+    // still gets one poll of an already-exited child, and otherwise falls
+    // straight to the timeout arm below.
+    let remaining = budget.saturating_sub(started.elapsed());
+    let status = match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(
+                program,
+                ?budget,
+                "process-table sample's child did not exit after its stdout was fully read — \
+                 killing it and reporting no sample"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+    };
     if !status.success() {
         return None;
     }
+    reset_size_cap_trip_streak();
     Some(String::from_utf8_lossy(&stdout).into_owned())
 }
 
@@ -1148,10 +1283,18 @@ mod tests {
     /// `run_shell_activity_monitor` in `daemon.rs`) handles it exactly like a
     /// timed-out sample, unchanged.
     ///
-    /// Scenario: `head -c 400000 /dev/zero` finishes in well under the 2s
-    /// time budget, so a pure time bound cannot catch it — instead it
-    /// produces a 400,000-byte capture, which today is returned whole on both
-    /// the sync and async forms.
+    /// Scenario: `head -c <PS_SAMPLE_BYTE_CAP + 1> /dev/zero` finishes in well
+    /// under the 2s time budget, so a pure time bound cannot catch it —
+    /// instead it produces a capture one byte over the cap, which today is
+    /// returned whole on both the sync and async forms. The fixture size is
+    /// derived from `PS_SAMPLE_BYTE_CAP` itself (fork issue #160's audit:
+    /// raising the cap to 4 MiB left the old literal 400,000-byte fixture
+    /// *under* the cap, so the test would have silently stopped exercising
+    /// the size-cap path) rather than hand-picked, so the two can never drift
+    /// apart again. It still discriminates: one byte over the cap is the
+    /// minimal input that must trip it, so the test fails the instant the
+    /// cap logic is removed or loosened to `>=`/`>` the wrong way, exactly as
+    /// it did against the old fixture.
     #[spec("status/shell-activity/010")]
     #[test]
     fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample() {
@@ -1169,7 +1312,8 @@ mod tests {
     }
 
     async fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample_inner() {
-        let oversized_args = ["-c", "400000", "/dev/zero"];
+        let oversized_size = (PS_SAMPLE_BYTE_CAP + 1).to_string();
+        let oversized_args = ["-c", oversized_size.as_str(), "/dev/zero"];
         assert_eq!(
             capture_bounded("head", &oversized_args, PS_SAMPLE_BUDGET),
             None,
