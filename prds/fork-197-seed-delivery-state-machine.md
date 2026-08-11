@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: In progress — M1 (#188), M2 (#182) and M3 step 1 (#187, TEXT) are landed and green on PR #219. Remaining: M3 step 2 (remove LEVEL) and M4 (#194).
+**Status**: **PARKED mid-review**, 2026-08-11. All four milestones are implemented and green on PR #219 (draft, HEAD `9ab04b7`, fast tier 1942/1942). Reviewer and auditor have both reported. **One blocker is confirmed live by a real-Codex run and its resolution is decided but not yet executed** — see *Resume here* at the bottom of this document before doing anything else.
 
 ## Decisions taken
 
@@ -125,3 +125,42 @@ All runs go to CI (CLAUDE.md rule 5). A draft PR opens before the first RED push
 - Raising `SPAWN_TIME_READINESS_BUFFER` from 500 ms. It is palliative — it moves the boundary rather than fixing the mechanism. Decide it separately, on evidence.
 - The Pi re-assertion path, explicitly out of scope in #423's own implementation notes.
 - Offering any of this upstream. See the header — there is nothing upstream to fix today.
+
+## Resume here (parked 2026-08-11)
+
+**State.** Branch `fork-197-seed-delivery-state-machine`, worktree `/Users/prageeth.warnak/workspace/ai/dot-agent-deck-prd197`, HEAD `9ab04b7`, clean, no upstream configured (push with `git push origin HEAD:refs/heads/fork-197-seed-delivery-state-machine`). Draft PR **#219**. Fast tier 1942/1932→**1942/1942** green as of `db9f580`; CI for `9ab04b7` was still running when parked — **check it first**. All four milestones are implemented. No worker is mid-task.
+
+Findings live in the root checkout (gitignored, machine-local — copy anything that matters into this document before relying on it): `.dot-agent-deck/findings-197-review.md` (9 findings) and `.dot-agent-deck/findings-197-audit.md` (6 findings, no blocker).
+
+### The decision taken, not yet executed
+
+**Revert M3 step 2 — commit `7cd091e`, the LEVEL removal — and keep everything else.** M1, M2, M3 step 1 (TEXT now confirms a byte-identical resubmit) and M4 all stay. #187 then closes **partially**: TEXT is fixed, LEVEL stays, and a follow-up issue must be filed for a sound confirmation signal for wrapper-strategy agents before LEVEL can be removed.
+
+**Why, with the evidence** (real-Codex carve-out run, isolated deck log, reproduced across two runs):
+
+```
+14:02.329  SessionStart  agent_type=Codex
+14:03.008  orchestrator prompt: write applied; awaiting submit confirmation   delivery_id=…-2-0
+14:03.008  Received event  event_type=Thinking          <- SAME millisecond as the write
+14:03.511  orchestrator prompt: write applied…          <- retry, +503ms
+15:01.872  WARN deadline reached with a landed write still unconfirmed;
+           reporting delivered-unconfirmed rather than abandoning        <- +58.87s
+```
+
+Codex uses the **Wrapper** strategy, whose classifier hardcodes `user_prompt: None` (`src/wrap.rs:304`), so TEXT is structurally unavailable — and with LEVEL gone there is no confirmation path at all. Every Codex delivery now waits out the full 60 s deadline and fires a stray CR, where `main` confirmed in milliseconds. This fork runs its `reviewer` and `auditor` roles on Codex, so it is not a corner case. Restoring a narrow LEVEL-equivalent was rejected: the `Thinking` event arrives 0–160 ms after the write, i.e. it is the classifier heuristic, not a real submit — confirming on it would be knowingly unsound.
+
+### Work remaining, in order
+
+1. **Revert `7cd091e`** (coder). Keep M1/M2/M3-step-1/M4. Expect `orchestration/seed/002`, `004`, `007` to stay green — the tester already flipped `seed/002` to confirm via TEXT, so it passes either way.
+2. **File the follow-up issue** for a sound wrapper-strategy confirmation signal; reference this section.
+3. **Reviewer F3 / auditor F1 — the vacuous tests.** No test pins the negative TEXT case: changing `>` to `>=` in `prompt_text_confirms` (`src/ui.rs:2029`) makes it always true and the whole suite still passes. `seed/007` passes trivially — *deleting `expected_session_id` pinning entirely keeps it green* — and `seed/004` frames 1–3 are vacuous. Fix is test-side (tester).
+4. **Reviewer F2 — the real-agent tests never exercise the retry.** The retry is gated on `max(grace, 500 ms backoff floor)`, so the 250 ms `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` override is **inert**, and the confirming `UserPromptSubmit` fires *before* inference — so the "fires deterministically" claim in `tests/e2e_orchestration_seed_retry_real.rs` is false. Measured: retry fired at +503 ms in run 1 and **not at all** in run 2. Fix the mechanism or delete the claim; do not leave the comment asserting determinism.
+5. **`orchestration/seed/016` cannot pass as written.** Both real-Codex runs panicked at the 120 s readiness wait (`tests/e2e_orchestration_seed_retry_real.rs:179`) with a **completely blank** pane, while the deck log proved Codex booted (`SessionStart`/`Thinking`/`Idle` within ~1.5 s). The `input_ready_needle` is `common::codex_test_model()`; that model string appears in `codex exec`'s single-shot header but seemingly never in the interactive TUI's viewport. Needs a different readiness signal.
+6. **`CODEX_TEST_MODEL_DEFAULT` is stale** (`tests/common/mod.rs`). `gpt-5.1-codex-mini` — and every `gpt-5*`/`codex-*` name tried — is rejected for a ChatGPT-subscription account: `400 invalid_request_error: … not supported when using Codex with a ChatGPT account`. This host's actual default is **`gpt-5.6-sol`**. The constant's doc comment claims the default is "correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`, which is what most dev boxes here log in with" — that did not hold. Either the default is stale or the claim is. Worth its own issue; `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-sol` is the documented workaround.
+7. **Remaining review findings** — auditor F2 (`user_prompt` is harvested from *any* hook event type, `src/hook.rs:328,396`, so "the counter only advances on a real submit" is a producer convention rather than code; latent, every current producer is clean), reviewer F8 (M2 turns every *successful* seed delivery into a 60 s hold ending in `warn!("seed prompt: timed out; abandoning")` — misleading logs, no leak), reviewer F9 (`src/hook.rs:328` truncates `user_prompt` at 200 bytes; the pointer is 151, so 49 bytes of headroom), auditor F4/F5/F6 (a distinct retry log line; `confirmation_grace_period()` unclamped unlike its named sibling; a shared-keyspace note), reviewer F7 (stale RED-phase catalog prose across `pane-input/023`/`024`, `seed/013`, `seed/014`).
+8. **No changelog fragment exists on the branch.** One is required. **Rule 12 was disputed and resolved: no `.breaking.md`, no `PROTOCOL_VERSION` bump.** The auditor verified both directions with a mechanism the reviewer missed — a new TUI on an old daemon still advances the counter locally from the broadcast stream (`reconnect.rs:463`), and the `serde(default)` `0` only lands at attach/reconnect, where it fails closed.
+9. Then: re-review the changed areas, `/prd-done` via **release**, and the **user's merge gate**.
+
+### Carve-out status
+
+Carve-out (a) local runs authorised and completed: `seed/015` (Claude) **passed genuinely**, `seed/011` (regression) **passed genuinely**, `seed/016` (Codex) **failed at readiness** (item 5). Note per reviewer F2 that `seed/015` passing does **not** prove the retry path works — it passes whether or not a retry fired. OpenCode was dropped from scope; the CLI is not installed on this machine.
