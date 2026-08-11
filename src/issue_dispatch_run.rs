@@ -1777,6 +1777,138 @@ exit 0
         );
     }
 
+    // --- PRD fork#235 round-4 author gate: issue/claim/024 ---
+
+    /// A minimal synthetic `gh` for
+    /// [`issue_claim_024_adversarial_task_name_cannot_self_inflict`] only:
+    /// `gh issue view --json comments` always replies with the EXACT JSON
+    /// written to `$GHSTUB_DIR/comment.json` at test setup (built from a
+    /// REAL [`claim_comment_body`] rendering, so this test can never
+    /// silently defang itself the way the ORIGINAL `issue/claim/012` did —
+    /// see that test's own doc comment); every other verb is a no-op
+    /// success. Every invocation is logged to `$GHSTUB_DIR/gh-calls.log` so
+    /// the test can assert on argv values, mirroring `tests/issue_claim.rs`'s
+    /// `Fixture::gh_calls`.
+    const CLAIM_024_GH_STUB: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GHSTUB_DIR/gh-calls.log" 2>/dev/null || true
+group="$1"; sub="$2"
+if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
+    cat "$GHSTUB_DIR/comment.json"
+    exit 0
+fi
+exit 0
+"#;
+
+    /// Scenario: A scheduled issue-dispatch task is named `nightly, for
+    /// @torvalds,` — plain, hand-edited `ScheduledTask.name` config, no
+    /// forged or hostile comment involved at all. `sanitize_clone_segment`
+    /// strips only `/ \ \0 ..`, so the literal substring `, for @torvalds,`
+    /// survives intact into the task's derived worktree PATH (and its
+    /// `Identity::issue_dispatch` label, which embeds the same task name),
+    /// and from there into the deck's OWN claim-comment body when it
+    /// renders — genuinely self-inflicted, no attacker required. On the
+    /// NEXT fire, [`claim_issue`] reads that same comment back via
+    /// [`fetch_claim_comment`]/[`parse_claim_fields`]:
+    /// `parse_worktree_claim`'s `rest.find(", for @")` scans the WHOLE
+    /// remaining body from the very start, so it matches the embedded `,
+    /// for @torvalds,` substring inside the task-name-decorated label/path —
+    /// text that comes BEFORE the real timestamp clause — long before it
+    /// would ever reach a genuine trailing `, for @<login>` clause (there is
+    /// none here; this comment was posted with `login: None`). The parsed
+    /// login therefore comes back `Some("torvalds")` — a value nobody ever
+    /// intended as a login at all — and reaches `claim_issue`'s
+    /// `prior_login`. Assert no `gh` call ever carries `--remove-assignee
+    /// torvalds`. Companion to `issue/claim/020`, which covered `@mention`
+    /// injection into the deck's own rendered comment but not this: a
+    /// self-inflicted, structurally-invisible-to-`claim_line` false parse of
+    /// the deck's OWN prior comment.
+    #[spec("issue/claim/024")]
+    #[test]
+    #[cfg(unix)]
+    fn issue_claim_024_adversarial_task_name_cannot_self_inflict() {
+        let malicious_task_name = "nightly, for @torvalds,";
+        let paths = derive_issue_paths(Path::new("/ws"), malicious_task_name, 24);
+        // Sanity: `sanitize_clone_segment` really did leave the `, for
+        // @torvalds,` substring intact in the derived path — otherwise this
+        // test would pass vacuously, exactly the `012`/`020` "it passes with
+        // the parser deleted" failure mode this file's own tests exist to
+        // avoid repeating.
+        assert!(
+            paths
+                .worktree_dir
+                .to_string_lossy()
+                .contains(", for @torvalds,"),
+            "sanitize_clone_segment must leave the `, for @torvalds,` substring intact in the \
+             derived path for this test to be exercising anything real; got {:?}",
+            paths.worktree_dir
+        );
+
+        let identity =
+            Identity::issue_dispatch(malicious_task_name, 24, &paths.worktree_dir, &paths.branch);
+        let prior_body = claim_comment_body(&identity, "2020-01-01T00:00:00Z", None, None);
+        let prior_parsed = parse_claim_fields(&prior_body);
+        assert_eq!(
+            prior_parsed.as_ref().and_then(|p| p.login.as_deref()),
+            Some("torvalds"),
+            "sanity precondition: `parse_claim_fields` must genuinely mis-parse `torvalds` out \
+             of the task-name-derived text for this test to be exercising the real defect \
+             rather than a hypothetical one; got {prior_parsed:?} from body {prior_body:?}"
+        );
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh = bindir.join("gh");
+        std::fs::write(&gh, CLAIM_024_GH_STUB).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ghstub = scratch.path().join("ghstub");
+        std::fs::create_dir_all(&ghstub).unwrap();
+        let comment_json = serde_json::json!({ "comments": [{ "body": prior_body }] }).to_string();
+        std::fs::write(ghstub.join("comment.json"), &comment_json).unwrap();
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`'s
+        // identical comment above — every test run happens in CI via
+        // `cargo nextest`, one process per test, so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GHSTUB_DIR", &ghstub);
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(claim_issue(
+            "acme/widgets",
+            24,
+            "nightly",
+            &identity,
+            Some("stub-user"),
+            &crate::scheduler::StderrNotifier,
+        ));
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GHSTUB_DIR");
+        }
+
+        let gh_calls = std::fs::read_to_string(ghstub.join("gh-calls.log")).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-assignee torvalds"),
+            "a self-inflicted, structurally-mis-parsed `torvalds` (from the task NAME's own `, \
+             for @torvalds,` substring, embedded in the deck's OWN prior comment — no forged or \
+             hostile comment involved) must never reach a `--remove-assignee` argv; observed \
+             gh-calls.log:\n{gh_calls}"
+        );
+    }
+
     #[test]
     fn record_then_take_worktree_returns_clone_once() {
         let reg = new_worktree_registry();

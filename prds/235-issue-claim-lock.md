@@ -26,6 +26,23 @@ That is one testable boundary rather than a judgement re-made at every use site.
 
 The same boundary covers values that never passed through a comment but are equally attacker-influenceable — a worktree **path** and **branch** derived from a scheduled-task name, which `sanitize_clone_segment` strips only `/ \ \0 ..` from. Those reach a public comment body and the operator's terminal, so PRD #421's C5 mention-injection defence must cover them too. Fork #232 is the same observation for `worktree list`.
 
+**Known limitation of render-only sanitization.** `claim_comment_body` strips a path/branch's backtick only when rendering the comment text, deliberately leaving the stored `Identity`'s own path/branch — and therefore the freshly-resolved caller identity's `Display` string — untouched (comparing the RAW value is what the lock decision needs). For a worktree whose path or branch genuinely contains a backtick, this means the deck can no longer recognise its own prior claim on a later run: the comment reconstructs `held.identity` from the SANITIZED (backtick-stripped) text it rendered, while the caller's own freshly-resolved identity still carries the backtick, so the two compare unequal even though it is the same worktree. This fails closed — the mismatch reads as "held by a different identity" and refuses — and is recoverable the same way any other refusal is: `--takeover --confirm-stopped`.
+
+### The removal target is author-gated, because validation cannot close this
+
+The round-4 audit found the amendment's own worked example still live, and — importantly — showed that a validator does **not** close it: `validate_gh_login("maintainer")` returns `true`. The harm is structural, not malformed input. Replace-to-one means *the removal target is chosen by comment content by design*, so a stranger posting a well-formed single-line claim comment ending `, for @maintainer.` on an unlabelled issue causes the next cron fire to run `gh issue edit --remove-assignee maintainer` with the daemon's credentials. No forgery of the deck's format, no newline, no label required.
+
+**The rule, which is the boundary applied rather than an exception to it:**
+
+| Decision | Source |
+|---|---|
+| *Who holds this issue?* | **any** claim comment — being deceived here is an accepted non-goal |
+| *Whose assignment do we remove?* | **only** a claim comment whose author is the deck's own authenticated account |
+
+`gh issue view --json comments` already returns `author`, so this needs no new call. A parsed login is additionally passed through `validate_gh_login` and dropped to `None` on failure, at the **parser boundary** — so both write paths inherit it and neither can re-make the judgement.
+
+**Accepted cost, stated plainly:** a cross-deck takeover no longer removes the previous human, because their claim comment was authored by *their* account, not this deck's. Both remain assigned until the earlier holder's deck next acts. That weakens "always exactly one" to "exactly one per deck, converging" — a real reduction in the guarantee, chosen because the alternative lets an outsider's comment drive a write with the daemon's credentials. It fails safe: the error is an extra assignee, never a wrongly-removed one.
+
 **Fork-only**, and intended to stay so. Builds on PRD #421 (the claim), fork #192 (orchestration names as identity) and fork #144/#425/#166 (the worktree ownership marker) — none of which exist upstream, where [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) is still open and unimplemented. Per `docs/develop/upstream-contribution-policy.md` this is not an offer-later case.
 
 **Related**: fork [#201](https://github.com/prageethw/dot-agent-deck/issues/201) (name uniqueness is advisory — the defect this PRD routes around) · fork [#222](https://github.com/prageethw/dot-agent-deck/issues/222) (owner-identity collision edges) · fork [#74](https://github.com/prageethw/dot-agent-deck/issues/74) (the motivating collision) · fork #184, #218, #164 (the marker this reads) · upstream [#482](https://github.com/vfarcic/dot-agent-deck/issues/482) (nothing clears a claim), #483, #486, #484 (neighbouring issue-dispatch defects, not fixed here)

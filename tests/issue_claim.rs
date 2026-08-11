@@ -72,8 +72,14 @@ use spec::spec;
 ///   - `gh api user --jq .login` → the content of `$GHSTUB_DIR/login` (or
 ///     `stub-user` if unset), UNLESS `$GHSTUB_DIR/fail-api-user` exists, in
 ///     which case it fails like a real revoked/expired token would.
-///   - `gh issue comment --repo R --body B -- N` → appends `{"body":"B"}` to
-///     `$GHSTUB_DIR/<key>/issue-<n>/comments.jsonl`.
+///   - `gh issue comment --repo R --body B -- N` → appends
+///     `{"body":"B","author":{"login":"<current $GHSTUB_DIR/login>"}}` to
+///     `$GHSTUB_DIR/<key>/issue-<n>/comments.jsonl` — a real `gh issue
+///     comment` is always posted as whoever `gh` is currently authenticated
+///     as, so the stub's own author field tracks [`Fixture::set_login`] the
+///     same way `gh api user` does (round-4 author gate,
+///     `issue/claim/022`-`025`: nothing before this needed a comment's
+///     AUTHOR, only its body, so this field did not exist until now).
 ///   - `gh issue edit --repo R --add-label L -- N` → appends `L` to
 ///     `.../labels.txt` (idempotent).
 ///   - `gh issue edit --repo R --add-assignee A --remove-assignee B -- N` →
@@ -140,7 +146,11 @@ issuedir="$GHSTUB_DIR/$key/issue-$issue"
 mkdir -p "$issuedir" 2>/dev/null || true
 
 if [ "$group" = "issue" ] && [ "$sub" = "comment" ]; then
-    printf '{"body":"%s"}\n' "$body" >> "$issuedir/comments.jsonl"
+    author="stub-user"
+    if [ -f "$GHSTUB_DIR/login" ]; then
+        author=$(cat "$GHSTUB_DIR/login")
+    fi
+    printf '{"body":"%s","author":{"login":"%s"}}\n' "$body" "$author" >> "$issuedir/comments.jsonl"
     exit 0
 fi
 
@@ -353,6 +363,29 @@ impl Fixture {
         let line = format!("{}\n", serde_json::json!({ "body": body }));
         std::fs::write(dir.join("comments.jsonl"), &line).expect("seed hostile comment");
         line
+    }
+
+    /// Directly seed an UNLABELLED issue (no `in-progress` label written —
+    /// unlike [`Fixture::seed_claim_comment`]) with exactly ONE claim comment
+    /// whose raw body is `body` and whose comment `author` is `author` —
+    /// bypassing `gh` entirely. Round-4 author gate (`issue/claim/022`-`025`):
+    /// `decide_claim_unlabelled_always_claims` never inspects `held` for the
+    /// LOCK decision on an unlabelled issue, but `do_claim`'s `prior_login`
+    /// extraction (the replace-to-one REMOVAL target) is unconditional, so a
+    /// bogus claim comment on an issue this deck never labelled can still
+    /// drive a `gh issue edit --remove-assignee` it should never have
+    /// written. `author` lets a test place that comment's author on either
+    /// side of the gate: matching [`Fixture::set_login`]'s later value
+    /// (self-authored, `023`/`025`) or a DIFFERENT stranger's login (`022`).
+    fn seed_claim_comment_unlabelled_by(&self, repo: &str, issue: u64, body: &str, author: &str) {
+        let key = repo.replace('/', "_");
+        let dir = self.ghstub.join(&key).join(format!("issue-{issue}"));
+        std::fs::create_dir_all(&dir).expect("create issue dir");
+        let line = format!(
+            "{}\n",
+            serde_json::json!({ "body": body, "author": { "login": author } })
+        );
+        std::fs::write(dir.join("comments.jsonl"), &line).expect("seed unlabelled claim comment");
     }
 
     /// Run the REAL `dot-agent-deck` CLI as a subprocess in `cwd`, with the
@@ -1688,5 +1721,158 @@ fn issue_claim_021_refusal_output_carries_no_raw_control_characters() {
          operator's terminal — `run_issue_claim`'s `RefuseHeldByOther` arm sanitizes `holder` \
          but interpolates `held.timestamp` RAW into the ` since {{timestamp}}` clause (auditor \
          A4); got:\n{text:?}"
+    );
+}
+
+/// Build a well-formed, genuinely round-3-parseable worktree-shape claim
+/// comment body naming `login` in its trailing `, for @<login>` clause — the
+/// shared shape `issue/claim/022`/`023`/`025` seed, varying only `login` and
+/// the seeded comment's `author` (see [`Fixture::seed_claim_comment_unlabelled_by`]).
+/// Distinct from `stranger-orch`/`/some/other/path` in each caller so a
+/// failure names which test it came from.
+fn stranger_claim_body(login: &str) -> String {
+    format!(
+        "Claimed by the orchestration `stranger-orch` working `/some/other/path` on branch \
+         `some-other-branch` at 2020-01-01T00:00:00Z, for @{login}."
+    )
+}
+
+/// Scenario: an UNLABELLED issue already carries a well-formed claim comment
+/// — on its FIRST line, no forged newline needed — naming `victim` in its
+/// `, for @victim.` clause, authored by `eve`, a stranger unrelated to the
+/// claiming agent. A legitimate agent (`legit`) then runs a bare `issue
+/// claim` (which always succeeds on an unlabelled issue, regardless of
+/// `held`). Assert the claim still succeeds, but NO `gh` call ever carries
+/// `--remove-assignee victim` — round-4 author gate (PRD fork#235): the
+/// removal target must come ONLY from a claim comment whose author is the
+/// deck's own authenticated account, never from comment CONTENT alone.
+/// Reachable exactly as the PRD's threat-model amendment describes: "a
+/// stranger posts a well-formed single-line claim comment ending `, for
+/// @maintainer.` on an unlabelled issue; the next cron fire runs `gh issue
+/// edit --add-assignee <deck> --remove-assignee maintainer`."
+#[spec("issue/claim/022")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_022_stranger_comment_cannot_drive_a_removal() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_claim_comment_unlabelled_by(repo, 22, &stranger_claim_body("victim"), "eve");
+
+    let wt = fx.add_worktree("wt-022", "claim-022-branch");
+    fx.mark_owned(&wt, "orchestration:orch-022");
+    fx.set_login("legit");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim", "22", "--repo", repo],
+        Some("pane-022"),
+    );
+    assert!(
+        out.status.success(),
+        "a bare claim on an unlabelled issue must still succeed regardless of any stray claim \
+         comment already present; out={}",
+        combined(&out)
+    );
+    assert!(
+        !fx.gh_calls()
+            .iter()
+            .any(|l| l.contains("--remove-assignee") && l.contains("victim")),
+        "a claim comment authored by someone OTHER than the deck's own authenticated account \
+         must never drive a `--remove-assignee` — `do_claim`'s `prior_login` extraction \
+         (`issue_claim.rs:388`) reads `held.login` unconditionally, with no author check at all, \
+         so ANY well-formed `, for @victim.` clause on ANY discoverable comment — even on an \
+         issue this deck never labelled — reaches the removal argv; observed gh calls: {:?}",
+        fx.gh_calls()
+    );
+}
+
+/// Scenario: the SAME shape as `022` — an UNLABELLED issue carrying a
+/// well-formed claim comment naming `priorholder` in its `, for
+/// @priorholder.` clause — but this time authored by `legit`, the SAME
+/// account the claiming agent is currently authenticated as. Assert the
+/// removal still happens (`--remove-assignee priorholder` reaches `gh`): the
+/// author gate must open when the author genuinely IS the deck's own
+/// account, so it narrows the removal target rather than disabling
+/// replace-to-one outright. Unlike `022`/`024`/`025`, this one may already
+/// be GREEN before the fix lands — today's code removes unconditionally,
+/// author or not — so it is a regression guard, not RED-first (mirroring
+/// `scheduler/dispatch/022`'s own not-RED-first catalog note); the catalog
+/// entry says so.
+#[spec("issue/claim/023")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_023_own_comment_still_drives_the_removal() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_claim_comment_unlabelled_by(repo, 23, &stranger_claim_body("priorholder"), "legit");
+
+    let wt = fx.add_worktree("wt-023", "claim-023-branch");
+    fx.mark_owned(&wt, "orchestration:orch-023");
+    fx.set_login("legit");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim", "23", "--repo", repo],
+        Some("pane-023"),
+    );
+    assert!(
+        out.status.success(),
+        "a bare claim on an unlabelled issue must succeed; out={}",
+        combined(&out)
+    );
+    assert!(
+        fx.gh_calls()
+            .iter()
+            .any(|l| l.contains("--remove-assignee") && l.contains("priorholder")),
+        "a claim comment authored by the deck's OWN currently-authenticated account must still \
+         drive its named removal — the author gate must narrow WHO can trigger a removal, not \
+         disable replace-to-one for every legitimately-authored prior claim; observed gh calls: \
+         {:?}",
+        fx.gh_calls()
+    );
+}
+
+/// Scenario: an UNLABELLED issue carries a well-formed, SELF-authored claim
+/// comment (author `legit`, matching the claiming agent's own login — the
+/// author gate, on its own, would let this through) whose `, for @<login>`
+/// clause names a MALFORMED login: `-baduser025` (leading `-`, failing
+/// [`dot_agent_deck::issue_dispatch::validate_gh_login`]'s
+/// `^[A-Za-z0-9][A-Za-z0-9-]*$` shape). Assert the claim succeeds but NO `gh`
+/// call ever carries `-baduser025` as a `--remove-assignee` value — cause 1
+/// of the PRD's two independent causes: `validate_gh_login` has exactly two
+/// call sites and both validate the deck's OWN `gh api user` reply, never
+/// the PARSED one, so a malformed value sails straight through even once the
+/// author gate (`022`/`023`) is satisfied. Pins the parser-boundary
+/// validation independently of the author gate, so removing one fix doesn't
+/// silently take the other with it.
+#[spec("issue/claim/025")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_025_malformed_parsed_login_is_dropped_not_passed_through() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_claim_comment_unlabelled_by(repo, 25, &stranger_claim_body("-baduser025"), "legit");
+
+    let wt = fx.add_worktree("wt-025", "claim-025-branch");
+    fx.mark_owned(&wt, "orchestration:orch-025");
+    fx.set_login("legit");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim", "25", "--repo", repo],
+        Some("pane-025"),
+    );
+    assert!(
+        out.status.success(),
+        "a bare claim on an unlabelled issue must succeed; out={}",
+        combined(&out)
+    );
+    assert!(
+        !fx.gh_calls_raw().contains("-baduser025"),
+        "a parsed login failing `validate_gh_login` must never reach a `gh` argv — \
+         `validate_gh_login`'s two existing call sites both validate the deck's own `gh api \
+         user` reply, never the login PARSED out of a claim comment (cause 1 of the PRD's two \
+         independent causes); observed gh-calls.log:\n{}",
+        fx.gh_calls_raw()
     );
 }

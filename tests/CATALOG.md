@@ -1042,6 +1042,34 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** every conceivable control character (covers ESC and CR specifically, the auditor's named example); sanitizing `held.timestamp` at the parse layer vs. at the display layer (either satisfies this test).
 - **Platform coverage:** mac+linux.
 
+##### issue/claim/022 — A stranger's well-formed claim comment cannot drive a removal: an UNLABELLED issue already carries a `Claimed by … , for @victim.` comment authored by `eve`, unrelated to the claiming agent. A bare `issue claim` (which always succeeds on an unlabelled issue) is asserted to succeed with NO `--remove-assignee victim` ever reaching `gh` (PRD fork#235 round-4 author gate: `do_claim`'s `prior_login` extraction is unconditional today — no author check at all — so `held.login` reaches the removal argv from ANY discoverable comment, even on an issue this deck never labelled).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the comment is seeded directly with an explicit `author` field via a new `Fixture::seed_claim_comment_unlabelled_by`, leaving the issue UNLABELLED — unlike `Fixture::seed_claim_comment`, which always labels it).
+- **Agent:** none.
+- **Asserts:** the claim exits zero; no `gh` call in the log contains both `--remove-assignee` and `victim`.
+- **Does not assert:** the coder's chosen fix shape (comparing the comment's `author.login` against the deck's own `gh api user` reply, vs. some other author-gating mechanism).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/023 — The SAME shape as `022`, but the seeded comment's author IS the currently-authenticated account (`legit`), naming `priorholder` in its `, for @priorholder.` clause. Asserts the removal STILL happens — the author gate must narrow WHO can drive a removal, not disable replace-to-one outright (PRD fork#235 round-4 — a regression guard against an over-broad fix, not RED-first: today's unconditional extraction already removes `priorholder`, author or not, so this may already be GREEN before the fix lands, mirroring `scheduler/dispatch/022`'s own not-RED-first note).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/022`).
+- **Agent:** none.
+- **Asserts:** the claim exits zero; some `gh` call in the log contains both `--remove-assignee` and `priorholder`.
+- **Does not assert:** that this test is RED before the fix — it is a guard, expected to already pass.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/024 — A scheduled issue-dispatch task named `nightly, for @torvalds,` — plain hand-edited config, no forged/hostile comment involved. `sanitize_clone_segment` leaves the substring intact in the derived worktree path (and the task-name-decorated label), so it lands in the deck's OWN claim-comment body when rendered. On a later fire, `claim_issue` reads that SAME comment back: `parse_worktree_claim`'s `rest.find(", for @")` scans from the very start of the remaining body, so it matches the embedded substring inside the label/path — text that precedes the real timestamp clause — long before any genuine trailing `, for @<login>` clause (there is none; the comment was posted with `login: None`). The parsed login comes back `Some("torvalds")` and reaches `claim_issue`'s `prior_login`. Asserts no `gh` call ever carries `--remove-assignee torvalds` (PRD fork#235 round-4 — companion to `issue/claim/020`, which covered `@mention` injection into the deck's own rendered comment but not this self-inflicted false parse).
+- **Layer:** async unit test, in-process — a direct call to the private `claim_issue` function (same crate, `#[cfg(test)] mod tests` in `src/issue_dispatch_run.rs`, as `issue/claim/019`) with a minimal synthetic `gh` stub on `PATH` that replies to `gh issue view` with a REAL `claim_comment_body` rendering built from the malicious task name; no CLI subprocess, no full `issue_dispatch` scheduler orchestration, no repo clone.
+- **Agent:** none.
+- **Asserts:** a sanity check that `sanitize_clone_segment` really did leave the substring intact in the derived path, AND that `parse_claim_fields` genuinely mis-parses `torvalds` out of the rendered body (so the test cannot pass vacuously the way the ORIGINAL `issue/claim/012` once did); after `claim_issue` runs, no `gh` call in the log contains `--remove-assignee torvalds`.
+- **Does not assert:** the coder's chosen fix shape (bounding the `, for @` search to start after the timestamp clause, vs. some other parser fix).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — the stub `gh` is a shell script needing `chmod +x`).
+
+##### issue/claim/025 — An UNLABELLED issue carries a well-formed, SELF-authored claim comment (author `legit`, matching the claiming agent's own login — the author gate alone would let this through) whose `, for @<login>` clause names a MALFORMED login, `-baduser025` (leading `-`, failing `validate_gh_login`'s `^[A-Za-z0-9][A-Za-z0-9-]*$` shape). Asserts the claim succeeds but `-baduser025` never reaches a `gh` argv at all (PRD fork#235 round-4 — cause 1 of the PRD's two independent causes: `validate_gh_login` has exactly two call sites and both validate the deck's OWN `gh api user` reply, never the login PARSED out of a comment, so a malformed value sails through even once the author gate (`022`/`023`) is satisfied; pins the parser-boundary validation independently of the author gate).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/022`).
+- **Agent:** none.
+- **Asserts:** the claim exits zero; the raw (unsplit) gh-calls log never contains the literal substring `-baduser025`.
+- **Does not assert:** every conceivable malformed shape (covers a leading `-`, the PRD's own named example; a space or an empty string share the same root cause but are harder to pin through this log's space-joined format).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
