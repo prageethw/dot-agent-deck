@@ -886,6 +886,7 @@ pub fn current_ppid() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
     // `u32` PID → `libc::pid_t` PGID conversion used by the `killpg` call
@@ -1055,6 +1056,55 @@ mod tests {
         );
     }
 
+    /// Fork issue #212: the capture bounds how long a sample may take
+    /// (`PS_SAMPLE_BUDGET`) but nothing bounds how many BYTES it may read —
+    /// measured during PR #206's security audit at a 300,160-byte row for a
+    /// single process with a 300 KB argv, entirely untruncated. A capture
+    /// that exceeds a size cap must report "no sample" (`None`) — the
+    /// identical shape a time-budget overrun already reports (see
+    /// `a_sample_that_outruns_its_budget_reports_no_sample` and its async
+    /// twin above) — so `process_table`/`process_table_async`'s existing
+    /// `None` → [`super::super::ProcessTableOutcome::Failed`] mapping picks
+    /// this up with no new code path, and the daemon's existing fail-safe
+    /// (`last_known` untouched, nothing emitted — see
+    /// `run_shell_activity_monitor` in `daemon.rs`) handles it exactly like a
+    /// timed-out sample, unchanged.
+    ///
+    /// Scenario: `head -c 400000 /dev/zero` finishes in well under the 2s
+    /// time budget, so a pure time bound cannot catch it — instead it
+    /// produces a 400,000-byte capture, which today is returned whole on both
+    /// the sync and async forms.
+    #[spec("status/shell-activity/010")]
+    #[test]
+    fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample() {
+        // `#[test]` + `block_on` rather than `#[tokio::test]`: `cargo xtask
+        // linkage-check`'s Decision-17 name scan looks for the first line
+        // starting with `fn`, which an `async fn` signature does not — see
+        // `shell_activity_008` in `daemon.rs` for the same wrapper shape.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build size-cap runtime")
+            .block_on(
+                shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample_inner(),
+            );
+    }
+
+    async fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample_inner() {
+        let oversized_args = ["-c", "400000", "/dev/zero"];
+        assert_eq!(
+            capture_bounded("head", &oversized_args, PS_SAMPLE_BUDGET),
+            None,
+            "a capture whose output exceeds the size cap must never yield output, even though \
+             it finished well inside the time budget"
+        );
+        assert_eq!(
+            capture_bounded_async("head", &oversized_args, PS_SAMPLE_BUDGET).await,
+            None,
+            "same contract on the async form the daemon's poll actually uses"
+        );
+    }
+
     /// Fork issue #30, and the defect Greptile caught in this change's first
     /// draft: the `getsid` pass must run **between** the two captures, not after
     /// both of them. Capturing twice and only then reading session ids leaves
@@ -1125,17 +1175,52 @@ mod tests {
     /// live process table (the `001`–`004` behaviour), and the running test
     /// process — which by construction cannot be recycled while it is asking —
     /// survives the fork-issue-#30 confirmation pass with a readable session id.
+    ///
+    /// Fork issue #210: unlike the sampling-contract tests above, this test had
+    /// no retry at all — a single `None`/`Err` from one exhausted `ps` sample
+    /// panicked outright with a message ("sample must enumerate on unix") that
+    /// reads as a broken sampler, not as a timeout. `WINDOW` retries each form
+    /// across a window derived from `PS_SAMPLE_BUDGET` (a multiple of it, so
+    /// the two cannot drift apart) before treating the sample as genuinely
+    /// unavailable; only once a table IS in hand does a missing own-pid row
+    /// become the distinct, real-defect failure message.
     #[tokio::test]
     async fn both_sampling_forms_still_enumerate_the_live_process_table() {
+        const WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 3);
         let own_pid = std::process::id() as i32;
-        for (label, table) in [
-            ("sync", process_table()),
-            // `.ok()`: this test only cares that a live machine enumerates,
-            // not about the `Failed`/`Unsupported` distinction fork issue
-            // #160 added to the async form's error type.
-            ("async", process_table_async().await.ok()),
-        ] {
-            let table = table.unwrap_or_else(|| panic!("{label} sample must enumerate on unix"));
+
+        let sync_deadline = std::time::Instant::now() + WINDOW;
+        let mut sync_table = process_table();
+        while sync_table.is_none() && std::time::Instant::now() < sync_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            sync_table = process_table();
+        }
+        let sync_table = sync_table.unwrap_or_else(|| {
+            panic!(
+                "sync sample: every process_table() attempt timed out against its \
+                 {PS_SAMPLE_BUDGET:?} budget across the whole {WINDOW:?} retry window — a \
+                 sampler timeout under machine load, not evidence the platform cannot enumerate"
+            )
+        });
+
+        let async_deadline = tokio::time::Instant::now() + WINDOW;
+        // `.ok()`: this test only cares that a live machine enumerates, not
+        // about the `Failed`/`Unsupported` distinction fork issue #160 added
+        // to the async form's error type.
+        let mut async_table = process_table_async().await.ok();
+        while async_table.is_none() && tokio::time::Instant::now() < async_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            async_table = process_table_async().await.ok();
+        }
+        let async_table = async_table.unwrap_or_else(|| {
+            panic!(
+                "async sample: every process_table_async() attempt timed out against its \
+                 {PS_SAMPLE_BUDGET:?} budget across the whole {WINDOW:?} retry window — a \
+                 sampler timeout under machine load, not evidence the platform cannot enumerate"
+            )
+        });
+
+        for (label, table) in [("sync", sync_table), ("async", async_table)] {
             let own = table
                 .iter()
                 .find(|row| row.pid == own_pid)

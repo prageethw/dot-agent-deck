@@ -6585,6 +6585,16 @@ mod spawn_tests {
     /// PTY entirely, which is the topology a real Claude Bash-tool call has and
     /// the one #370 could never see — is covered by `status/shell-activity/004`
     /// in `tests/shell_activity.rs`.
+    // Fork issue #210: `shell_foreground_busy` samples through `process_table()`,
+    // the same `PS_SAMPLE_BUDGET`-bound `ps` this whole module's tests share, so
+    // a single budget-exhausted sample under load can consume an entire 2s
+    // deadline on its own. `RETRY_WINDOW` is deliberately a multiple of the
+    // sampler's own budget rather than an unrelated literal, so the two cannot
+    // silently drift apart.
+    #[cfg(unix)]
+    const RETRY_WINDOW: Duration =
+        Duration::from_secs(crate::platform::proc::PS_SAMPLE_BUDGET.as_secs() * 3);
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_foreground_busy_ignores_a_non_detached_foreground_child() {
@@ -6608,13 +6618,28 @@ mod spawn_tests {
                 .and_then(|a| a.shell_foreground_busy(&[]))
         };
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // The awaited state (an idle shell reading `Some(false)`) is persistent
+        // once true, so — unlike the loop below — widening the retry window
+        // genuinely helps here: a transient sampler timeout just costs another
+        // lap, not a false result.
+        let deadline = Instant::now() + RETRY_WINDOW;
         let mut state = busy(&registry);
         while state != Some(false) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
             state = busy(&registry);
         }
-        assert_eq!(state, Some(false), "an idle shell should not read busy");
+        match state {
+            Some(false) => {}
+            None => panic!(
+                "process_table() never completed within a {RETRY_WINDOW:?} retry window \
+                 (against a {:?} per-sample budget) — a sampler timeout under machine load, \
+                 not evidence the idle shell reads busy",
+                crate::platform::proc::PS_SAMPLE_BUDGET
+            ),
+            Some(true) => panic!(
+                "an idle shell read busy — a real classification defect, not a sampler timeout"
+            ),
+        }
 
         let writer = {
             let inner = registry.inner.lock().unwrap();
@@ -6626,21 +6651,34 @@ mod spawn_tests {
             w.flush().expect("flush");
         }
 
-        // Sampled repeatedly rather than once, so this fails if the signal ever
-        // rises even briefly — the old `Some(true)` assertion is inverted here,
-        // not just dropped.
+        // The awaited property here is the OPPOSITE shape: the signal must
+        // never rise for the whole window, so a wider window would only make
+        // this test slower, not more correct (Review finding F1 on PR #206).
+        // A `None` tick is a sampler timeout, not evidence of anything — it is
+        // therefore skipped rather than compared for equality, but at least
+        // one tick must still positively confirm `Some(false)` or the window
+        // proves nothing at all.
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut confirmed_idle = false;
         while Instant::now() < deadline {
-            assert_eq!(
-                busy(&registry),
-                Some(false),
-                "a foreground job typed into the pane's own PTY stays in the pane's POSIX \
-                 session, so PRD #386's descendant scan must NOT read it as busy — this \
-                 supersedes #370's tcgetpgrp behaviour, which reported `true` here and \
-                 `false` for the detached Bash-tool child that actually matters"
-            );
+            match busy(&registry) {
+                Some(true) => panic!(
+                    "a foreground job typed into the pane's own PTY stays in the pane's POSIX \
+                     session, so PRD #386's descendant scan must NOT read it as busy — this \
+                     supersedes #370's tcgetpgrp behaviour, which reported `true` here and \
+                     `false` for the detached Bash-tool child that actually matters"
+                ),
+                Some(false) => confirmed_idle = true,
+                None => {} // sampler timeout this tick — inconclusive, retry
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(
+            confirmed_idle,
+            "every sample in the 1s observation window timed out against the {:?} sampler \
+             budget — inconclusive, not a passing result",
+            crate::platform::proc::PS_SAMPLE_BUDGET
+        );
 
         registry.close_agent(&id).unwrap();
     }

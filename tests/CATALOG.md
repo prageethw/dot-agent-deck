@@ -612,6 +612,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** anything about a producer that BYPASSES the helper. The seam covers `ingest_event`'s internals only — a new call site doing `event_tx.send(...)` plus its own `state.write().await`, or a refactor that re-inlines the body, reopens the identical window and this test stays green. That is a visible, small-diff change for review to catch. Also asserts nothing about the descendant scan or the shell-activity classifier (`status/shell-activity/001`–`004`), about a real agent (`005`–`007`), or about what a TUI renders — it stops at the daemon's own broadcast and applied state.
 - **Platform coverage:** mac+linux+windows (pure in-process async, no OS process calls).
 
+##### status/shell-activity/010 — A `ps` capture whose output exceeds a size cap reports no sample, the same shape a time-budget overrun already reports (fork issue #212).
+- **Layer:** L1 (in-src unit test, `src/platform/proc/unix.rs`; no daemon, no PTY).
+- **Agent:** none (`head -c 400000 /dev/zero` stands in for a process whose `ps` row would be oversized — deterministic and fast, so it finishes well inside `PS_SAMPLE_BUDGET` and cannot be caught by the time bound alone).
+- **Asserts:** both `capture_bounded` (sync) and `capture_bounded_async` (async) report `None` — "no sample" — for a capture whose stdout exceeds the (not-yet-implemented) size cap, exactly like `a_sample_that_outruns_its_budget_reports_no_sample` already asserts for a time-out. Because `process_table`/`process_table_async` already map a `None` capture to `ProcessTableOutcome::Failed` (fork issue #160), and the daemon's existing fail-safe (`last_known` untouched, nothing emitted) already handles `Failed` unchanged, a size cap implemented inside the capture functions needs no new code path anywhere else — this test's whole job is to pin the `None` shape at the capture layer.
+- **Does not assert:** the exact byte threshold chosen for the cap (a coder decision, not pinned here), anything about `process_table_async`'s `Failed`/`Unsupported` split (`status/shell-activity` — see fork issue #160's tests in this same file), or the daemon's fail-safe handling of `Failed` itself (already covered by PR #206's tests, unchanged by this fix).
+- **Platform coverage:** mac+linux (`head -c`/`/dev/zero` are POSIX; this file is `#[cfg(unix)]` throughout).
+
+##### status/shell-activity/011 — `descendant_shell_activity` reports unknown, not a confident idle, when the only candidate descendant's session id could not be read (fork issue #160's note on #216).
+- **Layer:** L1 (in-src unit test, `src/platform/proc/scan.rs`; pure function over a synthetic `&[ProcessInfo]` table, no PTY and no real processes).
+- **Agent:** none (synthetic process-table fixtures via the module's `row()` helper).
+- **Asserts:** when a root's only candidate descendant has an unreadable session id (`session_id <= 0`), `descendant_shell_activity` returns `None` rather than `Some(false)` — the per-row fail-safe PR #206's `ProcessTableOutcome` split established at the per-sample level (`status/shell-activity/001`–`004`), extended to the per-row level scan.rs's `continue`-then-fall-through currently misses. The discriminating case is asserted in the same test: a table where every descendant's session id was validly read and genuinely matches the root's own must still return `Some(false)` — proving a fix can't satisfy this test by simply never resolving to idle.
+- **Does not assert:** anything about a real process table, a real agent, or the daemon's poll loop (`run_shell_activity_monitor`) — this is the pure discriminator only. Does not assert what happens when SOME candidates are unreadable and OTHERS are confirmed busy (a confirmed-busy candidate already short-circuits to `Some(true)` before the unreadable one is reached, per the function's existing candidate-order semantics, untouched by this fix).
+- **Platform coverage:** mac+linux+windows (pure data, no OS process calls — `scan.rs` compiles everywhere per its module doc comment).
+
 ### Agent protocol
 
 #### protocol/live-target
