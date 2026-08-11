@@ -6715,6 +6715,88 @@ mod spawn_tests {
         registry.close_agent(&id).unwrap();
     }
 
+    /// Fork issue #216: a bare count can't say WHICH pane went unconfirmed —
+    /// only a named counterpart to `candidates` can. This pins the seam
+    /// `unconfirmed` is built on directly against
+    /// `shell_foreground_busy_snapshot_in`, with a synthetic table so the
+    /// two panes' classification outcomes are deterministic rather than
+    /// depending on what each spawned shell's live descendants happen to be.
+    ///
+    /// Scenario: two real panes are registered, "pane-a" and "pane-b". The
+    /// synthetic process table names only pane-a's root process (with a
+    /// readable session id and no descendants), so pane-a classifies as
+    /// idle while pane-b's root is entirely absent from the sample — the
+    /// scan attempted it (it is a live candidate) but could not classify
+    /// it. The snapshot must name pane-b explicitly in `unconfirmed`, not
+    /// merely count it.
+    #[spec("status/shell-activity/009")]
+    #[test]
+    fn shell_activity_009_unconfirmed_names_the_specific_pane_not_just_a_count() {
+        let registry = AgentPtyRegistry::new();
+        let id_a = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a");
+        let _id_b = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-b".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn b");
+
+        let pid_a = {
+            let inner = registry.inner.lock().unwrap();
+            inner
+                .agents
+                .get(&id_a)
+                .unwrap()
+                .child
+                .process_id()
+                .expect("pane-a's child must have a live pid") as i32
+        };
+        // pane-b's root is deliberately NOT sampled into this table — the
+        // scenario where the scan attempted a live candidate but the sample
+        // could not confirm it, e.g. a `ps` row that raced the process's own
+        // exit or a table too contended to carry every candidate.
+        let table = vec![crate::platform::proc::ProcessInfo {
+            pid: pid_a,
+            ppid: 1,
+            session_id: pid_a,
+            has_controlling_tty: false,
+            session_leader: true,
+            argv: "sh".to_string(),
+        }];
+
+        let snapshot = registry.shell_foreground_busy_snapshot_in(&table, &[]);
+
+        assert_eq!(
+            snapshot.candidates, 2,
+            "both spawned panes are live, addressable candidates regardless of what the \
+             sample could confirm"
+        );
+        assert_eq!(
+            snapshot.statuses,
+            vec![("pane-a".to_string(), false)],
+            "pane-a's root was sampled with no descendants, so it classifies as confirmed idle"
+        );
+        assert_eq!(
+            snapshot.unconfirmed,
+            vec!["pane-b".to_string()],
+            "pane-b's root was absent from the sample, so the snapshot must name pane-b \
+             explicitly — asserting candidates or statuses.len() alone cannot discriminate \
+             this from an idle deck with only one live pane (fork issue #216)"
+        );
+        assert_eq!(
+            snapshot.statuses.len() + snapshot.unconfirmed.len(),
+            snapshot.candidates,
+            "the daemon's per-pane streak logic depends on this invariant holding"
+        );
+
+        registry.shutdown_all();
+    }
+
     #[test]
     fn spawn_options_env_reaches_child() {
         // Spawn a shell that exits with a status determined by a value passed
