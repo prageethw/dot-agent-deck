@@ -68,14 +68,15 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, TabMembership};
 use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
-    Claimant, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
-    IN_PROGRESS_LABEL_DESCRIPTION, TRIAGE_LABELS, claim_comment_body, derive_issue_paths,
-    dispatch_decision, issue_comment_argv, issue_edit_add_label_argv, issue_list_argv,
-    issue_view_comments_argv, label_create_argv, pr_list_for_issue_argv, substitute_issue_number,
-    triage_instruction,
+    CLAIM_COMMENT_PREFIX, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
+    IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, claim_comment_body,
+    derive_issue_paths, dispatch_decision, gh_current_login_argv, issue_comment_argv,
+    issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv, issue_view_comments_argv,
+    label_create_argv, parse_claim_fields, pr_list_for_issue_argv, substitute_issue_number,
+    triage_instruction, validate_gh_login,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
-use crate::spawn::{SpawnRequest, spawn};
+use crate::spawn::{SpawnKind, SpawnRequest, spawn};
 
 // ---------------------------------------------------------------------------
 // M2.4 — daemon-side worktree registry (close → cleanup plumbing)
@@ -260,6 +261,13 @@ pub async fn run_issue_dispatch(
     // abort the run.
     ensure_claim_label(&cfg.repo).await;
 
+    // PRD fork#235 M2: resolve the currently-authenticated `gh` login ONCE
+    // per run, beside `ensure_claim_label` above — one `gh api user` call
+    // per run, not per issue. Best-effort: a failure (or an implausible
+    // login) just means every claim this run writes no assignee, never that
+    // the run itself fails (`scheduler/dispatch/022`).
+    let login = resolve_current_login(&cfg.repo).await;
+
     // PRD #421 M2.0/M2.1 — opt-in: ensure the triage label vocabulary exists on
     // the repo once per run, before any issue is considered (it's a repo-level
     // concern, not a per-issue one). Best-effort like `claim_issue`: a `gh`
@@ -288,6 +296,7 @@ pub async fn run_issue_dispatch(
             worktrees,
             notifier,
             event_tx,
+            login.as_deref(),
         )
         .await
         {
@@ -318,6 +327,7 @@ async fn dispatch_one_issue(
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    login: Option<&str>,
 ) -> Result<(), String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
@@ -371,7 +381,9 @@ async fn dispatch_one_issue(
         // failure, so it degrades to "no claimant recorded" rather than
         // propagating.
         let claimant = fetch_claim_comment(&cfg.repo, issue).await;
-        notify_skip(SkipReason::Labelled { claimant });
+        notify_skip(SkipReason::Labelled {
+            claimant: claimant.map(|c| c.raw),
+        });
         return Ok(());
     }
 
@@ -459,14 +471,17 @@ async fn dispatch_one_issue(
         // derivation of it.
         owner: Some(creator),
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
-        // The spawn failed after the worktree was created/recorded: no agent
-        // will ever close to trigger cleanup, so drop the registry entry here.
-        // The worktree dir itself is left on disk — the next fire's
-        // worktree-exists idempotency signal reclaims the issue.
-        take_worktree(worktrees, &paths.worktree_dir);
-        return Err(e.to_string());
-    }
+    let handle = match spawn(req, registry, notifier, event_tx, true).await {
+        Ok(h) => h,
+        Err(e) => {
+            // The spawn failed after the worktree was created/recorded: no
+            // agent will ever close to trigger cleanup, so drop the registry
+            // entry here. The worktree dir itself is left on disk — the next
+            // fire's worktree-exists idempotency signal reclaims the issue.
+            take_worktree(worktrees, &paths.worktree_dir);
+            return Err(e.to_string());
+        }
+    };
 
     // M1.3 — surface the per-issue dispatch success.
     notifier.notify(NotifyEvent::IssueDispatched {
@@ -475,27 +490,51 @@ async fn dispatch_one_issue(
         issue,
     });
 
+    // PRD fork#235 M1/M2: derive the claimant IDENTITY from the bound spawn
+    // handle's `SpawnKind`, not from `task_name` alone — an orchestration
+    // dispatch names the ORCHESTRATION's own typed name in the claim
+    // (`scheduler/dispatch/021`), never the scheduled task that fired it. The
+    // worktree digest is of THIS issue's own worktree (`paths.worktree_dir`),
+    // the one the spawned agent actually runs in.
+    let host = local_hostname();
+    let identity = match &handle.kind {
+        SpawnKind::Orchestration { name } => {
+            Identity::orchestration(name, &host, &paths.worktree_dir)
+        }
+        SpawnKind::SingleAgent => {
+            Identity::issue_dispatch(task_name, issue, &host, &paths.worktree_dir)
+        }
+    };
+
     // PRD #421 M1.0/M1.1 — claim the issue now that the dispatch has
-    // genuinely succeeded: write the `in-progress` label and post a claim
-    // comment naming the claiming task. Deliberately AFTER both worktree
-    // creation and spawn succeeded (`dispatch/014`): marking any earlier would
-    // make a FAILED dispatch leave a false claim, permanently un-dispatchable
-    // once M1.2 reads the label back. A `gh` failure here must not turn this
+    // genuinely succeeded: write the `in-progress` label, replace-to-one the
+    // assignee (PRD fork#235 M2), and post a claim comment naming the
+    // claiming identity. Deliberately AFTER both worktree creation and spawn
+    // succeeded (`dispatch/014`): marking any earlier would make a FAILED
+    // dispatch leave a false claim, permanently un-dispatchable once M1.2
+    // reads the label back. A `gh` failure here must not turn this
     // already-successful dispatch into a per-issue failure — the per-issue
     // error boundary would otherwise report an `IssueDispatchFailed` for a
     // dispatch that genuinely worked, which is exactly the defect PRD #421's
-    // Risks section calls out — so `claim_issue` never propagates. Review fix
-    // C3: it no longer swallows the failure into `tracing::warn!` alone
-    // either — a claim failure is now surfaced through the `Notifier` seam as
-    // its own distinguishable event (see [`claim_issue`]).
-    claim_issue(&cfg.repo, issue, task_name, notifier).await;
+    // Risks section calls out (and PRD fork#235 M2 extends to the assignee
+    // write) — so `claim_issue` never propagates. Review fix C3: it no
+    // longer swallows the failure into `tracing::warn!` alone either — a
+    // claim failure is now surfaced through the `Notifier` seam as its own
+    // distinguishable event (see [`claim_issue`]).
+    claim_issue(&cfg.repo, issue, task_name, &identity, login, notifier).await;
 
     Ok(())
 }
 
-/// PRD #421 M1.0/M1.1: write the `in-progress` label and post a claim comment
-/// naming `task_name` — the scheduler-side claimant (`ScheduledTask.name`),
-/// the only claimant this fire-time flow ever has.
+/// PRD #421 M1.0/M1.1 + PRD fork#235 M2: write the `in-progress` label,
+/// replace-to-one the assignee, and post a claim comment naming `identity` —
+/// the bound spawn handle's identity (an orchestration's own typed name, or
+/// `task_name`#`issue` for a single-agent dispatch; see the call site).
+///
+/// Three writes, in order: label (unchanged since PRD #421), assignee
+/// (skipped entirely when `login` is `None` — no resolved human to assign),
+/// then the comment (always posted, appended never edited in place — the log
+/// is the history).
 ///
 /// Best-effort in the sense that mattered from the start (never propagated,
 /// never turns a successful dispatch into `IssueDispatchFailed` — see the
@@ -509,8 +548,19 @@ async fn dispatch_one_issue(
 /// what this PRD exists to prevent. A claim failure is now its own
 /// `NotifyEvent::IssueClaimFailed`, distinguishable from both a successful
 /// dispatch and an `IssueDispatchFailed`: the dispatch genuinely succeeded:
-/// only the claim could not be written.
-async fn claim_issue(repo: &str, issue: u64, task_name: &str, notifier: &dyn Notifier) {
+/// only the claim could not be written. PRD fork#235 M2 extends the same
+/// discipline to the assignee write — worded distinctly from the label and
+/// comment failures per its own implementation trap: GitHub silently drops
+/// an assignee lacking repo access and `gh` may still exit 0, so this reports
+/// what was ATTEMPTED, never what was achieved.
+async fn claim_issue(
+    repo: &str,
+    issue: u64,
+    task_name: &str,
+    identity: &Identity,
+    login: Option<&str>,
+    notifier: &dyn Notifier,
+) {
     let label_argv = issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL);
     if let Err(e) = run_status_args("gh", &label_argv).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
@@ -521,12 +571,27 @@ async fn claim_issue(repo: &str, issue: u64, task_name: &str, notifier: &dyn Not
         });
     }
 
+    if let Some(login) = login {
+        // PRD fork#235 M2: `prior` is the login parsed from the newest
+        // existing claim comment — the deck's own receipt for what it
+        // assigned last, not an assumption about who currently holds the
+        // GitHub-native assignee field.
+        let prior_login = fetch_claim_comment(repo, issue).await.and_then(|c| c.login);
+        let assignee_argv =
+            issue_edit_assignee_argv(repo, issue, Some(login), prior_login.as_deref());
+        if let Err(e) = run_status_args("gh", &assignee_argv).await {
+            notifier.notify(NotifyEvent::IssueClaimFailed {
+                task: task_name.to_string(),
+                repo: repo.to_string(),
+                issue,
+                message: format!("failed to write the assignee: {e}"),
+            });
+        }
+    }
+
     let host = local_hostname();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let claimant = Claimant::Task {
-        name: task_name.to_string(),
-    };
-    let body = claim_comment_body(&claimant, &host, &timestamp);
+    let body = claim_comment_body(identity, &host, &timestamp, login, None);
     let comment_argv = issue_comment_argv(repo, issue, &body);
     if let Err(e) = run_status_args("gh", &comment_argv).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
@@ -535,6 +600,47 @@ async fn claim_issue(repo: &str, issue: u64, task_name: &str, notifier: &dyn Not
             issue,
             message: format!("failed to post the claim comment: {e}"),
         });
+    }
+}
+
+/// PRD fork#235 M2: resolve the currently-authenticated `gh` login ONCE per
+/// run (see the call site in [`run_issue_dispatch`]) — "whoever `gh` is
+/// authenticated as on this host", the human who owns the agent working the
+/// issue right now. Best-effort: any failure (spawn error, non-zero exit, an
+/// empty reply, or a reply that fails [`validate_gh_login`] — the login
+/// reaches both a public comment body and a `gh` argv) degrades to `None`
+/// rather than failing the run; every claim this run writes then simply
+/// carries no assignee (`scheduler/dispatch/022`).
+async fn resolve_current_login(repo: &str) -> Option<String> {
+    let argv = gh_current_login_argv();
+    match run_capture("gh", &argv).await {
+        Ok(out) => {
+            let login = out.trim();
+            if login.is_empty() {
+                tracing::warn!(
+                    repo,
+                    "issue-dispatch: `gh api user` returned an empty login"
+                );
+                None
+            } else if !validate_gh_login(login) {
+                tracing::warn!(
+                    repo,
+                    login,
+                    "issue-dispatch: `gh api user` returned a login that fails validation"
+                );
+                None
+            } else {
+                Some(login.to_string())
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                error = %e,
+                "issue-dispatch: failed to resolve the current gh login"
+            );
+            None
+        }
     }
 }
 
@@ -580,26 +686,25 @@ async fn ensure_triage_labels(repo: &str) {
     }
 }
 
-/// The literal prefix [`claim_comment_body`] always produces — used to
-/// recognize the deck's OWN claim comment among an issue's comments, as
-/// opposed to any other comment a human left.
-const CLAIM_COMMENT_PREFIX: &str = "Claimed by ";
-
-/// PRD #421 M1.3: look up the deck's own claim comment for an issue already
-/// known to carry the `in-progress` label — called ONLY from the label-skip
-/// arm of `dispatch_one_issue`, i.e. only when a skip is already decided.
-/// Best-effort: a `gh` failure here must not turn an already-correct SKIP
-/// decision into a per-issue failure, so any error degrades to `None` ("no
-/// claimant recorded") rather than propagating.
-async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<String> {
+/// PRD #421 M1.3: look up the deck's own claim comment for an issue —
+/// called both from the label-skip arm of `dispatch_one_issue` (only when a
+/// skip is already decided) and from [`claim_issue`]'s prior-assignee lookup
+/// (PRD fork#235 M2). Best-effort: a `gh` failure here must not turn an
+/// already-correct SKIP decision (or a successful claim) into a per-issue
+/// failure, so any error degrades to `None` ("no claimant recorded") rather
+/// than propagating.
+async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<ParsedClaim> {
     let argv = issue_view_comments_argv(repo, issue);
     let stdout = run_capture("gh", &argv).await.ok()?;
     parse_claim_comment(&stdout).ok().flatten()
 }
 
 /// Pure parse of `gh issue view --json comments` output into the deck's own
-/// claim-comment text, if discoverable. Split out from [`fetch_claim_comment`]
-/// so the JSON-shape logic is unit-testable without a subprocess.
+/// claim, if discoverable — the structured fields (PRD fork#235 M1), plus the
+/// full `raw` text callers that only need the human-readable comment (the PRD
+/// #421 skip-reason claimant text) can still use. Split out from
+/// [`fetch_claim_comment`] so the JSON-shape logic is unit-testable without a
+/// subprocess.
 ///
 /// Takes the LAST matching comment, not the first (PRD #421 review C2 /
 /// reviewer F4): `gh issue view --json comments` returns comments in
@@ -607,7 +712,7 @@ async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<String> {
 /// place precisely so a succession of claimants is preserved when one hands
 /// off to another. Reading the first match reports the earliest, superseded
 /// claimant instead of the current one.
-fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
+fn parse_claim_comment(json: &str) -> Result<Option<ParsedClaim>, String> {
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
     Ok(value
@@ -618,7 +723,7 @@ fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
                 .iter()
                 .filter_map(|c| c.get("body").and_then(serde_json::Value::as_str))
                 .rfind(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
-                .map(str::to_string)
+                .and_then(parse_claim_fields)
         }))
 }
 
@@ -640,7 +745,7 @@ fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
 /// no `gethostname`-equivalent windows-sys feature already enabled in this
 /// crate, so it reads `COMPUTERNAME`, the same system environment variable
 /// the `hostname` command itself would have reported.
-fn local_hostname() -> String {
+pub(crate) fn local_hostname() -> String {
     #[cfg(unix)]
     {
         // SAFETY: `buf` is a valid buffer of `buf.len()` bytes for the
@@ -1488,11 +1593,17 @@ mod tests {
 
     #[test]
     fn parse_claim_comment_finds_deck_claim() {
-        let json = r#"{"comments":[{"body":"unrelated"},{"body":"Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z."}]}"#;
+        let body = "Claimed by issue-dispatch:dispatch-task#7@host:a1b2c3d4 on `host` at 2026-08-09T00:00:00Z, for @alice.";
+        let json = format!(r#"{{"comments":[{{"body":"unrelated"}},{{"body":"{body}"}}]}}"#);
+        let parsed = parse_claim_comment(&json)
+            .unwrap()
+            .expect("must find the claim");
         assert_eq!(
-            parse_claim_comment(json).unwrap().as_deref(),
-            Some("Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z.")
+            parsed.identity,
+            "issue-dispatch:dispatch-task#7@host:a1b2c3d4"
         );
+        assert_eq!(parsed.login.as_deref(), Some("alice"));
+        assert_eq!(parsed.raw, body);
     }
 
     #[test]
@@ -1507,14 +1618,18 @@ mod tests {
         // in place on a handover, so the LAST matching comment — not the
         // first — is the current claimant.
         let json = r#"{"comments":[
-            {"body":"Claimed by scheduled task `nightly-a` on `host-1` at 2026-08-01T00:00:00Z."},
+            {"body":"Claimed by issue-dispatch:nightly-a#1@host-1:aaaaaaaa on `host-1` at 2026-08-01T00:00:00Z, for @nina."},
             {"body":"unrelated"},
-            {"body":"Claimed by scheduled task `nightly-b` on `host-2` at 2026-08-09T00:00:00Z."}
+            {"body":"Claimed by issue-dispatch:nightly-b#1@host-2:bbbbbbbb on `host-2` at 2026-08-09T00:00:00Z, for @bob."}
         ]}"#;
+        let parsed = parse_claim_comment(json)
+            .unwrap()
+            .expect("must find the claim");
         assert_eq!(
-            parse_claim_comment(json).unwrap().as_deref(),
-            Some("Claimed by scheduled task `nightly-b` on `host-2` at 2026-08-09T00:00:00Z.")
+            parsed.identity,
+            "issue-dispatch:nightly-b#1@host-2:bbbbbbbb"
         );
+        assert_eq!(parsed.login.as_deref(), Some("bob"));
     }
 
     #[test]

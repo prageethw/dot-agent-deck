@@ -743,7 +743,7 @@ pub fn sanitize_marker_creator(name: &str) -> String {
 /// that doesn't parse as `owner/name`, or a host other than `github.com`
 /// (`gh` only ever talks to GitHub, so a non-GitHub remote must never resolve
 /// to a slug `gh` would misinterpret rather than reject).
-fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
+pub(crate) fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
         .args(["remote", "get-url", "origin"])

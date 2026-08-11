@@ -129,8 +129,8 @@ Both refusals name the holder **and its host**: `held by \`orchestration:orch-A@
 | Catalog ID | Action | Scenario |
 |---|---|---|
 | `scheduler/dispatch/010` | modify | Single-agent dispatch: label, assignee, one comment — wording otherwise unchanged. |
-| `scheduler/dispatch/016` | create | Orchestration dispatch names the **orchestration** in the claim, not the scheduled task. |
-| `scheduler/dispatch/017` | create | `gh api user` fails: label and comment still land, no assignee, dispatch **not** reported failed. |
+| `scheduler/dispatch/021` | create | Orchestration dispatch names the **orchestration** in the claim, not the scheduled task. |
+| `scheduler/dispatch/022` | create | `gh api user` fails: label and comment still land, no assignee, dispatch **not** reported failed. **GREEN today** — see below. |
 | `issue/claim/001` | create | **The lock:** issue held by A, `issue claim` from B **exits non-zero**, writes nothing, names A and A's host. |
 | `issue/claim/002` | create | `--takeover` alone **still refuses** — nothing written, message instructs `--confirm-stopped`. |
 | `issue/claim/003` | create | `--takeover --confirm-stopped` succeeds: log holds both in order, `.rfind` returns B, assignee is B's human only, new comment still starts `Claimed by `. |
@@ -147,6 +147,13 @@ Both refusals name the holder **and its host**: `held by \`orchestration:orch-A@
 Until the `issue claim` subcommand exists, these fail via clap's own "unrecognized subcommand" error rather than any assertion the tests make — the same honest RED `daemon_status.rs` documents for itself. `dispatch/004` remains the reference for the orchestration-vs-single-agent fixture split on the e2e side. Each test carries a `/// Scenario:` comment (rule 7) and a `tests/CATALOG.md` entry. None is demo-reel-eligible (no real agent).
 
 **`issue/claim/007` is the single most important test in the set** and its Scenario comment must state the #201 reasoning, not merely assert a refusal — it is the regression guard against anyone later "simplifying" the identity back to a bare name.
+
+**Two corrections made during the RED round**, recorded rather than silently applied:
+
+1. **The e2e IDs are `021`/`022`, not `016`/`017`.** This PRD originally named `016`/`017`; both are already taken in `tests/e2e_issue_dispatch.rs` by unrelated PRD #421 tests (`dispatch_016_externally_labelled_issue_skip_reports_no_claimant`, `dispatch_017_skip_causes_render_distinguishably`), as are `018`–`020`. The PRD was written without checking the file — the same "didn't look before naming" shape rule 20 exists to catch, one directory over instead of one repo over.
+2. **`scheduler/dispatch/022` is GREEN from the start, not RED-first.** Today's `claim_issue` never calls `gh api user` and writes no assignee at all, so "no assignee written, dispatch not reported failed" holds trivially against unmodified code. It is a regression guard that only becomes load-bearing once M2's assignee write lands — the same pattern as this file's existing `012`/`014`/`019`. Recorded in its catalog entry so it is not later mistaken for a test that failed to wire up.
+
+**RED confirmed on CI** at `fb55e2b`/`a43c05c` (PR #236): 1946 tests run, **1938 passed, 8 failed, 0 skipped** on both Linux and macOS — exactly the eight `issue/claim/*` tests, each failing at `assert_recognized_subcommand` with clap's `unrecognized subcommand 'issue'`, and nothing collateral. `dispatch/010` and `021` fail on their assertions in the e2e tier (read from the job log, not the check colour — the `e2e:` job is `continue-on-error: true`, so its green run reports nothing about test outcomes).
 
 ### M5 — Docs and close-out
 
