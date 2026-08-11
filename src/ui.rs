@@ -36163,4 +36163,152 @@ mod tests {
             role_statuses[0]
         );
     }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` through a FULL delivery
+    /// cycle on one tab/pane — frame 1 lands the write, frame 2 (past the
+    /// deadline, no confirmation ever observed) finalizes it as
+    /// delivered-unconfirmed via `finalize_orchestrator_prompt_delivered`,
+    /// which calls `reset_delivery_cycle()`. A SECOND cycle then starts on
+    /// the exact same tab/pane, mirroring what the remit re-arm gate does
+    /// (`src/ui.rs:12342`: fresh anchor, fresh readiness timestamp). Asserts
+    /// the second cycle's write reaches the pane double as a genuine new
+    /// attempt, under a `delivery_id` distinct from the first — not a replay
+    /// answered from the ledger entry the first cycle's id left behind.
+    #[spec("orchestration/seed/012")]
+    #[test]
+    fn orchestration_seed_012_reset_delivery_cycle_clears_every_field_so_a_fresh_cycle_gets_a_real_write()
+     {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 435;
+        let cycle_one_start = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at
+            .insert(tab_id, cycle_one_start);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            cycle_one_start
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-435".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-435".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-435".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt, cycle one".to_string());
+
+        // Cycle 1, frame 1: the write lands.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_one_start,
+            tab_id,
+            &["orch-pane-435".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "precondition: cycle 1 frame 1 must land exactly one write"
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: cycle 1's write must be awaiting confirmation, not finalized"
+        );
+        let delivery_id_cycle_one = ui
+            .prompt_delivery
+            .get("orch-pane-435")
+            .map(|d| d.delivery_id.clone())
+            .expect("precondition: cycle 1 must have minted a delivery_id");
+
+        // Cycle 1, frame 2: past the deadline, no confirmation was ever
+        // observed — finalizes as delivered-unconfirmed, which calls
+        // `reset_delivery_cycle()` (the exact path `orchestration/seed/005`
+        // pins for a single cycle).
+        let cycle_one_deadline = cycle_one_start
+            .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("past-deadline instant");
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_one_deadline,
+            tab_id,
+            &["orch-pane-435".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_none(),
+            "precondition: cycle 1 must have finalized (delivered-unconfirmed) \
+             before cycle 2 starts"
+        );
+
+        // A fresh cycle starts on the SAME tab/pane — a new prompt, a fresh
+        // anchor and a fresh readiness timestamp, exactly as the remit
+        // re-arm gate sets them (`src/ui.rs:12342`) when it calls
+        // `reset_delivery_cycle()` and re-arms with a new prompt.
+        let cycle_two_start = cycle_one_deadline + std::time::Duration::from_secs(1);
+        ui.orchestration_prompt_anchor_at
+            .insert(tab_id, cycle_two_start);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            cycle_two_start
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut prompt = Some("orchestrator prompt, cycle two".to_string());
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_two_start,
+            tab_id,
+            &["orch-pane-435".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        let attempts_after_cycle_two = attempts.load(Ordering::SeqCst);
+        let delivery_id_cycle_two = ui
+            .prompt_delivery
+            .get("orch-pane-435")
+            .map(|d| d.delivery_id.clone());
+        let cycle_two_landed = ui.orchestration_awaiting_confirmation.contains_key(&tab_id);
+
+        assert!(
+            attempts_after_cycle_two == 2
+                && cycle_two_landed
+                && delivery_id_cycle_two.as_deref() != Some(delivery_id_cycle_one.as_str()),
+            "a fresh delivery cycle on the same tab/pane must mint a fresh \
+             delivery_id and produce a REAL write, not a replay against the \
+             ledger entry cycle 1's delivery_id left behind: \
+             attempts_after_cycle_two={attempts_after_cycle_two} (must be 2 \
+             — the double's ledger short-circuits a repeat delivery_id with \
+             no call reaching the stand-in PTY at all, so this would read 1 \
+             if `reset_delivery_cycle()` failed to clear `prompt_delivery` \
+             and cycle 2 replayed cycle 1's cached `Applied` outcome instead \
+             of writing), cycle_two_landed={cycle_two_landed} (must be true \
+             — a genuine second write must land and await its own \
+             confirmation), delivery_id_cycle_one={delivery_id_cycle_one:?}, \
+             delivery_id_cycle_two={delivery_id_cycle_two:?} (must differ — \
+             `capture_prompt_delivery` only mints a fresh id when \
+             `prompt_delivery` has no entry for the pane; reusing cycle 1's \
+             would mean `reset_delivery_cycle()` forgot to clear it)"
+        );
+    }
 }
