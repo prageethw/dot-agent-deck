@@ -71,19 +71,22 @@ There is also **no launchd job** — no plist, nothing in `launchctl list`. The 
 ```bash
 # 1. Quit every TUI, then stop the daemon. THIS MUST COME FIRST —
 #    otherwise step 2 just attaches to the old one.
-#    Match on 'daemon serve' alone: the daemon is argv[0]-named after whichever
-#    binary spawned it (current_exe), so a pattern containing 'dot-agent-deck'
-#    silently fails to match a daemon spawned by 'worker-agent-deck'.
-pkill -f 'daemon serve'
+#    --force is required while managed agents are still running; stop refuses
+#    without it rather than killing them out from under you.
+worker-agent-deck daemon stop --force
 
 # 2. Relaunch from the binary you want to be running.
 worker-agent-deck
 
 # 3. Verify you got what you expected.
-pgrep -fl 'daemon serve'              # must name the new binary, not the old path
+ps -Ao pid,command | grep 'daemon serve' | grep -v grep   # NOT pgrep — see below
 worker-agent-deck daemon status       # roster — confirms the new build is live
 worker-agent-deck --version           # the version you just installed
 ```
+
+**Use `daemon stop`, not `pkill` — and do not verify with `pgrep`.** `daemon stop` is the supported path (PRD #103 Phase 3, "documented alternative to `kill -9` after upgrading the binary"): SIGTERM, then poll until the daemon stops accepting connections. `daemon restart` does the same and lets the next invocation lazy-spawn a fresh one.
+
+`pgrep -f 'daemon serve'` **silently matches nothing on macOS** even while the daemon is plainly running — verified 2026-08-11 against a live daemon that `ps -Ao pid,command` listed as `/Users/…/.local/bin/worker-agent-deck daemon serve`. `pgrep -f` needs `KERN_PROCARGS2` to read another process's full argv, and it cannot for a daemonized (`setsid`) process, so the match fails rather than erroring. This matters twice over: `pkill -f 'daemon serve'` therefore does **not** stop the daemon, and — worse — a `pgrep` check reports "no daemon running" for a deck that is running fine. That false negative is exactly how a binary gets replaced in the belief that nothing is using it. Match with `ps … | grep` when you need to see the process.
 
 If hooks were installed by an older binary and you want them pointing at the new one, re-run `hooks install` **from the new binary** — the path is baked at install time, so nothing else updates it. Reinstalling under the *same* filename does not need this: the baked path is unchanged, so the existing hook entries keep working and simply pick up the new build.
 
