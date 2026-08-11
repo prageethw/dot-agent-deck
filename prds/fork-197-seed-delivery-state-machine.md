@@ -4,11 +4,11 @@
 
 **Priority**: High
 
-**Status**: In progress — test plan approved and the two open mechanism choices decided (see *Decisions taken*). M1 starting; M2–M4 not started.
+**Status**: In progress — M1 (#188), M2 (#182) and M3 step 1 (#187, TEXT) are landed and green on PR #219. Remaining: M3 step 2 (remove LEVEL) and M4 (#194).
 
 ## Decisions taken
 
-Both were left open by this document for the implementer to choose. The user has now decided them, so they are no longer open questions and the implementer should not re-litigate either.
+The first two were left open by this document for the implementer to choose. The user has decided them, so they are no longer open questions and the implementer should not re-litigate either. The third and fourth were decided during implementation.
 
 - **M3 → a submission event, not a per-cycle nonce.** Confirmation compares against a *submission event* rather than diffing `last_user_prompt`'s value. The nonce alternative is rejected on exactly the ground this PRD's own Risks section raises: the remit pointer is user-visible text in the pane, and a varying token in it is a UX regression.
 - **M4 → submit-only, not clear-then-rewrite.** A confirmation-retry sends a bare CR rather than text plus CR, since `Applied` already means the bytes reached the PTY. This avoids inventing an agent-agnostic composer-clear primitive that claude/opencode/codex/pi do not share.
@@ -16,6 +16,14 @@ Both were left open by this document for the implementer to choose. The user has
   **This makes the lost-write risk live, not hypothetical**, which the Risks section anticipated: if the bytes were genuinely lost downstream, a bare CR does nothing and the deadline finalizes as *delivered-unconfirmed* — the exact silent-loss symptom upstream #424 exists to catch. So extending `orchestration/seed/005` for the lost-write half is **mandatory** under this choice, not optional, and it is the single most important thing for review and audit to probe.
 
   It also keeps the rule 12 answer unchanged: submit-only needs no new pane RPC, so no `PROTOCOL_VERSION` bump and no cross-version manual run. Had clear-then-rewrite been chosen, the composer-clear primitive would have made this a contract change. **Re-answer if the implementation ends up needing a new RPC anyway.**
+
+- **M4's feasibility question is answered: a bare CR rides the existing pane API — no new RPC.** The probe traced `write_and_submit_to_pane_with_identity("")` end to end: `encode_pane_payload("")` returns an empty vec (already pinned by `encode_pane_payload_empty`, `src/pane_input.rs:156-161`), the zero-length write loop never issues a syscall, and execution falls through to `SUBMIT_DELAY` then `\r` — mechanically identical to a real Enter keypress on a composer that already holds text. The delivery ledger needs nothing new: the confirmation-retry branch already mints a fresh `delivery_id` per attempt, so it never reaches `admit_delivery`'s replay path. **M4 is therefore a pure call-site change** in `deliver_orchestrator_prompt`: pass `""` instead of the prompt text when `awaiting.is_some()`. The rule 12 answer above stands — no bump, no fragment, no cross-version run.
+
+  The probe also corrected this document: the *"`prompt_text_confirms` rejects empty strings"* obstacle **conflated two different strings**. The text sent on one write attempt (which M4 makes empty) and the text remembered for confirmation matching (`orchestrator_prompt`/`sent_prompt`, which stays full-text for the cycle's duration) are already separate variables. M4 does not need to unify them, and the empty-string guard never fires on this flow.
+
+- **M4's real-agent e2e covers OpenCode as well as Claude** (user decision). The probe surfaced a risk this document had not recorded: the write path is agent-agnostic by construction — `b"\r"` is written with no branch on `AgentType` — but the codebase documents CR-as-submit only for **claude and codex** (`src/agent_pty.rs:3566`, `:3668`), and `SUBMIT_DELAY`'s 150 ms is documented as empirically tuned against *claude* (`src/pane_input.rs:77-82`). Nothing documents how **opencode** or **pi** treat a *standalone* CR arriving ~2 s after a separate write — a different case from the CR fused to its own payload, which is what demonstrably works today. If a standalone CR does not submit on those harnesses, M4 fixes duplicate delivery on Claude while making the retry a **no-op** there, which is arguably worse than the duplication it replaces.
+
+  **Consequence to plan around, not a formality:** OpenCode is one of the credential-gated e2e files that **self-skip in CI**, so this test will report green there having executed nothing — the empty-gate-versus-passed-gate trap of CLAUDE.md rule 8. It proves something only under an orchestrator-authorised **carve-out (a)** local run, filtered to the real-agent files, before `/prd-done`. Report that run's actual result; a green board is not evidence here. Pi remains an accepted, documented unknown.
 
 **Fork-only**, and currently intended to stay so. Verified mechanically against `upstream/main`: `orchestration_awaiting_confirmation`, `CONFIRMATION_GRACE_PERIOD`, `prompt_text_confirms` and `AwaitingConfirmation` all have **0** occurrences there. Upstream issue #424 is still OPEN — upstream carries the original problem and never received the fix, so there is nothing there to fix. This becomes an upstream offer only if `46b64f0` is eventually contributed, which is better done with this PRD already folded into it.
 
