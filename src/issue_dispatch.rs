@@ -683,6 +683,22 @@ pub struct ParsedClaim {
     /// the whole thing (the PRD #421 skip-reason claimant text), so parsing
     /// out structured fields doesn't lose the ability to show the original.
     pub raw: String,
+    /// The GitHub login that AUTHORED this claim comment (`gh issue view
+    /// --json comments`'s `author.login`), attached alongside `body` from
+    /// the SAME comment object by [`parsed_claim_from_comment_json`] — never
+    /// a second call. Round-4 author gate (PRD fork#235): "who holds this
+    /// issue?" (the fields above) reads ANY discoverable claim comment, but
+    /// "whose assignment do we remove?" trusts only a comment whose
+    /// `author` is the deck's own currently-authenticated account —
+    /// comparing this field against that login is how both write paths
+    /// (`issue_claim::do_claim`, `issue_dispatch_run::claim_issue`) make
+    /// that decision, never `login` alone. `None` when the JSON carried no
+    /// `author.login` (an older-shaped record, a synthetic JSON that omits
+    /// it, or a hand-typed comment) — always fails the gate rather than
+    /// assuming a match. Also `None` for a [`ParsedClaim`] built directly
+    /// from a raw body string (e.g. [`parse_claim_fields`] called without a
+    /// surrounding comment object), since there is no author to attach.
+    pub author: Option<String>,
 }
 
 /// Parse the structured fields out of one already-located claim comment body
@@ -734,16 +750,24 @@ fn parse_human_claim(after_at: &str, raw: &str) -> Option<ParsedClaim> {
     let marker = " working from `";
     let marker_idx = after_at.find(marker)?;
     let login = after_at[..marker_idx].to_string();
+    // Round-4 audit, cause 1 (`issue/claim/025`): validate at the parser
+    // boundary, same as `parse_worktree_claim`'s login clause — a
+    // hand-typed or hostile human-shaped comment is not restricted to a
+    // real login's shape either.
+    if !validate_gh_login(&login) {
+        return None;
+    }
     let after_marker = &after_at[marker_idx + marker.len()..];
     let host_end = after_marker.find('`')?;
     let host = after_marker[..host_end].to_string();
     let after_host = &after_marker[host_end + 1..];
-    let timestamp = extract_timestamp(after_host)?;
+    let (timestamp, _) = extract_timestamp(after_host)?;
     Some(ParsedClaim {
         identity: format!("human:{login}@{host}"),
         timestamp,
         login: Some(login),
         raw: raw.to_string(),
+        author: None,
     })
 }
 
@@ -790,30 +814,57 @@ fn parse_worktree_claim(rest: &str, raw: &str) -> Option<ParsedClaim> {
         None => (String::new(), after_branch),
     };
 
-    let timestamp = extract_timestamp(after_host_or_branch)?;
-    let login = rest.find(", for @").map(|idx| {
-        let after = &rest[idx + ", for @".len()..];
+    let (timestamp, after_timestamp) = extract_timestamp(after_host_or_branch)?;
+    // Round-4 audit (`issue/claim/024`): bound the START of this search to
+    // AFTER the timestamp clause's own span (`after_timestamp`, a suffix of
+    // `rest` starting right where `extract_timestamp` stopped), not the
+    // whole remaining line from the very start. `claim_line()` already
+    // bounds the END; without this, an EARLIER field — the decorative
+    // label, the path, or the branch, none of which are restricted from
+    // containing the literal substring `, for @` — can shadow a genuine
+    // trailing login clause, which can only ever appear after the
+    // timestamp in a comment this format actually renders.
+    let login = after_timestamp.find(", for @").and_then(|idx| {
+        let after = &after_timestamp[idx + ", for @".len()..];
         let end = after.find(',').unwrap_or(after.len());
-        after[..end].trim_end_matches('.').to_string()
+        let candidate = after[..end].trim_end_matches('.').to_string();
+        // Round-4 audit, cause 1 (`issue/claim/025`): validate at the
+        // parser boundary — `validate_gh_login`'s two pre-existing call
+        // sites both validate the deck's own `gh api user` reply, never a
+        // login PARSED out of a comment, so a malformed value used to sail
+        // straight through even once the author gate (`022`/`023`) was
+        // satisfied. Both write paths read `ParsedClaim.login`, so
+        // dropping an invalid candidate here means neither has to
+        // re-make this judgement.
+        validate_gh_login(&candidate).then_some(candidate)
     });
     Some(ParsedClaim {
         identity: format!("worktree:{path}@{branch}{host_suffix}"),
         timestamp,
         login,
         raw: raw.to_string(),
+        author: None,
     })
 }
 
 /// Extract the timestamp out of `after_marker`, which is assumed to start
 /// with (optionally after other text) the literal `" at "` marker followed by
 /// the RFC3339 timestamp, ending at the next `,` or the end of the string
-/// (with a trailing `.` trimmed).
-fn extract_timestamp(after_marker: &str) -> Option<String> {
+/// (with a trailing `.` trimmed). Returns the timestamp alongside the
+/// REMAINDER of `after_marker` starting at that same terminator — a suffix
+/// of the caller's own string, not a copy — so a caller can bound any
+/// further sub-search within the same claim line to start only after the
+/// timestamp clause has consumed its own span (round-4 audit,
+/// `issue/claim/024`: [`parse_worktree_claim`]'s login search used to scan
+/// from the very start of the line, so an EARLIER field could shadow a
+/// genuine trailing login clause — see that function's own doc).
+fn extract_timestamp(after_marker: &str) -> Option<(String, &str)> {
     let ts_marker = " at ";
     let ts_start = after_marker.find(ts_marker)? + ts_marker.len();
     let after_ts = &after_marker[ts_start..];
     let ts_end = after_ts.find(',').unwrap_or(after_ts.len());
-    Some(after_ts[..ts_end].trim_end_matches('.').to_string())
+    let timestamp = after_ts[..ts_end].trim_end_matches('.').to_string();
+    Some((timestamp, &after_ts[ts_end..]))
 }
 
 /// Build the `gh issue view --json labels,comments` argv (arguments after
@@ -831,6 +882,25 @@ pub fn issue_view_claim_state_argv(repo: &str, issue: u64) -> Vec<String> {
         "--".to_string(),
         issue.to_string(),
     ]
+}
+
+/// Parse [`ParsedClaim::author`] onto whatever [`parse_claim_fields`]
+/// extracts from `comment`'s `body` — reading BOTH from the SAME already-
+/// fetched comment object, never a second `gh` call. Round-4 author gate
+/// (PRD fork#235): shared by [`parse_claim_state`] (the CLI path) and
+/// `issue_dispatch_run::parse_claim_comment` (the async dispatch path) so
+/// the two write paths read "who authored the held claim?" the exact same
+/// way — the CLI-vs-dispatch asymmetry a round-3 audit already had to close
+/// once must not reopen here by each path re-implementing this lookup.
+pub(crate) fn parsed_claim_from_comment_json(comment: &serde_json::Value) -> Option<ParsedClaim> {
+    let body = comment.get("body").and_then(serde_json::Value::as_str)?;
+    let mut claim = parse_claim_fields(body)?;
+    claim.author = comment
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some(claim)
 }
 
 /// Parse a `gh issue view --json labels,comments` document into (label
@@ -854,9 +924,12 @@ pub fn parse_claim_state(json: &str) -> Result<(bool, Option<ParsedClaim>), Stri
         .and_then(|comments| {
             comments
                 .iter()
-                .filter_map(|c| c.get("body").and_then(serde_json::Value::as_str))
-                .rfind(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
-                .and_then(parse_claim_fields)
+                .rfind(|c| {
+                    c.get("body")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
+                })
+                .and_then(parsed_claim_from_comment_json)
         });
     Ok((label_present, held))
 }

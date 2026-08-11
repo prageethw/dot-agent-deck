@@ -385,7 +385,25 @@ pub fn run_issue_claim(
     ) {
         ClaimDecision::Claim { takeover_from } => {
             let login = resolve_assignee_login(&identity);
-            let prior_login = held.as_ref().and_then(|h| h.login.clone());
+            // Round-4 author gate (PRD fork#235 — "the removal target is
+            // author-gated"): "who holds this issue?" (the `decide_claim`
+            // call above) reads ANY claim comment, but "whose assignment do
+            // we remove?" trusts only a comment whose AUTHOR is the deck's
+            // own currently-authenticated account (`login`, resolved just
+            // above) — never comment CONTENT alone. `held.author` is `None`
+            // for a comment the JSON carried no `author.login` for, which
+            // also fails this comparison and drops the removal
+            // (`issue/claim/022`: a stranger's well-formed `, for
+            // @victim.` clause on an issue this deck never labelled must
+            // never reach `--remove-assignee`; `issue/claim/023`: the SAME
+            // shape, self-authored, must still drive it).
+            let prior_login = held.as_ref().and_then(|h| {
+                if h.author.is_some() && h.author.as_deref() == login.as_deref() {
+                    h.login.clone()
+                } else {
+                    None
+                }
+            });
             do_claim(
                 &repo,
                 issue,
@@ -460,6 +478,11 @@ mod tests {
             timestamp: timestamp.to_string(),
             login: login.map(str::to_string),
             raw: String::new(),
+            // None of these `decide_claim` unit tests exercise the round-4
+            // author gate (that's `do_claim`'s concern, covered by
+            // `tests/issue_claim.rs`'s `022`/`023`/`025`) — `decide_claim`
+            // itself never reads `author` at all.
+            author: None,
         }
     }
 

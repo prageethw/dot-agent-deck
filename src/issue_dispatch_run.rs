@@ -72,8 +72,8 @@ use crate::issue_dispatch::{
     IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, claim_comment_body,
     derive_issue_paths, dispatch_decision, gh_current_login_argv, issue_comment_argv,
     issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv, issue_view_comments_argv,
-    label_create_argv, parse_claim_fields, pr_list_for_issue_argv, substitute_issue_number,
-    triage_instruction, validate_gh_login,
+    label_create_argv, parsed_claim_from_comment_json, pr_list_for_issue_argv,
+    substitute_issue_number, triage_instruction, validate_gh_login,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
@@ -576,8 +576,22 @@ async fn claim_issue(
     // field. Resolved FIRST, before this run posts its own comment below —
     // reading it any later would find this run's own just-posted comment
     // instead of the actual prior holder's.
+    //
+    // Round-4 author gate (PRD fork#235 — "the removal target is
+    // author-gated"), mirroring `issue_claim::run_issue_claim`'s identical
+    // fix on the CLI path: "who holds this issue?" reads any claim
+    // comment, but the REMOVAL target is trusted only when that comment's
+    // AUTHOR is this run's own currently-authenticated `login` — never
+    // comment CONTENT alone. `c.author` is `None` for a comment the JSON
+    // carried no `author.login` for, which also fails this comparison.
     let prior_login = if login.is_some() {
-        fetch_claim_comment(repo, issue).await.and_then(|c| c.login)
+        fetch_claim_comment(repo, issue).await.and_then(|c| {
+            if c.author.is_some() && c.author.as_deref() == login {
+                c.login
+            } else {
+                None
+            }
+        })
     } else {
         None
     };
@@ -749,9 +763,12 @@ fn parse_claim_comment(json: &str) -> Result<Option<ParsedClaim>, String> {
         .and_then(|comments| {
             comments
                 .iter()
-                .filter_map(|c| c.get("body").and_then(serde_json::Value::as_str))
-                .rfind(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
-                .and_then(parse_claim_fields)
+                .rfind(|c| {
+                    c.get("body")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
+                })
+                .and_then(parsed_claim_from_comment_json)
         }))
 }
 
@@ -1572,6 +1589,12 @@ async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only this test module reads `parse_claim_fields` directly (production
+    // code here goes through `parsed_claim_from_comment_json` instead, since
+    // it also needs the comment's `author` — round-4 author gate), so the
+    // import lives here rather than at the top of the file to avoid an
+    // unused-import warning on the non-test build.
+    use crate::issue_dispatch::parse_claim_fields;
     use spec::spec;
 
     #[test]
