@@ -229,11 +229,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: WorktreeCmd,
     },
-    /// Claim/lock a GitHub issue against concurrent agents (PRD fork#235,
-    /// fork-only — layered over PRD #421's claim record). Refuses with a
-    /// non-zero exit when a DIFFERENT identity already holds the issue,
-    /// naming the holder and its host, rather than merely recording who
-    /// claimed it.
+    /// Claim a GitHub issue against concurrent agents — cooperative
+    /// coordination, not an adversarial lock (PRD fork#235, fork-only —
+    /// layered over PRD #421's claim record). Refuses with a non-zero exit
+    /// when a DIFFERENT identity already holds the issue, naming the
+    /// holder's worktree (path and branch, or the claiming human), rather
+    /// than merely recording who claimed it.
     Issue {
         #[command(subcommand)]
         cmd: IssueCmd,

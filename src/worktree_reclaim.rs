@@ -479,7 +479,14 @@ fn resolve_common_dir(repo_dir: &Path) -> Option<PathBuf> {
 /// landed in a forged one it controlled (fork #166 P2 / reviewer F5).
 /// Routing both through this single resolution closes that window: whatever
 /// directory passed containment is the directory whose content gets read.
-fn owned_git_dir(repo_dir: &Path, worktree_path: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)`, not private: PRD fork#235 M3's `issue_claim::resolve_caller_identity`
+/// calls this directly (with `repo_dir == worktree_path == cwd`, the same
+/// self-referential pattern `owner_of` below already uses) to answer "is this
+/// a genuinely linked worktree at all", independent of whether it carries an
+/// ownership marker — round 3's identity anchor needs the containment check
+/// alone, never the marker.
+pub(crate) fn owned_git_dir(repo_dir: &Path, worktree_path: &Path) -> Option<PathBuf> {
     let (Some(git_dir), Some(common_dir)) =
         (resolve_git_dir(worktree_path), resolve_common_dir(repo_dir))
     else {

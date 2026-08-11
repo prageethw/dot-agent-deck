@@ -490,19 +490,20 @@ async fn dispatch_one_issue(
         issue,
     });
 
-    // PRD fork#235 M1/M2: derive the claimant IDENTITY from the bound spawn
+    // PRD fork#235 round 3: derive the claimant IDENTITY from the bound spawn
     // handle's `SpawnKind`, not from `task_name` alone — an orchestration
     // dispatch names the ORCHESTRATION's own typed name in the claim
     // (`scheduler/dispatch/021`), never the scheduled task that fired it. The
-    // worktree digest is of THIS issue's own worktree (`paths.worktree_dir`),
-    // the one the spawned agent actually runs in.
-    let host = local_hostname();
+    // anchor itself (CLAUDE.md rule 23) is THIS issue's own dispatched
+    // worktree's absolute path plus its branch (`paths.worktree_dir` /
+    // `paths.branch`) — the one the spawned agent actually runs in — never a
+    // host or a digest; the task/orchestration name is decoration only.
     let identity = match &handle.kind {
         SpawnKind::Orchestration { name } => {
-            Identity::orchestration(name, &host, &paths.worktree_dir)
+            Identity::orchestration(name, &paths.worktree_dir, &paths.branch)
         }
         SpawnKind::SingleAgent => {
-            Identity::issue_dispatch(task_name, issue, &host, &paths.worktree_dir)
+            Identity::issue_dispatch(task_name, issue, &paths.worktree_dir, &paths.branch)
         }
     };
 
@@ -589,9 +590,8 @@ async fn claim_issue(
         }
     }
 
-    let host = local_hostname();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let body = claim_comment_body(identity, &host, &timestamp, login, None);
+    let body = claim_comment_body(identity, &timestamp, login, None);
     let comment_argv = issue_comment_argv(repo, issue, &body);
     if let Err(e) = run_status_args("gh", &comment_argv).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
@@ -1593,14 +1593,14 @@ mod tests {
 
     #[test]
     fn parse_claim_comment_finds_deck_claim() {
-        let body = "Claimed by issue-dispatch:dispatch-task#7@host:a1b2c3d4 on `host` at 2026-08-09T00:00:00Z, for @alice.";
+        let body = "Claimed by the issue-dispatch task `dispatch-task` (issue #7) working `/work/dispatch-task/.worktrees/issue-7` on branch `agent/issue-7` at 2026-08-09T00:00:00Z, for @alice.";
         let json = format!(r#"{{"comments":[{{"body":"unrelated"}},{{"body":"{body}"}}]}}"#);
         let parsed = parse_claim_comment(&json)
             .unwrap()
             .expect("must find the claim");
         assert_eq!(
             parsed.identity,
-            "issue-dispatch:dispatch-task#7@host:a1b2c3d4"
+            "worktree:/work/dispatch-task/.worktrees/issue-7@agent/issue-7"
         );
         assert_eq!(parsed.login.as_deref(), Some("alice"));
         assert_eq!(parsed.raw, body);
@@ -1618,16 +1618,16 @@ mod tests {
         // in place on a handover, so the LAST matching comment — not the
         // first — is the current claimant.
         let json = r#"{"comments":[
-            {"body":"Claimed by issue-dispatch:nightly-a#1@host-1:aaaaaaaa on `host-1` at 2026-08-01T00:00:00Z, for @nina."},
+            {"body":"Claimed by the issue-dispatch task `nightly-a` (issue #1) working `/work/nightly-a/.worktrees/issue-1` on branch `agent/issue-1` at 2026-08-01T00:00:00Z, for @nina."},
             {"body":"unrelated"},
-            {"body":"Claimed by issue-dispatch:nightly-b#1@host-2:bbbbbbbb on `host-2` at 2026-08-09T00:00:00Z, for @bob."}
+            {"body":"Claimed by the issue-dispatch task `nightly-b` (issue #1) working `/work/nightly-b/.worktrees/issue-1` on branch `agent/issue-1` at 2026-08-09T00:00:00Z, for @bob."}
         ]}"#;
         let parsed = parse_claim_comment(json)
             .unwrap()
             .expect("must find the claim");
         assert_eq!(
             parsed.identity,
-            "issue-dispatch:nightly-b#1@host-2:bbbbbbbb"
+            "worktree:/work/nightly-b/.worktrees/issue-1@agent/issue-1"
         );
         assert_eq!(parsed.login.as_deref(), Some("bob"));
     }

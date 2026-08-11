@@ -6,7 +6,9 @@
 //! operation over `git`/`gh`, synchronous like `worktree_reclaim`'s CLI
 //! verbs (rule 12: no daemon/protocol involvement — identity resolves
 //! entirely from local signals: `DOT_AGENT_DECK_PANE_ID`, the worktree's own
-//! ownership marker, and `gh api user`).
+//! absolute path and branch, and `gh api user`). Round 3
+//! (`prds/235-issue-claim-lock.md`) reads NO ownership marker at all — see
+//! [`resolve_caller_identity`].
 //!
 //! Decision table (see [`decide_claim`] for the pure form):
 //!
@@ -30,7 +32,7 @@ use std::process::Command;
 use crate::issue_dispatch::{
     IN_PROGRESS_LABEL, Identity, ParsedClaim, claim_comment_body, gh_current_login_argv,
     issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv,
-    issue_view_claim_state_argv, parse_claim_state, validate_gh_login,
+    issue_view_claim_state_argv, parse_claim_state, sanitize_claimant_name, validate_gh_login,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,7 +52,14 @@ pub enum ClaimDecision {
     Claim { takeover_from: Option<String> },
     /// The issue is labelled `in-progress` but no claim comment names a
     /// holder — a hand-typed claim (CLAUDE.md rule 14) applied outside any
-    /// deck flow. Identity unknown; refuse rather than guess.
+    /// deck flow, OR a prior claim whose comment write failed after its
+    /// label write already landed (`do_claim` writes comment-before-label
+    /// specifically to make this state rarer, but a transient failure on
+    /// the FIRST write can still produce it). Identity unknown; refuse
+    /// rather than guess — unless escaped via `--takeover --confirm-stopped`
+    /// (reviewer/auditor F4, `issue/claim/013`): the SAME two-step override
+    /// that recovers a known-holder refusal, so one transient failure can
+    /// never permanently wedge the issue for every future claim attempt.
     RefuseNoIdentity,
     /// Held by a different identity. `takeover_requested` distinguishes the
     /// two REFUSE rows that differ only in message: a bare refusal vs.
@@ -77,20 +86,39 @@ pub fn decide_claim(
         };
     }
     let Some(held) = held else {
-        return ClaimDecision::RefuseNoIdentity;
+        // Escapable with the SAME two-step override as a known-holder
+        // refusal — see `RefuseNoIdentity`'s own doc. Nothing to name as
+        // `takeover_from`: there is no known prior holder to attribute the
+        // takeover to.
+        return if takeover && confirm_stopped {
+            ClaimDecision::Claim {
+                takeover_from: None,
+            }
+        } else {
+            ClaimDecision::RefuseNoIdentity
+        };
     };
     if held.identity == caller_identity {
         return ClaimDecision::Claim {
             takeover_from: None,
         };
     }
+    // Auditor F3: `held.identity` is reconstructed from fields PARSED out of
+    // a comment this deck does not control the authorship of (this PRD's
+    // Threat model places forgery of a comment's AUTHOR out of scope, but
+    // not corruption of what the PARSER hands back). Sanitize before it is
+    // echoed into a NEW comment's `taking over from …` tail or a refusal
+    // message printed to the operator's terminal — the comparison just
+    // above already happened against the raw value, so this cannot change
+    // the decision itself, only what gets displayed.
+    let holder = sanitize_claimant_name(&held.identity);
     if takeover && confirm_stopped {
         return ClaimDecision::Claim {
-            takeover_from: Some(held.identity.clone()),
+            takeover_from: Some(holder),
         };
     }
     ClaimDecision::RefuseHeldByOther {
-        holder: held.identity.clone(),
+        holder,
         takeover_requested: takeover,
     }
 }
@@ -100,45 +128,84 @@ pub fn decide_claim(
 // ---------------------------------------------------------------------------
 
 /// Resolve the caller's own [`Identity`] from local signals only (rule 12 —
-/// no daemon lookup). Two local signals decide the shape (PRD fork#235 M3):
+/// no daemon lookup). Two local signals decide the shape (PRD fork#235 round
+/// 3, `prds/235-issue-claim-lock.md`'s "Identity, round 2" section):
 ///
-/// | `DOT_AGENT_DECK_PANE_ID` | Owner marker | Identity |
+/// | `DOT_AGENT_DECK_PANE_ID` | Linked worktree? | Identity |
 /// |---|---|---|
 /// | absent | — | `human:<login>@<host>` |
-/// | present | present | `orchestration:<name>@<host>:<wt>` |
-/// | present | absent | refuse |
+/// | present (any value, even blank) | yes | worktree path + branch |
+/// | present (any value, even blank) | no | refuse |
 ///
-/// The third row is the one to get right:
-/// [`crate::worktree_reclaim::mark_worktree_owned`] is best-effort by
-/// design, so a MISSING marker must never be read as "this is a human" —
-/// every agent on one deck whose marker write failed would otherwise
-/// resolve to the SAME identity, and the lock would read "held by me" and
-/// wave them all through while appearing to work (`issue/claim/006`).
+/// The third row is the one to get right: an agent-shaped caller (the env
+/// var present at all, regardless of its actual value — `issue/claim/006`
+/// pins that even a blank value counts as present) whose `cwd` is NOT a
+/// genuinely linked worktree — the main/root checkout, or any other
+/// non-worktree directory — must never fall back to `human:<login>`. Round
+/// 3 reads NO ownership marker at all (unlike round 1/2): the anchor is the
+/// worktree itself, so [`crate::worktree_reclaim::owned_git_dir`]'s
+/// containment check (does `cwd` even resolve as a linked worktree?) is the
+/// only thing consulted — a marker-less but genuinely linked worktree
+/// claims successfully (`issue/claim/009`, the orchestrator's own dominant
+/// real path under CLAUDE.md rule 1's hand-made `git worktree add` flow).
+/// Falling back to `human` here would collapse every agent on one deck to
+/// the SAME identity and the lock would wave them all through while
+/// appearing to work.
 fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
-    let host = crate::issue_dispatch_run::local_hostname();
     match std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID) {
         Err(_) => {
             // No pane env: a human terminal. The login IS part of the
-            // identity here, so — unlike the orchestration branch below —
+            // identity here, so — unlike the worktree branch below —
             // failing to resolve it means we have no valid identity at all.
+            let host = crate::issue_dispatch_run::local_hostname();
             let login = resolve_gh_login()?;
             Ok(Identity::human(&login, &host))
         }
-        Ok(_) => match crate::worktree_reclaim::owner_of(cwd, cwd) {
-            None => Err(format!(
-                "DOT_AGENT_DECK_PANE_ID is set but {} carries no ownership marker — refusing \
-                 rather than assuming a human caller; a worktree whose marker write failed is \
-                 still a perfectly good worktree, but a missing marker must never fall back to \
-                 a human identity (every agent on this deck whose marker write failed would \
-                 then resolve to the SAME identity and the lock would wave them all through)",
-                cwd.display()
-            )),
-            Some(owner) => {
-                let name = owner.strip_prefix("orchestration:").unwrap_or(&owner);
-                Ok(Identity::orchestration(name, &host, cwd))
+        Ok(_) => {
+            if crate::worktree_reclaim::owned_git_dir(cwd, cwd).is_none() {
+                return Err(format!(
+                    "DOT_AGENT_DECK_PANE_ID is set but {} is not a linked worktree — refusing \
+                     rather than assuming a human caller; round 3's identity anchor is the \
+                     worktree's own absolute path and branch (CLAUDE.md rule 23), and this \
+                     directory carries none (a `human:<login>` fallback here would collapse \
+                     every agent on this deck to the SAME identity and the lock would wave \
+                     them all through)",
+                    cwd.display()
+                ));
             }
-        },
+            let branch = resolve_branch(cwd)?;
+            Ok(Identity::worktree(cwd, &branch))
+        }
     }
+}
+
+/// Resolve `cwd`'s current branch via `git rev-parse --abbrev-ref HEAD` — the
+/// other half of round 3's identity anchor alongside `cwd` itself. Fails
+/// closed on a detached HEAD (`HEAD` is exactly what `--abbrev-ref` prints
+/// when there is no branch to name) — the anchor needs a real branch name,
+/// and rule 1's worktrees are always created with `-b <branch>`.
+fn resolve_branch(cwd: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_err(|e| format!("failed to run `git rev-parse --abbrev-ref HEAD`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git rev-parse --abbrev-ref HEAD` failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err(format!(
+            "{} has no resolvable branch (detached HEAD?) — round 3's identity anchor needs a \
+             real branch name",
+            cwd.display()
+        ));
+    }
+    Ok(branch)
 }
 
 /// Resolve the human login to write as the assignee (PRD fork#235 M2's
@@ -200,10 +267,16 @@ fn read_current_claim(repo: &str, issue: u64) -> Result<(bool, Option<ParsedClai
 // The write path
 // ---------------------------------------------------------------------------
 
-/// Write the label, replace-to-one the assignee (best-effort), and append
-/// the claim comment — the same three-write order PRD fork#235 M2's async
-/// `claim_issue` uses, reimplemented synchronously here since M3's CLI has
-/// no daemon/async runtime to reuse it through (rule 12).
+/// Post the claim comment, write the label, then replace-to-one the
+/// assignee (best-effort) — reviewer/auditor F4: comment-FIRST,
+/// label-SECOND, the inverse of PRD fork#235 M2's async `claim_issue`
+/// order. A failed comment write (the first, required call) simply leaves
+/// the issue unlabelled — harmless, since `decide_claim` only reads `held`
+/// when `label_present` is true (`decide_claim_unlabelled_always_claims`).
+/// The OLD order (label-then-comment) could instead leave the issue
+/// LABELLED with no discoverable comment if the SECOND, comment call
+/// failed — exactly `RefuseNoIdentity`'s wedge state, now also escapable
+/// (see that variant's doc) but better avoided than merely recovered from.
 fn do_claim(
     repo: &str,
     issue: u64,
@@ -212,10 +285,19 @@ fn do_claim(
     prior_login: Option<&str>,
     takeover_from: Option<&str>,
 ) -> Result<(), String> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let body = claim_comment_body(identity, &timestamp, login, takeover_from);
+    run_gh_status(&issue_comment_argv(repo, issue, &body))?;
+
     run_gh_status(&issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL))?;
 
     if let Some(login) = login {
-        let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), prior_login);
+        // Reviewer F3 (`issue/claim/011`): a same-identity refresh must not
+        // emit a self-cancelling `--add-assignee X --remove-assignee X` —
+        // real `gh` applies the two in argv order, and a `remove` matching
+        // the `add` nets the issue UNASSIGNED. Skip the redundant remove.
+        let remove = prior_login.filter(|prior| *prior != login);
+        let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), remove);
         // Best-effort (PRD fork#235 M2's discipline): GitHub silently drops
         // an assignee lacking repo access and `gh` may still exit 0, so a
         // genuine `gh` failure here is surfaced but must not undo the claim
@@ -224,11 +306,6 @@ fn do_claim(
             eprintln!("issue claim: warning: failed to write the assignee: {e}");
         }
     }
-
-    let host = crate::issue_dispatch_run::local_hostname();
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let body = claim_comment_body(identity, &host, &timestamp, login, takeover_from);
-    run_gh_status(&issue_comment_argv(repo, issue, &body))?;
     Ok(())
 }
 
@@ -307,8 +384,25 @@ pub fn run_issue_claim(
                 "pass `--takeover --confirm-stopped` once you have confirmed the other agent \
                  has stopped"
             };
+            // Auditor F7.3: when the holder is an `issue_dispatch`-fired
+            // claim, say so plainly — the most common way to hit this
+            // refusal is running `issue claim` by hand inside a worktree the
+            // dispatch that spawned you already claimed automatically
+            // (`claim_issue`, `issue_dispatch_run.rs`), which needs no
+            // manual claim at all. This is explanatory text only — it must
+            // NEVER make the two compare equal (that would defeat the lock);
+            // the decision above has already run against the raw identity.
+            let dispatch_note = held
+                .as_ref()
+                .filter(|h| h.raw.contains("issue-dispatch task"))
+                .map(|_| {
+                    " — this looks like an `issue_dispatch` fire's own automatic claim; if you \
+                     were spawned BY that dispatch, it already claimed the issue for you and you \
+                     do not need to run `issue claim` yourself"
+                })
+                .unwrap_or_default();
             Err(format!(
-                "issue #{issue} of {repo} is held by `{holder}`{since} — {instruction}"
+                "issue #{issue} of {repo} is held by `{holder}`{since} — {instruction}{dispatch_note}"
             ))
         }
     }
@@ -321,7 +415,6 @@ mod tests {
     fn claim(identity: &str, login: Option<&str>, timestamp: &str) -> ParsedClaim {
         ParsedClaim {
             identity: identity.to_string(),
-            host: "host-1".to_string(),
             timestamp: timestamp.to_string(),
             login: login.map(str::to_string),
             raw: String::new(),
@@ -398,5 +491,42 @@ mod tests {
                 takeover_from: Some("orchestration:a@h:1".to_string())
             }
         );
+    }
+
+    // --- PRD fork#235 round 3 / reviewer-auditor F4: RefuseNoIdentity escape ---
+
+    #[test]
+    fn decide_claim_no_identity_takeover_alone_still_refuses() {
+        assert_eq!(
+            decide_claim(true, None, "orchestration:a@h:1", true, false),
+            ClaimDecision::RefuseNoIdentity
+        );
+    }
+
+    #[test]
+    fn decide_claim_no_identity_escapes_with_takeover_and_confirm_stopped() {
+        assert_eq!(
+            decide_claim(true, None, "orchestration:a@h:1", true, true),
+            ClaimDecision::Claim {
+                takeover_from: None
+            }
+        );
+    }
+
+    // --- auditor F3: a held identity's display is sanitized before reuse ---
+
+    #[test]
+    fn decide_claim_sanitizes_held_identity_before_displaying_it() {
+        let held = claim("worktree:/work/evil\ninjected@branch", Some("alice"), "ts");
+        match decide_claim(true, Some(&held), "orchestration:b@h:2", false, false) {
+            ClaimDecision::RefuseHeldByOther { holder, .. } => {
+                assert!(
+                    !holder.contains('\n'),
+                    "a raw newline parsed out of a held claim comment must not survive into a \
+                     new refusal message/comment tail, got {holder:?}"
+                );
+            }
+            other => panic!("expected RefuseHeldByOther, got {other:?}"),
+        }
     }
 }

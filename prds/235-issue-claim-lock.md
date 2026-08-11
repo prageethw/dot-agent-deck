@@ -126,13 +126,25 @@ Claimed by the orchestration working `/Users/…/dot-agent-deck-prd235` on branc
 2. **"`cd` changes your identity" stops being a defect and becomes the definition.** The worktree *is* the unit of work; one orchestration entering another's is the rule 1 violation itself, not an identity flaw.
 3. **Stable across daemon restarts**, which is what rounds 1 and 2 both failed at from opposite ends — a value that is never written, then a value that is rewritten.
 
-**Equality is on that string and nothing else.** The orchestration name — from the marker when one exists — is rendered in the comment as human-readable **decoration** and is *not* compared:
+**Equality is on the worktree path and branch, and nothing else.** Not the orchestration name — that would reintroduce fork #201's advisory-uniqueness hole. Not the marker — that is the round-1 supply gap. Not the pane ID — that is the round-2 recycling bug. Host, timestamp and login all appear in the comment for other reasons and none of them is compared.
+
+**The exact comment format**, extending rule 23's sentence with the assignee bookkeeping this PRD needs:
 
 ```
-Claimed by `agent:pane-7f3a@host-1` (orchestration `fix-166`) at <ts>, for @prageethw.
+Claimed by the orchestration working `<worktree-path>` on branch `<branch>` at <ts>, for @<login>.
 ```
 
-This is deliberate. Keying equality on the name would reintroduce fork #201's advisory-uniqueness hole; keying it on the marker reintroduces the supply gap above. The name is worth showing because a human reading the issue needs to know *which* orchestration holds it — but it must never be the thing the machine decides on.
+and for a claimant outside any worktree:
+
+```
+Claimed by @<login> working from `<host>` at <ts>.
+```
+
+Three constraints on that format, each load-bearing:
+
+1. **It must still begin `Claimed by `.** `parse_claim_comment` finds claims by `.rfind` on `CLAIM_COMMENT_PREFIX`; a body that does not start with it is invisible, and the deck would go on believing a superseded holder still holds the issue.
+2. **The path and branch are the identity clause** — rule 23's own wording, unchanged, so a hand-written claim and a machine-written one are the same artefact and a human can check either against `git worktree list`.
+3. **`for @<login>` is bookkeeping, not identity.** The assignee replace-to-one logic parses the prior login back out of this clause. It is *not* part of the compared string, and it must be re-validated with `validate_gh_login` on the way back in (reviewer F8 / auditor F5).
 
 **Known consequence, accepted:** every pane working inside one worktree shares that worktree's identity, so an orchestrator and the workers it delegates into the same worktree all claim as the same actor. That is correct — rule 1 makes the worktree the unit of a change, and they *are* one actor working one change. Two orchestrations can never share it, because rule 1 forbids exactly that.
 
