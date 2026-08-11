@@ -121,8 +121,7 @@ pub struct AgentSpec {
 // module's signature to the spec's handler shape. Keeping them here (as the
 // values the statics point at) is what makes dispatch spec-resolved.
 fn claude_install() -> Result<(), String> {
-    crate::hooks_manage::install();
-    Ok(())
+    crate::hooks_manage::install()
 }
 fn claude_uninstall() -> Result<(), String> {
     crate::hooks_manage::uninstall();
