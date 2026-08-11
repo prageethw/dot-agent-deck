@@ -762,6 +762,14 @@ impl TabManager {
         // title — so the daemon's delegate role lookup compares against the
         // canonical on-disk config name (see the in-body comment below).
         display_title: Option<&str>,
+        // Fork #166 M2.4: the exact creator string THIS call stamped into
+        // the worktree marker when it created one (`orchestration:<name>`
+        // interactively) — threaded straight through to every role pane's
+        // `DOT_AGENT_DECK_WORKTREE_OWNER`, never recomputed here from
+        // `resolved_name`/`display_title` (that shortcut diverges from the
+        // `orchestration:unknown` sentinel case — see the PRD's M2.4). `None`
+        // when this orchestration tab owns no worktree.
+        creator: Option<&str>,
         // PRD #76 M2.15: initial PTY dims for every role pane in this
         // orchestration. The caller computes these from
         // `terminal.get_frame().area()` + the dashboard-layout helper, so
@@ -908,6 +916,12 @@ impl TabManager {
                 } else {
                     None
                 },
+                // Fork #166 M2.4: the SAME creator string this orchestration
+                // stamped into its own worktree marker (when it created
+                // one), injected into EVERY role pane — not a second
+                // derivation of it. `None` when this orchestration owns no
+                // worktree (e.g. started directly in `main`).
+                owner: creator.map(str::to_string),
             };
             let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
                 Some(&role.command),
@@ -1691,6 +1705,7 @@ mod tests {
                 "/work",
                 None,
                 Some("My Custom Run"),
+                None,
                 (24, 80),
             )
             .expect("create orchestration");
@@ -1744,7 +1759,14 @@ mod tests {
         let mut tm = TabManager::new(pc.clone());
 
         let (tab_index, role_pane_ids) = tm
-            .open_orchestration_tab(&orch_config("race-order"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config("race-order"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open_orchestration_tab");
 
         assert_eq!(role_pane_ids.len(), 2, "one pane id per declared role");
@@ -1808,7 +1830,7 @@ mod tests {
             )
             .expect("open mode tab");
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
 
         // Stamp a distinct remembered id onto each tab variant.
@@ -2101,7 +2123,7 @@ mod tests {
             )
             .expect("open background mode tab");
         let (bg_orch, bg_roles) = tm
-            .open_orchestration_tab(&orch_config("bg-orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config("bg-orch"), "/work", None, None, None, (24, 80))
             .expect("open background orchestration tab");
         let (active_mode, active_sides) = tm
             .open_mode_tab(
@@ -2224,7 +2246,7 @@ mod tests {
             )
             .expect("mode 2");
         let (orch, role_ids) = tm
-            .open_orchestration_tab(&orch_config("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config("orch"), "/work", None, None, None, (24, 80))
             .expect("orch");
 
         // Land on mode-1 and focus its side pane #1.
@@ -2283,7 +2305,7 @@ mod tests {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
         assert_eq!(tm.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();
@@ -2383,7 +2405,14 @@ mod tests {
         // Open a second orchestration tab, which becomes active and leaves
         // the first as a BACKGROUND tab.
         let (orch2_idx, _role_ids2) = tm
-            .open_orchestration_tab(&orch_config_3("orch-2"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_3("orch-2"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open second orchestration tab");
         assert_eq!(tm.active_index(), orch2_idx);
 
@@ -2434,7 +2463,7 @@ mod tests {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
         assert_eq!(tm.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();
@@ -2548,7 +2577,14 @@ mod tests {
         // Open a second orchestration tab, which becomes active and leaves
         // the first as a BACKGROUND tab.
         let (orch2_idx, _role_ids2) = tm
-            .open_orchestration_tab(&orch_config_3("orch-2"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_3("orch-2"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open second orchestration tab");
         assert_eq!(tm.active_index(), orch2_idx);
 
@@ -2590,7 +2626,7 @@ mod tests {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
         assert_eq!(tm.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();
@@ -2672,7 +2708,7 @@ mod tests {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config_4("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_4("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
         assert_eq!(tm.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();
@@ -2772,7 +2808,7 @@ mod tests {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
         assert_eq!(tm.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();
@@ -2935,13 +2971,13 @@ mod tests {
         let mut tm = TabManager::new(pc.clone());
 
         let (idx_a, roles_a) = tm
-            .open_orchestration_tab(&orch_config_3("orchA"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orchA"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab A");
         let orchestrator_a = roles_a[0].clone();
         let alpha_a = roles_a[1].clone();
 
         let (idx_b, _roles_b) = tm
-            .open_orchestration_tab(&orch_config_3("orchB"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orchB"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab B");
         assert_eq!(tm.active_index(), idx_b);
 
@@ -3046,7 +3082,7 @@ mod tests {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tm
-            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(&orch_config_3("orch"), "/work", None, None, None, (24, 80))
             .expect("open orchestration tab");
         assert_eq!(tm.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();

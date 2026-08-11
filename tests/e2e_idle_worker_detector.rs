@@ -217,6 +217,7 @@ fn real_agent_orchestration_session(
                 project_path: project_dir.to_string(),
                 started_role_indices: vec![0],
                 display_title: None,
+                owner: None,
             }),
         }],
         last_command: None,

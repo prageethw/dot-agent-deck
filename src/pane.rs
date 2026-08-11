@@ -262,6 +262,12 @@ pub struct AgentSpawnOptions<'a> {
     /// into the PTY. Set only for a Pi start-role (orchestrator) pane; `None`
     /// for every other pane, which keeps the unchanged PTY-injection path.
     pub seed: Option<String>,
+    /// Fork #166 M2.4: the exact creator string this orchestration stamped
+    /// into its own worktree marker (`orchestration:<typed_name>`), injected
+    /// into the pane's environment as `DOT_AGENT_DECK_WORKTREE_OWNER` so
+    /// `worktree list --mine` can match it. `None` for a pane that is not
+    /// part of a worktree-owning orchestration (e.g. a plain dashboard pane).
+    pub owner: Option<String>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -276,6 +282,7 @@ impl Default for AgentSpawnOptions<'_> {
             cols: 80,
             agent_type: None,
             seed: None,
+            owner: None,
         }
     }
 }

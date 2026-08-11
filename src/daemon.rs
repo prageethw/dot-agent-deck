@@ -904,6 +904,9 @@ fn make_schedule_callback(
         working_dir: task.working_dir.clone(),
         command: task.command.clone(),
         prompt: task.prompt.clone(),
+        // A plain scheduled fire creates no worktree, so there is no marker
+        // owner for `--mine` to match against.
+        owner: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {

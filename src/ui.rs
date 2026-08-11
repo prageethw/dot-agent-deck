@@ -9032,6 +9032,15 @@ fn dispatch_action(
                     // reintroduce the multi-orchestration collision CLAUDE.md
                     // rule 1 / fork #74 exists to prevent, while looking like
                     // it worked.
+                    // Fork #166 M2.4: hoisted out of the `match` arm below so
+                    // it survives to the `open_orchestration_tab` call after
+                    // the match — every role pane needs the SAME computed
+                    // string that gets written into the worktree marker,
+                    // never a second derivation of it. `None` when this
+                    // orchestration creates no worktree (the `None` arm
+                    // below, e.g. an unnamed orchestration reopened directly
+                    // in `main`).
+                    let mut creator: Option<String> = None;
                     let dir_str = match req.orchestration_worktree_path.as_ref() {
                         Some(worktree_path) => {
                             // Fork #122 audit (P1): use the validated raw
@@ -9050,12 +9059,9 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
-                            // fork #166 / fork #184: this is a three-way
-                            // precedence, and the FIRST branch is the one
-                            // that actually fires in practice — read it in
-                            // that order, not top-to-bottom-as-rare-cases.
-                            // `typed_name` (`req.name`, the same value that
-                            // becomes `display_title` below, trimmed once in
+                            // fork #166 / fork #184: `typed_name` (`req.name`,
+                            // the same value that becomes `display_title`
+                            // below, trimmed once in
                             // `build_new_pane_request` so both consumers
                             // test blankness and read content from the
                             // identical value; reviewer F1) is the Name the
@@ -9071,46 +9077,37 @@ fn dispatch_action(
                             // pane's own identity answers that better than
                             // `orch_config.name`, a value shared by every
                             // tab of the same orchestration config (#184).
-                            // Fall back to the canonical config name — as
-                            // issue #425 originally did — only when the
-                            // field was cleared to empty. That fallback is
-                            // still reachable after M1.0: M1.0 suggests and
-                            // refuses collisions, it does not forbid an
-                            // empty submit (see
-                            // `orchestration_form_empty_name_keeps_config_name`),
-                            // so this is not the "becomes unreachable once
-                            // M1.0 ships" case an earlier version of this
-                            // comment predicted before M1.0 existed. The
-                            // blankness test below is on an already-trimmed
-                            // value (fork issue #174: a whitespace-only name
-                            // must fall back too, not become the identity)
-                            // rather than the bare `is_empty()` #174 flags
-                            // elsewhere.
                             //
-                            // `load_project_config` normalises an empty
-                            // `name` to the dir basename at load time
-                            // (`src/project_config.rs:268-272`, via
-                            // `resolve_orchestration_name`), and this form's
-                            // orchestration list comes from that same
-                            // loader — so `orch_config.name` is non-empty by
-                            // construction and the inner `orch_config.name
-                            // .is_empty()` arm is unreachable in production.
-                            // It stays as defence-in-depth, purely so a
-                            // future constructor that bypasses the loader
-                            // can't write a bare `orchestration:`.
+                            // PR #215 fixup (reviewer F5 M2 / auditor M2):
+                            // there used to be a fallback to the canonical
+                            // config name when the field was cleared to
+                            // empty. That fallback is gone —
+                            // `orchestration_creator_string` now maps an
+                            // empty typed name straight to the
+                            // `orchestration:unknown` sentinel `--mine`
+                            // refuses, rather than to
+                            // `orchestration:<config_name>`, an identity
+                            // every unnamed orchestration on the same config
+                            // shared with no refusal. The blankness test
+                            // inside `orchestration_creator_string` is on an
+                            // already-trimmed value (fork issue #174: a
+                            // whitespace-only name must fall back too, not
+                            // become the identity) rather than the bare
+                            // `is_empty()` #174 flags elsewhere.
                             let typed_name = req.name.as_str();
-                            let creator = if !typed_name.is_empty() {
-                                format!("orchestration:{typed_name}")
-                            } else if orch_config.name.is_empty() {
-                                "orchestration:unknown".to_string()
-                            } else {
-                                format!("orchestration:{}", orch_config.name)
-                            };
+                            // Fork #166 M2.4: assigns the OUTER `creator`
+                            // hoisted above the match — the exact string
+                            // passed to `create_worktree_sync` below is the
+                            // one every role pane's env var carries too.
+                            // `orchestration_creator_string` is the single
+                            // shared computation the restore path also calls,
+                            // so the two can't drift apart.
+                            creator = Some(orchestration_creator_string(typed_name));
                             match crate::issue_dispatch_run::create_worktree_sync(
                                 &req.dir,
                                 worktree_path,
                                 &branch,
-                                &creator,
+                                creator.as_deref().expect("just assigned above"),
                             ) {
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::Created) => {
                                     worktree_path.display().to_string()
@@ -9214,6 +9211,7 @@ fn dispatch_action(
                         &dir_str,
                         prompt,
                         display_title.as_deref(),
+                        creator.as_deref(),
                         spawn_dims,
                     ) {
                         Ok((_tab_idx, role_pane_ids)) => {
@@ -9319,6 +9317,15 @@ fn dispatch_action(
                                         // under the user's name, not the
                                         // canonical config/cwd name.
                                         display_title: display_title.clone(),
+                                        // Fork #166 M3.0 / PR #215 fixup: the
+                                        // same computed `creator` string that
+                                        // went into the worktree marker and
+                                        // every role pane's
+                                        // `DOT_AGENT_DECK_WORKTREE_OWNER`
+                                        // above — not a re-derivation — so
+                                        // restore can pass it through rather
+                                        // than fabricate or drop it.
+                                        owner: creator.clone(),
                                     }),
                                 },
                             );
@@ -9464,6 +9471,7 @@ fn dispatch_action(
                             // PRD #201: single-pane spawn, not a Pi
                             // orchestrator — no native seed.
                             seed: None,
+                            owner: None,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -10097,6 +10105,75 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
 /// unit-tested in isolation (see `session/restore/005`).
 pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
+}
+
+/// Fork #166 M2.4: the ONE place this precedence is computed, so the
+/// live-create path (`Action::SpawnPane`) and the session-restore path
+/// (`resolve_orchestration_for_restore`'s caller) cannot drift apart — both
+/// call this rather than each inlining the branch. `typed_name` is the same
+/// string in both cases: the form's `req.name` when creating, and the
+/// persisted `OrchestrationSnapshot.display_title` (captured FROM that same
+/// `req.name`) when restoring. This is the SAME string
+/// [`crate::issue_dispatch_run::create_worktree_sync`] stamped into the
+/// worktree marker at creation time — restoring an orchestration with the
+/// same typed name reproduces it byte-for-byte, which is what lets
+/// `worktree list --mine` still match after a restart (PRD fork-166
+/// M2.4/M3.0).
+///
+/// PR #215 fixup (reviewer F5 M2 / auditor M2): the config-name fallback
+/// this used to have — `orchestration:<config_name>` when the typed name
+/// was empty — gave every unnamed orchestration on the same config the
+/// IDENTICAL identity, with no refusal, because that string is not the
+/// `orchestration:unknown` sentinel `--mine` refuses. Two such
+/// orchestrations would then match each other's worktrees, which is
+/// exactly the collision the sentinel exists to prevent (PRD fork-166 line
+/// 183: "must be treated exactly like an absent variable — fail loudly").
+/// The fallback is deleted: an empty typed name now ALWAYS produces the
+/// sentinel, so `--mine` refuses it rather than silently handing out a
+/// shared identity. `config_name` provenance for the unnamed case is not
+/// missed — it never distinguished one unnamed orchestration from another,
+/// and fork #192's M1.0 makes the interactive Name required, so the empty
+/// case is rare in practice.
+///
+/// PR #215 fixup (reviewer F3 / auditor L2): the result is run through
+/// [`crate::worktree_reclaim::sanitize_marker_creator`] before it is
+/// returned, so both sinks — the worktree marker (`mark_worktree_owned`,
+/// which applies the same sanitizer again, harmlessly, since it is a fixed
+/// point) and the `DOT_AGENT_DECK_WORKTREE_OWNER` env var (which applied no
+/// sanitizer at all before this fix) — receive the identical value. The
+/// invariant is "one literal string reaches both consumers" by
+/// construction now, not because no typed name has ever been long enough
+/// or carried a control character to prove it false.
+///
+/// PR #215 round-3 fixup (auditor L1): sanitizing AFTER building
+/// `orchestration:{typed_name}` means a `typed_name` composed only of
+/// characters the sanitizer strips (control characters) is non-empty going
+/// in but collapses to the bare literal `"orchestration:"` coming out — a
+/// non-empty, non-sentinel identity with no name in it, which two such
+/// orchestrations would share byte-for-byte and `--mine` would match on.
+/// `"orchestration:"` is illegal for exactly the reason the sentinel
+/// exists, so the check runs on the SANITIZED result, not the raw input.
+///
+/// One residual collision class this doc's "identities cannot collide"
+/// framing does not cover: [`crate::worktree_reclaim::sanitize_marker_creator`]'s
+/// 200-char truncation means two distinct names sharing their first 200
+/// characters now sanitize to the identical string — tracked as fork
+/// **#222**.
+fn orchestration_creator_string(typed_name: &str) -> String {
+    const ORCHESTRATION_PREFIX: &str = "orchestration:";
+    let raw = if typed_name.is_empty() {
+        crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string()
+    } else {
+        format!("{ORCHESTRATION_PREFIX}{typed_name}")
+    };
+    let sanitized = crate::worktree_reclaim::sanitize_marker_creator(&raw);
+    if sanitized
+        .strip_prefix(ORCHESTRATION_PREFIX)
+        .is_some_and(str::is_empty)
+    {
+        return crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string();
+    }
+    sanitized
 }
 
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
@@ -11204,6 +11281,31 @@ pub fn run_tui(
                         // start role once it signals readiness.
                         let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
                             .then(|| orch_snap.orchestrator_prompt.clone());
+                        // PR #215 fixup (reviewer F6 / auditor M3) used to
+                        // recompute `orchestration_creator_string` and pass
+                        // it unconditionally here, fabricating an identity
+                        // for every restored orchestration tab — including
+                        // one that never created a worktree. That was fixed
+                        // by passing `None` unconditionally instead, which
+                        // was honest but cost the "closing and reopening a
+                        // tab still matches its earlier worktrees under
+                        // `--mine`" success criterion the PRD exists for.
+                        //
+                        // Fork #166 M3.0 follow-up: `OrchestrationSnapshot`
+                        // now records the exact `owner` string the live path
+                        // stamped (`None` when the orchestration owned no
+                        // worktree) — see `src/config.rs`'s field doc — so
+                        // this branch can PASS THROUGH the saved value
+                        // rather than re-derive or drop it. An orchestration
+                        // that owned no worktree restores with `None`,
+                        // exactly as before; one that did restores with the
+                        // identical string it stamped, so `--mine` matches.
+                        // A snapshot written before this field existed has
+                        // no `owner`, so it deserializes to `None` and
+                        // restores with no identity — the same honest
+                        // "refuse loudly" outcome as before, not a silent
+                        // wrong answer, for exactly the tabs that predate
+                        // this fix.
                         match tab_manager.open_orchestration_tab(
                             &orch_config,
                             &saved_pane.dir,
@@ -11213,6 +11315,7 @@ pub fn run_tui(
                             // rather than the canonical config/cwd name. `None`
                             // when unset falls back to the canonical name.
                             orch_snap.display_title.as_deref(),
+                            orch_snap.owner.as_deref(),
                             spawn_dims,
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
@@ -11380,6 +11483,7 @@ pub fn run_tui(
                     agent_type: agent_type.clone(),
                     // PRD #201: single-pane spawn — no native seed.
                     seed: None,
+                    owner: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -11461,6 +11565,7 @@ pub fn run_tui(
                     agent_type: mode_agent_type,
                     // PRD #201: mode agent pane, not a Pi orchestrator — no seed.
                     seed: None,
+                    owner: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -11548,6 +11653,7 @@ pub fn run_tui(
                                     agent_type: fb_agent_type.clone(),
                                     // PRD #201: restore fallback spawn — no seed.
                                     seed: None,
+                                    owner: None,
                                 },
                             ) {
                                 Ok((fb_id, _resolved)) => {
@@ -11616,6 +11722,7 @@ pub fn run_tui(
                             agent_type: fb_agent_type.clone(),
                             // PRD #201: restore fallback spawn — no seed.
                             seed: None,
+                            owner: None,
                         },
                     ) {
                         Ok((fb_id, _resolved)) => {
@@ -24628,7 +24735,14 @@ mod tests {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
         let (orch_idx, _role_pane_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open an orchestration tab");
         // open_orchestration_tab leaves the orchestration tab active — return to
         // the Dashboard for the start state.
@@ -24755,7 +24869,14 @@ mod tests {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
         let (orch_idx, role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open orchestration tab");
         assert_eq!(tab_manager.active_index(), orch_idx);
         let orchestrator = role_ids[0].clone();
@@ -24957,7 +25078,14 @@ mod tests {
 
         // --- Orchestration tab: same contract (same gate). ---
         tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open an orchestration tab");
         assert_eq!(tab_manager.tab_count(), 2, "Dashboard + Orchestration tab");
 
@@ -25016,7 +25144,14 @@ mod tests {
             let pc = Arc::new(OpenTabPC::new());
             let mut tab_manager = TabManager::new(pc.clone());
             let (_orch_idx, role_pane_ids) = tab_manager
-                .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+                .open_orchestration_tab(
+                    &orch_config_local("orch"),
+                    "/work",
+                    None,
+                    None,
+                    None,
+                    (24, 80),
+                )
                 .expect("open an orchestration tab");
 
             // Placeholder sessions for the role panes, so the orchestration deck's
@@ -25176,7 +25311,14 @@ mod tests {
             let pc = Arc::new(OpenTabPC::new());
             let mut tab_manager = TabManager::new(pc.clone());
             let (orch_idx, role_pane_ids) = tab_manager
-                .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+                .open_orchestration_tab(
+                    &orch_config_local("orch"),
+                    "/work",
+                    None,
+                    None,
+                    None,
+                    (24, 80),
+                )
                 .expect("open an orchestration tab");
             let (mode_idx, _side_ids) = tab_manager
                 .open_mode_tab(
@@ -25352,10 +25494,24 @@ mod tests {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
         let (orch_a_idx, roles_a) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch-a"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch-a"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open orchestration tab A");
         let (orch_b_idx, roles_b) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch-b"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch-b"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open orchestration tab B");
 
         let snapshot = AppState::default();
@@ -25454,7 +25610,14 @@ mod tests {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
         let (orch_idx, role_pane_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open an orchestration tab");
         let (mode_idx, _side_ids) = tab_manager
             .open_mode_tab(
@@ -25553,7 +25716,7 @@ mod tests {
         // TabManager::new seeds the Dashboard at index 0.
         let dashboard_idx = 0;
         let (orch_idx, role_pane_ids) = tab_manager
-            .open_orchestration_tab(&three_role_orch, "/work", None, None, (24, 80))
+            .open_orchestration_tab(&three_role_orch, "/work", None, None, None, (24, 80))
             .expect("open an orchestration tab");
         let role_count = role_pane_ids.len();
         assert_eq!(
@@ -30341,6 +30504,11 @@ mod tests {
         /// pane actually spawned into (e.g. the orchestration's own
         /// worktree, rather than the deck's shared cwd).
         cwds: std::sync::Mutex<Vec<Option<String>>>,
+        /// Fork #166 M2.4: the `AgentSpawnOptions::owner` recorded for every
+        /// `create_pane_with_options` call, in call order — lets a test
+        /// assert every role pane carried the SAME creator string that was
+        /// written into the worktree marker (`orchestration/identity/008`).
+        owners: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl CapturingPaneController {
@@ -30351,6 +30519,7 @@ mod tests {
                 agent_generation: std::sync::Mutex::new("original".to_string()),
                 spawn_cols: std::sync::Mutex::new(Vec::new()),
                 cwds: std::sync::Mutex::new(Vec::new()),
+                owners: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -30378,6 +30547,11 @@ mod tests {
             self.cwds.lock().unwrap().clone()
         }
 
+        /// See `owners` field doc.
+        fn recorded_owners(&self) -> Vec<Option<String>> {
+            self.owners.lock().unwrap().clone()
+        }
+
         fn rebind_agents(&self) {
             *self.agent_generation.lock().unwrap() = "replacement".to_string();
         }
@@ -30396,6 +30570,7 @@ mod tests {
                 .push(opts.tab_membership.clone());
             self.spawn_cols.lock().unwrap().push(opts.cols);
             self.cwds.lock().unwrap().push(cwd.map(|s| s.to_string()));
+            self.owners.lock().unwrap().push(opts.owner.clone());
             let mut n = self.next.lock().unwrap();
             let id = format!("pane-{n}");
             *n += 1;
@@ -31513,6 +31688,169 @@ mod tests {
         );
     }
 
+    /// PR #215 round-3 (reviewer R-F5 / auditor A-M2): `orchestration_creator_string`
+    /// has exactly one caller and, before this test, no test called it
+    /// directly — so neither of this round's two semantic changes (the
+    /// deleted `orchestration:<config_name>` fallback → the sentinel, and
+    /// applying `sanitize_marker_creator` to the result) was pinned by
+    /// anything. Drives all four branches directly and asserts the empty
+    /// case against the SHARED constant, never a re-typed literal — typing
+    /// the sentinel on both sides of an assertion is what let the producer
+    /// and the consumer drift apart in the first place.
+    #[test]
+    fn orchestration_creator_string_covers_every_branch() {
+        // Empty typed name -> the shared sentinel constant, not a re-typed
+        // literal and not the deleted `orchestration:<config_name>` fallback.
+        assert_eq!(
+            orchestration_creator_string(""),
+            crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
+        );
+
+        // A name composed only of characters `sanitize_marker_creator` strips
+        // (control characters) must not collapse to a bare "orchestration:" --
+        // it must fall back to the same sentinel (auditor A-L1).
+        assert_eq!(
+            orchestration_creator_string("\u{7}\u{1b}"),
+            crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
+        );
+
+        // A name needing sanitization (control chars mixed with real
+        // content) is sanitized, not rejected and not passed through raw.
+        assert_eq!(
+            orchestration_creator_string("foo\u{7}bar"),
+            "orchestration:foobar"
+        );
+
+        // An ordinary name maps straight to `orchestration:<name>`.
+        assert_eq!(
+            orchestration_creator_string("review-1"),
+            "orchestration:review-1"
+        );
+    }
+
+    /// Scenario: A single live orchestration is spawned through the real
+    /// `Action::SpawnPane` path against its own worktree. Reads back BOTH
+    /// what `mark_worktree_owned` wrote into the worktree's `created-by:`
+    /// marker (via `owner_of`) AND what every role pane's
+    /// `AgentSpawnOptions::owner` carried -- captured by
+    /// `CapturingPaneController`, a test double whose `create_pane_with_options`
+    /// records `opts.owner` and returns. Pins fork #166 M2.4's invariant one
+    /// hop short of the real environment: for a given orchestration, the
+    /// marker and `AgentSpawnOptions::owner` must carry the LITERAL SAME
+    /// computed string, from one source (`orchestration_creator_string` via
+    /// the hoisted `creator` local), not two derivations of one input --
+    /// every role pane's recorded owner must equal the marker's owner
+    /// exactly, and there must be at least one role pane to compare.
+    ///
+    /// PR #215 fixup (reviewer F2 / auditor H1): this test's own doc comment
+    /// USED TO claim the recorded value was "exactly the value
+    /// `create_stream_pane` turns into `DOT_AGENT_DECK_WORKTREE_OWNER` in the
+    /// spawned pane's real environment" -- false at the SHA this test was
+    /// written: `create_stream_pane` dropped `opts.owner` on the floor
+    /// entirely, and this mock-backed test stayed green through that bug
+    /// because it never asks the mock to have an environment. It proves the
+    /// value reaches `AgentSpawnOptions`, nothing more. `orchestration/identity/009`
+    /// (`tests/e2e_worktree_owner_env.rs`) is the test that reaches the real
+    /// seam: a genuinely spawned process reading the variable back out of
+    /// its own environment.
+    #[spec("orchestration/identity/008")]
+    #[test]
+    fn orchestration_identity_008_marker_and_env_owner_share_one_source() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(
+            repo.join("README.md"),
+            "orchestration_identity_008 fixture\n",
+        )
+        .expect("write README");
+        run_git(&["add", "-A"]);
+        // CI runners carry no global git identity; pin it inline so the
+        // commit succeeds regardless of host config.
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let worktree = tmp.path().join("repo-identity-008");
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir: repo.clone(),
+            name: "identity-008-orchestrator".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            orchestration_worktree_path: Some(worktree.clone()),
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert!(
+            worktree.is_dir(),
+            "SpawnPane must have created the worktree on disk at {}",
+            worktree.display()
+        );
+
+        let marker_owner = crate::worktree_reclaim::owner_of(&repo, &worktree);
+        assert!(
+            marker_owner.is_some(),
+            "the worktree marker must record an owner after a live orchestration spawn"
+        );
+
+        let recorded = pc.recorded_owners();
+        assert!(
+            !recorded.is_empty(),
+            "the orchestration config must spawn at least one role pane to compare"
+        );
+        for (i, owner) in recorded.iter().enumerate() {
+            assert_eq!(
+                owner, &marker_owner,
+                "role pane {i}'s AgentSpawnOptions::owner (what becomes \
+                 DOT_AGENT_DECK_WORKTREE_OWNER in its environment) must be the LITERAL \
+                 SAME string written into the worktree marker -- a second derivation \
+                 (e.g. reconstructing it daemon-side from TabMembership/display_title) \
+                 is exactly the divergence fork #166 M2.4 prohibits; got {owner:?}, \
+                 marker carries {marker_owner:?}"
+            );
+        }
+    }
+
     /// Scenario: Call `resolve_orchestration_worktree_path` with four slugs,
     /// each violating exactly one rule of the #122/#123 audit's P1 fix — a
     /// path separator, the literal `..`, a leading dash, and a NUL control
@@ -31608,6 +31946,7 @@ mod tests {
             project_path: worktree_str.clone(),
             started_role_indices: Vec::new(),
             display_title: None,
+            owner: None,
         };
 
         let (orch_config, start_idx) = resolve_orchestration_for_restore(&snap, &worktree_str)
@@ -31617,7 +31956,7 @@ mod tests {
         let pc = Arc::new(CapturingPaneController::new());
         let mut tm = TabManager::new(pc.clone());
         let (_, role_pane_ids) = tm
-            .open_orchestration_tab(&orch_config, &worktree_str, None, None, (24, 80))
+            .open_orchestration_tab(&orch_config, &worktree_str, None, None, None, (24, 80))
             .expect("open_orchestration_tab");
 
         let cwds = pc.recorded_cwds();
@@ -31663,6 +32002,7 @@ mod tests {
             project_path: worktree_str.clone(),
             started_role_indices: Vec::new(),
             display_title: None,
+            owner: None,
         };
 
         let result = resolve_orchestration_for_restore(&snap, &worktree_str);
@@ -31677,6 +32017,99 @@ mod tests {
             "the resolve error must name the orchestration so session_warnings \
              surfaces something the user can act on: {err:?}"
         );
+    }
+
+    /// Scenario: Build a `SavedSession` whose orchestration pane carries an
+    /// `OrchestrationSnapshot` with `owner: Some("orchestration:my-feature")`
+    /// — the identity fork #166 M2.4 stamps into the worktree marker and
+    /// every role pane's env var at creation time — serialize it to TOML and
+    /// deserialize it back (the real `session.toml` write/read path), then
+    /// feed the recovered snapshot's `owner` through `open_orchestration_tab`
+    /// exactly as the daemon-empty restore branch in `run_tui` does
+    /// (`orch_snap.owner.as_deref()` as the `creator` argument). Every
+    /// spawned role pane's `AgentSpawnOptions::owner` (captured by
+    /// `CapturingPaneController`) must carry the identical string — proving
+    /// the identity survives a full write → read → restore round trip
+    /// instead of being fabricated or dropped, which is M3.0's headline
+    /// claim (PR #215 fixup).
+    #[spec("session/restore/017")]
+    #[test]
+    fn restore_017_persisted_owner_survives_write_read_restore_round_trip() {
+        let tmp = tempdir().expect("tempdir");
+        let worktree = tmp.path().join("dot-agent-deck-my-feature");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+        write_restore_fixture_config(&worktree, "restore-worktree");
+        let worktree_str = worktree.display().to_string();
+
+        let owner = "orchestration:my-feature".to_string();
+        let session = config::SavedSession {
+            panes: vec![config::SavedPane {
+                dir: worktree_str.clone(),
+                name: "orchestrator".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+                orchestration: Some(config::OrchestrationSnapshot {
+                    version: 1,
+                    roles: vec!["coder".to_string(), "reviewer".to_string()],
+                    start_role_index: 0,
+                    orchestrator_prompt: String::new(),
+                    config_name: "restore-worktree".to_string(),
+                    project_path: worktree_str.clone(),
+                    started_role_indices: Vec::new(),
+                    display_title: None,
+                    owner: Some(owner.clone()),
+                }),
+            }],
+            last_command: None,
+        };
+
+        // The real write → read path: TOML serialize, then deserialize back,
+        // exactly like `SavedSession::save`/`SavedSession::load`.
+        let toml_str = toml::to_string_pretty(&session).expect("serialize session");
+        let loaded: config::SavedSession = toml::from_str(&toml_str).expect("deserialize session");
+        let snap = loaded.panes[0]
+            .orchestration
+            .as_ref()
+            .expect("orchestration snapshot must round-trip as Some")
+            .clone();
+        assert_eq!(
+            snap.owner.as_deref(),
+            Some(owner.as_str()),
+            "the owner field must survive the TOML round trip unchanged"
+        );
+
+        let (orch_config, _start_idx) = resolve_orchestration_for_restore(&snap, &worktree_str)
+            .expect("resolve_orchestration_for_restore must succeed for a live worktree");
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let (_, role_pane_ids) = tm
+            .open_orchestration_tab(
+                &orch_config,
+                &worktree_str,
+                None,
+                None,
+                snap.owner.as_deref(),
+                (24, 80),
+            )
+            .expect("open_orchestration_tab");
+
+        let recorded = pc.recorded_owners();
+        assert_eq!(
+            recorded.len(),
+            role_pane_ids.len(),
+            "one recorded owner per spawned role pane"
+        );
+        assert!(!recorded.is_empty(), "must spawn at least one role pane");
+        for (i, recorded_owner) in recorded.iter().enumerate() {
+            assert_eq!(
+                recorded_owner.as_deref(),
+                Some(owner.as_str()),
+                "role pane {i}'s AgentSpawnOptions::owner must be the persisted \
+                 identity passed through from the snapshot, not fabricated or \
+                 dropped; got {recorded_owner:?}"
+            );
+        }
     }
 
     /// Scenario: Open an orchestration with an initial start-role agent, then
@@ -31795,7 +32228,14 @@ mod tests {
         let pc = Arc::new(OpenTabPC::new());
         let mut tab_manager = TabManager::new(pc.clone());
         let (orch_idx, _role_ids) = tab_manager
-            .open_orchestration_tab(&orch_config_local("orch"), "/work", None, None, (24, 80))
+            .open_orchestration_tab(
+                &orch_config_local("orch"),
+                "/work",
+                None,
+                None,
+                None,
+                (24, 80),
+            )
             .expect("open a real orchestration tab");
         // open_orchestration_tab leaves the orchestration tab active — this is
         // exactly the "launched from a non-Dashboard tab" precondition.
