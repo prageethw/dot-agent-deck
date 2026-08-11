@@ -59,7 +59,7 @@ use spec::spec;
 /// each hard-coding its own multiple of it, which is what let this window
 /// drift to a bare `8` disconnected from the constant it was meant to track.
 /// See [`poll_process_table`].
-const PROCESS_TABLE_SAMPLE_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 4);
+const PROCESS_TABLE_SAMPLE_WINDOW: Duration = PS_SAMPLE_BUDGET.saturating_mul(4);
 
 /// Fork issue #160 F5: `process_table()` returning `None` is a transient,
 /// load-caused sample miss, not evidence of anything about the process tree

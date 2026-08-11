@@ -181,10 +181,18 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// signal purely structural for the rest.
 ///
 /// `None` means "no answer available": `root_pid` is not in the table (it
-/// exited, or the table was sampled from another PID namespace), or its own
-/// session id could not be read. `None` is deliberately not folded into
-/// `Some(false)` — the caller must be able to leave a pane's status alone
-/// rather than assert it is idle.
+/// exited, or the table was sampled from another PID namespace), its own
+/// session id could not be read, or — the per-row fail-safe, fork issue #160
+/// — at least one candidate descendant's session id could not be read and no
+/// other candidate resolved a confirmed `Some(true)`. `None` is deliberately
+/// not folded into `Some(false)` — the caller must be able to leave a pane's
+/// status alone rather than assert it is idle. A single unreadable row used to
+/// be `continue`d identically to a genuinely same-session row, so a candidate
+/// set where *every* row was unreadable fell through to a confident
+/// `Some(false)` — a total false negative, the worse failure direction (see
+/// `docs/develop/shell-activity-signal.md`). A confirmed-busy candidate still
+/// short-circuits `Some(true)` immediately, unreadable rows elsewhere in the
+/// set notwithstanding.
 ///
 /// Note what this does **not** consult: [`ProcessInfo::has_controlling_tty`].
 /// A bare no-controlling-terminal test collapses in a container, where the
@@ -199,17 +207,29 @@ pub fn descendant_shell_activity(
         return None;
     }
 
+    let mut had_unreadable_candidate = false;
     for candidate in descendants(table, root_pid) {
         // A row whose session id could not be read is unclassifiable, not
         // "different" — counting it as different would turn an exit racing the
-        // sample into a false `Working`.
-        if candidate.session_id <= 0 || candidate.session_id == root.session_id {
+        // sample into a false `Working`. It is tracked separately from "same
+        // session" so a set where every candidate is unreadable reports
+        // unknown rather than a confident idle (fork issue #160's per-row
+        // fail-safe) — a confirmed-busy candidate elsewhere in the set still
+        // wins immediately via the `return Some(true)` below, untouched.
+        if candidate.session_id <= 0 {
+            had_unreadable_candidate = true;
+            continue;
+        }
+        if candidate.session_id == root.session_id {
             continue;
         }
         if !shapes.is_empty() && !shapes.iter().any(|shape| shape.matches(&candidate.argv)) {
             continue;
         }
         return Some(true);
+    }
+    if had_unreadable_candidate {
+        return None;
     }
     Some(false)
 }
@@ -328,6 +348,7 @@ fn next_token(s: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     fn row(pid: i32, ppid: i32, session_id: i32, argv: &str) -> ProcessInfo {
         ProcessInfo {
@@ -397,17 +418,54 @@ mod tests {
 
     /// A descendant whose own session id could not be read is unclassifiable,
     /// not "in a different session" — otherwise a process exiting during the
-    /// sample would read as a false `Working`.
+    /// sample would read as a false `Working`. Fork issue #160's note on
+    /// #216 (and #216 itself) named the follow-on failure this earlier
+    /// version of the test missed: an unclassifiable candidate was folded
+    /// into "not busy" rather than "unknown", so when it is the *only*
+    /// candidate the function fell through to a confident `Some(false)` — a
+    /// real `ShellIdle`, one level below the per-sample fail-safe PR #206
+    /// already closed. The fail-safe has to be a **per-row** property, not
+    /// only a per-sample one, or an unreadable row still gets silently
+    /// counted as "confirmed idle".
+    ///
+    /// Scenario: two synthetic tables share a root process. In the first, the
+    /// root's only candidate descendant has an unreadable session id, so the
+    /// discriminator must report `None` (unknown) rather than asserting the
+    /// pane is idle. In the second, every descendant has a validly-read
+    /// session id that genuinely matches the root's own — the discriminating
+    /// case that must still resolve to `Some(false)`, so a fix cannot pass by
+    /// simply returning `None` whenever any row exists.
+    #[spec("status/shell-activity/011")]
     #[test]
-    fn a_descendant_with_an_unreadable_session_id_is_not_counted_as_busy() {
-        let table = vec![
+    fn shell_activity_011_an_unreadable_candidate_session_id_is_unknown_not_a_confident_idle() {
+        let only_candidate_unreadable = vec![
             row(100, 1, 100, "claude"),
             ProcessInfo {
                 session_id: -1,
                 ..row(200, 100, 200, "gone-during-the-sample")
             },
         ];
-        assert_eq!(descendant_shell_activity(&table, 100, &[]), Some(false));
+        assert_eq!(
+            descendant_shell_activity(&only_candidate_unreadable, 100, &[]),
+            None,
+            "the only candidate's session id could not be read, so the discriminator must \
+             report unknown rather than asserting the pane is idle — a confident `Some(false)` \
+             here is a false negative, the worse failure direction per \
+             docs/develop/shell-activity-signal.md"
+        );
+
+        let every_candidate_confirmed_same_session = vec![
+            row(100, 1, 100, "claude"),
+            row(200, 100, 100, "a-well-behaved-mcp-server"),
+            row(300, 200, 100, "another-well-behaved-child"),
+        ];
+        assert_eq!(
+            descendant_shell_activity(&every_candidate_confirmed_same_session, 100, &[]),
+            Some(false),
+            "every descendant's session id was validly read and genuinely matches the root's \
+             own, so this must still resolve to a confident idle — the discriminating case that \
+             keeps the fix from passing by simply never answering"
+        );
     }
 
     /// Route A's parsing surface: three whitespace-free columns, then the whole
@@ -488,8 +546,18 @@ mod tests {
     /// The consequence that matters: a descendant whose identity could not be
     /// confirmed must not be able to invent a busy reading. Before the
     /// confirmation pass the same table classifies the pane as busy; after it,
-    /// the pane reads idle rather than trusting a `getsid` answer that may
-    /// describe an unrelated, recycled process.
+    /// the pane must report unknown rather than trusting a `getsid` answer
+    /// that may describe an unrelated, recycled process.
+    ///
+    /// Fork issue #160's per-row fail-safe (`status/shell-activity/011`)
+    /// changed this test's own expected outcome: `invalidate_unconfirmed_session_ids`
+    /// resets the unconfirmed row's session id to the same `-1` sentinel a
+    /// failed `getsid` produces, and pid 200 is the pane's *only* candidate —
+    /// so this is exactly the per-row fail-safe's scenario, reached via the
+    /// confirmation pass instead of a raw unreadable `getsid`. It used to
+    /// assert `Some(false)`, which was the bug: a confident idle reading built
+    /// entirely on a descendant nobody could confirm. The corrected contract
+    /// is `None` — "no answer available" — never `Some(false)`.
     #[test]
     fn an_unconfirmed_descendant_cannot_flip_a_pane_to_busy() {
         let mut rows = vec![
@@ -506,8 +574,9 @@ mod tests {
         invalidate_unconfirmed_session_ids(&mut rows, confirm);
         assert_eq!(
             descendant_shell_activity(&rows, 100, &[]),
-            Some(false),
-            "a descendant the second sample could not confirm must not count as busy evidence"
+            None,
+            "a descendant the second sample could not confirm must not count as busy evidence \
+             — and, being the pane's only candidate, must not be read as confirmed idle either"
         );
     }
 

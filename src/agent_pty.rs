@@ -2270,6 +2270,19 @@ impl Default for AgentPtyRegistry {
 /// vec; only `candidates` tells them apart. See the daemon's poll loop,
 /// which is the only production caller, for how the two counts are combined
 /// into a three-way discriminator.
+///
+/// Fork issue #216: `candidates` alone still cannot say **which** pane went
+/// unconfirmed — only how many did, aggregated across the whole deck. That is
+/// exactly what let PR #206's `consecutive_process_table_failures: u32`
+/// (`run_shell_activity_monitor` in `daemon.rs`) reset to zero on ANY one
+/// pane classifying, no matter how many *other* panes were degraded by the
+/// same contention that made the rest fail — the failure is load-correlated
+/// in the wrong direction, since more panes means more likely at least one
+/// classifies. `unconfirmed` closes that: every candidate pane that went
+/// unconfirmed this tick is named explicitly, rather than being represented
+/// only by its absence from `statuses` and folded into the aggregate
+/// `candidates` count. `daemon.rs` keys its per-pane failure streak off this
+/// field instead of one deck-wide scalar.
 pub struct ShellForegroundBusySnapshot {
     /// `(pane_id, busy)` for every pane the scan actually classified this
     /// tick.
@@ -2279,6 +2292,11 @@ pub struct ShellForegroundBusySnapshot {
     /// not the scan could actually classify them. Zero candidates means
     /// there was nothing to classify — not degradation, just an idle deck.
     pub candidates: usize,
+    /// The pane id of every candidate pane the scan attempted but could not
+    /// classify this tick (`RunningAgent::shell_activity_in` returned `None`)
+    /// — fork issue #216's named counterpart to `candidates`. Always a subset
+    /// of the candidates: `statuses.len() + unconfirmed.len() == candidates`.
+    pub unconfirmed: Vec<String>,
 }
 
 impl AgentPtyRegistry {
@@ -4260,6 +4278,7 @@ impl AgentPtyRegistry {
     ) -> ShellForegroundBusySnapshot {
         let inner = self.inner.lock().unwrap();
         let mut candidates = 0usize;
+        let mut unconfirmed = Vec::new();
         let statuses = inner
             .agents
             .values()
@@ -4271,7 +4290,8 @@ impl AgentPtyRegistry {
                 // itself can fail it (shape veto, missing session id, …) so
                 // the count answers "was there anything to classify", not
                 // "did classification succeed".
-                if agent.child.process_id().is_some() {
+                let is_candidate = agent.child.process_id().is_some();
+                if is_candidate {
                     candidates += 1;
                 }
                 let key = shell_tool_shape_key(agent.agent_type.as_ref());
@@ -4280,13 +4300,25 @@ impl AgentPtyRegistry {
                     .copied()
                     .filter(|shape| Some(shape.agent) == key)
                     .collect();
-                let busy = agent.shell_activity_in(table, &for_pane)?;
-                Some((pane_id, busy))
+                match agent.shell_activity_in(table, &for_pane) {
+                    Some(busy) => Some((pane_id, busy)),
+                    None => {
+                        // Fork issue #216: name the unconfirmed candidate
+                        // explicitly rather than letting it vanish as a
+                        // `filter_map` `None` — see `unconfirmed`'s doc on
+                        // [`ShellForegroundBusySnapshot`].
+                        if is_candidate {
+                            unconfirmed.push(pane_id);
+                        }
+                        None
+                    }
+                }
             })
             .collect();
         ShellForegroundBusySnapshot {
             statuses,
             candidates,
+            unconfirmed,
         }
     }
 
@@ -6585,6 +6617,15 @@ mod spawn_tests {
     /// PTY entirely, which is the topology a real Claude Bash-tool call has and
     /// the one #370 could never see — is covered by `status/shell-activity/004`
     /// in `tests/shell_activity.rs`.
+    // Fork issue #210: `shell_foreground_busy` samples through `process_table()`,
+    // the same `PS_SAMPLE_BUDGET`-bound `ps` this whole module's tests share, so
+    // a single budget-exhausted sample under load can consume an entire 2s
+    // deadline on its own. `RETRY_WINDOW` is deliberately a multiple of the
+    // sampler's own budget rather than an unrelated literal, so the two cannot
+    // silently drift apart.
+    #[cfg(unix)]
+    const RETRY_WINDOW: Duration = crate::platform::proc::PS_SAMPLE_BUDGET.saturating_mul(3);
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_foreground_busy_ignores_a_non_detached_foreground_child() {
@@ -6608,13 +6649,28 @@ mod spawn_tests {
                 .and_then(|a| a.shell_foreground_busy(&[]))
         };
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // The awaited state (an idle shell reading `Some(false)`) is persistent
+        // once true, so — unlike the loop below — widening the retry window
+        // genuinely helps here: a transient sampler timeout just costs another
+        // lap, not a false result.
+        let deadline = Instant::now() + RETRY_WINDOW;
         let mut state = busy(&registry);
         while state != Some(false) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
             state = busy(&registry);
         }
-        assert_eq!(state, Some(false), "an idle shell should not read busy");
+        match state {
+            Some(false) => {}
+            None => panic!(
+                "process_table() never completed within a {RETRY_WINDOW:?} retry window \
+                 (against a {:?} per-sample budget) — a sampler timeout under machine load, \
+                 not evidence the idle shell reads busy",
+                crate::platform::proc::PS_SAMPLE_BUDGET
+            ),
+            Some(true) => panic!(
+                "an idle shell read busy — a real classification defect, not a sampler timeout"
+            ),
+        }
 
         let writer = {
             let inner = registry.inner.lock().unwrap();
@@ -6626,23 +6682,118 @@ mod spawn_tests {
             w.flush().expect("flush");
         }
 
-        // Sampled repeatedly rather than once, so this fails if the signal ever
-        // rises even briefly — the old `Some(true)` assertion is inverted here,
-        // not just dropped.
+        // The awaited property here is the OPPOSITE shape: the signal must
+        // never rise for the whole window, so a wider window would only make
+        // this test slower, not more correct (Review finding F1 on PR #206).
+        // A `None` tick is a sampler timeout, not evidence of anything — it is
+        // therefore skipped rather than compared for equality, but at least
+        // one tick must still positively confirm `Some(false)` or the window
+        // proves nothing at all.
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut confirmed_idle = false;
         while Instant::now() < deadline {
-            assert_eq!(
-                busy(&registry),
-                Some(false),
-                "a foreground job typed into the pane's own PTY stays in the pane's POSIX \
-                 session, so PRD #386's descendant scan must NOT read it as busy — this \
-                 supersedes #370's tcgetpgrp behaviour, which reported `true` here and \
-                 `false` for the detached Bash-tool child that actually matters"
-            );
+            match busy(&registry) {
+                Some(true) => panic!(
+                    "a foreground job typed into the pane's own PTY stays in the pane's POSIX \
+                     session, so PRD #386's descendant scan must NOT read it as busy — this \
+                     supersedes #370's tcgetpgrp behaviour, which reported `true` here and \
+                     `false` for the detached Bash-tool child that actually matters"
+                ),
+                Some(false) => confirmed_idle = true,
+                None => {} // sampler timeout this tick — inconclusive, retry
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(
+            confirmed_idle,
+            "every sample in the 1s observation window timed out against the {:?} sampler \
+             budget — inconclusive, not a passing result",
+            crate::platform::proc::PS_SAMPLE_BUDGET
+        );
 
         registry.close_agent(&id).unwrap();
+    }
+
+    /// Fork issue #216: a bare count can't say WHICH pane went unconfirmed —
+    /// only a named counterpart to `candidates` can. This pins the seam
+    /// `unconfirmed` is built on directly against
+    /// `shell_foreground_busy_snapshot_in`, with a synthetic table so the
+    /// two panes' classification outcomes are deterministic rather than
+    /// depending on what each spawned shell's live descendants happen to be.
+    ///
+    /// Scenario: two real panes are registered, "pane-a" and "pane-b". The
+    /// synthetic process table names only pane-a's root process (with a
+    /// readable session id and no descendants), so pane-a classifies as
+    /// idle while pane-b's root is entirely absent from the sample — the
+    /// scan attempted it (it is a live candidate) but could not classify
+    /// it. The snapshot must name pane-b explicitly in `unconfirmed`, not
+    /// merely count it.
+    #[spec("status/shell-activity/009")]
+    #[test]
+    fn shell_activity_009_unconfirmed_names_the_specific_pane_not_just_a_count() {
+        let registry = AgentPtyRegistry::new();
+        let id_a = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a");
+        let _id_b = registry
+            .spawn_agent(SpawnOptions {
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-b".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn b");
+
+        let pid_a = {
+            let inner = registry.inner.lock().unwrap();
+            inner
+                .agents
+                .get(&id_a)
+                .unwrap()
+                .child
+                .process_id()
+                .expect("pane-a's child must have a live pid") as i32
+        };
+        // pane-b's root is deliberately NOT sampled into this table — the
+        // scenario where the scan attempted a live candidate but the sample
+        // could not confirm it, e.g. a `ps` row that raced the process's own
+        // exit or a table too contended to carry every candidate.
+        let table = vec![crate::platform::proc::ProcessInfo {
+            pid: pid_a,
+            ppid: 1,
+            session_id: pid_a,
+            has_controlling_tty: false,
+            session_leader: true,
+            argv: "sh".to_string(),
+        }];
+
+        let snapshot = registry.shell_foreground_busy_snapshot_in(&table, &[]);
+
+        assert_eq!(
+            snapshot.candidates, 2,
+            "both spawned panes are live, addressable candidates regardless of what the \
+             sample could confirm"
+        );
+        assert_eq!(
+            snapshot.statuses,
+            vec![("pane-a".to_string(), false)],
+            "pane-a's root was sampled with no descendants, so it classifies as confirmed idle"
+        );
+        assert_eq!(
+            snapshot.unconfirmed,
+            vec!["pane-b".to_string()],
+            "pane-b's root was absent from the sample, so the snapshot must name pane-b \
+             explicitly — asserting candidates or statuses.len() alone cannot discriminate \
+             this from an idle deck with only one live pane (fork issue #216)"
+        );
+        assert_eq!(
+            snapshot.statuses.len() + snapshot.unconfirmed.len(),
+            snapshot.candidates,
+            "the daemon's per-pane streak logic depends on this invariant holding"
+        );
+
+        registry.shutdown_all();
     }
 
     #[test]
