@@ -111,7 +111,7 @@ fn hook_rule_identification_001_repeated_install_renamed_binary_stays_single_rul
     let pre_tool_use = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         pre_tool_use,
-        vec![format!("{binary} hook")],
+        vec![format!("{binary} hook --agent claude-code")],
         "PreToolUse must hold exactly one rule for the renamed binary; got {pre_tool_use:?}"
     );
 }
@@ -219,7 +219,16 @@ fn hook_rule_identification_005_unrelated_command_ending_in_hook_is_never_delete
     }
 }
 
-/// Scenario: A hook rule written by an older, differently-named deck install (the plain `dot-agent-deck` binary name) must still be recognised and replaced by a fresh install running under a new renamed binary, rather than left orphaned alongside it.
+/// Scenario: A hook rule written by an older install under the historical default
+/// binary name (`dot-agent-deck`, pre-fix bare `<path> hook` form) must still be
+/// recognised and replaced by a fresh install — even when the fresh install's own
+/// binary name looks nothing like a deck binary at all. Recognition is keyed off
+/// the LEGACY RULE's own executable name, never off the installer's name: round 1
+/// required the installer to itself "look deck-ish" (contain a name fragment) to
+/// trigger migration, which is exactly what made it impossible to satisfy
+/// alongside `_003` (a genuinely different binary must NOT be swept up) — the two
+/// cases differed only by a coincidence of which fragment a test's binary path
+/// happened to contain, not by anything causal.
 #[test]
 fn hook_rule_identification_006_legacy_rule_is_recognised_and_replaced() {
     let (_dir, path) = settings_path();
@@ -233,14 +242,17 @@ fn hook_rule_identification_006_legacy_rule_is_recognised_and_replaced() {
         }),
     );
 
-    install_to(&path, "/opt/tools/worker-agent-deck");
+    // Deliberately a binary name that does not "look" deck-ish at all — proving
+    // migration is driven by the legacy RULE's own name, not by whether the
+    // installing binary resembles one.
+    install_to(&path, "/usr/local/bin/foo-tool");
 
     let rules = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         rules,
-        vec!["/opt/tools/worker-agent-deck hook".to_string()],
-        "a legacy rule from a differently-named prior install must be replaced by the \
-         fresh rule, not left orphaned; got {rules:?}"
+        vec!["/usr/local/bin/foo-tool hook --agent claude-code".to_string()],
+        "a legacy rule under the historical default binary name must be replaced by \
+         the fresh rule regardless of the installing binary's own name; got {rules:?}"
     );
 }
 
@@ -267,5 +279,208 @@ fn hook_rule_identification_007_old_flat_format_rule_is_recognised() {
     assert!(
         remaining.is_empty(),
         "an old flat-format deck rule must be recognised and removed by uninstall; got {remaining:?}"
+    );
+}
+
+/// Scenario: A binary installed at a path containing spaces must round-trip
+/// through repeated installs without accumulating rules, must be recognised in
+/// its quoted form, and must be fully removable by uninstall — mirroring
+/// `devin_hooks_manage`'s `install_quotes_a_binary_path_with_spaces` precedent
+/// (`src/devin_hooks_manage.rs:726-738`).
+#[test]
+fn hook_rule_identification_008_spaced_binary_path_round_trips() {
+    let (_dir, path) = settings_path();
+    let binary = "/Applications/My Deck/dot-agent-deck";
+    let expected_command = "'/Applications/My Deck/dot-agent-deck' hook --agent claude-code";
+
+    install_to(&path, binary);
+    let after_one = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_one,
+        vec![expected_command.to_string()],
+        "a spaced binary path must be quoted so the command still parses to the \
+         intended argv; got {after_one:?}"
+    );
+
+    install_to(&path, binary);
+    let after_two = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_two,
+        vec![expected_command.to_string()],
+        "a spaced binary path must not accumulate rules across repeated installs; \
+         got {after_two:?}"
+    );
+
+    uninstall_from(&path);
+    let remaining = total_rule_count(&read_settings(&path));
+    assert_eq!(
+        remaining, 0,
+        "a spaced binary path's rules must be fully removable by uninstall; {remaining} remained"
+    );
+}
+
+/// Scenario: A rule written by a HISTORICAL install under a spaced binary path,
+/// in the pre-fix unquoted flat `<path> hook` form (no shell quoting, no
+/// `--agent` suffix — the shape every rule had before this change), must still
+/// be recognised and removed by uninstall. The path's own internal whitespace
+/// means the executable cannot be recovered by counting whitespace-split tokens;
+/// it must be recovered by parsing the command from the RIGHT (`strip_suffix`).
+#[test]
+fn hook_rule_identification_009_historical_unquoted_spaced_rule_is_still_recognised() {
+    let (_dir, path) = settings_path();
+    let legacy_command = "/Applications/My Deck/dot-agent-deck hook";
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [user_rule(legacy_command)]
+            }
+        }),
+    );
+
+    uninstall_from(&path);
+
+    let remaining = rule_commands(&read_settings(&path), "PreToolUse");
+    assert!(
+        remaining.is_empty(),
+        "a historical unquoted spaced-path rule must still be recognised and removed \
+         by uninstall; got {remaining:?}"
+    );
+}
+
+/// Scenario: `~/.local/bin/dot-agent-deck` symlinked to a real, differently-named
+/// `~/.local/bin/worker-agent-deck` binary — the exact real-machine case fork
+/// #229 exists for. Installing via each path in turn must resolve to the SAME
+/// deployment and leave exactly one rule. Every fixture elsewhere in this file
+/// is a fictional path, so `canonicalize` never succeeds against it and this
+/// symlink-resolution branch has never actually executed under this suite
+/// before now.
+#[cfg(unix)]
+#[test]
+fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
+    let binary_dir = tempfile::tempdir().expect("create binary tempdir");
+    let real_binary = binary_dir.path().join("worker-agent-deck");
+    std::fs::write(&real_binary, b"#!/bin/sh\n").expect("write real binary");
+    let symlink_path = binary_dir.path().join("dot-agent-deck");
+    std::os::unix::fs::symlink(&real_binary, &symlink_path).expect("create symlink");
+
+    let (_dir, path) = settings_path();
+    install_to(&path, symlink_path.to_str().expect("symlink path is utf8"));
+    install_to(
+        &path,
+        real_binary.to_str().expect("real binary path is utf8"),
+    );
+
+    let pre_tool_use = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        pre_tool_use.len(),
+        1,
+        "a symlink and the real file it resolves to are the SAME deployment and \
+         must collapse to one rule, not two; got {pre_tool_use:?}"
+    );
+}
+
+/// Scenario: Two genuinely different on-disk binaries that happen to share the
+/// literal basename `dot-agent-deck` (e.g. two separate local builds at
+/// different paths) must be treated as distinct deployments — installing the
+/// second must not collapse onto the first's rule, and reinstalling either must
+/// not wipe the other's. Unlike `_003`'s fictional paths (where
+/// `canonicalize` always fails), both paths here are real files, so this
+/// exercises the canonicalize-success branch `_003` cannot reach.
+#[test]
+fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse() {
+    let build_a_dir = tempfile::tempdir().expect("build a tempdir");
+    let build_a = build_a_dir.path().join("dot-agent-deck");
+    std::fs::write(&build_a, b"#!/bin/sh\n").expect("write build a");
+
+    let build_b_dir = tempfile::tempdir().expect("build b tempdir");
+    let build_b = build_b_dir.path().join("dot-agent-deck");
+    std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
+
+    let (_dir, path) = settings_path();
+    install_to(&path, build_a.to_str().expect("build a path is utf8"));
+    install_to(&path, build_b.to_str().expect("build b path is utf8"));
+
+    let after_two = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_two.len(),
+        2,
+        "two distinct on-disk builds sharing a basename must each keep their own \
+         rule; got {after_two:?}"
+    );
+
+    install_to(&path, build_a.to_str().expect("build a path is utf8"));
+    let after_reinstall = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_reinstall.len(),
+        2,
+        "reinstalling one build must refresh its own rule, not wipe the other's; \
+         got {after_reinstall:?}"
+    );
+}
+
+/// Scenario: A user's own tool whose basename merely CONTAINS the substring
+/// "deck" (looser than the exact historical binary name `dot-agent-deck`)
+/// writes its own legacy-shaped `<path> hook` rule. Neither install nor
+/// uninstall may ever treat it as deck-owned. This is a mutation guard: fork
+/// #229's review found a fragment-based predicate (matching any basename
+/// containing `"deck"`, or containing `"agent-deck"`) passes every other test in
+/// this file, so this case exists specifically to fail if identification is
+/// ever loosened to a substring/fragment match instead of the exact compiled
+/// binary name.
+#[test]
+fn hook_rule_identification_012_fragment_match_mutation_guard() {
+    let (_dir, path) = settings_path();
+    let unrelated_command = "/usr/local/bin/my-deck-tool hook";
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [user_rule(unrelated_command)]
+            }
+        }),
+    );
+
+    install_to(&path, "/opt/tools/worker-agent-deck");
+    let after_install = rule_commands(&read_settings(&path), "PreToolUse");
+    assert!(
+        after_install.contains(&unrelated_command.to_string()),
+        "a user tool whose basename merely contains \"deck\" must survive install \
+         unless it is EXACTLY the historical default binary name; got {after_install:?}"
+    );
+
+    uninstall_from(&path);
+    let after_uninstall = rule_commands(&read_settings(&path), "PreToolUse");
+    assert!(
+        after_uninstall.contains(&unrelated_command.to_string()),
+        "a user tool whose basename merely contains \"deck\" must survive uninstall; \
+         got {after_uninstall:?}"
+    );
+}
+
+/// Scenario: A `settings.json` made invalid by a single trailing comma — while
+/// still carrying the user's `model`, `env`, and `permissions` configuration —
+/// must never be silently replaced. Audit's most serious finding: `read_settings`
+/// maps ANY parse error to `{}`, so on the real machine this would silently
+/// destroy 10 non-`hooks` keys including 123 `permissions.allow` entries and
+/// leave only the deck's own hooks behind. This pins that `install_to` leaves a
+/// file it cannot parse exactly as it found it, mirroring
+/// `codex_hooks_manage::install_to`'s `ErrorKind::NotFound`-only-means-empty
+/// contract (`src/codex_hooks_manage.rs:290-316`).
+#[test]
+fn hook_rule_identification_013_malformed_settings_json_is_never_clobbered() {
+    let (_dir, path) = settings_path();
+    let malformed = "{\n  \"model\": \"opus\",\n  \"env\": {\"FOO\": \"bar\"},\n  \
+                      \"permissions\": {\"allow\": [\"Bash(git *)\"]},\n  \"hooks\": {},\n}\n";
+    std::fs::write(&path, malformed).expect("write malformed settings fixture");
+
+    install_to(&path, "/opt/tools/worker-agent-deck");
+
+    let after = std::fs::read_to_string(&path).expect("read settings after install attempt");
+    assert_eq!(
+        after, malformed,
+        "a malformed settings.json must never be silently replaced by install — the \
+         user's model/env/permissions would be destroyed and only deck hooks would \
+         remain"
     );
 }
