@@ -1430,7 +1430,16 @@ fn issue_claim_016_host_is_not_part_of_the_identity() {
     let wt = fx.add_worktree("wt-shared-path", "shared-branch");
     fx.mark_owned(&wt, "orchestration:orch-local");
 
-    let wt_str = wt.to_string_lossy().into_owned();
+    // Canonicalize before seeding: `std::env::current_dir()` inside the
+    // spawned CLI process resolves the PHYSICAL path (e.g. macOS's `/tmp`
+    // symlinking to `/private/tmp`), so seeding the LEXICAL `tempdir()` path
+    // verbatim would make this test's own claim get refused on some
+    // platforms for an unrelated reason (the `issue/claim/018` path-
+    // normalization gap) rather than the host gap this test exists to pin —
+    // exactly the "passes/fails for the wrong reason" trap this PRD's round
+    // exists to close.
+    let wt_canonical = std::fs::canonicalize(&wt).expect("canonicalize worktree path");
+    let wt_str = wt_canonical.to_string_lossy().into_owned();
     let held_body = format!(
         "Claimed by the orchestration `orch-remote-host` working `{wt_str}` on branch \
          `shared-branch` at 2020-01-01T00:00:00Z."
