@@ -35382,14 +35382,16 @@ mod tests {
 
     /// Scenario: drive `deliver_orchestrator_prompt` across two simulated
     /// render frames: frame 1 performs an `Applied` write with no submit yet;
-    /// frame 2 simulates a REAL submit having landed for that pane — the
-    /// positional confirmation upstream #424's correction calls for (a
-    /// `UserPromptSubmit` hook maps to `EventType::Thinking`, `src/hook.rs:
-    /// 111`, which `AppState::apply_event` turns into `SessionStatus::
-    /// Thinking`, `src/state.rs` — the only existing "a submit arrived"
-    /// signal in the codebase). Pins the counterpart to `orchestration/
-    /// seed/001`: delivery must finalize exactly once, AFTER the submit is
-    /// observed, with no duplicate write — never before, and never twice.
+    /// frame 2 simulates a REAL submit having landed for that pane — both
+    /// the LEVEL signal (`SessionStatus::Thinking`, upstream #424's
+    /// correction) and, fork #197 M3 step 2 prep, the TEXT signal
+    /// (`last_user_prompt` becoming an exact match of the sent pointer,
+    /// `src/hook.rs:111` / `src/state.rs`) land together, so this cycle
+    /// confirms via TEXT already, not only via LEVEL — the shape M3 step 2
+    /// (LEVEL's removal) leaves standing. Pins the counterpart to
+    /// `orchestration/seed/001`: delivery must finalize exactly once, AFTER
+    /// the submit is observed, with no duplicate write — never before, and
+    /// never twice.
     #[spec("orchestration/seed/002")]
     #[test]
     fn orchestration_seed_002_confirmed_write_finalizes_once_no_duplicate() {
@@ -35436,12 +35438,23 @@ mod tests {
         // defect.
         let finalized_before_confirmation = role_statuses[0] == OrchestrationRoleStatus::Working;
 
-        // A real submit for this pane now lands.
-        snapshot
-            .sessions
-            .get_mut("pane-orch-pane-425")
-            .expect("placeholder session")
-            .status = SessionStatus::Thinking;
+        // A real submit for this pane now lands. Fork #197 M3 step 2 prep:
+        // flip `last_user_prompt` to an exact match of the sent pointer
+        // ALONGSIDE the status flip — cycle 1's baseline is `None` (no
+        // prior cycle on this tab), so `prompt_text_confirms` sees a
+        // genuine text-changed-since-baseline and confirms via TEXT on its
+        // own, with LEVEL merely redundant rather than load-bearing. This
+        // is the stand-in `orchestration/seed/002`'s own catalog entry
+        // disclaimed being — matching it to what M3 step 2 ships (LEVEL
+        // removed) rather than weakening this already-green test.
+        {
+            let session = snapshot
+                .sessions
+                .get_mut("pane-orch-pane-425")
+                .expect("placeholder session");
+            session.status = SessionStatus::Thinking;
+            session.last_user_prompt = Some("orchestrator prompt".to_string());
+        }
 
         let gate_open_before_confirmation_frame =
             prompt.is_some() && !ui.orchestration_prompted.contains(&tab_id);
