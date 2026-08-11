@@ -10144,13 +10144,35 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// invariant is "one literal string reaches both consumers" by
 /// construction now, not because no typed name has ever been long enough
 /// or carried a control character to prove it false.
+///
+/// PR #215 round-3 fixup (auditor L1): sanitizing AFTER building
+/// `orchestration:{typed_name}` means a `typed_name` composed only of
+/// characters the sanitizer strips (control characters) is non-empty going
+/// in but collapses to the bare literal `"orchestration:"` coming out — a
+/// non-empty, non-sentinel identity with no name in it, which two such
+/// orchestrations would share byte-for-byte and `--mine` would match on.
+/// `"orchestration:"` is illegal for exactly the reason the sentinel
+/// exists, so the check runs on the SANITIZED result, not the raw input.
+///
+/// One residual collision class this doc's "identities cannot collide"
+/// framing does not cover: [`crate::worktree_reclaim::sanitize_marker_creator`]'s
+/// 200-char truncation means two distinct names sharing their first 200
+/// characters now sanitize to the identical string — tracked as fork
+/// **#222**.
 fn orchestration_creator_string(typed_name: &str) -> String {
     let raw = if typed_name.is_empty() {
-        "orchestration:unknown".to_string()
+        crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string()
     } else {
         format!("orchestration:{typed_name}")
     };
-    crate::worktree_reclaim::sanitize_marker_creator(&raw)
+    let sanitized = crate::worktree_reclaim::sanitize_marker_creator(&raw);
+    if sanitized
+        .strip_prefix("orchestration:")
+        .is_some_and(str::is_empty)
+    {
+        return crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string();
+    }
+    sanitized
 }
 
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
@@ -31662,6 +31684,46 @@ mod tests {
              DISTINCT owners in their respective worktree markers, got {owner_a:?} and \
              {owner_b:?} -- on main today both format `orchestration:{{name}}` from the \
              shared config name, making per-instance ownership indistinguishable"
+        );
+    }
+
+    /// PR #215 round-3 (reviewer R-F5 / auditor A-M2): `orchestration_creator_string`
+    /// has exactly one caller and, before this test, no test called it
+    /// directly — so neither of this round's two semantic changes (the
+    /// deleted `orchestration:<config_name>` fallback → the sentinel, and
+    /// applying `sanitize_marker_creator` to the result) was pinned by
+    /// anything. Drives all four branches directly and asserts the empty
+    /// case against the SHARED constant, never a re-typed literal — typing
+    /// the sentinel on both sides of an assertion is what let the producer
+    /// and the consumer drift apart in the first place.
+    #[test]
+    fn orchestration_creator_string_covers_every_branch() {
+        // Empty typed name -> the shared sentinel constant, not a re-typed
+        // literal and not the deleted `orchestration:<config_name>` fallback.
+        assert_eq!(
+            orchestration_creator_string(""),
+            crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
+        );
+
+        // A name composed only of characters `sanitize_marker_creator` strips
+        // (control characters) must not collapse to a bare "orchestration:" --
+        // it must fall back to the same sentinel (auditor A-L1).
+        assert_eq!(
+            orchestration_creator_string("\u{7}\u{1b}"),
+            crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL
+        );
+
+        // A name needing sanitization (control chars mixed with real
+        // content) is sanitized, not rejected and not passed through raw.
+        assert_eq!(
+            orchestration_creator_string("foo\u{7}bar"),
+            "orchestration:foobar"
+        );
+
+        // An ordinary name maps straight to `orchestration:<name>`.
+        assert_eq!(
+            orchestration_creator_string("review-1"),
+            "orchestration:review-1"
         );
     }
 

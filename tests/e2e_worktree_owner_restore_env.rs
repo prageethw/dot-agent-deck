@@ -77,9 +77,11 @@ fn restore_018_owner_reaches_every_restored_role_panes_real_environment() {
     // process that has already exited and been filtered is indistinguishable
     // from one that was never spawned. The trailing `sleep 30` keeps each
     // child alive long enough for `wait_for_agent_where`'s poll to observe it
-    // as a live registry entry, mirroring why `orchestration/identity/009`'s
-    // single-role variant gets away with a bare `echo` (no second role's
-    // spawn work delays its poll) while this two-role test cannot.
+    // as a live registry entry — the SAME race `orchestration/identity/009`'s
+    // single-role variant hits under load (fork #166 CI run 31444090426: 3/3
+    // fails on `wait_for_agent_where` with a bare `echo`), not one this
+    // two-role test is special in having; both need the keep-alive for the
+    // identical reason.
     let toml = "[[orchestrations]]\n\
                 name = \"restore-018-fixture\"\n\n\
                 [[orchestrations.roles]]\n\

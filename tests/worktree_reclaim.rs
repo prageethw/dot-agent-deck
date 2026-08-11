@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use dot_agent_deck::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL;
 use spec::spec;
 
 // ---------------------------------------------------------------------------
@@ -1377,11 +1378,11 @@ fn worktree_reclaim_028_mine_refuses_the_unknown_sentinel() {
     // Written by a DIFFERENT nameless orchestration that also fell back to
     // the sentinel -- if `--mine` ever matched sentinel-to-sentinel, this is
     // the worktree it would wrongly hand over.
-    fx.mark_owned_with_creator(&wt, "orchestration:unknown");
+    fx.mark_owned_with_creator(&wt, ORCHESTRATION_UNKNOWN_SENTINEL);
 
     let out = fx.run_with_owner(
         &["worktree", "list", "--mine"],
-        Some("orchestration:unknown"),
+        Some(ORCHESTRATION_UNKNOWN_SENTINEL),
     );
     assert!(
         !out.status.success(),
@@ -1401,5 +1402,43 @@ fn worktree_reclaim_028_mine_refuses_the_unknown_sentinel() {
         !text.contains("wt-nameless"),
         "two nameless orchestrations sharing the `orchestration:unknown` sentinel must never be \
          treated as matching -- got:\n{text}"
+    );
+}
+
+/// Scenario: With `DOT_AGENT_DECK_WORKTREE_OWNER` exported but set to an
+/// empty (or whitespace-only) string -- an ordinary way to reach this via a
+/// wrapper script's `export VAR=` or an unset shell variable interpolated
+/// into `VAR="$OTHER"` -- `worktree list --mine` must refuse exactly as it
+/// does when the variable is absent entirely (`027`). `std::env::var`
+/// returns `Ok("")` for this case, so without an explicit refusal it falls
+/// into the "use it as the filter" arm and produces a definitive-looking
+/// "no worktrees owned by" with a blank subject and exit 0 -- a wrong
+/// answer arriving silently (fork #166 M3.0, PR #215 round-3 reviewer F4).
+#[spec("worktree/reclaim/029")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_029_mine_fails_loudly_when_owner_env_empty() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-someones", "feat/someones");
+    fx.set_pr_state("feat/someones", "OPEN");
+    fx.mark_owned_with_creator(&wt, "orchestration:someone");
+
+    let out = fx.run_with_owner(&["worktree", "list", "--mine"], Some("   "));
+    assert!(
+        !out.status.success(),
+        "`--mine` with DOT_AGENT_DECK_WORKTREE_OWNER set to an empty/whitespace-only value must \
+         fail loudly (non-zero exit), never succeed by silently filtering on a value that can \
+         never match anything; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("DOT_AGENT_DECK_WORKTREE_OWNER"),
+        "the failure must name the empty variable so the caller knows what to supply; got:\n{text}"
+    );
+    assert!(
+        !text.contains("wt-someones"),
+        "an empty owner identity must never be treated as \"list everything\" -- got:\n{text}"
     );
 }

@@ -74,7 +74,9 @@ What it leaves for this PRD:
 
 So Phase 2 shrinks: the format is settled and the plumbing exists. What remains is the read side, the right value, and the display.
 
-**Update 2026-08-10 — two of those three are now done, via fork#192.** Item 1 (no read side) is closed by `read_marker_owner`/`owner_of`. Item 2 (wrong identity) is closed on the normal path: `src/ui.rs:9103` now passes the typed name, though the `orch_config.name` fallback at `:9107` and the `orchestration:unknown` fallback at `:9105` both still exist. Item 3 (nothing surfaces the owner) is **half** closed — `--json` carries it, the human table does not. What that left unnoticed until now is that none of the three was the actual blocker for Phase 3: **the running orchestration has no way to know its own owner string**, which is M2.4.
+**Update 2026-08-10 — two of those three are now done, via fork#192.** Item 1 (no read side) is closed by `read_marker_owner`/`owner_of`. Item 2 (wrong identity) is closed on the normal path: `orchestration_creator_string` (`src/ui.rs`) now passes the typed name, though the `orch_config.name` fallback and the `orchestration:unknown` fallback both still exist. Item 3 (nothing surfaces the owner) is **half** closed — `--json` carries it, the human table does not. What that left unnoticed until now is that none of the three was the actual blocker for Phase 3: **the running orchestration has no way to know its own owner string**, which is M2.4.
+
+**Update 2026-08-11, PR #215 round 3 — both residuals in the paragraph above are now closed too, and are left in place rather than rewritten since this paragraph is itself a dated snapshot.** The `orch_config.name` fallback was deleted by the same PR #215 fixup M2.1 below records (reviewer F5 M2 / auditor M2): an empty typed name now always produces the `orchestration:unknown` sentinel, never the config-name string. And M2.3, completed since this paragraph was written, closed "the human table does not [carry the owner]" — `format_list_human` renders the OWNER column now.
 
 ### Why the marker decides and the name does not
 
@@ -177,7 +179,7 @@ That check was built to defeat a forged marker. It protects this case for free, 
 
     | Producer | Owner string | Source |
     |---|---|---|
-    | Interactive orchestration | `orchestration:<typed_name>` | `src/ui.rs:9103` |
+    | Interactive orchestration | `orchestration:<typed_name>` | `orchestration_creator_string`, `src/ui.rs` |
     | Issue-dispatch | `issue-dispatch:<task_name>#<issue>` | `src/issue_dispatch_run.rs:402` |
 
     Both producers now run `sanitize_marker_creator` at the point of computation, not only inside `mark_worktree_owned`'s own marker write — the interactive path via `orchestration_creator_string`, the issue-dispatch path directly at `src/issue_dispatch_run.rs:402` (PR #215 fixup). Leaving one producer unsanitized before it reaches `AgentSpawnOptions::owner`/`SpawnRequest::owner` was the same divergence class this milestone's "one literal string reaches both consumers" invariant exists to prevent, just with lower-entropy input (a task name and issue number, not free TUI text). `sanitize_marker_creator` is a fixed point (`f(f(x)) == f(x)`), so the marker write's own call stays harmless on top.
@@ -186,7 +188,7 @@ That check was built to defeat a forged marker. It protects this case for free, 
 
     **The fix.** Inject `DOT_AGENT_DECK_WORKTREE_OWNER` into every pane, carrying **the exact creator string this orchestration stamps when it creates a worktree** — `orchestration:<typed_name>` interactively, the `issue-dispatch:<task>#<n>` string on the dispatch path. One source for both sides, so marker and filter cannot drift. Named for what it carries, not for one producer: calling it `…_ORCHESTRATION` would misdescribe it the moment a dispatched orchestration used it.
 
-    **Decided consequences.** A **dispatched** orchestration therefore also matches the worktree it is running in, because that is the same string — M3.0's promise must hold for dispatched work, which is the autonomous case this PRD exists to serve. And `orchestration:unknown` (`src/ui.rs:9105`) is a **sentinel, never an identity**: two nameless orchestrations would otherwise match each other's worktrees and each be handed the other's work, so it must be treated exactly like an absent variable — fail loudly.
+    **Decided consequences.** A **dispatched** orchestration therefore also matches the worktree it is running in, because that is the same string — M3.0's promise must hold for dispatched work, which is the autonomous case this PRD exists to serve. And `orchestration:unknown` (produced by `orchestration_creator_string`, `src/ui.rs`) is a **sentinel, never an identity**: two nameless orchestrations would otherwise match each other's worktrees and each be handed the other's work, so it must be treated exactly like an absent variable — fail loudly.
 
     **Settled by a read-only spike, 2026-08-10** (`.dot-agent-deck/findings-166-spike-owner-supply.md`):
 

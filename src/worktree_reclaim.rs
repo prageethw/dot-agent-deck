@@ -609,10 +609,11 @@ pub(crate) fn owner_of(repo_dir: &Path, worktree_path: &Path) -> Option<String> 
 /// distinguish it from a genuine, complete identity. Still not asking for
 /// atomic writes here: the consequence today is a display-only
 /// misattribution, not a removal-gate bypass (`owner` never feeds `decide`
-/// or `remove_worktree_dir`). But once an orchestration matches its own
-/// worktrees on this identity (the PRD's later milestones), a truncated
-/// read becomes a failed match rather than a cosmetic one, and that is the
-/// point at which an atomic write stops being optional.
+/// or `remove_worktree_dir`). **PR #215 (`worktree list --mine`) is the
+/// milestone that changed this**: an orchestration now matches its own
+/// worktrees on this identity, so a truncated read is a failed match rather
+/// than a cosmetic one, and atomic writes are no longer merely optional —
+/// tracked as fork **#218**.
 pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result<(), String> {
     let git_dir = resolve_git_dir(worktree_path).ok_or_else(|| {
         format!(
@@ -663,7 +664,7 @@ const MARKER_CREATOR_MAX_CHARS: usize = 200;
 /// idempotent), so `mark_worktree_owned` re-applying it to an
 /// already-sanitized value is harmless rather than a second, diverging
 /// derivation.
-pub(crate) fn sanitize_marker_creator(name: &str) -> String {
+pub fn sanitize_marker_creator(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter_map(|c| match c {

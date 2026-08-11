@@ -70,6 +70,17 @@ pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 /// --mine` reader in `main.rs` all reference this one symbol.
 pub const DOT_AGENT_DECK_WORKTREE_OWNER: &str = "DOT_AGENT_DECK_WORKTREE_OWNER";
 
+/// Fork #166 M2.4's `orchestration:unknown` sentinel — the value
+/// [`crate::ui`]'s `orchestration_creator_string` writes into
+/// [`DOT_AGENT_DECK_WORKTREE_OWNER`] (and the worktree marker) when no typed
+/// orchestration name was available at spawn. It is never a real identity:
+/// two nameless orchestrations sharing it would otherwise match each other's
+/// worktrees, so `worktree list --mine` in `main.rs` must refuse it exactly
+/// like an absent variable. Declared once, here, so the producer and the
+/// consumer — which live on opposite sides of the lib/bin split — cannot
+/// drift apart the way three independent literals did in PR #215 round 3.
+pub const ORCHESTRATION_UNKNOWN_SENTINEL: &str = "orchestration:unknown";
+
 /// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
 ///
 /// The daemon injects its OWN bound hook-socket path into every agent it
