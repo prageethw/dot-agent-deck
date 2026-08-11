@@ -890,6 +890,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the absent-variable case itself (covered by `027`); the plain sentinel case with no control character (covered by `028`).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/030 — `owner_disagreements` finds a row whose marker names the owner but whose independent `owned` resolution disagrees, and the shared `is_mine` predicate `--mine`'s retain also calls still excludes that row afterward (fork issue #221 — a definitive empty `--mine` answer must not silently swallow evidence of a disagreement).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/024`'s precedent — no fixture repo needed, `WorktreeReport` literals constructed directly.
+- **Agent:** none.
+- **Asserts:** given five `WorktreeReport`s — (a) `owner: Some("orch-x")` with `owned: false`, (b) a genuinely-owned row for the same owner, (c) a row owned by a different name, (d) `owned: false` under that different name, and (e) `owned: false` with `owner: None` — `owner_disagreements(&reports, "orch-x")` returns exactly (a)'s path, not (d) or (e), which discriminates against an owner-blind implementation that would otherwise still pass with only one `owned: false` row in the fixture. `is_mine` — the same predicate `run_worktree_list_cli`'s retain calls, in `src/worktree_reclaim.rs` — still excludes (a) when filtering for `"orch-x"`, pinning that surfacing the disagreement never relaxes the fail-closed filter against the actual production predicate rather than a hand-written copy of it. `format_disagreement_warning`'s output for (a) is also asserted verbatim, including the likely-cause/remedy clause.
+- **Does not assert:** the CLI's stderr text as printed through `run_worktree_list_cli` itself (only the `format_disagreement_warning` function it calls). The divergent `owned=false` + `owner=Some(..)` state is produced by a race between two independent `owned_git_dir` resolutions (`ownership_of` and `owner_of` each spawning their own `git rev-parse`s), so it cannot be staged deterministically through the real-binary `Fixture` that `001`–`007`/`009`/`010` use — constructing `WorktreeReport` values directly is the only deterministic seam.
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
