@@ -37,11 +37,20 @@ fn settings_path() -> PathBuf {
 /// Read `path` the LENIENT way: any read or parse failure collapses to an empty
 /// config. This is the pre-fix behavior, kept ONLY for [`uninstall_impl`] callers
 /// — a config the deck cannot parse is treated as having nothing to uninstall.
-/// Deliberately not fixed here (out of scope, "uninstall over malformed
-/// settings" is its own follow-up): uninstall never WRITES fabricated content
-/// over a file it couldn't read, it only fails to find rules to remove from it,
-/// so the blast radius is smaller than install's — but it is not zero, and
-/// widening this fix to uninstall is left for that follow-up.
+///
+/// Deliberately not fixed here (out of scope; tracked as audit finding M-4, its
+/// own follow-up). Review finding H3, corrected from an earlier version of this
+/// comment that claimed uninstall "never WRITES fabricated content over a file
+/// it couldn't read": that is false as written — [`uninstall`] and
+/// [`uninstall_from`] both call [`write_settings`] UNCONDITIONALLY on the value
+/// this returns, so a malformed settings.json IS truncated to `{}` and
+/// rewritten on every uninstall run, not merely skipped over. The blast radius
+/// is smaller than install's collapse only in that uninstall's own write is
+/// always `{}` regardless of what was there — nothing deck-authored is
+/// fabricated on top of the user's settings — but destroying the user's
+/// `model`/`env`/`permissions` entries is the same failure mode
+/// [`load_settings_or_refuse`] exists to prevent for install, just not yet
+/// applied here. M-4 is the follow-up to widen that fix to uninstall.
 fn read_settings_lenient(path: &Path) -> Value {
     match std::fs::read_to_string(path) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| json!({})),
@@ -77,7 +86,7 @@ fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
             }
         },
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(json!({})),
-        Err(_) => Ok(json!({})),
+        Err(e) => Err(e),
     }
 }
 
@@ -394,11 +403,32 @@ fn legacy_format_executable(command: &str) -> Option<&str> {
 /// Scoped to an exact basename match (never a fragment, never the installing
 /// binary's own name) so a user tool whose basename merely contains "deck"
 /// (test 012) or ends in the literal word "hook" (test 005) is never swept up.
+///
+/// Review finding H2: on Windows the installed binary carries the platform's
+/// executable suffix (`dot-agent-deck.exe`), so every real legacy Windows rule
+/// has a basename that never equals bare [`DEFAULT_BINARY_NAME`]. The
+/// comparison is therefore extension-aware — it also accepts
+/// `DEFAULT_BINARY_NAME` with [`std::env::consts::EXE_SUFFIX`] appended, rather
+/// than hardcoding `".exe"` — and, on Windows only, case-insensitive, since
+/// Windows filesystems are and a rule reading `Dot-Agent-Deck.EXE` is a
+/// legitimate legacy rule. `EXE_SUFFIX` is empty on Unix, so this is a no-op
+/// there: the comparison stays exact-basename, case-sensitive, exactly as
+/// before.
 fn is_legacy_deck_rule(command: &str) -> bool {
-    legacy_format_executable(command)
+    let Some(basename) = legacy_format_executable(command)
         .and_then(|exe| Path::new(exe).file_name())
         .and_then(|n| n.to_str())
-        == Some(DEFAULT_BINARY_NAME)
+    else {
+        return false;
+    };
+
+    if cfg!(windows) {
+        let with_suffix = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+        basename.eq_ignore_ascii_case(DEFAULT_BINARY_NAME)
+            || basename.eq_ignore_ascii_case(&with_suffix)
+    } else {
+        basename == DEFAULT_BINARY_NAME
+    }
 }
 
 /// Whether `existing` and `installing` (both already unquoted) name the SAME
@@ -465,20 +495,43 @@ fn rule_matches_binary(rule: &Value, binary_path: &str) -> bool {
 }
 
 /// Whether `rule` is a deck-owned rule sharing `binary_path`'s own basename
-/// whose executable no longer resolves on disk. `owned_command_executable`
-/// returns `None` for any command that is not deck-owned by either shape, so
-/// this can never prune a user's own hook — only a rule the deck itself would
-/// recognise as its own, and only when it looks like a stale sibling of the
-/// binary currently installing (same basename, different — now-dead — path).
-/// A deck rule for a genuinely different-looking binary is left to
+/// whose executable is POSITIVELY KNOWN to no longer exist on disk.
+/// `owned_command_executable` returns `None` for any command that is not
+/// deck-owned by either shape, so this can never prune a user's own hook —
+/// only a rule the deck itself would recognise as its own, and only when it
+/// looks like a stale sibling of the binary currently installing (same
+/// basename, different — now-dead — path). A deck rule for a genuinely
+/// different-looking binary is left to
 /// [`rule_matches_binary`]/[`is_legacy_deck_rule`] instead, since most of this
 /// file's own fixtures are fictional paths that were never on disk to begin
 /// with and must not be swept up just because they don't exist.
+///
+/// Review finding: pruning on a bare `exists()` conflates "confirmed absent"
+/// with "could not determine" — a working binary behind an unmounted volume,
+/// or a path this process cannot `stat` (permissions), both make `exists()`
+/// return `false` even though the executable is fine, and deleting a working
+/// user's hook is worse than leaving a stale rule. [`Path::try_exists`]
+/// distinguishes the two: it returns `Ok(false)` only when the OS positively
+/// reports the path missing (`NotFound`), and `Err` for every other stat
+/// failure (permission denied, an I/O error off an unmounted or stale mount).
+/// The prune now fires ONLY on `Ok(false)` — `Err` is treated the same as
+/// "exists", i.e. left alone, which is the fail-safe direction.
+///
+/// This does not fully resolve the underlying nondeterminism, and is not
+/// meant to: it relocates the same class of problem one layer down rather
+/// than removing it. `try_exists` still assumes `exe` is itself a bare
+/// filesystem path; a command whose "executable" token is actually an
+/// argv-prefixed wrapper invocation (not a literal path) will still report a
+/// confident-looking `Ok(false)` for a string that was never a real path to
+/// begin with, the same way [`executables_match`]'s `canonicalize` call can
+/// already fail to resolve a path for reasons unrelated to the binary's
+/// health. That gap is unchanged by this fix.
 fn rule_is_dead_deck_rule(rule: &Value, binary_path: &str) -> bool {
     let installing_basename = Path::new(binary_path).file_name();
     rule_commands(rule).any(|cmd| {
         owned_command_executable(cmd).is_some_and(|exe| {
-            Path::new(&exe).file_name() == installing_basename && !Path::new(&exe).exists()
+            Path::new(&exe).file_name() == installing_basename
+                && matches!(Path::new(&exe).try_exists(), Ok(false))
         })
     })
 }
@@ -552,26 +605,24 @@ pub fn auto_install_to(path: &PathBuf) {
     write_settings(path, &settings).expect("failed to write settings");
 }
 
-pub fn install() {
+/// `dot-agent-deck hooks install --agent claude-code` — the explicit, chatty
+/// install. Returns `Err` on a refused write (malformed settings.json left
+/// unchanged, or the write itself failing) so the CLI dispatch in `main.rs`
+/// reports failure on stderr AND exits non-zero, instead of a refusal
+/// silently reporting success to the shell — see [`crate::agent_registry`]'s
+/// `claude_install` adapter, which used to hardcode `Ok(())` here regardless
+/// of outcome.
+pub fn install() -> Result<(), String> {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "dot-agent-deck".into());
 
     let path = settings_path();
-    let mut settings = match load_settings_or_refuse(&path) {
-        Ok(settings) => settings,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return;
-        }
-    };
+    let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let (installed, skipped) = install_impl(&mut settings, &binary_path);
 
-    if let Err(e) = write_settings(&path, &settings) {
-        eprintln!("Error writing {}: {e}", path.display());
-        return;
-    }
+    write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
 
     if !installed.is_empty() {
         println!("Installed hooks: {}", installed.join(", "));
@@ -580,6 +631,7 @@ pub fn install() {
         println!("Already installed (skipped): {}", skipped.join(", "));
     }
     println!("Settings file: {}", path.display());
+    Ok(())
 }
 
 pub fn uninstall() {
