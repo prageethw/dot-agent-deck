@@ -33626,6 +33626,14 @@ mod tests {
         delivery_ids: Arc<std::sync::Mutex<Vec<String>>>,
         expected_sessions: Arc<std::sync::Mutex<Vec<Option<String>>>>,
         delivery_ledger: Arc<std::sync::Mutex<HashMap<String, crate::event::SendResult>>>,
+        // Fork #197 M4 (issue #194): the exact `text` payload of every
+        // `write_and_submit_to_pane_with_identity` invocation, recorded in
+        // call order regardless of ledger outcome — the observable write
+        // boundary a confirmation-retry's non-duplication guarantee must be
+        // asserted at. `orchestration/seed/014` reads this to confirm a
+        // retry sends a bare-CR (empty) payload, never the full prompt text
+        // a second time.
+        texts: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl SendResultPaneController {
@@ -33637,11 +33645,16 @@ mod tests {
                 delivery_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
                 expected_sessions: Arc::new(std::sync::Mutex::new(Vec::new())),
                 delivery_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                texts: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
         fn rpc_calls(&self) -> usize {
             self.rpc_calls.load(Ordering::SeqCst)
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.texts.lock().unwrap().clone()
         }
     }
 
@@ -33716,6 +33729,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(expected_session_id.map(str::to_string));
+            self.texts.lock().unwrap().push(text.to_string());
             // Issue #424 round 2: mirror `AgentPtyRegistry::admit_delivery` — a
             // `delivery_id` that already produced a CACHEABLE outcome (Applied /
             // Queued / Ambiguous) is REPLAYED here too, with no call to
@@ -35779,23 +35793,33 @@ mod tests {
         );
     }
 
-    /// Scenario: drive `deliver_orchestrator_prompt` across two frames — frame 1
-    /// performs a real `Applied` write (bytes land, `orchestration_
-    /// awaiting_confirmation` is set); frame 2 runs AFTER
-    /// `AUTOMATIC_PROMPT_DEADLINE` has elapsed with no confirming submit ever
-    /// observed. Pins that once a write has genuinely landed, the deadline
-    /// must finalize as DELIVERED-UNCONFIRMED (`role_statuses[0] == Working`,
-    /// matching what `main` reported for a single successful delivery, plus a
-    /// status message that says so) — not as a failure ("not
-    /// delivered"/"abandoned").
+    /// Scenario: drive `deliver_orchestrator_prompt` across THREE frames —
+    /// frame 1 performs a real `Applied` write (bytes land, `orchestration_
+    /// awaiting_confirmation` is set); frame 2, past `CONFIRMATION_GRACE_
+    /// PERIOD` with no confirmation observed, drives the one budgeted
+    /// confirmation-retry (fork #197 M4, fork #194's lost-write half — the
+    /// PRD's own "single most important thing for review and audit to
+    /// probe": a genuinely lost write must still get a REAL retry
+    /// genuinely ATTEMPTED, not silently skipped just to avoid duplicating
+    /// text, and that retry rides the decided bare-CR mechanism, not the
+    /// full prompt text again); frame 3 runs AFTER `AUTOMATIC_PROMPT_
+    /// DEADLINE` has elapsed with no confirming submit ever observed. Pins
+    /// that once a write has genuinely landed, the deadline must finalize
+    /// as DELIVERED-UNCONFIRMED (`role_statuses[0] == Working`, matching
+    /// what `main` reported for a single successful delivery, plus a status
+    /// message that says so) — not as a failure ("not delivered"/
+    /// "abandoned") — and that this honest reporting survives the M4
+    /// retry-mechanism change unchanged, even though a bare CR retrying a
+    /// write that was genuinely lost downstream can do nothing to rescue
+    /// it (an accepted, explicitly-recorded risk of submit-only, not a
+    /// defect this test exists to fix).
     #[spec("orchestration/seed/005")]
     #[test]
     fn orchestration_seed_005_deadline_after_landed_write_is_delivered_unconfirmed_not_abandoned() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
-            InjectedSendOutcome::Applied,
-            attempts.clone(),
-        ));
+        let pane_controller =
+            SendResultPaneController::new(InjectedSendOutcome::Applied, attempts.clone());
+        let pane: Arc<dyn PaneController> = Arc::new(pane_controller);
         let mut ui = default_ui();
         let tab_id: TabId = 428;
         let created = std::time::Instant::now();
@@ -35839,7 +35863,70 @@ mod tests {
             "precondition: the write must be awaiting confirmation, not finalized"
         );
 
-        // Frame 2, past the deadline: no confirming submit was ever observed.
+        // Frame 2, comfortably past `CONFIRMATION_GRACE_PERIOD` (well short
+        // of the deadline), still no confirmation observed for this pane —
+        // the one budgeted confirmation-retry fires. Fork #194's
+        // lost-write half: this retry must GENUINELY be attempted (an RPC
+        // must reach the pane double — a coder "fix" that stops retrying
+        // altogether once a write has landed would trivially satisfy
+        // `orchestration/seed/014`'s no-duplication assertion by regressing
+        // THIS one, silently reintroducing #424's original silent-loss bug)
+        // — and it must ride the decided bare-CR mechanism (fork#197 M4),
+        // never the full prompt text a second time.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            created + std::time::Duration::from_secs(5),
+            tab_id,
+            &["orch-pane-428".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        let texts_after_retry = pane
+            .as_any()
+            .downcast_ref::<SendResultPaneController>()
+            .expect("SendResultPaneController")
+            .texts();
+        assert_eq!(
+            texts_after_retry.len(),
+            2,
+            "a write that genuinely landed but is still unconfirmed past the \
+             grace period must get a REAL retry — a genuine second RPC must \
+             reach the pane, not be silently skipped just because sending \
+             text again would duplicate it: observed payloads={texts_after_retry:?} \
+             (expected exactly 2 — the original write plus one genuinely \
+             ATTEMPTED confirmation-retry; issue #194's PRD calls this the \
+             single most important thing for review and audit to probe, \
+             since satisfying `orchestration/seed/014`'s no-duplication \
+             requirement by skipping the retry entirely would regress this \
+             one — the exact silent-loss symptom upstream #424 exists to \
+             catch)"
+        );
+        assert_eq!(
+            texts_after_retry.get(1).map(String::as_str),
+            Some(""),
+            "the confirmation-retry must send a BARE submit (empty payload), \
+             never the full prompt text again — observed retry \
+             payload={:?} (expected \"\" — fork#197 M4's decided submit-only \
+             mechanism, the same requirement `orchestration/seed/014` pins \
+             directly; a bare CR against a write that was genuinely lost \
+             downstream does nothing, which is why frame 3 below still must \
+             finalize this cycle as delivered-unconfirmed, honestly, rather \
+             than silently claiming the retry rescued it)",
+            texts_after_retry.get(1)
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: the retry alone (a bare CR that confirms nothing \
+             on its own in this double, which never changes session status) \
+             must not finalize the cycle — it must still be awaiting \
+             confirmation heading into the deadline frame"
+        );
+
+        // Frame 3, past the deadline: no confirming submit was ever
+        // observed, not even after the confirmation-retry above.
         let past_deadline = created
             .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
             .expect("past-deadline instant");
@@ -36763,6 +36850,113 @@ mod tests {
              never differs from that baseline and TEXT can never fire — \
              fork #187's structurally-dead path, reproduced here on the \
              SECOND cycle rather than asserted by inspecting the predicate."
+        );
+    }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` across two frames —
+    /// frame 1 performs a genuine `Applied` write (bytes land, the tab
+    /// enters `orchestration_awaiting_confirmation`); frame 2 runs past
+    /// `CONFIRMATION_GRACE_PERIOD` with no confirmation ever observed, so
+    /// the one-retry-per-cycle budget fires. Pins fork #194's decided
+    /// mechanism (submit-only, PRD fork#197 M4): the confirmation-retry
+    /// must send a BARE submit — an empty payload riding
+    /// `write_and_submit_to_pane_with_identity`'s existing empty-text path
+    /// (`encode_pane_payload("")`, already pinned by
+    /// `encode_pane_payload_empty`) — never the full prompt text a second
+    /// time into a composer that already holds it. Asserted at the
+    /// observable write boundary (the exact payload `SendResultPaneController`
+    /// receives on each call, via its new `texts()` accessor), not on any
+    /// internal predicate shape, per the task's own instruction. Expected
+    /// RED: today's code always resends `orchestrator_prompt`'s full text
+    /// on a confirmation-retry (`src/ui.rs`'s `let prompt_text = ...`
+    /// above `write_and_submit_to_pane_with_identity`), which is exactly
+    /// issue #194's observed duplication.
+    #[spec("orchestration/seed/014")]
+    #[test]
+    fn orchestration_seed_014_confirmation_retry_sends_bare_submit_not_prompt_text_again() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane_controller =
+            SendResultPaneController::new(InjectedSendOutcome::Applied, attempts.clone());
+        let pane: Arc<dyn PaneController> = Arc::new(pane_controller);
+        let mut ui = default_ui();
+        let tab_id: TabId = 437;
+        let write_time = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, write_time);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            write_time
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-437".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-437".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-437".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+
+        // Frame 1: the original write genuinely lands.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time,
+            tab_id,
+            &["orch-pane-437".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: frame 1's write must land and await confirmation"
+        );
+
+        // Frame 2: comfortably past the grace period, still no confirmation
+        // observed for this pane — the one budgeted confirmation-retry
+        // fires.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time + std::time::Duration::from_secs(5),
+            tab_id,
+            &["orch-pane-437".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        let texts = pane
+            .as_any()
+            .downcast_ref::<SendResultPaneController>()
+            .expect("SendResultPaneController")
+            .texts();
+
+        assert_eq!(
+            texts.len(),
+            2,
+            "precondition: exactly one original write and one confirmation-retry \
+             must have reached the pane double; observed payloads={texts:?}"
+        );
+        assert_eq!(
+            texts[0], "orchestrator prompt",
+            "precondition: the original write must carry the full prompt text"
+        );
+        assert_eq!(
+            texts[1], "",
+            "a confirmation-retry after a write that already LANDED must send a \
+             BARE submit (empty payload) — never the full prompt text a second \
+             time into a composer that already holds it: observed retry \
+             payload={:?} (expected \"\" — issue #194's decided mechanism, \
+             fork#197 M4: `Applied` already means the bytes reached the PTY, \
+             so re-sending the text can only duplicate what the agent will \
+             see when it submits)",
+            texts[1]
         );
     }
 }
