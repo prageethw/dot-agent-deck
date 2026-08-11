@@ -21,19 +21,20 @@
 //! arriving seconds after a separate write — a different case from the CR
 //! fused to its own payload, which is what works today.
 //!
-//! No attempt is made to artificially force the retry path (no hook for
-//! shrinking `CONFIRMATION_GRACE_PERIOD` exists, and adding one is a
-//! production-code change outside this task's remit). The assertion is
-//! written at the level of the OBSERVABLE CONTRACT instead, so it holds
-//! whether or not a retry actually fires this run: the spawn-time pointer
-//! must reach the agent through exactly ONE native prompt-submission
-//! event, and that event's `user_prompt` must contain the pointer text
-//! exactly ONCE — never concatenated with itself, issue #194's exact
-//! observed symptom (a confirmation-retry re-writing the full prompt text
-//! into a composer that already held it, so one CR submits BOTH copies as
-//! one message). A real boot that is slower than `CONFIRMATION_GRACE_
-//! PERIOD` (2s) — exactly what #194's own incident report describes —
-//! naturally exercises the retry path with no engineering required.
+//! Fork#197 M4 Part 2 shrinks `CONFIRMATION_GRACE_PERIOD` (2s production
+//! default) to `CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS` below via a
+//! test-only, `cfg(any(test, debug_assertions))`-gated hook
+//! (`confirmation_grace_period()`, `src/ui.rs`) set through
+//! `TuiDeckBuilder::with_env`, so the retry path fires DETERMINISTICALLY
+//! on every run rather than only opportunistically when a real boot
+//! happens to outrun the production grace period. The assertion is still
+//! written at the level of the OBSERVABLE CONTRACT, so it would hold
+//! either way: the spawn-time pointer must reach the agent through
+//! exactly ONE native prompt-submission event, and that event's
+//! `user_prompt` must contain the pointer text exactly ONCE — never
+//! concatenated with itself, issue #194's exact observed symptom (a
+//! confirmation-retry re-writing the full prompt text into a composer
+//! that already held it, so one CR submits BOTH copies as one message).
 //!
 //! Cost note (Decision 23): one short interactive turn per agent. Both
 //! cases are local-only (Decision 8 / rule 5 exception (a)): gated on the
@@ -42,6 +43,14 @@
 //! to exercise it — it self-skips in CI. Flaky-tolerant (real LLM + real
 //! network) per rule 4 — run once, never looped. No `[reel]` marker: this
 //! is a regression proof, not a showcase.
+//!
+//! PRD fork#197 M4 Part 2: both cases set
+//! `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` (see
+//! `CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS` below) on the spawned binary via
+//! `TuiDeckBuilder::with_env`, so the confirmation-retry this file exists
+//! to prove non-duplicating fires DETERMINISTICALLY on every run — not
+//! only opportunistically when a real boot happens to outrun the 2s
+//! production default (`CONFIRMATION_GRACE_PERIOD`, `src/ui.rs`).
 
 mod common;
 
@@ -67,6 +76,29 @@ const OPENCODE_SENTINEL: &str = "ORCH-SEED-015-RETRY-OPENCODE-OK-3c58de";
 /// with `ORCHESTRATOR_CONTEXT_POINTER` there, same as `seed/011`'s
 /// `DELIVERED_POINTER`.
 const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
+
+/// PRD fork#197 M4 Part 2: override for `confirmation_grace_period()`
+/// (`src/ui.rs`), forwarded to the spawned binary via
+/// `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS`. Chosen deliberately,
+/// not copied from a suggestion:
+///
+/// - Above `SUBMIT_DELAY` (150ms, `src/pane_input.rs`, tuned against
+///   claude): the ORIGINAL write's own text-then-`\r` sequence already
+///   completes — including that internal delay — before
+///   `AwaitingConfirmation::since` is even recorded, so this value's
+///   window never overlaps the original write finishing.
+/// - Below the fixed 500ms confirmation-retry backoff floor
+///   (`send_retry_delay(1)`, `src/ui.rs`) that `schedule_send_retry` sets
+///   after every landed write: the retry is ALSO gated on that backoff
+///   regardless of this override, so anything at or below it makes 500ms
+///   the binding constraint either way — never this constant.
+/// - Far below the real per-turn latency of a genuine LLM call (network +
+///   inference for a first tool call/response is on the order of
+///   1s+): the confirmation hook event a genuinely-fast agent would
+///   produce cannot plausibly land before this elapses, so the retry
+///   fires DETERMINISTICALLY rather than racing that event — the whole
+///   point of wiring this in (fork#197 M4).
+const CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS: &str = "250";
 
 struct RealRetryCase<'a> {
     agent_name: &'a str,
@@ -201,7 +233,7 @@ fn run_real_seed_retry(deck: TuiDeck, case: RealRetryCase<'_>) {
     );
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path with no test intervention (including any confirmation-retry that the real boot timing genuinely triggers), and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — never duplicated by a confirmation-retry (fork #194, fork#197 M4's decided submit-only mechanism) — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process, with the confirmation-retry grace period shrunk to a deterministic 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` so the confirmation-retry reliably fires, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — never duplicated by a confirmation-retry (fork #194, fork#197 M4's decided submit-only mechanism) — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
 #[spec("orchestration/seed/015")]
 #[test]
 fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_prompt() {
@@ -213,6 +245,10 @@ fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_pr
         .with_pty_size(120, 40)
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
+        .with_env(
+            "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS",
+            CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS,
+        )
         .launch_with_fixture("minimal");
 
     run_real_seed_retry(
@@ -227,7 +263,7 @@ fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_pr
     );
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive OpenCode process on a cheap mini model, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path with no test intervention, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — the user-decided coverage gap this PRD's probe surfaced: CR-as-submit is documented only for claude/codex, and nothing documents how OpenCode treats a standalone CR arriving after a separate write — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive OpenCode process on a cheap mini model, with the confirmation-retry grace period shrunk to a deterministic 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` so the confirmation-retry reliably fires, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — the user-decided coverage gap this PRD's probe surfaced: CR-as-submit is documented only for claude/codex, and nothing documents how OpenCode treats a standalone CR arriving after a separate write — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
 #[spec("orchestration/seed/016")]
 #[test]
 fn orchestration_seed_016_real_opencode_confirmation_retry_never_duplicates_the_prompt() {
@@ -236,6 +272,10 @@ fn orchestration_seed_016_real_opencode_confirmation_retry_never_duplicates_the_
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .with_imported_opencode_credentials()
+        .with_env(
+            "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS",
+            CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS,
+        )
         .launch_with_fixture("minimal");
 
     run_real_seed_retry(
