@@ -1697,21 +1697,17 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
 
     let owner_filter = if mine {
         match std::env::var(DOT_AGENT_DECK_WORKTREE_OWNER) {
-            Ok(v) if v.trim() == ORCHESTRATION_UNKNOWN_SENTINEL => {
-                eprintln!(
-                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set to the \
-                     `{ORCHESTRATION_UNKNOWN_SENTINEL}` sentinel, which is never a real \
-                     identity -- refusing rather than matching another nameless orchestration's \
-                     worktrees"
-                );
-                return ExitCode::FAILURE;
-            }
             // PR #215 round-3 fixup (reviewer F4): an exported-but-empty
             // (or whitespace-only) variable is exactly as meaningless as an
             // absent one -- `std::env::var` returns `Ok("")` for it, so
             // without this arm it fell through to "use it as the filter"
             // and produced a definitive-looking `no worktrees owned by `
-            // with a blank subject and exit 0.
+            // with a blank subject and exit 0. This must run on the RAW
+            // value and precede sanitization (round-4 fixup, R4-1):
+            // `sanitize_marker_creator("")` returns its `"unknown"` floor,
+            // not an empty string, so sanitizing first would let an empty
+            // variable slip past this guard as a non-empty, non-sentinel
+            // value.
             Ok(v) if v.trim().is_empty() => {
                 eprintln!(
                     "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set but empty -- \
@@ -1720,7 +1716,28 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            Ok(v) => Some(v),
+            // Round-4 fixup (R4-1): compare the SANITIZED value against the
+            // sentinel, not the merely-trimmed one -- `trim` strips
+            // whitespace, not control characters, so a value like
+            // `"orchestration:unknown\u{7}"` used to trim to itself, fail
+            // this check, and reach the filter as an unmatchable near-miss
+            // of the sentinel instead of being refused by it.
+            Ok(v) if sanitize_marker_creator(&v) == ORCHESTRATION_UNKNOWN_SENTINEL => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set to the \
+                     `{ORCHESTRATION_UNKNOWN_SENTINEL}` sentinel, which is never a real \
+                     identity -- refusing rather than matching another nameless orchestration's \
+                     worktrees"
+                );
+                return ExitCode::FAILURE;
+            }
+            // Round-4 fixup (R4-1): filter on the SAME sanitized value used
+            // above, not the raw one -- `read_marker_owner` always
+            // sanitizes the on-disk marker, so a raw filter value could
+            // never match a legitimate identity that carried stray
+            // whitespace, and would silently report "no worktrees owned by
+            // ..." for an identity that in fact owns one.
+            Ok(v) => Some(sanitize_marker_creator(&v)),
             Err(_) => {
                 eprintln!(
                     "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is not set -- cannot \
@@ -1787,9 +1804,14 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             // round 1 verified "the failure messages never print the
             // variable's value" as load-bearing, and printing it raw
             // reintroduced that terminal-escape / forged-line sink.
-            // Sanitizing (rather than dropping the value) also makes the
-            // printed string equal to what the OWNER column shows.
-            println!("no worktrees owned by {}", sanitize_marker_creator(owner));
+            // Round-4 fixup (R4-1): `owner` is now already sanitized at
+            // construction (the single `Ok(v) => Some(sanitize_marker_creator(&v))`
+            // arm above), so printing it directly satisfies M1 by
+            // construction and, unlike a second `sanitize_marker_creator`
+            // call here, guarantees this is the exact string the filter
+            // compared against -- not a second, possibly-divergent
+            // normalization of it.
+            println!("no worktrees owned by {owner}");
             return ExitCode::SUCCESS;
         }
         print!("{}", format_list_human(&reports));

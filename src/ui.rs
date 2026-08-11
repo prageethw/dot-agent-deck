@@ -10160,14 +10160,15 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// characters now sanitize to the identical string — tracked as fork
 /// **#222**.
 fn orchestration_creator_string(typed_name: &str) -> String {
+    const ORCHESTRATION_PREFIX: &str = "orchestration:";
     let raw = if typed_name.is_empty() {
         crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string()
     } else {
-        format!("orchestration:{typed_name}")
+        format!("{ORCHESTRATION_PREFIX}{typed_name}")
     };
     let sanitized = crate::worktree_reclaim::sanitize_marker_creator(&raw);
     if sanitized
-        .strip_prefix("orchestration:")
+        .strip_prefix(ORCHESTRATION_PREFIX)
         .is_some_and(str::is_empty)
     {
         return crate::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL.to_string();

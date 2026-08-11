@@ -883,11 +883,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the absent-variable case itself (covered by `027`); any handling of a non-sentinel, genuinely-set owner (covered by `025`/`026`); an exported-but-empty value (covered by `029`).
 - **Platform coverage:** mac+linux.
 
-##### worktree/reclaim/029 — With `DOT_AGENT_DECK_WORKTREE_OWNER` exported but empty (or whitespace-only), `--mine` refuses exactly as it does when the variable is absent — an empty identity is exactly as meaningless as an absent one (fork #166 M3.0, PR #215 round-3 reviewer F4).
-- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly set to a whitespace-only string.
-- **Agent:** none (one owned worktree present, so a silent "use the empty string as the filter" failure mode is distinguishable from the correct refusal).
-- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the output does not name the worktree present in the fixture (rules out the "list everything" failure mode).
-- **Does not assert:** the absent-variable case itself (covered by `027`); the sentinel case (covered by `028`).
+##### worktree/reclaim/029 — With `DOT_AGENT_DECK_WORKTREE_OWNER` exported but literal-empty (`Some("")`) or whitespace-only, `--mine` refuses exactly as it does when the variable is absent — an empty identity is exactly as meaningless as an absent one; conversely a legitimate identity carrying stray whitespace still matches once both sides are sanitized identically, and the sentinel is still refused with a trailing control character (fork #166 M3.0, PR #215 round-3 reviewer F4, round-4 R4-1).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly set to a literal-empty string, a whitespace-only string, a whitespace-padded legitimate identity, and the sentinel plus a trailing control character, in turn.
+- **Agent:** none (one owned worktree present, so a silent "use the value as the filter" failure mode is distinguishable from the correct refusal, and a genuine match is distinguishable from a silent non-match).
+- **Asserts:** for `""` and `"   "`, the process exits non-zero, the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`, and the output does not name the worktree present in the fixture (rules out the "list everything" failure mode); for `" orchestration:someone "` against a marker of `orchestration:someone`, the process exits zero and names the worktree (rules out the raw-vs-sanitized filter mismatch, round-4 R4-1); for the sentinel plus a trailing control character, the process exits non-zero and does not name the fixture's worktree (rules out `trim` alone being mistaken for full sanitization).
+- **Does not assert:** the absent-variable case itself (covered by `027`); the plain sentinel case with no control character (covered by `028`).
 - **Platform coverage:** mac+linux.
 
 ### Prompts

@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
 use dot_agent_deck::agent_pty::ORCHESTRATION_UNKNOWN_SENTINEL;
 use spec::spec;
 
@@ -1405,15 +1406,23 @@ fn worktree_reclaim_028_mine_refuses_the_unknown_sentinel() {
     );
 }
 
-/// Scenario: With `DOT_AGENT_DECK_WORKTREE_OWNER` exported but set to an
-/// empty (or whitespace-only) string -- an ordinary way to reach this via a
-/// wrapper script's `export VAR=` or an unset shell variable interpolated
-/// into `VAR="$OTHER"` -- `worktree list --mine` must refuse exactly as it
-/// does when the variable is absent entirely (`027`). `std::env::var`
-/// returns `Ok("")` for this case, so without an explicit refusal it falls
-/// into the "use it as the filter" arm and produces a definitive-looking
-/// "no worktrees owned by" with a blank subject and exit 0 -- a wrong
-/// answer arriving silently (fork #166 M3.0, PR #215 round-3 reviewer F4).
+/// Scenario: With `DOT_AGENT_DECK_WORKTREE_OWNER` exported but set to a
+/// literal empty (`Some("")`) or whitespace-only string -- an ordinary way
+/// to reach this via a wrapper script's `export VAR=` or an unset shell
+/// variable interpolated into `VAR="$OTHER"` -- `worktree list --mine` must
+/// refuse exactly as it does when the variable is absent entirely (`027`).
+/// `std::env::var` returns `Ok("")` for this case, so without an explicit
+/// refusal it falls into the "use it as the filter" arm and produces a
+/// definitive-looking "no worktrees owned by" with a blank subject and exit
+/// 0 -- a wrong answer arriving silently (fork #166 M3.0, PR #215 round-3
+/// reviewer F4). It must also do the opposite correctly: a legitimate
+/// identity carrying stray leading/trailing whitespace must still MATCH the
+/// marker once both sides are sanitized identically, and the
+/// `orchestration:unknown` sentinel must still be refused even carrying a
+/// trailing control character that `trim` alone would not strip (round-4
+/// fixup R4-1 -- before it, the filter used the raw env value while the
+/// marker was always sanitized, so the padded identity matched nothing and
+/// the control-suffixed sentinel slipped past the refusal).
 #[spec("worktree/reclaim/029")]
 #[test]
 #[cfg(unix)]
@@ -1423,22 +1432,67 @@ fn worktree_reclaim_029_mine_fails_loudly_when_owner_env_empty() {
     fx.set_pr_state("feat/someones", "OPEN");
     fx.mark_owned_with_creator(&wt, "orchestration:someone");
 
-    let out = fx.run_with_owner(&["worktree", "list", "--mine"], Some("   "));
-    assert!(
-        !out.status.success(),
-        "`--mine` with DOT_AGENT_DECK_WORKTREE_OWNER set to an empty/whitespace-only value must \
-         fail loudly (non-zero exit), never succeed by silently filtering on a value that can \
-         never match anything; got {:?} out={}",
-        out.status,
-        combined(&out)
+    for empty in ["   ", ""] {
+        let out = fx.run_with_owner(&["worktree", "list", "--mine"], Some(empty));
+        assert!(
+            !out.status.success(),
+            "`--mine` with DOT_AGENT_DECK_WORKTREE_OWNER set to {empty:?} must fail loudly \
+             (non-zero exit), never succeed by silently filtering on a value that can never \
+             match anything; got {:?} out={}",
+            out.status,
+            combined(&out)
+        );
+        let text = combined(&out);
+        assert!(
+            text.contains("DOT_AGENT_DECK_WORKTREE_OWNER"),
+            "the failure must name the empty variable so the caller knows what to supply; \
+             got:\n{text}"
+        );
+        assert!(
+            !text.contains("wt-someones"),
+            "an empty owner identity must never be treated as \"list everything\" -- got:\n{text}"
+        );
+    }
+
+    // Round-4 fixup (R4-1): a legitimate identity carrying stray whitespace
+    // must still match the (always-sanitized) marker -- the raw filter used
+    // to make this unmatchable even though the worktree genuinely is owned
+    // by it.
+    let padded = fx.run_with_owner(
+        &["worktree", "list", "--mine"],
+        Some(" orchestration:someone "),
     );
-    let text = combined(&out);
     assert!(
-        text.contains("DOT_AGENT_DECK_WORKTREE_OWNER"),
-        "the failure must name the empty variable so the caller knows what to supply; got:\n{text}"
+        padded.status.success(),
+        "a stray-whitespace identity that matches the marker once sanitized must be treated as \
+         a match, not silently filtered to nothing; got {:?} out={}",
+        padded.status,
+        combined(&padded)
     );
     assert!(
-        !text.contains("wt-someones"),
-        "an empty owner identity must never be treated as \"list everything\" -- got:\n{text}"
+        combined(&padded).contains("wt-someones"),
+        "the padded identity must name the worktree it owns; got:\n{}",
+        combined(&padded)
+    );
+
+    // Round-4 fixup (R4-1): the sentinel refusal must fire on the SANITIZED
+    // value, not the merely-trimmed one -- a trailing control character
+    // survives `trim` but not `sanitize_marker_creator`.
+    let sentinel_with_control = format!("{ORCHESTRATION_UNKNOWN_SENTINEL}\u{7}");
+    let control_out = fx.run_with_owner(
+        &["worktree", "list", "--mine"],
+        Some(&sentinel_with_control),
+    );
+    assert!(
+        !control_out.status.success(),
+        "the sentinel with a trailing control character must still be refused, not treated as \
+         an ordinary near-miss identity; got {:?} out={}",
+        control_out.status,
+        combined(&control_out)
+    );
+    assert!(
+        !combined(&control_out).contains("wt-someones"),
+        "must never fall through to listing the fixture's worktree; got:\n{}",
+        combined(&control_out)
     );
 }

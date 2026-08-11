@@ -654,10 +654,11 @@ pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result
 /// after the prefix.
 const MARKER_CREATOR_MAX_CHARS: usize = 200;
 
-/// `pub(crate)`, not private: PR #215 fixup (reviewer F3 / auditor L2) calls
-/// this from `ui.rs::orchestration_creator_string` too, so the marker write
-/// and the `DOT_AGENT_DECK_WORKTREE_OWNER` env var are the same sanitized
-/// value rather than one raw and one sanitized. This function is a fixed
+/// `pub`, not `pub(crate)`: PR #215 fixup (auditor M1) calls this from
+/// `main.rs::run_worktree_list_cli` too, a separate compilation unit
+/// `pub(crate)` cannot reach, so the marker write and the
+/// `DOT_AGENT_DECK_WORKTREE_OWNER` env var are the same sanitized value
+/// rather than one raw and one sanitized. This function is a fixed
 /// point (`f(f(x)) == f(x)` for every input — verified: the truncation
 /// branch drops exactly the trailing `…` it just appended before
 /// re-appending an identical one, and every other transform is already
