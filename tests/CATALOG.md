@@ -897,6 +897,64 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the CLI's stderr text as printed through `run_worktree_list_cli` itself (only the `format_disagreement_warning` function it calls). The divergent `owned=false` + `owner=Some(..)` state is produced by a race between two independent `owned_git_dir` resolutions (`ownership_of` and `owner_of` each spawning their own `git rev-parse`s), so it cannot be staged deterministically through the real-binary `Fixture` that `001`–`007`/`009`/`010` use — constructing `WorktreeReport` values directly is the only deterministic seam.
 - **Platform coverage:** mac+linux.
 
+#### issue/claim
+
+##### issue/claim/001 — `dot-agent-deck issue claim` refuses when the issue is already held by a DIFFERENT identity, exits non-zero, writes nothing, and names the holder and its host (PRD fork#235 — the centrepiece lock).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck issue claim` CLI as a subprocess against real git repos in a tempdir, with a synthetic STATEFUL `gh` on `PATH` — `issue comment`/`issue edit --add-label`/`--add-assignee`/`--remove-assignee` persist into per-issue files and `issue view --json ...` reads them back, so a sequential claim-then-claim exercises the same read-your-own-writes loop as real GitHub; no PTY, no daemon, no LLM, no `e2e` feature gate).
+- **Agent:** none (two synthetic orchestration identities, each a real linked worktree carrying the `dot-agent-deck-owner` marker fork #166/#425 writes, run with `DOT_AGENT_DECK_PANE_ID` set).
+- **Asserts:** orchestration A claims the issue; orchestration B's later claim on the same issue exits non-zero; no `gh` call attributable to B's run adds a label, assignee, or comment; B's stderr names A's typed name and the local host.
+- **Does not assert:** the `--takeover` override path (`002`/`003`); the labelled-with-no-comment case (`004`); human claimants (`005`).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/002 — `--takeover` alone still refuses: nothing written, the message instructs `--confirm-stopped` (PRD fork#235 — the two-step override is deliberate friction).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`).
+- **Agent:** none (as `001`; B's second claim adds `--takeover` with no `--confirm-stopped`).
+- **Asserts:** B's `--takeover`-only claim still exits non-zero, writes nothing (no label/assignee/comment call), and its output instructs the caller to re-run with `--confirm-stopped` — an agent must not be able to satisfy the override in the same breath it discovers the conflict.
+- **Does not assert:** the successful takeover path once `--confirm-stopped` is added (`003`).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/003 — `--takeover --confirm-stopped` succeeds: the comment log holds both claims in order, the newest still starts with `Claimed by ` and names who it took over from, and the assignee ends up as the new claimant's human ONLY (PRD fork#235).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`).
+- **Agent:** none (as `001`; B's second claim adds both `--takeover` and `--confirm-stopped`).
+- **Asserts:** B's takeover claim succeeds; the recorded `gh` comment calls for the issue number at least two (A's original plus B's); the LATEST comment call still contains the literal `Claimed by ` prefix (`parse_claim_comment` finds claims via `.rfind` on it, so any other wording would be invisible and the system would still believe A holds the issue) and names A in its tail; the final persisted assignee list is exactly B's resolved login, not A's.
+- **Does not assert:** the exact digest/host formatting inside the identity string; the `--takeover`-alone refusal (`002`).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/004 — An issue labelled `in-progress` with NO discoverable claim comment (the hand-typed CLAUDE.md rule 14 claim) refuses — identity unknown (PRD fork#235).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the label is seeded directly into the stub's files, bypassing `gh` entirely, standing in for a label a human or external tool applied by hand).
+- **Agent:** none.
+- **Asserts:** the claim exits non-zero and no `gh` call adds a label, assignee, or comment.
+- **Does not assert:** the exact refusal wording; the read-back mechanism (per-issue `gh issue view` vs. a list-embedded field) — either shape the coder chooses is served identically by the stub.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/005 — With no `DOT_AGENT_DECK_PANE_ID`, a claim resolves as `human:<login>@<host>`; a later orchestration claim on the same issue is refused, naming the human (PRD fork#235).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the first claim runs with `DOT_AGENT_DECK_PANE_ID` absent from the environment).
+- **Agent:** none.
+- **Asserts:** the human's claim is followed by an orchestration's claim on the same issue, which exits non-zero and whose message names the human's login.
+- **Does not assert:** the exact `human:<login>@<host>` string formatting; the no-marker-downgrade case (`006`), which is the inverse direction (an orchestration pane that must NOT be read as human).
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/006 — `DOT_AGENT_DECK_PANE_ID` set but the owner marker ABSENT refuses, and specifically does NOT fall back to `human:<login>` (PRD fork#235 — `write_owner_marker` is best-effort, so a missing marker must never be read as "this is a human").
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the worktree is deliberately never marked owned).
+- **Agent:** none.
+- **Asserts:** the claim exits non-zero; the output does not contain the `human:<login>` form for the login the stub would have resolved; no `gh` call adds a label, assignee, or comment. Every agent on one deck whose marker write failed would otherwise resolve to the identical `human:<login>` identity, and the lock would read "held by me" and wave them all through while appearing to work.
+- **Does not assert:** the exact refusal wording.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/007 — Two orchestrations sharing the exact SAME typed name but running from DIFFERENT worktrees: the second is REFUSED, never treated as an idempotent self-refresh (PRD fork#235 — the regression guard against "simplifying" identity back to a bare name; fork #201 records name uniqueness as only advisory and states "this is the case #74 is actually about").
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; two DISTINCT linked worktrees, each marked owned by the identical orchestration name).
+- **Agent:** none.
+- **Asserts:** the first same-named orchestration's claim is followed by the second's, from a different worktree; the second exits non-zero; exactly one comment call is ever recorded for the issue (the first's) — a self-refresh would post, or attempt, a second.
+- **Does not assert:** fork #201 itself (name-collision UI advisory) — this test proves the LOCK stays correct despite it, not that #201 is fixed.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/008 — The claim comment carries a worktree DIGEST, never a raw filesystem path — no `/Users/`, no `/home/` (PRD fork#235 — a claim comment is public and a raw path leaks the OS username and local layout).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the worktree's absolute path is deliberately nested under literal `Users`/`home` path segments, regardless of the host OS/CI runner, so a leaking implementation is caught deterministically).
+- **Agent:** none.
+- **Asserts:** the first, unlabelled claim succeeds; the posted comment body contains neither `/Users/` nor `/home/`.
+- **Does not assert:** the exact digest algorithm or length beyond the PRD's "first 8 hex of a digest" description; the identity string's overall format.
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
@@ -4199,12 +4257,12 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/010 — A successful dispatch writes the `in-progress` label on the issue and posts exactly one claim comment naming the claiming task, and the label write genuinely SUCCEEDS when the label already exists on the repo (PRD #421 M1.0/M1.1).
-- **Layer:** L2 (as `scheduler/dispatch/001`). The stub `gh` records every invocation verbatim to `$GHSTUB_DIR/gh-calls.log` (before any argv parsing), and unconditionally accepts `issue comment` calls — no canned response is needed since the tests assert on WHAT `gh` was asked to do, not on read-back state. `issue edit --add-label <name>` only succeeds when `<name>` is already in the repo's known label set (PRD #421 review fix — mirrors real `gh`'s label-name-to-ID resolution), tracked via `GhStub::seed_labels`/`gh label create`; this fixture pre-seeds `in-progress` so the claim write succeeds cleanly.
-- **Agent:** none (run-now; observes the dispatched orchestrator agent + the stub's recorded `gh` invocations + `GhStub::label_applied`).
-- **Asserts:** after a successful dispatch (worktree + orchestrator agent present, as in `scheduler/dispatch/001`), the recorded `gh` calls include an `issue edit ... --add-label in-progress` for the issue AND an `issue comment` whose body names the claiming task (`ScheduledTask.name`, the scheduler-side claimant per PRD #421's two-write-point split); because the fixture pre-seeds `in-progress`, the add-label call must have actually SUCCEEDED (`GhStub::label_applied`), not merely been attempted — see `scheduler/dispatch/020` for the unseeded/failure counterpart.
-- **Does not assert:** the exact claimant-comment format (instance id / host / timestamp) beyond the task name — those fields are the coder's implementation choice, not dictated here; the human-orchestration (`Instance{id,name}`) claimant write point, out of this task's scope.
-- **Note:** M1.0/M1.1 landed — `claim_issue` writes the `in-progress` label via `gh issue edit --add-label` and posts the claim comment via `gh issue comment`; GREEN today.
+##### scheduler/dispatch/010 — A successful dispatch writes the `in-progress` label on the issue and posts exactly one claim comment naming the claiming task, and the label write genuinely SUCCEEDS when the label already exists on the repo (PRD #421 M1.0/M1.1); PRD fork#235 M2 extends this to also assert the assignee is written, with the pre-existing single-agent comment wording/assertions left byte-identical.
+- **Layer:** L2 (as `scheduler/dispatch/001`). The stub `gh` records every invocation verbatim to `$GHSTUB_DIR/gh-calls.log` (before any argv parsing), and unconditionally accepts `issue comment` calls — no canned response is needed since the tests assert on WHAT `gh` was asked to do, not on read-back state. `issue edit --add-label <name>` only succeeds when `<name>` is already in the repo's known label set (PRD #421 review fix — mirrors real `gh`'s label-name-to-ID resolution), tracked via `GhStub::seed_labels`/`gh label create`; this fixture pre-seeds `in-progress` so the claim write succeeds cleanly. PRD fork#235 M2: the stub also tracks `--add-assignee`/`--remove-assignee` writes per issue (`GhStub::assignees`).
+- **Agent:** none (run-now; observes the dispatched orchestrator agent + the stub's recorded `gh` invocations + `GhStub::label_applied` + `GhStub::assignees`).
+- **Asserts:** after a successful dispatch (worktree + orchestrator agent present, as in `scheduler/dispatch/001`), the recorded `gh` calls include an `issue edit ... --add-label in-progress` for the issue AND an `issue comment` whose body names the claiming task (`ScheduledTask.name`, the scheduler-side claimant per PRD #421's two-write-point split); because the fixture pre-seeds `in-progress`, the add-label call must have actually SUCCEEDED (`GhStub::label_applied`), not merely been attempted — see `scheduler/dispatch/020` for the unseeded/failure counterpart. PRD fork#235 M2 additionally asserts a non-empty assignee list is recorded for the issue.
+- **Does not assert:** the exact claimant-comment format (instance id / host / timestamp) beyond the task name — those fields are the coder's implementation choice, not dictated here; the human-orchestration (`Instance{id,name}`) claimant write point, out of this task's scope; which of the claiming task or the bound orchestration's own name is used (this fixture is single-agent, so the two are the same distinction `scheduler/dispatch/021` exists to pin).
+- **Note:** M1.0/M1.1 landed — `claim_issue` writes the `in-progress` label via `gh issue edit --add-label` and posts the claim comment via `gh issue comment`; GREEN today for the label/comment assertions. The new assignee assertion (PRD fork#235 M2) is RED until `claim_issue` also writes `--add-assignee`/`--remove-assignee`.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/011 — A fired `issue_dispatch` task surfaces its per-issue card LIVE on an already-attached TUI — the user-visible showcase (and demo-reel clip) the headless `scheduler/dispatch/001-009` family can't observe (PRD #120 M2.3 live surfacing).
@@ -4281,6 +4339,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** the dispatch succeeds as normal (worktree + orchestrator agent present, as in `scheduler/dispatch/001`); an `issue edit ... --add-label in-progress` call is attempted for the issue; and — the actual defect this test pins — the add-label call SUCCEEDS (`GhStub::label_applied` reports it applied), which only happens if `in-progress` is ensured to exist first.
 - **Does not assert:** the claim-comment write (covered by `scheduler/dispatch/010`); the read-back skip signal once labelled (covered by `scheduler/dispatch/015`); WHICH mechanism the coder uses to ensure the label exists (alongside the triage vocabulary, on demand after a failed add, or otherwise) — any of them satisfies this.
 - **Note:** RED today — nothing ensures `in-progress` exists before the unconditional add, so the tightened stub's real-`gh`-accurate rejection fires and the claim silently fails (swallowed into `tracing::warn!`, so the run still reports success). This is the exact defect the PRD #421 review flagged: on any repo without a pre-existing `in-progress` label, the headline claim feature silently does nothing.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/021 — An ORCHESTRATION dispatch's claim comment names the orchestration's own typed name, not the scheduled task that fired it (PRD fork#235 M1/M2 — the claimant identity comes from the bound spawn handle's `SpawnKind`, not from `task_name`).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the fixture remote carries `ORCH_TOML`'s single-role orchestration named `dispatch-orch`, fired by a `ScheduledTask` deliberately named something else, `claim-task-021`).
+- **Agent:** none (run-now; observes the stub's recorded `gh` invocations).
+- **Asserts:** after a successful orchestration dispatch, a recorded `issue comment` call names `dispatch-orch` (the orchestration's own typed name); no `issue comment` call names `claim-task-021` (the scheduled task's name) — PRD #421 named the task exclusively; fork#235 derives the claimant from the spawn handle instead.
+- **Does not assert:** the exact identity string format (`orchestration:<name>@<host>:<wt>`); the single-agent path, which never has this distinction to make (covered by `scheduler/dispatch/010`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/022 — When `gh api user` fails, the label and claim comment still land and the dispatch is NOT reported as failed, but no assignee is ever written (PRD fork#235 M2 — a claim-identity resolution failure must never turn an already-successful dispatch into `IssueDispatchFailed`).
+- **Layer:** L2 (as `scheduler/dispatch/001`; `GhStub::fail_api_user` arms `gh api user --jq .login` to exit non-zero, standing in for a read-only or expired token).
+- **Agent:** none (run-now; observes the dispatched single-agent card, the stub's recorded `gh` invocations, `GhStub::label_applied`, `GhStub::assignees`, and the daemon's stderr).
+- **Asserts:** the dispatch succeeds as normal (worktree + single-agent card present); the `in-progress` label write still SUCCEEDS; a claim comment is still posted; the issue's assignee list stays empty throughout; the daemon's stderr never reports issue 51 as failed.
+- **Does not assert:** the exact wording of the best-effort warning surfaced for the skipped assignee write; the successful-login assignee path (covered by `scheduler/dispatch/010`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi
