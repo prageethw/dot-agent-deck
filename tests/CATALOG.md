@@ -1508,6 +1508,20 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** an LLM response (the safety invariant and native prompt-edit behavior are proven without submitting a model turn).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/023 — An `Applied` mode-seed write is not treated as delivered (fork #182 M2, RED).
+- **Layer:** L1 (in-process seed-prompt readiness consumer with a controllable `PaneController`).
+- **Agent:** none.
+- **Asserts:** with `SendResult::Applied` injected, `process_pending_seed_prompts` performs the one write, but the seed must remain in `ui.pending_seed_prompts` awaiting a genuine submit confirmation rather than being dropped in the same frame the write lands, and a second frame with no submit observed must not re-send the prompt text. Currently RED: `Ok(SendResult::Applied) | Ok(SendResult::Queued)` is treated as terminal delivery and the seed is dropped immediately.
+- **Does not assert:** the confirmation mechanism itself (LEVEL/TEXT paths) — that is `prompt/pane-input/006`'s orchestrator-path sibling territory and M3 (#187), not yet built for the mode-seed path.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/024 — The mode-seed 10s no-SessionStart fallback must honor the readiness buffer (fork #182 M2, RED).
+- **Layer:** L1 (in-process seed-prompt readiness consumer with a controllable `PaneController`).
+- **Agent:** none.
+- **Asserts:** for a pane that never signals `SessionStart`, at the exact instant `process_pending_seed_prompts`'s 10s fallback threshold is first crossed, no write has happened yet — the fallback must start the same `SPAWN_TIME_READINESS_BUFFER` wait a real `SessionStart` would, not bypass it. Currently RED: `buffer_elapsed = if timeout_ready { true } else { ... }` fires the write with a zero buffer the instant the 10s mark is crossed.
+- **Does not assert:** the orchestrator-path counterpart, already fixed and covered by `orchestration/seed/003`.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

@@ -33958,6 +33958,132 @@ mod tests {
         );
     }
 
+    /// Scenario: process a mode's pending seed prompt through
+    /// `process_pending_seed_prompts` with an injected `Applied` send outcome —
+    /// bytes reach the PTY but no submit is ever observed. Pins fork #182
+    /// (upstream #424 finding #2, surviving in the mode-seed copy of the
+    /// delivery logic that was never fixed): the write must not be treated as
+    /// terminal delivery, and the seed must remain pending an actual
+    /// confirmation rather than being dropped the instant the bytes are
+    /// accepted.
+    #[spec("prompt/pane-input/023")]
+    #[test]
+    fn pane_input_023_applied_seed_write_is_not_treated_as_delivered() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "applied-seed-pane".into(),
+            prompt: "seed prompt that must not be dropped on bytes-written alone".into(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("applied-seed-pane".into());
+        snapshot.insert_placeholder_session(
+            "applied-seed-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("applied-seed-agent".into()),
+        );
+
+        // Frame 1: the write lands (`Applied`) but no submit follows.
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+        let write_attempted = attempts.load(Ordering::SeqCst) == 1;
+        let seed_retained_pending_confirmation = ui.pending_seed_prompts.len() == 1;
+
+        // Frame 2: still no submit observed anywhere — a correct fix must not
+        // re-send the prompt text a second time while genuinely awaiting
+        // confirmation.
+        if seed_retained_pending_confirmation {
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        }
+        let no_duplicate_write = attempts.load(Ordering::SeqCst) == 1;
+
+        assert!(
+            write_attempted && seed_retained_pending_confirmation && no_duplicate_write,
+            "an Applied seed write must not be treated as delivered: \
+             write_attempted={write_attempted} (the write itself must happen \
+             once), seed_retained_pending_confirmation={seed_retained_pending_confirmation} \
+             (expected ui.pending_seed_prompts.len() == 1, got {}; \
+             process_pending_seed_prompts currently treats \
+             Ok(SendResult::Applied) | Ok(SendResult::Queued) as terminal \
+             delivery and drops the seed in the same frame the write lands — \
+             see the `Ok(SendResult::Applied) | Ok(SendResult::Queued) => {{ \
+             ...; return false; }}` arm), no_duplicate_write={no_duplicate_write} \
+             (attempts must stay 1 across a second frame with no submit \
+             observed) — see fork #182 / upstream #424 finding #2",
+            ui.pending_seed_prompts.len(),
+        );
+    }
+
+    /// Scenario: process a mode's pending seed prompt through
+    /// `process_pending_seed_prompts` for a pane that never signals
+    /// `SessionStart` (agent_type stays `AgentType::None`, so only the 10s
+    /// no-SessionStart fallback can ever fire), at the exact instant that
+    /// fallback threshold is crossed. Pins fork #182 (upstream #424 finding
+    /// #3, surviving in the mode-seed copy of the delivery logic that was
+    /// never fixed): the fallback must still honor
+    /// `SPAWN_TIME_READINESS_BUFFER` instead of writing with a zero buffer
+    /// the instant the 10s mark is crossed.
+    #[spec("prompt/pane-input/024")]
+    #[test]
+    fn pane_input_024_seed_timeout_fallback_still_honors_readiness_buffer() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        // No SessionStart ever arrives: agent_type stays `AgentType::None`,
+        // so `agent_ready` is false every frame and only the 10s fallback
+        // can trigger delivery.
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("timeout-seed-pane".into());
+        snapshot.insert_placeholder_session("timeout-seed-pane".into(), None, None, None);
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "timeout-seed-pane".into(),
+            prompt: "seed prompt gated only by the 10s fallback".into(),
+            // Just past the 10s no-SessionStart threshold — a correct fix
+            // must treat THIS moment as the start of the buffer wait,
+            // exactly like a real SessionStart would, not as a licence to
+            // write immediately.
+            created_at: std::time::Instant::now()
+                .checked_sub(
+                    std::time::Duration::from_secs(10) + std::time::Duration::from_millis(1),
+                )
+                .expect("just-past-ten-seconds timestamp"),
+            ready_since: None,
+        });
+
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+        let wrote_with_zero_buffer = attempts.load(Ordering::SeqCst) > 0;
+
+        assert!(
+            !wrote_with_zero_buffer,
+            "the 10s no-SessionStart fallback must still honor \
+             SPAWN_TIME_READINESS_BUFFER instead of firing with a zero buffer \
+             the instant the 10s mark is crossed: \
+             wrote_with_zero_buffer={wrote_with_zero_buffer} (expected false — \
+             no write at the exact instant timeout_ready first becomes true), \
+             attempts={} — process_pending_seed_prompts currently computes \
+             `buffer_elapsed = if timeout_ready {{ true }} else {{ \
+             should_inject_spawn_time_prompt(sp.ready_since, now) }}`, so the \
+             fallback path never consults the readiness buffer at all — see \
+             fork #182 / upstream #424 finding #3",
+            attempts.load(Ordering::SeqCst),
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PRD #20 R20-005 (finding #13, coder-authored): the ORCHESTRATOR prompt
     // path is bounded by a reachable deadline and abandons terminal outcomes,
