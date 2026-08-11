@@ -458,6 +458,99 @@ fn hook_rule_identification_012_fragment_match_mutation_guard() {
     );
 }
 
+/// Scenario: Two deck-owned rules exist, written by two distinct on-disk
+/// binaries sharing a basename (mirroring `_011`), alongside a coexisting
+/// non-deck user hook whose command names a path that never existed. One
+/// binary's file is then deleted from disk and install runs again via the
+/// surviving binary. The now-dead binary's rule must be pruned, the surviving
+/// binary's rule must remain, and the never-deck-owned user hook — whose
+/// command also names a nonexistent path — must be left untouched throughout:
+/// the prune applies only to rules already identified as deck-owned, never a
+/// general "delete anything pointing at a missing file" sweep, which would
+/// delete user hooks for tools not currently installed.
+#[test]
+fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
+    let build_a_dir = tempfile::tempdir().expect("build a tempdir");
+    let build_a = build_a_dir.path().join("dot-agent-deck");
+    std::fs::write(&build_a, b"#!/bin/sh\n").expect("write build a");
+    let build_a_str = build_a.to_str().expect("build a path is utf8").to_string();
+
+    let build_b_dir = tempfile::tempdir().expect("build b tempdir");
+    let build_b = build_b_dir.path().join("dot-agent-deck");
+    std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
+    let build_b_str = build_b.to_str().expect("build b path is utf8").to_string();
+
+    let (_dir, path) = settings_path();
+
+    let user_command = "/usr/local/bin/nonexistent-tool --watch";
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [user_rule(user_command)]
+            }
+        }),
+    );
+
+    install_to(&path, &build_a_str);
+    // Total right after only build_a is installed: one deck rule per event
+    // type plus the untouched user hook. Captured here (rather than hardcoding
+    // the private HOOK_TYPES length) so the final assertion below can check
+    // "pruning build_a's rules and keeping build_b's leaves the SAME total" —
+    // an invariant that holds regardless of how many event types there are.
+    let after_one_total = total_rule_count(&read_settings(&path));
+
+    install_to(&path, &build_b_str);
+
+    let after_two = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_two.len(),
+        3,
+        "two distinct on-disk builds plus the coexisting user hook must all be \
+         present before any file is deleted; got {after_two:?}"
+    );
+
+    std::fs::remove_file(&build_a).expect("delete build a from disk");
+
+    install_to(&path, &build_b_str);
+
+    let settings = read_settings(&path);
+    let pre_tool_use = rule_commands(&settings, "PreToolUse");
+    let build_a_command = format!("{build_a_str} hook --agent claude-code");
+    let build_b_command = format!("{build_b_str} hook --agent claude-code");
+
+    assert!(
+        !pre_tool_use.contains(&build_a_command),
+        "a deck-owned rule whose executable no longer exists on disk must be \
+         pruned on install; got {pre_tool_use:?}"
+    );
+    assert!(
+        pre_tool_use.contains(&build_b_command),
+        "a deck-owned rule whose executable still exists on disk must be kept; \
+         got {pre_tool_use:?}"
+    );
+    assert!(
+        pre_tool_use.contains(&user_command.to_string()),
+        "a non-deck user hook whose command names a nonexistent path must \
+         survive the prune — it was never deck-owned; got {pre_tool_use:?}"
+    );
+    assert_eq!(
+        pre_tool_use.len(),
+        2,
+        "exactly one surviving deck rule plus the untouched user hook must \
+         remain under PreToolUse; got {pre_tool_use:?}"
+    );
+
+    assert_eq!(
+        total_rule_count(&settings),
+        after_one_total,
+        "pruning the dead binary's rule across every event type must leave \
+         the same total rule count as when only one binary's rules existed \
+         (one deck rule per event type plus the untouched user hook) — just \
+         now owned by the surviving binary instead of the deleted one"
+    );
+}
+
 /// Scenario: A `settings.json` made invalid by a single trailing comma — while
 /// still carrying the user's `model`, `env`, and `permissions` configuration —
 /// must never be silently replaced. Audit's most serious finding: `read_settings`
