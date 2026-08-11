@@ -40,8 +40,9 @@ fn user_rule(command: &str) -> Value {
     })
 }
 
-/// A rule in the legacy flat `{"command": ...}` shape `rule_contains_dot_agent_deck`
-/// still has a matching arm for.
+/// A rule in the legacy flat `{"command": ...}` shape — one of the two shapes
+/// `rule_commands` (`src/hooks_manage.rs`) chains together when extracting a
+/// rule's command strings.
 fn old_format_rule(command: &str) -> Value {
     json!({"command": command})
 }
@@ -286,12 +287,19 @@ fn hook_rule_identification_007_old_flat_format_rule_is_recognised() {
 /// through repeated installs without accumulating rules, must be recognised in
 /// its quoted form, and must be fully removable by uninstall — mirroring
 /// `devin_hooks_manage`'s `install_quotes_a_binary_path_with_spaces` precedent
-/// (`src/devin_hooks_manage.rs:726-738`).
+/// (`src/devin_hooks_manage.rs:726-738`). The expected quoting form is
+/// platform-specific — POSIX single quotes on Unix, `cmd.exe` double quotes on
+/// Windows, per `shell_quote_if_needed`'s two `#[cfg]` arms
+/// (`src/hooks_manage.rs:147-184`) — so this pins the actual mechanism per
+/// platform rather than only the fact that quoting happened.
 #[test]
 fn hook_rule_identification_008_spaced_binary_path_round_trips() {
     let (_dir, path) = settings_path();
     let binary = "/Applications/My Deck/dot-agent-deck";
+    #[cfg(unix)]
     let expected_command = "'/Applications/My Deck/dot-agent-deck' hook --agent claude-code";
+    #[cfg(windows)]
+    let expected_command = "\"/Applications/My Deck/dot-agent-deck\" hook --agent claude-code";
 
     install_to(&path, binary);
     let after_one = rule_commands(&read_settings(&path), "PreToolUse");
@@ -548,6 +556,40 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
          the same total rule count as when only one binary's rules existed \
          (one deck rule per event type plus the untouched user hook) — just \
          now owned by the surviving binary instead of the deleted one"
+    );
+}
+
+/// Scenario: A binary path containing `%` or `!` — both `cmd.exe`-special for
+/// variable expansion — must be double-quoted on Windows even though neither
+/// character trips the POSIX safe-set check and `~` (also present here, but
+/// NOT `cmd.exe`-special) does not force quoting on its own. Closes the gap
+/// fork issue #238 recorded: nothing exercised this arm of
+/// `shell_quote_if_needed`'s Windows safe set before now, and `cargo clippy`
+/// on a Unix box cannot even compile the `#[cfg(windows)]` arm — CI's
+/// `build-windows` job is the only thing that sees it.
+#[cfg(windows)]
+#[test]
+fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
+    let (_dir, path) = settings_path();
+    let binary = r"C:\Tools\RUNNER~1\100%!\dot-agent-deck.exe";
+    let expected_command = format!("\"{binary}\" hook --agent claude-code");
+
+    install_to(&path, binary);
+    let after_install = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        after_install,
+        vec![expected_command.clone()],
+        "a path containing '%' or '!' must be double-quoted on Windows since both \
+         are cmd.exe-special for variable expansion, even though '~' alone would \
+         not force quoting; got {after_install:?}"
+    );
+
+    uninstall_from(&path);
+    let remaining = total_rule_count(&read_settings(&path));
+    assert_eq!(
+        remaining, 0,
+        "a Windows-quoted path containing '%'/'!' must still be fully removable \
+         by uninstall; {remaining} remained"
     );
 }
 
