@@ -251,14 +251,21 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // Orchestration tab just as the Orchestration tab's earlier toggle
     // propagated to the Dashboard tab.
     deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Orchestration
-    // Same hazard as the Shift+Tab switch above (see the comment at line
-    // 184-190): confirm the tab switch itself landed before polling for the
-    // exact edge, so a panicking `pane_box_left_edge` isn't used directly as
-    // a predicate against a first-sampled grid that can still show the
-    // Dashboard tab ("orchestrator" genuinely absent, not just moved).
-    deck.wait_for_string("orchestrator");
+    // Round 4 (fork issue #224): `wait_for_string("orchestrator")` here was a
+    // guard that did not guard anything. This fixture's tab strip renders
+    // the Dashboard tab's label as its live PTY session name, e.g.
+    // `.tmp6ozm36-orchestrator-1`, which itself CONTAINS the substring
+    // "orchestrator" — so the wait matched on the Dashboard tab, before the
+    // `Right` keypress had any effect, every time. Use DASH_PANE's absence
+    // instead (mirroring the comment at :211-217: DASH_PANE's title is only
+    // ever drawn on the Dashboard tab), which genuinely distinguishes having
+    // switched off of it, before polling for the Orchestration tab's exact
+    // edge with the non-panicking `find_pane_box_left_edge` form (see the
+    // file-level comment at :17-38 and the same fix applied at :156-158 /
+    // :188).
+    deck.wait_for_absence(DASH_PANE);
     let orch_also_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, "orchestrator") == 34
+        find_pane_box_left_edge(grid, "orchestrator") == Some(34)
     });
     assert!(
         orch_also_restored,
