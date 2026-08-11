@@ -10,35 +10,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, find_pane_box_left_edge, pane_box_left_edge};
 use spec::spec;
-
-/// Left edge (in columns) of a Tiled pane's box whose title fuses into the
-/// top border as `┌<pane_title>` (Plain, unfocused/PaneInput) or
-/// `┏<pane_title>` (Thick, focused command-mode — `TerminalWidget` in
-/// `src/terminal_widget.rs`) — the boundary between the sidebar (deck cards /
-/// role list) and the pane column that the split-stage percentages control.
-/// Duplicated from `tests/e2e_dashboard_pane_column.rs` (each integration
-/// test file compiles as its own crate, so helpers cannot be shared across
-/// them).
-fn find_pane_box_left_edge(grid: &str, pane_title: &str) -> Option<u16> {
-    let plain_needle = format!("┌{pane_title}");
-    let thick_needle = format!("┏{pane_title}");
-    for line in grid.lines() {
-        if let Some(byte_idx) = line
-            .find(&plain_needle)
-            .or_else(|| line.find(&thick_needle))
-        {
-            return Some(line[..byte_idx].chars().count() as u16);
-        }
-    }
-    None
-}
-
-fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
-    find_pane_box_left_edge(grid, pane_title)
-        .unwrap_or_else(|| panic!("{pane_title:?} pane box top border not found in grid:\n{grid}"))
-}
 
 /// Scenario: launch the deck with a Dashboard pane already live and
 /// attached, then run the SAME four-press `Ctrl+l` pre-open cycle
@@ -85,14 +58,14 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
     for expected_edge in [25u16, 0, 33, 25] {
         deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
         let reached = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-            pane_box_left_edge(grid, DASH_PANE) == expected_edge
+            find_pane_box_left_edge(grid, DASH_PANE) == Some(expected_edge)
         });
         assert!(
             reached,
             "Ctrl+l did not bring the Dashboard sidebar to the {expected_edge}\
              -column split-stage edge within 3s during the pre-open cycle — \
-             pane-column edge stayed at {}\nGrid:\n{}",
-            pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+             pane-column edge stayed at {:?}\nGrid:\n{}",
+            find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
             deck.snapshot_grid()
         );
     }
@@ -145,7 +118,7 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
     );
 
     // Send further input to the freshly-opened Orchestration tab, mirroring
-    // `dashboard_001`'s post-open `Ctrl+D` + `Ctrl+l` (`e2e_dashboard_pane_column.rs:180-181`).
+    // `dashboard_001`'s post-open `Ctrl+D` + `Ctrl+l` in `e2e_dashboard_pane_column.rs`.
     // Round 2's own analysis identified this as the one thing `dashboard_001`
     // does that this test didn't: `dashboard_001` sends further input to the
     // new tab afterward, `dashboard_002` only watched it passively. PRD #387
