@@ -542,6 +542,32 @@ fn dispatch_task(
     )
 }
 
+/// PRD fork#235: build a workspace tempdir + single-task `issue_dispatch`
+/// schedule, then spawn a daemon over it — the setup shared verbatim by
+/// `scheduler/dispatch/010`, `021`, and `022`, which each fire it via
+/// `run_now` themselves and diverge only in their fixture (`stub`) and
+/// assertions afterward. Returns the workspace `TempDir` (kept alive by the
+/// caller for the daemon's lifetime), the workspace path as a `String` (for
+/// `derive_issue_paths`), and the running daemon.
+fn spawn_dispatch_daemon(
+    stub: &GhStub,
+    task_name: &str,
+    id_template: &str,
+    repo: &str,
+) -> (tempfile::TempDir, String, common::DaemonProc) {
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(task_name, &work_str, id_template, repo, 5);
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    (work_td, work_str, daemon)
+}
+
 /// Like [`dispatch_task`] but with `triage = true` appended to the
 /// `[scheduled_tasks.issue_dispatch]` table (PRD #421 M2.0, opt-in). Today
 /// `IssueDispatchConfig` carries no `triage` field and no
@@ -1506,15 +1532,19 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
 const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
      [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"dad-nonexistent-binary-421\"\nstart = true\n";
 
-/// Scenario: Fire an `issue_dispatch` task for one open issue on a repo that
-/// already carries the `in-progress` label (seeded via
-/// [`GhStub::seed_labels`], mirroring a repo where the label vocabulary
-/// pre-exists — see `scheduler/dispatch/020` for the counterpart where it
-/// doesn't). After the dispatch succeeds (worktree + orchestrator agent
-/// present, as in `scheduler/dispatch/001`), the stub `gh` log must show an
-/// `issue edit ... --add-label in-progress` invocation for the issue AND an
-/// `issue comment` invocation whose body names the claiming task
-/// (`ScheduledTask.name`, the scheduler-side claimant per PRD #421) — and,
+/// Scenario: Fire a SINGLE-AGENT `issue_dispatch` task (fixture remote
+/// carries no `.dot-agent-deck.toml`, mirroring `scheduler/dispatch/022`) for
+/// one open issue on a repo that already carries the `in-progress` label
+/// (seeded via [`GhStub::seed_labels`], mirroring a repo where the label
+/// vocabulary pre-exists — see `scheduler/dispatch/020` for the counterpart
+/// where it doesn't). After the dispatch succeeds (worktree + single agent
+/// card present, as in `scheduler/dispatch/022`), the stub `gh` log must show
+/// an `issue edit ... --add-label in-progress` invocation for the issue AND
+/// an `issue comment` invocation whose body names the claiming task
+/// (`ScheduledTask.name` via `Identity::issue_dispatch`, PRD fork#235 M1/M2's
+/// single-agent identity — this is the genuinely single-agent claim path
+/// PRD #421 originally covered here, kept distinct from the
+/// orchestration-named claim `scheduler/dispatch/021` exists to pin) — and,
 /// because `in-progress` pre-existed, the add-label call must have actually
 /// SUCCEEDED, not merely been attempted.
 #[spec("scheduler/dispatch/010")]
@@ -1522,27 +1552,16 @@ const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\
 fn dispatch_010_success_writes_label_and_claim_comment() {
     let stub = GhStub::new();
     let repo = "acme/widgets";
-    stub.add_repo(repo, true);
+    stub.add_repo(repo, false);
     stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
-    let work = work_td.path().join("ws");
-    std::fs::create_dir_all(&work).expect("create workspace root");
-    let work_str = work.to_string_lossy().into_owned();
-
-    let toml = dispatch_task(
+    let (_work_td, work_str, daemon) = spawn_dispatch_daemon(
+        &stub,
         "dispatch-task",
-        &work_str,
         "ISSUEDISPATCH-{{issue_number}}",
         repo,
-        5,
     );
-    let path = stub.path_env();
-    let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
-    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
-
     daemon
         .run_now("dispatch-task")
         .expect("run-now dispatch-task");
@@ -1550,7 +1569,7 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .wait_for_agent_where(|r| single_card_in(r, &paths.worktree_dir), W)
             .is_some(),
         "the dispatch must succeed (precondition for a label/comment write)"
     );
@@ -2195,23 +2214,8 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
     stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
     stub.set_issues(repo, &[41]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
-    let work = work_td.path().join("ws");
-    std::fs::create_dir_all(&work).expect("create workspace root");
-    let work_str = work.to_string_lossy().into_owned();
-
-    let toml = dispatch_task(
-        "claim-task-021",
-        &work_str,
-        "ORCHCLAIM-{{issue_number}}",
-        repo,
-        5,
-    );
-    let path = stub.path_env();
-    let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
-    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
-
+    let (_work_td, work_str, daemon) =
+        spawn_dispatch_daemon(&stub, "claim-task-021", "ORCHCLAIM-{{issue_number}}", repo);
     daemon
         .run_now("claim-task-021")
         .expect("run-now claim-task-021");
@@ -2267,22 +2271,8 @@ fn dispatch_022_gh_api_user_failure_skips_assignee_without_failing_dispatch() {
     stub.set_issues(repo, &[51]);
     stub.fail_api_user();
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
-    let work = work_td.path().join("ws");
-    std::fs::create_dir_all(&work).expect("create workspace root");
-    let work_str = work.to_string_lossy().into_owned();
-
-    let toml = dispatch_task(
-        "claim-task-022",
-        &work_str,
-        "NOLOGIN-{{issue_number}}",
-        repo,
-        5,
-    );
-    let path = stub.path_env();
-    let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
-    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    let (_work_td, work_str, daemon) =
+        spawn_dispatch_daemon(&stub, "claim-task-022", "NOLOGIN-{{issue_number}}", repo);
 
     daemon
         .run_now("claim-task-022")

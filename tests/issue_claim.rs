@@ -133,15 +133,15 @@ fi
 if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
     comments="[]"
     if [ -s "$issuedir/comments.jsonl" ]; then
-        comments="[$(paste -sd, "$issuedir/comments.jsonl")]"
+        comments="[$(tr '\n' ',' < "$issuedir/comments.jsonl" | sed 's/,$//')]"
     fi
     labels="[]"
     if [ -s "$issuedir/labels.txt" ]; then
-        labels="[$(sed 's/.*/{"name":"&"}/' "$issuedir/labels.txt" | paste -sd,)]"
+        labels="[$(sed 's/.*/{"name":"&"}/' "$issuedir/labels.txt" | tr '\n' ',' | sed 's/,$//')]"
     fi
     assignees="[]"
     if [ -s "$issuedir/assignees.txt" ]; then
-        assignees="[$(sed 's/.*/{"login":"&"}/' "$issuedir/assignees.txt" | paste -sd,)]"
+        assignees="[$(sed 's/.*/{"login":"&"}/' "$issuedir/assignees.txt" | tr '\n' ',' | sed 's/,$//')]"
     fi
     printf '{"comments":%s,"labels":%s,"assignees":%s}\n' "$comments" "$labels" "$assignees"
     exit 0
@@ -389,16 +389,43 @@ fn assert_recognized_subcommand(out: &std::process::Output, label: &str) {
     );
 }
 
+/// Whether `line` (a `$GHSTUB_DIR/gh-calls.log` line, the stub's raw `$*`) is
+/// a genuine `gh issue comment` WRITE — matched on the subcommand form
+/// (`issue comment `), never by substring. `gh issue view --json
+/// comments,labels,assignees` is a mandatory READ the lock must issue before
+/// it can refuse and name the holder, but its own `--json` FIELD NAME
+/// `comments` contains the substring `comment`, so a two-substring match
+/// misclassifies that read as a write.
+fn is_issue_comment_call(line: &str) -> bool {
+    line.starts_with("issue comment ")
+}
+
 /// Whether any of `calls` is a write the lock must never make on a refusal:
-/// an `--add-label` call, an `issue ... comment` call, or an
+/// an `--add-label` call, an `issue comment` call, or an
 /// `--add-assignee`/`--remove-assignee` call.
 fn any_claim_write(calls: &[String]) -> bool {
     calls.iter().any(|l| {
         l.contains("--add-label")
-            || (l.contains("issue") && l.contains("comment"))
+            || is_issue_comment_call(l)
             || l.contains("--add-assignee")
             || l.contains("--remove-assignee")
     })
+}
+
+/// Build a fixture with the standard `acme/widgets` repo and two
+/// orchestration-owned worktrees — the two-holder setup shared by
+/// `issue/claim/001`, `002`, `003` (`name_a`/`name_b` distinct) and `007`
+/// (called with `name_b == name_a`, since that test's whole point is two
+/// DIFFERENT worktrees claiming under the exact SAME typed name).
+#[cfg(unix)]
+fn two_orchestrations(name_a: &str, name_b: &str) -> (Fixture, &'static str, PathBuf, PathBuf) {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let wt_a = fx.add_worktree("wt-a", "orch-a-branch");
+    fx.mark_owned(&wt_a, &format!("orchestration:{name_a}"));
+    let wt_b = fx.add_worktree("wt-b", "orch-b-branch");
+    fx.mark_owned(&wt_b, &format!("orchestration:{name_b}"));
+    (fx, repo, wt_a, wt_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,12 +441,7 @@ fn any_claim_write(calls: &[String]) -> bool {
 #[test]
 #[cfg(unix)]
 fn issue_claim_001_second_orchestration_is_refused_and_writes_nothing() {
-    let fx = Fixture::new();
-    let repo = "acme/widgets";
-    let wt_a = fx.add_worktree("wt-a", "orch-a-branch");
-    fx.mark_owned(&wt_a, "orchestration:orch-A");
-    let wt_b = fx.add_worktree("wt-b", "orch-b-branch");
-    fx.mark_owned(&wt_b, "orchestration:orch-B");
+    let (fx, repo, wt_a, wt_b) = two_orchestrations("orch-A", "orch-B");
 
     fx.set_login("alice");
     let claim_a = fx.run(&wt_a, &["issue", "claim", "1", "--repo", repo], true);
@@ -466,12 +488,7 @@ fn issue_claim_001_second_orchestration_is_refused_and_writes_nothing() {
 #[test]
 #[cfg(unix)]
 fn issue_claim_002_takeover_alone_still_refuses() {
-    let fx = Fixture::new();
-    let repo = "acme/widgets";
-    let wt_a = fx.add_worktree("wt-a", "orch-a-branch");
-    fx.mark_owned(&wt_a, "orchestration:orch-A");
-    let wt_b = fx.add_worktree("wt-b", "orch-b-branch");
-    fx.mark_owned(&wt_b, "orchestration:orch-B");
+    let (fx, repo, wt_a, wt_b) = two_orchestrations("orch-A", "orch-B");
 
     fx.set_login("alice");
     let claim_a = fx.run(&wt_a, &["issue", "claim", "2", "--repo", repo], true);
@@ -517,12 +534,7 @@ fn issue_claim_002_takeover_alone_still_refuses() {
 #[test]
 #[cfg(unix)]
 fn issue_claim_003_takeover_confirm_stopped_succeeds_and_records_succession() {
-    let fx = Fixture::new();
-    let repo = "acme/widgets";
-    let wt_a = fx.add_worktree("wt-a", "orch-a-branch");
-    fx.mark_owned(&wt_a, "orchestration:orch-A");
-    let wt_b = fx.add_worktree("wt-b", "orch-b-branch");
-    fx.mark_owned(&wt_b, "orchestration:orch-B");
+    let (fx, repo, wt_a, wt_b) = two_orchestrations("orch-A", "orch-B");
 
     fx.set_login("alice");
     let claim_a = fx.run(&wt_a, &["issue", "claim", "3", "--repo", repo], true);
@@ -550,10 +562,7 @@ fn issue_claim_003_takeover_confirm_stopped_succeeds_and_records_succession() {
     );
 
     let calls = fx.gh_calls();
-    let comment_calls: Vec<&String> = calls
-        .iter()
-        .filter(|l| l.contains("issue") && l.contains("comment"))
-        .collect();
+    let comment_calls: Vec<&String> = calls.iter().filter(|l| is_issue_comment_call(l)).collect();
     assert!(
         comment_calls.len() >= 2,
         "the comment log must hold both A's original claim and B's takeover comment, in order \
@@ -710,12 +719,7 @@ fn issue_claim_006_pane_without_marker_refuses_without_downgrading_to_human() {
 #[test]
 #[cfg(unix)]
 fn issue_claim_007_same_orchestration_name_different_worktree_is_refused_not_self_refresh() {
-    let fx = Fixture::new();
-    let repo = "acme/widgets";
-    let wt_first = fx.add_worktree("wt-same-name-1", "same-name-branch-1");
-    fx.mark_owned(&wt_first, "orchestration:same-name");
-    let wt_second = fx.add_worktree("wt-same-name-2", "same-name-branch-2");
-    fx.mark_owned(&wt_second, "orchestration:same-name");
+    let (fx, repo, wt_first, wt_second) = two_orchestrations("same-name", "same-name");
 
     fx.set_login("gina");
     let first = fx.run(&wt_first, &["issue", "claim", "7", "--repo", repo], true);
@@ -736,10 +740,7 @@ fn issue_claim_007_same_orchestration_name_different_worktree_is_refused_not_sel
     );
 
     let calls = fx.gh_calls();
-    let comment_calls = calls
-        .iter()
-        .filter(|l| l.contains("issue") && l.contains("comment"))
-        .count();
+    let comment_calls = calls.iter().filter(|l| is_issue_comment_call(l)).count();
     assert_eq!(
         comment_calls, 1,
         "only the FIRST same-named orchestration's claim may have posted a comment — a \
