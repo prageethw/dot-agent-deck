@@ -579,8 +579,7 @@ mod tests {
     // from one constant and cannot drift apart — shared by `worktree_009` and
     // `worktree_010`, whose discovery loops have the identical shape.
     #[cfg(unix)]
-    const DISCOVERY_WINDOW: std::time::Duration =
-        std::time::Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 3);
+    const DISCOVERY_WINDOW: std::time::Duration = PS_SAMPLE_BUDGET.saturating_mul(3);
 
     /// Fork issue #133 — the mechanism the fix actually buys: killing the
     /// whole process group, not just the tracked child, reaches a grandchild

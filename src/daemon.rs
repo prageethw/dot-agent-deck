@@ -1196,7 +1196,28 @@ async fn run_shell_activity_monitor(
     // [`crate::agent_pty::ShellForegroundBusySnapshot::unconfirmed`], which
     // names each unconfirmed candidate explicitly rather than only counting
     // them.
-    let mut pane_unconfirmed_streaks: std::collections::HashMap<String, u32> =
+    // PR #233 review (R3): the streak used to be `remove`d the instant a
+    // pane classified even ONCE, so a FLAPPING pane (unconfirmed →
+    // classified → unconfirmed → …) re-entered at `streak == 1` — and
+    // therefore logged — on every unconfirmed tick. The rate limit above
+    // only bounds a *consecutive* run of unconfirmed ticks, and flapping
+    // never produces one; this is exactly the scenario audit A8 identified
+    // as newly more likely because of this PR's per-row fail-safe. Require
+    // `UNCONFIRMED_RESET_AFTER_CLASSIFIED` consecutive classified ticks
+    // before the streak actually drops, so a pane oscillating under
+    // contention keeps accumulating on the same streak instead of
+    // restarting it every other tick.
+    const UNCONFIRMED_RESET_AFTER_CLASSIFIED: u32 = 3;
+    #[derive(Default)]
+    struct PaneUnconfirmedStreak {
+        /// Run of unconfirmed ticks, tolerant of interruption by fewer than
+        /// `UNCONFIRMED_RESET_AFTER_CLASSIFIED` classified ticks in a row.
+        streak: u32,
+        /// Consecutive classified ticks since the last unconfirmed one —
+        /// any unconfirmed tick resets this to zero.
+        classified_run: u32,
+    }
+    let mut pane_unconfirmed_streaks: std::collections::HashMap<String, PaneUnconfirmedStreak> =
         std::collections::HashMap::new();
 
     loop {
@@ -1295,28 +1316,41 @@ async fn run_shell_activity_monitor(
         // does below. Per-pane outcomes are tracked separately, next.
         consecutive_process_table_failures = 0;
 
-        // A pane that classified this tick is healthy — drop any streak it
-        // was carrying from a prior tick.
+        // A pane that classified this tick is healthy for THIS tick, but
+        // only actually drops its streak once it has stayed classified for
+        // `UNCONFIRMED_RESET_AFTER_CLASSIFIED` ticks in a row — see the
+        // R3 comment on `PaneUnconfirmedStreak` above.
         for (pane_id, _) in &snapshot.statuses {
-            pane_unconfirmed_streaks.remove(pane_id.as_str());
+            let should_remove =
+                if let Some(entry) = pane_unconfirmed_streaks.get_mut(pane_id.as_str()) {
+                    entry.classified_run += 1;
+                    entry.classified_run >= UNCONFIRMED_RESET_AFTER_CLASSIFIED
+                } else {
+                    false
+                };
+            if should_remove {
+                pane_unconfirmed_streaks.remove(pane_id.as_str());
+            }
         }
         // Fork issue #216: bump each unconfirmed candidate's OWN streak
         // rather than one shared scalar, so a healthy sibling pane can never
         // mask this pane's ongoing degradation.
         for pane_id in &snapshot.unconfirmed {
-            let streak = pane_unconfirmed_streaks
-                .entry(pane_id.clone())
-                .and_modify(|c| *c += 1)
-                .or_insert(1);
+            let entry = pane_unconfirmed_streaks.entry(pane_id.clone()).or_default();
+            // Any classified run in progress is broken by this unconfirmed
+            // tick — see R3.
+            entry.classified_run = 0;
+            entry.streak += 1;
+            let streak = entry.streak;
             // Same cadence as F6's deck-wide log, but per pane: the
             // transition into "unconfirmed" is always logged, then only
             // every `FAILURE_LOG_EVERY`th tick after that — loud enough that
             // a pane chronically unconfirmed under sustained contention is
             // still visible, quiet enough it cannot flood per tick.
-            if *streak == 1 || streak.is_multiple_of(FAILURE_LOG_EVERY) {
+            if streak == 1 || streak.is_multiple_of(FAILURE_LOG_EVERY) {
                 tracing::warn!(
                     pane_id = pane_id.as_str(),
-                    consecutive_failures = *streak,
+                    consecutive_failures = streak,
                     "shell-activity poll: this pane's process-table sample succeeded but \
                      the pane went unconfirmed — its status will not update until it \
                      classifies"

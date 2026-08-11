@@ -6624,8 +6624,7 @@ mod spawn_tests {
     // sampler's own budget rather than an unrelated literal, so the two cannot
     // silently drift apart.
     #[cfg(unix)]
-    const RETRY_WINDOW: Duration =
-        Duration::from_secs(crate::platform::proc::PS_SAMPLE_BUDGET.as_secs() * 3);
+    const RETRY_WINDOW: Duration = crate::platform::proc::PS_SAMPLE_BUDGET.saturating_mul(3);
 
     #[cfg(unix)]
     #[tokio::test]

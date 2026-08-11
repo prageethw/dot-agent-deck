@@ -554,7 +554,10 @@ pub const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
 /// a sample, so any value under ~490 KB already catches the 300 KB row
 /// measured above once combined with a normal process table; a tighter cap
 /// buys no extra protection against that row and only spends headroom against
-/// healthy output. fork issue #160's audit measured 1.20–1.38× headroom for
+/// healthy output. **At the shipped 4 MiB, this constant does *not* catch the
+/// 300 KB row measured in isolation, and that is intentional — the row is not
+/// what this constant defends against; bounding cumulative allocation is.**
+/// fork issue #160's audit measured 1.20–1.38× headroom for
 /// the previous 256 KiB value on two ordinary desktops (macOS, ~1,050–1,174
 /// processes) — a healthy but busy host, especially Linux, where `ps -A` also
 /// enumerates thousands of kernel threads, or a host running this repo's own
@@ -602,20 +605,36 @@ pub const PS_SAMPLE_BYTE_CAP: u64 = 4 * 1024 * 1024;
 /// on every capture that returns a usable sample.
 static SIZE_CAP_TRIP_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const SIZE_CAP_WARN_EVERY: u32 = 20;
+// PR #233 review (R3): a host whose sample size oscillates around the cap
+// used to reset this streak to zero on every single usable sample, so it
+// re-entered at `streak == 1` — and therefore logged — on every trip. The
+// rate limit above only bounds a *consecutive* run of trips, and flapping
+// never produces one. Require this many consecutive usable samples before
+// actually clearing the streak, so a flapping host keeps accumulating on the
+// same streak (and its existing `SIZE_CAP_WARN_EVERY` cadence) instead of
+// restarting it every other tick. Any trip in between resets this counter,
+// so genuine recovery still needs an unbroken run, not just a majority.
+static SIZE_CAP_SUCCESS_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const SIZE_CAP_RESET_AFTER_SUCCESSES: u32 = 3;
 
 /// Bumps the size-cap trip streak and reports whether this trip should be
 /// logged — the transition (first trip after a success) and every
 /// [`SIZE_CAP_WARN_EVERY`]th trip after that.
 fn should_log_size_cap_trip() -> bool {
+    // A trip breaks any in-progress recovery run — see `SIZE_CAP_SUCCESS_RUN`.
+    SIZE_CAP_SUCCESS_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
     let streak = SIZE_CAP_TRIP_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     streak == 1 || streak.is_multiple_of(SIZE_CAP_WARN_EVERY)
 }
 
-/// Resets the size-cap trip streak — called whenever a capture returns a
-/// usable sample, so the next trip after a healthy run logs again as a fresh
-/// transition rather than continuing a stale streak.
+/// Called whenever a capture returns a usable sample. Only actually clears
+/// the size-cap trip streak once [`SIZE_CAP_RESET_AFTER_SUCCESSES`]
+/// consecutive samples have been usable — see `SIZE_CAP_SUCCESS_RUN` above.
 fn reset_size_cap_trip_streak() {
-    SIZE_CAP_TRIP_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+    let successes = SIZE_CAP_SUCCESS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if successes >= SIZE_CAP_RESET_AFTER_SUCCESSES {
+        SIZE_CAP_TRIP_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<String> {
@@ -639,12 +658,19 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
         return None;
     };
     let (cap_tx, cap_rx) = std::sync::mpsc::channel();
+    // Fork issue #160's audit (A5) named this site alongside the async form's
+    // `read_capped`, but only the async form was fixed in this PR's first
+    // pass — this reader thread still discarded a partial-read error with
+    // `let _ = …`, which let a truncated table pass the cap check and the
+    // exit-status check below and be parsed as a COMPLETE table. Returning
+    // `None` on a read error (rather than the partial `buf`) restores the
+    // same fail-closed behaviour the async form has.
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut limited = (&mut pipe).take(PS_SAMPLE_BYTE_CAP + 1);
-        let _ = limited.read_to_end(&mut buf);
+        let read_ok = limited.read_to_end(&mut buf).is_ok();
         let _ = cap_tx.send(buf.len() as u64 > PS_SAMPLE_BYTE_CAP);
-        buf
+        read_ok.then_some(buf)
     });
 
     let deadline = std::time::Instant::now() + budget;
@@ -704,7 +730,7 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
         std::thread::sleep(Duration::from_millis(5));
     };
 
-    let stdout = reader.join().ok()?;
+    let stdout = reader.join().ok()??;
     if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
         // Belt-and-braces: a fast, self-limiting over-cap producer can exit on
         // its own before the poll loop above observes the `cap_rx` signal.
@@ -731,14 +757,23 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
 /// `PS_SAMPLE_BYTE_CAP + 1` bytes via `AsyncReadExt::take`, matching the sync
 /// form's shape — see [`process_table_async`].
 ///
-/// `budget` bounds the ENTIRE call — spawn, read and the final wait —
-/// matching the sync form's single `deadline` loop, which already covers all
-/// three. Fork issue #160's audit (A4): an earlier version of this function
-/// wrapped only the read in `timeout`, leaving the final `wait()` unbounded —
-/// a child that reached stdout EOF without exiting (wedged in `D` state,
-/// `SIGSTOP`ed) parked this function, and with it the daemon's whole poll,
-/// forever. Keep the wait inside the bounded region if this is ever edited
-/// again.
+/// `budget` bounds the SUCCESS path — spawn, read and the final wait, if all
+/// three complete without needing remediation — matching the sync form's
+/// single `deadline` loop over that same span. **It does not bound the
+/// remediation `kill().await` / `wait().await` pairs on the error, size-cap
+/// and timeout arms below** (PR #233 review, R2): `tokio::process::Child::
+/// kill()` is `start_kill()` followed by an unbounded `wait()`, so a child
+/// wedged in uninterruptible sleep (`D` state) still parks this function —
+/// now on the remediation path instead of the happy path. `SIGSTOP`ed
+/// children genuinely are fixed by this, since SIGKILL does terminate a
+/// stopped process; bounding the remediation arms themselves is filed as a
+/// follow-up rather than folded into this PR. Fork issue #160's audit (A4):
+/// an earlier version of this function wrapped only the read in `timeout`,
+/// leaving the final `wait()` unbounded on the success path — a child that
+/// reached stdout EOF without exiting (wedged in `D` state, `SIGSTOP`ed)
+/// parked this function, and with it the daemon's whole poll, forever, even
+/// when nothing had actually timed out. Keep the wait inside the bounded
+/// region if this is ever edited again.
 async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
     use tokio::io::AsyncReadExt;
 
@@ -1291,10 +1326,12 @@ mod tests {
     /// raising the cap to 4 MiB left the old literal 400,000-byte fixture
     /// *under* the cap, so the test would have silently stopped exercising
     /// the size-cap path) rather than hand-picked, so the two can never drift
-    /// apart again. It still discriminates: one byte over the cap is the
-    /// minimal input that must trip it, so the test fails the instant the
-    /// cap logic is removed or loosened to `>=`/`>` the wrong way, exactly as
-    /// it did against the old fixture.
+    /// apart again. It still discriminates in the direction that matters: one
+    /// byte over the cap is the minimal input that must trip it, so the test
+    /// fails if the cap logic is removed entirely, or if `> CAP` is loosened
+    /// to `> CAP + 1` — exactly as it did against the old fixture. It does
+    /// **not** fail if `> CAP` is tightened to `>= CAP` (stricter by one
+    /// byte), and should not: that is not a defect.
     #[spec("status/shell-activity/010")]
     #[test]
     fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample() {
@@ -1408,7 +1445,7 @@ mod tests {
     /// become the distinct, real-defect failure message.
     #[tokio::test]
     async fn both_sampling_forms_still_enumerate_the_live_process_table() {
-        const WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 3);
+        const WINDOW: Duration = PS_SAMPLE_BUDGET.saturating_mul(3);
         let own_pid = std::process::id() as i32;
 
         let sync_deadline = std::time::Instant::now() + WINDOW;
