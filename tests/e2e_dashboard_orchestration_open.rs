@@ -47,15 +47,18 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
 /// state and after comparable wall-clock, before opening a new Orchestration
 /// tab via Ctrl+n and completing the form. The new tab's role pane must
 /// render and STAY the active view (checked on an early read AND held across
-/// a 3s follow-up window, not just the first read that finds it — the
-/// reported defect is a revert back to the Dashboard tab that happens some
-/// time after the switch), and the split stage must still read Narrow rather
-/// than having reset to Default. Round 3: mirrors `dashboard_001`'s post-open
-/// `Ctrl+D` + `Ctrl+l` by sending that same input to the freshly-opened tab,
-/// then repeats both checks — still the active view, held again, and the
-/// split now advanced to Hidden rather than reset to Default — to test
-/// whether sending further input to the new tab (not just watching it
-/// passively) is what triggers the reported revert.
+/// a 3s follow-up window, not just the first read that finds it), and the
+/// split stage must still read Narrow rather than having reset to Default.
+/// Round 3: mirrors `dashboard_001`'s post-open `Ctrl+D` + `Ctrl+l` by
+/// sending that same input to the freshly-opened tab, then repeats both
+/// checks — still the active view, held again, and the split now advanced to
+/// Hidden rather than reset to Default. This is positive regression coverage
+/// for behaviour that works, not a reproduction of fork issue #224: the
+/// originally reported revert back to the Dashboard tab never reproduced
+/// across four investigation rounds, and the one test that appeared to catch
+/// it, `dashboard_001`, turned out to owe that appearance to two defects of
+/// its own (a panicking helper called directly inside a grid-predicate
+/// closure, and an inert wait-guard matching the wrong tab), both now fixed.
 #[spec("tabs/dashboard/002")]
 #[test]
 fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active() {

@@ -8295,38 +8295,6 @@ fn dispatch_action(
     selected_id: Option<&str>,
     frame_area: Rect,
 ) -> Flow {
-    // TEMPORARY fork issue #224 diagnostic — gated on an env var so it costs
-    // nothing unless explicitly opted into, and deleted once #224 is
-    // root-caused. Prints the state fields the tab-revert symptom implicates
-    // (active tab, mode, split stage, status message) around every action
-    // that could plausibly touch them, so a CI run answers "what actually
-    // dispatched, in what order, and did anything unexpected fire" directly
-    // instead of by inference from a single rendered frame.
-    if std::env::var_os("DOT224_DIAG").is_some()
-        && matches!(
-            action,
-            Action::SpawnPane(_)
-                | Action::DetachToNormal
-                | Action::CycleSplitStage
-                | Action::SelectTab(_)
-                | Action::GlobalNextTab
-                | Action::GlobalPrevTab
-                | Action::CycleTabNext
-                | Action::CycleTabPrev
-                | Action::NewPane
-                | Action::FormSubmit
-        )
-    {
-        eprintln!(
-            "DOT224_DIAG before action={:?} active_idx={} tab_count={} mode={:?} split_stage={:?} status_msg={:?}",
-            std::mem::discriminant(&action),
-            tab_manager.active_index(),
-            tab_manager.tab_count(),
-            ui.mode,
-            ui.split_stage,
-            ui.status_message.as_ref().map(|(m, _)| m.clone()),
-        );
-    }
     match action {
         // ===== PRD #80 global command actions (formerly inline in run_tui) =====
         // Ctrl+n: new pane (open directory picker).
@@ -9368,18 +9336,6 @@ fn dispatch_action(
                             // Focus the start role's pane.
                             let _ = pane.focus_pane(&role_pane_ids[start_idx]);
                             ui.mode = UiMode::PaneInput;
-
-                            // TEMPORARY fork issue #224 diagnostic — see the
-                            // matching block at the top of `dispatch_action`.
-                            if std::env::var_os("DOT224_DIAG").is_some() {
-                                eprintln!(
-                                    "DOT224_DIAG orch-spawn-ok active_idx={} tab_count={} mode={:?} split_stage={:?}",
-                                    tab_manager.active_index(),
-                                    tab_manager.tab_count(),
-                                    ui.mode,
-                                    ui.split_stage,
-                                );
-                            }
 
                             // PRD #84 M4: role panes were spawned at the
                             // orchestration layout dims (above); the pre-draw
@@ -12038,20 +11994,6 @@ pub fn run_tui(
         // tab match below: the source is no longer the active tab, so every
         // tab type — Mode included — leaves the same single value in place.
         ACTIVE_SPLIT_STAGE.with(|c| c.set(ui.split_stage));
-        // TEMPORARY fork issue #224 diagnostic — see the matching block at
-        // the top of `dispatch_action`. Gated on tab_count() > 1 so it only
-        // fires once an Orchestration/Mode tab exists, keeping the volume
-        // sane across the full e2e suite.
-        if std::env::var_os("DOT224_DIAG").is_some() && tab_manager.tab_count() > 1 {
-            eprintln!(
-                "DOT224_DIAG frame active_idx={} tab_count={} mode={:?} split_stage={:?} status_msg={:?}",
-                tab_manager.active_index(),
-                tab_manager.tab_count(),
-                ui.mode,
-                ui.split_stage,
-                ui.status_message.as_ref().map(|(m, _)| m.clone()),
-            );
-        }
         let tab_view = match tab_manager.active_tab() {
             Tab::Dashboard { .. } => ActiveTabView::Dashboard {
                 exclude_pane_ids: tab_manager.all_managed_pane_ids(),
