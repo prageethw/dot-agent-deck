@@ -13,13 +13,19 @@
 //! for the path #194 was actually filed against — a confirmation-retry
 //! that must not duplicate what the agent sees.
 //!
-//! The user decision recorded in the PRD is that this MUST cover OpenCode
-//! as well as Claude: the write path is agent-agnostic by construction
-//! (`b"\r"` written with no branch on `AgentType`), but CR-as-submit is
-//! documented only for claude and codex (`src/agent_pty.rs:3566`,
-//! `:3668`), and nothing documents how OpenCode treats a STANDALONE CR
-//! arriving seconds after a separate write — a different case from the CR
-//! fused to its own payload, which is what works today.
+//! The user decision recorded in the PRD is that this MUST cover Codex as
+//! well as Claude: the write path is agent-agnostic by construction (`b"\r"`
+//! written with no branch on `AgentType`), and CR-as-submit is documented for
+//! claude and codex (`src/agent_pty.rs:3566`, `:3668`) — this test verifies
+//! that documented behavior actually holds for the confirmation-retry's
+//! STANDALONE CR, arriving seconds after a separate write, a different case
+//! from the CR fused to its own payload that `:3566`/`:3668` document
+//! directly. OpenCode and Pi are explicitly OUT of scope for this PRD's M4
+//! real-agent verification — the user rescoped away from gating on
+//! installing the OpenCode CLI and provisioning an OpenRouter key, recording
+//! the standalone-CR question on those two harnesses as an accepted,
+//! documented unknown rather than a verified one (see the PRD's *Decisions
+//! taken*, commit `6e49744`).
 //!
 //! Fork#197 M4 Part 2 shrinks `CONFIRMATION_GRACE_PERIOD` (2s production
 //! default) to `CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS` below via a
@@ -54,6 +60,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::Duration;
 
 use common::TuiDeck;
@@ -61,7 +68,23 @@ use dot_agent_deck::event::{AgentType, EventType};
 use spec::spec;
 
 const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
-const OPENCODE_MODEL: &str = "openrouter/openai/gpt-4o-mini";
+
+/// PATH for the spawned deck (→ daemon → agents) with the freshly-built
+/// `dot-agent-deck` binary's dir prepended to the host PATH, matching
+/// `codex/live/001` and `orchestration/delegate/009`'s established shape for
+/// a real interactive Codex booted through this harness: the wrapper seam
+/// (`dot-agent-deck wrap --agent codex -- codex …`) resolves it, while the
+/// rest of the host PATH is preserved so the real `codex` binary still
+/// resolves.
+fn path_with_binary_dir() -> String {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin_dir = Path::new(bin)
+        .parent()
+        .expect("test binary has a parent dir")
+        .to_str()
+        .expect("binary directory is UTF-8");
+    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
+}
 
 /// Fixed, uniquely-named per agent so a stale pane from one case can never
 /// satisfy the other. Matches this harness's other real-agent sentinels
@@ -69,7 +92,7 @@ const OPENCODE_MODEL: &str = "openrouter/openai/gpt-4o-mini";
 /// randomly generated, since uniqueness against coincidence is all that's
 /// needed here.
 const CLAUDE_SENTINEL: &str = "ORCH-SEED-015-RETRY-CLAUDE-OK-9f21ab";
-const OPENCODE_SENTINEL: &str = "ORCH-SEED-015-RETRY-OPENCODE-OK-3c58de";
+const CODEX_SENTINEL: &str = "ORCH-SEED-016-RETRY-CODEX-OK-4e91cb";
 
 /// The exact spawn-time pointer text `deliver_orchestrator_prompt`
 /// (`src/ui.rs`) submits into the orchestrator's pane — kept in lockstep
@@ -263,15 +286,21 @@ fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_pr
     );
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive OpenCode process on a cheap mini model, with the confirmation-retry grace period shrunk to a deterministic 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` so the confirmation-retry reliably fires, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — the user-decided coverage gap this PRD's probe surfaced: CR-as-submit is documented only for claude/codex, and nothing documents how OpenCode treats a standalone CR arriving after a separate write — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Codex process on a cheap model, with the confirmation-retry grace period shrunk to a deterministic 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` so the confirmation-retry reliably fires, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — verifying that Codex's documented CR-as-submit behavior (`src/agent_pty.rs:3566`, `:3668`) actually holds for the confirmation-retry's standalone CR, arriving seconds after a separate write, not only the CR fused to its own payload — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
 #[spec("orchestration/seed/016")]
 #[test]
-fn orchestration_seed_016_real_opencode_confirmation_retry_never_duplicates_the_prompt() {
-    skip_unless!(common::check_opencode_available());
+fn orchestration_seed_016_real_codex_confirmation_retry_never_duplicates_the_prompt() {
+    skip_unless!(common::check_codex_available());
+
+    let orchestrator_command = format!(
+        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+        common::codex_test_model(),
+    );
 
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
-        .with_imported_opencode_credentials()
+        .with_env("PATH", path_with_binary_dir())
+        .with_imported_codex_credentials()
         .with_env(
             "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS",
             CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS,
@@ -281,11 +310,11 @@ fn orchestration_seed_016_real_opencode_confirmation_retry_never_duplicates_the_
     run_real_seed_retry(
         deck,
         RealRetryCase {
-            agent_name: "OpenCode",
-            agent_type: AgentType::OpenCode,
-            orchestrator_command: format!("opencode --model {OPENCODE_MODEL} --auto"),
-            input_ready_needle: "Ask anything...",
-            sentinel: OPENCODE_SENTINEL,
+            agent_name: "Codex",
+            agent_type: AgentType::Codex,
+            orchestrator_command,
+            input_ready_needle: common::codex_test_model(),
+            sentinel: CODEX_SENTINEL,
         },
     );
 }
