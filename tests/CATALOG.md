@@ -1566,6 +1566,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** persistence of the toggled state across restart; remapping the chord via config; the reverse toggle order (toggling the Dashboard tab first vs. the Orchestration tab first — `tabs/orchestration/006` covers the same-type case, and both entries together exercise the sharing direction from each tab type without duplicating the full matrix).
 - **Platform coverage:** mac+linux.
 
+##### tabs/dashboard/002 — Opening a new Orchestration tab (Ctrl+n) while a Dashboard pane is already live and attached switches to and STAYS on the new tab, without resetting the deck-global split stage (fork issue #224, regression from PRD fork#192 / PR #193, `7426b25`).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`orch-deck` fixture; a `with_continue_session` stub `cat` pane for the Dashboard tab plus the fixture's `demo-orch` orchestration, no LLM tokens spent).
+- **Asserts:** with a Dashboard pane already live and attached (the distinguishing precondition — `orchestration_006`/`identity_004` open an orchestration from an EMPTY Dashboard and both pass), toggling the deck-global split stage to Narrow (25/75) via `Ctrl+l` and then opening a new Orchestration tab via `Ctrl+n` renders the new tab's role pane and KEEPS it as the active view — checked with `wait_until_grid_then_hold`, which re-asserts the predicate across a 750ms hold window rather than returning on the first grid read that finds it, since the reported defect is a revert back to the Dashboard tab microseconds after the switch; and the pane-column edge stays at the Narrow 25-column boundary rather than resetting to the Orchestration tab's own untoggled 34-column Default.
+- **Does not assert:** the reverse precondition (`tabs/dashboard/001`'s Dashboard-first-then-Orchestration cross-tab-type sharing after both tabs are already open, and the full 3-stage split-stage cycle — covered there); which of `suggest_name_if_orchestration_selected`, the daemon `ListAgents` collision-detection snapshot, or a reconcile/hydrate path is the actual cause of the revert (root-cause isolation is the coder's follow-up); the reverse toggle order or Mode-tab coverage.
+- **Platform coverage:** mac+linux.
+
 #### tabs/selection
 
 ##### tabs/selection/001 — Each tab remembers its own selection by stable id across switch-away/switch-back (PRD #83 M1).
