@@ -174,6 +174,12 @@ jobs:
       # member automatically, which is the property that would have caught
       # this the first time rather than needing a dedicated issue to find it.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
       # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
       # rule 7 fails the build if the Scenario comment is missing or the
       # generator fails"), and the build-macos/build-windows comment says these
@@ -289,6 +295,12 @@ jobs:
       # — separate from the `cargo xtask linkage-check` *binary* invocation,
       # which correctly stays Linux-only per the comment above.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
 
   # macOS (host = aarch64-apple-darwin) compile + clippy + unit-test gate,
   # mirroring build-windows. macOS is otherwise built ONLY in the release
@@ -328,6 +340,12 @@ jobs:
       # so a bare invocation silently skipped the `xtask/*` members' own
       # tests on every job, this one included.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
