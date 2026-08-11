@@ -36495,10 +36495,16 @@ mod tests {
     /// 2's write lands with the session ALREADY `Thinking`, poisoning the
     /// LEVEL path for the cycle's whole duration exactly as
     /// `orchestration/seed/004` does, so LEVEL cannot rescue confirmation. A
-    /// genuine resubmission of the identical text then occurs (modeled by
-    /// advancing `last_activity`, the one per-event signal `SessionSnapshot`
-    /// carries independent of the frozen text value), and delivery must
-    /// still confirm. It does not.
+    /// genuine resubmission of the identical text then occurs, driven
+    /// through `AppState::apply_event` exactly as a real `UserPromptSubmit`
+    /// hook arrives — the only path that sets a submission-specific signal
+    /// (`src/state.rs:4000-4005`, gated on a hook payload that actually
+    /// carries a `prompt` field). `last_activity` is deliberately NOT the
+    /// signal under test here: it forward-stamps on every event
+    /// (`src/state.rs:3976-3977`), including ones that are not submissions
+    /// at all, so keying confirmation on it would falsely confirm on any
+    /// event and is forbidden. Delivery must still confirm on the genuine
+    /// resubmit. It does not.
     #[spec("orchestration/seed/013")]
     #[test]
     fn orchestration_seed_013_text_confirms_a_genuine_resubmit_of_byte_identical_prompt_text() {
@@ -36626,22 +36632,35 @@ mod tests {
              any genuine resubmit occurs"
         );
 
-        // The genuine resubmit: the agent submits the SAME text again.
-        // Since the text is byte-identical to what `last_user_prompt`
-        // already held (cycle 1's leftover, captured as cycle 2's baseline
-        // at the write above), re-assigning it is a no-op for TEXT's value
-        // diff. `last_activity` moving forward is the one per-event signal
-        // on `SessionSnapshot` independent of the frozen string, and is
-        // exactly what a real `UserPromptSubmit` hook event does even when
-        // the submitted text is unchanged (`src/state.rs:3976-3977`).
-        {
-            let session = snapshot
-                .sessions
-                .get_mut("pane-orch-pane-436")
-                .expect("placeholder session");
-            session.last_user_prompt = Some(remit_text.clone());
-            session.last_activity = Utc::now();
-        }
+        // The genuine resubmit: the agent submits the SAME text again,
+        // driven through `AppState::apply_event` — the only path that sets
+        // a sound, submission-specific signal (`src/state.rs:4000-4005`,
+        // gated on `event.user_prompt`, which is populated only from a hook
+        // payload that actually carries a `prompt` field, e.g. a real
+        // `UserPromptSubmit`). `event_type: EventType::Thinking` mirrors
+        // `map_event_type`'s mapping for `"UserPromptSubmit"`
+        // (`src/hook.rs:111`) so this is the same event shape a real hook
+        // delivery would produce. Since the text is byte-identical to what
+        // `last_user_prompt` already held (cycle 1's leftover, captured as
+        // cycle 2's baseline at the write above), this is a no-op for
+        // TEXT's value diff even though it travels the genuine submission
+        // path.
+        snapshot.apply_event(AgentEvent {
+            session_id: "pane-orch-pane-436".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: Some(remit_text.clone()),
+            metadata: Default::default(),
+            pane_id: Some("orch-pane-436".into()),
+            agent_id: Some("orch-agent-436".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
         deliver_orchestrator_prompt(
             &mut ui,
             pane.as_ref(),
