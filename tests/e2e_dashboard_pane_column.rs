@@ -179,8 +179,13 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // byte forwards straight to the pane instead of cycling the split.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
+    // Non-panicking form (see the file-level comment on `find_pane_box_left_edge`
+    // / `pane_box_left_edge` above at :26-42, and the same fix applied at
+    // :156-158): the panicking `pane_box_left_edge` would abort on the first
+    // sampled grid if the box were momentarily absent instead of letting this
+    // 3s loop actually retry.
     let orch_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, "orchestrator") == 0
+        find_pane_box_left_edge(grid, "orchestrator") == Some(0)
     });
     assert!(
         orch_hidden,

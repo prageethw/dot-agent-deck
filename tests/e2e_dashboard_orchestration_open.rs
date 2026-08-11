@@ -50,7 +50,12 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
 /// a 3s follow-up window, not just the first read that finds it — the
 /// reported defect is a revert back to the Dashboard tab that happens some
 /// time after the switch), and the split stage must still read Narrow rather
-/// than having reset to Default.
+/// than having reset to Default. Round 3: mirrors `dashboard_001`'s post-open
+/// `Ctrl+D` + `Ctrl+l` by sending that same input to the freshly-opened tab,
+/// then repeats both checks — still the active view, held again, and the
+/// split now advanced to Hidden rather than reset to Default — to test
+/// whether sending further input to the new tab (not just watching it
+/// passively) is what triggers the reported revert.
 #[spec("tabs/dashboard/002")]
 #[test]
 fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active() {
@@ -133,6 +138,42 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
         "the deck-global split stage must stay Narrow (25/75) after opening \
          an Orchestration tab over a live Dashboard pane, not reset to \
          Default — got pane-column edge {orch_edge_after_open}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Send further input to the freshly-opened Orchestration tab, mirroring
+    // `dashboard_001`'s post-open `Ctrl+D` + `Ctrl+l` (`e2e_dashboard_pane_column.rs:180-181`).
+    // Round 2's own analysis identified this as the one thing `dashboard_001`
+    // does that this test didn't: `dashboard_001` sends further input to the
+    // new tab afterward, `dashboard_002` only watched it passively. PRD #387
+    // M1 scopes `Ctrl+l` to command mode on every tab type, and opening the
+    // tab re-lands the deck in PaneInput mode on its start-role pane, so
+    // `Ctrl+D` must enter Normal mode before the toggle.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
+    deck.send_bytes(b"\x0c"); // Ctrl+l -> Narrow -> Hidden
+
+    // Both symptoms again, now with input directed at the new tab: it must
+    // still be the active view (not reverted to the Dashboard tab), held
+    // across the same 3s window as the pre-input check above rather than
+    // trusting a single read.
+    deck.wait_until_grid_then_hold(
+        "the Orchestration tab's role pane staying the active view after \
+         Ctrl+D/Ctrl+l input was sent to it (not reverting back to the \
+         Dashboard tab)",
+        Duration::from_secs(3),
+        |grid| find_pane_box_left_edge(grid, "orchestrator").is_some(),
+    );
+
+    // And the split stage must have advanced from Narrow to Hidden (the
+    // correct effect of the Ctrl+l just sent), not have reset to Default.
+    let orch_edge_after_input = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
+    assert_eq!(
+        orch_edge_after_input,
+        0,
+        "after Ctrl+D/Ctrl+l was sent to the freshly-opened Orchestration \
+         tab, the split stage must advance to Hidden (0/100) from the \
+         Narrow stage it opened at, not reset to Default — got pane-column \
+         edge {orch_edge_after_input}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
