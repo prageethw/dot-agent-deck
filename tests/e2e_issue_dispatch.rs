@@ -1541,12 +1541,12 @@ const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\
 /// card present, as in `scheduler/dispatch/022`), the stub `gh` log must show
 /// an `issue edit ... --add-label in-progress` invocation for the issue AND
 /// an `issue comment` invocation whose body names the claiming task
-/// (`ScheduledTask.name` via `Identity::issue_dispatch`, PRD fork#235 M1/M2's
-/// single-agent identity — this is the genuinely single-agent claim path
-/// PRD #421 originally covered here, kept distinct from the
-/// orchestration-named claim `scheduler/dispatch/021` exists to pin) — and,
-/// because `in-progress` pre-existed, the add-label call must have actually
-/// SUCCEEDED, not merely been attempted.
+/// (the task name as DECORATION on the round-2 `agent:<pane-id>@<host>`
+/// identity — this is the genuinely single-agent claim path PRD #421
+/// originally covered here, kept distinct from the orchestration-named claim
+/// `scheduler/dispatch/021` exists to pin) — and, because `in-progress`
+/// pre-existed, the add-label call must have actually SUCCEEDED, not merely
+/// been attempted.
 #[spec("scheduler/dispatch/010")]
 #[test]
 fn dispatch_010_success_writes_label_and_claim_comment() {
@@ -1597,6 +1597,21 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     assert!(
         commented,
         "a successful dispatch must post a claim comment naming the claiming task (`dispatch-task`); observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    // PRD fork#235 round 2: the identity itself is now pane-keyed
+    // (`agent:<pane-id>@<host>`), not `issue-dispatch:<task>#<issue>@…` — the
+    // task name above is DECORATION, not the compared identity string.
+    let named_agent_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("agent:"))
+    });
+    assert!(
+        named_agent_identity,
+        "the claim comment must name the round-2 `agent:<pane-id>@<host>` identity, not merely \
+         decorate it with the task name; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
     );
 
@@ -2200,11 +2215,12 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
 /// Scenario: Fire an `issue_dispatch` task against a fixture repo whose
 /// `.dot-agent-deck.toml` opens an ORCHESTRATION tab (`ORCH_TOML`'s
 /// `dispatch-orch`). Assert the posted claim comment names the
-/// ORCHESTRATION's own typed name (`dispatch-orch`), not the scheduled
-/// task's name (`claim-task-021`, the `ScheduledTask.name` PRD #421 used
-/// exclusively) — PRD fork#235 M1/M2 derives the claimant identity from the
-/// bound spawn handle's `SpawnKind` (`Orchestration { name }` vs
-/// `SingleAgent`) rather than from `task_name`.
+/// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, not the
+/// scheduled task's name (`claim-task-021`, the `ScheduledTask.name` PRD
+/// #421 used exclusively) — PRD fork#235 round 2's identity itself is
+/// `agent:<pane-id>@<host>` regardless of which spawn kind fired it; what
+/// differs between an orchestration dispatch and a single-agent one
+/// (`scheduler/dispatch/010`) is only which name is rendered as decoration.
 #[spec("scheduler/dispatch/021")]
 #[test]
 fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
@@ -2239,6 +2255,21 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
          (`dispatch-orch`), not merely be posted; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
     );
+
+    // PRD fork#235 round 2: the identity itself is `agent:<pane-id>@<host>`
+    // regardless of spawn kind — `dispatch-orch` above is decoration only.
+    let named_agent_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("agent:"))
+    });
+    assert!(
+        named_agent_identity,
+        "the claim comment must name the round-2 `agent:<pane-id>@<host>` identity, not merely \
+         decorate it with the orchestration name; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
     let named_task_instead = stub
         .gh_calls()
         .iter()
@@ -2300,6 +2331,21 @@ fn dispatch_022_gh_api_user_failure_skips_assignee_without_failing_dispatch() {
             .iter()
             .any(|l| l.contains("issue") && l.contains("comment"))
     });
+    // PRD fork#235 round 2: identity resolution (`agent:<pane-id>@<host>`)
+    // needs no `gh api user` call at all — only the ASSIGNEE login does — so
+    // the comment must still name the round-2 identity even when the login
+    // resolution that feeds the assignee write fails.
+    let named_agent_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("agent:"))
+    });
+    assert!(
+        named_agent_identity,
+        "the claim comment must name the round-2 `agent:<pane-id>@<host>` identity even when \
+         `gh api user` fails to resolve a login for the assignee write; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
     assert!(
         commented,
         "the claim comment must still be posted even when `gh api user` fails; observed gh \

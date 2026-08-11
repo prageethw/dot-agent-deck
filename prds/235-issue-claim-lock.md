@@ -4,7 +4,19 @@
 
 **Priority**: High
 
-**Status**: Planning
+**Status**: In progress — M1–M4 implemented and green at `375285d`, then **re-scoped after review**. Reviewer and auditor both returned blocking verdicts on the marker-based identity (see "Identity, round 2"). Round-2 fixes in flight.
+
+## Threat model — read this before the design
+
+**What this defends against: accidental collision between cooperating agents.** Fork #74 was an accident — a second orchestration that did not check a label nobody made it check. Every agent involved was trying to do the right thing. That is the whole of the problem this PRD exists to solve.
+
+**What it explicitly does NOT defend against**, recorded as non-goals rather than left implied:
+
+- **Replay.** The identity is published in a public claim comment, so it is a record, not a secret. Anyone who can read the issue can post a comment reproducing it. A deck reading that back sees "held by me" and proceeds.
+- **Forgery.** Anyone who can comment on the issue can write a `Claimed by …` line. There is no author check on claim comments.
+- **A hostile local process.** The ownership marker and the pane environment are both writable by anything running as the same user.
+
+Calling this a "lock" oversells it: it is **cooperative claim coordination**. Prose in this PRD, the CLI help, and the changelog should say "claim", and reserve "lock" for something that could survive an adversary. The auditor's F2/F6/F8 are correct *as adversarial findings* and are out of scope by this definition — they are recorded here so a future reader knows they were considered, not overlooked.
 
 **Fork-only**, and intended to stay so. Builds on PRD #421 (the claim), fork #192 (orchestration names as identity) and fork #144/#425/#166 (the worktree ownership marker) — none of which exist upstream, where [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) is still open and unimplemented. Per `docs/develop/upstream-contribution-policy.md` this is not an offer-later case.
 
@@ -80,6 +92,31 @@ Comparison is on the **whole string**, never the name alone.
 This **neutralises both halves of #222 as a side effect**: even when two long names truncate identically, or two orchestrations are both called `unknown`, their worktree paths differ — rule 1 mandates one worktree per change — so the composed identities differ. It does **not** fix #201; it makes the lock correct despite #201, which stays open.
 
 **The path is digested, never emitted raw.** A claim comment is public, and `/Users/<name>/workspace/…` leaks the OS username and local directory layout. Eight hex of a digest preserves comparison and leaks nothing; #222 proposes exactly this technique for its truncation half, so it is already blessed in-repo. The host is already published in today's claim comment — accepted precedent, unchanged.
+
+## Identity, round 2 — keyed on the pane, not the marker
+
+The round-1 design derived identity from the worktree ownership marker. Reviewer and auditor both found it defeated, from opposite ends:
+
+- **The marker is almost never there.** `owned_git_dir` requires the git-dir to sit under `<common>/worktrees`, which the root checkout's `.git` can never satisfy, and **CLAUDE.md rule 1's mandated flow is the orchestrator creating worktrees by hand with `git worktree add`** — which writes no marker. So the dominant real path is "pane env present, marker absent → refuse", and the orchestrator, the caller M5 rewrites rules 14/23 around, could never claim at all. This is rule 16's exact shape: a consumed value with no named supplier, in a PRD that listed "apply rule 16" as a step.
+- **`human:<login>@<host>` carries no instance component**, so two orchestrations started by one person on one machine compare **equal**, take the idempotent-refresh row, and both proceed — #74 verbatim. With the orchestration form unreachable, that was the form people would actually hit.
+- **The pane env's value was discarded** (`Ok(_)`), so identity came entirely from `cwd` — any agent could assume another orchestration's identity by `cd`-ing into its worktree, deliberately or by accident.
+
+**Round 2: the instance component is `DOT_AGENT_DECK_PANE_ID`**, which the daemon sets in **every** spawned pane (`src/spawn.rs`), needs no marker, and does not travel when an agent changes directory.
+
+| Form | Compared string |
+|---|---|
+| agent (any deck-spawned pane) | `agent:<pane-id>@<host>` |
+| human at a plain terminal | `human:<login>@<host>` |
+
+**Equality is on that string and nothing else.** The orchestration name — from the marker when one exists — is rendered in the comment as human-readable **decoration** and is *not* compared:
+
+```
+Claimed by `agent:pane-7f3a@host-1` (orchestration `fix-166`) at <ts>, for @prageethw.
+```
+
+This is deliberate. Keying equality on the name would reintroduce fork #201's advisory-uniqueness hole; keying it on the marker reintroduces the supply gap above. The name is worth showing because a human reading the issue needs to know *which* orchestration holds it — but it must never be the thing the machine decides on.
+
+**Known consequence, accepted:** the pane ID is per-**pane**, not per-orchestration, so a *worker* pane of the same orchestration gets a different identity and is refused. That is fine — rule 14 has the orchestrator claim before its first delegation, and workers do not claim. It is also fail-closed: the failure mode is an unnecessary refusal, never a missed collision. If an orchestrator pane is respawned with a new pane ID it will refuse itself and need `--takeover --confirm-stopped`; annoying, safe, and visible.
 
 ## Milestones
 
