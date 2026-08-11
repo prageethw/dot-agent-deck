@@ -593,6 +593,72 @@ fn hook_rule_identification_015_windows_percent_and_bang_are_quoted() {
     );
 }
 
+/// A hook rule written by a pre-fix Windows install, in the bare `<path> hook`
+/// legacy shape carrying the platform's real `.exe` suffix
+/// (`C:\Program Files\deck\dot-agent-deck.exe hook`), must still be recognised
+/// as a legacy deck rule on Windows. Review finding H2: `is_legacy_deck_rule`
+/// (`src/hooks_manage.rs:397`) compares a rule's basename against the literal
+/// `DEFAULT_BINARY_NAME` (`"dot-agent-deck"`, no `.exe`), which never matches
+/// a Windows basename — which always carries the extension. Today that means
+/// a fresh install appends a second rule beside the unrecognised legacy one
+/// instead of replacing it (the hook fires twice), and uninstall can never
+/// remove either. This is #229's own duplicate-rule / unremovable-rule
+/// symptom, reintroduced specifically on the platform the fix was meant to
+/// make safe.
+///
+/// Scenario: Seed a legacy Windows rule whose command is a real `.exe` path in
+/// the historical bare `hook` form, install a fresh binary, and assert the
+/// legacy rule is replaced (not duplicated) under `PreToolUse`; separately,
+/// seed the same legacy rule and assert `uninstall_from` removes it entirely.
+#[cfg(windows)]
+#[test]
+fn hook_rule_identification_016_windows_legacy_exe_rule_is_recognised_and_removed() {
+    let legacy_command = r"C:\Program Files\deck\dot-agent-deck.exe hook";
+
+    // Part 1: install must recognise and replace the legacy rule, not
+    // duplicate a fresh one beside it.
+    let (_dir, path) = settings_path();
+    write_settings(
+        &path,
+        &json!({
+            "hooks": {
+                "PreToolUse": [user_rule(legacy_command)]
+            }
+        }),
+    );
+
+    install_to(&path, r"C:\Tools\worker-agent-deck.exe");
+
+    let pre_tool_use = rule_commands(&read_settings(&path), "PreToolUse");
+    assert_eq!(
+        pre_tool_use,
+        vec![r"C:\Tools\worker-agent-deck.exe hook --agent claude-code".to_string()],
+        "a pre-fix Windows legacy rule (with its real .exe suffix) must be \
+         recognised and replaced by the fresh install, not left duplicated \
+         beside a second rule; got {pre_tool_use:?}"
+    );
+
+    // Part 2: uninstall must remove a legacy .exe rule entirely.
+    let (_dir2, path2) = settings_path();
+    write_settings(
+        &path2,
+        &json!({
+            "hooks": {
+                "PreToolUse": [user_rule(legacy_command)]
+            }
+        }),
+    );
+
+    uninstall_from(&path2);
+
+    let remaining = total_rule_count(&read_settings(&path2));
+    assert_eq!(
+        remaining, 0,
+        "a pre-fix Windows legacy .exe rule must be fully removable by \
+         uninstall; {remaining} remained"
+    );
+}
+
 /// Scenario: A `settings.json` made invalid by a single trailing comma — while
 /// still carrying the user's `model`, `env`, and `permissions` configuration —
 /// must never be silently replaced. Audit's most serious finding: `read_settings`
