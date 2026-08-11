@@ -18,6 +18,14 @@
 
 Calling this a "lock" oversells it: it is **cooperative claim coordination**. Prose in this PRD, the CLI help, and the changelog should say "claim", and reserve "lock" for something that could survive an adversary. The auditor's F2/F6/F8 are correct *as adversarial findings* and are out of scope by this definition — they are recorded here so a future reader knows they were considered, not overlooked.
 
+**Amendment (round-3 audit) — the non-goal is about belief, not about writes.** "Forgery is out of scope" was being stretched to excuse what the deck *does* on the strength of comment contents, and that stretch produced three separate findings in three consecutive rounds (A2, A3, A4). Stated precisely:
+
+> **Forgery may deceive the deck about *who holds* an issue. It must never let comment content drive a *write*.**
+
+That is one testable boundary rather than a judgement re-made at every use site. Concretely: everything parsed out of a claim comment — login, identity, host, timestamp — is **untrusted input**, and must be validated or sanitized at the point it leaves the parser, not at each point it is used. A parsed login reaching `--remove-assignee` unvalidated is a defect *even though* forgery is a non-goal, because the deck is taking an action on attacker-supplied text. Believing a forged claim is acceptable; unassigning a real user because of one is not.
+
+The same boundary covers values that never passed through a comment but are equally attacker-influenceable — a worktree **path** and **branch** derived from a scheduled-task name, which `sanitize_clone_segment` strips only `/ \ \0 ..` from. Those reach a public comment body and the operator's terminal, so PRD #421's C5 mention-injection defence must cover them too. Fork #232 is the same observation for `worktree list`.
+
 **Fork-only**, and intended to stay so. Builds on PRD #421 (the claim), fork #192 (orchestration names as identity) and fork #144/#425/#166 (the worktree ownership marker) — none of which exist upstream, where [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) is still open and unimplemented. Per `docs/develop/upstream-contribution-policy.md` this is not an offer-later case.
 
 **Related**: fork [#201](https://github.com/prageethw/dot-agent-deck/issues/201) (name uniqueness is advisory — the defect this PRD routes around) · fork [#222](https://github.com/prageethw/dot-agent-deck/issues/222) (owner-identity collision edges) · fork [#74](https://github.com/prageethw/dot-agent-deck/issues/74) (the motivating collision) · fork #184, #218, #164 (the marker this reads) · upstream [#482](https://github.com/vfarcic/dot-agent-deck/issues/482) (nothing clears a claim), #483, #486, #484 (neighbouring issue-dispatch defects, not fixed here)
@@ -111,8 +119,14 @@ Rule 23 was invisible for rounds 1 and 2 because the harness injects `CLAUDE.md`
 
 | Form | Compared string |
 |---|---|
-| agent working a worktree | the worktree's absolute path + its branch |
+| agent working a worktree | the worktree **root** path (canonicalised) + its branch + the **host** |
 | human at a plain terminal | `human:<login>@<host>` |
+
+**Three corrections from the round-3 audit, each of which made two distinct holders compare equal or one holder split in two:**
+
+1. **The host must stay in the compared identity.** The first round-3 implementation dropped it, so two decks on two machines with identical worktree paths compared **equal** — and identical cross-machine paths are ordinary, not exotic (`/workspaces/<repo>` under Codespaces and devcontainers). That is #74 verbatim. It also left the PRD's own requirement that a refusal name *which machine* unmet.
+2. **Anchor on the worktree root, not `cwd`.** `git rev-parse --show-toplevel`, not `current_dir()`. Otherwise claiming from `<wt>/src` refuses against a claim made from `<wt>` — one actor split into as many identities as it has subdirectories, contradicting this PRD's own "every pane working inside one worktree shares that worktree's identity".
+3. **One normalisation on both sides.** The CLI resolved a physical `getcwd` while the dispatch path built a lexical path from configured text, so a `/tmp` or symlinked workspace could never match its own dispatch's claim. Canonicalise in one place and use it for both writers.
 
 The rendered claim matches rule 23's existing prose format exactly, so the mechanised claim and the hand-written one are **one artefact**, not two competing formats feeding the same `.rfind` parser:
 

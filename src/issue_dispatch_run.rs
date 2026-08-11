@@ -1632,6 +1632,123 @@ mod tests {
         assert_eq!(parsed.login.as_deref(), Some("bob"));
     }
 
+    // --- PRD fork#235 round-3 hardening: issue/claim/019 ---
+
+    /// A minimal, single-purpose synthetic `gh` for
+    /// [`issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`]
+    /// only — not the full stateful fixture `tests/issue_claim.rs` uses,
+    /// since this test drives [`claim_issue`] directly rather than the CLI
+    /// subprocess. `issue view --json comments` always reports ONE prior
+    /// claim naming `$PRIOR_LOGIN` (simulating a same-identity refresh);
+    /// `issue edit --add-assignee`/`--remove-assignee` apply into
+    /// `$GHSTUB_DIR/assignees.txt` in the SAME add-then-remove order real
+    /// `gh` applies (matching `tests/issue_claim.rs`'s `issue/claim/011`
+    /// fix), so a self-cancelling pair nets the file UNASSIGNED exactly as
+    /// it would against a real `gh`; every other verb is a no-op.
+    const CLAIM_019_GH_STUB: &str = r#"#!/bin/sh
+group="$1"; sub="$2"; shift 2 2>/dev/null || true
+add_assignee=""; remove_assignee=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --add-assignee) shift; add_assignee="$1" ;;
+        --remove-assignee) shift; remove_assignee="$1" ;;
+        *) ;;
+    esac
+    shift
+done
+if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
+    printf '{"comments":[{"body":"Claimed by the orchestration `prior` working `/ws/prior` on branch `prior-branch` at 2020-01-01T00:00:00Z, for @%s."}]}\n' "$PRIOR_LOGIN"
+    exit 0
+fi
+if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
+    if [ -n "$add_assignee" ]; then
+        grep -qxF "$add_assignee" "$GHSTUB_DIR/assignees.txt" 2>/dev/null || printf '%s\n' "$add_assignee" >> "$GHSTUB_DIR/assignees.txt"
+    fi
+    if [ -n "$remove_assignee" ] && [ -f "$GHSTUB_DIR/assignees.txt" ]; then
+        grep -vxF "$remove_assignee" "$GHSTUB_DIR/assignees.txt" > "$GHSTUB_DIR/assignees.txt.tmp" 2>/dev/null
+        mv "$GHSTUB_DIR/assignees.txt.tmp" "$GHSTUB_DIR/assignees.txt" 2>/dev/null || true
+    fi
+    exit 0
+fi
+exit 0
+"#;
+
+    /// Scenario: [`claim_issue`] (the unattended `issue_dispatch` claim
+    /// path) is called with the SAME login as a claim comment already on
+    /// record — a same-identity refresh, e.g. the same task re-dispatching
+    /// an issue it already claimed. Reviewer R3 / auditor A8: the
+    /// `--add-assignee X --remove-assignee X` self-cancelling-pair fix
+    /// landed on `issue_claim::do_claim` only (`issue/claim/011`); this
+    /// function still emits the self-cancelling pair unconditionally. Assert
+    /// the assignee ends up STILL SET to that login afterward, never
+    /// unassigned.
+    //
+    // Written as a sync `#[test]` driving an explicit runtime rather than
+    // `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
+    // `#[spec(...)]` to the next plain `fn` definition and does not
+    // recognize a `#[tokio::test] async fn` — see `tests/shell_activity.rs`'s
+    // `shell_activity_001` for the same pattern.
+    #[spec("issue/claim/019")]
+    #[test]
+    #[cfg(unix)]
+    fn issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh = bindir.join("gh");
+        std::fs::write(&gh, CLAIM_019_GH_STUB).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ghstub = scratch.path().join("ghstub");
+        std::fs::create_dir_all(&ghstub).unwrap();
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: `std::env::set_var` is process-global, but CLAUDE.md rule 5's
+        // fork addendum means every test run happens in CI via `cargo nextest`,
+        // which runs each test in its OWN process — so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GHSTUB_DIR", &ghstub);
+            std::env::set_var("PRIOR_LOGIN", "sameuser");
+        }
+
+        let identity =
+            Identity::worktree(Path::new("/ws/task/.worktrees/issue-19"), "agent/issue-19");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(claim_issue(
+            "acme/widgets",
+            19,
+            "dispatch-task",
+            &identity,
+            Some("sameuser"),
+            &crate::scheduler::StderrNotifier,
+        ));
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GHSTUB_DIR");
+            std::env::remove_var("PRIOR_LOGIN");
+        }
+
+        let assignees = std::fs::read_to_string(ghstub.join("assignees.txt")).unwrap_or_default();
+        assert!(
+            assignees.lines().any(|l| l == "sameuser"),
+            "the unattended dispatch path's assignee refresh must keep the assignee — \
+             `claim_issue` still emits a self-cancelling `--add-assignee sameuser \
+             --remove-assignee sameuser` pair on a same-identity refresh, unlike \
+             `issue_claim::do_claim`'s fix for the SAME defect (`issue/claim/011`, reviewer R3 / \
+             auditor A8); got assignees.txt = {assignees:?}"
+        );
+    }
+
     #[test]
     fn record_then_take_worktree_returns_clone_once() {
         let reg = new_worktree_registry();

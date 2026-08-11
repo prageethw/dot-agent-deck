@@ -56,6 +56,9 @@ use std::process::Command;
 
 #[cfg(unix)]
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
+use dot_agent_deck::issue_dispatch::{
+    Identity, claim_comment_body, derive_issue_paths, parse_claim_fields,
+};
 #[cfg(unix)]
 use dot_agent_deck::worktree_reclaim::OWNER_MARKER_FILENAME;
 use spec::spec;
@@ -1060,32 +1063,87 @@ fn issue_claim_011_idempotent_refresh_leaves_assignee_intact() {
     );
 }
 
-/// Scenario: An issue's ONLY claim comment is hostile/malformed — crafted to
-/// carry (a) an embedded newline followed by a forged second `Claimed by `
-/// line, (b) a forged `, for @forgedvictim` clause, (c) a backtick inside
-/// the claimed identity positioned to close a code span early, and (d) a
-/// raw `@forgedmention` mention with a preceding space. A legitimate agent
-/// pane then takes over the issue. Assert: no `gh` call the takeover makes
-/// ever carries the forged/corrupted parse artifact as an argv value (in
-/// particular never as a `--remove-assignee` value), and the deck's OWN
-/// newly-posted comment never carries a LIVE (non-code-spanned) mention
-/// reproduced from the hostile comment — auditor F2/F3/F5, reviewer F8/F9.
-/// This PRD's Threat model places FORGERY of a claim comment's authorship
-/// out of scope (anyone with comment access can write one), but the PARSER
-/// consuming an already-located claim comment's BODY must still not be
-/// corrupted by adversarial content within it.
+/// Scenario: An issue's ONLY claim comment is hostile — and, unlike the
+/// ORIGINAL version of this test, genuinely round-3-parseable. That original
+/// wrote its hostile body in the round-2 comment shape the round-3 parser
+/// rejects outright (`parse_claim_fields_rejects_old_format_comment` pins
+/// that rejection elsewhere), so `parse_claim_fields` returned `None`, the
+/// takeover only ever ran through `RefuseNoIdentity`'s `--takeover
+/// --confirm-stopped` escape hatch, and every assertion below held
+/// TRIVIALLY — reviewer and auditor found this independently: "it passes
+/// with the parser deleted." This version's FIRST line is genuinely
+/// well-formed round-3 worktree-shape text; a raw embedded newline then
+/// introduces a FORGED second `Claimed by` line carrying a `, for
+/// @forgedvictim` clause and cc mentions, so the parser genuinely has
+/// adversarial content to resist. Assert directly on the PARSED fields (so
+/// this test can never again silently defang itself if the format moves):
+/// the recognised identity and timestamp come from the FIRST line only,
+/// never the forged second one, and the recognised login is never the
+/// forged `@forgedvictim` reachable only by scanning past the injected
+/// newline. A legitimate agent pane then takes over the issue: assert no
+/// `gh` call ever carries the forged clause as an argv value (in particular
+/// never as a `--remove-assignee` value), and the deck's OWN newly-posted
+/// comment never carries a LIVE (non-code-spanned) mention — including one
+/// embedded in the LEGITIMATE branch text itself, confirming the wrapping
+/// code-span mechanism holds even for recognised (not forged) data — auditor
+/// F2/F3/F5, reviewer F8/F9. This PRD's Threat model places FORGERY of a
+/// claim comment's authorship out of scope (anyone with comment access can
+/// write one), but the PARSER consuming an already-located claim comment's
+/// BODY must still not be corrupted by adversarial content within it.
 #[spec("issue/claim/012")]
 #[test]
 #[cfg(unix)]
 fn issue_claim_012_hostile_comment_body_does_not_confuse_the_parser() {
     let fx = Fixture::new();
     let repo = "acme/widgets";
-    let hostile_identity = "orchestration:orch-hostile` cc @forgedmention@host-x:11112222";
+    let legit_path = "/legit/holder/path";
+    // Embeds a FOURTH mention directly in the LEGITIMATE (recognised)
+    // branch text — no backtick can survive inside it (the parser's own
+    // first-backtick-terminates rule forbids that structurally), so this
+    // proves the wrapping code span protects even data that DOES reach
+    // `held.identity`, not only the forged/garbage region that never does.
+    let legit_branch = "legit-branch-cc-@forgedmention4";
+    let legit_ts = "2020-01-01T00:00:00Z";
     let hostile_body = format!(
-        "Claimed by {hostile_identity} on `host-x` at 2020-01-01T00:00:00Z, for @forgedvictim.\n\
-         GARBAGE_MARKER_ZZZ Claimed by orchestration:forged-second@host-y:33334444 on `host-y` \
-         at 2099-01-01T00:00:00Z, for @forgedmention2, cc @forgedmention3."
+        "Claimed by the orchestration `orch-hostile` working `{legit_path}` on branch \
+         `{legit_branch}` at {legit_ts}.\n\
+         GARBAGE_MARKER_ZZZ Claimed by orchestration:forged-second working `/forged/path` on \
+         branch `forged-branch` at 2099-01-01T00:00:00Z, for @forgedvictim, cc @forgedmention2, \
+         mention @forgedmention3."
     );
+
+    // The round-3 parser must genuinely consume this body — if it stops
+    // parsing (returns `None`), everything below passes vacuously exactly
+    // like the original `012` did. This is the guard the task exists to add
+    // so this test can never silently defang itself again.
+    let parsed = parse_claim_fields(&hostile_body).expect(
+        "the round-3 parser must genuinely consume this hostile body — if this returns None the \
+         rest of this test would pass vacuously, exactly the '012 is vacuous' finding this \
+         rewrite exists to fix; see prds/235-issue-claim-lock.md's round-3 section",
+    );
+    assert_eq!(
+        parsed.identity,
+        format!("worktree:{legit_path}@{legit_branch}"),
+        "the recognised identity must come from the FIRST (legitimate) `Claimed by` occurrence \
+         ONLY — a forged SECOND `Claimed by` line injected across a raw newline must never \
+         override it; got {:?}",
+        parsed.identity
+    );
+    assert!(
+        !parsed.timestamp.contains("GARBAGE_MARKER_ZZZ") && !parsed.timestamp.contains('\n'),
+        "the recognised claim's timestamp must be scoped to the first line only — a forged \
+         `Claimed by` line injected across a raw newline must never extend the timestamp \
+         capture past that newline; got {:?}",
+        parsed.timestamp
+    );
+    assert_ne!(
+        parsed.login.as_deref(),
+        Some("forgedvictim"),
+        "a forged `, for @victim` clause reachable only by scanning past an injected newline \
+         must never become the recognised claim's login; got {:?}",
+        parsed.login
+    );
+
     let seeded_line = fx.seed_claim_comment(repo, 12, &hostile_body);
 
     let wt = fx.add_worktree("wt-takeover", "takeover-branch");
@@ -1122,7 +1180,15 @@ fn issue_claim_012_hostile_comment_body_does_not_confuse_the_parser() {
     assert!(
         !raw_calls_after.contains("GARBAGE_MARKER_ZZZ"),
         "a forged clause reachable only by scanning past an injected newline must never leak \
-         into a `gh` argv value (e.g. `--remove-assignee`); raw gh-calls.log:\n{raw_calls_after}"
+         into a `gh` argv value; raw gh-calls.log:\n{raw_calls_after}"
+    );
+    assert!(
+        !fx.gh_calls()
+            .iter()
+            .any(|l| l.contains("--remove-assignee") && l.contains("forgedvictim")),
+        "a forged `, for @victim` clause must never reach a `--remove-assignee` argv value; \
+         observed gh calls: {:?}",
+        fx.gh_calls()
     );
 
     // (b) The deck's OWN newly-posted comment must not carry a LIVE mention
@@ -1143,14 +1209,18 @@ fn issue_claim_012_hostile_comment_body_does_not_confuse_the_parser() {
         !new_content.trim().is_empty(),
         "the takeover must have appended its own new comment; raw file content:\n{raw_comments_after}"
     );
-    for mention in ["forgedmention", "forgedmention2", "forgedmention3"] {
+    for mention in [
+        "forgedvictim",
+        "forgedmention2",
+        "forgedmention3",
+        "forgedmention4",
+    ] {
         assert!(
             !raw_mention_present(new_content, mention),
-            "the deck's own new comment must not carry a LIVE `@{mention}` mention reproduced \
-             from the hostile prior comment — GitHub notifies on any bare `@user` outside a code \
-             span, so echoing the hostile identity's own embedded backtick/mention verbatim would \
-             make the deck itself page a real user it never intended to mention; new comment \
-             content: {new_content:?}"
+            "the deck's own new comment must not carry a LIVE `@{mention}` mention — neither one \
+             reproduced from the hostile prior comment's forged/garbage region, nor one embedded \
+             in the LEGITIMATE recognised branch text (`forgedmention4`) — GitHub notifies on any \
+             bare `@user` outside a code span; new comment content: {new_content:?}"
         );
     }
 }
@@ -1328,5 +1398,286 @@ fn issue_claim_015_repo_omitted_derives_from_origin_and_is_shown() {
         refused_text.contains("acme/widgets"),
         "the refusal must ALSO name the derived repo — the reader must be able to tell WHICH \
          tracker (this fork vs. upstream) the refusal is even about; got:\n{refused_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD fork#235 round-3 hardening — RED for the re-review findings (reviewer
+// R1-R3, auditor A1/A3/A5/A6/A8). Reviewer and auditor both endorse the
+// round-3 DESIGN (the marker supply gap and the pane-ID recycling bug are
+// genuinely gone); every test below pins an IMPLEMENTATION defect with a
+// named fix, not a design flaw.
+// ---------------------------------------------------------------------------
+
+/// Scenario: A claim comment is seeded directly for issue 16, naming the
+/// EXACT worktree absolute path and branch a legitimate agent pane will
+/// itself resolve as its own identity when it claims from that SAME
+/// worktree — standing in for "a second deck, on a DIFFERENT physical host,
+/// whose worktree happens to share this path" (ordinary, not exotic: e.g.
+/// `/workspaces/<repo>` under Codespaces/devcontainers). Auditor A1, a
+/// blocker: the compared identity string (`worktree:{path}@{branch}`,
+/// `Identity::Worktree`'s `Display`) carries NO host component at all, so
+/// this pane's claim is today indistinguishable from an idempotent refresh
+/// of its OWN prior claim and succeeds — #74 verbatim, just moved from the
+/// pane-id anchor (round 2) to the worktree-path anchor (round 3). Assert
+/// the claim is REFUSED.
+#[spec("issue/claim/016")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_016_host_is_not_part_of_the_identity() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let wt = fx.add_worktree("wt-shared-path", "shared-branch");
+    fx.mark_owned(&wt, "orchestration:orch-local");
+
+    let wt_str = wt.to_string_lossy().into_owned();
+    let held_body = format!(
+        "Claimed by the orchestration `orch-remote-host` working `{wt_str}` on branch \
+         `shared-branch` at 2020-01-01T00:00:00Z."
+    );
+    fx.seed_claim_comment(repo, 16, &held_body);
+
+    fx.set_login("localuser");
+    let out = fx.run(
+        &wt,
+        &["issue", "claim", "16", "--repo", repo],
+        Some("pane-local"),
+    );
+    assert!(
+        !out.status.success(),
+        "the SAME worktree absolute path and branch claimed from a DIFFERENT host must be \
+         REFUSED — round 3's identity (`worktree:{{path}}@{{branch}}`) carries no host \
+         component at all (auditor A1), so two decks on two different machines with identical \
+         worktree paths compare EQUAL and both take the idempotent-refresh row today (#74 \
+         verbatim); out={}",
+        combined(&out)
+    );
+}
+
+/// Scenario: An agent claims issue 17 from its worktree ROOT (`wt-sub`,
+/// branch `sub-branch`), succeeding. A second claim then runs `issue claim`
+/// again from a SUBDIRECTORY of that SAME worktree (`wt-sub/src`) — standing
+/// in for an agent that legitimately `cd`s into a subdirectory mid-task,
+/// which CLAUDE.md rule 1's "every pane in one worktree shares that
+/// worktree's identity" already promises. Reviewer R1 / auditor A5: identity
+/// anchors on `cwd` VERBATIM, not the worktree ROOT, so `<wt>/src`'s resolved
+/// identity (`worktree:<wt>/src@sub-branch`) differs textually from
+/// `<wt>`'s own (`worktree:<wt>@sub-branch`) and today's second claim is
+/// wrongly REFUSED as a conflict with itself — the case most likely to be
+/// hit in practice, since agents routinely operate from subdirectories.
+/// Assert the second claim succeeds as an idempotent refresh, never a
+/// refusal.
+#[spec("issue/claim/017")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_017_subdirectory_shares_the_worktree_root_identity() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let wt = fx.add_worktree("wt-sub", "sub-branch");
+    fx.mark_owned(&wt, "orchestration:orch-sub");
+    fx.set_login("olga");
+
+    let root_claim = fx.run(
+        &wt,
+        &["issue", "claim", "17", "--repo", repo],
+        Some("pane-root"),
+    );
+    assert!(
+        root_claim.status.success(),
+        "the first claim, from the worktree ROOT, must succeed (sanity precondition); out={}",
+        combined(&root_claim)
+    );
+
+    let subdir = wt.join("src");
+    std::fs::create_dir_all(&subdir).expect("create subdirectory");
+    let sub_claim = fx.run(
+        &subdir,
+        &["issue", "claim", "17", "--repo", repo],
+        Some("pane-sub"),
+    );
+    assert!(
+        sub_claim.status.success(),
+        "a claim from a SUBDIRECTORY of the SAME worktree must be recognized as the SAME \
+         identity and succeed as an idempotent refresh — CLAUDE.md rule 1 promises every pane in \
+         one worktree shares that worktree's identity, but `resolve_caller_identity` anchors on \
+         `cwd` VERBATIM rather than the worktree ROOT (reviewer R1 / auditor A5); out={}",
+        combined(&sub_claim)
+    );
+    let text = combined(&sub_claim).to_lowercase();
+    assert!(
+        !text.contains("held by") && !text.contains("refus"),
+        "a same-identity refresh must not be reported as a refusal/held-by-another message; \
+         out={}",
+        combined(&sub_claim)
+    );
+}
+
+/// Scenario: A claim comment is seeded from an `Identity` built with the
+/// worktree's SYMLINKED (lexical, unresolved) path — the shape
+/// `derive_issue_paths`/`Identity::issue_dispatch` produce when the
+/// dispatch's configured workspace root itself contains a symlink component
+/// (e.g. `/tmp` -> `/private/tmp` on macOS is the natural, non-contrived
+/// case reviewer R2 names). A legitimate CLI `issue claim` is then run with
+/// its OWN `cwd` set through that SAME symlink, exactly as a pane the
+/// dispatch flow spawns into that path would be — `std::env::current_dir()`
+/// (`run_issue_claim_cli`) resolves the PHYSICAL path per POSIX `getcwd`
+/// semantics, so its resolved identity differs textually from the
+/// lexical-path identity seeded above even though both name the exact same
+/// worktree on disk. Assert the CLI claim is recognized as an idempotent
+/// refresh of the SAME identity, never a refusal (reviewer R2 / auditor A6).
+#[spec("issue/claim/018")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_018_symlinked_path_normalizes_to_one_identity() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let wt_real = fx.add_worktree("wt-normalize", "normalize-branch");
+    let wt_link = wt_real
+        .parent()
+        .expect("worktree has a parent dir")
+        .join("wt-normalize-link");
+    std::os::unix::fs::symlink(&wt_real, &wt_link).expect("create symlink to worktree");
+
+    // The "dispatch side" identity, built from the LEXICAL (symlinked,
+    // unresolved) path — exactly the shape `derive_issue_paths` produces
+    // from configured workspace text with no canonicalization applied.
+    let dispatch_identity = Identity::worktree(&wt_link, "normalize-branch");
+    let body = claim_comment_body(&dispatch_identity, "2020-01-01T00:00:00Z", None, None);
+    fx.seed_claim_comment(repo, 18, &body);
+
+    fx.set_login("petra");
+    // The CLI side: spawned with its `cwd` set through the SAME symlink —
+    // `std::env::current_dir()` inside the child resolves the PHYSICAL path.
+    let out = fx.run(
+        &wt_link,
+        &["issue", "claim", "18", "--repo", repo],
+        Some("pane-normalize"),
+    );
+    assert!(
+        out.status.success(),
+        "a claim written through the dispatch path (lexical/symlinked path) and one made from \
+         the CLI in that SAME worktree (which `std::env::current_dir()` resolves to the \
+         PHYSICAL path) must compare EQUAL and succeed as an idempotent refresh — today the CLI \
+         resolves a physical `getcwd` while the dispatch path builds a lexical path from \
+         configured text, so a symlinked workspace can never match its own dispatch's claim \
+         (reviewer R2 / auditor A6); out={}",
+        combined(&out)
+    );
+    let text = combined(&out).to_lowercase();
+    assert!(
+        !text.contains("held by") && !text.contains("refus"),
+        "a same-identity refresh must not be reported as a refusal/held-by-another message; \
+         out={}",
+        combined(&out)
+    );
+}
+
+/// Scenario: A scheduled issue-dispatch task's NAME (hand-edited config,
+/// untrusted per `sanitize_claimant_name`'s own doc) contains a raw backtick
+/// immediately followed by an `@mention`. `sanitize_clone_segment` — which
+/// derives the task's worktree PATH component — strips only `/ \ \0 ..`
+/// (auditor A3), so the backtick and mention both survive intact into the
+/// real worktree directory name that becomes `Identity::Worktree.path`.
+/// Assert the FIRST claim comment the deck itself posts for that identity —
+/// built by `claim_comment_body`, which wraps `path` in its own backtick
+/// pair with NO further sanitization — never lets that mention go LIVE (i.e.
+/// escape the wrapping code span), even though no forged/hostile COMMENT is
+/// involved at all; the task NAME alone is the attack surface, producing a
+/// live `@mention` (or, structurally the same bug, a forged `Claimed by`
+/// line or a forged `, for @victim` clause) with no adversarial comment
+/// required. Also covers the BRANCH component, which the SAME rendering
+/// interpolates with the SAME lack of escaping.
+#[spec("issue/claim/020")]
+#[test]
+fn issue_claim_020_adversarial_task_name_cannot_inject_a_live_mention() {
+    let workspace = Path::new("/ws");
+    let malicious_task_name = "evil`cc @forgedmention5 done";
+    let paths = derive_issue_paths(workspace, malicious_task_name, 20);
+    // Sanity: `sanitize_clone_segment` really did leave the backtick/mention
+    // intact in the derived path — otherwise this test would pass vacuously
+    // because the attack surface it exists to pin was already closed by a
+    // DIFFERENT function than the one under test.
+    assert!(
+        paths
+            .worktree_dir
+            .to_string_lossy()
+            .contains("evil`cc @forgedmention5"),
+        "sanitize_clone_segment must leave the backtick/mention intact in the derived path for \
+         this test to be exercising anything real; got {:?}",
+        paths.worktree_dir
+    );
+
+    let identity =
+        Identity::issue_dispatch(malicious_task_name, 20, &paths.worktree_dir, &paths.branch);
+    let body = claim_comment_body(&identity, "2020-01-01T00:00:00Z", None, None);
+    assert!(
+        !raw_mention_present(&body, "forgedmention5"),
+        "an adversarial issue-dispatch task NAME must never produce a LIVE `@mention` in the \
+         deck's own claim comment via its WORKTREE PATH component — `sanitize_clone_segment` \
+         strips only `/ \\ \\0 ..`, not backticks, so the task name's own backtick closes \
+         `claim_comment_body`'s wrapping code span early and everything after it renders as \
+         live markdown with NO forged comment involved at all; got body: {body:?}"
+    );
+
+    // The branch component is interpolated by the SAME template with the
+    // SAME lack of sanitization — cover it too, directly, since no current
+    // caller derives `branch` from untrusted config the way `path` is here.
+    let branch_identity = Identity::worktree(
+        Path::new("/ws/clean/path"),
+        "clean-branch`cc @forgedmention6 done",
+    );
+    let branch_body = claim_comment_body(&branch_identity, "2020-01-01T00:00:00Z", None, None);
+    assert!(
+        !raw_mention_present(&branch_body, "forgedmention6"),
+        "the SAME code-span escape must never be reachable via the BRANCH component either; got \
+         body: {branch_body:?}"
+    );
+}
+
+/// Scenario: A claim comment is seeded for issue 21 whose timestamp field
+/// carries raw ESC and CR control characters — reachable because
+/// `extract_timestamp` bounds its capture only at the next comma (or end of
+/// string), with no character restriction at all. A DIFFERENT identity then
+/// runs a bare `issue claim` against it, which is refused (the holder is
+/// someone else). Auditor A4: `run_issue_claim`'s `RefuseHeldByOther` arm
+/// sanitizes `holder` (via `sanitize_claimant_name`, applied in
+/// `decide_claim`) but interpolates `held.timestamp` RAW into the ` since
+/// {timestamp}` clause of the refusal message printed to the operator's
+/// terminal — the earlier sanitizer fix cleaned only its sibling field.
+/// Assert the refusal's combined output carries no raw ESC/CR control
+/// characters.
+#[spec("issue/claim/021")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_021_refusal_output_carries_no_raw_control_characters() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let held_body = "Claimed by the orchestration `orch-holder` working `/held/path` on branch \
+         `held-branch` at 2020-01-01T00:00:00Z\u{1b}[31mCONTROL-INJECTED\u{1b}[0m\r, for \
+         @holderlogin.";
+    fx.seed_claim_comment(repo, 21, held_body);
+
+    let wt = fx.add_worktree("wt-control", "control-branch");
+    fx.mark_owned(&wt, "orchestration:orch-control");
+    fx.set_login("quinn");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim", "21", "--repo", repo],
+        Some("pane-control"),
+    );
+    assert!(
+        !out.status.success(),
+        "a claim against an issue held by a DIFFERENT identity must be refused (sanity \
+         precondition); out={}",
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\r'),
+        "the refusal message must never carry a raw ESC or CR control character to the \
+         operator's terminal — `run_issue_claim`'s `RefuseHeldByOther` arm sanitizes `holder` \
+         but interpolates `held.timestamp` RAW into the ` since {{timestamp}}` clause (auditor \
+         A4); got:\n{text:?}"
     );
 }
