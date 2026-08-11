@@ -216,6 +216,17 @@ jobs:
       # (9-12 min) and `continue-on-error: true`. Revisit only if a workspace
       # member ever grows its own `e2e`-gated tests.
       - run: cargo nextest run --features e2e --retries 2
+        env:
+          # Fork issue #224: every e2e panic previously pinned the shared
+          # `pane_box_left_edge` helper's line, not the call site, because
+          # nextest doesn't set this by default. A real backtrace turns a
+          # multi-round timing inference into a one-run answer.
+          RUST_BACKTRACE: "1"
+          # TEMPORARY fork issue #224 diagnostic round — opts into the
+          # eprintln! instrumentation in `src/ui.rs::dispatch_action` and the
+          # main render loop. Remove this line together with that
+          # instrumentation once #224 is root-caused.
+          DOT224_DIAG: "1"
       # `if: always()` because the step above exits non-zero on a real failure and
       # that is exactly when this summary is worth having. (Job-level
       # `continue-on-error` keeps the WORKFLOW conclusion green; it does not
