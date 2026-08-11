@@ -41,6 +41,21 @@
 //! with `max_per_run = 1`, so ONLY issue #1 is ever enumerated — the run is
 //! deterministic against a fixed remote.
 //!
+//! ## The claim precondition (upstream #471 review fix)
+//! `claim_issue` (`src/issue_dispatch_run.rs`) writes an `in-progress` label
+//! on a successful dispatch (PRD #421 M1.0/M1.1) and nothing ever removes
+//! it, so a prior run of THIS test permanently claims fixture issue #1 for
+//! every run after it — the daemon enumerates it, reads the label, and
+//! skips, and this test then hangs to the 120s readiness wait before
+//! panicking with a blank pane and `Records: []`. `clear_stale_claim` runs
+//! FIRST, as an idempotent precondition: a no-op when the label is already
+//! absent, and a skip (not a panic) naming the exact remediation `gh`
+//! command when this account cannot remove it — this account has `pull`-only
+//! access to the fixture repo, confirmed via `gh api
+//! repos/vfarcic/dot-agent-deck-tests --jq .permissions`, so on every machine
+//! that runs this test today the label read (needs no permission) succeeds
+//! and the label removal (needs push/triage) does not.
+//!
 //! Seams it exercises end to end:
 //!   - REAL `gh` on the normal PATH (no stub): the lazily-spawned daemon really
 //!     enumerates (`gh issue list`), checks for an in-flight PR (`gh pr list`),
@@ -91,6 +106,10 @@ const FIXTURE_REPO: &str = "vfarcic/dot-agent-deck-tests";
 const FIXTURE_LABEL: &str = "agent-dispatch-test";
 const SCHEDULE_NAME: &str = "github-issues";
 const SENTINEL: &str = "DISPATCH_E2E_SENTINEL.md";
+/// The fixture's permanent open issue number — the only one `FIXTURE_LABEL`
+/// and `max_per_run = 1` ever enumerate, and the one `clear_stale_claim`
+/// clears the `in-progress` claim from before every run.
+const FIXTURE_ISSUE: u64 = 1;
 /// The fixture's `[[orchestrations]] name` — the label the live orchestration
 /// TAB renders with in the tab strip. NOT the schedule/display name
 /// (`github-issues`, which titles the flat per-role cards) and NOT the worktree
@@ -189,10 +208,161 @@ fn remote_branch_exists(branch: &str) -> Option<bool> {
     }
 }
 
-/// Scenario: Launch the deck attached to a daemon configured with one enabled
-/// `issue_dispatch` schedule that targets the LIVE public fixture repo
-/// `vfarcic/dot-agent-deck-tests` (filtered to the permanent label-gated issue
-/// #1, `max_per_run = 1`) whose `.dot-agent-deck.toml` declares an
+/// upstream #471 review fix: a `gh` failure distinguishing why
+/// [`remove_in_progress_label`] could not clear the claim — only the
+/// `PermissionDenied` variant degrades to a skip; `Other` is a genuine
+/// failure and must not be swallowed.
+enum ClearClaimError {
+    PermissionDenied(String),
+    Other(String),
+}
+
+/// Read (never write — this account has `pull`-only access to the fixture
+/// repo, confirmed via `gh api repos/vfarcic/dot-agent-deck-tests --jq
+/// .permissions`) whether [`FIXTURE_ISSUE`] currently carries
+/// [`dot_agent_deck::issue_dispatch::IN_PROGRESS_LABEL`]. A read needs no
+/// elevated permission, so a failure here is always genuine (network, repo
+/// gone, malformed response) — never a permission problem.
+fn fixture_has_in_progress_label() -> Result<bool, String> {
+    let out = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "view",
+            &FIXTURE_ISSUE.to_string(),
+            "--repo",
+            FIXTURE_REPO,
+            "--json",
+            "labels",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run `gh issue view`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`gh issue view {FIXTURE_ISSUE} --repo {FIXTURE_REPO} --json labels` failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("`gh issue view` returned non-JSON output: {e}"))?;
+    let has_label = json
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .is_some_and(|labels| {
+            labels.iter().any(|l| {
+                l.get("name").and_then(|n| n.as_str())
+                    == Some(dot_agent_deck::issue_dispatch::IN_PROGRESS_LABEL)
+            })
+        });
+    Ok(has_label)
+}
+
+/// Whether `stderr` from a failed `gh issue edit --remove-label` indicates
+/// this account lacks push/triage/admin on the fixture repo, as opposed to a
+/// genuine failure (network, repo gone, malformed response, ...).
+///
+/// TEXTUAL match on `gh`/GitHub's own wording — INFERRED, not observed live:
+/// this harness must never attempt a write this account cannot make (the
+/// maintainer declined that in review, and separately this development
+/// sandbox's own command classifier refuses a `gh issue edit --remove-label`
+/// dry run even against an unrelated repo, so there was no way to capture
+/// the real 403 body without violating that constraint). Same discipline —
+/// and the same caveat — as `is_claim_label_already_exists` in
+/// `src/issue_dispatch_run.rs`: not a documented/stable contract, and a
+/// future `gh`/GitHub wording change could stop matching. That fails SAFE
+/// here: an unrecognized message falls through to the `Other` (genuine
+/// failure) arm, which panics rather than silently degrading to a skip.
+fn is_permission_denied(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("403")
+        || lower.contains("resource not accessible")
+        || lower.contains("must have push access")
+        || lower.contains("must have admin")
+        || lower.contains("must have triage")
+}
+
+/// Attempt to remove [`dot_agent_deck::issue_dispatch::IN_PROGRESS_LABEL`]
+/// from [`FIXTURE_ISSUE`] via `gh issue edit --remove-label`. Only called
+/// once [`fixture_has_in_progress_label`] has confirmed the label is
+/// present, so this never depends on `gh`'s (unverified) behavior for
+/// removing an absent label.
+fn remove_in_progress_label() -> Result<(), ClearClaimError> {
+    let out = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "edit",
+            &FIXTURE_ISSUE.to_string(),
+            "--repo",
+            FIXTURE_REPO,
+            "--remove-label",
+            dot_agent_deck::issue_dispatch::IN_PROGRESS_LABEL,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| ClearClaimError::Other(format!("failed to run `gh issue edit`: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if is_permission_denied(&stderr) {
+        return Err(ClearClaimError::PermissionDenied(stderr));
+    }
+    Err(ClearClaimError::Other(format!(
+        "`gh issue edit {FIXTURE_ISSUE} --repo {FIXTURE_REPO} --remove-label \
+         {}` failed ({}): {stderr}",
+        dot_agent_deck::issue_dispatch::IN_PROGRESS_LABEL,
+        out.status
+    )))
+}
+
+/// upstream #471 review fix: idempotent precondition that clears any stale
+/// `in-progress` claim `claim_issue` (`src/issue_dispatch_run.rs`) left on
+/// the fixture issue by a PREVIOUS run of this test. Without this, every run
+/// after the first permanently skips the fixture issue (nothing ever removes
+/// the claim it writes on success) and the test hangs to the 120s readiness
+/// wait before panicking with a blank pane and `Records: []` — see the
+/// module doc's "production gap" note for the read half of that skip path.
+///
+/// `Ok(())` covers both "the label was present and is now cleared" and "the
+/// label was already absent" (an idempotent precondition, per the task).
+/// `Err(reason)` is returned ONLY for a permission denial — pair this with
+/// `skip_unless!` in the caller, exactly like the credential gates above.
+/// Any other failure (an unreadable fixture, a `gh` failure that is not a
+/// permission denial) panics directly here rather than degrading to a skip:
+/// only the permission case is expected and actionable on this account.
+fn clear_stale_claim() -> Result<(), String> {
+    let has_label = fixture_has_in_progress_label().unwrap_or_else(|e| {
+        panic!("failed to read {FIXTURE_REPO}#{FIXTURE_ISSUE}'s current labels: {e}")
+    });
+    if !has_label {
+        return Ok(());
+    }
+    match remove_in_progress_label() {
+        Ok(()) => Ok(()),
+        Err(ClearClaimError::PermissionDenied(detail)) => Err(format!(
+            "cannot clear the `in-progress` claim from {FIXTURE_REPO}#{FIXTURE_ISSUE} (token \
+             lacks triage/push on that repo): {detail}\nA maintainer must run:\n  gh issue edit \
+             {FIXTURE_ISSUE} --repo {FIXTURE_REPO} --remove-label {}",
+            dot_agent_deck::issue_dispatch::IN_PROGRESS_LABEL
+        )),
+        Err(ClearClaimError::Other(detail)) => panic!(
+            "failed to clear the stale `in-progress` claim from \
+             {FIXTURE_REPO}#{FIXTURE_ISSUE}: {detail}"
+        ),
+    }
+}
+
+/// Scenario: First clear any stale `in-progress` claim a previous run left on
+/// the fixture issue (idempotent precondition — a no-op if the label is
+/// already absent; skips with an actionable message, rather than hanging to
+/// a blank-pane panic, if this account cannot clear it for lack of
+/// push/triage on the fixture repo). Then launch the deck attached to a
+/// daemon configured with one enabled `issue_dispatch` schedule that targets
+/// the LIVE public fixture repo `vfarcic/dot-agent-deck-tests` (filtered to
+/// the permanent label-gated issue #1, `max_per_run = 1`) whose
+/// `.dot-agent-deck.toml` declares an
 /// `[[orchestrations]] name = "issue-work"` with an `orchestrator` (start) and a
 /// `worker` role, both interactive Haiku `claude`, then fire it via `RunNow` over
 /// the attach socket WITHOUT detaching. With the REAL `gh` on PATH and
@@ -229,6 +399,16 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     skip_unless!(token_result.clone().map(|_| ()));
     let token = token_result.expect("github token checked above");
 
+    // upstream #471 review fix: idempotent precondition — clear a stale
+    // `in-progress` claim a PREVIOUS run left on the fixture issue, or this
+    // run's own fire skips it and the test hangs to the 120s readiness wait
+    // before panicking with a blank pane and `Records: []` (see the module
+    // doc's "production gap" note). Skips (rather than panics) specifically
+    // when this account cannot clear the label for lack of push/triage on
+    // the fixture repo; any other failure panics directly inside
+    // `clear_stale_claim`.
+    skip_unless!(clear_stale_claim());
+
     // Workspace root where the daemon provisions the clone
     // (`<work>/github-issues`) and its per-issue worktree
     // (`<work>/github-issues/.worktrees/issue-1`). A scratch tempdir removed on
@@ -257,11 +437,14 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // BEFORE the dispatch fires (the builder writes it into the per-test HOME at
     // launch).
     let workspace_abs = std::path::absolute(&work).expect("absolutize workspace root");
-    let worktree_cwd =
-        dot_agent_deck::issue_dispatch::derive_issue_paths(&workspace_abs, SCHEDULE_NAME, 1)
-            .worktree_dir
-            .to_string_lossy()
-            .into_owned();
+    let worktree_cwd = dot_agent_deck::issue_dispatch::derive_issue_paths(
+        &workspace_abs,
+        SCHEDULE_NAME,
+        FIXTURE_ISSUE,
+    )
+    .worktree_dir
+    .to_string_lossy()
+    .into_owned();
 
     let deck = TuiDeck::builder()
         // Real Claude credentials so the daemon-spawned interactive `claude` role
