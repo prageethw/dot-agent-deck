@@ -41,13 +41,16 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
 }
 
 /// Scenario: launch the deck with a Dashboard pane already live and
-/// attached, toggle the deck-global split stage to Narrow (25/75), then open
-/// a new Orchestration tab via Ctrl+n and complete the form. The new tab's
-/// role pane must render and STAY the active view (checked on an early read
-/// AND held across a follow-up window, not just the first read that finds
-/// it — the reported defect is a revert back to the Dashboard tab that
-/// happens microseconds after the switch), and the split stage must still
-/// read Narrow rather than having reset to Default.
+/// attached, then run the SAME four-press `Ctrl+l` pre-open cycle
+/// `tabs/dashboard/001` uses (Default -> Narrow -> Hidden -> Default ->
+/// Narrow) so this test arrives at the orchestration-open step in the same
+/// state and after comparable wall-clock, before opening a new Orchestration
+/// tab via Ctrl+n and completing the form. The new tab's role pane must
+/// render and STAY the active view (checked on an early read AND held across
+/// a 3s follow-up window, not just the first read that finds it — the
+/// reported defect is a revert back to the Dashboard tab that happens some
+/// time after the switch), and the split stage must still read Narrow rather
+/// than having reset to Default.
 #[spec("tabs/dashboard/002")]
 #[test]
 fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active() {
@@ -62,20 +65,29 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
 
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode, still on the Dashboard tab
 
-    // Toggle the deck-global split stage to Narrow (25/75) BEFORE opening
-    // the orchestration tab, so the split-stage assertion below has
-    // something to preserve.
-    deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
-    let narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 25
-    });
-    assert!(
-        narrowed,
-        "Ctrl+l did not narrow the Dashboard sidebar to the 25/75 split \
-         within 3s — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
-        deck.snapshot_grid()
-    );
+    // Mirror `dashboard_001`'s exact pre-open sequence (round 1 of fork
+    // issue #224's investigation reproduced the defect only through
+    // `dashboard_001`, not through a single Ctrl+l press here — either the
+    // extra split-stage transitions or the extra wall-clock they burn
+    // matters, and this test does not need to know which). Four presses:
+    // Default(33) -> Narrow(25) -> Hidden(0) -> Default(33) -> Narrow(25).
+    // This is NOT re-asserting the cycle itself — `tabs/dashboard/001` owns
+    // that job — these waits exist only so each press lands before the next
+    // one is sent.
+    for expected_edge in [25u16, 0, 33, 25] {
+        deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
+        let reached = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+            pane_box_left_edge(grid, DASH_PANE) == expected_edge
+        });
+        assert!(
+            reached,
+            "Ctrl+l did not bring the Dashboard sidebar to the {expected_edge}\
+             -column split-stage edge within 3s during the pre-open cycle — \
+             pane-column edge stayed at {}\nGrid:\n{}",
+            pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+            deck.snapshot_grid()
+        );
+    }
 
     // Open a real Orchestration tab (Ctrl+n new-pane flow) in the same
     // directory, WHILE the Dashboard pane above is still live and attached
@@ -91,19 +103,22 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
     deck.wait_for_absence("New Agent"); // new-pane form closed
 
     // The reported defect: the switch to the new Orchestration tab happens
-    // and then REVERTS back to the Dashboard tab microseconds later — a
-    // single bounded probe that returns as soon as the role pane is found
-    // would pass and hide the bug (this is exactly what happened in
-    // `dashboard_001` before this focused test existed: PR #223's 3s wait
-    // finds the `orchestrator` pane box, and the very next grid read no
-    // longer does). `wait_until_grid_then_hold` waits for the role pane to
-    // first appear, then keeps re-reading the grid and re-asserting the
-    // predicate for the hold window, so a revert anywhere inside that
-    // window fails the assertion instead of being missed.
+    // and then REVERTS back to the Dashboard tab some time later — a single
+    // bounded probe that returns as soon as the role pane is found would
+    // pass and hide the bug (this is exactly what happened in `dashboard_001`
+    // before this focused test existed: PR #223's 3s wait finds the
+    // `orchestrator` pane box, and the very next grid read no longer does).
+    // `wait_until_grid_then_hold` waits for the role pane to first appear,
+    // then keeps re-reading the grid and re-asserting the predicate for the
+    // hold window, so a revert anywhere inside that window fails the
+    // assertion instead of being missed. Round 1 held for 750ms and did not
+    // reproduce; widened to 3s here in case the revert lands later than that
+    // (a periodic background reconcile, rather than something tied to the
+    // open path itself, would explain a longer delay).
     deck.wait_until_grid_then_hold(
         "the new Orchestration tab's role pane staying the active view \
          (not reverting back to the Dashboard tab)",
-        Duration::from_millis(750),
+        Duration::from_secs(3),
         |grid| find_pane_box_left_edge(grid, "orchestrator").is_some(),
     );
 
