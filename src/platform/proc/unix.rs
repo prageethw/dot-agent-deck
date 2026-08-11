@@ -540,15 +540,36 @@ const PS_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="];
 /// before the async move below, a Tokio worker) forever.
 pub const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
 
+/// Byte ceiling on one [`capture_bounded`]/[`capture_bounded_async`] capture
+/// (fork issue #212). `PS_SAMPLE_BUDGET` bounds how long a sample may take but
+/// not how much it may allocate — measured during PR #206's security audit at
+/// a single **300,160-byte row** for one process with a 300 KB argv, `-w -w`
+/// leaving it untruncated. That row finishes well inside the time budget, so
+/// only a byte cap catches it.
+///
+/// 256 KiB. Chosen to sit strictly below the pathological row — the cap fires
+/// partway through ingesting it, not after the whole payload has already
+/// landed in memory — while staying well clear of a healthy `ps -A -w -w`
+/// sample, which is normally tens of KB to (on a genuinely process-heavy
+/// desktop, measured locally at ~1,200 processes) a couple hundred KB. This is
+/// the one number to retune if a real deployment's healthy sample turns out to
+/// sit closer to it than expected; nothing else depends on the exact value.
+pub const PS_SAMPLE_BYTE_CAP: u64 = 256 * 1024;
+
 /// Run `program args…` with its stdout captured, abandoning it if it has not
-/// finished within `budget`. `None` means "no usable output": spawn failed, the
-/// budget elapsed, or the process exited non-zero.
+/// finished within `budget` or its stdout exceeds [`PS_SAMPLE_BYTE_CAP`].
+/// `None` means "no usable output": spawn failed, the budget elapsed, the
+/// output exceeded the size cap, or the process exited non-zero.
 ///
 /// The child is polled through the [`std::process::Child`] this function owns
 /// and is never reaped before the kill decision is made, so the SIGKILL cannot
 /// land on a recycled pid. stdout is drained on a helper thread because `ps -A`
 /// output routinely exceeds a pipe buffer: waiting on the child while nothing
-/// reads the pipe would deadlock the very timeout this exists to enforce.
+/// reads the pipe would deadlock the very timeout this exists to enforce. The
+/// helper thread reads at most `PS_SAMPLE_BYTE_CAP + 1` bytes (via
+/// `Read::take`) rather than draining to EOF — an over-cap producer is left
+/// blocked on its own write() once the cap is hit, which the main loop's
+/// `cap_rx` check kills promptly instead of waiting out the whole time budget.
 fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<String> {
     use std::io::Read;
 
@@ -569,14 +590,27 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
         let _ = child.wait();
         return None;
     };
+    let (cap_tx, cap_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
+        let mut limited = (&mut pipe).take(PS_SAMPLE_BYTE_CAP + 1);
+        let _ = limited.read_to_end(&mut buf);
+        let _ = cap_tx.send(buf.len() as u64 > PS_SAMPLE_BYTE_CAP);
         buf
     });
 
     let deadline = std::time::Instant::now() + budget;
     let status = loop {
+        if let Ok(true) = cap_rx.try_recv() {
+            tracing::warn!(
+                program,
+                cap = PS_SAMPLE_BYTE_CAP,
+                "process-table sample exceeded its size cap — killing it and reporting no sample"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
@@ -600,6 +634,11 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
     };
 
     let stdout = reader.join().ok()?;
+    if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
+        // Belt-and-braces: a fast, self-limiting over-cap producer can exit on
+        // its own before the poll loop above observes the `cap_rx` signal.
+        return None;
+    }
     if !status?.success() {
         return None;
     }
@@ -607,13 +646,21 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
 }
 
 /// The async twin of [`capture_bounded`], for callers on a Tokio runtime.
+/// Bounded the same two ways: [`PS_SAMPLE_BUDGET`] on wall clock, and
+/// [`PS_SAMPLE_BYTE_CAP`] on stdout size.
 ///
-/// `kill_on_drop` is what makes the timeout real: when `tokio::time::timeout`
-/// drops the inner future, the child is dropped, killed, and reaped by Tokio's
-/// orphan reaper. That is also why this is a `tokio::process::Command` rather
-/// than a `spawn_blocking` wrapper around [`capture_bounded`] — see
-/// [`process_table_async`].
+/// `kill_on_drop` remains set as a safety net, but with the manual spawn below
+/// `child` is owned by this function rather than by the timed future, so a
+/// `tokio::time::timeout` firing no longer reaps it implicitly — both the
+/// budget and size-cap branches kill and wait on it explicitly. That is also
+/// why this spawns and reads stdout manually rather than calling
+/// `Command::output()`: `output()` collects stdout to EOF with no size bound,
+/// which is exactly the gap #212 closes. Reads are capped at
+/// `PS_SAMPLE_BYTE_CAP + 1` bytes via `AsyncReadExt::take`, matching the sync
+/// form's shape — see [`process_table_async`].
 async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
     if budget.is_zero() {
         return None;
     }
@@ -621,21 +668,52 @@ async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -
     command
         .args(args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let Ok(output) = tokio::time::timeout(budget, command.output()).await else {
+    let mut child = command.spawn().ok()?;
+    let Some(mut pipe) = child.stdout.take() else {
+        // Unreachable — stdout was just configured as a pipe — but returning
+        // without reaping would leave a zombie behind on every call.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    };
+
+    let read_capped = async {
+        let mut buf = Vec::new();
+        let mut limited = (&mut pipe).take(PS_SAMPLE_BYTE_CAP + 1);
+        let _ = limited.read_to_end(&mut buf).await;
+        buf
+    };
+
+    let Ok(stdout) = tokio::time::timeout(budget, read_capped).await else {
         tracing::warn!(
             program,
             ?budget,
             "process-table sample exceeded its budget — killing it and reporting no sample"
         );
+        let _ = child.kill().await;
+        let _ = child.wait().await;
         return None;
     };
-    let output = output.ok()?;
-    if !output.status.success() {
+
+    if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
+        tracing::warn!(
+            program,
+            cap = PS_SAMPLE_BYTE_CAP,
+            "process-table sample exceeded its size cap — killing it and reporting no sample"
+        );
+        let _ = child.kill().await;
+        let _ = child.wait().await;
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+
+    let status = child.wait().await.ok()?;
+    if !status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 /// The sampling sequence itself, over an injected `capture` (called twice) and

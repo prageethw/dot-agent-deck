@@ -181,10 +181,18 @@ pub fn descendants(table: &[ProcessInfo], root_pid: i32) -> Vec<&ProcessInfo> {
 /// signal purely structural for the rest.
 ///
 /// `None` means "no answer available": `root_pid` is not in the table (it
-/// exited, or the table was sampled from another PID namespace), or its own
-/// session id could not be read. `None` is deliberately not folded into
-/// `Some(false)` — the caller must be able to leave a pane's status alone
-/// rather than assert it is idle.
+/// exited, or the table was sampled from another PID namespace), its own
+/// session id could not be read, or — the per-row fail-safe, fork issue #160
+/// — at least one candidate descendant's session id could not be read and no
+/// other candidate resolved a confirmed `Some(true)`. `None` is deliberately
+/// not folded into `Some(false)` — the caller must be able to leave a pane's
+/// status alone rather than assert it is idle. A single unreadable row used to
+/// be `continue`d identically to a genuinely same-session row, so a candidate
+/// set where *every* row was unreadable fell through to a confident
+/// `Some(false)` — a total false negative, the worse failure direction (see
+/// `docs/develop/shell-activity-signal.md`). A confirmed-busy candidate still
+/// short-circuits `Some(true)` immediately, unreadable rows elsewhere in the
+/// set notwithstanding.
 ///
 /// Note what this does **not** consult: [`ProcessInfo::has_controlling_tty`].
 /// A bare no-controlling-terminal test collapses in a container, where the
@@ -199,17 +207,29 @@ pub fn descendant_shell_activity(
         return None;
     }
 
+    let mut had_unreadable_candidate = false;
     for candidate in descendants(table, root_pid) {
         // A row whose session id could not be read is unclassifiable, not
         // "different" — counting it as different would turn an exit racing the
-        // sample into a false `Working`.
-        if candidate.session_id <= 0 || candidate.session_id == root.session_id {
+        // sample into a false `Working`. It is tracked separately from "same
+        // session" so a set where every candidate is unreadable reports
+        // unknown rather than a confident idle (fork issue #160's per-row
+        // fail-safe) — a confirmed-busy candidate elsewhere in the set still
+        // wins immediately via the `return Some(true)` below, untouched.
+        if candidate.session_id <= 0 {
+            had_unreadable_candidate = true;
+            continue;
+        }
+        if candidate.session_id == root.session_id {
             continue;
         }
         if !shapes.is_empty() && !shapes.iter().any(|shape| shape.matches(&candidate.argv)) {
             continue;
         }
         return Some(true);
+    }
+    if had_unreadable_candidate {
+        return None;
     }
     Some(false)
 }

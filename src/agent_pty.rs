@@ -2270,6 +2270,19 @@ impl Default for AgentPtyRegistry {
 /// vec; only `candidates` tells them apart. See the daemon's poll loop,
 /// which is the only production caller, for how the two counts are combined
 /// into a three-way discriminator.
+///
+/// Fork issue #216: `candidates` alone still cannot say **which** pane went
+/// unconfirmed — only how many did, aggregated across the whole deck. That is
+/// exactly what let PR #206's `consecutive_process_table_failures: u32`
+/// (`run_shell_activity_monitor` in `daemon.rs`) reset to zero on ANY one
+/// pane classifying, no matter how many *other* panes were degraded by the
+/// same contention that made the rest fail — the failure is load-correlated
+/// in the wrong direction, since more panes means more likely at least one
+/// classifies. `unconfirmed` closes that: every candidate pane that went
+/// unconfirmed this tick is named explicitly, rather than being represented
+/// only by its absence from `statuses` and folded into the aggregate
+/// `candidates` count. `daemon.rs` keys its per-pane failure streak off this
+/// field instead of one deck-wide scalar.
 pub struct ShellForegroundBusySnapshot {
     /// `(pane_id, busy)` for every pane the scan actually classified this
     /// tick.
@@ -2279,6 +2292,11 @@ pub struct ShellForegroundBusySnapshot {
     /// not the scan could actually classify them. Zero candidates means
     /// there was nothing to classify — not degradation, just an idle deck.
     pub candidates: usize,
+    /// The pane id of every candidate pane the scan attempted but could not
+    /// classify this tick (`RunningAgent::shell_activity_in` returned `None`)
+    /// — fork issue #216's named counterpart to `candidates`. Always a subset
+    /// of the candidates: `statuses.len() + unconfirmed.len() == candidates`.
+    pub unconfirmed: Vec<String>,
 }
 
 impl AgentPtyRegistry {
@@ -4260,6 +4278,7 @@ impl AgentPtyRegistry {
     ) -> ShellForegroundBusySnapshot {
         let inner = self.inner.lock().unwrap();
         let mut candidates = 0usize;
+        let mut unconfirmed = Vec::new();
         let statuses = inner
             .agents
             .values()
@@ -4271,7 +4290,8 @@ impl AgentPtyRegistry {
                 // itself can fail it (shape veto, missing session id, …) so
                 // the count answers "was there anything to classify", not
                 // "did classification succeed".
-                if agent.child.process_id().is_some() {
+                let is_candidate = agent.child.process_id().is_some();
+                if is_candidate {
                     candidates += 1;
                 }
                 let key = shell_tool_shape_key(agent.agent_type.as_ref());
@@ -4280,13 +4300,25 @@ impl AgentPtyRegistry {
                     .copied()
                     .filter(|shape| Some(shape.agent) == key)
                     .collect();
-                let busy = agent.shell_activity_in(table, &for_pane)?;
-                Some((pane_id, busy))
+                match agent.shell_activity_in(table, &for_pane) {
+                    Some(busy) => Some((pane_id, busy)),
+                    None => {
+                        // Fork issue #216: name the unconfirmed candidate
+                        // explicitly rather than letting it vanish as a
+                        // `filter_map` `None` — see `unconfirmed`'s doc on
+                        // [`ShellForegroundBusySnapshot`].
+                        if is_candidate {
+                            unconfirmed.push(pane_id);
+                        }
+                        None
+                    }
+                }
             })
             .collect();
         ShellForegroundBusySnapshot {
             statuses,
             candidates,
+            unconfirmed,
         }
     }
 
