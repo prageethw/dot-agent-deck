@@ -36484,4 +36484,196 @@ mod tests {
              would mean `reset_delivery_cycle()` forgot to clear it)"
         );
     }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` through TWO delivery
+    /// cycles on one tab/pane where BOTH cycles send byte-identical prompt
+    /// text — modeling `prepare_orchestrator_prompt`'s real constant pointer
+    /// text (fork #187). Cycle 1 finalizes via a genuine TEXT confirmation
+    /// (its baseline is `None`, so a plain exact match confirms it), which
+    /// leaves `last_user_prompt` holding that exact text behind as cycle 2's
+    /// leftover baseline — the real-world condition #187 describes. Cycle
+    /// 2's write lands with the session ALREADY `Thinking`, poisoning the
+    /// LEVEL path for the cycle's whole duration exactly as
+    /// `orchestration/seed/004` does, so LEVEL cannot rescue confirmation. A
+    /// genuine resubmission of the identical text then occurs (modeled by
+    /// advancing `last_activity`, the one per-event signal `SessionSnapshot`
+    /// carries independent of the frozen text value), and delivery must
+    /// still confirm. It does not.
+    #[spec("orchestration/seed/013")]
+    #[test]
+    fn orchestration_seed_013_text_confirms_a_genuine_resubmit_of_byte_identical_prompt_text() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 436;
+        let cycle_one_start = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at
+            .insert(tab_id, cycle_one_start);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            cycle_one_start
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-436".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-436".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-436".into()),
+        );
+        // The SAME constant pointer text every cycle sends — real-world
+        // `prepare_orchestrator_prompt` never varies it.
+        let remit_text = "orchestrator prompt".to_string();
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(remit_text.clone());
+
+        // Cycle 1, frame 1: the write lands. The session is `Idle`
+        // throughout this cycle, so LEVEL cannot confirm it either —
+        // confirmation must come via TEXT alone, same as cycle 2 later.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_one_start,
+            tab_id,
+            &["orch-pane-436".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: cycle 1's write must land and await confirmation"
+        );
+
+        // Cycle 1, frame 2: a genuine submit is observed — `last_user_prompt`
+        // becomes an exact match of `remit_text`. Cycle 1's baseline is
+        // `None` (no prior cycle), so this is real positive identification
+        // and TEXT confirms it. Finalizing leaves `last_user_prompt` ==
+        // `remit_text` behind on the session — cycle 2's leftover baseline.
+        {
+            let session = snapshot
+                .sessions
+                .get_mut("pane-orch-pane-436")
+                .expect("placeholder session");
+            session.last_user_prompt = Some(remit_text.clone());
+            session.last_activity = Utc::now();
+        }
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_one_start + std::time::Duration::from_millis(50),
+            tab_id,
+            &["orch-pane-436".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_none() && ui.orchestration_prompted.contains(&tab_id),
+            "precondition: cycle 1 must finalize via a genuine TEXT \
+             confirmation (baseline `None`, exact match), leaving \
+             `last_user_prompt` == remit_text as cycle 2's leftover baseline"
+        );
+
+        // A fresh cycle 2 starts on the SAME tab/pane with the SAME text —
+        // the re-arm gate re-sends `prepare_orchestrator_prompt`'s constant
+        // pointer, never a different string (`src/ui.rs:12362`).
+        let cycle_two_start = cycle_one_start + std::time::Duration::from_secs(2);
+        ui.orchestration_prompt_anchor_at
+            .insert(tab_id, cycle_two_start);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            cycle_two_start
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        // The trap this test is built around: poison LEVEL for cycle 2's
+        // ENTIRE duration by making the session already `Thinking` before
+        // cycle 2's write lands — the same technique `orchestration/seed/004`
+        // frame 1 uses. `pre_write_thinking` is captured once at the write
+        // and is NEVER cleared mid-cycle, so no later status transition can
+        // let LEVEL rescue this cycle. Only TEXT is left standing between
+        // here and the assertion below.
+        snapshot
+            .sessions
+            .get_mut("pane-orch-pane-436")
+            .expect("placeholder session")
+            .status = SessionStatus::Thinking;
+        let mut prompt = Some(remit_text.clone());
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_two_start,
+            tab_id,
+            &["orch-pane-436".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: cycle 2's write must land and await confirmation, \
+             with LEVEL already poisoned (pre_write_thinking=true) before \
+             any genuine resubmit occurs"
+        );
+
+        // The genuine resubmit: the agent submits the SAME text again.
+        // Since the text is byte-identical to what `last_user_prompt`
+        // already held (cycle 1's leftover, captured as cycle 2's baseline
+        // at the write above), re-assigning it is a no-op for TEXT's value
+        // diff. `last_activity` moving forward is the one per-event signal
+        // on `SessionSnapshot` independent of the frozen string, and is
+        // exactly what a real `UserPromptSubmit` hook event does even when
+        // the submitted text is unchanged (`src/state.rs:3976-3977`).
+        {
+            let session = snapshot
+                .sessions
+                .get_mut("pane-orch-pane-436")
+                .expect("placeholder session");
+            session.last_user_prompt = Some(remit_text.clone());
+            session.last_activity = Utc::now();
+        }
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            cycle_two_start + std::time::Duration::from_millis(50),
+            tab_id,
+            &["orch-pane-436".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        let confirmed_after_genuine_resubmit = prompt.is_none();
+        let role_status_after_genuine_resubmit = role_statuses[0];
+
+        assert!(
+            confirmed_after_genuine_resubmit
+                && role_status_after_genuine_resubmit == OrchestrationRoleStatus::Working,
+            "a genuine resubmit of byte-identical prompt text must confirm \
+             delivery, with NO LEVEL signal available to rescue it \
+             (pre_write_thinking=true for the whole cycle, so \
+             level_confirmed is structurally false regardless of session \
+             status): confirmed_after_genuine_resubmit={confirmed_after_genuine_resubmit} \
+             (expected true — `prompt.is_none()`), \
+             role_status_after_genuine_resubmit={role_status_after_genuine_resubmit:?} \
+             (expected `OrchestrationRoleStatus::Working`). Today this is \
+             false: `prompt_text_confirms` requires `observed != baseline`, \
+             but cycle 1 already left `last_user_prompt` == remit_text as \
+             cycle 2's baseline, so a genuine resubmit of the SAME text \
+             never differs from that baseline and TEXT can never fire — \
+             fork #187's structurally-dead path, reproduced here on the \
+             SECOND cycle rather than asserted by inspecting the predicate."
+        );
+    }
 }
