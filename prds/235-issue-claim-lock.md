@@ -101,12 +101,30 @@ The round-1 design derived identity from the worktree ownership marker. Reviewer
 - **`human:<login>@<host>` carries no instance component**, so two orchestrations started by one person on one machine compare **equal**, take the idempotent-refresh row, and both proceed — #74 verbatim. With the orchestration form unreachable, that was the form people would actually hit.
 - **The pane env's value was discarded** (`Ok(_)`), so identity came entirely from `cwd` — any agent could assume another orchestration's identity by `cd`-ing into its worktree, deliberately or by accident.
 
-**Round 2: the instance component is `DOT_AGENT_DECK_PANE_ID`**, which the daemon sets in **every** spawned pane (`src/spawn.rs`), needs no marker, and does not travel when an agent changes directory.
+**Round 2 keyed the instance on `DOT_AGENT_DECK_PANE_ID`. That was also wrong**, and for a reason already written down: CLAUDE.md **rule 23**, verified 2026-08-10, records that those values are *"small daemon-scoped integers … and they recycle across a daemon restart."* Confirmed in code — `next_pane_id` (`src/spawn.rs:718`) increments `PANE_COUNTER`, a process-global atomic that resets with the daemon. So after a restart a new orchestration reusing pane id `6` compares **equal** to the previous holder, takes the idempotent-refresh row, and proceeds. That is the fork #160/#163/#166 incident rule 23 exists to prevent.
+
+Rule 23 was invisible for rounds 1 and 2 because the harness injects `CLAUDE.md` from the **root checkout**, which sits at `4a68720` with 21 rules while `origin/main` carries 23 (filed as fork [#242](https://github.com/prageethw/dot-agent-deck/issues/242)).
+
+**Round 3: the anchor is the worktree path and branch** — rule 23's own answer, for rule 16's own reason:
+
+> The claim comment names the **worktree path and branch** you created for the issue, per rule 1 … Those are the right identifiers because rule 1 **already obliges you to create and name them**, so this rule invents no new mechanism and consumes nothing rule 1 does not already supply.
 
 | Form | Compared string |
 |---|---|
-| agent (any deck-spawned pane) | `agent:<pane-id>@<host>` |
+| agent working a worktree | the worktree's absolute path + its branch |
 | human at a plain terminal | `human:<login>@<host>` |
+
+The rendered claim matches rule 23's existing prose format exactly, so the mechanised claim and the hand-written one are **one artefact**, not two competing formats feeding the same `.rfind` parser:
+
+```
+Claimed by the orchestration working `/Users/…/dot-agent-deck-prd235` on branch `prd-235-issue-claim-lock`.
+```
+
+**Three consequences that reverse earlier decisions:**
+
+1. **The digest is dropped, and `issue/claim/008` with it.** Rule 23 publishes the raw path deliberately: the check it enables is a human running `git worktree list`, and a digest is uncheckable. Publishing the path is already the status quo on this repo's issues.
+2. **"`cd` changes your identity" stops being a defect and becomes the definition.** The worktree *is* the unit of work; one orchestration entering another's is the rule 1 violation itself, not an identity flaw.
+3. **Stable across daemon restarts**, which is what rounds 1 and 2 both failed at from opposite ends — a value that is never written, then a value that is rewritten.
 
 **Equality is on that string and nothing else.** The orchestration name — from the marker when one exists — is rendered in the comment as human-readable **decoration** and is *not* compared:
 
@@ -116,7 +134,9 @@ Claimed by `agent:pane-7f3a@host-1` (orchestration `fix-166`) at <ts>, for @prag
 
 This is deliberate. Keying equality on the name would reintroduce fork #201's advisory-uniqueness hole; keying it on the marker reintroduces the supply gap above. The name is worth showing because a human reading the issue needs to know *which* orchestration holds it — but it must never be the thing the machine decides on.
 
-**Known consequence, accepted:** the pane ID is per-**pane**, not per-orchestration, so a *worker* pane of the same orchestration gets a different identity and is refused. That is fine — rule 14 has the orchestrator claim before its first delegation, and workers do not claim. It is also fail-closed: the failure mode is an unnecessary refusal, never a missed collision. If an orchestrator pane is respawned with a new pane ID it will refuse itself and need `--takeover --confirm-stopped`; annoying, safe, and visible.
+**Known consequence, accepted:** every pane working inside one worktree shares that worktree's identity, so an orchestrator and the workers it delegates into the same worktree all claim as the same actor. That is correct — rule 1 makes the worktree the unit of a change, and they *are* one actor working one change. Two orchestrations can never share it, because rule 1 forbids exactly that.
+
+**Where it is weaker than rounds 1–2 would have been:** a claim outside any worktree — a human at a plain terminal, or an agent in the root checkout — falls back to `human:<login>@<host>`, which has no instance component. Two such claimants on one machine still compare equal. That residual is accepted: rule 1 already forbids working in the root checkout, and a human racing themselves across two terminals can see both.
 
 ## Milestones
 

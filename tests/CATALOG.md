@@ -899,12 +899,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### issue/claim
 
-Round 2 (PRD fork#235, re-scoped after review): identity is `agent:<pane-id>@<host>` from `DOT_AGENT_DECK_PANE_ID`, keyed on the pane, never on the worktree ownership marker or a decorative name. The marker (when present) supplies human-readable DECORATION only — an orchestration's typed name shown in the claim comment for a human reader — and is never part of the compared identity string. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 2's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still marker-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
+Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's WORKTREE — its absolute path plus its git branch (CLAUDE.md rule 23) — never a `DOT_AGENT_DECK_PANE_ID` value (round 2, dropped: those ids recycle across a daemon restart, fork #160/#163/#166) and never the worktree ownership marker (round 1, dropped: the marker is almost never present under CLAUDE.md rule 1's mandated hand-made `git worktree add`). Both the path and the branch are derivable straight from `git`, so no marker is required at all — the marker, when present, supplies human-readable DECORATION only and is never part of the compared identity. A human claiming outside any worktree still resolves as `human:<login>@<host>` — that half is unchanged since round 1. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 3's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still pane-id-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
 
-##### issue/claim/001 — `dot-agent-deck issue claim` refuses when the issue is already held by a DIFFERENT agent-pane identity, exits non-zero, writes nothing, and names the holder's decorative orchestration name and its host (PRD fork#235 — the centrepiece lock).
+##### issue/claim/001 — `dot-agent-deck issue claim` refuses when the issue is already held by a DIFFERENT agent-worktree identity, exits non-zero, writes nothing, and names the holder's worktree absolute path and branch (PRD fork#235 — the centrepiece lock).
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck issue claim` CLI as a subprocess against real git repos in a tempdir, with a synthetic STATEFUL `gh` on `PATH` — `issue comment`/`issue edit --add-label`/`--add-assignee`/`--remove-assignee` persist into per-issue files and `issue view --json ...` reads them back, so a sequential claim-then-claim exercises the same read-your-own-writes loop as real GitHub; no PTY, no daemon, no LLM, no `e2e` feature gate).
-- **Agent:** none (two agent-shaped identities under DISTINCT `DOT_AGENT_DECK_PANE_ID` values, `pane-a`/`pane-b`, each running from its own real linked worktree carrying a `dot-agent-deck-owner` marker for decoration only).
-- **Asserts:** pane A claims the issue; pane B's later claim on the same issue exits non-zero; no `gh` call attributable to B's run adds a label, assignee, or comment; B's stderr names A's decorative orchestration name and the local host.
+- **Agent:** none (two agent-shaped identities, each running from its own real linked worktree/branch pair carrying a `dot-agent-deck-owner` marker that is now fully inert).
+- **Asserts:** pane A claims the issue; pane B's later claim on the same issue (from B's own, DIFFERENT worktree) exits non-zero; no `gh` call attributable to B's run adds a label, assignee, or comment; B's stderr names A's worktree absolute path and A's branch.
 - **Does not assert:** the `--takeover` override path (`002`/`003`); the labelled-with-no-comment case (`004`); human claimants (`005`).
 - **Platform coverage:** mac+linux.
 
@@ -918,8 +918,8 @@ Round 2 (PRD fork#235, re-scoped after review): identity is `agent:<pane-id>@<ho
 ##### issue/claim/003 — `--takeover --confirm-stopped` succeeds: the comment log holds both claims in order, the newest still starts with `Claimed by ` and names who it took over from, and the assignee ends up as the new claimant's human ONLY (PRD fork#235).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`).
 - **Agent:** none (as `001`; B's second claim adds both `--takeover` and `--confirm-stopped`).
-- **Asserts:** B's takeover claim succeeds; the recorded `gh` comment calls for the issue number at least two (A's original plus B's); the LATEST comment call still contains the literal `Claimed by ` prefix (`parse_claim_comment` finds claims via `.rfind` on it, so any other wording would be invisible and the system would still believe A holds the issue) and names A's decorative orchestration name in its tail; the final persisted assignee list is exactly B's resolved login, not A's.
-- **Does not assert:** the exact identity string formatting; the `--takeover`-alone refusal (`002`).
+- **Asserts:** B's takeover claim succeeds; the recorded `gh` comment calls for the issue number at least two (A's original plus B's); the LATEST comment call still contains the literal `Claimed by ` prefix (`parse_claim_comment` finds claims via `.rfind` on it, so any other wording would be invisible and the system would still believe A holds the issue) and names A's worktree absolute path and branch in its tail; the final persisted assignee list is exactly B's resolved login, not A's.
+- **Does not assert:** the exact identity string formatting beyond path+branch; the `--takeover`-alone refusal (`002`).
 - **Platform coverage:** mac+linux.
 
 ##### issue/claim/004 — An issue labelled `in-progress` with NO discoverable claim comment (the hand-typed CLAUDE.md rule 14 claim) refuses — identity unknown (PRD fork#235).
@@ -929,52 +929,45 @@ Round 2 (PRD fork#235, re-scoped after review): identity is `agent:<pane-id>@<ho
 - **Does not assert:** the exact refusal wording; the read-back mechanism (per-issue `gh issue view` vs. a list-embedded field) — either shape the coder chooses is served identically by the stub.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/005 — With no `DOT_AGENT_DECK_PANE_ID`, a claim resolves as `human:<login>@<host>`; a later agent-pane claim on the same issue is refused, naming the human (PRD fork#235).
+##### issue/claim/005 — With no `DOT_AGENT_DECK_PANE_ID`, a claim resolves as `human:<login>@<host>`; a later agent claim on the same issue is refused, naming the human (PRD fork#235).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the first claim runs with `DOT_AGENT_DECK_PANE_ID` absent from the environment).
 - **Agent:** none.
-- **Asserts:** the human's claim is followed by an agent pane's claim on the same issue, which exits non-zero and whose message names the human's login.
+- **Asserts:** the human's claim is followed by an agent's claim on the same issue, which exits non-zero and whose message names the human's login.
 - **Does not assert:** the exact `human:<login>@<host>` string formatting; the blank-pane-env case (`006`), which is the inverse direction (a pane whose id somehow resolved blank, which must NOT be read as human either).
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/006 — `DOT_AGENT_DECK_PANE_ID` set but BLANK (empty, and separately whitespace-only) refuses, and specifically does NOT fall back to `human:<login>` (PRD fork#235 round 2 — repurposed from round 1's marker-absent case, since round 2 drops the marker requirement entirely; see `009` for the marker-less-but-present-pane-id case, which now succeeds).
+##### issue/claim/006 — `DOT_AGENT_DECK_PANE_ID` set but BLANK (empty, and separately whitespace-only) refuses, and specifically does NOT fall back to `human:<login>` (PRD fork#235 — round 2 dropped the marker requirement entirely and round 3 keeps that; see `009` for the marker-less-but-present-pane-id case, which succeeds).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; run twice, once with the pane env set to `""` and once to `"   "`).
 - **Agent:** none.
 - **Asserts:** both blank-pane-env claims exit non-zero; neither output contains the `human:<login>` form for the login the stub would have resolved; no `gh` call adds a label, assignee, or comment across either run. Every agent on one deck whose pane id resolved blank would otherwise collapse to the SAME `human:<login>` identity, and the lock would read "held by me" and wave them all through while appearing to work.
 - **Does not assert:** the exact refusal wording.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/007 — Two agent panes sharing the exact SAME decorative orchestration name but running under DIFFERENT pane ids: the second is REFUSED, never treated as an idempotent self-refresh (PRD fork#235 — the regression guard against anyone later "simplifying" the comparison back onto the decorative name; fork #201 records name uniqueness as only advisory and states "this is the case #74 is actually about").
+##### issue/claim/007 — Two agents sharing the exact SAME decorative orchestration name (in their now-inert owner markers) but running from TWO DIFFERENT worktrees: the second is REFUSED, never treated as an idempotent self-refresh (PRD fork#235 — the regression guard against anyone later "simplifying" the comparison back onto the decorative name OR the pane id; fork #201 records name uniqueness as only advisory and states "this is the case #74 is actually about").
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; two DISTINCT linked worktrees, each marked owned by the identical decorative orchestration name, run under two DISTINCT pane ids).
 - **Agent:** none.
-- **Asserts:** the first same-named pane's claim is followed by the second's, under a different pane id; the second exits non-zero; exactly one comment call is ever recorded for the issue (the first's) — a self-refresh would post, or attempt, a second.
-- **Does not assert:** fork #201 itself (name-collision UI advisory) — this test proves the LOCK stays correct despite it, not that #201 is fixed.
+- **Asserts:** the first same-named pane's claim is followed by the second's, from a different worktree under a different pane id; the second exits non-zero; exactly one comment call is ever recorded for the issue (the first's) — a self-refresh would post, or attempt, a second.
+- **Does not assert:** fork #201 itself (name-collision UI advisory) — this test proves the LOCK stays correct despite it (now trivially, since round 3 doesn't compare on the name at all), not that #201 is fixed.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/008 — The claim comment never carries a raw filesystem path — no `/Users/`, no `/home/` (PRD fork#235 — a claim comment is public and a raw path leaks the OS username and local layout).
-- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the worktree's absolute path is deliberately nested under literal `Users`/`home` path segments, regardless of the host OS/CI runner, so a leaking implementation is caught deterministically).
-- **Agent:** none.
-- **Asserts:** the first, unlabelled claim succeeds; the posted comment body contains neither `/Users/` nor `/home/`.
-- **Does not assert:** any digest — round 2 keys identity on the pane id, not a worktree-path digest, so there is no digest field left to pin here; the identity string's overall format.
-- **Platform coverage:** mac+linux.
-
-##### issue/claim/009 — A deck-spawned pane in a worktree carrying NO owner marker at all claims SUCCESSFULLY (PRD fork#235 round 2 — reviewer F1: round 1 refused this unconditionally, but it is the orchestrator's own dominant real path under CLAUDE.md rule 1's mandated hand-made `git worktree add`, which writes no marker).
+##### issue/claim/009 — A deck-spawned pane in a worktree carrying NO owner marker at all claims SUCCESSFULLY (PRD fork#235 — reviewer F1: round 1 refused this unconditionally, but it is the orchestrator's own dominant real path under CLAUDE.md rule 1's mandated hand-made `git worktree add`, which writes no marker; round 3 makes this even more foundational, since the worktree's path/branch are derivable straight from `git` and no marker is EVER consulted).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the worktree is deliberately never marked owned).
 - **Agent:** none.
 - **Asserts:** the claim succeeds; at least one `gh` call writes the label/assignee/comment.
 - **Does not assert:** the decorative rendering when no marker exists (whether the comment omits decoration entirely or falls back to some other label) — left to the coder.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/010 — The SAME pane id claiming from TWO DIFFERENT working directories (its own worktree, then a DIFFERENT orchestration's own worktree) is recognized as the SAME identity and succeeds as an idempotent refresh, never a refusal or an impersonation (PRD fork#235 round 2 — auditor F1: `DOT_AGENT_DECK_PANE_ID` does not travel with `cd`, unlike round 1's discarded pane-env value, where identity came entirely from `cwd`).
+##### issue/claim/010 — The SAME pane id claiming from TWO DIFFERENT worktrees (its own, then a DIFFERENT orchestration's own worktree) is REFUSED, never treated as an idempotent self-refresh or an impersonation (PRD fork#235 round 3 — flipped from round 2's own regression: round 2 keyed identity on `DOT_AGENT_DECK_PANE_ID` alone, so the SAME pane id `cd`-ing into another orchestration's worktree was wrongly waved through as a self-refresh; round 3 makes the worktree the unit of identity, so entering someone else's worktree — the rule 1 violation itself — is now correctly caught).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; two distinct linked worktrees, each marked owned by a DIFFERENT decorative name, both runs sharing one pane id).
 - **Agent:** none.
-- **Asserts:** the first claim (from the pane's own worktree) succeeds; the second claim (same pane id, a DIFFERENT worktree) also succeeds, and its output contains neither "held by" nor "refus" — i.e. is not rendered as a refusal.
-- **Does not assert:** what (if anything) the refresh writes to `gh` — only that it is not treated as a conflict.
+- **Asserts:** the first claim (from the pane's own worktree) succeeds; the second claim (SAME pane id, a DIFFERENT worktree) exits non-zero, names the FIRST worktree's absolute path and branch as the holder, and writes nothing.
+- **Does not assert:** N/A.
 - **Platform coverage:** mac+linux.
 
-##### issue/claim/011 — An idempotent refresh (the SAME pane id claiming twice) leaves the assignee INTACT rather than unassigning it (PRD fork#235 — reviewer F3: today's refresh path emits a self-cancelling `--add-assignee X --remove-assignee X`, which nets UNASSIGNED under real `gh`'s ordering; this file's stub is fixed to match that ordering so the defect is observable at all).
+##### issue/claim/011 — An idempotent refresh (the SAME worktree claiming twice) leaves the assignee INTACT rather than unassigning it (PRD fork#235 — reviewer F3: today's refresh path emits a self-cancelling `--add-assignee X --remove-assignee X`, which nets UNASSIGNED under real `gh`'s ordering; this file's stub is fixed to match that ordering so the defect is observable at all).
 - **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`).
 - **Agent:** none.
-- **Asserts:** the first claim assigns the claiming human; a second claim by the SAME pane id succeeds; the assignee after the second claim is STILL exactly the same human — not unassigned.
+- **Asserts:** the first claim assigns the claiming human; a second claim by the SAME worktree succeeds; the assignee after the second claim is STILL exactly the same human — not unassigned.
 - **Does not assert:** which of the two documented fixes (skip the redundant remove; skip the assignee write entirely on a same-identity refresh) the coder chooses.
 - **Note:** this test's RED-ness also depends on a companion fix IN THIS FILE — the synthetic `gh` stub's assignee-edit handling was changed from remove-then-add to add-then-remove ordering (matching real `gh`), since the prior ordering made the self-cancelling pair net ASSIGNED and hid the defect from CI entirely.
 - **Platform coverage:** mac+linux.
@@ -991,6 +984,20 @@ Round 2 (PRD fork#235, re-scoped after review): identity is `agent:<pane-id>@<ho
 - **Agent:** none.
 - **Asserts:** a bare claim against the labelled-with-no-comment issue still refuses (unchanged from `004`); `--takeover --confirm-stopped` against the SAME state succeeds and writes the label/assignee/comment.
 - **Does not assert:** how the state was reached in production (a failed comment write vs. a hand-typed label) — the test seeds it directly, since both routes converge on the identical `RefuseNoIdentity` decision.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/014 — Identity SURVIVES a `DOT_AGENT_DECK_PANE_ID` change: the SAME worktree re-claiming under a DIFFERENT pane id (simulating a daemon restart that recycled the pane-id counter) is recognized as the SAME identity and succeeds as an idempotent refresh (PRD fork#235 — the round-2 regression guard: CLAUDE.md rule 23, verified 2026-08-10, records that pane ids are small daemon-scoped integers that recycle across a restart, the exact mechanism behind fork #160/#163/#166).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; one worktree, claimed twice under two DIFFERENT pane ids).
+- **Agent:** none.
+- **Asserts:** the first claim succeeds; the second claim (same worktree, different pane id) also succeeds, and its output contains neither "held by" nor "refus" — i.e. is not rendered as a refusal.
+- **Does not assert:** what (if anything) the refresh writes to `gh` — only that it is not treated as a conflict.
+- **Platform coverage:** mac+linux.
+
+##### issue/claim/015 — `--repo` omitted derives the repo from `origin`, and the DERIVED repo is named explicitly in BOTH a success and a refusal (PRD fork#235 — reviewer F11: this fork's `origin` is the fork itself while plenty of issues live upstream, so a silently-derived repo could target the wrong tracker).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `issue/claim/001`; the fixture repo's `origin` remote is set to a real GitHub-shaped URL, `git@github.com:acme/widgets.git`, so `derive_repo_slug` has something real to parse).
+- **Agent:** none.
+- **Asserts:** a `--repo`-omitted claim succeeds and its output names `acme/widgets` explicitly; a second, different identity's `--repo`-omitted claim on the SAME issue is refused, and its output ALSO names `acme/widgets`.
+- **Does not assert:** non-GitHub or malformed `origin` URLs (covered, if at all, by `derive_repo_slug`'s own unit tests in `src/worktree_reclaim.rs`); the explicit-`--repo` path (covered by every other test in this family).
 - **Platform coverage:** mac+linux.
 
 ### Prompts
@@ -4295,12 +4302,12 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/010 — A successful dispatch writes the `in-progress` label on the issue and posts exactly one claim comment naming the claiming task, and the label write genuinely SUCCEEDS when the label already exists on the repo (PRD #421 M1.0/M1.1); PRD fork#235 M2 extends this to also assert the assignee is written, with the pre-existing single-agent comment wording/assertions left byte-identical; round 2 additionally asserts the comment names the `agent:<pane-id>@<host>` identity, not merely the decorative task name.
+##### scheduler/dispatch/010 — A successful dispatch writes the `in-progress` label on the issue and posts exactly one claim comment naming the claiming task, and the label write genuinely SUCCEEDS when the label already exists on the repo (PRD #421 M1.0/M1.1); PRD fork#235 M2 extends this to also assert the assignee is written, with the pre-existing single-agent comment wording/assertions left byte-identical; round 3 additionally asserts the comment names the dispatched worktree's absolute path and branch (CLAUDE.md rule 23), not the decorative task name alone.
 - **Layer:** L2 (as `scheduler/dispatch/001`). The stub `gh` records every invocation verbatim to `$GHSTUB_DIR/gh-calls.log` (before any argv parsing), and unconditionally accepts `issue comment` calls — no canned response is needed since the tests assert on WHAT `gh` was asked to do, not on read-back state. `issue edit --add-label <name>` only succeeds when `<name>` is already in the repo's known label set (PRD #421 review fix — mirrors real `gh`'s label-name-to-ID resolution), tracked via `GhStub::seed_labels`/`gh label create`; this fixture pre-seeds `in-progress` so the claim write succeeds cleanly. PRD fork#235 M2: the stub also tracks `--add-assignee`/`--remove-assignee` writes per issue (`GhStub::assignees`).
 - **Agent:** none (run-now; observes the dispatched orchestrator agent + the stub's recorded `gh` invocations + `GhStub::label_applied` + `GhStub::assignees`).
-- **Asserts:** after a successful dispatch (worktree + orchestrator agent present, as in `scheduler/dispatch/001`), the recorded `gh` calls include an `issue edit ... --add-label in-progress` for the issue AND an `issue comment` whose body names the claiming task (`ScheduledTask.name`, rendered as DECORATION on the round-2 identity) AND separately contains `agent:` (the round-2 `agent:<pane-id>@<host>` identity itself); because the fixture pre-seeds `in-progress`, the add-label call must have actually SUCCEEDED (`GhStub::label_applied`), not merely been attempted — see `scheduler/dispatch/020` for the unseeded/failure counterpart. PRD fork#235 M2 additionally asserts a non-empty assignee list is recorded for the issue.
-- **Does not assert:** the exact identity/host/timestamp formatting beyond the task-name decoration and the `agent:` prefix — those fields are the coder's implementation choice, not dictated here; the human-orchestration (`Instance{id,name}`) claimant write point, out of this task's scope; which of the claiming task or the bound orchestration's own name is used as decoration (this fixture is single-agent, so the two are the same distinction `scheduler/dispatch/021` exists to pin).
-- **Note:** M1.0/M1.1 landed — `claim_issue` writes the `in-progress` label via `gh issue edit --add-label` and posts the claim comment via `gh issue comment`; GREEN today for the label/comment assertions. The assignee assertion (PRD fork#235 M2) and the `agent:` identity assertion (round 2) are RED until `claim_issue` also writes `--add-assignee`/`--remove-assignee` and re-keys onto the pane-based identity.
+- **Asserts:** after a successful dispatch (worktree + orchestrator agent present, as in `scheduler/dispatch/001`), the recorded `gh` calls include an `issue edit ... --add-label in-progress` for the issue AND an `issue comment` whose body names the claiming task (`ScheduledTask.name`, rendered as DECORATION on the round-3 identity) AND separately contains both the dispatched worktree's absolute path AND its branch (`agent/issue-7`) — round 3's identity itself; because the fixture pre-seeds `in-progress`, the add-label call must have actually SUCCEEDED (`GhStub::label_applied`), not merely been attempted — see `scheduler/dispatch/020` for the unseeded/failure counterpart. PRD fork#235 M2 additionally asserts a non-empty assignee list is recorded for the issue.
+- **Does not assert:** the exact identity/host/timestamp formatting beyond the task-name decoration and the worktree path/branch — those fields are the coder's implementation choice, not dictated here; the human-orchestration (`Instance{id,name}`) claimant write point, out of this task's scope; which of the claiming task or the bound orchestration's own name is used as decoration (this fixture is single-agent, so the two are the same distinction `scheduler/dispatch/021` exists to pin).
+- **Note:** M1.0/M1.1 landed — `claim_issue` writes the `in-progress` label via `gh issue edit --add-label` and posts the claim comment via `gh issue comment`; GREEN today for the label/comment assertions. The assignee assertion (PRD fork#235 M2) and the worktree-path-plus-branch identity assertion (round 3) are RED until `claim_issue` also writes `--add-assignee`/`--remove-assignee` and re-keys onto the worktree-based identity.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/011 — A fired `issue_dispatch` task surfaces its per-issue card LIVE on an already-attached TUI — the user-visible showcase (and demo-reel clip) the headless `scheduler/dispatch/001-009` family can't observe (PRD #120 M2.3 live surfacing).
@@ -4379,19 +4386,19 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Note:** RED today — nothing ensures `in-progress` exists before the unconditional add, so the tightened stub's real-`gh`-accurate rejection fires and the claim silently fails (swallowed into `tracing::warn!`, so the run still reports success). This is the exact defect the PRD #421 review flagged: on any repo without a pre-existing `in-progress` label, the headline claim feature silently does nothing.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/021 — An ORCHESTRATION dispatch's claim comment names the orchestration's own typed name as DECORATION, not the scheduled task that fired it, and separately names the round-2 `agent:<pane-id>@<host>` identity (PRD fork#235 round 2 — decoration comes from the bound spawn handle's `SpawnKind`, not from `task_name`; the identity itself is pane-keyed regardless of spawn kind).
+##### scheduler/dispatch/021 — An ORCHESTRATION dispatch's claim comment names the orchestration's own typed name as DECORATION, not the scheduled task that fired it, and separately names the round-3 worktree-path-plus-branch identity (PRD fork#235 round 3 — decoration comes from the bound spawn handle's `SpawnKind`, not from `task_name`; the identity itself is the dispatched worktree regardless of spawn kind).
 - **Layer:** L2 (as `scheduler/dispatch/001`; the fixture remote carries `ORCH_TOML`'s single-role orchestration named `dispatch-orch`, fired by a `ScheduledTask` deliberately named something else, `claim-task-021`).
 - **Agent:** none (run-now; observes the stub's recorded `gh` invocations).
-- **Asserts:** after a successful orchestration dispatch, a recorded `issue comment` call names `dispatch-orch` (the orchestration's own typed name, as decoration) AND separately contains `agent:` (the round-2 identity itself); no `issue comment` call names `claim-task-021` (the scheduled task's name) — PRD #421 named the task exclusively; fork#235 derives the decoration from the spawn handle instead.
-- **Does not assert:** the exact identity string format beyond the `agent:` prefix; the single-agent path, which never has the decoration distinction to make (covered by `scheduler/dispatch/010`).
+- **Asserts:** after a successful orchestration dispatch, a recorded `issue comment` call names `dispatch-orch` (the orchestration's own typed name, as decoration) AND separately contains both the dispatched worktree's absolute path AND its branch (the round-3 identity itself); no `issue comment` call names `claim-task-021` (the scheduled task's name) — PRD #421 named the task exclusively; fork#235 derives the decoration from the spawn handle instead.
+- **Does not assert:** the exact identity string format beyond the worktree path/branch; the single-agent path, which never has the decoration distinction to make (covered by `scheduler/dispatch/010`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/022 — When `gh api user` fails, the label and claim comment still land (naming the round-2 `agent:<pane-id>@<host>` identity, which needs no `gh api user` call) and the dispatch is NOT reported as failed, but no assignee is ever written (PRD fork#235 M2 — a claim-identity resolution failure must never turn an already-successful dispatch into `IssueDispatchFailed`).
+##### scheduler/dispatch/022 — When `gh api user` fails, the label and claim comment still land (naming the round-3 worktree-path-plus-branch identity, which needs no `gh api user` call) and the dispatch is NOT reported as failed, but no assignee is ever written (PRD fork#235 M2 — a claim-identity resolution failure must never turn an already-successful dispatch into `IssueDispatchFailed`).
 - **Layer:** L2 (as `scheduler/dispatch/001`; `GhStub::fail_api_user` arms `gh api user --jq .login` to exit non-zero, standing in for a read-only or expired token).
 - **Agent:** none (run-now; observes the dispatched single-agent card, the stub's recorded `gh` invocations, `GhStub::label_applied`, `GhStub::assignees`, and the daemon's stderr).
-- **Asserts:** the dispatch succeeds as normal (worktree + single-agent card present); the `in-progress` label write still SUCCEEDS; a claim comment is still posted and contains `agent:` (the round-2 identity resolves from `DOT_AGENT_DECK_PANE_ID` + host alone, with no `gh` call, so a login failure cannot block it); the issue's assignee list stays empty throughout; the daemon's stderr never reports issue 51 as failed.
+- **Asserts:** the dispatch succeeds as normal (worktree + single-agent card present); the `in-progress` label write still SUCCEEDS; a claim comment is still posted and contains the dispatched worktree's absolute path AND its branch (round 3's identity resolves straight from the worktree, with no `gh` call, so a login failure cannot block it); the issue's assignee list stays empty throughout; the daemon's stderr never reports issue 51 as failed.
 - **Does not assert:** the exact wording of the best-effort warning surfaced for the skipped assignee write; the successful-login assignee path (covered by `scheduler/dispatch/010`).
-- **Note:** the label/comment/no-assignee/not-failed assertions were GREEN from the start (like `scheduler/dispatch/012`/`014`/`019`) since `claim_issue` does not yet call `gh api user` or write an assignee at all; the round-2 `agent:` identity assertion is a NEW addition this round and is RED until the identity is re-keyed, independent of the assignee logic this test otherwise pins.
+- **Note:** the label/comment/no-assignee/not-failed assertions were GREEN from the start (like `scheduler/dispatch/012`/`014`/`019`) since `claim_issue` does not yet call `gh api user` or write an assignee at all; the round-3 worktree-path-plus-branch identity assertion is a NEW addition this round and is RED until the identity is re-keyed, independent of the assignee logic this test otherwise pins.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi

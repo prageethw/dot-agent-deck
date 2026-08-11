@@ -1541,7 +1541,7 @@ const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\
 /// card present, as in `scheduler/dispatch/022`), the stub `gh` log must show
 /// an `issue edit ... --add-label in-progress` invocation for the issue AND
 /// an `issue comment` invocation whose body names the claiming task
-/// (the task name as DECORATION on the round-2 `agent:<pane-id>@<host>`
+/// (the task name as DECORATION on round 3's worktree-path-plus-branch
 /// identity — this is the genuinely single-agent claim path PRD #421
 /// originally covered here, kept distinct from the orchestration-named claim
 /// `scheduler/dispatch/021` exists to pin) — and, because `in-progress`
@@ -1600,18 +1600,25 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
         stub.gh_calls().join("\n")
     );
 
-    // PRD fork#235 round 2: the identity itself is now pane-keyed
-    // (`agent:<pane-id>@<host>`), not `issue-dispatch:<task>#<issue>@…` — the
-    // task name above is DECORATION, not the compared identity string.
-    let named_agent_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls()
-            .iter()
-            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("agent:"))
+    // PRD fork#235 round 3: the identity itself is the dispatched worktree's
+    // absolute path plus its branch (`agent/issue-<n>`, CLAUDE.md rule 23),
+    // not `issue-dispatch:<task>#<issue>@…` — the task name above is
+    // DECORATION, not the compared identity string.
+    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&worktree_str)
+                && l.contains(&paths.branch)
+        })
     });
     assert!(
-        named_agent_identity,
-        "the claim comment must name the round-2 `agent:<pane-id>@<host>` identity, not merely \
+        named_worktree_identity,
+        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
+         absolute path ({worktree_str:?}) and its branch ({:?}, CLAUDE.md rule 23) — not merely \
          decorate it with the task name; observed gh calls:\n{}",
+        paths.branch,
         stub.gh_calls().join("\n")
     );
 
@@ -2217,10 +2224,11 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
 /// `dispatch-orch`). Assert the posted claim comment names the
 /// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, not the
 /// scheduled task's name (`claim-task-021`, the `ScheduledTask.name` PRD
-/// #421 used exclusively) — PRD fork#235 round 2's identity itself is
-/// `agent:<pane-id>@<host>` regardless of which spawn kind fired it; what
-/// differs between an orchestration dispatch and a single-agent one
-/// (`scheduler/dispatch/010`) is only which name is rendered as decoration.
+/// #421 used exclusively) — PRD fork#235 round 3's identity itself is the
+/// dispatched worktree's absolute path plus its branch (CLAUDE.md rule 23)
+/// regardless of which spawn kind fired it; what differs between an
+/// orchestration dispatch and a single-agent one (`scheduler/dispatch/010`)
+/// is only which name is rendered as decoration.
 #[spec("scheduler/dispatch/021")]
 #[test]
 fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
@@ -2256,17 +2264,24 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
         stub.gh_calls().join("\n")
     );
 
-    // PRD fork#235 round 2: the identity itself is `agent:<pane-id>@<host>`
-    // regardless of spawn kind — `dispatch-orch` above is decoration only.
-    let named_agent_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls()
-            .iter()
-            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("agent:"))
+    // PRD fork#235 round 3: the identity itself is the dispatched worktree's
+    // absolute path plus its branch (CLAUDE.md rule 23) regardless of spawn
+    // kind — `dispatch-orch` above is decoration only.
+    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&worktree_str)
+                && l.contains(&paths.branch)
+        })
     });
     assert!(
-        named_agent_identity,
-        "the claim comment must name the round-2 `agent:<pane-id>@<host>` identity, not merely \
+        named_worktree_identity,
+        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
+         absolute path ({worktree_str:?}) and its branch ({:?}, CLAUDE.md rule 23) — not merely \
          decorate it with the orchestration name; observed gh calls:\n{}",
+        paths.branch,
         stub.gh_calls().join("\n")
     );
 
@@ -2331,19 +2346,26 @@ fn dispatch_022_gh_api_user_failure_skips_assignee_without_failing_dispatch() {
             .iter()
             .any(|l| l.contains("issue") && l.contains("comment"))
     });
-    // PRD fork#235 round 2: identity resolution (`agent:<pane-id>@<host>`)
-    // needs no `gh api user` call at all — only the ASSIGNEE login does — so
-    // the comment must still name the round-2 identity even when the login
-    // resolution that feeds the assignee write fails.
-    let named_agent_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls()
-            .iter()
-            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("agent:"))
+    // PRD fork#235 round 3: identity resolution (the dispatched worktree's
+    // absolute path plus its branch, CLAUDE.md rule 23) needs no `gh api
+    // user` call at all — only the ASSIGNEE login does — so the comment must
+    // still name the round-3 identity even when the login resolution that
+    // feeds the assignee write fails.
+    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&worktree_str)
+                && l.contains(&paths.branch)
+        })
     });
     assert!(
-        named_agent_identity,
-        "the claim comment must name the round-2 `agent:<pane-id>@<host>` identity even when \
-         `gh api user` fails to resolve a login for the assignee write; observed gh calls:\n{}",
+        named_worktree_identity,
+        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
+         absolute path ({worktree_str:?}) and its branch ({:?}) — even when `gh api user` fails \
+         to resolve a login for the assignee write; observed gh calls:\n{}",
+        paths.branch,
         stub.gh_calls().join("\n")
     );
     assert!(

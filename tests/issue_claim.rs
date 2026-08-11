@@ -9,19 +9,27 @@
 //! the tier CI actually blocks on, and the lock is exactly the part that
 //! matters.
 //!
-//! **Round 2 (this file).** `issue claim` is a REAL, already-wired
+//! **Round 3 (this file).** `issue claim` is a REAL, already-wired
 //! subcommand (`src/issue_claim.rs`, dispatched from `src/main.rs`'s
 //! `IssueCmd::Claim`) — M1-M4 landed and were green at `375285d`. What is
 //! RED this round is the IDENTITY it resolves: `src/issue_claim.rs`'s
-//! `resolve_caller_identity` still derives identity from the worktree
-//! ownership marker (round 1), while every test below is re-keyed onto the
-//! round-2 design — identity is `agent:<pane-id>@<host>` from
-//! `DOT_AGENT_DECK_PANE_ID`, no marker required, orchestration name rendered
-//! as human-readable DECORATION only, never compared. So a failure here is a
-//! genuine behavioral mismatch (a claim wrongly refused, or wrongly allowed
-//! through, or a marker treated as load-bearing when it must not be) — not a
-//! clap parse error. See `prds/235-issue-claim-lock.md`'s "Identity, round
-//! 2" section for the authoritative design this round tests against.
+//! `resolve_caller_identity` still derives identity from
+//! `DOT_AGENT_DECK_PANE_ID` (round 2 — wrong, because those values are small
+//! daemon-scoped integers that recycle across a daemon restart, CLAUDE.md
+//! rule 23), while every test below is re-keyed onto the round-3 design: an
+//! agent's identity IS the worktree it is running in — its absolute path
+//! plus its git branch, exactly the two identifiers CLAUDE.md rule 1 already
+//! obliges the orchestrator to create and name — rendered into the claim
+//! comment in rule 23's own hand-typed prose format (`Claimed by the
+//! orchestration working \`<path>\` on branch \`<branch>\`.`), so the
+//! mechanised claim and the hand-written one are one artefact. A human
+//! claiming outside any worktree is unchanged: `human:<login>@<host>`. So a
+//! failure here is a genuine behavioral mismatch (a claim wrongly refused,
+//! or wrongly allowed through, or a pane id treated as load-bearing when it
+//! must not be) — not a clap parse error. See
+//! `prds/235-issue-claim-lock.md`'s "Identity, round 2" section (which also
+//! documents round 3, the design that stuck) for the authoritative design
+//! this round tests against.
 //!
 //! The stub `gh` here is a genuine, stateful fixture (not a one-shot canned
 //! reply): `issue comment`/`issue edit --add-label`/`issue edit
@@ -217,17 +225,6 @@ fn combined(out: &std::process::Output) -> String {
     )
 }
 
-/// Best-effort local hostname, via the same `hostname` binary the OS ships —
-/// standing in for `src/issue_dispatch_run.rs::local_hostname`'s in-process
-/// `gethostname(2)` call so a test can look for the CLI's own reported host
-/// without depending on the exact resolution mechanism.
-fn local_hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
-
 impl Fixture {
     fn new() -> Self {
         let scratch = tempfile::tempdir().expect("scratch tempdir");
@@ -288,13 +285,15 @@ impl Fixture {
     /// marker-reading implementation resolves `creator` for this worktree —
     /// mirroring `worktree_reclaim.rs`'s `Fixture::mark_owned_with_creator`.
     ///
-    /// Round 2: this is DECORATION data only — the orchestration name it
-    /// carries is rendered in a claim comment for a human to read, but never
-    /// compared. Identity equality is on `DOT_AGENT_DECK_PANE_ID` alone (see
-    /// [`Fixture::run`]'s `pane_id` parameter), so two calls sharing a
-    /// worktree's marker are NOT automatically the same identity, and two
-    /// calls with the SAME pane id but DIFFERENT markers (or no marker at
-    /// all) ARE.
+    /// Round 3: this marker is INERT for identity purposes — dropped
+    /// entirely, not merely decorative. Identity is the worktree's own
+    /// absolute path plus its git branch (CLAUDE.md rule 23), both derivable
+    /// straight from `git`, so no marker is required or consulted. Calls to
+    /// this helper remain in the fixtures that use it purely as a regression
+    /// guard (`issue/claim/007`): even when two DIFFERENT worktrees are
+    /// marked with the IDENTICAL decorative `creator` string, their paths and
+    /// branches still differ, so they must still compare as different
+    /// identities.
     #[cfg(unix)]
     fn mark_owned(&self, worktree: &Path, creator: &str) {
         let git_dir = worktree_git_dir(worktree);
@@ -309,6 +308,16 @@ impl Fixture {
     /// for "whoever `gh` is currently authenticated as on this host".
     fn set_login(&self, login: &str) {
         std::fs::write(self.ghstub.join("login"), format!("{login}\n")).expect("write login");
+    }
+
+    /// Point the fixture repo's `origin` remote at `url` — so
+    /// `derive_repo_slug` (`src/worktree_reclaim.rs`) can resolve an
+    /// `owner/name` slug from it when `--repo` is omitted
+    /// (`issue/claim/015`). Every linked worktree shares this same remote
+    /// config (it lives in the common git dir), so this must be called
+    /// before any worktree that needs it to claim.
+    fn set_origin(&self, url: &str) {
+        git(&self.repo, &["remote", "add", "origin", url]);
     }
 
     /// Directly seed an issue as carrying `label` with NO discoverable claim
@@ -345,13 +354,17 @@ impl Fixture {
 
     /// Run the REAL `dot-agent-deck` CLI as a subprocess in `cwd`, with the
     /// stub `gh` first on `PATH`. `pane_id`, when `Some`, sets
-    /// `DOT_AGENT_DECK_PANE_ID` to that EXACT value (an agent-shaped caller —
-    /// round 2 keys identity equality on this string, so two calls sharing a
-    /// `pane_id` are the SAME identity regardless of `cwd`, and two calls
-    /// with different `pane_id`s are different identities regardless of any
-    /// worktree marker); `None` removes the variable entirely (a plain human
-    /// terminal). `Some("")`/`Some("   ")` sets it to a blank value — the
-    /// pane-env-present-but-blank case `issue/claim/006` pins.
+    /// `DOT_AGENT_DECK_PANE_ID` to that EXACT value — present vs. absent
+    /// still switches between an agent-shaped caller and a plain human
+    /// terminal, but round 3 keys identity equality on `cwd`'s worktree
+    /// (its absolute path plus its git branch), NOT on this string: two
+    /// calls sharing a `pane_id` from DIFFERENT worktrees are DIFFERENT
+    /// identities, and two calls from the SAME worktree under DIFFERENT
+    /// `pane_id`s are the SAME identity (`issue/claim/014`'s regression
+    /// guard against round 2's mistake — pane ids recycle across a daemon
+    /// restart, CLAUDE.md rule 23). `None` removes the variable entirely (a
+    /// plain human terminal). `Some("")`/`Some("   ")` sets it to a blank
+    /// value — the pane-env-present-but-blank case `issue/claim/006` pins.
     #[cfg(unix)]
     fn run(&self, cwd: &Path, args: &[&str], pane_id: Option<&str>) -> std::process::Output {
         let path = format!(
@@ -392,22 +405,6 @@ impl Fixture {
     /// otherwise corrupt line-based parsing.
     fn gh_calls_raw(&self) -> String {
         std::fs::read_to_string(self.ghstub.join("gh-calls.log")).unwrap_or_default()
-    }
-
-    /// The accumulated `comments.jsonl` lines for `repo`/`issue`, in the
-    /// order `gh issue comment` calls appended them.
-    fn comments(&self, repo: &str, issue: u64) -> Vec<String> {
-        let key = repo.replace('/', "_");
-        let path = self
-            .ghstub
-            .join(&key)
-            .join(format!("issue-{issue}"))
-            .join("comments.jsonl");
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect()
     }
 
     /// The current `assignees.txt` content for `repo`/`issue`, one login per
@@ -475,22 +472,31 @@ fn raw_mention_present(body: &str, handle: &str) -> bool {
     false
 }
 
+/// The fixed branch names [`two_orchestrations`] gives `wt_a`/`wt_b` — round
+/// 3's identity anchor (CLAUDE.md rule 23), so tests assert on these
+/// literally rather than on the (now-inert) decorative marker name.
+#[cfg(unix)]
+const BRANCH_A: &str = "orch-a-branch";
+#[cfg(unix)]
+const BRANCH_B: &str = "orch-b-branch";
+
 /// Build a fixture with the standard `acme/widgets` repo and two
-/// agent-shaped worktrees, each carrying an owner marker for DECORATION
-/// (round 2 — see [`Fixture::mark_owned`]'s doc) — the two-holder setup
-/// shared by `issue/claim/001`, `002`, `003` (`name_a`/`name_b` distinct) and
-/// `007` (called with `name_b == name_a`, since that test's whole point is
-/// two DIFFERENT holders sharing the exact SAME decorative name). Callers
-/// must still pass DISTINCT `pane_id`s to [`Fixture::run`] for `wt_a` and
-/// `wt_b` — identity equality is keyed on the pane id alone, not on which of
-/// these two worktrees a call runs from.
+/// agent-shaped worktrees on [`BRANCH_A`]/[`BRANCH_B`], each ALSO carrying an
+/// owner marker (now fully INERT for identity — see [`Fixture::mark_owned`]'s
+/// doc) — the two-holder setup shared by `issue/claim/001`, `002`, `003`
+/// (`name_a`/`name_b` distinct) and `007` (called with `name_b == name_a`,
+/// since that test's whole point is two DIFFERENT holders sharing the exact
+/// SAME decorative name, which must still not make them compare equal).
+/// Callers may pass the SAME or DISTINCT `pane_id`s to [`Fixture::run`] for
+/// `wt_a`/`wt_b` — round 3 keys identity equality on the worktree (path +
+/// branch), never on the pane id.
 #[cfg(unix)]
 fn two_orchestrations(name_a: &str, name_b: &str) -> (Fixture, &'static str, PathBuf, PathBuf) {
     let fx = Fixture::new();
     let repo = "acme/widgets";
-    let wt_a = fx.add_worktree("wt-a", "orch-a-branch");
+    let wt_a = fx.add_worktree("wt-a", BRANCH_A);
     fx.mark_owned(&wt_a, &format!("orchestration:{name_a}"));
-    let wt_b = fx.add_worktree("wt-b", "orch-b-branch");
+    let wt_b = fx.add_worktree("wt-b", BRANCH_B);
     fx.mark_owned(&wt_b, &format!("orchestration:{name_b}"));
     (fx, repo, wt_a, wt_b)
 }
@@ -499,13 +505,15 @@ fn two_orchestrations(name_a: &str, name_b: &str) -> (Fixture, &'static str, Pat
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Scenario: Agent pane A (`pane-a`) claims issue 1 from its own worktree. A
-/// second, DIFFERENT agent pane B (`pane-b`) then runs `issue claim 1` from
-/// its own worktree. Assert B's claim exits non-zero, writes NOTHING (no
+/// Scenario: Agent pane A (`pane-a`) claims issue 1 from its own worktree
+/// (`wt-a`, branch [`BRANCH_A`]). A second, DIFFERENT agent pane B (`pane-b`)
+/// then runs `issue claim 1` from ITS OWN worktree (`wt-b`, branch
+/// [`BRANCH_B`]). Assert B's claim exits non-zero, writes NOTHING (no
 /// label/assignee/comment call is added to the gh call log during B's run),
-/// and B's stderr names A's decorative orchestration name and A's host — the
-/// centrepiece lock PRD fork#235 exists to add, re-keyed round 2 onto
-/// `DOT_AGENT_DECK_PANE_ID` rather than the worktree ownership marker.
+/// and B's stderr names A's worktree's absolute path and A's branch — round
+/// 3's identity anchor (CLAUDE.md rule 23), replacing round 2's
+/// `DOT_AGENT_DECK_PANE_ID`-keyed identity — the centrepiece lock PRD
+/// fork#235 exists to add.
 #[spec("issue/claim/001")]
 #[test]
 #[cfg(unix)]
@@ -539,16 +547,16 @@ fn issue_claim_001_second_agent_pane_is_refused_and_writes_nothing() {
         combined(&claim_b)
     );
     let text = combined(&claim_b);
+    let wt_a_str = wt_a.to_string_lossy().into_owned();
     assert!(
-        text.contains("orch-A"),
-        "the refusal must name the current holder's decorative orchestration name (`orch-A`); \
-         got:\n{text}"
+        text.contains(&wt_a_str),
+        "the refusal must name the current holder's worktree ABSOLUTE PATH — round 3's identity \
+         anchor (CLAUDE.md rule 23), replacing round 2's pane id; expected {wt_a_str:?} in:\n{text}"
     );
-    let host = local_hostname();
     assert!(
-        !host.is_empty() && text.contains(&host),
-        "the refusal must name the holder's host, so a human can act on it (which machine may \
-         still be running the other agent); expected host {host:?} in:\n{text}"
+        text.contains(BRANCH_A),
+        "the refusal must also name the current holder's BRANCH — the other half of round 3's \
+         identity anchor; expected {BRANCH_A:?} in:\n{text}"
     );
 
     let new_calls: Vec<String> = fx.gh_calls().into_iter().skip(calls_before_b).collect();
@@ -616,8 +624,9 @@ fn issue_claim_002_takeover_alone_still_refuses() {
 /// LATEST of which still starts with `Claimed by ` (the literal prefix
 /// `parse_claim_comment` finds claims by, so any other wording would make it
 /// invisible and the system would still believe A holds the issue) and names
-/// A's decorative orchestration name in its tail; and the final assignee is
-/// B's human ONLY (A's removed).
+/// A's worktree absolute path and branch — round 3's identity anchor
+/// (CLAUDE.md rule 23) — in its tail; and the final assignee is B's human
+/// ONLY (A's removed).
 #[spec("issue/claim/003")]
 #[test]
 #[cfg(unix)]
@@ -675,10 +684,12 @@ fn issue_claim_003_takeover_confirm_stopped_succeeds_and_records_succession() {
          would be invisible to it and the system would still believe A holds the issue; got: \
          {last_comment}"
     );
+    let wt_a_str = wt_a.to_string_lossy().into_owned();
     assert!(
-        last_comment.contains("orch-A"),
-        "B's new comment must name who it took over from (A's decorative orchestration name) in \
-         its tail; got: {last_comment}"
+        last_comment.contains(&wt_a_str) && last_comment.contains(BRANCH_A),
+        "B's new comment must name who it took over from — A's worktree absolute path \
+         ({wt_a_str:?}) and branch ({BRANCH_A:?}), round 3's identity anchor (CLAUDE.md rule 23) \
+         — in its tail; got: {last_comment}"
     );
 
     let assignees = fx.assignees(repo, 3);
@@ -818,17 +829,19 @@ fn issue_claim_006_pane_env_set_but_blank_refuses_without_downgrading_to_human()
 }
 
 /// Scenario: Two agent panes share the exact SAME decorative orchestration
-/// name but run from TWO DIFFERENT worktrees under TWO DIFFERENT pane ids —
-/// fork #201 records that orchestration-name uniqueness is only advisory
-/// (two forms open at once are suggested the same name and neither submit is
+/// name (written into each worktree's inert owner marker, `Fixture::mark_owned`)
+/// but run from TWO DIFFERENT worktrees under TWO DIFFERENT pane ids — fork
+/// #201 records that orchestration-name uniqueness is only advisory (two
+/// forms open at once are suggested the same name and neither submit is
 /// refused), and its own text states plainly "this is the case #74 is
-/// actually about". Comparing on the decorative name (instead of the pane
-/// id) would make these two DISTINCT holders compare equal and hit the "held
-/// by this identity → idempotent refresh, exit 0" row, waving both through
-/// in exactly the scenario the lock exists for. Assert the SECOND
-/// same-named pane's claim is REFUSED, not treated as an idempotent
-/// self-refresh — the regression guard against anyone later "simplifying"
-/// the comparison back onto the decorative name.
+/// actually about". Round 3 keys identity on the worktree (path + branch),
+/// never on the pane id or the decorative name, so this name collision now
+/// TRIVIALLY cannot make these two DISTINCT holders compare equal — but the
+/// test still exists as the regression guard against anyone later
+/// "simplifying" the comparison back onto the decorative name (or the pane
+/// id — `issue/claim/014` guards the same comparison from the opposite
+/// direction). Assert the SECOND same-named pane's claim is REFUSED, not
+/// treated as an idempotent self-refresh.
 #[spec("issue/claim/007")]
 #[test]
 #[cfg(unix)]
@@ -857,10 +870,11 @@ fn issue_claim_007_same_decorative_name_different_pane_is_refused_not_self_refre
     assert!(
         !second.status.success(),
         "a SECOND agent pane sharing the first's exact decorative orchestration name but running \
-         under a DIFFERENT pane id must be REFUSED, not treated as an idempotent self-refresh of \
-         its own claim — comparing on the decorative name would make these two distinct holders \
-         compare equal (fork #201: name uniqueness is only advisory, and this is the case fork \
-         #74 is actually about); out={}",
+         from a DIFFERENT worktree under a DIFFERENT pane id must be REFUSED, not treated as an \
+         idempotent self-refresh of its own claim — comparing on the decorative name (or the pane \
+         id) would make these two distinct holders compare equal (fork #201: name uniqueness is \
+         only advisory, and this is the case fork #74 is actually about); round 3's worktree-keyed \
+         identity makes this trivially correct; out={}",
         combined(&second)
     );
 
@@ -874,68 +888,16 @@ fn issue_claim_007_same_decorative_name_different_pane_is_refused_not_self_refre
     );
 }
 
-/// Scenario: An agent pane whose worktree's absolute path is deliberately
-/// forced to contain `/Users/` and `/home/`-shaped segments (regardless of
-/// the host OS/CI runner) makes the FIRST, unlabelled claim on an issue.
-/// Assert the posted claim comment never carries that raw path — a claim
-/// comment is public, and a raw path leaks the OS username and local
-/// directory layout. Round 2 keys identity on the pane id, not a worktree
-/// digest, so there is no digest left to assert on here — what survives
-/// unchanged from round 1 is the underlying "no path leak" requirement
-/// itself.
-#[spec("issue/claim/008")]
-#[test]
-#[cfg(unix)]
-fn issue_claim_008_claim_comment_never_leaks_a_raw_worktree_path() {
-    let fx = Fixture::new();
-    let repo = "acme/widgets";
-    let nested = fx
-        ._scratch
-        .path()
-        .join("Users")
-        .join("home")
-        .join("leak-check-home");
-    std::fs::create_dir_all(&nested).expect("create nested Users/home dir");
-    let wt = nested.join("wt-leak");
-    fx.add_worktree_at(&wt, "leak-branch");
-    fx.mark_owned(&wt, "orchestration:orch-leak");
-    fx.set_login("ivy");
-
-    let out = fx.run(
-        &wt,
-        &["issue", "claim", "8", "--repo", repo],
-        Some("pane-leak"),
-    );
-    assert!(
-        out.status.success(),
-        "an unlabelled issue's first claim must succeed; out={}",
-        combined(&out)
-    );
-
-    let comments = fx.comments(repo, 8);
-    assert!(
-        !comments.is_empty(),
-        "the claim must have posted a comment to inspect; observed gh calls: {:?}",
-        fx.gh_calls()
-    );
-    let body = comments.join("\n");
-    assert!(
-        !body.contains("/Users/") && !body.contains("/home/"),
-        "the claim comment must never carry a raw filesystem path — a public comment leaking \
-         `/Users/<name>/...` or `/home/<name>/...` exposes the OS username and local directory \
-         layout; worktree was {:?}, comment body was: {body:?}",
-        wt
-    );
-}
-
 /// Scenario: An agent pane (`DOT_AGENT_DECK_PANE_ID` set) claims from a
 /// worktree carrying NO owner marker at all — the orchestrator's OWN
 /// dominant real path, since CLAUDE.md rule 1 mandates the orchestrator
 /// create worktrees by hand with `git worktree add`, which writes no marker.
 /// Round 1 refused this unconditionally (reviewer F1): the caller M5
-/// rewrites rules 14/23 around could never actually claim. Assert round 2
-/// succeeds instead — a marker is decoration only, never required for
-/// identity.
+/// rewrites rules 14/23 around could never actually claim. Round 3 makes this
+/// even more foundational than round 2 did: the worktree's path and branch
+/// are derivable straight from `git`, so no marker is EVER required — a
+/// marker is not merely "decoration only", it is now entirely unconsulted
+/// for identity.
 #[spec("issue/claim/009")]
 #[test]
 #[cfg(unix)]
@@ -956,8 +918,8 @@ fn issue_claim_009_pane_in_hand_made_worktree_without_marker_claims_successfully
     assert!(
         out.status.success(),
         "a deck-spawned pane in a marker-less, hand-made worktree — the orchestrator's own \
-         dominant real path (CLAUDE.md rule 1) — must be able to claim; a marker is decoration \
-         only in round 2, never required for identity; out={}",
+         dominant real path (CLAUDE.md rule 1) — must be able to claim; round 3 derives identity \
+         purely from the worktree's own path and branch, so no marker is ever required; out={}",
         combined(&out)
     );
 
@@ -969,19 +931,24 @@ fn issue_claim_009_pane_in_hand_made_worktree_without_marker_claims_successfully
     );
 }
 
-/// Scenario: The SAME pane id claims issue 10 twice, from TWO DIFFERENT
-/// working directories — its own worktree first, then a DIFFERENT
-/// orchestration's own worktree second (standing in for the agent `cd`-ing
-/// into it, deliberately or by accident). Assert the second call is
-/// recognized as the SAME identity and succeeds as an idempotent refresh,
-/// never as a refusal or an impersonation of the second worktree's
-/// orchestration — `DOT_AGENT_DECK_PANE_ID` does not travel with `cd`, and
-/// round 1's discarded pane-env value meant identity came entirely from
-/// `cwd`, letting any agent assume another's identity this exact way.
+/// Scenario: An agent claims issue 10 from its own worktree (`wt-mine`,
+/// branch `mine-branch`) — succeeds. The SAME pane id then runs `issue claim`
+/// again from a DIFFERENT worktree (`wt-other`, branch `other-branch`,
+/// belonging to a DIFFERENT orchestration) — standing in for the agent `cd`
+/// -ing into it, deliberately or by accident. Assert the SECOND call is
+/// REFUSED, naming `wt-mine`'s path and branch as the holder, and writes
+/// nothing. This is the round-2 regression flipped: round 2 keyed identity on
+/// `DOT_AGENT_DECK_PANE_ID` alone, so the SAME pane id `cd`-ing into another
+/// orchestration's worktree was (wrongly) treated as an idempotent
+/// self-refresh — letting any agent assume another's identity just by
+/// entering its directory. Round 3 makes `cd`-ing into another worktree the
+/// rule 1 violation it actually is: the worktree the caller is IN is now the
+/// unit of identity, so entering someone else's is entering someone else,
+/// full stop — pane id is no longer load-bearing either way.
 #[spec("issue/claim/010")]
 #[test]
 #[cfg(unix)]
-fn issue_claim_010_same_pane_id_different_cwd_is_idempotent_refresh_not_impersonation() {
+fn issue_claim_010_different_worktree_is_refused_even_with_same_pane_id() {
     let fx = Fixture::new();
     let repo = "acme/widgets";
     let wt_mine = fx.add_worktree("wt-mine", "mine-branch");
@@ -1001,25 +968,36 @@ fn issue_claim_010_same_pane_id_different_cwd_is_idempotent_refresh_not_imperson
         combined(&first)
     );
 
+    let calls_before_second = fx.gh_calls().len();
     let second = fx.run(
         &wt_other,
         &["issue", "claim", "10", "--repo", repo],
         Some("pane-cd"),
     );
     assert!(
-        second.status.success(),
-        "the SAME pane id claiming again from a DIFFERENT cwd — even another orchestration's own \
-         worktree — must be recognized as the SAME identity and succeed as an idempotent refresh; \
-         identity is keyed on DOT_AGENT_DECK_PANE_ID, which does not travel when an agent `cd`s, \
-         never on cwd; out={}",
+        !second.status.success(),
+        "the SAME pane id claiming from a DIFFERENT worktree — even entering another \
+         orchestration's own worktree, as if by `cd` — must be REFUSED, not treated as the same \
+         identity; round 3 keys identity on the worktree the caller is actually in (CLAUDE.md \
+         rule 23), never on DOT_AGENT_DECK_PANE_ID, which round 2 wrongly relied on and which \
+         recycles across a daemon restart; out={}",
         combined(&second)
     );
-    let text = combined(&second).to_lowercase();
+    let text = combined(&second);
+    let wt_mine_str = wt_mine.to_string_lossy().into_owned();
     assert!(
-        !text.contains("held by") && !text.contains("refus"),
-        "a same-identity refresh must not be reported as a refusal/held-by-another message; \
-         out={}",
-        combined(&second)
+        text.contains(&wt_mine_str) && text.contains("mine-branch"),
+        "the refusal must name the ORIGINAL holder's worktree absolute path and branch; got:\n{text}"
+    );
+
+    let new_calls: Vec<String> = fx
+        .gh_calls()
+        .into_iter()
+        .skip(calls_before_second)
+        .collect();
+    assert!(
+        !any_claim_write(&new_calls),
+        "a refused claim must write nothing; new gh calls during the second run: {new_calls:?}"
     );
 }
 
@@ -1240,5 +1218,115 @@ fn issue_claim_013_refuse_no_identity_is_escapable_with_takeover_confirm_stopped
         any_claim_write(&calls),
         "the rescue claim must actually write the label/assignee/comment; observed gh calls: \
          {calls:?}"
+    );
+}
+
+/// Scenario: The same worktree claims issue 14, then claims it AGAIN with a
+/// DIFFERENT `DOT_AGENT_DECK_PANE_ID` — simulating a daemon restart that
+/// recycled the pane-id counter (CLAUDE.md rule 23, verified 2026-08-10:
+/// `DOT_AGENT_DECK_PANE_ID` values are "small daemon-scoped integers … and
+/// they recycle across a daemon restart"; confirmed in code —
+/// `next_pane_id`/`src/spawn.rs`'s `PANE_COUNTER` is a process-global atomic
+/// that resets with the daemon). Assert the SECOND claim is recognized as the
+/// SAME identity and succeeds as an idempotent refresh, never a refusal. This
+/// is round 2's own regression, guarded directly: a pane-id-keyed identity
+/// would make a restarted daemon's recycled id compare EQUAL to a totally
+/// different, unrelated prior holder and wave it through (the fork
+/// #160/#163/#166 incident CLAUDE.md rule 23 exists to prevent) — here the
+/// worktree is unchanged and its OWN prior claim is correctly recognized
+/// regardless of which pane id happens to be assigned this time.
+#[spec("issue/claim/014")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_014_identity_survives_a_pane_id_change() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let wt = fx.add_worktree("wt-restart", "restart-branch");
+    fx.mark_owned(&wt, "orchestration:orch-restart");
+    fx.set_login("liam");
+
+    let first = fx.run(
+        &wt,
+        &["issue", "claim", "14", "--repo", repo],
+        Some("pane-6"),
+    );
+    assert!(
+        first.status.success(),
+        "the first claim must succeed; out={}",
+        combined(&first)
+    );
+
+    // Simulate a daemon restart recycling the pane-id counter: a DIFFERENT
+    // pane id, same worktree.
+    let second = fx.run(
+        &wt,
+        &["issue", "claim", "14", "--repo", repo],
+        Some("pane-9"),
+    );
+    assert!(
+        second.status.success(),
+        "the SAME worktree re-claiming with a DIFFERENT pane id (simulating a recycled \
+         daemon-restart pane id, CLAUDE.md rule 23) must be recognized as the SAME identity and \
+         succeed as an idempotent refresh, never a refusal; out={}",
+        combined(&second)
+    );
+    let text = combined(&second).to_lowercase();
+    assert!(
+        !text.contains("held by") && !text.contains("refus"),
+        "a same-identity refresh must not be reported as a refusal/held-by-another message; \
+         out={}",
+        combined(&second)
+    );
+}
+
+/// Scenario: An agent claims issue 15 with `--repo` OMITTED, from a worktree
+/// whose `origin` remote resolves to `acme/widgets`. Assert the claim
+/// succeeds and its output names the DERIVED repo explicitly. A second,
+/// different identity's `--repo`-omitted claim on the SAME issue is then
+/// refused, and its output ALSO names the derived repo. Reviewer F11: this
+/// fork's `origin` is the fork itself while plenty of issues live upstream,
+/// so a silently-derived repo could target the WRONG tracker — a reader must
+/// be able to tell, from the output alone, which repo a success or a refusal
+/// is even about.
+#[spec("issue/claim/015")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_015_repo_omitted_derives_from_origin_and_is_shown() {
+    let fx = Fixture::new();
+    fx.set_origin("git@github.com:acme/widgets.git");
+
+    let wt = fx.add_worktree("wt-derive", "derive-branch");
+    fx.mark_owned(&wt, "orchestration:orch-derive");
+    fx.set_login("maya");
+
+    let claim = fx.run(&wt, &["issue", "claim", "15"], Some("pane-derive"));
+    assert!(
+        claim.status.success(),
+        "a claim with --repo omitted must succeed by deriving the repo from `origin`; out={}",
+        combined(&claim)
+    );
+    let claim_text = combined(&claim);
+    assert!(
+        claim_text.contains("acme/widgets"),
+        "the success output must name the DERIVED repo explicitly — a silently-derived repo \
+         could target the wrong tracker (this fork's `origin` vs. upstream, reviewer F11); \
+         got:\n{claim_text}"
+    );
+
+    let wt2 = fx.add_worktree("wt-derive-2", "derive-branch-2");
+    fx.mark_owned(&wt2, "orchestration:orch-derive-2");
+    fx.set_login("noah");
+    let refused = fx.run(&wt2, &["issue", "claim", "15"], Some("pane-derive-2"));
+    assert!(
+        !refused.status.success(),
+        "a second identity's claim on the same issue must still be refused when --repo is \
+         omitted; out={}",
+        combined(&refused)
+    );
+    let refused_text = combined(&refused);
+    assert!(
+        refused_text.contains("acme/widgets"),
+        "the refusal must ALSO name the derived repo — the reader must be able to tell WHICH \
+         tracker (this fork vs. upstream) the refusal is even about; got:\n{refused_text}"
     );
 }
