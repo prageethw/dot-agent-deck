@@ -2532,6 +2532,22 @@ struct UiState {
     /// so every (re)delivery carries the same agent identity + stable delivery
     /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
     prompt_delivery: HashMap<String, PromptDelivery>,
+    /// Fork #197 M2 (closes #182, upstream #424 finding #2): pane ids whose
+    /// mode `seed_prompt` write has LANDED (`Applied`/`Queued` — bytes
+    /// reached the PTY) but has no independent submit confirmation. Unlike
+    /// `orchestration_awaiting_confirmation`, this is a marker only — the
+    /// mode-seed path has no LEVEL/TEXT confirmation check yet (that is
+    /// fork #197 M3 / #187's job, matching the orchestrator path's
+    /// mechanism to this one) — so while a pane is in this set no further
+    /// write is attempted for it at all; it is retained, silently, until
+    /// `AUTOMATIC_PROMPT_DEADLINE` reclaims it (checked at the top of
+    /// `process_pending_seed_prompts` on every call, same as before this
+    /// fix). Before fork #197 M2, `Applied`/`Queued` was instead treated as
+    /// terminal delivery and the seed dropped in the same frame the write
+    /// landed — issue #424's own finding #2, surviving here because this
+    /// copy of the delivery logic was never updated when #424 fixed the
+    /// orchestrator path.
+    seed_delivery_landed: HashSet<String>,
     /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
@@ -2706,6 +2722,7 @@ impl UiState {
             pending_seed_prompts: Vec::new(),
             send_retry_backoff: HashMap::new(),
             prompt_delivery: HashMap::new(),
+            seed_delivery_landed: HashSet::new(),
             // next_delivery_seq removed (PRD #20 finding #3): delivery ids are now
             // minted globally unique via `mint_delivery_id`.
             scheduled_tasks: Vec::new(),
@@ -3659,18 +3676,37 @@ fn process_pending_seed_prompts(
     let mut prompts = std::mem::take(&mut ui.pending_seed_prompts);
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
+    // Fork #197 M2 (closes #182): take `seed_delivery_landed` out too — see
+    // [`UiState::seed_delivery_landed`] for what it tracks and why it is a
+    // marker only, not a full awaiting-confirmation cycle.
+    let mut landed = std::mem::take(&mut ui.seed_delivery_landed);
     prompts.retain_mut(|sp| {
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
-        // the readiness/backoff/delivery branches — so it is actually reachable.
-        // The old code checked it only AFTER the delivery branch (which always
-        // returned first), making the 60s deadline unreachable: a permanent
-        // non-delivery re-attempted one RPC every ~2s forever. An expired seed is
-        // abandoned here with NO further delivery attempt.
+        // the landed/readiness/backoff/delivery branches — so it is actually
+        // reachable. The old code checked it only AFTER the delivery branch
+        // (which always returned first), making the 60s deadline unreachable: a
+        // permanent non-delivery re-attempted one RPC every ~2s forever. An
+        // expired seed is abandoned here with NO further delivery attempt —
+        // this is also how a seed retained past a landed write (fork #197 M2,
+        // below) eventually terminates: nothing else reclaims it.
         if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
             tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
+            landed.remove(&sp.pane_id);
             return false;
+        }
+        // Fork #197 M2 (closes #182, upstream #424 finding #2): a prior write
+        // for this pane already LANDED (`Applied`/`Queued` — bytes reached the
+        // PTY) but the mode-seed path has no independent submit-confirmation
+        // check yet (that is fork #197 M3 / #187's job — matching the
+        // orchestrator path's LEVEL/TEXT mechanism to this one). So a landed
+        // write is retained here, with no further write attempted, until the
+        // deadline above reclaims it — never reported as delivered (the #182
+        // bug this closes) and never resubmitted (which would risk the
+        // #194-shaped duplicate-submission bug M4 exists to solve properly).
+        if landed.contains(&sp.pane_id) {
+            return true;
         }
         // Fast path: agent fired SessionStart (agent_type resolved).
         let agent_ready = snapshot.sessions.values().any(|s| {
@@ -3679,16 +3715,17 @@ fn process_pending_seed_prompts(
         // Slow path: no SessionStart after 10s (e.g. opencode) — proceed anyway.
         let timeout_ready =
             !agent_ready && sp.created_at.elapsed() > std::time::Duration::from_secs(10);
-        if agent_ready {
+        // Upstream #424 finding #3 (fork #182): the 10s no-SessionStart
+        // fallback must still honor the readiness buffer instead of firing
+        // with a zero buffer the instant the 10s mark is crossed — mirrors
+        // `deliver_orchestrator_prompt`'s `orchestration_ready_since.entry(
+        // tab_id).or_insert(now)`. Engaging `timeout_ready` now starts the
+        // same buffer wait a real `SessionStart` would, instead of bypassing
+        // it the way the old `if timeout_ready { true } else { ... }` did.
+        if agent_ready || timeout_ready {
             sp.ready_since.get_or_insert(now);
         }
-        // Hold the write until the readiness buffer elapses (mirrors the
-        // orchestrator path). The timeout path bypasses the buffer.
-        let buffer_elapsed = if timeout_ready {
-            true
-        } else {
-            should_inject_spawn_time_prompt(sp.ready_since, now)
-        };
+        let buffer_elapsed = should_inject_spawn_time_prompt(sp.ready_since, now);
         if (agent_ready || timeout_ready) && buffer_elapsed {
             // R20-005: don't re-attempt until the backoff window elapses.
             if backoff
@@ -3726,11 +3763,20 @@ fn process_pending_seed_prompts(
                 expected_session_id.as_deref(),
                 Some(&delivery_id),
             ) {
-                // Delivered (or accepted for delivery): drop the seed + its state.
-                Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-                    backoff.remove(&sp.pane_id);
-                    deliveries.remove(&sp.pane_id);
-                    return false;
+                // Fork #197 M2 (closes #182, upstream #424 finding #2):
+                // "bytes reached the PTY" is NOT confirmed delivery — mark the
+                // pane landed and retain the seed instead of dropping it here.
+                // See the `landed.contains` check above for what happens next.
+                Ok(result @ (SendResult::Applied | SendResult::Queued)) => {
+                    tracing::info!(
+                        pane_id = %sp.pane_id,
+                        delivery_id = delivery_id.as_str(),
+                        result = describe_send_result(result),
+                        "seed prompt: write applied; retained pending confirmation \
+                         (mode-seed path has no confirmation check yet — fork #197 M3)"
+                    );
+                    landed.insert(sp.pane_id.clone());
+                    return true;
                 }
                 // Explicit non-delivery: retain for retry, back off, surface
                 // feedback. Bounded by the deadline checked at the top of this
@@ -3756,6 +3802,7 @@ fn process_pending_seed_prompts(
     ui.pending_seed_prompts = prompts;
     ui.send_retry_backoff = backoff;
     ui.prompt_delivery = deliveries;
+    ui.seed_delivery_landed = landed;
     if let Some(message) = feedback {
         ui.status_message = Some((message, now));
     }
