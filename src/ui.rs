@@ -2213,6 +2213,33 @@ fn prompt_text_confirms(
 /// value rather than one name doing two jobs.
 const CONFIRMATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Fork #197 M4 Part 2: test-only override for [`CONFIRMATION_GRACE_PERIOD`],
+/// in milliseconds, via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS`.
+/// Mirrors `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS`'s idiom
+/// (`src/daemon_protocol.rs`): gated behind `cfg(any(test, debug_assertions))`
+/// so a shipped release binary compiles this override out entirely and its
+/// retry timing can never be altered by an env var — this is a test hook,
+/// not a production knob, unlike `DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS`
+/// which stays live in release builds. Exists so a real-agent e2e run
+/// (`orchestration/seed/015`/`016`) can shrink the grace period far below a
+/// real agent's boot time and make the confirmation-retry path fire
+/// deterministically, rather than only opportunistically when a real boot
+/// happens to be slower than the 2s production default. An invalid or
+/// unset value falls back to [`CONFIRMATION_GRACE_PERIOD`] unchanged.
+#[cfg(any(test, debug_assertions))]
+fn confirmation_grace_period() -> std::time::Duration {
+    std::env::var("DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(CONFIRMATION_GRACE_PERIOD)
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn confirmation_grace_period() -> std::time::Duration {
+    CONFIRMATION_GRACE_PERIOD
+}
+
 /// Issue #424 round 3 (reviewer F9 / auditor N1): the exponential-backoff
 /// cap for [`send_retry_delay`], split out from [`CONFIRMATION_GRACE_PERIOD`]
 /// — see that constant's doc for why. Same value (2s) as of this writing;
@@ -4166,7 +4193,7 @@ fn deliver_orchestrator_prompt(
     let awaiting = ui.orchestration_awaiting_confirmation.get(&tab_id).cloned();
     let confirmation_retry_blocked = awaiting
         .as_ref()
-        .is_some_and(|a| a.retried || now.duration_since(a.since) < CONFIRMATION_GRACE_PERIOD);
+        .is_some_and(|a| a.retried || now.duration_since(a.since) < confirmation_grace_period());
     if !((agent_ready || timeout_ready) && buffer_elapsed && !backed_off)
         || confirmation_retry_blocked
     {
