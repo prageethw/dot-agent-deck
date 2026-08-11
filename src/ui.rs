@@ -4217,10 +4217,22 @@ fn deliver_orchestrator_prompt(
             ),
             None => (None, None, None),
         };
-    let prompt_text = orchestrator_prompt
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
+    // Fork #197 M4 (closes #194): a confirmation-retry (`awaiting.is_some()`)
+    // targets a write that already LANDED — `Applied`/`Queued` means the
+    // bytes reached the PTY. Re-sending the full text would duplicate it in
+    // a composer that already holds it, so the retry sends a bare submit
+    // instead: `encode_pane_payload("")` returns an empty vec (pinned by
+    // `encode_pane_payload_empty`), so the write loop issues no syscall and
+    // execution falls through to `SUBMIT_DELAY` then `\r` — mechanically the
+    // same as pressing Enter on a composer that already holds the text.
+    let prompt_text = if awaiting.is_some() {
+        String::new()
+    } else {
+        orchestrator_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    };
     match pane.write_and_submit_to_pane_with_identity(
         &start_pane_id,
         &prompt_text,
