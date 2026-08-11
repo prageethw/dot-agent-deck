@@ -273,6 +273,26 @@ pub struct SessionSnapshot {
     /// The most recent user prompt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_prompt: Option<String>,
+    /// Fork #197 M3 step 1 (issue #187): a monotonically increasing counter,
+    /// advanced ONLY inside the same `event.user_prompt` gate that sets
+    /// `last_user_prompt` above (`AppState::apply_event`,
+    /// `src/state.rs:4000-4005`) — i.e. only by a hook payload that actually
+    /// carries a `prompt` field (a real `UserPromptSubmit` / `session.prompt`).
+    /// This is what lets `deliver_orchestrator_prompt`'s TEXT confirmation
+    /// (`src/ui.rs`, `prompt_text_confirms`) recognize a genuine RESUBMIT of
+    /// byte-identical text: the string comparison alone cannot, since the
+    /// value does not change, but this counter still advances because a real
+    /// submission occurred. Carried in the snapshot for the same reason
+    /// `last_user_prompt` is: it must travel WITH the value it qualifies, or
+    /// a reconnect ends up with `last_user_prompt` restored from the
+    /// snapshot while this counter resets to its `#[serde(default)]` `0`,
+    /// which breaks the invariant that the two only ever change together and
+    /// can make a stale post-reconnect baseline look like a fresh submit (or
+    /// vice versa). An older daemon sends nothing, which decodes to `0` —
+    /// exactly today's behavior — so this is NOT a wire-shape change and
+    /// needs no `PROTOCOL_VERSION` bump.
+    #[serde(default)]
+    pub last_user_prompt_seq: u64,
     /// PRD #20 blocker-4: the session's durable live-target descriptor, so a
     /// history-only / view-only card keeps its input-refusal across a
     /// detach/reconnect instead of falling back to the legacy live default.
@@ -310,6 +330,10 @@ pub struct SessionState {
     pub recent_events: VecDeque<AgentEvent>,
     pub tool_count: u32,
     pub last_user_prompt: Option<String>,
+    /// Fork #197 M3 step 1 (issue #187): see [`SessionSnapshot::last_user_prompt_seq`]
+    /// for the full rationale — advanced only alongside `last_user_prompt`
+    /// above, inside the same `event.user_prompt` gate.
+    pub last_user_prompt_seq: u64,
     pub first_prompts: Vec<String>,
     pub pane_id: Option<String>,
     /// PRD #110: the daemon-side registry id of the agent process that
@@ -382,6 +406,9 @@ impl SessionState {
             tool_count: self.tool_count,
             first_prompts: self.first_prompts.clone(),
             last_user_prompt: self.last_user_prompt.clone(),
+            // Fork #197 M3 step 1: carry the counter alongside the value it
+            // qualifies (see `SessionSnapshot::last_user_prompt_seq`).
+            last_user_prompt_seq: self.last_user_prompt_seq,
             // PRD #20 blocker-4: carry the durable live-target so a reconnect
             // restores the card's write-semantics (history-only / view-only).
             live_target: self.live_target(),
@@ -2775,6 +2802,7 @@ impl AppState {
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
+                last_user_prompt_seq: 0,
                 first_prompts: Vec::new(),
                 pane_id: Some(pane_id),
                 agent_id,
@@ -2839,6 +2867,9 @@ impl AppState {
                 session.tool_count = snap.tool_count;
                 session.first_prompts = snap.first_prompts.clone();
                 session.last_user_prompt = snap.last_user_prompt.clone();
+                // Fork #197 M3 step 1: restore alongside the value it
+                // qualifies — see `SessionSnapshot::last_user_prompt_seq`.
+                session.last_user_prompt_seq = snap.last_user_prompt_seq;
                 // Fork issue #21: restore the PRD #370 synthetic-`Working`
                 // provenance alongside the status it qualifies. Dropping it
                 // stranded a card that reconnected mid-`ShellBusy` at
@@ -2933,6 +2964,9 @@ impl AppState {
             session.tool_count = snap.tool_count;
             session.first_prompts = snap.first_prompts.clone();
             session.last_user_prompt = snap.last_user_prompt.clone();
+            // Fork #197 M3 step 1: restore alongside the value it
+            // qualifies — see `SessionSnapshot::last_user_prompt_seq`.
+            session.last_user_prompt_seq = snap.last_user_prompt_seq;
             // Fork issue #21's provenance marker, under the same guard
             // `seed_hydrated_session` applies: it may only qualify a `Working`.
             session.shell_synthetic_working =
@@ -4075,6 +4109,7 @@ impl AppState {
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
+                last_user_prompt_seq: 0,
                 first_prompts: Vec::new(),
                 pane_id: event.pane_id.clone(),
                 agent_id: event.agent_id.clone(),
@@ -4141,6 +4176,14 @@ impl AppState {
 
         if let Some(ref prompt) = event.user_prompt {
             session.last_user_prompt = Some(prompt.clone());
+            // Fork #197 M3 step 1 (issue #187): advance the submission
+            // counter INSIDE this same gate, unconditionally — even when
+            // `prompt` is byte-identical to the previous `last_user_prompt`.
+            // A saturating add rather than a wrap: at one increment per
+            // genuine submission this cannot realistically reach u64::MAX
+            // in a session's lifetime, and saturating is strictly safer than
+            // wrapping back to a low value a stale baseline could exceed.
+            session.last_user_prompt_seq = session.last_user_prompt_seq.saturating_add(1);
             if session.first_prompts.len() < MAX_FIRST_PROMPTS {
                 session.first_prompts.push(prompt.clone());
             }

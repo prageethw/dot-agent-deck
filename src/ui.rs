@@ -2034,6 +2034,18 @@ struct AwaitingConfirmation {
     /// before this write ever happened, and that leftover value must not
     /// instantly confirm a NEW write that hasn't actually been submitted yet.
     baseline_prompt: Option<String>,
+    /// Fork #197 M3 step 1 (issue #187): the target session's
+    /// `last_user_prompt_seq` at the moment THIS write landed — captured
+    /// once and carried through any retry, same lifetime as
+    /// `baseline_prompt`. `prompt_text_confirms` treats a STRICTLY GREATER
+    /// current value as positive evidence that a genuine submission
+    /// happened since this baseline was captured, even when the resubmitted
+    /// text is byte-identical to `baseline_prompt` and the text-diff check
+    /// alone would stay silent forever. The counter only advances inside
+    /// `AppState::apply_event`'s `event.user_prompt` gate
+    /// (`src/state.rs:4000-4005`+), so it cannot be moved by anything other
+    /// than a real submission-carrying hook event.
+    baseline_prompt_seq: u64,
     /// Has the one confirmation-retry this cycle is allowed already been
     /// spent? Minting a fresh `delivery_id` per retry (below) means the
     /// daemon's ledger (`AgentPtyRegistry::admit_delivery`) can never dedupe
@@ -2126,17 +2138,46 @@ fn reset_delivery_cycle(ui: &mut UiState, tab_id: TabId, start_pane_id: &str) {
     ui.orchestration_awaiting_confirmation.remove(&tab_id);
 }
 
-/// Issue #424 round 4: does `observed` (a session's current
-/// `last_user_prompt`) positively identify a genuine submit of `sent` (the
-/// text we wrote to the pane)? Trimmed equality or a trimmed-prefix match
-/// (the seed is a one-line pointer; the agent's echoed/submitted text may
-/// carry leading/trailing whitespace or trailing artefacts) counts — a loose
-/// substring `contains` does not, since a short common substring can appear
-/// by coincidence. `baseline` is the SAME session's `last_user_prompt` at the
-/// moment our write landed: if the current value is unchanged from that
-/// baseline, it cannot be evidence of a NEW submit — it is a leftover from
-/// before this write even happened (see [`AwaitingConfirmation::baseline_prompt`]).
-fn prompt_text_confirms(observed: Option<&str>, sent: &str, baseline: Option<&str>) -> bool {
+/// Issue #424 round 4, extended by fork #197 M3 step 1 (issue #187): does
+/// `observed` (a session's current `last_user_prompt`) positively identify a
+/// genuine submit of `sent` (the text we wrote to the pane)? Trimmed
+/// equality or a trimmed-prefix match (the seed is a one-line pointer; the
+/// agent's echoed/submitted text may carry leading/trailing whitespace or
+/// trailing artefacts) counts — a loose substring `contains` does not, since
+/// a short common substring can appear by coincidence.
+///
+/// Text matching alone is not sufficient: `baseline` is the SAME session's
+/// `last_user_prompt` at the moment our write landed, and an unchanged
+/// current value relative to it is, BY ITSELF, ambiguous — it is either a
+/// leftover from before this write even happened, or a genuine RESUBMIT of
+/// byte-identical text (the remit pointer this repo actually sends is a
+/// constant string every cycle, so this is not a rare case). A resubmit
+/// cannot be told apart from a stale leftover by the text alone, so this
+/// also consults `baseline_seq`/`observed_seq` — the SAME session's
+/// `last_user_prompt_seq` at write time and now respectively. That counter
+/// advances ONLY inside `AppState::apply_event`'s `event.user_prompt` gate
+/// (`src/state.rs:4000-4005`+), fed only by a hook payload that actually
+/// carries a `prompt` field, so `observed_seq > baseline_seq` can only be
+/// true when a real submission happened after the baseline was captured —
+/// it cannot be forged by `last_activity` forward-stamping (unconditional on
+/// every event, `src/state.rs:3976-3978` — deliberately NOT consulted here)
+/// or by any event that omits `user_prompt`.
+///
+/// Confirmed when the text matches AND EITHER signal shows a change since
+/// the baseline: the current value differs from the leftover baseline text
+/// (the pre-existing check — still needed for a raw `last_user_prompt`
+/// mutation that does not go through `apply_event`, e.g. test fixtures), OR
+/// the submission counter has advanced (the new check — covers a genuine
+/// resubmit through `apply_event` whose text happens to match the baseline
+/// exactly). See [`AwaitingConfirmation::baseline_prompt`] and
+/// [`AwaitingConfirmation::baseline_prompt_seq`].
+fn prompt_text_confirms(
+    observed: Option<&str>,
+    sent: &str,
+    baseline: Option<&str>,
+    baseline_seq: u64,
+    observed_seq: u64,
+) -> bool {
     let Some(observed) = observed else {
         return false;
     };
@@ -2147,7 +2188,9 @@ fn prompt_text_confirms(observed: Option<&str>, sent: &str, baseline: Option<&st
     }
     let matches_text =
         observed_trimmed == sent_trimmed || observed_trimmed.starts_with(sent_trimmed);
-    matches_text && baseline != Some(observed_trimmed)
+    let text_changed_since_baseline = baseline != Some(observed_trimmed);
+    let genuine_resubmit_observed = observed_seq > baseline_seq;
+    matches_text && (text_changed_since_baseline || genuine_resubmit_observed)
 }
 
 /// Issue #424 round 2 (`orchestration/seed/006`): the plausible upper bound
@@ -4063,6 +4106,8 @@ fn deliver_orchestrator_prompt(
                 s.last_user_prompt.as_deref(),
                 sent_prompt,
                 awaiting.baseline_prompt.as_deref(),
+                awaiting.baseline_prompt_seq,
+                s.last_user_prompt_seq,
             )
         });
         if level_confirmed || text_confirmed {
@@ -4229,7 +4274,7 @@ fn deliver_orchestrator_prompt(
                         && s.agent_type != AgentType::None
                 })
                 .max_by_key(|s| s.last_activity);
-            let (confirmation_session_id, pre_write_thinking, baseline_prompt) =
+            let (confirmation_session_id, pre_write_thinking, baseline_prompt, baseline_prompt_seq) =
                 match awaiting.as_ref() {
                     Some(a) => (
                         a.expected_session_id
@@ -4237,11 +4282,15 @@ fn deliver_orchestrator_prompt(
                             .or_else(|| confirmation_target.map(|s| s.session_id.clone())),
                         a.pre_write_thinking,
                         a.baseline_prompt.clone(),
+                        a.baseline_prompt_seq,
                     ),
                     None => (
                         confirmation_target.map(|s| s.session_id.clone()),
                         confirmation_target.is_some_and(|s| s.status == SessionStatus::Thinking),
                         confirmation_target.and_then(|s| s.last_user_prompt.clone()),
+                        confirmation_target
+                            .map(|s| s.last_user_prompt_seq)
+                            .unwrap_or(0),
                     ),
                 };
             ui.orchestration_awaiting_confirmation.insert(
@@ -4251,6 +4300,7 @@ fn deliver_orchestrator_prompt(
                     expected_session_id: confirmation_session_id,
                     pre_write_thinking,
                     baseline_prompt,
+                    baseline_prompt_seq,
                     retried: awaiting.is_some(),
                 },
             );
@@ -22687,6 +22737,7 @@ mod tests {
             recent_events: events,
             tool_count: 0,
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
@@ -25187,6 +25238,7 @@ mod tests {
             recent_events: std::collections::VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             first_prompts: Vec::new(),
             pane_id: Some(pane.to_string()),
             agent_id: None,
@@ -28006,6 +28058,7 @@ mod tests {
             recent_events: std::collections::VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
@@ -28228,6 +28281,7 @@ mod tests {
             recent_events: events,
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
+            last_user_prompt_seq: 0,
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
@@ -28264,6 +28318,7 @@ mod tests {
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
+            last_user_prompt_seq: 0,
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
@@ -28291,6 +28346,7 @@ mod tests {
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             first_prompts: Vec::new(),
             pane_id: None,
             agent_id: None,
@@ -36000,6 +36056,7 @@ mod tests {
                     recent_events: std::collections::VecDeque::new(),
                     tool_count: 0,
                     last_user_prompt: None,
+                    last_user_prompt_seq: 0,
                     first_prompts: Vec::new(),
                     pane_id: Some("orch-pane-431".to_string()),
                     agent_id: Some("orch-agent-431-b".to_string()),
