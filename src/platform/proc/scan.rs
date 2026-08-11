@@ -546,8 +546,18 @@ mod tests {
     /// The consequence that matters: a descendant whose identity could not be
     /// confirmed must not be able to invent a busy reading. Before the
     /// confirmation pass the same table classifies the pane as busy; after it,
-    /// the pane reads idle rather than trusting a `getsid` answer that may
-    /// describe an unrelated, recycled process.
+    /// the pane must report unknown rather than trusting a `getsid` answer
+    /// that may describe an unrelated, recycled process.
+    ///
+    /// Fork issue #160's per-row fail-safe (`status/shell-activity/011`)
+    /// changed this test's own expected outcome: `invalidate_unconfirmed_session_ids`
+    /// resets the unconfirmed row's session id to the same `-1` sentinel a
+    /// failed `getsid` produces, and pid 200 is the pane's *only* candidate —
+    /// so this is exactly the per-row fail-safe's scenario, reached via the
+    /// confirmation pass instead of a raw unreadable `getsid`. It used to
+    /// assert `Some(false)`, which was the bug: a confident idle reading built
+    /// entirely on a descendant nobody could confirm. The corrected contract
+    /// is `None` — "no answer available" — never `Some(false)`.
     #[test]
     fn an_unconfirmed_descendant_cannot_flip_a_pane_to_busy() {
         let mut rows = vec![
@@ -564,8 +574,9 @@ mod tests {
         invalidate_unconfirmed_session_ids(&mut rows, confirm);
         assert_eq!(
             descendant_shell_activity(&rows, 100, &[]),
-            Some(false),
-            "a descendant the second sample could not confirm must not count as busy evidence"
+            None,
+            "a descendant the second sample could not confirm must not count as busy evidence \
+             — and, being the pane's only candidate, must not be read as confirmed idle either"
         );
     }
 
