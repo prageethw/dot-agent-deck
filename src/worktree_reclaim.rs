@@ -223,9 +223,9 @@ pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
 pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
     format!(
         "worktree list --mine: {path} is marked owned by {owner}, but the ownership check \
-         disagrees -- excluding it rather than trusting either signal alone (usually a \
-         transient `git rev-parse` race under load, or a concurrent write to the worktree's \
-         admin dir; re-run to confirm)",
+         disagrees -- excluding it rather than trusting either signal (often a `git \
+         rev-parse` race; persisting past a re-run rules that out -- check the marker and \
+         admin dir)",
         path = path.display()
     )
 }
@@ -584,10 +584,10 @@ fn read_marker_owner(marker_path: &Path) -> Option<String> {
 /// disagreement was accepted as cosmetic because "no consumer treats
 /// `owner`'s mere presence as an ownership signal." That is no longer
 /// true — `worktree list --mine` (`src/main.rs::run_worktree_list_cli`) is
-/// exactly such a consumer as of this PR, and now filters on `r.owned &&
-/// r.owner == Some(..)` rather than `owner` alone, so a foreign worktree
-/// whose marker happens to read back a matching identity is excluded
-/// rather than reported as mine.
+/// exactly such a consumer as of this PR, and now filters through
+/// [`is_mine`] rather than `owner` alone, so a foreign worktree whose
+/// marker happens to read back a matching identity is excluded rather
+/// than reported as mine.
 ///
 /// [`examine_worktrees`] calls this immediately after [`ownership_of`], with
 /// no I/O of any kind — no `gh` call, no other filesystem work — in between,
@@ -2059,9 +2059,9 @@ mod tests {
         assert_eq!(
             format_disagreement_warning(Path::new("/repo/wt-disagree"), "orch-x"),
             "worktree list --mine: /repo/wt-disagree is marked owned by orch-x, but the \
-             ownership check disagrees -- excluding it rather than trusting either signal alone \
-             (usually a transient `git rev-parse` race under load, or a concurrent write to the \
-             worktree's admin dir; re-run to confirm)",
+             ownership check disagrees -- excluding it rather than trusting either signal \
+             (often a `git rev-parse` race; persisting past a re-run rules that out -- check \
+             the marker and admin dir)",
             "the disagreement warning's user-visible text must name the path and owner, state \
              what disagreed, and give a likely cause with a remedy"
         );
