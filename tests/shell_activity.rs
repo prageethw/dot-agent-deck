@@ -63,7 +63,7 @@ use spec::spec;
 /// `#[cfg(unix)]` entirely; an ungated use of `Duration` here fails to
 /// compile on Windows.
 #[cfg(unix)]
-const PROCESS_TABLE_POLL_WINDOW: Duration = Duration::from_secs(PS_SAMPLE_BUDGET.as_secs() * 4);
+const PROCESS_TABLE_POLL_WINDOW: Duration = PS_SAMPLE_BUDGET.saturating_mul(4);
 
 /// Fork issue #160 F2: the trailing `sleep` in `shell_activity_004`'s script,
 /// after the detached target is killed, keeps the pane's own shell (and so

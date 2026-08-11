@@ -730,7 +730,22 @@ fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<Str
         std::thread::sleep(Duration::from_millis(5));
     };
 
-    let stdout = reader.join().ok()??;
+    let stdout = match reader.join() {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            // PR #233 review (V4): the async form logs on this exact path
+            // (`read_capped`'s `Ok(None)` arm) — this restores the matching
+            // line so a sync-path read failure isn't silent, now that both
+            // forms are behaviourally symmetric (R1).
+            tracing::warn!(
+                program,
+                "process-table sample's read failed — reporting no sample rather than a \
+                 partial table"
+            );
+            return None;
+        }
+        Err(_) => return None,
+    };
     if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
         // Belt-and-braces: a fast, self-limiting over-cap producer can exit on
         // its own before the poll loop above observes the `cap_rx` signal.
