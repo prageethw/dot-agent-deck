@@ -184,6 +184,25 @@ pub struct WorktreeReport {
     pub real_path: PathBuf,
 }
 
+/// Reports where the on-disk marker names `owner`, but the independent
+/// `owned` resolution says otherwise (issue #221). `ownership_of` and
+/// `owner_of` each spawn their own `git rev-parse`s to answer a related but
+/// distinct question, and `owner_of`'s own doc records that under
+/// concurrent worktree-admin-dir writes the two can disagree: `owned=false`
+/// landing alongside a non-`None` `owner`. `worktree list --mine`'s retain
+/// filter (`src/main.rs`) correctly excludes such a row -- `owned` must stay
+/// a conjunct, not a relaxation -- but excluding it silently turns a
+/// disagreement into indistinguishable-from-"nothing found", which is worse
+/// than surfacing it. Callers use this to warn on stderr before filtering,
+/// never to change what gets filtered.
+pub fn owner_disagreements<'a>(reports: &'a [WorktreeReport], owner: &str) -> Vec<&'a Path> {
+    reports
+        .iter()
+        .filter(|r| !r.owned && r.owner.as_deref() == Some(owner))
+        .map(|r| r.real_path.as_path())
+        .collect()
+}
+
 /// Top-level `--json` document.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeListDocument {
@@ -1893,6 +1912,74 @@ mod tests {
             Some(&DASH),
             "the OWNER column must render the existing DASH placeholder for a report whose \
              owner is None; got row: {legacy_row:?}"
+        );
+    }
+
+    /// Scenario: Three `WorktreeReport`s are constructed directly -- one
+    /// whose marker names `orch-x` but whose independent `owned` resolution
+    /// came back `false` (the issue #221 disagreement shape), one genuinely
+    /// owned by `orch-x`, and one owned by a different name entirely.
+    /// `owner_disagreements` must return exactly the first report's path,
+    /// and the existing `retain` filter applied afterward must still
+    /// exclude that same disagreeing row -- pinning that surfacing the
+    /// disagreement never relaxes the fail-closed filter.
+    #[spec("worktree/reclaim/030")]
+    #[test]
+    fn worktree_reclaim_030_owner_disagreements_finds_owned_false_with_matching_owner() {
+        let disagreeing = WorktreeReport {
+            path: "/repo/wt-disagree".to_string(),
+            branch: Some("feat/disagree".to_string()),
+            clean: true,
+            owned: false,
+            owner: Some("orch-x".to_string()),
+            pr_state: "unknown".to_string(),
+            verdict: "keep".to_string(),
+            reason: None,
+            real_path: PathBuf::from("/repo/wt-disagree"),
+        };
+        let genuinely_owned = WorktreeReport {
+            path: "/repo/wt-owned".to_string(),
+            branch: Some("feat/owned".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("orch-x".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: PathBuf::from("/repo/wt-owned"),
+        };
+        let different_owner = WorktreeReport {
+            path: "/repo/wt-other".to_string(),
+            branch: Some("feat/other".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("orch-y".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: PathBuf::from("/repo/wt-other"),
+        };
+        let reports = vec![
+            disagreeing.clone(),
+            genuinely_owned.clone(),
+            different_owner.clone(),
+        ];
+
+        let disagreements = owner_disagreements(&reports, "orch-x");
+        assert_eq!(
+            disagreements,
+            vec![Path::new("/repo/wt-disagree")],
+            "owner_disagreements must return exactly the row whose owner matches but whose \
+             owned flag is false, not the genuinely-owned row or the different-owner row"
+        );
+
+        let mut filtered = reports.clone();
+        filtered.retain(|r| r.owned && r.owner.as_deref() == Some("orch-x"));
+        assert_eq!(
+            filtered.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/repo/wt-owned"],
+            "the fail-closed retain filter must still exclude the disagreeing row -- surfacing \
+             the disagreement must never relax what gets filtered"
         );
     }
 }

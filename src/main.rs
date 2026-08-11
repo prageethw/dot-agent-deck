@@ -1692,7 +1692,8 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
         DOT_AGENT_DECK_WORKTREE_OWNER, ORCHESTRATION_UNKNOWN_SENTINEL,
     };
     use dot_agent_deck::worktree_reclaim::{
-        WorktreeListDocument, examine_worktrees, format_list_human, sanitize_marker_creator,
+        WorktreeListDocument, examine_worktrees, format_list_human, owner_disagreements,
+        sanitize_marker_creator,
     };
 
     let owner_filter = if mine {
@@ -1766,6 +1767,19 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
         }
     };
     if let Some(owner) = &owner_filter {
+        // Issue #221: before filtering, name any row where the marker names
+        // this owner but the independent `owned` resolution disagrees --
+        // otherwise that disagreement becomes indistinguishable from
+        // "nothing found" once the retain below drops the row. Stderr, so
+        // `--json` consumers see it too.
+        for path in owner_disagreements(&reports, owner) {
+            eprintln!(
+                "worktree list --mine: {path} is marked owned by {owner}, but the ownership \
+                 check disagrees -- excluding it rather than trusting either signal alone",
+                path = path.display()
+            );
+        }
+
         // PR #215 fixup (reviewer F4 / auditor L1 item 3): `owned` must be a
         // conjunct, not just a non-`None` `owner`. `owner_of`'s own doc
         // records that `owned=false` can land alongside a non-`None`
