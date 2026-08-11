@@ -13,6 +13,7 @@ This is not cosmetic. `vfarcic/tap` can never ship a fork build (see the last se
 | Path | What it should be |
 |---|---|
 | `~/.local/bin/worker-agent-deck` | the fork build you launch; also the absolute path baked into the `~/.claude/settings.json` hook entries |
+| `~/.local/bin/dot-agent-deck` | a **symlink** to `worker-agent-deck` — never a second build. See the caveat below: agents invoke `dot-agent-deck` by name, and the symlink is what keeps those calls on the fork binary |
 | `/opt/homebrew/bin/dot-agent-deck` | the upstream brew install, moved only by `brew upgrade` |
 
 ### Installing a fork build
@@ -42,7 +43,20 @@ Build in a **throwaway worktree on a disk-backed sibling path**, never in the ro
 
 The `current_exe()` choice is deliberate and should not be "fixed" to use `$PATH`. The doc comment at `daemon_attach.rs:247` records why: *"non-interactive ssh shells routinely skip `~/.local/bin` (we hit this exact bug three times — commits `493248b`, `bbf2236`, `ea8c748`)."*
 
-**Open caveat, where row 2 meets the naming convention.** The generated orchestrator context instructs workers to run `dot-agent-deck delegate …` / `dot-agent-deck work-done …`, resolved **by name** from `$PATH`. Under the convention above, the only `dot-agent-deck` on `PATH` is the *upstream* brew build — so those calls do not necessarily run the fork binary you just installed, and a fork-only change to `delegate` can be live in your TUI while the agents keep calling something else entirely. This is unresolved, not decided. Before trusting a `delegate`/`work-done` fix to be deployed, check what it actually resolves to **inside the agent's own shell** (the role commands run under `devbox`, whose `PATH` is not necessarily yours): `command -v dot-agent-deck`.
+**Row 2 collides with the naming convention, and the collision is not theoretical.** The command name `dot-agent-deck` is **hardcoded in the product**: `src/state.rs` generates the worker prompts that tell agents to run `dot-agent-deck delegate …` / `dot-agent-deck work-done …`, resolved **by name** from `$PATH`. So the convention cannot simply be applied to that name and left there — if the only `dot-agent-deck` on `PATH` is the upstream brew build, every delegation call runs it.
+
+That fails, rather than degrading quietly. Measured 2026-08-11: brew's upstream **0.35.10 speaks `PROTOCOL_VERSION` 6** while the fork's 0.37.1 speaks **7**, and since v0.36.0 a local attach on a mismatched protocol is *refused* outright. Deleting a fork build that happened to be installed under the reserved name therefore breaks `delegate` and `work-done` for every worker — the binary was load-bearing by accident.
+
+**Resolution, until the hardcoded name is fixed at the source:** make `~/.local/bin/dot-agent-deck` a **symlink to `worker-agent-deck`**, not a second copy of the build.
+
+```bash
+rm -f ~/.local/bin/dot-agent-deck
+ln -s worker-agent-deck ~/.local/bin/dot-agent-deck
+```
+
+A symlink keeps both names on one fork binary at one protocol version, and stays correct across every future upgrade because there is only ever one file to replace — which a second copy does not, since it silently goes stale the moment you upgrade the other. It is still an interim measure: it shadows the brew binary, so `dot-agent-deck` no longer means "upstream" on this machine. The end state is for the generated prompts to name the fork binary directly.
+
+When diagnosing, check what the name resolves to **inside the agent's own shell** rather than yours — role commands run under `devbox`, whose `PATH` need not match: `command -v dot-agent-deck`.
 
 ## The trap: attaching is not spawning
 
@@ -87,4 +101,4 @@ So **`vfarcic/tap` can never ship a fork build**. A fork release produces GitHub
 
 This is also why a fork build and a brew build can coexist and be confused for one another: `/opt/homebrew/bin/dot-agent-deck` stays installed and becomes active again the moment anything earlier on `PATH` is removed. **The naming convention at the top of this page is the answer to that** — keeping fork builds under `worker-agent-deck` means the two can never shadow each other by accident, and `which` alone tells you which lineage you are about to run.
 
-It also means a stray fork build installed as `~/.local/bin/dot-agent-deck` is worse than a duplicate: it shadows the brew binary while wearing its name, so `dot-agent-deck --version` reports a fork version that no `brew upgrade` will ever move. If you find one, that is what happened.
+It also means a stray fork **build** installed as `~/.local/bin/dot-agent-deck` is worse than a duplicate: it shadows the brew binary while wearing its name, so `dot-agent-deck --version` reports a fork version that no `brew upgrade` will ever move — and it goes stale independently of the build you actually upgrade, so the two names drift apart silently. If you find one, replace it with the symlink described above rather than deleting it outright; deleting it drops `delegate`/`work-done` onto the protocol-mismatched brew binary.
