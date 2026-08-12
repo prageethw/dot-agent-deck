@@ -68,14 +68,15 @@ use crate::agent_pty::{AgentPtyRegistry, AgentRecord, TabMembership};
 use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
-    Claimant, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
-    IN_PROGRESS_LABEL_DESCRIPTION, TRIAGE_LABELS, claim_comment_body, derive_issue_paths,
-    dispatch_decision, issue_comment_argv, issue_edit_add_label_argv, issue_list_argv,
-    issue_view_comments_argv, label_create_argv, pr_list_for_issue_argv, substitute_issue_number,
-    triage_instruction,
+    CLAIM_COMMENT_PREFIX, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
+    IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, claim_comment_body,
+    derive_issue_paths, dispatch_decision, gh_current_login_argv, issue_comment_argv,
+    issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv, issue_view_comments_argv,
+    label_create_argv, parse_current_assignees, parsed_claim_from_comment_json,
+    pr_list_for_issue_argv, substitute_issue_number, triage_instruction, validate_gh_login,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
-use crate::spawn::{SpawnRequest, spawn};
+use crate::spawn::{SpawnKind, SpawnRequest, spawn};
 use crate::worktree_owner::Creator;
 
 // ---------------------------------------------------------------------------
@@ -510,6 +511,13 @@ pub async fn run_issue_dispatch(
     // abort the run.
     ensure_claim_label(&cfg.repo).await;
 
+    // PRD fork#235 M2: resolve the currently-authenticated `gh` login ONCE
+    // per run, beside `ensure_claim_label` above — one `gh api user` call
+    // per run, not per issue. Best-effort: a failure (or an implausible
+    // login) just means every claim this run writes no assignee, never that
+    // the run itself fails (`scheduler/dispatch/022`).
+    let login = resolve_current_login(&cfg.repo).await;
+
     // PRD #421 M2.0/M2.1 — opt-in: ensure the triage label vocabulary exists on
     // the repo once per run, before any issue is considered (it's a repo-level
     // concern, not a per-issue one). Best-effort like `claim_issue`: a `gh`
@@ -539,6 +547,7 @@ pub async fn run_issue_dispatch(
             notifier,
             event_tx,
             state,
+            login.as_deref(),
         )
         .await
         {
@@ -573,6 +582,7 @@ async fn dispatch_one_issue(
     // the daemon's delegate-routing maps — see
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
+    login: Option<&str>,
 ) -> Result<(), String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
@@ -626,7 +636,9 @@ async fn dispatch_one_issue(
         // failure, so it degrades to "no claimant recorded" rather than
         // propagating.
         let claimant = fetch_claim_comment(&cfg.repo, issue).await;
-        notify_skip(SkipReason::Labelled { claimant });
+        notify_skip(SkipReason::Labelled {
+            claimant: claimant.map(|c| c.raw),
+        });
         return Ok(());
     }
 
@@ -744,14 +756,17 @@ async fn dispatch_one_issue(
         // derivation of it.
         owner: Some(creator),
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
-        // The spawn failed after the worktree was created/recorded: no agent
-        // will ever close to trigger cleanup, so drop the registry entry here.
-        // The worktree dir itself is left on disk — the next fire's
-        // worktree-exists idempotency signal reclaims the issue.
-        take_worktree(worktrees, &paths.worktree_dir);
-        return Err(e.to_string());
-    }
+    let handle = match spawn(req, registry, notifier, event_tx, true, state).await {
+        Ok(h) => h,
+        Err(e) => {
+            // The spawn failed after the worktree was created/recorded: no
+            // agent will ever close to trigger cleanup, so drop the registry
+            // entry here. The worktree dir itself is left on disk — the next
+            // fire's worktree-exists idempotency signal reclaims the issue.
+            take_worktree(worktrees, &paths.worktree_dir);
+            return Err(e.to_string());
+        }
+    };
 
     // M1.3 — surface the per-issue dispatch success.
     notifier.notify(NotifyEvent::IssueDispatched {
@@ -760,27 +775,61 @@ async fn dispatch_one_issue(
         issue,
     });
 
+    // PRD fork#235 round 3: derive the claimant IDENTITY from the bound spawn
+    // handle's `SpawnKind`, not from `task_name` alone — an orchestration
+    // dispatch names the ORCHESTRATION's own typed name in the claim
+    // (`scheduler/dispatch/021`), never the scheduled task that fired it. The
+    // anchor itself (CLAUDE.md rule 23) is THIS issue's own dispatched
+    // worktree's absolute path plus its branch (`paths.worktree_dir` /
+    // `paths.branch`) — the one the spawned agent actually runs in — plus
+    // the claiming host (round-3 audit A1, `issue/claim/016`) that every
+    // `Identity::Worktree` constructor resolves automatically; never a
+    // digest. The task/orchestration name is decoration only.
+    let identity = match &handle.kind {
+        SpawnKind::Orchestration { name } => {
+            Identity::orchestration(name, &paths.worktree_dir, &paths.branch)
+        }
+        SpawnKind::SingleAgent => {
+            Identity::issue_dispatch(task_name, issue, &paths.worktree_dir, &paths.branch)
+        }
+    };
+
     // PRD #421 M1.0/M1.1 — claim the issue now that the dispatch has
-    // genuinely succeeded: write the `in-progress` label and post a claim
-    // comment naming the claiming task. Deliberately AFTER both worktree
-    // creation and spawn succeeded (`dispatch/014`): marking any earlier would
-    // make a FAILED dispatch leave a false claim, permanently un-dispatchable
-    // once M1.2 reads the label back. A `gh` failure here must not turn this
+    // genuinely succeeded: write the `in-progress` label, replace-to-one the
+    // assignee (PRD fork#235 M2), and post a claim comment naming the
+    // claiming identity. Deliberately AFTER both worktree creation and spawn
+    // succeeded (`dispatch/014`): marking any earlier would make a FAILED
+    // dispatch leave a false claim, permanently un-dispatchable once M1.2
+    // reads the label back. A `gh` failure here must not turn this
     // already-successful dispatch into a per-issue failure — the per-issue
     // error boundary would otherwise report an `IssueDispatchFailed` for a
     // dispatch that genuinely worked, which is exactly the defect PRD #421's
-    // Risks section calls out — so `claim_issue` never propagates. Review fix
-    // C3: it no longer swallows the failure into `tracing::warn!` alone
-    // either — a claim failure is now surfaced through the `Notifier` seam as
-    // its own distinguishable event (see [`claim_issue`]).
-    claim_issue(&cfg.repo, issue, task_name, notifier).await;
+    // Risks section calls out (and PRD fork#235 M2 extends to the assignee
+    // write) — so `claim_issue` never propagates. Review fix C3: it no
+    // longer swallows the failure into `tracing::warn!` alone either — a
+    // claim failure is now surfaced through the `Notifier` seam as its own
+    // distinguishable event (see [`claim_issue`]).
+    claim_issue(&cfg.repo, issue, task_name, &identity, login, notifier).await;
 
     Ok(())
 }
 
-/// PRD #421 M1.0/M1.1: write the `in-progress` label and post a claim comment
-/// naming `task_name` — the scheduler-side claimant (`ScheduledTask.name`),
-/// the only claimant this fire-time flow ever has.
+/// PRD #421 M1.0/M1.1 + PRD fork#235 M2: write the `in-progress` label,
+/// replace-to-one the assignee, and post a claim comment naming `identity` —
+/// the bound spawn handle's identity (an orchestration's own typed name, or
+/// `task_name`#`issue` for a single-agent dispatch; see the call site).
+///
+/// Three writes, in order: the comment (always posted, appended never edited
+/// in place — the log is the history), then the label (unchanged since PRD
+/// #421), then the assignee (skipped entirely when `login` is `None` — no
+/// resolved human to assign). Comment-FIRST, mirroring `issue_claim::do_claim`
+/// (auditor A8, round-3 hardening): the OLD label-then-comment order could
+/// leave the issue LABELLED with no discoverable comment if the comment
+/// write failed after the label write already landed. The current GitHub
+/// assignees (for the assignee's replace-to-one, PRD fork#235 FINAL round 5)
+/// are resolved before ANY of these three writes, so the removal target
+/// always reads the ACTUAL prior state, never one this run's own writes
+/// below have already changed.
 ///
 /// Best-effort in the sense that mattered from the start (never propagated,
 /// never turns a successful dispatch into `IssueDispatchFailed` — see the
@@ -794,8 +843,56 @@ async fn dispatch_one_issue(
 /// what this PRD exists to prevent. A claim failure is now its own
 /// `NotifyEvent::IssueClaimFailed`, distinguishable from both a successful
 /// dispatch and an `IssueDispatchFailed`: the dispatch genuinely succeeded:
-/// only the claim could not be written.
-async fn claim_issue(repo: &str, issue: u64, task_name: &str, notifier: &dyn Notifier) {
+/// only the claim could not be written. PRD fork#235 M2 extends the same
+/// discipline to the assignee write — worded distinctly from the label and
+/// comment failures per its own implementation trap: GitHub silently drops
+/// an assignee lacking repo access and `gh` may still exit 0, so this reports
+/// what was ATTEMPTED, never what was achieved.
+async fn claim_issue(
+    repo: &str,
+    issue: u64,
+    task_name: &str,
+    identity: &Identity,
+    login: Option<&str>,
+    notifier: &dyn Notifier,
+) {
+    // PRD fork#235 FINAL round 5, mirroring `issue_claim::run_issue_claim`'s
+    // identical fix on the CLI path: the removal target is `current GitHub
+    // assignees − {claimant}`, read from `gh issue view`'s own `assignees`
+    // field — never from any claim comment's content or authorship (the
+    // round-4 author gate this superseded did not narrow that removal, it
+    // disabled it). Resolved FIRST, before this run posts its own comment
+    // below — reading it any later would find this run's own just-posted
+    // comment instead of the actual prior state.
+    let remove: Vec<String> = if let Some(login) = login {
+        fetch_current_assignees(repo, issue)
+            .await
+            .into_iter()
+            .filter(|a| a != login)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Auditor A8: `issue_claim::do_claim`'s comment-FIRST, label-SECOND
+    // ordering fix (reviewer/auditor F4) landed on the CLI path only. The
+    // OLD label-then-comment order here could leave the issue LABELLED with
+    // no discoverable comment if the comment write failed AFTER the label
+    // write already landed — `ClaimDecision::RefuseNoIdentity`'s wedge state
+    // (`issue/claim/013`'s escape hatch recovers it, but avoiding it is
+    // better than merely recovering from it). Mirror the same order here.
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let body = claim_comment_body(identity, &timestamp, login, None);
+    let comment_argv = issue_comment_argv(repo, issue, &body);
+    if let Err(e) = run_status_args("gh", &comment_argv).await {
+        notifier.notify(NotifyEvent::IssueClaimFailed {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            message: format!("failed to post the claim comment: {e}"),
+        });
+    }
+
     let label_argv = issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL);
     if let Err(e) = run_status_args("gh", &label_argv).await {
         notifier.notify(NotifyEvent::IssueClaimFailed {
@@ -806,20 +903,63 @@ async fn claim_issue(repo: &str, issue: u64, task_name: &str, notifier: &dyn Not
         });
     }
 
-    let host = local_hostname();
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let claimant = Claimant::Task {
-        name: task_name.to_string(),
-    };
-    let body = claim_comment_body(&claimant, &host, &timestamp);
-    let comment_argv = issue_comment_argv(repo, issue, &body);
-    if let Err(e) = run_status_args("gh", &comment_argv).await {
-        notifier.notify(NotifyEvent::IssueClaimFailed {
-            task: task_name.to_string(),
-            repo: repo.to_string(),
-            issue,
-            message: format!("failed to post the claim comment: {e}"),
-        });
+    if let Some(login) = login {
+        // `remove` is already `current assignees − {login}` (PRD fork#235
+        // FINAL round 5) — a same-identity refresh's own login is excluded
+        // by the set difference itself, so reviewer R3 / auditor A8's
+        // self-cancelling `--add-assignee X --remove-assignee X` pair
+        // (`issue/claim/019`) cannot arise here; no special-case guard
+        // needed.
+        let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), &remove);
+        if let Err(e) = run_status_args("gh", &assignee_argv).await {
+            notifier.notify(NotifyEvent::IssueClaimFailed {
+                task: task_name.to_string(),
+                repo: repo.to_string(),
+                issue,
+                message: format!("failed to write the assignee: {e}"),
+            });
+        }
+    }
+}
+
+/// PRD fork#235 M2: resolve the currently-authenticated `gh` login ONCE per
+/// run (see the call site in [`run_issue_dispatch`]) — "whoever `gh` is
+/// authenticated as on this host", the human who owns the agent working the
+/// issue right now. Best-effort: any failure (spawn error, non-zero exit, an
+/// empty reply, or a reply that fails [`validate_gh_login`] — the login
+/// reaches both a public comment body and a `gh` argv) degrades to `None`
+/// rather than failing the run; every claim this run writes then simply
+/// carries no assignee (`scheduler/dispatch/022`).
+async fn resolve_current_login(repo: &str) -> Option<String> {
+    let argv = gh_current_login_argv();
+    match run_capture("gh", &argv).await {
+        Ok(out) => {
+            let login = out.trim();
+            if login.is_empty() {
+                tracing::warn!(
+                    repo,
+                    "issue-dispatch: `gh api user` returned an empty login"
+                );
+                None
+            } else if !validate_gh_login(login) {
+                tracing::warn!(
+                    repo,
+                    login,
+                    "issue-dispatch: `gh api user` returned a login that fails validation"
+                );
+                None
+            } else {
+                Some(login.to_string())
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo,
+                error = %e,
+                "issue-dispatch: failed to resolve the current gh login"
+            );
+            None
+        }
     }
 }
 
@@ -865,26 +1005,37 @@ async fn ensure_triage_labels(repo: &str) {
     }
 }
 
-/// The literal prefix [`claim_comment_body`] always produces — used to
-/// recognize the deck's OWN claim comment among an issue's comments, as
-/// opposed to any other comment a human left.
-const CLAIM_COMMENT_PREFIX: &str = "Claimed by ";
-
-/// PRD #421 M1.3: look up the deck's own claim comment for an issue already
-/// known to carry the `in-progress` label — called ONLY from the label-skip
-/// arm of `dispatch_one_issue`, i.e. only when a skip is already decided.
+/// PRD #421 M1.3: look up the deck's own claim comment for an issue —
+/// called from the label-skip arm of `dispatch_one_issue` (only when a skip
+/// is already decided), to display which claimant is being skipped for.
 /// Best-effort: a `gh` failure here must not turn an already-correct SKIP
 /// decision into a per-issue failure, so any error degrades to `None` ("no
 /// claimant recorded") rather than propagating.
-async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<String> {
+async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<ParsedClaim> {
     let argv = issue_view_comments_argv(repo, issue);
     let stdout = run_capture("gh", &argv).await.ok()?;
     parse_claim_comment(&stdout).ok().flatten()
 }
 
+/// [`claim_issue`]'s removal-target lookup (PRD fork#235 FINAL round 5):
+/// the current GitHub assignees, straight from `gh issue view`'s own
+/// `assignees` field — never a claim comment. Best-effort, same discipline
+/// as [`fetch_claim_comment`]: a `gh` failure degrades to no assignees known
+/// rather than failing the claim.
+async fn fetch_current_assignees(repo: &str, issue: u64) -> Vec<String> {
+    let argv = issue_view_comments_argv(repo, issue);
+    let Ok(stdout) = run_capture("gh", &argv).await else {
+        return Vec::new();
+    };
+    parse_current_assignees(&stdout).unwrap_or_default()
+}
+
 /// Pure parse of `gh issue view --json comments` output into the deck's own
-/// claim-comment text, if discoverable. Split out from [`fetch_claim_comment`]
-/// so the JSON-shape logic is unit-testable without a subprocess.
+/// claim, if discoverable — the structured fields (PRD fork#235 M1), plus the
+/// full `raw` text callers that only need the human-readable comment (the PRD
+/// #421 skip-reason claimant text) can still use. Split out from
+/// [`fetch_claim_comment`] so the JSON-shape logic is unit-testable without a
+/// subprocess.
 ///
 /// Takes the LAST matching comment, not the first (PRD #421 review C2 /
 /// reviewer F4): `gh issue view --json comments` returns comments in
@@ -892,7 +1043,7 @@ async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<String> {
 /// place precisely so a succession of claimants is preserved when one hands
 /// off to another. Reading the first match reports the earliest, superseded
 /// claimant instead of the current one.
-fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
+fn parse_claim_comment(json: &str) -> Result<Option<ParsedClaim>, String> {
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
     Ok(value
@@ -901,9 +1052,12 @@ fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
         .and_then(|comments| {
             comments
                 .iter()
-                .filter_map(|c| c.get("body").and_then(serde_json::Value::as_str))
-                .rfind(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
-                .map(str::to_string)
+                .rfind(|c| {
+                    c.get("body")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
+                })
+                .and_then(parsed_claim_from_comment_json)
         }))
 }
 
@@ -925,7 +1079,7 @@ fn parse_claim_comment(json: &str) -> Result<Option<String>, String> {
 /// no `gethostname`-equivalent windows-sys feature already enabled in this
 /// crate, so it reads `COMPUTERNAME`, the same system environment variable
 /// the `hostname` command itself would have reported.
-fn local_hostname() -> String {
+pub(crate) fn local_hostname() -> String {
     #[cfg(unix)]
     {
         // SAFETY: `buf` is a valid buffer of `buf.len()` bytes for the
@@ -2007,6 +2161,12 @@ async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only this test module reads `parse_claim_fields` directly (production
+    // code here goes through `parsed_claim_from_comment_json` instead, since
+    // it also needs the comment's `author` — round-4 author gate), so the
+    // import lives here rather than at the top of the file to avoid an
+    // unused-import warning on the non-test build.
+    use crate::issue_dispatch::parse_claim_fields;
     use spec::spec;
 
     #[test]
@@ -2056,11 +2216,17 @@ mod tests {
 
     #[test]
     fn parse_claim_comment_finds_deck_claim() {
-        let json = r#"{"comments":[{"body":"unrelated"},{"body":"Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z."}]}"#;
+        let body = "Claimed by the issue-dispatch task `dispatch-task` (issue #7) working `/work/dispatch-task/.worktrees/issue-7` on branch `agent/issue-7` at 2026-08-09T00:00:00Z, for @alice.";
+        let json = format!(r#"{{"comments":[{{"body":"unrelated"}},{{"body":"{body}"}}]}}"#);
+        let parsed = parse_claim_comment(&json)
+            .unwrap()
+            .expect("must find the claim");
         assert_eq!(
-            parse_claim_comment(json).unwrap().as_deref(),
-            Some("Claimed by scheduled task `dispatch-task` on `host` at 2026-08-09T00:00:00Z.")
+            parsed.identity,
+            "worktree:/work/dispatch-task/.worktrees/issue-7@agent/issue-7"
         );
+        assert_eq!(parsed.login.as_deref(), Some("alice"));
+        assert_eq!(parsed.raw, body);
     }
 
     #[test]
@@ -2075,13 +2241,463 @@ mod tests {
         // in place on a handover, so the LAST matching comment — not the
         // first — is the current claimant.
         let json = r#"{"comments":[
-            {"body":"Claimed by scheduled task `nightly-a` on `host-1` at 2026-08-01T00:00:00Z."},
+            {"body":"Claimed by the issue-dispatch task `nightly-a` (issue #1) working `/work/nightly-a/.worktrees/issue-1` on branch `agent/issue-1` at 2026-08-01T00:00:00Z, for @nina."},
             {"body":"unrelated"},
-            {"body":"Claimed by scheduled task `nightly-b` on `host-2` at 2026-08-09T00:00:00Z."}
+            {"body":"Claimed by the issue-dispatch task `nightly-b` (issue #1) working `/work/nightly-b/.worktrees/issue-1` on branch `agent/issue-1` at 2026-08-09T00:00:00Z, for @bob."}
         ]}"#;
+        let parsed = parse_claim_comment(json)
+            .unwrap()
+            .expect("must find the claim");
         assert_eq!(
-            parse_claim_comment(json).unwrap().as_deref(),
-            Some("Claimed by scheduled task `nightly-b` on `host-2` at 2026-08-09T00:00:00Z.")
+            parsed.identity,
+            "worktree:/work/nightly-b/.worktrees/issue-1@agent/issue-1"
+        );
+        assert_eq!(parsed.login.as_deref(), Some("bob"));
+    }
+
+    // --- PRD fork#235 round-3 hardening: issue/claim/019 ---
+
+    /// A minimal, single-purpose synthetic `gh` for
+    /// [`issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`]
+    /// only — not the full stateful fixture `tests/issue_claim.rs` uses,
+    /// since this test drives [`claim_issue`] directly rather than the CLI
+    /// subprocess. `issue view --json ...` always reports ONE prior claim
+    /// naming `$PRIOR_LOGIN`, its comment `author` set to that SAME login,
+    /// AND `$PRIOR_LOGIN` as a REAL current assignee (PRD fork#235 FINAL
+    /// round 5 — see this constant's own history: rounds 3/4 needed the
+    /// comment's `author` field to match so the then-existing author gate
+    /// would let `prior_login` resolve at all; round 5 deletes that gate and
+    /// reads the removal target from the `assignees` field instead, so the
+    /// stub must genuinely report the claimant as a current assignee for
+    /// this test to exercise the same-identity-refresh property it is named
+    /// for, rather than passing vacuously because nothing was ever assigned
+    /// to begin with); `issue edit --add-assignee`/`--remove-assignee` apply
+    /// into `$GHSTUB_DIR/assignees.txt` in the SAME add-then-remove order
+    /// real `gh` applies (matching `tests/issue_claim.rs`'s `issue/claim/011`
+    /// fix), so a self-cancelling pair — if one were ever still emitted —
+    /// would net the file UNASSIGNED exactly as it would against a real
+    /// `gh`; every other verb is a no-op.
+    const CLAIM_019_GH_STUB: &str = r#"#!/bin/sh
+group="$1"; sub="$2"; shift 2 2>/dev/null || true
+add_assignee=""; remove_assignee=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --add-assignee) shift; add_assignee="$1" ;;
+        --remove-assignee) shift; remove_assignee="$1" ;;
+        *) ;;
+    esac
+    shift
+done
+if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
+    printf '{"comments":[{"body":"Claimed by the orchestration `prior` working `/ws/prior` on branch `prior-branch` at 2020-01-01T00:00:00Z, for @%s.","author":{"login":"%s"}}],"assignees":[{"login":"%s"}]}\n' "$PRIOR_LOGIN" "$PRIOR_LOGIN" "$PRIOR_LOGIN"
+    exit 0
+fi
+if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
+    if [ -n "$add_assignee" ]; then
+        grep -qxF "$add_assignee" "$GHSTUB_DIR/assignees.txt" 2>/dev/null || printf '%s\n' "$add_assignee" >> "$GHSTUB_DIR/assignees.txt"
+    fi
+    if [ -n "$remove_assignee" ] && [ -f "$GHSTUB_DIR/assignees.txt" ]; then
+        grep -vxF "$remove_assignee" "$GHSTUB_DIR/assignees.txt" > "$GHSTUB_DIR/assignees.txt.tmp" 2>/dev/null
+        mv "$GHSTUB_DIR/assignees.txt.tmp" "$GHSTUB_DIR/assignees.txt" 2>/dev/null || true
+    fi
+    exit 0
+fi
+exit 0
+"#;
+
+    /// Scenario: [`claim_issue`] (the unattended `issue_dispatch` claim
+    /// path) is called with the SAME login as a claim comment already on
+    /// record, that comment's `author` ALSO matching that login, AND that
+    /// login already a REAL current GitHub assignee (`gh issue view`'s
+    /// `assignees` field, seeded by [`CLAIM_019_GH_STUB`]) — a same-identity
+    /// refresh, e.g. the same task re-dispatching an issue it already
+    /// claimed. Assert the assignee ends up STILL SET to that login
+    /// afterward, never unassigned.
+    ///
+    /// **Passes for a different reason under round 5** (PRD fork#235 FINAL
+    /// round 5, checked per that round's own instruction to verify
+    /// `011`/`019` still exercise what they claim): this test originally
+    /// pinned reviewer R3 / auditor A8's finding that `claim_issue` emitted a
+    /// self-cancelling `--add-assignee X --remove-assignee X` pair
+    /// unconditionally, unlike `issue_claim::do_claim`'s explicit same-login
+    /// skip guard (`issue/claim/011`). Round 5 deletes BOTH the guard and the
+    /// whole prior-login-from-a-comment mechanism it special-cased — the
+    /// removal target is now `current assignees − {{claimant}}`, a set
+    /// difference computed from `gh issue view`'s own `assignees` field,
+    /// which STRUCTURALLY excludes the claimant from their own removal set
+    /// with no special-casing required. The stub was updated to report the
+    /// claimant as a real current assignee (previously it reported none at
+    /// all) specifically so this test keeps exercising a genuine
+    /// same-identity refresh under round 5, rather than passing vacuously
+    /// because there was nothing to remove regardless of any refresh logic.
+    //
+    // Written as a sync `#[test]` driving an explicit runtime rather than
+    // `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
+    // `#[spec(...)]` to the next plain `fn` definition and does not
+    // recognize a `#[tokio::test] async fn` — see `tests/shell_activity.rs`'s
+    // `shell_activity_001` for the same pattern.
+    #[spec("issue/claim/019")]
+    #[test]
+    #[cfg(unix)]
+    fn issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh = bindir.join("gh");
+        std::fs::write(&gh, CLAIM_019_GH_STUB).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ghstub = scratch.path().join("ghstub");
+        std::fs::create_dir_all(&ghstub).unwrap();
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: `std::env::set_var` is process-global, but CLAUDE.md rule 5's
+        // fork addendum means every test run happens in CI via `cargo nextest`,
+        // which runs each test in its OWN process — so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GHSTUB_DIR", &ghstub);
+            std::env::set_var("PRIOR_LOGIN", "sameuser");
+        }
+
+        let identity =
+            Identity::worktree(Path::new("/ws/task/.worktrees/issue-19"), "agent/issue-19");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(claim_issue(
+            "acme/widgets",
+            19,
+            "dispatch-task",
+            &identity,
+            Some("sameuser"),
+            &crate::scheduler::StderrNotifier,
+        ));
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GHSTUB_DIR");
+            std::env::remove_var("PRIOR_LOGIN");
+        }
+
+        let assignees = std::fs::read_to_string(ghstub.join("assignees.txt")).unwrap_or_default();
+        assert!(
+            assignees.lines().any(|l| l == "sameuser"),
+            "the unattended dispatch path's assignee refresh must keep the assignee — \
+             `claim_issue` still emits a self-cancelling `--add-assignee sameuser \
+             --remove-assignee sameuser` pair on a same-identity refresh, unlike \
+             `issue_claim::do_claim`'s fix for the SAME defect (`issue/claim/011`, reviewer R3 / \
+             auditor A8); got assignees.txt = {assignees:?}"
+        );
+    }
+
+    // --- PRD fork#235 round-4 author gate: issue/claim/024 ---
+
+    /// A minimal synthetic `gh` for
+    /// [`issue_claim_024_adversarial_task_name_cannot_self_inflict`] only:
+    /// `gh issue view --json comments` always replies with the EXACT JSON
+    /// written to `$GHSTUB_DIR/comment.json` at test setup (built from a
+    /// REAL [`claim_comment_body`] rendering, so this test can never
+    /// silently defang itself the way the ORIGINAL `issue/claim/012` did —
+    /// see that test's own doc comment); every other verb is a no-op
+    /// success. Every invocation is logged to `$GHSTUB_DIR/gh-calls.log` so
+    /// the test can assert on argv values, mirroring `tests/issue_claim.rs`'s
+    /// `Fixture::gh_calls`.
+    const CLAIM_024_GH_STUB: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GHSTUB_DIR/gh-calls.log" 2>/dev/null || true
+group="$1"; sub="$2"
+if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
+    cat "$GHSTUB_DIR/comment.json"
+    exit 0
+fi
+exit 0
+"#;
+
+    /// Scenario: A scheduled issue-dispatch task is named `nightly, for
+    /// @torvalds,` — plain, hand-edited `ScheduledTask.name` config, no
+    /// forged or hostile comment involved at all. `sanitize_clone_segment`
+    /// strips only `/ \ \0 ..`, so the literal substring `, for @torvalds,`
+    /// survives intact into the task's derived worktree PATH (and its
+    /// `Identity::issue_dispatch` label, which embeds the same task name),
+    /// and from there into the deck's OWN claim-comment body when it
+    /// renders — genuinely self-inflicted, no attacker required. Before fix
+    /// 3, `parse_worktree_claim`'s `rest.find(", for @")` scanned the WHOLE
+    /// remaining body from the very start, so it matched the embedded `,
+    /// for @torvalds,` substring inside the task-name-decorated label/path —
+    /// text that comes BEFORE the real timestamp clause — long before it
+    /// would ever reach a genuine trailing `, for @<login>` clause (there is
+    /// none here; this comment was posted with `login: None`), and the
+    /// parsed login came back `Some("torvalds")` — a value nobody ever
+    /// intended as a login at all. Fix 3 bounds that same search to start
+    /// AFTER the timestamp clause (`extract_timestamp`'s returned
+    /// remainder), so today's [`parse_claim_fields`] correctly returns
+    /// `login: None` for this exact body — pinned below as a sanity
+    /// precondition on TODAY's behaviour, not yesterday's bug. The removal
+    /// is refused on a SECOND, independent ground too: this fixture's `gh
+    /// issue view` JSON carries no `author` field on the comment at all, so
+    /// the round-4 author gate
+    /// (`c.author.is_some() && c.author.as_deref() == login`) in
+    /// [`claim_issue`] would refuse the removal regardless of what the
+    /// login parse returns — also pinned below, so a regression in either
+    /// fix alone still fails this test via the other rather than the test
+    /// quietly becoming a single-cause test. Assert no `gh` call ever
+    /// carries `--remove-assignee torvalds`. Companion to `issue/claim/020`,
+    /// which covered `@mention` injection into the deck's own rendered
+    /// comment but not this: a self-inflicted, structurally-mis-parsed
+    /// false parse of the deck's OWN prior comment.
+    ///
+    /// **Re-pointed for round 5** (PRD fork#235 FINAL round 5): both grounds
+    /// above (the parse fix, the author gate) are about to stop mattering —
+    /// round 5 deletes the author gate and stops parsing ANY login out of a
+    /// comment for a write at all, so this test's original two-cause defence
+    /// collapses into a single, STRUCTURAL one: `torvalds` was never added
+    /// as a real GitHub assignee (this fixture's `gh issue view` reports no
+    /// `assignees` field at all), so the round-5 removal target — `current
+    /// assignees − {{claimant}}` — never contains it, regardless of what any
+    /// comment says or who wrote it. The two sanity preconditions above
+    /// remain worth keeping: they still pin `parse_claim_fields`'s own
+    /// correctness (a pure function, unrelated to whether its output is used
+    /// for a write) and the fixture's own shape, so a regression there still
+    /// surfaces via a clearly-labelled precondition failure rather than a
+    /// confusing failure two steps downstream. A future reader must not read
+    /// the final assertion as still guarding the author gate.
+    #[spec("issue/claim/024")]
+    #[test]
+    #[cfg(unix)]
+    fn issue_claim_024_adversarial_task_name_cannot_self_inflict() {
+        let malicious_task_name = "nightly, for @torvalds,";
+        let paths = derive_issue_paths(Path::new("/ws"), malicious_task_name, 24);
+        // Sanity: `sanitize_clone_segment` really did leave the `, for
+        // @torvalds,` substring intact in the derived path — otherwise this
+        // test would pass vacuously, exactly the `012`/`020` "it passes with
+        // the parser deleted" failure mode this file's own tests exist to
+        // avoid repeating.
+        assert!(
+            paths
+                .worktree_dir
+                .to_string_lossy()
+                .contains(", for @torvalds,"),
+            "sanitize_clone_segment must leave the `, for @torvalds,` substring intact in the \
+             derived path for this test to be exercising anything real; got {:?}",
+            paths.worktree_dir
+        );
+
+        let identity =
+            Identity::issue_dispatch(malicious_task_name, 24, &paths.worktree_dir, &paths.branch);
+        let prior_body = claim_comment_body(&identity, "2020-01-01T00:00:00Z", None, None);
+        let prior_parsed = parse_claim_fields(&prior_body);
+        assert_eq!(
+            prior_parsed.as_ref().and_then(|p| p.login.as_deref()),
+            None,
+            "sanity precondition (ground 1 of 2, today's CORRECT behaviour, not yesterday's \
+             bug): fix 3 bounds `parse_worktree_claim`'s `, for @` search to start AFTER the \
+             timestamp clause, so the earlier, task-name-derived `, for @torvalds,` substring — \
+             which appears only in the decorative label/path, BEFORE the timestamp — must no \
+             longer be mistaken for a genuine trailing login clause; got {prior_parsed:?} from \
+             body {prior_body:?}"
+        );
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh = bindir.join("gh");
+        std::fs::write(&gh, CLAIM_024_GH_STUB).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ghstub = scratch.path().join("ghstub");
+        std::fs::create_dir_all(&ghstub).unwrap();
+        let comment_json = serde_json::json!({ "comments": [{ "body": prior_body }] }).to_string();
+        std::fs::write(ghstub.join("comment.json"), &comment_json).unwrap();
+        // Sanity precondition (ground 2 of 2, independent of ground 1
+        // above): the fixture JSON must carry no `author` field at all, so
+        // the round-4 author gate refuses the removal on its own even if
+        // ground 1's parse-level fix ever regressed and `login` came back
+        // `Some("torvalds")` again — this test pins TWO independent
+        // grounds for the refusal, not one, so it doesn't quietly collapse
+        // into single-cause coverage.
+        let comment_value: serde_json::Value = serde_json::from_str(&comment_json).unwrap();
+        assert!(
+            comment_value["comments"][0].get("author").is_none(),
+            "sanity precondition (ground 2 of 2): the fixture JSON must carry no `author` field \
+             — got {comment_json:?}"
+        );
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`'s
+        // identical comment above — every test run happens in CI via
+        // `cargo nextest`, one process per test, so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GHSTUB_DIR", &ghstub);
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(claim_issue(
+            "acme/widgets",
+            24,
+            "nightly",
+            &identity,
+            Some("stub-user"),
+            &crate::scheduler::StderrNotifier,
+        ));
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GHSTUB_DIR");
+        }
+
+        let gh_calls = std::fs::read_to_string(ghstub.join("gh-calls.log")).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-assignee torvalds"),
+            "PRD fork#235 round 5: `torvalds` (from the task NAME's own `, for @torvalds,` \
+             substring, embedded in the deck's OWN prior comment — no forged or hostile comment \
+             involved) must never reach a `--remove-assignee` argv — comment content is never \
+             consulted for a removal write at all, and `torvalds` was never a real GitHub \
+             assignee either; observed gh-calls.log:\n{gh_calls}"
+        );
+    }
+
+    // --- PRD fork#235 FINAL round 5: issue/claim/026 ---
+
+    /// Scenario: the mirror image of
+    /// [`issue_claim_024_adversarial_task_name_cannot_self_inflict`]. The
+    /// SAME task-name-derived body carries an EARLIER, coincidental `, for
+    /// @` clause — inside the decorative label/path, BEFORE the timestamp —
+    /// AND a GENUINE trailing `, for @<login>` clause AFTER it (unlike
+    /// `024`, whose body carries no genuine clause at all, `login: None`).
+    /// The comment is authored as the deck's own currently-authenticated
+    /// account (`stub-user`, matching the `login` passed to [`claim_issue`])
+    /// — the BEST-CASE authorship for a comment-driven removal, and the
+    /// login clause parses out precisely (`genuineuser`, proven by the sanity
+    /// precondition below, not the earlier fake match). Assert the genuine
+    /// login's removal is NEVER attempted regardless.
+    ///
+    /// **Assertion flipped for round 5** (PRD fork#235 FINAL round 5 — see
+    /// this test's own history for why): under round 4 this test proved the
+    /// OPPOSITE — that a well-formed, self-authored, precisely-parsed
+    /// trailing login clause DID drive a removal, showing fix 3's
+    /// timestamp-bound search was precise rather than merely suppressive.
+    /// Round 5 deletes the whole mechanism that made that removal happen at
+    /// all: `claim_issue` no longer parses ANY login out of a comment for a
+    /// write, so even the most favourable case for a comment-driven removal
+    /// — self-authored, no parse ambiguity, a real trailing clause that
+    /// resolves cleanly — must now do NOTHING. This is deliberately the
+    /// STRONGEST form of `022`/`024`/`025`'s "comment content never reaches
+    /// a removal argv" property: those tests each have an independent reason
+    /// the OLD mechanism would already have refused (stranger authorship,
+    /// invalid shape, an unparseable clause) that could mask a
+    /// still-existing removal mechanism; this one removes every such excuse,
+    /// so it alone proves the removal-from-a-comment mechanism is gone, not
+    /// merely blocked on this particular input.
+    #[spec("issue/claim/026")]
+    #[test]
+    #[cfg(unix)]
+    fn issue_claim_026_genuine_trailing_login_still_never_drives_a_removal() {
+        let malicious_task_name = "nightly, for @torvalds,";
+        let paths = derive_issue_paths(Path::new("/ws"), malicious_task_name, 26);
+        assert!(
+            paths
+                .worktree_dir
+                .to_string_lossy()
+                .contains(", for @torvalds,"),
+            "sanity precondition: `sanitize_clone_segment` must leave the `, for @torvalds,` \
+             substring intact in the derived path for this test to be exercising anything real; \
+             got {:?}",
+            paths.worktree_dir
+        );
+
+        let identity =
+            Identity::issue_dispatch(malicious_task_name, 26, &paths.worktree_dir, &paths.branch);
+        // Unlike `024` (`login: None`, no genuine clause at all), this body
+        // carries a REAL trailing `, for @genuineuser.` clause after the
+        // timestamp — the case `024` does not cover.
+        let prior_body =
+            claim_comment_body(&identity, "2020-01-01T00:00:00Z", Some("genuineuser"), None);
+        let prior_parsed = parse_claim_fields(&prior_body);
+        assert_eq!(
+            prior_parsed.as_ref().and_then(|p| p.login.as_deref()),
+            Some("genuineuser"),
+            "sanity precondition: the GENUINE trailing `, for @genuineuser.` clause (after the \
+             timestamp) must win over the earlier, coincidental `, for @torvalds,` substring \
+             embedded in the task-name-decorated label/path (before the timestamp) — fix 3's \
+             search bound must be precise, not merely suppressive; got {prior_parsed:?} from \
+             body {prior_body:?}"
+        );
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh = bindir.join("gh");
+        std::fs::write(&gh, CLAIM_024_GH_STUB).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ghstub = scratch.path().join("ghstub");
+        std::fs::create_dir_all(&ghstub).unwrap();
+        // Authored as `stub-user`, the SAME login `claim_issue` is called
+        // with below, so the round-4 author gate does not mask this test's
+        // own result.
+        let comment_json = serde_json::json!({
+            "comments": [{ "body": prior_body, "author": { "login": "stub-user" } }]
+        })
+        .to_string();
+        std::fs::write(ghstub.join("comment.json"), &comment_json).unwrap();
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`'s
+        // identical comment above — every test run happens in CI via
+        // `cargo nextest`, one process per test, so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GHSTUB_DIR", &ghstub);
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(claim_issue(
+            "acme/widgets",
+            26,
+            "nightly",
+            &identity,
+            Some("stub-user"),
+            &crate::scheduler::StderrNotifier,
+        ));
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GHSTUB_DIR");
+        }
+
+        let gh_calls = std::fs::read_to_string(ghstub.join("gh-calls.log")).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-assignee genuineuser"),
+            "PRD fork#235 round 5: `genuineuser` — a GENUINE, precisely-parsed trailing login \
+             clause in a comment self-authored by the deck's own currently-authenticated account, \
+             the best possible case for a comment-driven removal — must still NEVER reach a \
+             `--remove-assignee` argv; the removal target is `current assignees − {{claimant}}`, \
+             read from `gh issue view`'s own `assignees` field (which this fixture reports as \
+             empty), and comment content — however well-formed, well-authored, and precisely \
+             parsed — is never consulted for a write at all; observed gh-calls.log:\n{gh_calls}"
         );
     }
 
