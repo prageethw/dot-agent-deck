@@ -290,7 +290,11 @@ pub async fn handle_dispatch(
         }
     };
 
-    let creator = format!("dispatch:{name}");
+    // Fork #166: stamp this worktree with the creator identity `dispatch`
+    // used, mirroring `issue-dispatch:<task>#<issue>` and
+    // `orchestration:<name>` — `dispatch:<name>` names this command's own
+    // dispatched worktree the same way.
+    let creator = crate::worktree_reclaim::sanitize_marker_creator(&format!("dispatch:{name}"));
     match create_worktree(
         &clone_dir,
         &paths.worktree_dir,
@@ -570,7 +574,14 @@ mod tests {
 
         // First dispatch claims the name.
         assert_eq!(
-            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test").await,
+            create_worktree(
+                &repo,
+                &paths.worktree_dir,
+                &paths.branch,
+                false,
+                "dispatch:test"
+            )
+            .await,
             Ok(WorktreeCreation::Created)
         );
 
@@ -584,7 +595,14 @@ mod tests {
 
         // Second dispatch of the SAME name: refused, but for the real reason.
         assert_eq!(
-            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test").await,
+            create_worktree(
+                &repo,
+                &paths.worktree_dir,
+                &paths.branch,
+                false,
+                "dispatch:test"
+            )
+            .await,
             Ok(WorktreeCreation::BranchExists),
             "a leftover branch must be distinguishable from a claimed worktree"
         );
@@ -599,9 +617,15 @@ mod tests {
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
 
-        create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test")
-            .await
-            .unwrap();
+        create_worktree(
+            &repo,
+            &paths.worktree_dir,
+            &paths.branch,
+            false,
+            "dispatch:test",
+        )
+        .await
+        .unwrap();
         remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
         std::process::Command::new("git")
             .args(["branch", "-D", &paths.branch])
@@ -610,7 +634,14 @@ mod tests {
             .expect("git available");
 
         assert_eq!(
-            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test").await,
+            create_worktree(
+                &repo,
+                &paths.worktree_dir,
+                &paths.branch,
+                false,
+                "dispatch:test"
+            )
+            .await,
             Ok(WorktreeCreation::Created),
             "after deleting the branch the same dispatch name must work again"
         );
@@ -626,9 +657,15 @@ mod tests {
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "unit");
-        create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test")
-            .await
-            .unwrap();
+        create_worktree(
+            &repo,
+            &paths.worktree_dir,
+            &paths.branch,
+            false,
+            "dispatch:test",
+        )
+        .await
+        .unwrap();
         std::fs::write(paths.worktree_dir.join("uncommitted.txt"), "work").unwrap();
 
         remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
@@ -649,7 +686,7 @@ mod tests {
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let worktree_dir = repo.join(".worktrees").join("issue-7");
-        create_worktree(&repo, &worktree_dir, "agent/issue-7", true, "test")
+        create_worktree(&repo, &worktree_dir, "agent/issue-7", true, "dispatch:test")
             .await
             .unwrap();
         std::fs::write(worktree_dir.join("uncommitted.txt"), "wip").unwrap();
