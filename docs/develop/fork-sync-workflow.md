@@ -276,7 +276,29 @@ So `754f0ba` stays **independently PERMANENT**: it is a feature to preserve on i
 
 **Drift resolved 2026-08-07:** PRD #373's *implementation* used to be missing from this table — it landed directly on `main` after the 2026-08-05 sync without being curated in. It is now curated in as `d021c35`. It was **not** split into its surviving and deleted halves, deliberately: `main` merged all of #373 as one PR (#18), and carving M1's all-clear focus move out of M2/M3's inactivity snap-back would have meant hunk-level surgery on a tree that no commit on `main` ever had. The stack therefore replays history faithfully — `d021c35` adds the timer, `8111027` (PRD #393) deletes it — and this note is how a future conflict resolver knows that roughly half of `d021c35` is dead on arrival. **If a rebase conflicts inside `d021c35` on `auto_focus_after_inactivity`, `last_role_pane_activity_at`, or `DOT_AGENT_DECK_INACTIVITY_TIMEOUT_SECS`, resolve it however is cheapest** — `8111027` removes all three a few commits later. Only `d021c35`'s all-clear focus move is worth resolving with care.
 
-**None of this changes upstream conflict risk**, because none of it exists upstream: `command_entry_locked`, `auto_focus_*`, `ToggleOrchestrationLock` and `gate_pane_input_key` all have **zero** occurrences on `upstream/main`, verified during #393. #373 and #374 were both closed upstream as not-planned. See PRD #393's Upstream section for why a future contribution would be a net-new proposal rather than a port, and issue #369 for the maintainer's recorded position on the feature itself.
+> ⚠️ **This section's "zero occurrences upstream" claim is OBSOLETE and was inverted by upstream PR #404.** It is preserved below, struck through, because the sync procedure's whole value is that its predictions are auditable after the fact — see the correction that follows.
+
+> ~~**None of this changes upstream conflict risk**, because none of it exists upstream: `command_entry_locked`, `auto_focus_*`, `ToggleOrchestrationLock` and `gate_pane_input_key` all have **zero** occurrences on `upstream/main`, verified during #393.~~ #373 and #374 were both closed upstream as not-planned. See PRD #393's Upstream section for the original reasoning, and issue #369 for the maintainer's recorded position on the feature itself.
+
+**Correction (2026-08-10, fork issue #149): upstream now implements this feature, so the conflict risk is real and this is a supersession, not a clean replay.** Upstream merged PR #404 (`feat/orchestration-command-entry-lock`) on 2026-08-08 as `30c2064`. Measured against `upstream/main` at `ce35f45`:
+
+| Symbol | Occurrences on `upstream/main` (`src/`) | The old claim said |
+|---|---|---|
+| `command_entry_locked` | **25** in 3 files | zero |
+| `auto_focus` | **63** in 2 files | zero |
+| `ToggleOrchestrationLock` | **24** in 2 files | zero |
+| `gate_pane_input_key` | **20** in 2 files | zero |
+| `scope_command_entry_lock` | **15** in 3 files | (not listed) |
+
+**The finding is broader than fork #149 reported.** That issue measured `command_entry_locked` alone; all four named symbols are now present upstream, plus `scope_command_entry_lock`, which the original claim never listed. Only the split-toggle symbols remain genuinely fork-only — `scope_split_stage` and `SplitStage` are still **0** upstream, so that supersession section below is unaffected and still accurate.
+
+**What the next sync must therefore do.** A rebase will replay the fork's `feat(prd-374): lock command entry…` and `feat(prd-393): command-mode-scoped, deck-global command-entry lock…` against an `upstream/main` that already implements the same feature. **Treat it exactly like the `split_narrow`/`SplitStage` supersession documented below**: read both implementations, decide deliberately which survives, and delete the other outright. Do not let both live side by side — two lock mechanisms in one tree is the specific failure that section exists to prevent. The fork's version is two generations further along (PRD #374 → #393, deck-global and command-mode-scoped), which is an argument for keeping it, not a conclusion; verify against upstream's actual behaviour at the time.
+
+**Why this went stale, which is the reusable lesson.** This is the *third* time in one sync cycle that an upstream merge overtook a recorded prediction — PR #342 (PRD #336, predicted correctly), PR #356 (PRD #333, predicted a clean empty-commit drop, actually a second supersession), and now PR #404 (predicted zero conflict risk, actually a full supersession). **A "verified zero occurrences upstream" claim is a measurement with a timestamp, not a property**, and upstream's tracker moves independently of this fork's. Re-measure the symbols at the start of every sync rather than trusting a recorded count — the command is one line:
+
+```bash
+git fetch upstream && for s in <symbols>; do echo -n "$s: "; git grep -o "$s" upstream/main -- 'src/*' | wc -l; done
+```
 
 ### Historical watch-item: PRD #333 was temporary — resolved 2026-08-09
 
