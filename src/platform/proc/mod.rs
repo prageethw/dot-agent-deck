@@ -345,8 +345,9 @@ pub(crate) fn detach_reap_or_fallback_sync_with_cap(
 #[cfg(unix)]
 pub use unix::{
     AgentProcessGroup, PS_SAMPLE_BUDGET, PinnedProcess, current_ppid, force_kill_child_and_wait,
-    force_kill_child_group, force_kill_pid, foreground_pgid, pin_process, process_table,
-    process_table_async, send_sigterm_to_child_group, spawn_in_new_process_group,
+    force_kill_child_group, force_kill_pid, foreground_pgid, peek_child_exited_without_reaping,
+    pin_process, process_table, process_table_async, send_sigterm_to_child_group,
+    spawn_in_new_process_group,
     terminate_child_with_grace_and_detached_reap_forcing_group_backstop,
     terminate_child_with_grace_and_wait,
     terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
