@@ -20,7 +20,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, find_pane_box_left_edge};
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
@@ -66,12 +66,20 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
 
     // Baseline: the default 34/66 split puts tab A's pane-column left edge at
     // 34% of the 120-col frame (col 40 or 41, depending on Percentage
-    // rounding).
-    let default_edge = pane_column_left_edge(&deck.snapshot_grid());
+    // rounding). `find_pane_box_left_edge(grid, "orchestrator")` locates the
+    // role-pane box drawn for the fixture's `start = true` role
+    // ("orchestrator"), whose title fuses into the top border as
+    // `┌orchestrator───…` (Plain, unfocused/PaneInput) or `┏orchestrator───…`
+    // (Thick, focused command-mode — `TerminalWidget` in
+    // `src/terminal_widget.rs`) — the boundary that `ORCHESTRATION_LEFT_PERCENT`
+    // / `ORCHESTRATION_PANES_PERCENT` (src/ui.rs:1951-1952) control. Distinct
+    // from the sidebar's own truncated `orchestrat…` card label, so there is
+    // no collision risk.
+    let default_edge = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert!(
-        (40..=41).contains(&default_edge),
+        default_edge.is_some_and(|edge| (40..=41).contains(&edge)),
         "expected tab A's default 34/66 split's pane-column edge near col \
-         40/41, got {default_edge}\nGrid:\n{}",
+         40/41, got {default_edge:?}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -83,13 +91,13 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
     let a_narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        (29..=30).contains(&pane_column_left_edge(grid))
+        find_pane_box_left_edge(grid, "orchestrator").is_some_and(|edge| (29..=30).contains(&edge))
     });
     assert!(
         a_narrowed,
         "Ctrl+l did not narrow tab A's sidebar to the 25/75 split within 3s \
-         — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_column_left_edge(&deck.snapshot_grid()),
+         — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 
@@ -100,12 +108,12 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
 
-    let b_narrow_edge = pane_column_left_edge(&deck.snapshot_grid());
+    let b_narrow_edge = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert!(
-        (29..=30).contains(&b_narrow_edge),
+        b_narrow_edge.is_some_and(|edge| (29..=30).contains(&edge)),
         "a brand-new orchestration tab B must open AT the deck-global Narrow \
          stage tab A was just toggled to, not its own untoggled Default, \
-         got {b_narrow_edge}\nGrid:\n{}",
+         got {b_narrow_edge:?}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -117,24 +125,24 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
     let b_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_column_left_edge(grid) == 0
+        find_pane_box_left_edge(grid, "orchestrator") == Some(0)
     });
     assert!(
         b_hidden,
         "Ctrl+l did not collapse tab B's sidebar to the Hidden stage within \
-         3s — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_column_left_edge(&deck.snapshot_grid()),
+         3s — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 
-    // PRD #387 M5: `pane_column_left_edge(grid) == 0` above proves the pane
-    // column's own box starts at column 0, which is necessary but not
-    // sufficient — it does not rule out sidebar content still being drawn
-    // (e.g. a stray card fragment) that this substring search never looks
-    // for. Directly assert NEITHER role's sidebar card marker
-    // (`" <role> "`, the same bounded needle `has_role_status` below uses to
-    // find a sidebar deck card's title row) is present anywhere on the
-    // settled grid, so Hidden is proven to render NO sidebar at all.
+    // PRD #387 M5: `find_pane_box_left_edge(grid, "orchestrator") == Some(0)`
+    // above proves the pane column's own box starts at column 0, which is
+    // necessary but not sufficient — it does not rule out sidebar content
+    // still being drawn (e.g. a stray card fragment) that this substring
+    // search never looks for. Directly assert NEITHER role's sidebar card
+    // marker (`" <role> "`, the same bounded needle `has_role_status` below
+    // uses to find a sidebar deck card's title row) is present anywhere on
+    // the settled grid, so Hidden is proven to render NO sidebar at all.
     let hidden_grid = deck.snapshot_grid();
     assert!(
         !hidden_grid.contains(" orchestrator ") && !hidden_grid.contains(" worker "),
@@ -156,13 +164,13 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // re-enter PaneInput on tab B and break the Shift+Tab below.
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> tab A
     let a_also_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_column_left_edge(grid) == 0
+        find_pane_box_left_edge(grid, "orchestrator") == Some(0)
     });
     assert!(
         a_also_hidden,
         "toggling tab B's split must move tab A's split too — expected tab \
-         A ALSO Hidden (edge 0) after switching back, got {}\nGrid:\n{}",
-        pane_column_left_edge(&deck.snapshot_grid()),
+         A ALSO Hidden (edge 0) after switching back, got {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 
@@ -171,13 +179,13 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // `UiMode`, so the deck is still in Normal mode from above.
     deck.send_bytes(b"\x0c");
     let a_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        (40..=41).contains(&pane_column_left_edge(grid))
+        find_pane_box_left_edge(grid, "orchestrator").is_some_and(|edge| (40..=41).contains(&edge))
     });
     assert!(
         a_restored,
         "Ctrl+l did not restore tab A's 34/66 default split within 3s — \
-         pane-column edge stayed at {}\nGrid:\n{}",
-        pane_column_left_edge(&deck.snapshot_grid()),
+         pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 
@@ -188,14 +196,14 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // earlier toggles propagated to A.
     deck.send_bytes(b"\x1b[C"); // Right -> next tab -> tab B
     let b_also_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        (40..=41).contains(&pane_column_left_edge(grid))
+        find_pane_box_left_edge(grid, "orchestrator").is_some_and(|edge| (40..=41).contains(&edge))
     });
     assert!(
         b_also_restored,
         "toggling tab A's split back to Default must move tab B's split \
          too — expected tab B ALSO Default (edge ~col 40/41) after \
-         switching to it, got {}\nGrid:\n{}",
-        pane_column_left_edge(&deck.snapshot_grid()),
+         switching to it, got {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 }
@@ -433,37 +441,4 @@ fn orchestration_008_stacked_pane_column_hides_collapsed_frames_while_agents_sta
     deck.wait_for_string("ALPHA_ROLE_SENTINEL");
     deck.send_bytes(b"k"); // alpha -> orchestrator
     deck.wait_for_string("ORCH_ROLE_SENTINEL");
-}
-
-// ---------------------------------------------------------------------------
-// PRD #336 — `Ctrl+l` toggles the orchestration sidebar/pane-column split.
-// ---------------------------------------------------------------------------
-
-/// Column index of the orchestration tab's role-pane column's LEFT edge: the
-/// role-pane box drawn for the fixture's `start = true` role ("orchestrator")
-/// renders its title fused into the top border as `┌orchestrator───…`, so the
-/// column of that `┌` is exactly `panes_area.x` — the boundary between the
-/// sidebar (role list) and the pane column that `orchestration_split_percents`
-/// controls. Distinct from the sidebar's own truncated `orchestrat…` card
-/// label, so there is no collision risk.
-///
-/// The corner glyph is NOT fixed: PRD #341 ("make UI modes unmistakable")
-/// renders the focused pane's border heavier in command mode, so the same box
-/// reads `┌orchestrator` in PaneInput and `┏orchestrator` in command mode.
-/// [`common::orchestration_pane_left_edge`] matches any weight — this helper is
-/// about the box's COLUMN, not its styling, and pinning one glyph made the test
-/// fail on a mode switch that was working correctly. That scan lives in the
-/// harness rather than here because `e2e_idle_worker_detector.rs` needs the same
-/// anchor to crop on, and two copies is one copy too many for a scan whose glyph
-/// set has already had to change once (review of #465, S1).
-fn orchestrator_box_edge(grid: &str) -> Option<u16> {
-    common::orchestration_pane_left_edge(grid).map(|column| column as u16)
-}
-
-/// Panicking form of [`orchestrator_box_edge`], for use outside a predicate
-/// where the box must exist.
-fn pane_column_left_edge(grid: &str) -> u16 {
-    orchestrator_box_edge(grid).unwrap_or_else(|| {
-        panic!("orchestrator role-pane box top border not found in grid:\n{grid}")
-    })
 }
