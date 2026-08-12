@@ -1618,15 +1618,16 @@ const WORKTREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// reappearing through a narrower door. The final reap now normally runs on a
 /// short-lived detached thread instead
 /// ([`crate::platform::proc::detach_reap_or_fallback_sync`]), so escalation
-/// is *normally* limited to this grace window plus polling and operation
-/// overhead — not an exact bound: the grace loop sleeps a fixed 50ms after
-/// each pre-deadline poll, so it can overshoot by nearly a full cadence
-/// before phase 3 even starts, and signal delivery, OS scheduling, and thread
-/// creation all add their own (unaccounted-for) time on top. When the
-/// process-wide outstanding-reap cap is saturated, or spawning the detached
-/// thread itself fails, the reap falls back to a synchronous `wait()` on this
-/// same calling thread instead — reintroducing a real, if rare and
-/// cap-bounded, block for that call. See
+/// is *normally* limited to this grace window plus operation overhead — and
+/// this grace is now an accurate floor on that escalation, not merely an
+/// approximate one: phase 2 is a single flat `sleep(grace)` with no poll
+/// loop to overshoot, so nothing between the timeout firing and phase 3
+/// starting can add more than the requested duration. What remains
+/// unaccounted for is signal delivery, OS scheduling, and thread creation.
+/// When the process-wide outstanding-reap cap is saturated, or spawning the
+/// detached thread itself fails, the reap falls back to a synchronous
+/// `wait()` on this same calling thread instead — reintroducing a real, if
+/// rare and cap-bounded, block for that call. See
 /// [`crate::platform::proc::detach_reap_or_fallback_sync`] for the cap value
 /// and both fallback paths.
 const WORKTREE_GIT_KILL_GRACE: Duration = Duration::from_millis(200);
