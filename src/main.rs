@@ -308,6 +308,11 @@ enum ScheduleAction {
         label: Option<String>,
         #[arg(long)]
         query: Option<String>,
+        // PRD #421 M3.0: opt-in triage. Only meaningful alongside the other
+        // issue_dispatch flags above; like them, threaded through with no
+        // extra validation of that relationship.
+        #[arg(long)]
+        triage: bool,
     },
     /// Update fields of an existing task. Rename is forbidden — there is no
     /// name-change flag; `name` selects the task to edit.
@@ -2354,6 +2359,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             max_per_run,
             label,
             query,
+            triage,
         } => {
             // PRD #120: `--repo` turns this into an issue-dispatch `add`. Build
             // the sub-table here (defaulting `max_per_run` to the documented 3
@@ -2365,6 +2371,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
                 max_per_run: max_per_run.unwrap_or_else(default_max_per_run),
                 label,
                 query,
+                triage,
             });
             schedule_cli::add(
                 &mut tasks,
