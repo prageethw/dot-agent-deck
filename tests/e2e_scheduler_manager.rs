@@ -939,7 +939,10 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
     // leak scrolls the pane, which changes WHICH markers are visible without
     // changing how many, so this can only wait out a torn frame — it cannot
     // wait out (and so cannot mask) the leak the `assert_eq!` below is for.
-    deck.wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
+    // Deliberately discarded: this call is only a frame-completeness pause
+    // (see comment above), and the `assert_eq!` below catches a genuine
+    // leak whether or not the predicate ever became true.
+    let _ = deck.wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
         visible_side_scroll_markers(grid).len() >= before.len()
     });
     let after_down_grid = deck.snapshot_grid();
@@ -954,7 +957,8 @@ fn manager_016_wheel_over_dialog_does_not_scroll_side_pane() {
         .wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
             grid.contains("\u{25b6} alpha")
         });
-    deck.wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
+    // Deliberately discarded: same frame-completeness pause as above.
+    let _ = deck.wait_for_grid_predicate_within(common::OBSERVATION_BUDGET, |grid| {
         visible_side_scroll_markers(grid).len() >= before.len()
     });
     let after_up_grid = deck.snapshot_grid();
