@@ -538,6 +538,13 @@ pub struct IssueDispatchConfig {
     /// default "all open issues up to `max_per_run`" listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// PRD #421 M2.0/M2.1: opt-in triage. When true, the dispatch flow ensures
+    /// the triage label vocabulary exists and appends the triage instruction to
+    /// each dispatched issue's prompt, so the spawned agent applies its own
+    /// priority/size labels. Off by default — this is additive behaviour, not
+    /// a required part of dispatch.
+    #[serde(default)]
+    pub triage: bool,
 }
 
 /// One `[[scheduled_tasks]]` entry from the global
