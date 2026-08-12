@@ -44,10 +44,16 @@ remove = current assignees − { the claimant }
 
 | Finding | Status under round 5 |
 |---|---|
-| B1 (parsed login → `--remove-assignee`, unvalidated) | **gone** — the login is not parsed for writes |
-| A1 (attacker text laundered through the deck's own takeover tail) | **gone** — same reason |
-| R5-1 (`, taking over from` tail residual) | **gone** — same reason |
+| B1 (parsed login → `--remove-assignee`, unvalidated) | **gone** — the login has zero production readers |
 | A2 (the gate disabled replace-to-one) | **gone** — the trigger no longer depends on the parse |
+| A1 (attacker text laundered through the takeover tail into an argv) | **defanged, not removed** — see below |
+| R5-1 (`, taking over from` tail residual) | **defanged, not removed** — see below |
+
+**A1 and R5-1 are defanged, and the distinction matters more than it looks.** What round 5 killed is the laundered text being **re-parsed back out as a login to drive `--remove-assignee`** — that half is genuinely dead. What survives is the mechanism both findings were *named* for: stranger-supplied text still reaches a public GitHub comment **posted under the deck's own account**, via `held.identity` → `sanitize_claimant_name` → `takeover_from` → `claim_comment_body`.
+
+The residual exposure is small — the sanitizer strips backticks, newlines and control characters, and the tail renders inside its own backtick span, so an embedded `@` cannot become a live mention and the span cannot be closed early. The round-5 auditor attacked it and could not construct a rendering escape.
+
+**But `sanitize_claimant_name` and the code-span wrapping are now the *only* things between a forged comment and markdown/mention injection in a deck-authored comment.** Writing "gone" here would set a trap: a future reader applying this PRD's own stated principle — *"a control that no longer guards anything is a future reader's trap"* — would delete the sanitizer as dead decoration, exactly as round 5 correctly deleted the author gate, and reopen a real hole. That control still guards something. Do not remove it.
 
 The author gate becomes unnecessary for this purpose and should be removed rather than left as decoration; a control that no longer guards anything is a future reader's trap.
 
