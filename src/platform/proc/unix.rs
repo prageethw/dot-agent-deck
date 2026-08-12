@@ -568,8 +568,370 @@ const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args=
 /// #160 item 2).
 pub const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
 
-/// The sampling sequence itself, over an injected `capture` (called twice) —
-/// the shared body of [`process_table`] and [`process_table_async`].
+/// Byte ceiling on one [`capture_bounded`]/[`capture_bounded_async`] capture
+/// (fork issue #212). `PS_SAMPLE_BUDGET` bounds how long a sample may take but
+/// not how much it may allocate — measured during PR #206's security audit at
+/// a single **300,160-byte row** for one process with a 300 KB argv, `-w -w`
+/// leaving it untruncated. That row finishes well inside the time budget, so
+/// only a byte cap catches it.
+///
+/// 4 MiB. **The job of this constant is bounding worst-case allocation from
+/// N rows × `ARG_MAX` (roughly 1 MiB/process on macOS, ~2 MiB on Linux — i.e.
+/// hundreds of MB to GB, unbounded) down to a fixed ceiling — not sitting just
+/// below any one pathological row.** The cap fires on the *cumulative* size of
+/// a sample, so any value under ~490 KB already catches the 300 KB row
+/// measured above once combined with a normal process table; a tighter cap
+/// buys no extra protection against that row and only spends headroom against
+/// healthy output. **At the shipped 4 MiB, this constant does *not* catch the
+/// 300 KB row measured in isolation, and that is intentional — the row is not
+/// what this constant defends against; bounding cumulative allocation is.**
+/// fork issue #160's audit measured 1.20–1.38× headroom for
+/// the previous 256 KiB value on two ordinary desktops (macOS, ~1,050–1,174
+/// processes) — a healthy but busy host, especially Linux, where `ps -A` also
+/// enumerates thousands of kernel threads, or a host running this repo's own
+/// `cargo -j16` build with its long `rustc`/JVM/`docker run` argv rows, can
+/// cross a tight cap on entirely healthy output and go permanently dark (the
+/// cap is a persistent property of the host, not a transient spike, so it
+/// then fails on every subsequent tick). 4 MiB is ~21x the largest healthy
+/// sample measured on either machine, comfortably above a kernel-thread-heavy
+/// Linux host, while remaining a hard, small, transient allocation (one
+/// sample at a time, dropped once parsed). If this needs retuning, retune it
+/// upward for headroom against healthy output, not downward toward the
+/// pathological-row size — 1 MiB is the floor worth accepting, and even that
+/// sits at exactly one macOS `ARG_MAX`, i.e. within reach of a single
+/// process.
+pub const PS_SAMPLE_BYTE_CAP: u64 = 4 * 1024 * 1024;
+
+/// Run `program args…` with its stdout captured, abandoning it if it has not
+/// finished within `budget` or its stdout exceeds [`PS_SAMPLE_BYTE_CAP`].
+/// `None` means "no usable output": spawn failed, the budget elapsed, the
+/// output exceeded the size cap, or the process exited non-zero.
+///
+/// The child is polled through the [`std::process::Child`] this function owns
+/// and is never reaped before the kill decision is made, so the SIGKILL cannot
+/// land on a recycled pid. stdout is drained on a helper thread because `ps -A`
+/// output routinely exceeds a pipe buffer: waiting on the child while nothing
+/// reads the pipe would deadlock the very timeout this exists to enforce. The
+/// helper thread reads at most `PS_SAMPLE_BYTE_CAP + 1` bytes (via
+/// `Read::take`) rather than draining to EOF — an over-cap producer is left
+/// blocked on its own write() once the cap is hit, which the main loop's
+/// `cap_rx` check kills promptly instead of waiting out the whole time budget.
+///
+/// Shared with [`capture_bounded_async`]: a run of consecutive size-cap trips
+/// (fork issue #160's audit, A3). The size-cap `warn!` used to fire
+/// unrate-limited on every trip — cheaper to trigger than the budget timeout
+/// (~50ms vs the full [`PS_SAMPLE_BUDGET`]) and, unlike a timeout, a
+/// persistent property of the host rather than a transient spike, so a
+/// chronically over-cap machine wrote ~1.8 lines/s indefinitely into
+/// `deck.log`, which PRD #170 keeps synchronous, unrotated and unbounded (see
+/// `src/main.rs`'s `init_logging_from_env`). Rate-limited to the same shape
+/// as the daemon's own failure logging in `run_shell_activity_monitor`
+/// (`FAILURE_LOG_EVERY`): log the transition into "over cap" and then only
+/// every [`SIZE_CAP_WARN_EVERY`]th trip after that. A single process-global
+/// counter is enough — `sample_table_async` short-circuits so only one
+/// capture is in flight at a time in the daemon's own poll — and it is reset
+/// on every capture that returns a usable sample.
+static SIZE_CAP_TRIP_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const SIZE_CAP_WARN_EVERY: u32 = 20;
+// PR #233 review (R3): a host whose sample size oscillates around the cap
+// used to reset this streak to zero on every single usable sample, so it
+// re-entered at `streak == 1` — and therefore logged — on every trip. The
+// rate limit above only bounds a *consecutive* run of trips, and flapping
+// never produces one. Require this many consecutive usable samples before
+// actually clearing the streak, so a flapping host keeps accumulating on the
+// same streak (and its existing `SIZE_CAP_WARN_EVERY` cadence) instead of
+// restarting it every other tick. Any trip in between resets this counter,
+// so genuine recovery still needs an unbroken run, not just a majority.
+static SIZE_CAP_SUCCESS_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const SIZE_CAP_RESET_AFTER_SUCCESSES: u32 = 3;
+
+/// Bumps the size-cap trip streak and reports whether this trip should be
+/// logged — the transition (first trip after a success) and every
+/// [`SIZE_CAP_WARN_EVERY`]th trip after that.
+fn should_log_size_cap_trip() -> bool {
+    // A trip breaks any in-progress recovery run — see `SIZE_CAP_SUCCESS_RUN`.
+    SIZE_CAP_SUCCESS_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
+    let streak = SIZE_CAP_TRIP_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    streak == 1 || streak.is_multiple_of(SIZE_CAP_WARN_EVERY)
+}
+
+/// Called whenever a capture returns a usable sample. Only actually clears
+/// the size-cap trip streak once [`SIZE_CAP_RESET_AFTER_SUCCESSES`]
+/// consecutive samples have been usable — see `SIZE_CAP_SUCCESS_RUN` above.
+fn reset_size_cap_trip_streak() {
+    let successes = SIZE_CAP_SUCCESS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if successes >= SIZE_CAP_RESET_AFTER_SUCCESSES {
+        SIZE_CAP_TRIP_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn capture_bounded(program: &str, args: &[&str], budget: Duration) -> Option<String> {
+    use std::io::Read;
+
+    if budget.is_zero() {
+        return None;
+    }
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut pipe) = child.stdout.take() else {
+        // Unreachable — stdout was just configured as a pipe — but returning
+        // without reaping would leave a zombie behind on every call.
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (cap_tx, cap_rx) = std::sync::mpsc::channel();
+    // Fork issue #160's audit (A5) named this site alongside the async form's
+    // `read_capped`, but only the async form was fixed in this PR's first
+    // pass — this reader thread still discarded a partial-read error with
+    // `let _ = …`, which let a truncated table pass the cap check and the
+    // exit-status check below and be parsed as a COMPLETE table. Returning
+    // `None` on a read error (rather than the partial `buf`) restores the
+    // same fail-closed behaviour the async form has.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut limited = (&mut pipe).take(PS_SAMPLE_BYTE_CAP + 1);
+        let read_ok = limited.read_to_end(&mut buf).is_ok();
+        let _ = cap_tx.send(buf.len() as u64 > PS_SAMPLE_BYTE_CAP);
+        read_ok.then_some(buf)
+    });
+
+    let deadline = std::time::Instant::now() + budget;
+    let status = loop {
+        if let Ok(true) = cap_rx.try_recv() {
+            // Fork issue #160's audit (A7): the read stops at `CAP + 1`
+            // bytes (see `Read::take` above), so the observed length is
+            // always exactly that one value and carries no information
+            // beyond "over cap" — logging it would not tell an operator
+            // whether they are at cap+1 or several MB over. Reading further
+            // just to measure the overshoot would give up the bound this
+            // cap exists to enforce, so instead point at the command that
+            // measures the true size out-of-band.
+            if should_log_size_cap_trip() {
+                tracing::warn!(
+                    program,
+                    cap = PS_SAMPLE_BYTE_CAP,
+                    hint = "observed size cannot be reported without exceeding the cap; run \
+                            `ps -A -w -w -o pid=,ppid=,tty=,args= | wc -c` to measure the true \
+                            sample size",
+                    "process-table sample exceeded its size cap — killing it and reporting no \
+                     sample"
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => {
+                // Fork issue #160's audit (A6): every other exit from this
+                // loop kills before reaping so a SIGKILL cannot land on a
+                // recycled pid — this arm was the one exception, leaving a
+                // live `ps` and, once it exits on its own, a zombie entry.
+                // Symmetric with the size-cap and budget-overrun arms above.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                program,
+                ?budget,
+                "process-table sample exceeded its budget — killing it and reporting no sample"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        // Same shape as `terminate_child_with_grace_and_wait`'s grace poll: a
+        // child that finishes early is picked up on the next tick rather than
+        // costing the whole budget. 5 ms is well under the cost of the `ps` it
+        // is waiting on and keeps the CPU cost of the wait negligible.
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let stdout = match reader.join() {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            // PR #233 review (V4): the async form logs on this exact path
+            // (`read_capped`'s `Ok(None)` arm) — this restores the matching
+            // line so a sync-path read failure isn't silent, now that both
+            // forms are behaviourally symmetric (R1).
+            tracing::warn!(
+                program,
+                "process-table sample's read failed — reporting no sample rather than a \
+                 partial table"
+            );
+            return None;
+        }
+        Err(_) => return None,
+    };
+    if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
+        // Belt-and-braces: a fast, self-limiting over-cap producer can exit on
+        // its own before the poll loop above observes the `cap_rx` signal.
+        return None;
+    }
+    if !status?.success() {
+        return None;
+    }
+    reset_size_cap_trip_streak();
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// The async twin of [`capture_bounded`], for callers on a Tokio runtime.
+/// Bounded the same two ways: [`PS_SAMPLE_BUDGET`] on wall clock, and
+/// [`PS_SAMPLE_BYTE_CAP`] on stdout size.
+///
+/// `kill_on_drop` remains set as a safety net, but with the manual spawn below
+/// `child` is owned by this function rather than by the timed future, so a
+/// `tokio::time::timeout` firing no longer reaps it implicitly — both the
+/// budget and size-cap branches kill and wait on it explicitly. That is also
+/// why this spawns and reads stdout manually rather than calling
+/// `Command::output()`: `output()` collects stdout to EOF with no size bound,
+/// which is exactly the gap #212 closes. Reads are capped at
+/// `PS_SAMPLE_BYTE_CAP + 1` bytes via `AsyncReadExt::take`, matching the sync
+/// form's shape — see [`process_table_async`].
+///
+/// `budget` bounds the SUCCESS path — spawn, read and the final wait, if all
+/// three complete without needing remediation — matching the sync form's
+/// single `deadline` loop over that same span. **It does not bound the
+/// remediation `kill().await` / `wait().await` pairs on the error, size-cap
+/// and timeout arms below** (PR #233 review, R2): `tokio::process::Child::
+/// kill()` is `start_kill()` followed by an unbounded `wait()`, so a child
+/// wedged in uninterruptible sleep (`D` state) still parks this function —
+/// now on the remediation path instead of the happy path. `SIGSTOP`ed
+/// children genuinely are fixed by this, since SIGKILL does terminate a
+/// stopped process; bounding the remediation arms themselves is filed as a
+/// follow-up rather than folded into this PR. Fork issue #160's audit (A4):
+/// an earlier version of this function wrapped only the read in `timeout`,
+/// leaving the final `wait()` unbounded on the success path — a child that
+/// reached stdout EOF without exiting (wedged in `D` state, `SIGSTOP`ed)
+/// parked this function, and with it the daemon's whole poll, forever, even
+/// when nothing had actually timed out. Keep the wait inside the bounded
+/// region if this is ever edited again.
+async fn capture_bounded_async(program: &str, args: &[&str], budget: Duration) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    if budget.is_zero() {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().ok()?;
+    let Some(mut pipe) = child.stdout.take() else {
+        // Unreachable — stdout was just configured as a pipe — but returning
+        // without reaping would leave a zombie behind on every call.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    };
+
+    // Fork issue #160's audit (A5): propagate a read error via `?` rather
+    // than discarding it with `let _ = …` — a discarded error left `buf`
+    // holding a partial read that then passed the cap check and the exit
+    // status check and was parsed as a COMPLETE table, silently dropping
+    // whichever rows never made it into the pipe. That is precisely the
+    // confident false idle this whole change exists to prevent, reached
+    // through the one path that used to fail open instead of closed. The old
+    // `Command::output()` call this replaced returned a `Result` and the
+    // prior code did `output.ok()?`, so this restores that behaviour rather
+    // than introducing new policy.
+    let read_capped = async {
+        let mut buf = Vec::new();
+        let mut limited = (&mut pipe).take(PS_SAMPLE_BYTE_CAP + 1);
+        limited.read_to_end(&mut buf).await.ok()?;
+        Some(buf)
+    };
+
+    let stdout = match tokio::time::timeout(budget, read_capped).await {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            tracing::warn!(
+                program,
+                "process-table sample's read failed — reporting no sample rather than a \
+                 partial table"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                program,
+                ?budget,
+                "process-table sample exceeded its budget — killing it and reporting no sample"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+    };
+
+    if stdout.len() as u64 > PS_SAMPLE_BYTE_CAP {
+        // See A7/A3's rationale on `should_log_size_cap_trip` above the sync
+        // form: the observed length here is likewise always exactly
+        // `CAP + 1` (see `Read::take` in `read_capped` above), so it is not
+        // worth reporting on its own, and the trip is rate-limited the same
+        // way `capture_bounded`'s is.
+        if should_log_size_cap_trip() {
+            tracing::warn!(
+                program,
+                cap = PS_SAMPLE_BYTE_CAP,
+                hint = "observed size cannot be reported without exceeding the cap; run `ps -A \
+                        -w -w -o pid=,ppid=,tty=,args= | wc -c` to measure the true sample size",
+                "process-table sample exceeded its size cap — killing it and reporting no sample"
+            );
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    }
+
+    // Fork issue #160's audit (A4): bound the final wait with whatever budget
+    // remains rather than awaiting it unconditionally — see the doc comment
+    // above. `saturating_sub` floors at zero rather than panicking if the
+    // spawn+read already consumed the whole budget; a zero-duration timeout
+    // still gets one poll of an already-exited child, and otherwise falls
+    // straight to the timeout arm below.
+    let remaining = budget.saturating_sub(started.elapsed());
+    let status = match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(
+                program,
+                ?budget,
+                "process-table sample's child did not exit after its stdout was fully read — \
+                 killing it and reporting no sample"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    reset_size_cap_trip_streak();
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// The sampling sequence itself, over an injected `capture` (called twice) and
+/// an injected session-id resolver — the shared body of [`process_table`] and
+/// [`process_table_async`].
 ///
 /// **The order of the three steps is the entire fix for fork issue #30 and is
 /// not incidental**: the `getsid` pass (inside [`super::scan::parse_ps_table`])
@@ -640,12 +1002,17 @@ where
 /// for why the ordering matters and
 /// [`super::scan::invalidate_unconfirmed_session_ids`] for the exact invariant.
 ///
-/// **Synchronous and unbounded — never call this from an async task** (issue
-/// #429). It blocks the calling thread for the whole run — two `ps`
-/// invocations back to back — measured at ~49 ms each on an idle 16-core Linux
-/// box with ~620 processes, and forever if `ps` wedges in D-state on a stuck
-/// filesystem. [`process_table_async`] is the variant for a Tokio context.
+/// **Synchronous — never call this from an async task** (issue #429). It
+/// blocks the calling thread for the whole run — two `ps` invocations back to
+/// back — measured at ~49 ms each on an idle 16-core Linux box with ~620
+/// processes. [`process_table_async`] is the variant for a Tokio context.
 /// This one remains for synchronous callers and tests.
+///
+/// Each of the two captures goes through [`capture_bounded`], so a `ps`
+/// wedged in D-state is killed and this returns `None` after roughly
+/// [`PS_SAMPLE_BUDGET`] rather than blocking the calling thread forever, and
+/// an oversized capture is rejected the same way (fork issue #212's byte
+/// cap — see [`PS_SAMPLE_BYTE_CAP`]).
 ///
 /// Route B (native enumeration — `/proc/<pid>/{stat,cmdline}` on Linux,
 /// `sysctl(KERN_PROC_ALL)` on macOS) stays open behind PRD #386's M5
@@ -653,18 +1020,7 @@ where
 /// implementations, and is only worth taking if the measurement says so.
 pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
     sample_table(
-        || {
-            let output = std::process::Command::new("ps")
-                .args(PS_TABLE_ARGS)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            Some(String::from_utf8_lossy(&output.stdout).into_owned())
-        },
+        || capture_bounded("ps", &PS_TABLE_ARGS, PS_SAMPLE_BUDGET),
         getsid_or_negative,
     )
 }
@@ -691,39 +1047,32 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 ///   still running and leaves it to the runtime's orphan reaper rather than
 ///   abandoning it.
 ///
-/// **Callers MUST wrap this in a timeout**; it has no internal deadline, and a
-/// `ps` wedged in D-state never returns. The deadline lives at the call site
-/// (see `run_shell_activity_monitor`) because the *interpretation* of a blown
-/// deadline is the caller's: a timed-out sample means "no opinion", never "not
-/// busy".
+/// **Callers MUST still wrap this in a timeout**, and generously so — the
+/// call site (`run_shell_activity_monitor`, `src/daemon.rs`) is where the
+/// *interpretation* of a blown deadline actually lives: a timed-out sample
+/// means "no opinion", never "not busy", and only the caller has the
+/// candidate/`last_known` state to act on that correctly. This function's own
+/// internal [`PS_SAMPLE_BUDGET`] bound (via [`capture_bounded_async`], below)
+/// is a second, narrower line of defense — it kills a `ps` that is merely
+/// slow — not a substitute for the caller's: a genuinely D-state-wedged child
+/// does not act on `kill()` until it leaves D-state, so `capture_bounded_async`'s
+/// own remediation `wait()` can itself run long past its nominal budget on
+/// that specific pathology, which is exactly the case the external
+/// timeout-with-retention exists to bound (issue #429/#500 — see
+/// `SAMPLE_TIMEOUT` and `inflight` in `run_shell_activity_monitor_with`).
 ///
 /// Fork issue #160: returns [`super::ProcessTableOutcome::Failed`] rather than
 /// a bare `None` when the sample does not produce a table — Unix always
 /// *attempts* the sample, so it is never [`super::ProcessTableOutcome::Unsupported`]
 /// here (that variant is the Windows backend's alone). The underlying capture
-/// already `tracing::warn!`s the proximate cause (non-zero exit, spawn
-/// failure); this return value is what lets the daemon's poll itself log
-/// loudly at the point the signal actually degrades, instead of only in a
-/// lower-level log line with no "shell activity" context attached.
+/// already `tracing::warn!`s the proximate cause (budget exceeded, size cap
+/// exceeded, non-zero exit, spawn failure); this return value is what lets
+/// the daemon's poll itself log loudly at the point the signal actually
+/// degrades, instead of only in a lower-level log line with no "shell
+/// activity" context attached.
 pub async fn process_table_async() -> Result<Vec<super::ProcessInfo>, super::ProcessTableOutcome> {
     sample_table_async(
-        || async {
-            // `output()` forces `stdout`/`stderr` to pipes (tokio, unlike
-            // `std`, leaves `stdin` alone — hence the explicit null), and
-            // `wait_with_output` drains both concurrently, so the
-            // captured-and-discarded stderr cannot deadlock.
-            let output = tokio::process::Command::new("ps")
-                .args(PS_TABLE_ARGS)
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            Some(String::from_utf8_lossy(&output.stdout).into_owned())
-        },
+        || capture_bounded_async("ps", &PS_TABLE_ARGS, PS_SAMPLE_BUDGET),
         getsid_or_negative,
     )
     .await
@@ -854,6 +1203,7 @@ pub fn current_ppid() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
     // `u32` PID → `libc::pid_t` PGID conversion used by the `killpg` call
@@ -937,6 +1287,152 @@ mod tests {
     // here or it is not pinned anywhere CI actually runs.
     // -----------------------------------------------------------------------
 
+    /// A sample that outruns its budget must report **no sample** (`None`), not
+    /// an empty or partial one — and must give up at roughly the budget rather
+    /// than waiting for the child. `Some(String::new())` here would be read by
+    /// the caller as "the table is empty", and a wedged `ps` would then flip
+    /// every busy pane to `Idle` — the exact PRD #386 failure mode, through a
+    /// different door.
+    #[test]
+    fn a_sample_that_outruns_its_budget_reports_no_sample() {
+        let started = std::time::Instant::now();
+        let captured = capture_bounded("sleep", &["30"], Duration::from_millis(200));
+        assert_eq!(captured, None, "a timed-out sample must never yield output");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget must actually bound the call (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// Same contract on the async path the daemon's poll actually uses: the
+    /// budget bounds the call, and a timed-out sample is `None`.
+    #[tokio::test]
+    async fn an_async_sample_that_outruns_its_budget_reports_no_sample() {
+        let started = std::time::Instant::now();
+        let captured = capture_bounded_async("sleep", &["30"], Duration::from_millis(200)).await;
+        assert_eq!(captured, None, "a timed-out sample must never yield output");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget must actually bound the call (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// A sample that fails outright — a non-zero exit, or a program that is not
+    /// there to run at all — is also "no sample", never an empty table.
+    #[test]
+    fn a_failed_sample_reports_no_sample() {
+        assert_eq!(
+            capture_bounded("false", &[], PS_SAMPLE_BUDGET),
+            None,
+            "a non-zero exit must not be read as an empty process table"
+        );
+        assert_eq!(
+            capture_bounded(
+                "dot-agent-deck-no-such-program-exists",
+                &[],
+                PS_SAMPLE_BUDGET
+            ),
+            None,
+            "a spawn failure must not be read as an empty process table"
+        );
+    }
+
+    /// The async twin of the failure contract.
+    #[tokio::test]
+    async fn a_failed_async_sample_reports_no_sample() {
+        assert_eq!(
+            capture_bounded_async("false", &[], PS_SAMPLE_BUDGET).await,
+            None
+        );
+        assert_eq!(
+            capture_bounded_async(
+                "dot-agent-deck-no-such-program-exists",
+                &[],
+                PS_SAMPLE_BUDGET
+            )
+            .await,
+            None
+        );
+    }
+
+    /// The healthy path is unchanged by the bounding: a process that finishes
+    /// inside its budget still hands back its whole stdout, on both forms.
+    #[tokio::test]
+    async fn a_healthy_sample_still_returns_its_whole_output() {
+        assert_eq!(
+            capture_bounded("echo", &["hello"], PS_SAMPLE_BUDGET).as_deref(),
+            Some("hello\n")
+        );
+        assert_eq!(
+            capture_bounded_async("echo", &["hello"], PS_SAMPLE_BUDGET)
+                .await
+                .as_deref(),
+            Some("hello\n")
+        );
+    }
+
+    /// Fork issue #212: the capture bounds how long a sample may take
+    /// (`PS_SAMPLE_BUDGET`) but nothing bounds how many BYTES it may read —
+    /// measured during PR #206's security audit at a 300,160-byte row for a
+    /// single process with a 300 KB argv, entirely untruncated. A capture
+    /// that exceeds a size cap must report "no sample" (`None`) — the
+    /// identical shape a time-budget overrun already reports (see
+    /// `a_sample_that_outruns_its_budget_reports_no_sample` and its async
+    /// twin above) — so `process_table`/`process_table_async`'s existing
+    /// `None` → [`super::super::ProcessTableOutcome::Failed`] mapping picks
+    /// this up with no new code path, and the daemon's existing fail-safe
+    /// (`last_known` untouched, nothing emitted — see
+    /// `run_shell_activity_monitor` in `daemon.rs`) handles it exactly like a
+    /// timed-out sample, unchanged.
+    ///
+    /// Scenario: `head -c <PS_SAMPLE_BYTE_CAP + 1> /dev/zero` finishes in well
+    /// under the 2s time budget, so a pure time bound cannot catch it —
+    /// instead it produces a capture one byte over the cap, which today is
+    /// returned whole on both the sync and async forms. The fixture size is
+    /// derived from `PS_SAMPLE_BYTE_CAP` itself (fork issue #160's audit:
+    /// raising the cap to 4 MiB left the old literal 400,000-byte fixture
+    /// *under* the cap, so the test would have silently stopped exercising
+    /// the size-cap path) rather than hand-picked, so the two can never drift
+    /// apart again. It still discriminates in the direction that matters: one
+    /// byte over the cap is the minimal input that must trip it, so the test
+    /// fails if the cap logic is removed entirely, or if `> CAP` is loosened
+    /// to `> CAP + 1` — exactly as it did against the old fixture. It does
+    /// **not** fail if `> CAP` is tightened to `>= CAP` (stricter by one
+    /// byte), and should not: that is not a defect.
+    #[spec("status/shell-activity/010")]
+    #[test]
+    fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample() {
+        // `#[test]` + `block_on` rather than `#[tokio::test]`: `cargo xtask
+        // linkage-check`'s Decision-17 name scan looks for the first line
+        // starting with `fn`, which an `async fn` signature does not — see
+        // `shell_activity_008` in `daemon.rs` for the same wrapper shape.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build size-cap runtime")
+            .block_on(
+                shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample_inner(),
+            );
+    }
+
+    async fn shell_activity_010_a_capture_exceeding_its_size_cap_reports_no_sample_inner() {
+        let oversized_size = (PS_SAMPLE_BYTE_CAP + 1).to_string();
+        let oversized_args = ["-c", oversized_size.as_str(), "/dev/zero"];
+        assert_eq!(
+            capture_bounded("head", &oversized_args, PS_SAMPLE_BUDGET),
+            None,
+            "a capture whose output exceeds the size cap must never yield output, even though \
+             it finished well inside the time budget"
+        );
+        assert_eq!(
+            capture_bounded_async("head", &oversized_args, PS_SAMPLE_BUDGET).await,
+            None,
+            "same contract on the async form the daemon's poll actually uses"
+        );
+    }
+
     /// Fork issue #30, and the defect Greptile caught in this change's first
     /// draft: the `getsid` pass must run **between** the two captures, not after
     /// both of them. Capturing twice and only then reading session ids leaves
@@ -1007,17 +1503,52 @@ mod tests {
     /// live process table (the `001`–`004` behaviour), and the running test
     /// process — which by construction cannot be recycled while it is asking —
     /// survives the fork-issue-#30 confirmation pass with a readable session id.
+    ///
+    /// Fork issue #210: unlike the sampling-contract tests above, this test had
+    /// no retry at all — a single `None`/`Err` from one exhausted `ps` sample
+    /// panicked outright with a message ("sample must enumerate on unix") that
+    /// reads as a broken sampler, not as a timeout. `WINDOW` retries each form
+    /// across a window derived from `PS_SAMPLE_BUDGET` (a multiple of it, so
+    /// the two cannot drift apart) before treating the sample as genuinely
+    /// unavailable; only once a table IS in hand does a missing own-pid row
+    /// become the distinct, real-defect failure message.
     #[tokio::test]
     async fn both_sampling_forms_still_enumerate_the_live_process_table() {
+        const WINDOW: Duration = PS_SAMPLE_BUDGET.saturating_mul(3);
         let own_pid = std::process::id() as i32;
-        for (label, table) in [
-            ("sync", process_table()),
-            // `.ok()`: this test only cares that a live machine enumerates,
-            // not about the `Failed`/`Unsupported` distinction fork issue
-            // #160 added to the async form's error type.
-            ("async", process_table_async().await.ok()),
-        ] {
-            let table = table.unwrap_or_else(|| panic!("{label} sample must enumerate on unix"));
+
+        let sync_deadline = std::time::Instant::now() + WINDOW;
+        let mut sync_table = process_table();
+        while sync_table.is_none() && std::time::Instant::now() < sync_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            sync_table = process_table();
+        }
+        let sync_table = sync_table.unwrap_or_else(|| {
+            panic!(
+                "sync sample: every process_table() attempt timed out against its \
+                 {PS_SAMPLE_BUDGET:?} budget across the whole {WINDOW:?} retry window — a \
+                 sampler timeout under machine load, not evidence the platform cannot enumerate"
+            )
+        });
+
+        let async_deadline = tokio::time::Instant::now() + WINDOW;
+        // `.ok()`: this test only cares that a live machine enumerates, not
+        // about the `Failed`/`Unsupported` distinction fork issue #160 added
+        // to the async form's error type.
+        let mut async_table = process_table_async().await.ok();
+        while async_table.is_none() && tokio::time::Instant::now() < async_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            async_table = process_table_async().await.ok();
+        }
+        let async_table = async_table.unwrap_or_else(|| {
+            panic!(
+                "async sample: every process_table_async() attempt timed out against its \
+                 {PS_SAMPLE_BUDGET:?} budget across the whole {WINDOW:?} retry window — a \
+                 sampler timeout under machine load, not evidence the platform cannot enumerate"
+            )
+        });
+
+        for (label, table) in [("sync", sync_table), ("async", async_table)] {
             let own = table
                 .iter()
                 .find(|row| row.pid == own_pid)

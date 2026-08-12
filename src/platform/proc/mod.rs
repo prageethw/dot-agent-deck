@@ -577,6 +577,16 @@ mod tests {
         );
     }
 
+    // Fork issue #210: a single `process_table()` call can exhaust its own
+    // `PS_SAMPLE_BUDGET` under load, so a discovery window equal to that
+    // budget can be consumed by one failed sample with none left for a retry.
+    // `DISCOVERY_WINDOW` widens the window (not the per-sample budget, which
+    // stays fixed) to a multiple of `PS_SAMPLE_BUDGET` so the two are derived
+    // from one constant and cannot drift apart — shared by `worktree_009` and
+    // `worktree_010`, whose discovery loops have the identical shape.
+    #[cfg(unix)]
+    const DISCOVERY_WINDOW: std::time::Duration = PS_SAMPLE_BUDGET.saturating_mul(3);
+
     /// Fork issue #133 — the mechanism the fix actually buys: killing the
     /// whole process group, not just the tracked child, reaches a grandchild
     /// the child forked before it died. A real 30s-hook integration test would
@@ -605,18 +615,36 @@ mod tests {
         // Discover the backgrounded grandchild through the repo's own
         // descendant scan. Bounded polling, not a bare sleep: the fork behind
         // `&` is near-instant but not synchronous with `spawn()` returning.
-        let discover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // `sampled_at_least_once` distinguishes "the sampler itself kept
+        // timing out" from "sampling worked but the descendant never showed
+        // up" — the two need different failure messages, since only the
+        // second is evidence of a real defect.
+        let discover_deadline = std::time::Instant::now() + DISCOVERY_WINDOW;
+        let mut sampled_at_least_once = false;
         let grandchild_pid = loop {
-            if let Some(table) = process_table()
-                && let Some(descendant) = descendants(&table, child_pid as i32).first()
-            {
-                break descendant.pid as libc::pid_t;
+            if let Some(table) = process_table() {
+                sampled_at_least_once = true;
+                if let Some(descendant) = descendants(&table, child_pid as i32).first() {
+                    break descendant.pid as libc::pid_t;
+                }
             }
-            assert!(
-                std::time::Instant::now() < discover_deadline,
-                "the backgrounded `sleep` never showed up as a descendant of pid {child_pid} \
-                 within the discovery window"
-            );
+            if std::time::Instant::now() >= discover_deadline {
+                if sampled_at_least_once {
+                    panic!(
+                        "the backgrounded `sleep` never showed up as a descendant of pid \
+                         {child_pid} within the {DISCOVERY_WINDOW:?} discovery window, across \
+                         samples that did complete — this looks like a real defect, not a \
+                         timeout"
+                    );
+                } else {
+                    panic!(
+                        "every process_table() sample timed out against its {PS_SAMPLE_BUDGET:?} \
+                         budget for the whole {DISCOVERY_WINDOW:?} discovery window — a sampler \
+                         timeout under machine load, not evidence the backgrounded `sleep` never \
+                         spawned"
+                    );
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
@@ -696,19 +724,35 @@ mod tests {
         // Discover the backgrounded, SIGTERM-resistant descendant the same
         // way `009` does: bounded polling against the repo's own descendant
         // scan, not a bare sleep or an assumption inferred from the parent's
-        // exit.
-        let discover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // exit. Same fork issue #210 widening as `009` — see that test's
+        // comment for why the window (not the per-sample budget) grows, and
+        // why a sampler timeout needs a different message than a genuine miss.
+        let discover_deadline = std::time::Instant::now() + DISCOVERY_WINDOW;
+        let mut sampled_at_least_once = false;
         let descendant_pid = loop {
-            if let Some(table) = process_table()
-                && let Some(descendant) = descendants(&table, child_pid as i32).first()
-            {
-                break descendant.pid as libc::pid_t;
+            if let Some(table) = process_table() {
+                sampled_at_least_once = true;
+                if let Some(descendant) = descendants(&table, child_pid as i32).first() {
+                    break descendant.pid as libc::pid_t;
+                }
             }
-            assert!(
-                std::time::Instant::now() < discover_deadline,
-                "the backgrounded SIGTERM-resistant shell never showed up as a descendant of \
-                 pid {child_pid} within the discovery window"
-            );
+            if std::time::Instant::now() >= discover_deadline {
+                if sampled_at_least_once {
+                    panic!(
+                        "the backgrounded SIGTERM-resistant shell never showed up as a \
+                         descendant of pid {child_pid} within the {DISCOVERY_WINDOW:?} \
+                         discovery window, across samples that did complete — this looks like \
+                         a real defect, not a timeout"
+                    );
+                } else {
+                    panic!(
+                        "every process_table() sample timed out against its {PS_SAMPLE_BUDGET:?} \
+                         budget for the whole {DISCOVERY_WINDOW:?} discovery window — a sampler \
+                         timeout under machine load, not evidence the backgrounded shell never \
+                         spawned"
+                    );
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
