@@ -3018,7 +3018,7 @@ mod hook_ingestion_tests {
                     let samples = samples.clone();
                     async move {
                         samples.fetch_add(1, AtomicOrdering::SeqCst);
-                        None
+                        Err(crate::platform::proc::ProcessTableOutcome::Failed)
                     }
                 })
                 .await
@@ -3116,7 +3116,12 @@ mod hook_ingestion_tests {
                     samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // The wedged `ps`: a sample that never answers. The
                     // monitor's SAMPLE_TIMEOUT is what has to end this tick.
-                    std::future::pending::<Option<Vec<crate::platform::proc::ProcessInfo>>>()
+                    std::future::pending::<
+                        Result<
+                            Vec<crate::platform::proc::ProcessInfo>,
+                            crate::platform::proc::ProcessTableOutcome,
+                        >,
+                    >()
                 })
                 .await
             }
@@ -3245,7 +3250,7 @@ mod hook_ingestion_tests {
                         // Answers eventually, but far past MAX_TABLE_AGE — the
                         // late-wedge-recovery shape, compressed.
                         tokio::time::sleep(Duration::from_secs(4)).await;
-                        Some(busy_table)
+                        Ok(busy_table)
                     }
                 })
                 .await
@@ -3362,7 +3367,7 @@ mod hook_ingestion_tests {
                         // freshness bound alone would let it through, so it is
                         // the window the identity filter has to cover.
                         tokio::time::sleep(Duration::from_millis(2_100)).await;
-                        Some(late_table.lock().unwrap().clone())
+                        Ok(late_table.lock().unwrap().clone())
                     }
                 })
                 .await

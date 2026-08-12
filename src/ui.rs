@@ -9839,6 +9839,22 @@ fn dispatch_action(
                                     ));
                                     return Flow::Continue;
                                 }
+                                // `create_worktree_sync` always attaches an
+                                // existing branch rather than refusing it, so
+                                // this variant is structurally unreachable
+                                // from this call site — kept only because the
+                                // match must stay exhaustive against the
+                                // shared `WorktreeCreation` enum.
+                                Ok(crate::issue_dispatch_run::WorktreeCreation::BranchExists) => {
+                                    ui.status_message = Some((
+                                        format!(
+                                            "Orchestration failed: branch already exists for {}",
+                                            worktree_path.display()
+                                        ),
+                                        std::time::Instant::now(),
+                                    ));
+                                    return Flow::Continue;
+                                }
                                 Err(e) => {
                                     ui.status_message = Some((
                                         format!("Orchestration failed: {e}"),
@@ -35599,6 +35615,9 @@ mod tests {
             mode_config: None,
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),

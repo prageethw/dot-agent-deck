@@ -1299,7 +1299,7 @@ fn classify_worktree_add_result(
 /// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
-async fn create_worktree(
+pub(crate) async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
@@ -1482,7 +1482,7 @@ fn parse_open_issues(json: &str) -> Result<Vec<OpenIssue>, String> {
 /// for a process-group kill to fix, and no `AgentProcessGroup` handle worth
 /// threading through an await that never times out. The asymmetry with
 /// [`run_status_sync`] is intentional, not an oversight.
-async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+pub(crate) async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
