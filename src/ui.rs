@@ -9868,10 +9868,32 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
+                            // issue #425: name the orchestration that
+                            // created this worktree, using the canonical
+                            // config name (not the form name — see the
+                            // "do NOT overwrite orch_config.name" note
+                            // below) so the marker matches the identity the
+                            // daemon itself uses. `load_project_config`
+                            // normalises an empty `name` to the dir
+                            // basename at load time
+                            // (`src/project_config.rs:268-272`, via
+                            // `resolve_orchestration_name`), and this form's
+                            // orchestration list comes from that same
+                            // loader — so `orch_config.name` is non-empty
+                            // by construction and this arm is unreachable
+                            // in production. It stays as defence-in-depth,
+                            // purely so a future constructor that bypasses
+                            // the loader can't write a bare `orchestration:`.
+                            let creator = if orch_config.name.is_empty() {
+                                "orchestration:unknown".to_string()
+                            } else {
+                                format!("orchestration:{}", orch_config.name)
+                            };
                             match crate::issue_dispatch_run::create_worktree_sync(
                                 &req.dir,
                                 worktree_path,
                                 &branch,
+                                &creator,
                             ) {
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::Created) => {
                                     worktree_path.display().to_string()
