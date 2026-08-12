@@ -16,16 +16,18 @@ This is not cosmetic. `vfarcic/tap` can never ship a fork build (see the last se
 | `~/.local/bin/dot-agent-deck` | a **symlink** to `worker-agent-deck` — never a second build. This is a deliberate, interim exception to the reservation below, not a second violation of it: agents invoke `dot-agent-deck` by name, and the symlink is what keeps those calls on the fork binary. See "Row 2 collides with the naming convention" below |
 | `/opt/homebrew/bin/dot-agent-deck` | the upstream brew install, moved only by `brew upgrade` |
 
-Verify which lineage a binary actually is with `dot-agent-deck daemon hello` (a static print — it does not spawn a daemon, `src/main.rs:350-358`), not `--version`: the `server_version` field separates the lineages unambiguously, and `build_version` pins the exact commit either way. This is the per-binary version inventory CLAUDE.md rule 21 promises this page carries:
+Verify which lineage a binary actually is with `dot-agent-deck daemon hello` (a static print — it does not spawn a daemon, `src/main.rs:350-358`), not `--version`. Read **`build_version`**, which pins the exact commit: that is the field that still answers the question. This is the per-binary version inventory CLAUDE.md rule 21 promises this page carries, re-measured 2026-08-12:
 
 ```
 /opt/homebrew/bin/dot-agent-deck daemon hello
-  {"ok":true,"server_version":6,"build_version":"0.35.10-g6974cb4","daemon_version":"0.35.10"}
+  {"ok":true,"server_version":7,"build_version":"0.36.0-g6a98629","daemon_version":"0.36.0"}
 ~/.local/bin/worker-agent-deck daemon hello
-  {"ok":true,"server_version":7,"build_version":"0.37.1-gf057ba6","daemon_version":"0.37.1"}
+  {"ok":true,"server_version":7,"build_version":"0.35.10-g66077b2","daemon_version":"0.35.10"}
 ```
 
-`server_version` 6 is upstream, 7 is fork — matching the `PROTOCOL_VERSION` numbers cited below.
+**`server_version` no longer separates the lineages, and this page previously said it did.** It read "6 is upstream, 7 is fork" — true when measured 2026-08-11, false the next day: upstream's v0.36.0 raised its own `PROTOCOL_VERSION` to 7, brew upgraded to it on 2026-08-12, and both lineages now answer 7. Anything derived from that split is void with it — in particular the local-attach guard (`ensure_compatible_daemon_or_die`) no longer refuses a cross-lineage attach here, so a mismatched *attach* has gone as quiet as `delegate`/`work-done` already were. `build_version`'s short SHA is the discriminator that survives: resolve it against each lineage's history (`git merge-base --is-ancestor <sha> upstream/main`) rather than trusting the number in front of it.
+
+**Nor does "the fork is the higher number" hold — it is currently inverted.** The inventory above has the fork build reporting `0.35.10` against brew's `0.36.0`, because every fork release tag is unreachable from `origin/main` and `git describe` falls back to upstream's newest reachable tag. See [`versioning.md`](versioning.md) § "The fork's own tags are orphaned by every sync" for the mechanism. So on this machine the *lower* version is the fork build, and a version comparison between the two names tells you nothing about lineage in either direction.
 
 **All of this — the shadowing, the symlink, `which` reporting the fork build — depends on `~/.local/bin` coming before `/opt/homebrew/bin` on `$PATH`.** Confirm it, don't assume it: `echo $PATH | tr ':' '\n' | grep -n 'local/bin\|homebrew/bin'` — `~/.local/bin` must have the lower line number. If Homebrew comes first instead, the brew binary wins every lookup, the symlink below does nothing, and every "shadows" claim on this page inverts.
 
