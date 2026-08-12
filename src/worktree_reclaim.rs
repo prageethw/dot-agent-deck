@@ -484,10 +484,18 @@ const MARKER_READ_MAX_BYTES: u64 = 4096;
 /// characters such as U+200B (zero-width space), U+202E (RTL override) or
 /// U+FEFF (BOM) — those sit outside `White_Space` too (which stops at
 /// U+200A), so they survive both the sanitizer and `.trim()` and can reach a
-/// future rendered `worktree list` column or a `jq -r` pipeline unfiltered.
-/// This is latent today (no consumer renders `owner` yet) and becomes live
-/// once M2.3 adds a human-facing `OWNER` column — see fork #166 N2/auditor
-/// re-audit; closing the Cf gap itself is deliberately out of scope here. An
+/// rendered `worktree list` column or a `jq -r` pipeline unfiltered.
+///
+/// PR #215 fixup (reviewer L3 / auditor L3): this used to say the gap was
+/// latent because no consumer rendered `owner` yet, and becomes live once
+/// M2.3 adds a human-facing `OWNER` column. **This PR is M2.3's display
+/// half** — `format_list_human` now emits the OWNER column — so the gap is
+/// live as of this SHA, not latent. Its effect is bounded to display
+/// spoofing in that one cell: `format_reclaim_human` does not render
+/// `owner`, so a `created-by:` value carrying U+202E cannot reach the
+/// removal-confirmation surface, only make the OWNER column (and,
+/// depending on the terminal, the rest of that row) render reversed.
+/// Closing the Cf gap itself remains out of scope here. An
 /// empty value after stripping the prefix and trimming becomes `None`
 /// (unknown), never `Some("")` — `sanitize_marker_creator`'s own "unknown"
 /// floor means the writer can never produce an empty owner, so a `Some("")`
@@ -521,10 +529,16 @@ fn read_marker_owner(marker_path: &Path) -> Option<String> {
 /// resolution rather than a shared one (see below), the auditor measured 24
 /// of 120 adversarial cases landing `owned=false` from [`ownership_of`]
 /// alongside a non-`None` `owner` from this function (fork #166 N3) — the
-/// two disagreeing rather than both reporting unknown. That disagreement is
-/// accepted as cosmetic for now (no consumer treats `owner`'s mere presence
-/// as an ownership signal), but is a contract worth pinning explicitly
-/// before M1.0 makes this identity load-bearing.
+/// two disagreeing rather than both reporting unknown.
+///
+/// PR #215 fixup (reviewer F4 / auditor L1 item 3): this used to say the
+/// disagreement was accepted as cosmetic because "no consumer treats
+/// `owner`'s mere presence as an ownership signal." That is no longer
+/// true — `worktree list --mine` (`src/main.rs::run_worktree_list_cli`) is
+/// exactly such a consumer as of this PR, and now filters on `r.owned &&
+/// r.owner == Some(..)` rather than `owner` alone, so a foreign worktree
+/// whose marker happens to read back a matching identity is excluded
+/// rather than reported as mine.
 ///
 /// [`examine_worktrees`] calls this immediately after [`ownership_of`], with
 /// no I/O of any kind — no `gh` call, no other filesystem work — in between,
@@ -592,10 +606,11 @@ pub(crate) fn owner_of(repo_dir: &Path, worktree_path: &Path) -> Option<String> 
 /// distinguish it from a genuine, complete identity. Still not asking for
 /// atomic writes here: the consequence today is a display-only
 /// misattribution, not a removal-gate bypass (`owner` never feeds `decide`
-/// or `remove_worktree_dir`). But once an orchestration matches its own
-/// worktrees on this identity (the PRD's later milestones), a truncated
-/// read becomes a failed match rather than a cosmetic one, and that is the
-/// point at which an atomic write stops being optional.
+/// or `remove_worktree_dir`). **PR #215 (`worktree list --mine`) is the
+/// milestone that changed this**: an orchestration now matches its own
+/// worktrees on this identity, so a truncated read is a failed match rather
+/// than a cosmetic one, and atomic writes are no longer merely optional —
+/// tracked as fork **#218**.
 pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result<(), String> {
     let git_dir = resolve_git_dir(worktree_path).ok_or_else(|| {
         format!(
@@ -636,7 +651,18 @@ pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result
 /// after the prefix.
 const MARKER_CREATOR_MAX_CHARS: usize = 200;
 
-fn sanitize_marker_creator(name: &str) -> String {
+/// `pub`, not `pub(crate)`: PR #215 fixup (auditor M1) calls this from
+/// `main.rs::run_worktree_list_cli` too, a separate compilation unit
+/// `pub(crate)` cannot reach, so the marker write and the
+/// `DOT_AGENT_DECK_WORKTREE_OWNER` env var are the same sanitized value
+/// rather than one raw and one sanitized. This function is a fixed
+/// point (`f(f(x)) == f(x)` for every input — verified: the truncation
+/// branch drops exactly the trailing `…` it just appended before
+/// re-appending an identical one, and every other transform is already
+/// idempotent), so `mark_worktree_owned` re-applying it to an
+/// already-sanitized value is harmless rather than a second, diverging
+/// derivation.
+pub fn sanitize_marker_creator(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter_map(|c| match c {
@@ -931,16 +957,17 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
         return "no worktrees found\n".to_string();
     }
     let mut out = String::new();
-    out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tVERDICT\tREASON\n");
+    out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tOWNER\tVERDICT\tREASON\n");
     for r in reports {
         let path = display_path(&r.path);
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             path,
             cell(&r.branch),
             r.pr_state,
             if r.clean { "yes" } else { "no" },
             if r.owned { "yes" } else { "no" },
+            cell(&r.owner),
             r.verdict,
             r.reason.as_deref().unwrap_or(DASH),
         ));
@@ -1972,6 +1999,79 @@ mod tests {
             owner_a, owner_b,
             "two orchestrations of the same config type in the same directory \
              must record distinct owners in their own worktree markers"
+        );
+    }
+
+    /// Scenario: `format_list_human` renders two `WorktreeReport`s -- one
+    /// carrying a known owner, one carrying `None` (the shape a pre-#166
+    /// legacy marker or a `Foreign` worktree produces) -- and the resulting
+    /// human table must carry an OWNER column: the exact owner string for
+    /// the first row, and the existing `DASH` placeholder for the second.
+    /// `reason` is deliberately `Some(..)` on both reports so the table's
+    /// only unexplained dash is the owner column under test, not a
+    /// pre-existing dash from an absent reason.
+    #[spec("worktree/reclaim/030")]
+    #[test]
+    fn worktree_reclaim_030_format_list_human_renders_owner_column() {
+        let reports = vec![
+            WorktreeReport {
+                path: PathBuf::from("/repo/wt-owned"),
+                branch: Some("feat/owned".to_string()),
+                clean: true,
+                owned: true,
+                owner: Some("orchestration:owner-x".to_string()),
+                pr_state: "merged".to_string(),
+                verdict: "remove".to_string(),
+                reason: Some("ready to remove".to_string()),
+                real_path: PathBuf::from("/repo/wt-owned"),
+            },
+            WorktreeReport {
+                path: PathBuf::from("/repo/wt-legacy"),
+                branch: Some("feat/legacy".to_string()),
+                clean: true,
+                owned: true,
+                owner: None,
+                pr_state: "merged".to_string(),
+                verdict: "remove".to_string(),
+                reason: Some("ready to remove".to_string()),
+                real_path: PathBuf::from("/repo/wt-legacy"),
+            },
+        ];
+
+        let out = format_list_human(&reports);
+        let mut lines = out.lines();
+        let header = lines
+            .next()
+            .expect("format_list_human must emit a header line");
+        let header_fields: Vec<&str> = header.split('\t').collect();
+        let owner_idx = header_fields
+            .iter()
+            .position(|f| *f == "OWNER")
+            .unwrap_or_else(|| {
+                panic!(
+                    "format_list_human's header must carry an OWNER column; got header: {header:?}"
+                )
+            });
+
+        let owned_row = lines
+            .next()
+            .expect("format_list_human must emit a row for the owned report");
+        let owned_fields: Vec<&str> = owned_row.split('\t').collect();
+        assert_eq!(
+            owned_fields.get(owner_idx),
+            Some(&"orchestration:owner-x"),
+            "the OWNER column must carry the report's owner string; got row: {owned_row:?}"
+        );
+
+        let legacy_row = lines
+            .next()
+            .expect("format_list_human must emit a row for the legacy (owner-unknown) report");
+        let legacy_fields: Vec<&str> = legacy_row.split('\t').collect();
+        assert_eq!(
+            legacy_fields.get(owner_idx),
+            Some(&DASH),
+            "the OWNER column must render the existing DASH placeholder for a report whose \
+             owner is None; got row: {legacy_row:?}"
         );
     }
 }

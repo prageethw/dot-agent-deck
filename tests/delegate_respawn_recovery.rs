@@ -673,6 +673,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
             compose_orchestrator_context: Some(
                 dot_agent_deck::orchestrator_context::Attendance::Unattended,
             ),
+            owner: None,
         },
         &daemon.registry,
         &SilentNotifier,

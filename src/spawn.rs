@@ -148,6 +148,14 @@ pub struct SpawnRequest {
     /// starting the team with the orchestrator holding the bare task. `None` is
     /// unaffected — a path that composes nothing has no precondition to fail.
     pub compose_orchestrator_context: Option<crate::orchestrator_context::Attendance>,
+    /// Fork #166 M2.4: the exact creator string stamped into this spawn's
+    /// worktree marker (`issue-dispatch:<task>#<issue>` on the issue-dispatch
+    /// path), injected into every spawned pane's environment as
+    /// `DOT_AGENT_DECK_WORKTREE_OWNER` so `worktree list --mine` can match it
+    /// after a restart. `None` for a plain scheduled fire that creates no
+    /// worktree (`src/daemon.rs`'s `SpawnRequest`) — there is no marker to
+    /// match, so no owner is injected.
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -604,6 +612,7 @@ pub async fn spawn(
                 // derive it from the command exactly as before (issue #308).
                 None,
                 pin_sh,
+                req.owner.as_deref(),
                 notifier,
             )?;
             // Issue #454: a single-agent spawn registers NOTHING in the
@@ -819,6 +828,7 @@ pub async fn spawn(
                     // identically to the TUI path.
                     role.agent_type.clone(),
                     false,
+                    req.owner.as_deref(),
                     notifier,
                 );
                 // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
@@ -1148,6 +1158,7 @@ fn spawn_one(
     // schedule (no role config, so nothing to declare) always passes.
     agent_type: Option<AgentType>,
     pin_sh: bool,
+    owner: Option<&str>,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let opts = SpawnOptions {
@@ -1156,7 +1167,7 @@ fn spawn_one(
         display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
-        env: pane_env(pane_id, pin_sh),
+        env: pane_env(pane_id, pin_sh, owner),
         tab_membership: membership,
         // PRD #127 finding #4: tag the daemon-side registry entry with the
         // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
@@ -1191,12 +1202,21 @@ fn spawn_one(
 /// [`crate::platform::shell::fixed_command_shell`] — still `/bin/sh` on Unix,
 /// but `%COMSPEC%` on Windows, where pinning a POSIX path would hand
 /// `agent_pty::spawn` a shell that does not exist.
-pub(crate) fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
+pub(crate) fn pane_env(pane_id: &str, pin_sh: bool, owner: Option<&str>) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
         env.push((
             "SHELL".to_string(),
             crate::platform::shell::fixed_command_shell("/bin/sh"),
+        ));
+    }
+    // Fork #166 M2.4: the SAME creator string `create_worktree` wrote into
+    // this spawn's worktree marker, not a second derivation of it — see
+    // `SpawnRequest::owner`.
+    if let Some(owner) = owner {
+        env.push((
+            crate::agent_pty::DOT_AGENT_DECK_WORKTREE_OWNER.to_string(),
+            owner.to_string(),
         ));
     }
     env
@@ -6110,6 +6130,7 @@ mod tests {
                 }),
             }),
             compose_orchestrator_context: None,
+            owner: None,
         };
 
         let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;
@@ -6208,6 +6229,7 @@ mod tests {
                 }),
             }),
             compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
+            owner: None,
         }
     }
 
@@ -6818,7 +6840,7 @@ mod tests {
         assert!(command_needs_shell_wrap("touch x; sleep 30"));
 
         // pane_env: single-word (pin_sh=false) → only the pane-id tag.
-        let env = pane_env("sched-x-0", false);
+        let env = pane_env("sched-x-0", false, None);
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, DOT_AGENT_DECK_PANE_ID);
         assert!(!env.iter().any(|(k, _)| k == "SHELL"));
@@ -6829,7 +6851,7 @@ mod tests {
         // resolves `%COMSPEC%` (else `cmd.exe`) instead. Asserting the real value
         // on each platform rather than skipping the Windows half — the expectation
         // is restated here independently, not read back out of the seam.
-        let env = pane_env("sched-x-1", true);
+        let env = pane_env("sched-x-1", true, None);
         assert_eq!(env.len(), 2);
         let shell = env
             .iter()

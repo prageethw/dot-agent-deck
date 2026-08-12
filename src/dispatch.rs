@@ -503,12 +503,17 @@ pub async fn handle_dispatch(
     // [`describe_dispatch_base`] for why this is reported at all.
     let base = describe_dispatch_base(&clone_dir).await;
 
+    let creator_ident = Creator::dispatch(name);
+    let creator = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+        "{}:{}",
+        creator_ident.kind, creator_ident.subject
+    ));
     match create_worktree(
         &clone_dir,
         &paths.worktree_dir,
         &paths.branch,
         false,
-        Creator::dispatch(name),
+        creator_ident,
     )
     .await
     {
@@ -609,6 +614,10 @@ pub async fn handle_dispatch(
         // in front of the pane mid-run and a coordinator waiting for an approval
         // never reaches the completion that would report it.
         compose_orchestrator_context: Some(crate::orchestrator_context::Attendance::Unattended),
+        // Fork #166 M2.4: the SAME string just written into the worktree's
+        // `created-by:` marker above (`create_worktree`), not a second
+        // derivation of it.
+        owner: Some(creator),
     };
 
     let notifier = StderrNotifier;

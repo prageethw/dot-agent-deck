@@ -7790,7 +7790,7 @@ pub async fn handle_spawn_role_with_state(
         // every role pane — just `DOT_AGENT_DECK_PANE_ID` (plus a `SHELL`
         // override when the command needs shell-wrapping, which orchestration
         // role commands never do — `pin_sh: false` matches that path exactly).
-        env: crate::spawn::pane_env(&pane_id, false),
+        env: crate::spawn::pane_env(&pane_id, false, None),
         tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
             name: resolved.identity.name().to_string(),
             role_index: resolved.role_index,

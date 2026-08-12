@@ -978,6 +978,9 @@ fn make_schedule_callback(
         // done, the value that belongs here is `Unattended`: a scheduled task
         // fires with no one at the pane (issue #703).
         compose_orchestrator_context: None,
+        // A plain scheduled fire creates no worktree, so there is no marker
+        // owner for `--mine` to match against.
+        owner: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     // Issue #835: the task's declared spawn shape, `None` for every task that does
@@ -4185,7 +4188,7 @@ mod hook_ingestion_tests {
                     let samples = samples.clone();
                     async move {
                         samples.fetch_add(1, AtomicOrdering::SeqCst);
-                        Err(crate::platform::proc::ProcessTableOutcome::Failed)
+                        Ok(Vec::new())
                     }
                 })
                 .await
