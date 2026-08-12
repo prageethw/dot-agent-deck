@@ -995,7 +995,7 @@ async fn handshake_008_local_attach_refuses_a_protocol_version_mismatch_inner() 
 
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3376,7 +3376,7 @@ async fn start_server_with_broadcast(
 
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)

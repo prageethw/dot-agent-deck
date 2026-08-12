@@ -115,7 +115,7 @@ fn login_path_fixture(stub_name: &str) -> LoginFixture {
 /// the spawned card reads as "running".
 ///
 /// The marker path is POSIX single-quoted (issue #57) — it descends from
-/// `tempfile::tempdir()`, i.e. `TMPDIR`, so a `"`, `$`, backtick, `\` or newline
+/// `common::harness_tempdir()`, i.e. `TMPDIR`, so a `"`, `$`, backtick, `\` or newline
 /// in it would otherwise terminate or expand inside the redirection, and the
 /// marker this whole file asserts on would be written somewhere else (or a
 /// substitution executed) rather than failing loudly. `sh_quote_path` also
@@ -145,7 +145,7 @@ fn write_marker_stub(stub: &std::path::Path, marker: &std::path::Path) {
 /// expected while a command substitution silently executes instead.
 #[test]
 fn marker_stub_survives_shell_metacharacters_in_the_marker_path() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
 
     // Every character the double-quoted-interpolation bug is sensitive to:
     // a quote, a command substitution, a backtick and a backslash.

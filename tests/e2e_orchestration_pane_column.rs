@@ -467,4 +467,3 @@ fn pane_column_left_edge(grid: &str) -> u16 {
         panic!("orchestrator role-pane box top border not found in grid:\n{grid}")
     })
 }
-

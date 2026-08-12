@@ -2398,6 +2398,86 @@ fn delegate_032_third_collision_destroys_the_first_archived_report() {
         });
 }
 
+#[cfg(unix)]
+struct CliDelegateResult {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run the real `dot-agent-deck delegate` CLI as a subprocess against
+/// `hook_path`, exactly as a role's shell would from inside a pane —
+/// `DOT_AGENT_DECK_PANE_ID` is the only thing that identifies the caller to
+/// the daemon.
+#[cfg(unix)]
+async fn run_delegate_cli(
+    hook_path: &std::path::Path,
+    pane_id: &str,
+    to: &str,
+    task: &str,
+) -> CliDelegateResult {
+    let hook_path = hook_path.to_path_buf();
+    let pane_id = pane_id.to_string();
+    let to = to.to_string();
+    let task = task.to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .arg("delegate")
+            .arg("--to")
+            .arg(&to)
+            .arg("--task")
+            .arg(&task)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .output()
+            .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
+        CliDelegateResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .expect("delegate CLI subprocess task did not panic")
+}
+
+/// Same as [`run_delegate_cli`] but with MULTIPLE `--to` flags, needed for
+/// `orchestration/delegate/033`'s duplicate-role scenario — a single `--to`
+/// cannot reproduce a `signal.to` containing a repeated role name.
+#[cfg(unix)]
+async fn run_delegate_cli_multi(
+    hook_path: &std::path::Path,
+    pane_id: &str,
+    to: &[&str],
+    task: &str,
+) -> CliDelegateResult {
+    let hook_path = hook_path.to_path_buf();
+    let pane_id = pane_id.to_string();
+    let to: Vec<String> = to.iter().map(|s| s.to_string()).collect();
+    let task = task.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        cmd.arg("delegate");
+        for role in &to {
+            cmd.arg("--to").arg(role);
+        }
+        cmd.arg("--task")
+            .arg(&task)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path);
+        let output = cmd
+            .output()
+            .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
+        CliDelegateResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .expect("delegate CLI subprocess task did not panic")
+}
+
 // --- fork #92: `delegate` confirms a delegation it never made -------------
 //
 // P3 follow-up to `orchestration/delegate/016`-`018`: none of that trio
@@ -2595,7 +2675,7 @@ async fn delegate_040_duplicate_role_reports_what_was_armed_inner() {
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Register a real orchestrator pane and a single `cat`-stub `coder` worker, then run the REAL `dot-agent-deck delegate` CLI from the orchestrator pane with `--to coder --to nonexistent-role` — one requested role resolves to a real pane, its sibling does not. The fork #92 partial-resolution decision requires the call to succeed (something really did arm, so failing it would make a retry-on-non-zero orchestrator double-delegate the role that DID arm — upstream #330's harm) while naming BOTH the armed role and the unresolved one, distinguishably. Today `handle_delegate` replies `DelegateResponse::accepted(signal.to)` unconditionally, so `main.rs` folds both roles into one undifferentiated, comma-joined echo of the raw request — the same silent-drop failure `022`/`023` pin, wearing the partial-resolution shape. Assert the call succeeds, both roles are named somewhere observable, and they are not simply reported as one plain comma-joined pair (fork #92 partial-resolution decision).
+/// Scenario: Register a real orchestrator pane and a single `cat`-stub `coder` worker, then run the REAL `dot-agent-deck delegate` CLI from the orchestrator pane with `--to coder --to nonexistent-role` — one requested role resolves to a real pane, its sibling does not. The fork #92 partial-resolution decision requires the call to succeed (something really did arm, so failing it would make a retry-on-non-zero orchestrator double-delegate the role that DID arm — upstream #330's harm) while naming BOTH the armed role and the unresolved one, distinguishably. Today `handle_delegate` replies `DelegateResponse::accepted(signal.to)` unconditionally, so `main.rs` folds both roles into one undifferentiated, comma-joined echo of the raw request — the same silent-drop failure `038`/`039` pin, wearing the partial-resolution shape. Assert the call succeeds, both roles are named somewhere observable, and they are not simply reported as one plain comma-joined pair (fork #92 partial-resolution decision).
 #[spec("orchestration/delegate/041")]
 #[test]
 #[cfg(unix)]
@@ -2682,7 +2762,7 @@ async fn delegate_041_partial_resolution_names_both_armed_and_unresolved_inner()
         !combined.contains(&naive_echo_forward) && !combined.contains(&naive_echo_reverse),
         "the armed role and the unresolved role must not be reported as a single \
          undifferentiated comma-joined list — that reads exactly like a delegate where both \
-         roles genuinely armed, the same silent-drop failure `022`/`023` exist to stop, now in \
+         roles genuinely armed, the same silent-drop failure `038`/`039` exist to stop, now in \
          the partial-resolution shape (fork #92); got stdout={:?} stderr={:?}",
         result.stdout,
         result.stderr

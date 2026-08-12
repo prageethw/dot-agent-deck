@@ -6136,8 +6136,7 @@ impl AppState {
                     Some(None) => false,
                     Some(Some(pending)) => Some(pending.as_str()) == event.tool_name.as_deref(),
                 };
-                let asserted =
-                    session.status != SessionStatus::WaitingForInput || matches_pending;
+                let asserted = session.status != SessionStatus::WaitingForInput || matches_pending;
                 if asserted {
                     session.status = SessionStatus::Working;
                 }
@@ -7195,7 +7194,8 @@ mod tests {
             "a file the deck did not write must never be pointed at: {feedback:?}"
         );
         assert!(
-            feedback.contains("could not write .dot-agent-deck/work-done-coder-0000000000000000.md"),
+            feedback
+                .contains("could not write .dot-agent-deck/work-done-coder-0000000000000000.md"),
             "the orchestrator must be told the file is missing, and which one: {feedback:?}"
         );
         assert!(
@@ -7373,7 +7373,13 @@ mod tests {
 
         assert!(
             matches!(
-                write_work_done_summary(Some(cwd_str), &file_name, "coder", "pane-1", "The report."),
+                write_work_done_summary(
+                    Some(cwd_str),
+                    &file_name,
+                    "coder",
+                    "pane-1",
+                    "The report."
+                ),
                 WorkDoneWriteOutcome::Written
             ),
             "a writable cwd with nothing already at the path must file the report cleanly"

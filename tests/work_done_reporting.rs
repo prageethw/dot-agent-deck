@@ -71,10 +71,7 @@ const UNSOLICITED_NEEDLE: &str = "you have no outstanding delegation to that wor
 
 /// The #433 label, for a commissioned completion whose file could not be written.
 fn unfiled_needle() -> String {
-    format!(
-        "could not write .dot-agent-deck/{}",
-        summary_file_name()
-    )
+    format!("could not write .dot-agent-deck/{}", summary_file_name())
 }
 
 /// The daemon frames an inlined report as inert data, so matching the WRAPPED
