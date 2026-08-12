@@ -28,7 +28,37 @@ The same boundary covers values that never passed through a comment but are equa
 
 **Known limitation of render-only sanitization.** `claim_comment_body` strips a path/branch's backtick only when rendering the comment text, deliberately leaving the stored `Identity`'s own path/branch — and therefore the freshly-resolved caller identity's `Display` string — untouched (comparing the RAW value is what the lock decision needs). For a worktree whose path or branch genuinely contains a backtick, this means the deck can no longer recognise its own prior claim on a later run: the comment reconstructs `held.identity` from the SANITIZED (backtick-stripped) text it rendered, while the caller's own freshly-resolved identity still carries the backtick, so the two compare unequal even though it is the same worktree. This fails closed — the mismatch reads as "held by a different identity" and refuses — and is recoverable the same way any other refusal is: `--takeover --confirm-stopped`.
 
-### The removal target is author-gated, because validation cannot close this
+### FINAL (round 5): the removal target comes from GitHub, not from comment text
+
+**Superseding the author-gate section below.** The round-5 audit proved the author gate did not *narrow* replace-to-one — it **disabled** it. For any deck-authored comment, the `, for @X` clause always renders the authenticated account (`resolve_gh_login` / `resolve_current_login`, both `gh api user`), so `X == author`; the gate requires `author == login_now`; and the self-cancelling filter then drops the removal because `X == login_now`. The removal therefore fires **only when the parsed login disagrees with the comment's author — i.e. only when the parse has been corrupted.** Its entire reachable trigger set in production was the attack it was meant to stop.
+
+**The root mistake, carried since round 1: the claim comment was never a sound source for *who is currently assigned*. GitHub already knows.**
+
+```
+gh issue view --json labels,comments,assignees
+                                     ^^^^^^^^^ added to a call we already make
+remove = current assignees − { the claimant }
+```
+
+**Nothing parsed out of a comment drives a write any more.** The login clause is still *rendered*, because a human reading the issue wants it — but it is no longer parsed back, so it cannot reach an argv at all. That closes the whole class at the root rather than guarding each exit:
+
+| Finding | Status under round 5 |
+|---|---|
+| B1 (parsed login → `--remove-assignee`, unvalidated) | **gone** — the login is not parsed for writes |
+| A1 (attacker text laundered through the deck's own takeover tail) | **gone** — same reason |
+| R5-1 (`, taking over from` tail residual) | **gone** — same reason |
+| A2 (the gate disabled replace-to-one) | **gone** — the trigger no longer depends on the parse |
+
+The author gate becomes unnecessary for this purpose and should be removed rather than left as decoration; a control that no longer guards anything is a future reader's trap.
+
+**This reverses two costs I recorded earlier as accepted:**
+
+1. **"A cross-deck takeover no longer removes the previous human"** — no longer true. The previous human is in GitHub's assignee list, so a takeover removes them. `issue/claim/003` returns to expecting `["bob"]`, not `["alice", "bob"]`.
+2. **Replace-to-one is genuinely restored** — "always exactly one", as originally decided, rather than "exactly one per deck, converging".
+
+**The cost that returns** is the one accepted at the very start and never actually incurred until now: the deck can overwrite an assignee a human set by hand, because GitHub's assignee list does not record who set it. That is the field's defined meaning — *the human who owns the agent working the issue at that moment* — enforced. It is worth saying plainly in the changelog rather than leaving it to be discovered.
+
+### Superseded: the removal target is author-gated, because validation cannot close this
 
 The round-4 audit found the amendment's own worked example still live, and — importantly — showed that a validator does **not** close it: `validate_gh_login("maintainer")` returns `true`. The harm is structural, not malformed input. Replace-to-one means *the removal target is chosen by comment content by design*, so a stranger posting a well-formed single-line claim comment ending `, for @maintainer.` on an unlabelled issue causes the next cron fire to run `gh issue edit --remove-assignee maintainer` with the daemon's credentials. No forgery of the deck's format, no newline, no label required.
 

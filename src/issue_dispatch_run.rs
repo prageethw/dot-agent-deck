@@ -1689,20 +1689,22 @@ mod tests {
     /// [`issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`]
     /// only — not the full stateful fixture `tests/issue_claim.rs` uses,
     /// since this test drives [`claim_issue`] directly rather than the CLI
-    /// subprocess. `issue view --json comments` always reports ONE prior
-    /// claim naming `$PRIOR_LOGIN`, its comment `author` set to that SAME
-    /// login (simulating a same-identity refresh where the prior claim was
-    /// authored by the deck's own currently-authenticated account) — the
-    /// round-4 author gate (`c.author.as_deref() == login`) would otherwise
-    /// unconditionally drop `prior_login` to `None` regardless of body
-    /// content, exercising only the "no prior login, nothing to remove"
-    /// path rather than the same-login self-cancelling-pair logic this test
-    /// is actually named for; `issue edit --add-assignee`/`--remove-assignee`
-    /// apply into `$GHSTUB_DIR/assignees.txt` in the SAME add-then-remove
-    /// order real `gh` applies (matching `tests/issue_claim.rs`'s
-    /// `issue/claim/011` fix), so a self-cancelling pair nets the file
-    /// UNASSIGNED exactly as it would against a real `gh`; every other verb
-    /// is a no-op.
+    /// subprocess. `issue view --json ...` always reports ONE prior claim
+    /// naming `$PRIOR_LOGIN`, its comment `author` set to that SAME login,
+    /// AND `$PRIOR_LOGIN` as a REAL current assignee (PRD fork#235 FINAL
+    /// round 5 — see this constant's own history: rounds 3/4 needed the
+    /// comment's `author` field to match so the then-existing author gate
+    /// would let `prior_login` resolve at all; round 5 deletes that gate and
+    /// reads the removal target from the `assignees` field instead, so the
+    /// stub must genuinely report the claimant as a current assignee for
+    /// this test to exercise the same-identity-refresh property it is named
+    /// for, rather than passing vacuously because nothing was ever assigned
+    /// to begin with); `issue edit --add-assignee`/`--remove-assignee` apply
+    /// into `$GHSTUB_DIR/assignees.txt` in the SAME add-then-remove order
+    /// real `gh` applies (matching `tests/issue_claim.rs`'s `issue/claim/011`
+    /// fix), so a self-cancelling pair — if one were ever still emitted —
+    /// would net the file UNASSIGNED exactly as it would against a real
+    /// `gh`; every other verb is a no-op.
     const CLAIM_019_GH_STUB: &str = r#"#!/bin/sh
 group="$1"; sub="$2"; shift 2 2>/dev/null || true
 add_assignee=""; remove_assignee=""
@@ -1715,7 +1717,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
-    printf '{"comments":[{"body":"Claimed by the orchestration `prior` working `/ws/prior` on branch `prior-branch` at 2020-01-01T00:00:00Z, for @%s.","author":{"login":"%s"}}]}\n' "$PRIOR_LOGIN" "$PRIOR_LOGIN"
+    printf '{"comments":[{"body":"Claimed by the orchestration `prior` working `/ws/prior` on branch `prior-branch` at 2020-01-01T00:00:00Z, for @%s.","author":{"login":"%s"}}],"assignees":[{"login":"%s"}]}\n' "$PRIOR_LOGIN" "$PRIOR_LOGIN" "$PRIOR_LOGIN"
     exit 0
 fi
 if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
@@ -1733,17 +1735,29 @@ exit 0
 
     /// Scenario: [`claim_issue`] (the unattended `issue_dispatch` claim
     /// path) is called with the SAME login as a claim comment already on
-    /// record, that comment's `author` ALSO matching that login (so the
-    /// round-4 author gate lets `prior_login` resolve at all — otherwise
-    /// this test would exercise only "no prior login" and never reach the
-    /// self-cancelling-pair logic it is named for) — a same-identity
+    /// record, that comment's `author` ALSO matching that login, AND that
+    /// login already a REAL current GitHub assignee (`gh issue view`'s
+    /// `assignees` field, seeded by [`CLAIM_019_GH_STUB`]) — a same-identity
     /// refresh, e.g. the same task re-dispatching an issue it already
-    /// claimed. Reviewer R3 / auditor A8: the `--add-assignee X
-    /// --remove-assignee X` self-cancelling-pair fix landed on
-    /// `issue_claim::do_claim` only (`issue/claim/011`); this function
-    /// still emits the self-cancelling pair unconditionally. Assert the
-    /// assignee ends up STILL SET to that login afterward, never
-    /// unassigned.
+    /// claimed. Assert the assignee ends up STILL SET to that login
+    /// afterward, never unassigned.
+    ///
+    /// **Passes for a different reason under round 5** (PRD fork#235 FINAL
+    /// round 5, checked per that round's own instruction to verify
+    /// `011`/`019` still exercise what they claim): this test originally
+    /// pinned reviewer R3 / auditor A8's finding that `claim_issue` emitted a
+    /// self-cancelling `--add-assignee X --remove-assignee X` pair
+    /// unconditionally, unlike `issue_claim::do_claim`'s explicit same-login
+    /// skip guard (`issue/claim/011`). Round 5 deletes BOTH the guard and the
+    /// whole prior-login-from-a-comment mechanism it special-cased — the
+    /// removal target is now `current assignees − {{claimant}}`, a set
+    /// difference computed from `gh issue view`'s own `assignees` field,
+    /// which STRUCTURALLY excludes the claimant from their own removal set
+    /// with no special-casing required. The stub was updated to report the
+    /// claimant as a real current assignee (previously it reported none at
+    /// all) specifically so this test keeps exercising a genuine
+    /// same-identity refresh under round 5, rather than passing vacuously
+    /// because there was nothing to remove regardless of any refresh logic.
     //
     // Written as a sync `#[test]` driving an explicit runtime rather than
     // `#[tokio::test]`: the linkage-check (PRD #77 Decision 17) ties each
@@ -1865,6 +1879,22 @@ exit 0
     /// which covered `@mention` injection into the deck's own rendered
     /// comment but not this: a self-inflicted, structurally-mis-parsed
     /// false parse of the deck's OWN prior comment.
+    ///
+    /// **Re-pointed for round 5** (PRD fork#235 FINAL round 5): both grounds
+    /// above (the parse fix, the author gate) are about to stop mattering —
+    /// round 5 deletes the author gate and stops parsing ANY login out of a
+    /// comment for a write at all, so this test's original two-cause defence
+    /// collapses into a single, STRUCTURAL one: `torvalds` was never added
+    /// as a real GitHub assignee (this fixture's `gh issue view` reports no
+    /// `assignees` field at all), so the round-5 removal target — `current
+    /// assignees − {{claimant}}` — never contains it, regardless of what any
+    /// comment says or who wrote it. The two sanity preconditions above
+    /// remain worth keeping: they still pin `parse_claim_fields`'s own
+    /// correctness (a pure function, unrelated to whether its output is used
+    /// for a write) and the fixture's own shape, so a regression there still
+    /// surfaces via a clearly-labelled precondition failure rather than a
+    /// confusing failure two steps downstream. A future reader must not read
+    /// the final assertion as still guarding the author gate.
     #[spec("issue/claim/024")]
     #[test]
     #[cfg(unix)]
@@ -1961,14 +1991,15 @@ exit 0
         let gh_calls = std::fs::read_to_string(ghstub.join("gh-calls.log")).unwrap_or_default();
         assert!(
             !gh_calls.contains("--remove-assignee torvalds"),
-            "a self-inflicted, structurally-mis-parsed `torvalds` (from the task NAME's own `, \
-             for @torvalds,` substring, embedded in the deck's OWN prior comment — no forged or \
-             hostile comment involved) must never reach a `--remove-assignee` argv; observed \
-             gh-calls.log:\n{gh_calls}"
+            "PRD fork#235 round 5: `torvalds` (from the task NAME's own `, for @torvalds,` \
+             substring, embedded in the deck's OWN prior comment — no forged or hostile comment \
+             involved) must never reach a `--remove-assignee` argv — comment content is never \
+             consulted for a removal write at all, and `torvalds` was never a real GitHub \
+             assignee either; observed gh-calls.log:\n{gh_calls}"
         );
     }
 
-    // --- PRD fork#235 round-4 author gate: issue/claim/026 ---
+    // --- PRD fork#235 FINAL round 5: issue/claim/026 ---
 
     /// Scenario: the mirror image of
     /// [`issue_claim_024_adversarial_task_name_cannot_self_inflict`]. The
@@ -1976,21 +2007,34 @@ exit 0
     /// @` clause — inside the decorative label/path, BEFORE the timestamp —
     /// AND a GENUINE trailing `, for @<login>` clause AFTER it (unlike
     /// `024`, whose body carries no genuine clause at all, `login: None`).
-    /// `024` proves a fabricated match must not fire; it does not prove a
-    /// real match still wins when a fake one precedes it — those are
-    /// different properties, and only this one shows fix 3's
-    /// timestamp-bound search is PRECISE (finds the real clause) rather
-    /// than merely SUPPRESSIVE (finds nothing at all once any earlier match
-    /// exists). The comment is authored as the deck's own
-    /// currently-authenticated account (`stub-user`, matching the `login`
-    /// passed to [`claim_issue`]) so the round-4 author gate does not
-    /// itself mask this test's result — this test is about the PARSE, not
-    /// the gate (`022`/`023` cover the gate itself). Assert the genuine
-    /// login's removal IS attempted.
+    /// The comment is authored as the deck's own currently-authenticated
+    /// account (`stub-user`, matching the `login` passed to [`claim_issue`])
+    /// — the BEST-CASE authorship for a comment-driven removal, and the
+    /// login clause parses out precisely (`genuineuser`, proven by the sanity
+    /// precondition below, not the earlier fake match). Assert the genuine
+    /// login's removal is NEVER attempted regardless.
+    ///
+    /// **Assertion flipped for round 5** (PRD fork#235 FINAL round 5 — see
+    /// this test's own history for why): under round 4 this test proved the
+    /// OPPOSITE — that a well-formed, self-authored, precisely-parsed
+    /// trailing login clause DID drive a removal, showing fix 3's
+    /// timestamp-bound search was precise rather than merely suppressive.
+    /// Round 5 deletes the whole mechanism that made that removal happen at
+    /// all: `claim_issue` no longer parses ANY login out of a comment for a
+    /// write, so even the most favourable case for a comment-driven removal
+    /// — self-authored, no parse ambiguity, a real trailing clause that
+    /// resolves cleanly — must now do NOTHING. This is deliberately the
+    /// STRONGEST form of `022`/`024`/`025`'s "comment content never reaches
+    /// a removal argv" property: those tests each have an independent reason
+    /// the OLD mechanism would already have refused (stranger authorship,
+    /// invalid shape, an unparseable clause) that could mask a
+    /// still-existing removal mechanism; this one removes every such excuse,
+    /// so it alone proves the removal-from-a-comment mechanism is gone, not
+    /// merely blocked on this particular input.
     #[spec("issue/claim/026")]
     #[test]
     #[cfg(unix)]
-    fn issue_claim_026_genuine_trailing_login_wins_over_earlier_fake_match() {
+    fn issue_claim_026_genuine_trailing_login_still_never_drives_a_removal() {
         let malicious_task_name = "nightly, for @torvalds,";
         let paths = derive_issue_paths(Path::new("/ws"), malicious_task_name, 26);
         assert!(
@@ -2074,11 +2118,14 @@ exit 0
 
         let gh_calls = std::fs::read_to_string(ghstub.join("gh-calls.log")).unwrap_or_default();
         assert!(
-            gh_calls.contains("--remove-assignee genuineuser"),
-            "the GENUINE prior login `genuineuser` must still reach `--remove-assignee` when it \
-             wins over an earlier, coincidental fake match and the comment's author matches this \
-             run's own login — fix 3 must be precise, not merely suppressive; observed \
-             gh-calls.log:\n{gh_calls}"
+            !gh_calls.contains("--remove-assignee genuineuser"),
+            "PRD fork#235 round 5: `genuineuser` — a GENUINE, precisely-parsed trailing login \
+             clause in a comment self-authored by the deck's own currently-authenticated account, \
+             the best possible case for a comment-driven removal — must still NEVER reach a \
+             `--remove-assignee` argv; the removal target is `current assignees − {{claimant}}`, \
+             read from `gh issue view`'s own `assignees` field (which this fixture reports as \
+             empty), and comment content — however well-formed, well-authored, and precisely \
+             parsed — is never consulted for a write at all; observed gh-calls.log:\n{gh_calls}"
         );
     }
 

@@ -443,6 +443,31 @@ impl Fixture {
         std::fs::read_to_string(self.ghstub.join("gh-calls.log")).unwrap_or_default()
     }
 
+    /// Directly seed `login` as a REAL current GitHub assignee for
+    /// `repo`/`issue` — bypassing `gh` entirely, standing in for an assignee
+    /// set by an earlier claim (or by a human, by hand) before this test
+    /// starts observing calls. PRD fork#235 FINAL round 5: the removal
+    /// target is computed as `current assignees − {{claimant}}`, read
+    /// straight from `gh issue view`'s own `assignees` field — never from
+    /// any claim comment's content — so this helper lets a test set up "who
+    /// is REALLY assigned" independently of "what a claim comment happens to
+    /// say" (`issue/claim/023`, `027`).
+    fn seed_assignee(&self, repo: &str, issue: u64, login: &str) {
+        let key = repo.replace('/', "_");
+        let dir = self.ghstub.join(&key).join(format!("issue-{issue}"));
+        std::fs::create_dir_all(&dir).expect("create issue dir");
+        let path = dir.join("assignees.txt");
+        let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if !existing.lines().any(|l| l == login) {
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(login);
+            existing.push('\n');
+        }
+        std::fs::write(&path, existing).expect("seed assignee");
+    }
+
     /// The current `assignees.txt` content for `repo`/`issue`, one login per
     /// line — the replace-to-one state after every `--add-assignee`/
     /// `--remove-assignee` write so far.
@@ -661,15 +686,25 @@ fn issue_claim_002_takeover_alone_still_refuses() {
 /// `parse_claim_comment` finds claims by, so any other wording would make it
 /// invisible and the system would still believe A holds the issue) and names
 /// A's worktree absolute path and branch — round 3's identity anchor
-/// (CLAUDE.md rule 23) — in its tail; and the final assignee list holds BOTH
-/// A's and B's humans, A's NOT removed. This is round-4's author gate (PRD
-/// fork#235, "The removal target is author-gated, because validation cannot
-/// close this"): A's claim comment was authored by `alice`, not by B's
-/// authenticated account, so B's takeover correctly refuses to remove it.
-/// This is the PRD's own accepted cost — "a cross-deck takeover no longer
-/// removes the previous human … Both remain assigned until the earlier
-/// holder's deck next acts … It fails safe: the error is an extra assignee,
-/// never a wrongly-removed one" — not a regression.
+/// (CLAUDE.md rule 23) — in its tail; and the final assignee list holds ONLY
+/// B's human — A's IS removed. **Reverted from round 4's expectation** (PRD
+/// fork#235 FINAL round 5, superseding the author gate entirely): round 4
+/// read the removal target from A's claim comment's `, for @alice` clause,
+/// gated on that comment's author — since A's comment was authored by
+/// `alice`, not B's account, the gate refused the removal and both stayed
+/// assigned. Round 5 deletes that whole mechanism at the root: the removal
+/// target is now `current GitHub assignees − { the claimant }`, read
+/// straight from `gh issue view`'s own `assignees` field, never from any
+/// comment's content or authorship. `alice` genuinely IS a current GitHub
+/// assignee (added by A's own earlier claim), so B's takeover removes her —
+/// replace-to-one is "always exactly one" again, not "exactly one per deck,
+/// converging". The auditor's round-5 finding was that the author gate did
+/// not narrow this removal, it DISABLED it: for any deck-authored comment
+/// the `, for @X` clause always names the authenticated account, so `X ==
+/// author` always, and the gate's `author == login_now` check then made the
+/// self-cancelling filter drop the removal on every legitimate run — its
+/// only reachable trigger in production was the parse-corruption attack it
+/// existed to stop.
 #[spec("issue/claim/003")]
 #[test]
 #[cfg(unix)]
@@ -738,12 +773,14 @@ fn issue_claim_003_takeover_confirm_stopped_succeeds_and_records_succession() {
     let assignees = fx.assignees(repo, 3);
     assert_eq!(
         assignees,
-        vec!["alice".to_string(), "bob".to_string()],
-        "the round-4 author gate (PRD fork#235) refuses to let B's takeover remove A's \
-         assignment — A's claim comment was authored by `alice`, not B's authenticated account \
-         — so BOTH remain assigned until A's own deck next acts; this is the PRD's accepted \
-         cost, not a regression: it fails safe, an extra assignee rather than a wrongly-removed \
-         one; got {assignees:?}"
+        vec!["bob".to_string()],
+        "PRD fork#235 round 5: the removal target is `current GitHub assignees − {{the \
+         claimant}}`, read from `gh issue view`'s own `assignees` field — never from any claim \
+         comment's content or authorship. `alice` genuinely IS a current assignee (A's own \
+         earlier claim added her), so B's takeover removes her and adds `bob`; replace-to-one is \
+         restored to \"always exactly one\", reverting round 4's author-gated \
+         `[\"alice\", \"bob\"]` expectation, which depended on a gate the round-5 audit found \
+         disabled removal entirely rather than narrowing it; got {assignees:?}"
     );
 }
 
@@ -1056,6 +1093,21 @@ fn issue_claim_010_different_worktree_is_refused_even_with_same_pane_id() {
 /// UNASSIGNED — reviewer F3. Both this file's stub and the e2e stub
 /// previously applied remove-before-add, which netted ASSIGNED and hid the
 /// defect from CI entirely.
+///
+/// **Passes for a different reason under round 5** (PRD fork#235 FINAL round
+/// 5, checked per that round's own instruction to verify `011`/`019` still
+/// exercise what they claim): the fix this test originally pinned was an
+/// EXPLICIT same-login skip guard (`remove = prior_login.filter(|prior|
+/// *prior != login)`) in the writer. Round 5 deletes that guard along with
+/// the whole prior-login-from-a-comment mechanism it special-cased — the
+/// removal target is now `current assignees − {{claimant}}`, a set
+/// difference computed from `gh issue view`'s own `assignees` field, which
+/// STRUCTURALLY excludes the claimant from their own removal set by
+/// construction, with no special-casing required at all. So this test still
+/// pins a real, still-true property (a same-identity refresh never
+/// unassigns), but the MECHANISM that makes it true has moved from an
+/// explicit guard to a structural set-difference — a future reader must not
+/// look for the old guard and conclude it went missing.
 #[spec("issue/claim/011")]
 #[test]
 #[cfg(unix)]
@@ -1753,13 +1805,26 @@ fn stranger_claim_body(login: &str) -> String {
 /// claiming agent. A legitimate agent (`legit`) then runs a bare `issue
 /// claim` (which always succeeds on an unlabelled issue, regardless of
 /// `held`). Assert the claim still succeeds, but NO `gh` call ever carries
-/// `--remove-assignee victim` — round-4 author gate (PRD fork#235): the
-/// removal target must come ONLY from a claim comment whose author is the
-/// deck's own authenticated account, never from comment CONTENT alone.
-/// Reachable exactly as the PRD's threat-model amendment describes: "a
-/// stranger posts a well-formed single-line claim comment ending `, for
-/// @maintainer.` on an unlabelled issue; the next cron fire runs `gh issue
-/// edit --add-assignee <deck> --remove-assignee maintainer`."
+/// `--remove-assignee victim`.
+///
+/// **Re-pointed for round 5** (PRD fork#235 FINAL round 5 — the removal
+/// target comes from GitHub, not comment text): this test predates round 5
+/// and originally pinned the round-4 author gate (`held.author ==
+/// login_now`). Round 5 deletes that gate along with the whole mechanism it
+/// guarded — `do_claim` no longer parses ANY login out of a comment for a
+/// write, so this test's original mechanism ("the author gate blocks a
+/// stranger's comment") no longer exists to pin at all. The property that
+/// still matters, and that this test still genuinely exercises: `victim` was
+/// never added as a REAL GitHub assignee (only named in a comment), so the
+/// round-5 removal target — `current assignees − {{claimant}}`, read
+/// straight from `gh issue view`'s own `assignees` field — never contains
+/// `victim` regardless of who authored the comment naming him, or whether
+/// any author-gate exists at all. A future reader must not read this as
+/// still guarding a gate that has been removed. Reachable exactly as the
+/// PRD's original threat-model amendment describes: "a stranger posts a
+/// well-formed single-line claim comment ending `, for @maintainer.` on an
+/// unlabelled issue" — round 5 kills the whole class at the root rather than
+/// gating each exit.
 #[spec("issue/claim/022")]
 #[test]
 #[cfg(unix)]
@@ -1787,34 +1852,47 @@ fn issue_claim_022_stranger_comment_cannot_drive_a_removal() {
         !fx.gh_calls()
             .iter()
             .any(|l| l.contains("--remove-assignee") && l.contains("victim")),
-        "a claim comment authored by someone OTHER than the deck's own authenticated account \
-         must never drive a `--remove-assignee` — `do_claim`'s `prior_login` extraction \
-         (`issue_claim.rs:388`) reads `held.login` unconditionally, with no author check at all, \
-         so ANY well-formed `, for @victim.` clause on ANY discoverable comment — even on an \
-         issue this deck never labelled — reaches the removal argv; observed gh calls: {:?}",
+        "PRD fork#235 round 5: a claim comment's content — no matter who authored it — is never \
+         consulted for a removal write at all; the removal target is `current GitHub assignees − \
+         {{claimant}}`, and `victim` was never added as a real assignee here, so `victim` is \
+         structurally absent from that set regardless of the comment naming him; observed gh \
+         calls: {:?}",
         fx.gh_calls()
     );
 }
 
 /// Scenario: the SAME shape as `022` — an UNLABELLED issue carrying a
-/// well-formed claim comment naming `priorholder` in its `, for
-/// @priorholder.` clause — but this time authored by `legit`, the SAME
-/// account the claiming agent is currently authenticated as. Assert the
-/// removal still happens (`--remove-assignee priorholder` reaches `gh`): the
-/// author gate must open when the author genuinely IS the deck's own
-/// account, so it narrows the removal target rather than disabling
-/// replace-to-one outright. Unlike `022`/`024`/`025`, this one may already
-/// be GREEN before the fix lands — today's code removes unconditionally,
-/// author or not — so it is a regression guard, not RED-first (mirroring
-/// `scheduler/dispatch/022`'s own not-RED-first catalog note); the catalog
-/// entry says so.
+/// well-formed claim comment, self-authored by `legit` (the SAME account the
+/// claiming agent is currently authenticated as), naming `priorholder` in its
+/// `, for @priorholder.` clause — but `priorholder` is ALSO seeded directly
+/// as a REAL current GitHub assignee, standing in for a human who assigned
+/// the issue by hand before any deck ever claimed it. Assert the removal
+/// still happens (`--remove-assignee priorholder` reaches `gh`).
+///
+/// **Repurposed for round 5** (PRD fork#235 FINAL round 5): this test
+/// originally pinned the round-4 author gate opening for a self-authored
+/// comment (self-authorship was WHY the removal was allowed). Round 5
+/// deletes the author gate — comment authorship no longer has any bearing on
+/// a removal at all — so `priorholder`'s self-authored `, for @priorholder.`
+/// clause is no longer why this removal happens; it is now pure decoration.
+/// The property this test is repurposed to pin instead: replace-to-one
+/// applies uniformly, even to an issue's FIRST claim, against whatever is
+/// ALREADY in GitHub's own assignees field — including an assignee a human
+/// set by hand, never through this deck at all. That is the round-5 PRD's
+/// own stated accepted cost, made concrete: "the deck can overwrite an
+/// assignee a human set by hand, because GitHub's assignee list does not
+/// record who set it." This test is a regression guard, not RED-first: the
+/// removal already happens under round-4 code too (the self-authored gate
+/// was open), so it stays GREEN before AND after the coder's round-5 fix —
+/// only the REASON it passes changes.
 #[spec("issue/claim/023")]
 #[test]
 #[cfg(unix)]
-fn issue_claim_023_own_comment_still_drives_the_removal() {
+fn issue_claim_023_removes_an_assignee_a_human_set_by_hand() {
     let fx = Fixture::new();
     let repo = "acme/widgets";
     fx.seed_claim_comment_unlabelled_by(repo, 23, &stranger_claim_body("priorholder"), "legit");
+    fx.seed_assignee(repo, 23, "priorholder");
 
     let wt = fx.add_worktree("wt-023", "claim-023-branch");
     fx.mark_owned(&wt, "orchestration:orch-023");
@@ -1834,27 +1912,39 @@ fn issue_claim_023_own_comment_still_drives_the_removal() {
         fx.gh_calls()
             .iter()
             .any(|l| l.contains("--remove-assignee") && l.contains("priorholder")),
-        "a claim comment authored by the deck's OWN currently-authenticated account must still \
-         drive its named removal — the author gate must narrow WHO can trigger a removal, not \
-         disable replace-to-one for every legitimately-authored prior claim; observed gh calls: \
-         {:?}",
+        "PRD fork#235 round 5: `priorholder` is a REAL current GitHub assignee (seeded directly, \
+         standing in for a human who assigned the issue by hand), so replace-to-one removes them \
+         on the claimant's first claim regardless of any comment's authorship — this is the \
+         round-5 PRD's own accepted cost (the deck can overwrite an assignee a human set by \
+         hand) made concrete, not the now-deleted author gate; observed gh calls: {:?}",
         fx.gh_calls()
     );
 }
 
 /// Scenario: an UNLABELLED issue carries a well-formed, SELF-authored claim
-/// comment (author `legit`, matching the claiming agent's own login — the
-/// author gate, on its own, would let this through) whose `, for @<login>`
-/// clause names a MALFORMED login: `-baduser025` (leading `-`, failing
-/// [`dot_agent_deck::issue_dispatch::validate_gh_login`]'s
+/// comment (author `legit`, matching the claiming agent's own login) whose
+/// `, for @<login>` clause names a MALFORMED login: `-baduser025` (leading
+/// `-`, failing [`dot_agent_deck::issue_dispatch::validate_gh_login`]'s
 /// `^[A-Za-z0-9][A-Za-z0-9-]*$` shape). Assert the claim succeeds but NO `gh`
-/// call ever carries `-baduser025` as a `--remove-assignee` value — cause 1
-/// of the PRD's two independent causes: `validate_gh_login` has exactly two
-/// call sites and both validate the deck's OWN `gh api user` reply, never
-/// the PARSED one, so a malformed value sails straight through even once the
-/// author gate (`022`/`023`) is satisfied. Pins the parser-boundary
-/// validation independently of the author gate, so removing one fix doesn't
-/// silently take the other with it.
+/// call ever carries `-baduser025` as a `--remove-assignee` value.
+///
+/// **Re-pointed for round 5** (PRD fork#235 FINAL round 5): this test
+/// originally pinned `parse_worktree_claim`'s parser-boundary
+/// `validate_gh_login` check (cause 1 of the round-4 PRD's two independent
+/// causes) — the fact that `-baduser025` never reaches a `gh` argv because
+/// the PARSE drops it, independently of the (then still-open) author gate.
+/// Round 5 removes that mechanism's relevance entirely: `do_claim` no longer
+/// parses ANY login out of a comment for a write, valid or not, so this is
+/// no longer "a malformed value slips past validation" — there is no
+/// validation-of-a-parsed-value step left to slip past. The property that
+/// still matters, and that this test still genuinely exercises: `-baduser025`
+/// was never added as a REAL GitHub assignee (only named, malformed, in a
+/// comment), so the round-5 removal target — `current assignees −
+/// {{claimant}}` — never contains it regardless. A malformed string like this
+/// could in fact never BE a real GitHub login to begin with, which makes the
+/// round-5 guarantee even more robust than the round-4 parser check it
+/// replaces: it does not merely reject bad shapes, it never reads comment
+/// content for this purpose at all.
 #[spec("issue/claim/025")]
 #[test]
 #[cfg(unix)]
@@ -1879,10 +1969,158 @@ fn issue_claim_025_malformed_parsed_login_is_dropped_not_passed_through() {
     );
     assert!(
         !fx.gh_calls_raw().contains("-baduser025"),
-        "a parsed login failing `validate_gh_login` must never reach a `gh` argv — \
-         `validate_gh_login`'s two existing call sites both validate the deck's own `gh api \
-         user` reply, never the login PARSED out of a claim comment (cause 1 of the PRD's two \
-         independent causes); observed gh-calls.log:\n{}",
+        "PRD fork#235 round 5: comment content is never consulted for a removal write at all, so \
+         a malformed `-baduser025` (which could never be a real GitHub login anyway) never \
+         reaches a `gh` argv — `-baduser025` was never added as a real assignee, so it is \
+         structurally absent from `current assignees − {{claimant}}`; observed \
+         gh-calls.log:\n{}",
+        fx.gh_calls_raw()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD fork#235 FINAL round 5 — the removal target comes from GitHub, not
+// comment text. The round-5 audit found the round-4 author gate did not
+// narrow replace-to-one, it DISABLED it: for any deck-authored comment the
+// `, for @X` clause always names the authenticated account, so `X == author`
+// always, and the gate's `author == login_now` check then made the
+// self-cancelling filter drop the removal on every legitimate run — its only
+// reachable trigger in production was the parse-corruption attack it existed
+// to stop. Round 5 deletes the gate and the whole comment-parsing-for-writes
+// mechanism at the root: `remove = current GitHub assignees − {the
+// claimant}`, read from `gh issue view`'s own `assignees` field. See
+// `prds/235-issue-claim-lock.md`'s "FINAL (round 5)" section.
+// ---------------------------------------------------------------------------
+
+/// Scenario: An issue already holds a REAL GitHub assignee, `priorholder` —
+/// seeded directly into the stub's assignee list, standing in for an
+/// assignee set by an earlier claim before this test starts observing calls.
+/// Its held claim comment (naming the identity a takeover must compare
+/// against for the lock decision) carries a `, for @wronguser.` clause that
+/// DISAGREES with the real assignees list — `wronguser` is not, and never
+/// was, an actual assignee, and the comment's author is left unset (nobody's
+/// account) so a round-4-shaped implementation could never treat it as
+/// self-authored either. A new agent pane takes over
+/// (`--takeover --confirm-stopped`, required because the issue is held by a
+/// different identity). Assert the takeover succeeds, `priorholder` — the
+/// REAL prior assignee — is removed and the claimant added, and no `gh` call
+/// ever carries `--remove-assignee wronguser`: the removal target comes from
+/// GitHub's own assignees field, never from any comment's `, for @` clause,
+/// which is now rendered for a human reader only and never parsed back for a
+/// write.
+#[spec("issue/claim/027")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_027_removal_target_comes_from_the_assignees_field() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    let held_body = "Claimed by the orchestration `orch-prior-027` working `/held/prior-027` on \
+         branch `prior-027-branch` at 2020-01-01T00:00:00Z, for @wronguser.";
+    fx.seed_claim_comment(repo, 27, held_body);
+    fx.seed_assignee(repo, 27, "priorholder");
+
+    let wt = fx.add_worktree("wt-027", "claim-027-branch");
+    fx.mark_owned(&wt, "orchestration:orch-027");
+    fx.set_login("claimant027");
+
+    let out = fx.run(
+        &wt,
+        &[
+            "issue",
+            "claim",
+            "27",
+            "--repo",
+            repo,
+            "--takeover",
+            "--confirm-stopped",
+        ],
+        Some("pane-027"),
+    );
+    assert!(
+        out.status.success(),
+        "a takeover of an issue held by a different identity must succeed; out={}",
+        combined(&out)
+    );
+
+    let assignees = fx.assignees(repo, 27);
+    assert_eq!(
+        assignees,
+        vec!["claimant027".to_string()],
+        "the REAL prior assignee (`priorholder`, seeded directly into GitHub's own assignees \
+         field) must be removed and the claimant added — the removal target is `current \
+         assignees − {{claimant}}`, computed from `gh issue view`'s `assignees` field, never \
+         from the held comment's `, for @wronguser.` clause; got {assignees:?}"
+    );
+    assert!(
+        !fx.gh_calls_raw().contains("--remove-assignee wronguser"),
+        "`wronguser`, named only in the held comment's `, for @` clause and never a real \
+         assignee, must never reach a `--remove-assignee` argv; raw gh-calls.log:\n{}",
+        fx.gh_calls_raw()
+    );
+    assert!(
+        fx.gh_calls()
+            .iter()
+            .any(|l| l.contains("--remove-assignee") && l.contains("priorholder")),
+        "the REAL prior assignee `priorholder` must be the one actually removed; observed gh \
+         calls: {:?}",
+        fx.gh_calls()
+    );
+}
+
+/// Scenario: an UNLABELLED issue carries a well-formed claim comment,
+/// self-authored by `claimant028` — the SAME account about to run the claim,
+/// so a round-4-shaped author gate would have OPENED for it — naming
+/// `victim` in its `, for @victim.` clause. `victim` is never seeded as a
+/// real GitHub assignee. A bare `issue claim` (which always succeeds on an
+/// unlabelled issue) is asserted to succeed with NO `--remove-assignee
+/// victim` ever reaching `gh`.
+///
+/// This is B1's original exploit — "a stranger posts a well-formed
+/// single-line claim comment ending `, for @maintainer.`; the next claim
+/// removes `maintainer`" — re-pointed at the round-5 design, and
+/// deliberately the ONE quadrant `022`/`023`/`025` don't already cover:
+/// self-authored (so the now-deleted round-4 gate would have let it through)
+/// AND naming a login that is not a real assignee (so round 5's own removal
+/// target excludes it). Under CURRENT (round-4) code this genuinely
+/// removes `victim` — the self-authored gate opens and nothing yet checks
+/// whether `victim` is a real assignee — so this test is RED before the
+/// coder's round-5 fix lands and GREEN after: `victim` stays unreachable for
+/// a STRUCTURAL reason (absent from `current assignees`), never because of
+/// comment-authorship.
+#[spec("issue/claim/028")]
+#[test]
+#[cfg(unix)]
+fn issue_claim_028_comment_naming_a_non_assignee_removes_nobody() {
+    let fx = Fixture::new();
+    let repo = "acme/widgets";
+    fx.seed_claim_comment_unlabelled_by(repo, 28, &stranger_claim_body("victim"), "claimant028");
+    // Deliberately no `seed_assignee` call: `victim` is named only in the
+    // comment — self-authored though it is — and is never a real GitHub
+    // assignee.
+
+    let wt = fx.add_worktree("wt-028", "claim-028-branch");
+    fx.mark_owned(&wt, "orchestration:orch-028");
+    fx.set_login("claimant028");
+
+    let out = fx.run(
+        &wt,
+        &["issue", "claim", "28", "--repo", repo],
+        Some("pane-028"),
+    );
+    assert!(
+        out.status.success(),
+        "a bare claim on an unlabelled issue must succeed; out={}",
+        combined(&out)
+    );
+    assert!(
+        !fx.gh_calls_raw().contains("--remove-assignee victim"),
+        "PRD fork#235 round 5: `victim`, named only in a SELF-authored comment's `, for @` \
+         clause and absent from GitHub's own assignees field, must never reach a \
+         `--remove-assignee` argv — the removal target is `current assignees − {{claimant}}`, \
+         and `victim` is structurally absent from that set; this must now hold even though the \
+         now-deleted round-4 author gate would have opened for this exact comment (self-authored \
+         by the claimant), proving the guarantee no longer depends on authorship at all; raw \
+         gh-calls.log:\n{}",
         fx.gh_calls_raw()
     );
 }
