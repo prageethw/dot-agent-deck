@@ -246,7 +246,11 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let mut cap = max;
+        while cap > 0 && !s.is_char_boundary(cap) {
+            cap -= 1;
+        }
+        format!("{}…", &s[..cap])
     }
 }
 
@@ -343,6 +347,13 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // populated only for a genuine submission. Adding a new event source
     // here that sets `prompt` on a non-submission event would silently
     // violate that invariant — nothing downstream enforces it.
+    //
+    // Audit A3: fork #197 M3's multi-byte `truncate` fix re-arms this route
+    // on the dispatch (`--task`) path — a 207-byte pointer could never
+    // satisfy TEXT confirmation before that fix, so a non-submission event
+    // carrying `prompt` could not have produced a false confirm there
+    // either. That immunity was an accident of the truncation bug, not a
+    // guarantee; F2's document-only disposition now covers this path too.
     let user_prompt = prompt.map(|p| truncate(&p, USER_PROMPT_TRUNCATE_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     // PRD #92 F9 followup-7: the daemon injects DOT_AGENT_DECK_AGENT_ID

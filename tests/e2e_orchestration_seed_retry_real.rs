@@ -25,7 +25,7 @@
 //! installing the OpenCode CLI and provisioning an OpenRouter key, recording
 //! the standalone-CR question on those two harnesses as an accepted,
 //! documented unknown rather than a verified one (see the PRD's *Decisions
-//! taken*, commit `6e49744`).
+//! taken* section, recorded during the OpenCode-to-Codex rescoping).
 //!
 //! Fork#197 M4 Part 2 shrinks `CONFIRMATION_GRACE_PERIOD` (2s production
 //! default) to `CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS` below via a

@@ -2231,13 +2231,14 @@ const CONFIRMATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from
 /// (`SPAWN_READINESS_BUFFER_MIN`/`_MAX`), which this function is the sibling
 /// of and previously did not match: that one clamps an out-of-range env
 /// override, this one trusted it verbatim. Zero is a legitimate value (skip
-/// the grace period entirely); [`AUTOMATIC_PROMPT_DEADLINE`] is the ceiling
-/// because a grace period at or beyond it can never let a
-/// confirmation-retry fire before the whole cycle is abandoned — past that
-/// point the override isn't a longer grace period, it's a silently disabled
-/// one.
+/// the grace period entirely); [`AUTOMATIC_PROMPT_DEADLINE`] is excluded as
+/// the ceiling — pinned 1ms below it — because a grace period at or beyond
+/// it can never let a confirmation-retry fire before the whole cycle is
+/// abandoned — past that point the override isn't a longer grace period,
+/// it's a silently disabled one.
 #[cfg(any(test, debug_assertions))]
-const CONFIRMATION_GRACE_PERIOD_MAX: std::time::Duration = AUTOMATIC_PROMPT_DEADLINE;
+const CONFIRMATION_GRACE_PERIOD_MAX: std::time::Duration =
+    std::time::Duration::from_millis(AUTOMATIC_PROMPT_DEADLINE.as_millis() as u64 - 1);
 
 #[cfg(any(test, debug_assertions))]
 fn confirmation_grace_period() -> std::time::Duration {
@@ -2636,8 +2637,8 @@ struct UiState {
     /// exists today — the audit checked every current producer — so this is
     /// a constraint to notice, not a live bug. A future change that lets a
     /// pane carry two concurrent automatic-prompt cycles must key this (and
-    /// [`UiState::prompt_delivery`]) by `(pane_id, cycle kind)`, not pane id
-    /// alone.
+    /// [`UiState::prompt_delivery`] and [`UiState::seed_delivery_landed`]) by
+    /// `(pane_id, cycle kind)`, not pane id alone.
     send_retry_backoff: HashMap<String, SendRetryState>,
     /// PRD #20 R20-003/R20-004: per-pane captured delivery identity for automatic
     /// prompts. Populated at ENQUEUE (and lazily at first delivery as a fallback)
@@ -2662,6 +2663,19 @@ struct UiState {
     /// landed — issue #424's own finding #2, surviving here because this
     /// copy of the delivery logic was never updated when #424 fixed the
     /// orchestrator path.
+    ///
+    /// Audit F13: inserted in exactly one place and removed in exactly one
+    /// place (the `AUTOMATIC_PROMPT_DEADLINE` reclaim branch), keyed by pane
+    /// id alone. Safe today because both enqueue sites mint a fresh,
+    /// monotonic `new_id` for the `PendingSeedPrompt`, and `retain_mut` is
+    /// the only other mutation of `pending_seed_prompts`. Two things would
+    /// break it, neither reachable now: a future path enqueueing a second
+    /// seed for a pane id already in this set (the stale entry makes the
+    /// new seed's write report `true` on the very first poll and it is
+    /// never actually written — silently), and `PANE_COUNTER` resetting on
+    /// daemon restart while a TUI outlives it, colliding a freshly-minted
+    /// pane id with a stale marker's. See [`UiState::send_retry_backoff`]'s
+    /// audit F6 note for the adjacent pane-id-only keyspace this shares.
     seed_delivery_landed: HashSet<String>,
     /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
     /// loaded from the global config when the dialog opens.
@@ -4109,32 +4123,34 @@ fn deliver_orchestrator_prompt(
         // never independently confirmed — bytes reached the PTY, which is
         // exactly what `main` reported as success for a single delivery. Only
         // a tab with NO landed write at all (no entry) is genuinely abandoned.
-        if delivery_phase(
+        match delivery_phase(
             &*orchestrator_prompt,
             ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
-        ) == DeliveryPhase::Landed
-        {
-            tracing::warn!(
-                pane_id = %start_pane_id,
-                tab_id,
-                "orchestrator prompt: deadline reached with a landed write still \
-                 unconfirmed; reporting delivered-unconfirmed rather than abandoning"
-            );
-            finalize_orchestrator_prompt_delivered(
-                ui,
-                tab_id,
-                &start_pane_id,
-                orchestrator_prompt,
-                role_statuses,
-                start_role_index,
-                now,
-                Some(
-                    "Orchestrator prompt delivered but unconfirmed (no submit \
-                     observed before timeout)"
-                        .to_string(),
-                ),
-            );
-            return;
+        ) {
+            DeliveryPhase::Landed => {
+                tracing::warn!(
+                    pane_id = %start_pane_id,
+                    tab_id,
+                    "orchestrator prompt: deadline reached with a landed write still \
+                     unconfirmed; reporting delivered-unconfirmed rather than abandoning"
+                );
+                finalize_orchestrator_prompt_delivered(
+                    ui,
+                    tab_id,
+                    &start_pane_id,
+                    orchestrator_prompt,
+                    role_statuses,
+                    start_role_index,
+                    now,
+                    Some(
+                        "Orchestrator prompt delivered but unconfirmed (no submit \
+                         observed before timeout)"
+                            .to_string(),
+                    ),
+                );
+                return;
+            }
+            DeliveryPhase::Idle | DeliveryPhase::Armed | DeliveryPhase::Finalized => {}
         }
         tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
         abandon_orchestrator_prompt(
@@ -4196,6 +4212,14 @@ fn deliver_orchestrator_prompt(
         // per cycle, not an error) rather than truncation-mismatch being the
         // visible cause. Truncate `sent_prompt` the same way before
         // comparing so a prefix match is actually reachable.
+        //
+        // Audit A2: truncating the sent side coarsens confirmation to a
+        // `USER_PROMPT_TRUNCATE_LEN`-byte-prefix equivalence class — two
+        // seeds sharing the same first 200 bytes are indistinguishable to
+        // this check. No new attacker capability today, but a forward
+        // hazard: content meant to distinguish one seed's confirmation from
+        // another's must stay within the first 200 bytes, or this silently
+        // stops telling them apart.
         let sent_prompt_truncated =
             crate::hook::truncate(sent_prompt.trim(), crate::hook::USER_PROMPT_TRUNCATE_LEN);
         let text_confirmed = target_session.is_some_and(|s| {
@@ -6319,11 +6343,6 @@ fn focus_deck(
                         ),
                         std::time::Instant::now(),
                     ));
-                    // PRD #373 M2: a digit-jump (`Action::FocusCard`) that lands
-                    // on a new pane counts as activity — see
-                    // `mirror_selection_into_focus`'s stamp for the cycling-key
-                    // counterpart and why the 30s inactivity timer needs both.
-                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
                     // PRD #84 M4: focusing a pane just updates focus state; the
                     // per-frame `resize_panes_to_layout` pass sizes the (now
                     // possibly expanded) pane to its inner area on the next
@@ -12664,13 +12683,15 @@ pub fn run_tui(
                     // still genuinely in-flight and must keep blocking
                     // re-arm — `orchestration/remit/003`'s deferred-delivery
                     // (history-only) phase depends on exactly that.
-                    let no_delivery_pending = !matches!(
-                        delivery_phase(
-                            &*orchestrator_prompt,
-                            ui.orchestration_awaiting_confirmation.contains_key(id),
-                        ),
-                        DeliveryPhase::Armed
-                    );
+                    let no_delivery_pending = match delivery_phase(
+                        &*orchestrator_prompt,
+                        ui.orchestration_awaiting_confirmation.contains_key(id),
+                    ) {
+                        DeliveryPhase::Armed => false,
+                        DeliveryPhase::Idle | DeliveryPhase::Landed | DeliveryPhase::Finalized => {
+                            true
+                        }
+                    };
 
                     if !ui.orchestration_remit_compacting.contains(id)
                         && no_delivery_pending
