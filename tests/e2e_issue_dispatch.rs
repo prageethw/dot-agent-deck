@@ -555,7 +555,7 @@ fn spawn_dispatch_daemon(
     id_template: &str,
     repo: &str,
 ) -> (tempfile::TempDir, String, common::DaemonProc) {
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1668,7 +1668,7 @@ fn dispatch_014_failed_spawn_leaves_issue_unmarked() {
     init_remote_with_orch_toml(&fixture.join("remote"), Some(FAILING_ORCH_TOML));
     stub.set_issues(repo, &[9]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1731,7 +1731,7 @@ fn dispatch_015_externally_labelled_issue_skips_with_no_other_signal() {
     stub.add_repo(repo, true);
     stub.set_issues_with_labels(repo, &[(7, &["in-progress"])]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1787,7 +1787,7 @@ fn dispatch_016_externally_labelled_issue_skip_reports_no_claimant() {
     stub.add_repo(repo, true);
     stub.set_issues_with_labels(repo, &[(7, &["in-progress"])]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1870,7 +1870,7 @@ fn dispatch_017_skip_causes_render_distinguishably() {
     stub.set_issues_with_labels(repo, &[(31, &[]), (32, &[]), (33, &["in-progress"])]);
     stub.set_open_pr(repo, 32);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1977,7 +1977,7 @@ fn dispatch_018_triage_enabled_ensures_labels_and_prompts_agent() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -2079,7 +2079,7 @@ fn dispatch_019_triage_off_by_default_no_label_no_prompt_text() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -2162,7 +2162,7 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
     // exist on this repo yet, mirroring a fresh GitHub repo.
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();

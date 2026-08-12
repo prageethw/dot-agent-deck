@@ -145,7 +145,7 @@ fn write_marker_stub(stub: &std::path::Path, marker: &std::path::Path) {
 /// expected while a command substitution silently executes instead.
 #[test]
 fn marker_stub_survives_shell_metacharacters_in_the_marker_path() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
 
     // Every character the double-quoted-interpolation bug is sensitive to:
     // a quote, a command substitution, a backtick and a backslash.
