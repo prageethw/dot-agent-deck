@@ -143,11 +143,45 @@ fn git(dir: &Path, args: &[&str]) {
 impl Fixture {
     /// A real git repo with one commit on `main`, plus a stub `gh` on `PATH`.
     fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Like [`Fixture::new`], but the main repo's own git directory lives in a
+    /// SEPARATE store via `git init --separate-git-dir=<store>`, so every
+    /// linked worktree's admin dir resolves under `<store>/worktrees/<name>`
+    /// rather than `<repo>/.git/worktrees/<name>`. A legitimate, git-native
+    /// way to relocate metadata -- issue #144 finding 2's proposed
+    /// containment fix (require the resolved git-dir to sit under the
+    /// enumerating repo's own `<common-dir>/worktrees/`) must still accept
+    /// this layout, since `<common-dir>` here is genuinely the store, not
+    /// `<repo>/.git`.
+    fn new_with_separate_git_dir() -> Self {
         let scratch = test_temp::tempdir().expect("scratch tempdir");
+        let store = scratch.path().join("gitdir-store");
+        Self::build_in(scratch, Some(&store))
+    }
+
+    fn build(separate_git_dir: Option<&Path>) -> Self {
+        let scratch = test_temp::tempdir().expect("scratch tempdir");
+        Self::build_in(scratch, separate_git_dir)
+    }
+
+    fn build_in(scratch: tempfile::TempDir, separate_git_dir: Option<&Path>) -> Self {
         let repo = scratch.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
 
-        git(&repo, &["init", "--initial-branch=main", "--quiet"]);
+        match separate_git_dir {
+            Some(store) => git(
+                &repo,
+                &[
+                    "init",
+                    "--initial-branch=main",
+                    "--quiet",
+                    &format!("--separate-git-dir={}", store.display()),
+                ],
+            ),
+            None => git(&repo, &["init", "--initial-branch=main", "--quiet"]),
+        }
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
         std::fs::write(repo.join("README.md"), "seed\n").expect("write seed file");
@@ -230,8 +264,35 @@ impl Fixture {
         path
     }
 
-    /// Canned `gh pr list --head <branch>` reply.
+    /// Canned `gh pr list --head <branch>` reply. `headRepositoryOwner` is set
+    /// to `"test-org"`, matching `Fixture::new`'s own `origin` remote
+    /// (`test-org/test-repo`) -- so every existing caller of this helper keeps
+    /// describing a legitimate same-repo merged PR once `resolve_pr_state`
+    /// starts requiring the head repository owner to match (issue #144
+    /// finding 2). Callers exercising a DIFFERENT owner (a genuinely
+    /// different fork, or a worktree-scoped remote pointing elsewhere) use
+    /// [`Fixture::set_pr_state_with_head_owner`] instead.
     fn set_pr_state(&self, branch: &str, state: &str) {
+        self.set_pr_state_with_head_owner(branch, state, "test-org");
+    }
+
+    /// Same as [`Fixture::set_pr_state`], but with an explicit
+    /// `headRepositoryOwner.login` value -- for a PR opened from a fork whose
+    /// owner differs from this fixture's own `origin` remote.
+    fn set_pr_state_with_head_owner(&self, branch: &str, state: &str, head_owner: &str) {
+        let key = branch.replace('/', "_");
+        let body = format!(
+            r#"[{{"state":"{state}","headRefName":"{branch}","headRepositoryOwner":{{"login":"{head_owner}"}}}}]"#
+        );
+        std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
+    }
+
+    /// Same as [`Fixture::set_pr_state`], but the canned reply carries NO
+    /// `headRepositoryOwner` key at all -- the shape real `gh` can return
+    /// when the head repository can no longer be resolved (e.g. a fork
+    /// deleted after its PR merged). Used to pin the fail-closed path: an
+    /// unverifiable owner must never be treated as a match.
+    fn set_pr_state_no_owner_field(&self, branch: &str, state: &str) {
         let key = branch.replace('/', "_");
         let body = format!(r#"[{{"state":"{state}","headRefName":"{branch}"}}]"#);
         std::fs::write(self.ghstub.join(format!("pr-{key}.json")), body).expect("write pr fixture");
@@ -267,17 +328,7 @@ impl Fixture {
     /// working tree — so it can never make the tree dirty, and it is removed
     /// along with the worktree by `git worktree remove`.
     fn mark_owned(&self, worktree: &Path) {
-        let out = Command::new("git")
-            .current_dir(worktree)
-            .args(["rev-parse", "--git-dir"])
-            .output()
-            .expect("git rev-parse --git-dir");
-        let git_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-        let git_dir = if git_dir.is_absolute() {
-            git_dir
-        } else {
-            worktree.join(git_dir)
-        };
+        let git_dir = worktree_git_dir(worktree);
         std::fs::write(git_dir.join("dot-agent-deck-owner"), "deck\n").expect("write owner marker");
     }
 
@@ -343,6 +394,59 @@ impl Fixture {
         std::fs::write(git_dir.join("dot-agent-deck-owner"), "deck\n").expect("write owner marker");
     }
 
+    /// The scratch tempdir's own root -- for fixtures that need to place a
+    /// file OUTSIDE the repo/worktree tree, such as the forged admin dir
+    /// below.
+    fn scratch_root(&self) -> &Path {
+        self._scratch.path()
+    }
+
+    /// Commit a `.gitignore` naming `pattern` to `main`. Any worktree created
+    /// AFTER this call inherits it, since a new branch starts from `main`'s
+    /// tip. Content later written under `pattern` is untracked-and-ignored,
+    /// so `git status --porcelain` (which never reports ignored files) stays
+    /// blind to it -- the exact gate issue #144 finding 1 measured as blind.
+    fn write_gitignore(&self, pattern: &str) {
+        std::fs::write(self.repo.join(".gitignore"), pattern).expect("write .gitignore");
+        git(&self.repo, &["add", ".gitignore"]);
+        git(&self.repo, &["commit", "--quiet", "-m", "add gitignore"]);
+    }
+
+    /// Forge `Ownership::Ours` for `worktree` WITHOUT calling
+    /// [`Fixture::mark_owned`] -- auditor finding 2's working reproduction for
+    /// issue #144. Copies the worktree's REAL admin dir to a location outside
+    /// the repo (`evil`), drops the ownership marker into the copy, keeps
+    /// `commondir` honest (pointing at the repo's real `.git`, so the
+    /// containment fix under discussion has something legitimate to compare
+    /// against), fixes the `gitdir` back-pointer to point at the worktree's
+    /// own `.git` file, and finally overwrites that ONE regular file --
+    /// `<worktree>/.git` -- to redirect there. `git status --porcelain` never
+    /// reports `.git` itself, so the cleanliness gate stays blind to this.
+    /// Requires only write access to a file inside the worktree's own
+    /// directory, never to the repo's real `.git`.
+    fn forge_ownership_via_git_dir_redirect(&self, worktree: &Path) {
+        let real_admin_dir = worktree_git_dir(worktree);
+        let evil = self.scratch_root().join(format!(
+            "evil-{}",
+            worktree.file_name().unwrap().to_string_lossy()
+        ));
+        copy_dir_all(&real_admin_dir, &evil);
+        std::fs::write(evil.join("dot-agent-deck-owner"), "deck\n").expect("write forged marker");
+        std::fs::write(
+            evil.join("commondir"),
+            format!("{}\n", self.repo.join(".git").display()),
+        )
+        .expect("write commondir");
+        let worktree_git_file = worktree.join(".git");
+        std::fs::write(
+            evil.join("gitdir"),
+            format!("{}\n", worktree_git_file.display()),
+        )
+        .expect("write gitdir back-pointer");
+        std::fs::write(&worktree_git_file, format!("gitdir: {}\n", evil.display()))
+            .expect("forge the worktree's own .git redirect");
+    }
+
     fn run(&self, args: &[&str]) -> std::process::Output {
         let path = format!(
             "{}:{}",
@@ -356,6 +460,40 @@ impl Fixture {
             .env("GHSTUB_DIR", &self.ghstub)
             .output()
             .expect("run dot-agent-deck")
+    }
+}
+
+/// Resolve a worktree's OWN git metadata dir via `git rev-parse --git-dir`,
+/// mirroring `src/worktree_reclaim.rs`'s own `resolve_git_dir` -- used both by
+/// [`Fixture::mark_owned`] (to write a legitimate marker) and by
+/// [`Fixture::forge_ownership_via_git_dir_redirect`] (to locate the REAL admin
+/// dir before it gets copied and the worktree's `.git` file is overwritten).
+fn worktree_git_dir(worktree: &Path) -> PathBuf {
+    let out = Command::new("git")
+        .current_dir(worktree)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .expect("git rev-parse --git-dir");
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    if git_dir.is_absolute() {
+        git_dir
+    } else {
+        worktree.join(git_dir)
+    }
+}
+
+/// Recursively copy a directory tree -- `std` has no built-in for this.
+fn copy_dir_all(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create copy destination dir");
+    for entry in std::fs::read_dir(src).expect("read source dir") {
+        let entry = entry.expect("read dir entry");
+        let target = dst.join(entry.file_name());
+        let ty = entry.file_type().expect("read file type");
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
     }
 }
 
@@ -696,7 +834,11 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
     // matter what this worktree's own PR actually is.
     git(&fx.repo, &["remote", "remove", "origin"]);
     fx.set_worktree_origin(&wt, "https://github.com/other-org/other-repo.git");
-    fx.set_pr_state("feat/own-remote", "MERGED");
+    // headRepositoryOwner must match the WORKTREE's own derived slug
+    // ("other-org"), not this fixture's default ("test-org") -- the whole
+    // point of this test is that PR state is resolved against the
+    // worktree's own remote.
+    fx.set_pr_state_with_head_owner("feat/own-remote", "MERGED", "other-org");
 
     let out = fx.run(&["worktree", "list"]);
     assert!(
@@ -743,6 +885,384 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
     );
 }
 
+/// Scenario: A local, UNMERGED worktree on branch `fix/typo` shares its name
+/// with a DIFFERENT fork's already-merged PR whose head branch is also called
+/// `fix/typo`. `resolve_pr_state` matches on `headRefName` alone, which is not
+/// namespaced by head repository owner, so the other fork's MERGED state would
+/// otherwise be attributed to this local branch. The worktree is deck-owned
+/// and clean, so only the PR-state gate can save it: `worktree reclaim --yes`
+/// must not remove it. Also pins reviewer finding NEW-2 (issue #144 follow-up):
+/// this exact shape -- a genuine `headRefName` match rejected only on owner --
+/// is the triangular (push-to-fork) workflow's every-branch case, so the
+/// reported reason must name the real cause (an unresolvable head-repository
+/// owner) rather than the misleading "no pull request found for this branch",
+/// which would send a user hunting a PR that in fact exists.
+#[spec("worktree/reclaim/009")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_009_cross_fork_branch_name_collision_is_not_treated_as_merged() {
+    let fx = Fixture::new();
+    // A NEW branch carrying its own commit: genuinely unmerged locally.
+    let wt = fx.add_worktree_with_commit("wt-collision", "fix/typo");
+    fx.mark_owned(&wt); // owned and clean: only PR state can still save it
+    // A merged PR from a DIFFERENT fork ("other-fork", not this fixture's own
+    // "test-org") whose head branch happens to be named identically.
+    fx.set_pr_state_with_head_owner("fix/typo", "MERGED", "other-fork");
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a same-named branch from a DIFFERENT fork's merged PR must not be attributed to this \
+         local branch -- headRefName alone is not namespaced by head repository owner -- \
+         {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+    let text = combined(&out).to_lowercase();
+    assert!(
+        !text.contains("no pull request found for this branch"),
+        "a branch whose headRefName genuinely matched a PR (from another fork) must not be \
+         reported as though no PR exists at all -- that sends the user hunting a PR that is \
+         really there (reviewer finding NEW-2); got:\n{}",
+        combined(&out)
+    );
+    assert!(
+        text.contains("owner"),
+        "the reported reason must name the real cause -- the head repository owner could not be \
+         confirmed -- not merely omit the misleading \"no pull request\" claim; got:\n{}",
+        combined(&out)
+    );
+}
+
+/// Scenario: Mirrors `009`, but the canned `gh` reply carries no
+/// `headRepositoryOwner` field at all -- the shape real `gh` can return when
+/// the head repository can no longer be resolved (e.g. a fork deleted after
+/// its PR merged). The gate must fail closed to NOT-merged when it cannot
+/// verify the head repository owner, exactly as every other unresolvable path
+/// in this gate keeps rather than guesses.
+#[spec("worktree/reclaim/010")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_010_missing_head_repository_owner_fails_closed_not_merged() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-no-owner-field", "fix/deleted-fork");
+    fx.mark_owned(&wt); // owned and clean: only PR state can still save it
+    // No `headRepositoryOwner` field in the canned reply at all.
+    fx.set_pr_state_no_owner_field("fix/deleted-fork", "MERGED");
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a PR reply missing `headRepositoryOwner` must fail closed -- an unverifiable owner \
+         must never be treated as a match -- {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
+/// Scenario: A FOREIGN worktree (no ownership marker) that is merged and
+/// clean is first left alone by a bare `reclaim` -- named in the pending list
+/// -- and then IS removed once the user runs `reclaim --yes`. This pins the
+/// batch-confirmation contract `--yes` actually has (issue #144 follow-up):
+/// it removes an `Ask`-verdict worktree whose path was already shown to the
+/// user, not only `Remove`-verdict (deck-owned) ones. An earlier version of
+/// this suite asserted the opposite -- that a hand-made foreign worktree must
+/// SURVIVE `--yes` -- which was withdrawn as a design mistake once this
+/// module's own doc comment and `format_reclaim_human`'s "Run ... --yes to
+/// remove them" message made clear that withholding removal here would leave
+/// the `"ask" if yes` branch in `run_reclaim` unreachable dead code.
+#[spec("worktree/reclaim/011")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_011_yes_removes_a_foreign_merged_clean_worktree_named_in_pending_first() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-foreign-yes", "feat/foreign-yes");
+    fx.set_pr_state("feat/foreign-yes", "MERGED");
+    // Deliberately NOT marked owned: `--yes` must still remove it, once its
+    // path has been shown to the user via a bare `reclaim` first.
+
+    let bare = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        bare.status.success(),
+        "a bare `worktree reclaim` must succeed; got {:?} out={}",
+        bare.status,
+        combined(&bare)
+    );
+    let bare_text = combined(&bare);
+    assert!(
+        bare_text.contains("wt-foreign-yes"),
+        "the bare run must name this worktree's exact path in the pending list before --yes \
+         is ever invoked; got:\n{bare_text}"
+    );
+    assert!(
+        wt.exists(),
+        "the bare run must not remove a foreign worktree on its own -- {} is gone\n{bare_text}",
+        wt.display()
+    );
+
+    let yes = fx.run(&["worktree", "reclaim", "--yes"]);
+    assert!(
+        yes.status.success(),
+        "`worktree reclaim --yes` must succeed; got {:?} out={}",
+        yes.status,
+        combined(&yes)
+    );
+    assert!(
+        !wt.exists(),
+        "`--yes` must remove a merged, clean, foreign worktree whose path was already shown to \
+         the user by the prior bare run -- {} still exists\n{}",
+        wt.display(),
+        combined(&yes)
+    );
+}
+
+/// Scenario: A deck-owned, MERGED, otherwise-clean worktree also holds a
+/// directory matched by a committed `.gitignore` -- exactly the shape of a
+/// real, worked-in deck worktree's `target/`. `git status --porcelain` never
+/// reports ignored content, so the pre-fix gate treats it as clean and a bare
+/// `reclaim` removes it (and the ignored content with it) with no path ever
+/// shown and no `--yes` required. Ignored content must instead demote the
+/// verdict from `Remove` to `Ask`, so the exact path is shown and removal
+/// requires `--yes` (auditor finding F1, P1).
+#[spec("worktree/reclaim/012")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_012_gitignored_content_demotes_bare_reclaim_to_ask() {
+    let fx = Fixture::new();
+    fx.write_gitignore("ignored/\n");
+    let wt = fx.add_worktree_with_commit("wt-ignored", "feat/ignored");
+    fx.set_pr_state("feat/ignored", "MERGED");
+    fx.mark_owned(&wt);
+    std::fs::create_dir_all(wt.join("ignored")).expect("create ignored dir");
+    std::fs::write(wt.join("ignored").join("artifact.bin"), b"built stuff")
+        .expect("write ignored content");
+
+    // Fixture precondition: the ignored content must be genuinely invisible
+    // to `git status --porcelain`, or this test is not exercising the gate
+    // gap F1 exists for.
+    let status = Command::new("git")
+        .current_dir(&wt)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git status --porcelain");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "fixture precondition: `git status --porcelain` must report nothing for a worktree \
+         holding only ignored content, or this test proves nothing about F1"
+    );
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a deck-owned, merged, clean-per-`git status` worktree that still holds gitignored \
+         content must NOT be removed by a bare reclaim -- ignored content was never part of the \
+         merged PR, and a bare reclaim prints nothing before acting -- {} is gone\n{}",
+        wt.display(),
+        combined(&out)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("wt-ignored"),
+        "ignored content must demote the verdict to `Ask`, so the exact path is shown pending \
+         `--yes` -- not merely survive some other way; got:\n{text}"
+    );
+}
+
+/// Scenario: Pairs with `012` to prove the ignored-content demotion actually
+/// discriminates: the SAME deck-owned/merged/clean shape, but with no ignored
+/// content at all, must still be removed by a bare `reclaim`, unprompted.
+/// Without this, a coder could satisfy `012` by demoting every worktree to
+/// `Ask` regardless of content, which would make the ownership gate `012`
+/// exists alongside pointless again. Expected GREEN from the start -- nothing
+/// about the current (pre-F1-fix) code path treats this shape differently.
+#[spec("worktree/reclaim/013")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_013_no_ignored_content_still_removed_bare_regression_guard() {
+    let fx = Fixture::new();
+    fx.write_gitignore("ignored/\n");
+    let wt = fx.add_worktree_with_commit("wt-clean-no-ignored", "feat/clean-no-ignored");
+    fx.set_pr_state("feat/clean-no-ignored", "MERGED");
+    fx.mark_owned(&wt);
+    // Deliberately no ignored content created.
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !wt.exists(),
+        "a deck-owned, merged, clean worktree with NO ignored content must still be removed by a \
+         bare reclaim, unprompted -- a fix that demotes every worktree to `Ask` regardless of \
+         content would make the ownership gate pointless -- {} still exists\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
+/// Scenario: One regular file inside a worktree's own directory -- its
+/// `.git` file -- is overwritten to redirect to a copied admin dir that
+/// carries a forged ownership marker, with `commondir` kept honest (pointing
+/// at the real repo's `.git`) and the `gitdir` back-pointer fixed to match.
+/// `git status --porcelain` never reports `.git` itself, so the cleanliness
+/// gate stays blind to the tamper. The forged worktree must not resolve
+/// `Ownership::Ours` -- it must land on `Ask`, not be removed unprompted by a
+/// bare `reclaim` (auditor finding F2, P2; the #152-lineage class of trusting
+/// *a* git-dir rather than *this worktree's own* git-dir).
+#[spec("worktree/reclaim/014")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_014_forged_git_dir_redirect_is_not_treated_as_ours() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-forged", "feat/forged");
+    fx.set_pr_state("feat/forged", "MERGED");
+    // Deliberately NOT marked via `fx.mark_owned`: ownership is forged below
+    // instead, by redirecting the worktree's own `.git` file.
+    fx.forge_ownership_via_git_dir_redirect(&wt);
+
+    // Fixture precondition: the redirect must actually fool
+    // `git status --porcelain` into reporting nothing, or this test is not
+    // exercising the forgery F2 exists for.
+    let status = Command::new("git")
+        .current_dir(&wt)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git status --porcelain");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "fixture precondition: the cleanliness gate must remain blind to the .git redirect, or \
+         this test is not exercising F2's forgery"
+    );
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        wt.exists(),
+        "a forged `.git` redirect pointing at a copied admin dir carrying the ownership marker \
+         must not resolve to `Ownership::Ours` -- the resolved git-dir must be required to sit \
+         under the enumerating repo's own <common-dir>/worktrees/ -- {} is gone (removed by a \
+         BARE reclaim, no path ever shown, no --yes)\n{}",
+        wt.display(),
+        combined(&out)
+    );
+    let text = combined(&out);
+    // Deliberately more specific than "the worktree survived": survival alone
+    // does not prove `Ownership::Foreign` was resolved -- it would ALSO hold
+    // if ownership resolved `Ours` (verdict `Remove`) but the physical `git
+    // worktree remove` step itself failed for some unrelated reason, landing
+    // the report in `Kept` with a "removal failed: ..." reason instead of the
+    // pending-ask list. Requiring the pending-list header (mirroring `005`'s
+    // and `011`'s bare-run assertions) pins the SPECIFIC verdict this finding
+    // is about, not merely "nothing bad happened this time".
+    assert!(
+        text.contains("reclaimable pending confirmation"),
+        "the forged worktree must land specifically in the pending ASK list -- \
+         `Ownership::Foreign`, not merely survive via some other keep/failure path; got:\n{text}"
+    );
+    assert!(
+        text.contains("wt-forged"),
+        "the pending ask list must name the forged worktree's exact path; got:\n{text}"
+    );
+}
+
+/// Scenario: Pairs with `014` to prove the (not-yet-implemented) git-dir
+/// containment fix discriminates rather than rejecting every worktree whose
+/// admin dir lives outside `<repo>/.git/worktrees/`. The MAIN repo here uses
+/// `git init --separate-git-dir=<store>`, a legitimate git-native metadata
+/// relocation -- so linked worktrees resolve under `<store>/worktrees/<name>`
+/// instead. A deck-owned, merged, clean worktree in this layout must still be
+/// removed by a bare `reclaim`. Expected GREEN from the start -- nothing in
+/// the current code treats a `--separate-git-dir` main repo differently.
+#[spec("worktree/reclaim/015")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_015_separate_git_dir_layout_still_reclaimed_regression_guard() {
+    let fx = Fixture::new_with_separate_git_dir();
+    let wt = fx.add_worktree_with_commit("wt-separate", "feat/separate");
+    fx.set_pr_state("feat/separate", "MERGED");
+    fx.mark_owned(&wt);
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !wt.exists(),
+        "a legitimately owned, merged, clean worktree in a `--separate-git-dir` main-repo layout \
+         must still be removed by a bare reclaim -- a containment fix for F2 must discriminate, \
+         not reject every worktree whose common dir lives outside `<repo>/.git` -- {} still \
+         exists\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
+/// Scenario: The canned `gh` reply's `headRepositoryOwner.login` differs from
+/// this fixture's own `origin` owner ONLY in case (`"Test-Org"` vs.
+/// `"test-org"`) -- exactly how a GitHub remote configured with capitalized
+/// case resolves: `gh` follows the case-insensitive API and returns the
+/// canonical login, but the byte-exact local comparison discards the match.
+/// A deck-owned, otherwise-reclaimable worktree must still resolve `Merged`
+/// and be removed by a bare `reclaim` (auditor finding F3 / reviewer NEW-1,
+/// P2 -- GitHub logins are ASCII and case-insensitive).
+#[spec("worktree/reclaim/016")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_016_case_variant_head_owner_still_resolves_merged() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-case-owner", "feat/case-owner");
+    fx.mark_owned(&wt);
+    // `Fixture::new`'s own `origin` owner is "test-org"; the canned reply
+    // carries the case-variant "Test-Org" -- the shape GitHub itself would
+    // return for a remote a user typed with capitals.
+    fx.set_pr_state_with_head_owner("feat/case-owner", "MERGED", "Test-Org");
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        out.status.success(),
+        "`worktree reclaim` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !wt.exists(),
+        "an owner that differs only in case from the local origin's owner must still resolve to \
+         MERGED -- GitHub logins are case-insensitive -- {} still exists (a byte-exact \
+         comparison silently discarded the only matching PR)\n{}",
+        wt.display(),
+        combined(&out)
+    );
+}
+
 /// Scenario: A deck-owned worktree whose PR is MERGED and whose tree is clean
 /// is fully reclaimable by every measure except one: its directory name
 /// contains a byte that is not valid UTF-8. `examine_worktrees` lossy-converts
@@ -750,10 +1270,10 @@ fn worktree_reclaim_007_pr_state_resolved_against_worktree_own_remote_not_caller
 /// worktree remove`, so git is asked to remove a path that does not exist and
 /// the worktree survives `reclaim --yes` untouched. Asserts the directory is
 /// gone afterward, and that the report actually says so.
-#[spec("worktree/reclaim/008")]
+#[spec("worktree/reclaim/017")]
 #[test]
 #[cfg(target_os = "linux")]
-fn worktree_reclaim_008_non_utf8_path_is_reclaimed() {
+fn worktree_reclaim_017_non_utf8_path_is_reclaimed() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
