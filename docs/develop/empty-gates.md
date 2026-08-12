@@ -8,6 +8,8 @@ CLAUDE.md rule 8 states the policy: **before treating any check as evidence, rea
 
 Each of these can report success while having verified nothing. They are not hypothetical; every one has been observed on this repo.
 
+One caveat on that, since a reviewer went looking: the `Closes` row leaves **no trace in a merged PR**, because the fix is always applied before merge. It was observed on PR #233, where `Closes #160, #212, #216, #210.` returned `closingIssuesReferences = [160]` and three issues would have silently stayed open; the body was corrected to repeat the keyword and re-verified as `[160, 210, 212, 216]` before merging. Searching merged bodies for the broken form will therefore find nothing — which is itself the pattern this table is about.
+
 | Signal | How it goes empty | What to read instead |
 |---|---|---|
 | **Greptile** | Publishes nothing at all when absent, or a `COMMENTED` review with **zero** inline comments when credit-limited. Neither produces a `Greptile Review` check-run, so the checks board is all-green with no Greptile row on it. | The **review body**. A credit-limited account carries *"prageethw has reached the 50-credit limit for trial accounts."* Absence carries nothing. |
@@ -15,7 +17,7 @@ Each of these can report success while having verified nothing. They are not hyp
 | **`semgrep`** | **Not** an empty gate: it is blocking via an explicit `--error` (`ci.yml:441`). Listed because a stale claim that it runs `--no-error` circulated in this repo's own docs — see below. | Findings still live in GitHub code scanning, not in the check. |
 | **`e2e`** | `continue-on-error: true` by design, so the **workflow** conclusion reads `success` even when the job failed outright. | The **job** conclusion and the nextest failure list. |
 | **`linkage-check`** | Silently pairs a `#[spec]` above an `async fn` with an unrelated later function and still reports `ok` (fork [#234](https://github.com/prageethw/dot-agent-deck/issues/234)). | Until fixed: use the `#[test]` + `block_on(inner())` wrapper shape for async specs, as `shell_activity_008` does. |
-| **A `Closes` line** | `Closes #1, #2, #3` links **only the first**. GitHub requires the keyword repeated per issue. | `gh pr view <n> --json closingIssuesReferences`. |
+| **A `Closes` line** | `Closes #1, #2, #3` links **only the first**. GitHub requires the keyword repeated per issue: `Closes #1, closes #2, closes #3`. | `gh pr view <n> --json closingIssuesReferences`. |
 | **A `CONFLICTING` PR** | The most complete form: **no `pull_request` run is created at all** (fork [#150](https://github.com/prageethw/dot-agent-deck/issues/150)). There is no check to be green or red, and a `pull_request_target` workflow like `PR Labeler` still fires beside it, so the PR looks alive. | Ask what you expected to see and did not. The board omits the row rather than misreporting it. |
 | **A delegated worker** | Displacement and deep thought look identical — no error, no signal. | The worktree: new commits, dirty files, and file mtimes. |
 
@@ -65,9 +67,9 @@ Do not conclude the job is still running from the status field alone.
 nextest distinguishes the outcomes explicitly, and the distinction matters:
 
 - `FAIL` after all retries — a real failure.
-- `FLAKY n/3` — failed then passed; recovered.
+- `FLAKY n/3` — failed then passed; recovered. **Only ever seen in CI**: `.config/nextest.toml` sets `retries = 0`, and the `/3` comes from `--retries 2` on the e2e job's command line alone. A local run has no retries to be flaky across.
 - `LEAK` — passed, but left something behind.
-- *"Every test passed on its first attempt"* in the run summary — the only phrasing that means no retry was consumed anywhere.
+- *"Every test passed on its first attempt."* — the only phrasing that means no retry was consumed anywhere. Note this line is **not** nextest's: it is emitted by `e2e.yml`'s own summary step (`:279`), so it exists only for that job.
 
 ## A displaced worker looks exactly like a thinking one
 
@@ -107,4 +109,6 @@ The useful habit is narrow and cheap: **ask what this signal would look like if 
 
 ## Upstream note
 
-Most of this is fork-specific. The `e2e:` job is fork-only (see CLAUDE.md rule 5), and `--no-error` on `semgrep` and the `SONAR_TOKEN` gate are this repo's CI configuration. The delegation behaviour is upstream product behaviour, but is recorded here as an unconfirmed observation rather than offered upstream as a claim — see CLAUDE.md rule 19 for when that distinction matters.
+Most of this is fork-specific. The `e2e:` job is fork-only (see CLAUDE.md rule 5), and the `SONAR_TOKEN` gate is this repo's CI configuration. The delegation behaviour is upstream product behaviour, but is recorded here as an unconfirmed observation rather than offered upstream as a claim — see CLAUDE.md rule 19 for when that distinction matters.
+
+*(This paragraph originally also listed `--no-error` on `semgrep` as fork CI configuration — the exact claim this document retracts, left standing 85 lines below the example retracting it. Caught in review. It is recorded rather than quietly deleted because it is the same failure twice in one file: a correction applied where it was noticed and nowhere else.)*
