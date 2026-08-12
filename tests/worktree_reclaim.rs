@@ -1354,10 +1354,10 @@ fn worktree_reclaim_023_non_utf8_path_is_reclaimed() {
 /// directories the follow-up `--yes` would remove, even though the removal
 /// acts on the distinct byte-exact paths. Asserts the two rendered bullets
 /// differ from each other.
-#[spec("worktree/reclaim/018")]
+#[spec("worktree/reclaim/024")]
 #[test]
 #[cfg(target_os = "linux")]
-fn worktree_reclaim_018_pending_bullets_never_alias_two_distinct_paths() {
+fn worktree_reclaim_024_pending_bullets_never_alias_two_distinct_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1465,10 +1465,10 @@ fn worktree_reclaim_018_pending_bullets_never_alias_two_distinct_paths() {
 /// is the control: it must still read as foreign. Pins issue #425, where the
 /// marker was read but never written, so the deck's own worktrees could only
 /// ever reach `ask`.
-#[spec("worktree/reclaim/019")]
+#[spec("worktree/reclaim/025")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_019_worktree_created_by_the_deck_reads_as_owned() {
+fn worktree_reclaim_025_worktree_created_by_the_deck_reads_as_owned() {
     let fx = Fixture::new();
 
     // The subject: created the way production creates one. Deliberately NOT
@@ -1568,13 +1568,13 @@ fn worktree_reclaim_019_worktree_created_by_the_deck_reads_as_owned() {
 /// The same worktree is checked before and after that truncation: it must go
 /// from `owned: true` / `remove` to `owned: false` / `ask`, and a bare
 /// `worktree reclaim` must then leave the directory on disk.
-#[spec("worktree/reclaim/020")]
+#[spec("worktree/reclaim/026")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_020_a_zero_byte_marker_is_not_proof_of_ownership() {
+fn worktree_reclaim_026_a_zero_byte_marker_is_not_proof_of_ownership() {
     let fx = Fixture::new();
 
-    // Created the way production creates one, as in `019` — the marker has to
+    // Created the way production creates one, as in `025` — the marker has to
     // arrive from the creation path, so that truncating it is the only thing
     // that differs between the two measurements below.
     let wt = fx._scratch.path().join("wt-torn-marker");

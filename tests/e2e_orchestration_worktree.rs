@@ -181,7 +181,7 @@ fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary(
     let expected_creator = format!("created-by: orchestration:{launch_dir_basename}");
     let git_dir = resolve_git_dir(&worktree);
     let marker = std::fs::read_to_string(
-        git_dir.join(dot_agent_deck::worktree_reclaim::OWNER_MARKER_FILENAME),
+        git_dir.join(dot_agent_deck::worktree_owner::OWNER_MARKER_FILENAME),
     )
     .expect("ownership marker must exist and be readable in the worktree's git-dir");
     assert!(

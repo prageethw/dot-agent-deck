@@ -1227,6 +1227,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "ask".to_string(),
             reason: Some("reclaimable".to_string()),
+            owner: None,
         }
     }
 
@@ -1240,7 +1241,7 @@ mod tests {
     }
 
     /// The half of injectivity a hand-rolled `\xNN` escape usually forgets, and
-    /// which `worktree/reclaim/009` cannot cheaply reach: a directory whose name
+    /// which `worktree/reclaim/024` cannot cheaply reach: a directory whose name
     /// literally contains the four ASCII characters `\`, `x`, `F`, `F` must not
     /// render the same as one holding the single raw byte `0xFF`. Escaping only
     /// the invalid bytes and leaving a literal backslash alone relocates the
