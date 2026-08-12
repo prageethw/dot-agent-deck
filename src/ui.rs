@@ -2226,13 +2226,41 @@ const CONFIRMATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from
 /// deterministically, rather than only opportunistically when a real boot
 /// happens to be slower than the 2s production default. An invalid or
 /// unset value falls back to [`CONFIRMATION_GRACE_PERIOD`] unchanged.
+/// Audit F5: the ceiling for [`confirmation_grace_period`]'s test override —
+/// mirrors [`spawn_readiness_buffer`]'s clamp idiom
+/// (`SPAWN_READINESS_BUFFER_MIN`/`_MAX`), which this function is the sibling
+/// of and previously did not match: that one clamps an out-of-range env
+/// override, this one trusted it verbatim. Zero is a legitimate value (skip
+/// the grace period entirely); [`AUTOMATIC_PROMPT_DEADLINE`] is the ceiling
+/// because a grace period at or beyond it can never let a
+/// confirmation-retry fire before the whole cycle is abandoned — past that
+/// point the override isn't a longer grace period, it's a silently disabled
+/// one.
+#[cfg(any(test, debug_assertions))]
+const CONFIRMATION_GRACE_PERIOD_MAX: std::time::Duration = AUTOMATIC_PROMPT_DEADLINE;
+
 #[cfg(any(test, debug_assertions))]
 fn confirmation_grace_period() -> std::time::Duration {
-    std::env::var("DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS")
+    static OUT_OF_RANGE_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let Some(raw_ms) = std::env::var("DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(CONFIRMATION_GRACE_PERIOD)
+    else {
+        return CONFIRMATION_GRACE_PERIOD;
+    };
+    let requested = std::time::Duration::from_millis(raw_ms);
+    let clamped = requested.clamp(std::time::Duration::ZERO, CONFIRMATION_GRACE_PERIOD_MAX);
+    if clamped != requested && !OUT_OF_RANGE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            requested_ms = requested.as_millis(),
+            clamped_ms = clamped.as_millis(),
+            max_ms = CONFIRMATION_GRACE_PERIOD_MAX.as_millis(),
+            "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS is out of range; clamped"
+        );
+    }
+    clamped
 }
 
 #[cfg(not(any(test, debug_assertions)))]
@@ -2596,11 +2624,28 @@ struct UiState {
     /// `next_attempt_at`. Cleared on a successful delivery or when the prompt is
     /// abandoned. Kept OUTSIDE `PendingSeedPrompt` so the struct's construction
     /// shape is unchanged.
+    ///
+    /// Audit F6 (Info, bounded): keyed by pane id ONLY, not by which cycle
+    /// owns the entry — both `process_pending_seed_prompts` (mode seeds) and
+    /// `deliver_orchestrator_prompt` (orchestrator role prompts) read/write
+    /// this same map for whatever pane they are each driving. Fork #197 grew
+    /// the collision window: before M2, only the orchestrator-prompt path
+    /// used this map at all; now a pane running BOTH an active mode-seed
+    /// cycle and an active orchestrator-prompt cycle at once would have the
+    /// two cycles' backoff state alias through the same key. No such pane
+    /// exists today — the audit checked every current producer — so this is
+    /// a constraint to notice, not a live bug. A future change that lets a
+    /// pane carry two concurrent automatic-prompt cycles must key this (and
+    /// [`UiState::prompt_delivery`]) by `(pane_id, cycle kind)`, not pane id
+    /// alone.
     send_retry_backoff: HashMap<String, SendRetryState>,
     /// PRD #20 R20-003/R20-004: per-pane captured delivery identity for automatic
     /// prompts. Populated at ENQUEUE (and lazily at first delivery as a fallback)
     /// so every (re)delivery carries the same agent identity + stable delivery
     /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
+    ///
+    /// Audit F6: shares [`UiState::send_retry_backoff`]'s pane-id-only
+    /// keyspace and the same bounded collision window — see that field's doc.
     prompt_delivery: HashMap<String, PromptDelivery>,
     /// Fork #197 M2 (closes #182, upstream #424 finding #2): pane ids whose
     /// mode `seed_prompt` write has LANDED (`Applied`/`Queued` — bytes
@@ -3760,7 +3805,20 @@ fn process_pending_seed_prompts(
         // this is also how a seed retained past a landed write (fork #197 M2,
         // below) eventually terminates: nothing else reclaims it.
         if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
-            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            // F8 (reviewer, MINOR): a landed write already succeeded — bytes
+            // reached the PTY (`Applied`/`Queued`, see the `landed.insert`
+            // below) — this branch is only reclaiming the tracking entry
+            // because the mode-seed path has no confirmation check yet (fork
+            // #197 M3 / #187). Logging "abandoning" here would say the
+            // opposite of what happened on the happy path, every time.
+            if landed.contains(&sp.pane_id) {
+                tracing::info!(
+                    pane_id = %sp.pane_id,
+                    "seed prompt: delivery landed; reclaiming unconfirmed tracking entry"
+                );
+            } else {
+                tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            }
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
             landed.remove(&sp.pane_id);
@@ -4128,10 +4186,22 @@ fn deliver_orchestrator_prompt(
         let level_confirmed = !awaiting.pre_write_thinking
             && target_session.is_some_and(|s| s.status == SessionStatus::Thinking);
         let sent_prompt = orchestrator_prompt.as_deref().unwrap_or_default();
+        // F9 (reviewer, MINOR/latent): `s.last_user_prompt` passed through
+        // `crate::hook::USER_PROMPT_TRUNCATE_LEN`-byte truncation at
+        // ingestion (`src/hook.rs`), but `sent_prompt` above is the full,
+        // un-truncated seed text. Comparing the two as-is means any seed
+        // longer than that width can never satisfy `prompt_text_confirms`'s
+        // `starts_with`/`==` — the observed side is short, the sent side is
+        // not — so TEXT confirmation would silently fail forever (a 60s wait
+        // per cycle, not an error) rather than truncation-mismatch being the
+        // visible cause. Truncate `sent_prompt` the same way before
+        // comparing so a prefix match is actually reachable.
+        let sent_prompt_truncated =
+            crate::hook::truncate(sent_prompt.trim(), crate::hook::USER_PROMPT_TRUNCATE_LEN);
         let text_confirmed = target_session.is_some_and(|s| {
             prompt_text_confirms(
                 s.last_user_prompt.as_deref(),
-                sent_prompt,
+                &sent_prompt_truncated,
                 awaiting.baseline_prompt.as_deref(),
                 awaiting.baseline_prompt_seq,
                 s.last_user_prompt_seq,

@@ -2836,8 +2836,19 @@ pub fn check_opencode_available() -> Result<(), String> {
 }
 
 /// Compiled-in default cheap model for Codex availability probes and real-agent
-/// e2e coverage. Correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
-/// which is what most dev boxes here log in with.
+/// e2e coverage.
+///
+/// Coder item 7 (fork #197 PR #219): the previous claim here — that this
+/// default is correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
+/// "which is what most dev boxes here log in with" — did not hold on at least
+/// one such box: `gpt-5.1-codex-mini`, and every other `gpt-5*`/`codex-*` name
+/// tried, was rejected with `400 invalid_request_error: … not supported when
+/// using Codex with a ChatGPT account`. That host's actual working default is
+/// `gpt-5.6-sol`, set via `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-sol` (see
+/// [`CODEX_TEST_MODEL_ENV`]). Whether the constant below or the original claim
+/// about it is the thing that's wrong is an open question — it needs evidence
+/// from more than one machine/account before this default is changed, so it
+/// is left alone here; if your host also rejects it, use the env override.
 const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
 
 /// Env var that overrides [`codex_test_model`] on a host whose Codex credentials

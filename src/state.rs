@@ -4175,6 +4175,18 @@ impl AppState {
         }
 
         if let Some(ref prompt) = event.user_prompt {
+            // Audit F2 (Medium, DOCUMENT ONLY — fork #197): this gate, and
+            // therefore `src/ui.rs`'s TEXT confirmation path
+            // (`prompt_text_confirms`), relies on `event.user_prompt` being
+            // `Some` only for a GENUINE submission. Nothing in this function
+            // enforces that — `event.user_prompt` is harvested from ANY hook
+            // event type at the producer (`src/hook.rs:328`,`:396`), not
+            // gated to a submission event type there either. The invariant
+            // holds today only because every current producer happens to be
+            // well-behaved (the audit checked each one); a future producer
+            // that populates `user_prompt` on a non-submission event would
+            // silently advance this counter and feed a false TEXT
+            // confirmation, with nothing here to catch it.
             session.last_user_prompt = Some(prompt.clone());
             // Fork #197 M3 step 1 (issue #187): advance the submission
             // counter INSIDE this same gate, unconditionally — even when

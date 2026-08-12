@@ -232,7 +232,17 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
     Some(detail)
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Reviewer F9 (fork #197): the width `user_prompt` is truncated to below.
+/// `src/ui.rs`'s TEXT confirmation path (`prompt_text_confirms`) compares a
+/// pane's observed `last_user_prompt` — which passed through this truncation
+/// — against the full, un-truncated seed text we wrote. A seed longer than
+/// this many bytes can therefore never satisfy `starts_with`/`==` there: the
+/// observed side is short, the sent side is not. Exposed so the comparison
+/// site can truncate `sent` the same way before comparing, instead of the
+/// mismatch silently defeating confirmation until the 60s deadline.
+pub(crate) const USER_PROMPT_TRUNCATE_LEN: usize = 200;
+
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
@@ -325,7 +335,15 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     }
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
-    let user_prompt = prompt.map(|p| truncate(&p, 200));
+    // Audit F2 (Medium, DOCUMENT ONLY — fork #197): `user_prompt` is set
+    // here from whatever `prompt` the hook payload carried, for ANY
+    // `event_type` this function maps to — not gated to a submission event.
+    // `AppState::apply_event` (`src/state.rs`) and, downstream,
+    // `src/ui.rs`'s TEXT confirmation path both rely on `user_prompt` being
+    // populated only for a genuine submission. Adding a new event source
+    // here that sets `prompt` on a non-submission event would silently
+    // violate that invariant — nothing downstream enforces it.
+    let user_prompt = prompt.map(|p| truncate(&p, USER_PROMPT_TRUNCATE_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     // PRD #92 F9 followup-7: the daemon injects DOT_AGENT_DECK_AGENT_ID
     // on spawn (same pattern as DOT_AGENT_DECK_PANE_ID). Forwarding it
@@ -393,7 +411,10 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
 fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
-    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    // Audit F2 (Medium, DOCUMENT ONLY — fork #197): see the matching note in
+    // `build_event_typed` above — this harvest is equally unguarded, for
+    // whatever `event_type` `map_opencode_event_type` produced.
+    let user_prompt = input.prompt.map(|p| truncate(&p, USER_PROMPT_TRUNCATE_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
