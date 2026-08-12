@@ -467,6 +467,25 @@ fn getsid_or_negative(pid: i32) -> i32 {
 /// header line entirely.
 const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="];
 
+/// The nominal budget a single `ps -A` sample is expected to fit inside. A
+/// healthy sample on macOS or Linux costs single-digit to low tens of
+/// milliseconds, so 2 s is ~50–200× the honest cost and cannot plausibly fire
+/// on a healthy machine — including this repo's own test runs, which have
+/// been measured at load averages of 11–19 where a fork/exec can be delayed
+/// by hundreds of milliseconds.
+///
+/// This is a **documented reference value, not an internal deadline** —
+/// [`process_table_async`] itself has none (issue #429; the daemon's poll
+/// applies the actual timeout externally, with retention across ticks so a
+/// wedged sample cannot accumulate undead `ps` children — see
+/// `run_shell_activity_monitor` in `src/daemon.rs`, whose own `SAMPLE_TIMEOUT`
+/// independently carries the same 2 s figure). `pub` so callers that need to
+/// size a timing budget around a sample's expected cost — today, only
+/// `tests/shell_activity.rs`'s poll-window constants — derive from the real
+/// number instead of hand-keeping a mirror of it that can drift (fork issue
+/// #160 item 2).
+pub const PS_SAMPLE_BUDGET: Duration = Duration::from_secs(2);
+
 /// The sampling sequence itself, over an injected `capture` (called twice) —
 /// the shared body of [`process_table`] and [`process_table_async`].
 ///
@@ -595,7 +614,16 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
 /// (see `run_shell_activity_monitor`) because the *interpretation* of a blown
 /// deadline is the caller's: a timed-out sample means "no opinion", never "not
 /// busy".
-pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+///
+/// Fork issue #160: returns [`super::ProcessTableOutcome::Failed`] rather than
+/// a bare `None` when the sample does not produce a table — Unix always
+/// *attempts* the sample, so it is never [`super::ProcessTableOutcome::Unsupported`]
+/// here (that variant is the Windows backend's alone). The underlying capture
+/// already `tracing::warn!`s the proximate cause (non-zero exit, spawn
+/// failure); this return value is what lets the daemon's poll itself log
+/// loudly at the point the signal actually degrades, instead of only in a
+/// lower-level log line with no "shell activity" context attached.
+pub async fn process_table_async() -> Result<Vec<super::ProcessInfo>, super::ProcessTableOutcome> {
     sample_table_async(
         || async {
             // `output()` forces `stdout`/`stderr` to pipes (tokio, unlike
@@ -617,6 +645,7 @@ pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
         getsid_or_negative,
     )
     .await
+    .ok_or(super::ProcessTableOutcome::Failed)
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +930,10 @@ mod tests {
         let own_pid = std::process::id() as i32;
         for (label, table) in [
             ("sync", process_table()),
-            ("async", process_table_async().await),
+            // `.ok()`: this test only cares that a live machine enumerates,
+            // not about the `Failed`/`Unsupported` distinction fork issue
+            // #160 added to the async form's error type.
+            ("async", process_table_async().await.ok()),
         ] {
             let table = table.unwrap_or_else(|| panic!("{label} sample must enumerate on unix"));
             let own = table

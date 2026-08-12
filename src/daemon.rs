@@ -1377,7 +1377,12 @@ async fn run_shell_activity_monitor_with<S, F>(
     sample: S,
 ) where
     S: Fn() -> F,
-    F: std::future::Future<Output = Option<Vec<crate::platform::proc::ProcessInfo>>>,
+    F: std::future::Future<
+            Output = Result<
+                Vec<crate::platform::proc::ProcessInfo>,
+                crate::platform::proc::ProcessTableOutcome,
+            >,
+        >,
 {
     // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
     // between feeling responsive and negligible overhead (one registry lock
@@ -1399,7 +1404,35 @@ async fn run_shell_activity_monitor_with<S, F>(
     // `inflight` below). Generous next to the ~49ms a healthy `ps -A` takes, so
     // ordinary load never trips it.
     const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+    // Fork issue #160 F6 / N4: how often a *sustained* run of `Failed`
+    // samples still gets a log line after the first (transition) one. Under
+    // sustained sample failure each failed tick costs the 500ms poll
+    // interval plus up to `SAMPLE_TIMEOUT` (~2.5s total —
+    // `docs/develop/shell-activity-signal.md` derives the same figure), so
+    // 20 ticks is ~50s between lines while contention persists, not ~10s —
+    // loud enough that a chronically failing machine is still visible, quiet
+    // enough that it cannot become a per-tick flood (see the match arm
+    // below).
+    const FAILURE_LOG_EVERY: u32 = 20;
     let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // Fork issue #160 F6: counts an unbroken run of `Failed` samples, next to
+    // `last_known` since both are this loop's only persistent state.
+    //
+    // Fork issue #160 Q1 (PR #206 round-3 verification): this is a
+    // three-way count, not a two-way one. A tick that actually classifies a
+    // pane (non-empty `statuses` below) resets it — a healthy tick. A tick
+    // that classifies nothing because every *candidate* pane went
+    // unconfirmed (`statuses` empty, `candidates > 0`) increments it — the
+    // same degradation as an explicit `Failed`, one level down. A tick that
+    // classifies nothing because there was nothing to classify (`statuses`
+    // and `candidates` both empty — the steady state of an idle deck, true
+    // from the moment the daemon starts and every time the last pane
+    // closes) leaves it untouched: no opinion, neither success nor failure.
+    // An earlier version of this comment claimed a bare non-empty check was
+    // the whole story; it was wrong in both directions — see PR #206 round-3
+    // verification, finding Q1, for the false-negative (idle deck) and
+    // false-positive (multi-pane partial degradation) cases it missed.
+    let mut consecutive_process_table_failures: u32 = 0;
     // The sample still in flight from an earlier tick, if any (#500 review, P1).
     //
     // This exists so a wedged `ps` cannot ACCUMULATE. The obvious shape —
@@ -1477,7 +1510,7 @@ async fn run_shell_activity_monitor_with<S, F>(
         let candidates = pty_registry
             .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
 
-        let snapshot = if candidates.is_empty() {
+        let statuses = if candidates.is_empty() {
             // No pane, so no sample — and an empty reading rather than a
             // skipped tick, because "there are no panes" is a fact we just
             // established under the lock, not a failure to observe. Falling
@@ -1503,7 +1536,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                 }
             };
             match tokio::time::timeout(SAMPLE_TIMEOUT, pending.as_mut()).await {
-                Ok(Some(table)) => {
+                Ok(Ok(table)) => {
                     // See `MAX_TABLE_AGE`: a sample that answered this late
                     // describes a machine that has since moved on. No opinion.
                     let age = started.elapsed();
@@ -1555,17 +1588,34 @@ async fn run_shell_activity_monitor_with<S, F>(
                         AgentPtyRegistry::classify_shell_activity(&candidates, &table)
                     }
                 }
+                // Fork issue #160 F7: `Unsupported` is permanent for the life
+                // of the process (see `ProcessTableOutcome`'s doc comment) —
+                // there is nothing to gain from waking every 500ms to learn
+                // it again, and never saying so leaves a Windows deployment
+                // with no line anywhere explaining why this signal never
+                // fires. One line at the point this is first (and only ever)
+                // discovered, then end the poll outright rather than
+                // `continue`ing forever.
+                Ok(Err(crate::platform::proc::ProcessTableOutcome::Unsupported)) => {
+                    tracing::info!(
+                        "shell-activity poll: process-table sampling is unsupported on this \
+                         platform — this signal will never fire here, so the poll is ending \
+                         instead of waking every 500ms to learn a fact that cannot change"
+                    );
+                    return;
+                }
                 // ── The load-bearing decision of issue #429 ──
                 //
-                // BOTH arms below mean "no opinion", and neither may become
+                // Every arm below means "no opinion", and none may become
                 // `Some(false)`.
                 //
                 // `descendant_shell_activity` draws that distinction on purpose
                 // and callers are documented to treat `None` as "leave the
-                // pane's status alone". A timed-out sample is a statement about
-                // `ps`, not about the pane: if a `ps` wedges in D-state on a
-                // stuck filesystem, every pane is still exactly as busy as it
-                // was a moment ago. Collapsing the timeout to "not busy" would
+                // pane's status alone". A timed-out or failed sample is a
+                // statement about `ps`, not about the pane: if `ps` wedges in
+                // D-state on a stuck filesystem, or a healthy `ps` exits
+                // non-zero, every pane is still exactly as busy as it was a
+                // moment ago. Collapsing either into "not busy" would
                 // synthesize a `ShellIdle` for every pane the deck is running
                 // and silently flip them all to `Idle` — which is precisely the
                 // stale-`Idle` bug PRD #386 exists to fix, reintroduced with a
@@ -1577,12 +1627,36 @@ async fn run_shell_activity_monitor_with<S, F>(
                 // nothing is emitted. The reading simply resumes on the next
                 // sample that answers.
                 //
-                // The two arms differ only in what happens to the sample itself:
-                // an answered-but-failed sample is finished, so it is dropped and
-                // the next tick starts a fresh one; an overrunning sample is
-                // RETAINED, so the next tick waits on the same `ps` instead of
-                // spawning a second one.
-                Ok(None) => continue,
+                // The three arms differ only in what happens to the sample
+                // itself: an answered-but-failed sample is finished, so it is
+                // dropped, counted and (rate-limited) logged, and the next
+                // tick starts a fresh one; an overrunning sample is RETAINED,
+                // so the next tick waits on the same `ps` instead of spawning
+                // a second one.
+                Ok(Err(crate::platform::proc::ProcessTableOutcome::Failed)) => {
+                    // Fork issue #160 A3: do NOT reset
+                    // `consecutive_process_table_failures` here — the reset
+                    // only happens after a tick that actually classified a
+                    // pane, below.
+                    consecutive_process_table_failures += 1;
+                    // Fork issue #160 F6: rate-limited — this would otherwise
+                    // fire every tick under exactly the sustained-contention
+                    // condition it exists to report. Log the TRANSITION (the
+                    // first failure right after a success) and then only
+                    // every `FAILURE_LOG_EVERY`th consecutive failure after
+                    // that, so a chronically failing machine still shows up
+                    // in the log without drowning it.
+                    if consecutive_process_table_failures == 1
+                        || consecutive_process_table_failures.is_multiple_of(FAILURE_LOG_EVERY)
+                    {
+                        tracing::warn!(
+                            consecutive_failures = consecutive_process_table_failures,
+                            "shell-activity poll: process-table sample failed this tick — pane \
+                             statuses will not update until a sample succeeds"
+                        );
+                    }
+                    continue;
+                }
                 Err(_elapsed) => {
                     if !inflight_reported {
                         inflight_reported = true;
@@ -1600,7 +1674,44 @@ async fn run_shell_activity_monitor_with<S, F>(
                 }
             }
         };
+        // Fork issue #160 Q1 (PR #206 round-3 verification): a three-way
+        // discriminator, not a bare `!statuses.is_empty()`. That bare check
+        // reads a healthy idle deck — zero live panes, `candidates == 0`,
+        // true from daemon start and every time the last pane closes — as an
+        // unbroken run of failures that never resets, silently breaking F6's
+        // "first failure after a success is always logged" guarantee and
+        // turning `consecutive_process_table_failures` into a false number on
+        // any chronically idle-but-healthy machine. `candidates` (the live,
+        // addressable panes the scan actually attempted) is what
+        // distinguishes "nothing to classify" from "everything went
+        // unconfirmed":
+        let snapshot = crate::agent_pty::ShellForegroundBusySnapshot {
+            statuses,
+            candidates: candidates.len(),
+        };
+        if !snapshot.statuses.is_empty() {
+            // At least one pane classified this tick — healthy, reset.
+            consecutive_process_table_failures = 0;
+        } else if snapshot.candidates > 0 {
+            // Every candidate pane went unconfirmed even though the table
+            // sample itself succeeded — the same degradation as an explicit
+            // `Failed`, one level down, so count and log it the same way.
+            consecutive_process_table_failures += 1;
+            if consecutive_process_table_failures == 1
+                || consecutive_process_table_failures.is_multiple_of(FAILURE_LOG_EVERY)
+            {
+                tracing::warn!(
+                    consecutive_failures = consecutive_process_table_failures,
+                    "shell-activity poll: process-table sample succeeded but every \
+                     candidate pane went unconfirmed this tick — pane statuses will not \
+                     update until a pane classifies"
+                );
+            }
+        }
+        // else: no candidates at all (an idle deck) — no opinion, leave the
+        // counter untouched. Neither a success nor a failure happened.
         let seen: std::collections::HashSet<&str> = snapshot
+            .statuses
             .iter()
             .map(|(pane_id, _)| pane_id.as_str())
             .collect();
@@ -1610,7 +1721,7 @@ async fn run_shell_activity_monitor_with<S, F>(
         // busy/idle reading.
         last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
 
-        for (pane_id, busy) in snapshot {
+        for (pane_id, busy) in snapshot.statuses {
             let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
 
             // Cheap path, and the overwhelmingly common one: a pane whose scan
