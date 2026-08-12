@@ -73,6 +73,25 @@ if [ "$group" = "repo" ] && [ "$sub" = "clone" ]; then
     exec git clone --quiet "$GHSTUB_DIR/$key/remote" "$dest"
 fi
 
+# PRD fork#235 M2: `gh_current_login_argv()` — `gh api user --jq .login`,
+# resolved once per run beside `ensure_claim_label`. `GhStub::fail_api_user`
+# arms the failure path (a read-only/expired token): label and comment must
+# still land and the dispatch must not be reported as failed, but the
+# assignee write is skipped since no login resolved. `GhStub::set_login` sets
+# the canned successful reply; default `gh-stub-user` when unset.
+if [ "$group" = "api" ] && [ "$sub" = "user" ]; then
+    if [ -f "$GHSTUB_DIR/fail-api-user" ]; then
+        echo "gh: HTTP 401: Bad credentials (stubbed failure)" 1>&2
+        exit 1
+    fi
+    if [ -f "$GHSTUB_DIR/login" ]; then
+        cat "$GHSTUB_DIR/login"
+    else
+        printf 'gh-stub-user\n'
+    fi
+    exit 0
+fi
+
 # PRD #421 review fix: `gh label create <name> ...` is idempotent (real `gh`
 # passes `--force`, which overwrites rather than erroring on a collision), so
 # this always succeeds — AND it adds `<name>` to the repo's known label set,
@@ -135,11 +154,15 @@ repo=""
 head=""
 issue_num=""
 add_label=""
+add_assignee=""
+remove_assignee=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --repo) shift; repo="$1" ;;
         --head) shift; head="$1" ;;
         --add-label) shift; add_label="$1" ;;
+        --add-assignee) shift; add_assignee="$1" ;;
+        --remove-assignee) shift; remove_assignee="$1" ;;
         [0-9]*) issue_num="$1" ;;
         *) ;;
     esac
@@ -147,6 +170,7 @@ while [ "$#" -gt 0 ]; do
 done
 key=$(printf '%s' "$repo" | tr '/' '_')
 labels_file="$GHSTUB_DIR/$key/labels"
+assignees_file="$GHSTUB_DIR/$key/assignees-$issue_num"
 
 # PRD #421 review fix: real `gh issue edit --add-label <name>` resolves the
 # label name to an ID and hard-errors BEFORE any mutation when the repo does
@@ -167,6 +191,20 @@ if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
         fi
         echo "gh: GraphQL: Could not resolve to a Label with the name '$add_label'. (addLabelsToLabelable)" 1>&2
         exit 1
+    fi
+    # PRD fork#235 M2: assignee, replace-to-one — `gh issue edit
+    # --add-assignee <current> --remove-assignee <prior>`. Either flag may be
+    # absent (the very first claim on an issue has no `prior` login to
+    # remove). Real `gh` silently drops an assignee lacking repo access and
+    # can still exit 0 (PRD fork#235 M2 implementation trap) — this stub
+    # always accepts the add, mirroring that permissive real-world behavior
+    # rather than the stricter label-resolution check above.
+    if [ -n "$remove_assignee" ] && [ -f "$assignees_file" ]; then
+        grep -vxF "$remove_assignee" "$assignees_file" > "$assignees_file.tmp" 2>/dev/null
+        mv "$assignees_file.tmp" "$assignees_file" 2>/dev/null || true
+    fi
+    if [ -n "$add_assignee" ]; then
+        grep -qxF "$add_assignee" "$assignees_file" 2>/dev/null || printf '%s\n' "$add_assignee" >> "$assignees_file"
     fi
     exit 0
 fi
@@ -377,6 +415,26 @@ impl GhStub {
             .any(|l| l == label)
     }
 
+    /// PRD fork#235 M2: the current assignee list for `issue` on `repo`, one
+    /// login per line, after every `--add-assignee`/`--remove-assignee`
+    /// write so far (replace-to-one state).
+    fn assignees(&self, repo: &str, issue: u64) -> Vec<String> {
+        std::fs::read_to_string(
+            self.dir
+                .join(format!("{}/assignees-{issue}", Self::key(repo))),
+        )
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// PRD fork#235 M2: arm `gh api user --jq .login` to fail (a
+    /// read-only/expired token) — `scheduler/dispatch/022`'s scenario.
+    fn fail_api_user(&self) {
+        std::fs::write(self.dir.join("fail-api-user"), b"").expect("write fail-api-user marker");
+    }
+
     /// Make `gh pr list --head agent/issue-<n>` report an open PR (skip signal).
     fn set_open_pr(&self, repo: &str, issue: u64) {
         std::fs::write(
@@ -482,6 +540,32 @@ fn dispatch_task(
          max_per_run = {max_per_run}\n\
          \n"
     )
+}
+
+/// PRD fork#235: build a workspace tempdir + single-task `issue_dispatch`
+/// schedule, then spawn a daemon over it — the setup shared verbatim by
+/// `scheduler/dispatch/010`, `021`, and `022`, which each fire it via
+/// `run_now` themselves and diverge only in their fixture (`stub`) and
+/// assertions afterward. Returns the workspace `TempDir` (kept alive by the
+/// caller for the daemon's lifetime), the workspace path as a `String` (for
+/// `derive_issue_paths`), and the running daemon.
+fn spawn_dispatch_daemon(
+    stub: &GhStub,
+    task_name: &str,
+    id_template: &str,
+    repo: &str,
+) -> (tempfile::TempDir, String, common::DaemonProc) {
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(task_name, &work_str, id_template, repo, 5);
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    (work_td, work_str, daemon)
 }
 
 /// Like [`dispatch_task`] but with `triage = true` appended to the
@@ -1448,43 +1532,36 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
 const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
      [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"dad-nonexistent-binary-421\"\nstart = true\n";
 
-/// Scenario: Fire an `issue_dispatch` task for one open issue on a repo that
-/// already carries the `in-progress` label (seeded via
-/// [`GhStub::seed_labels`], mirroring a repo where the label vocabulary
-/// pre-exists — see `scheduler/dispatch/020` for the counterpart where it
-/// doesn't). After the dispatch succeeds (worktree + orchestrator agent
-/// present, as in `scheduler/dispatch/001`), the stub `gh` log must show an
-/// `issue edit ... --add-label in-progress` invocation for the issue AND an
-/// `issue comment` invocation whose body names the claiming task
-/// (`ScheduledTask.name`, the scheduler-side claimant per PRD #421) — and,
-/// because `in-progress` pre-existed, the add-label call must have actually
-/// SUCCEEDED, not merely been attempted.
+/// Scenario: Fire a SINGLE-AGENT `issue_dispatch` task (fixture remote
+/// carries no `.dot-agent-deck.toml`, mirroring `scheduler/dispatch/022`) for
+/// one open issue on a repo that already carries the `in-progress` label
+/// (seeded via [`GhStub::seed_labels`], mirroring a repo where the label
+/// vocabulary pre-exists — see `scheduler/dispatch/020` for the counterpart
+/// where it doesn't). After the dispatch succeeds (worktree + single agent
+/// card present, as in `scheduler/dispatch/022`), the stub `gh` log must show
+/// an `issue edit ... --add-label in-progress` invocation for the issue AND
+/// an `issue comment` invocation whose body names the claiming task
+/// (the task name as DECORATION on round 3's worktree-path-plus-branch
+/// identity — this is the genuinely single-agent claim path PRD #421
+/// originally covered here, kept distinct from the orchestration-named claim
+/// `scheduler/dispatch/021` exists to pin) — and, because `in-progress`
+/// pre-existed, the add-label call must have actually SUCCEEDED, not merely
+/// been attempted.
 #[spec("scheduler/dispatch/010")]
 #[test]
 fn dispatch_010_success_writes_label_and_claim_comment() {
     let stub = GhStub::new();
     let repo = "acme/widgets";
-    stub.add_repo(repo, true);
+    stub.add_repo(repo, false);
     stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
-    let work = work_td.path().join("ws");
-    std::fs::create_dir_all(&work).expect("create workspace root");
-    let work_str = work.to_string_lossy().into_owned();
-
-    let toml = dispatch_task(
+    let (_work_td, work_str, daemon) = spawn_dispatch_daemon(
+        &stub,
         "dispatch-task",
-        &work_str,
         "ISSUEDISPATCH-{{issue_number}}",
         repo,
-        5,
     );
-    let path = stub.path_env();
-    let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
-    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
-
     daemon
         .run_now("dispatch-task")
         .expect("run-now dispatch-task");
@@ -1492,7 +1569,7 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
     assert!(
         daemon
-            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .wait_for_agent_where(|r| single_card_in(r, &paths.worktree_dir), W)
             .is_some(),
         "the dispatch must succeed (precondition for a label/comment write)"
     );
@@ -1523,6 +1600,28 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
         stub.gh_calls().join("\n")
     );
 
+    // PRD fork#235 round 3: the identity itself is the dispatched worktree's
+    // absolute path plus its branch (`agent/issue-<n>`, CLAUDE.md rule 23),
+    // not `issue-dispatch:<task>#<issue>@…` — the task name above is
+    // DECORATION, not the compared identity string.
+    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&worktree_str)
+                && l.contains(&paths.branch)
+        })
+    });
+    assert!(
+        named_worktree_identity,
+        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
+         absolute path ({worktree_str:?}) and its branch ({:?}, CLAUDE.md rule 23) — not merely \
+         decorate it with the task name; observed gh calls:\n{}",
+        paths.branch,
+        stub.gh_calls().join("\n")
+    );
+
     // The fixture pre-seeded `in-progress`, so the add-label call must have
     // actually SUCCEEDED against the stub's real-`gh`-accurate label-name
     // resolution — not merely been attempted (`labelled` above only proves
@@ -1534,6 +1633,19 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     assert!(
         applied,
         "the `in-progress` label write must SUCCEED when the label already exists on the repo; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    // PRD fork#235 M2: the assignee is written alongside the label and
+    // comment — replace-to-one, the human who owns the agent working the
+    // issue right now. This is the ONLY new assertion added by fork#235; the
+    // wording and assertions above are unchanged from PRD #421.
+    let assigned = common::wait_until(Duration::from_secs(5), || {
+        !stub.assignees(repo, 7).is_empty()
+    });
+    assert!(
+        assigned,
+        "a successful dispatch must also write the assignee alongside the label and comment (PRD fork#235 M2); observed gh calls:\n{}",
         stub.gh_calls().join("\n")
     );
 }
@@ -2104,5 +2216,190 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
          tightened stub (modeling real `gh`'s label-name-to-ID resolution) rejected it because \
          nothing created `in-progress` first; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
+    );
+}
+
+/// Scenario: Fire an `issue_dispatch` task against a fixture repo whose
+/// `.dot-agent-deck.toml` opens an ORCHESTRATION tab (`ORCH_TOML`'s
+/// `dispatch-orch`). Assert the posted claim comment names the
+/// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, and
+/// separately anchors on the round-3 identity — the dispatched worktree's
+/// absolute path plus its branch (CLAUDE.md rule 23) — regardless of which
+/// spawn kind fired it. Does NOT assert the scheduled task's name
+/// (`claim-task-021`) is absent from the comment: `derive_issue_paths` keys
+/// the clone directory on the task name for every `SpawnKind`, so the raw
+/// worktree path this test also requires present legitimately contains
+/// `claim-task-021` as a path segment — what differs between an
+/// orchestration dispatch and a single-agent one (`scheduler/dispatch/010`)
+/// is only which name is rendered as decoration.
+#[spec("scheduler/dispatch/021")]
+#[test]
+fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
+    let stub = GhStub::new();
+    let repo = "acme/orch-claim";
+    stub.add_repo(repo, true);
+    stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
+    stub.set_issues(repo, &[41]);
+
+    let (_work_td, work_str, daemon) =
+        spawn_dispatch_daemon(&stub, "claim-task-021", "ORCHCLAIM-{{issue_number}}", repo);
+    daemon
+        .run_now("claim-task-021")
+        .expect("run-now claim-task-021");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "claim-task-021", 41);
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "the orchestration dispatch must succeed (precondition for a claim-comment write)"
+    );
+
+    let commented = common::wait_until(Duration::from_secs(10), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains("dispatch-orch"))
+    });
+    assert!(
+        commented,
+        "an orchestration dispatch's claim comment must name the ORCHESTRATION's own typed name \
+         (`dispatch-orch`), not merely be posted; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    // PRD fork#235 round 3: the identity itself is the dispatched worktree's
+    // absolute path plus its branch (CLAUDE.md rule 23) regardless of spawn
+    // kind — `dispatch-orch` above is decoration only.
+    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&worktree_str)
+                && l.contains(&paths.branch)
+        })
+    });
+    assert!(
+        named_worktree_identity,
+        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
+         absolute path ({worktree_str:?}) and its branch ({:?}, CLAUDE.md rule 23) — not merely \
+         decorate it with the orchestration name; observed gh calls:\n{}",
+        paths.branch,
+        stub.gh_calls().join("\n")
+    );
+
+    let named_orchestration = stub
+        .gh_calls()
+        .iter()
+        .any(|l| l.contains("issue") && l.contains("comment") && l.contains("dispatch-orch"));
+    assert!(
+        named_orchestration,
+        "the claim comment must name the ORCHESTRATION (`dispatch-orch`) as decoration \
+         alongside the round-3 identity anchor asserted above — PRD #421 named the scheduled \
+         task exclusively; fork#235 M1/M2 derives the claimant's decoration from the bound \
+         spawn handle's `SpawnKind` instead. This does NOT assert the scheduled task's name \
+         (`claim-task-021`) is absent from the comment: `derive_issue_paths` keys the clone \
+         directory on the task name for every `SpawnKind`, so the worktree path asserted above \
+         legitimately contains `claim-task-021` as a path segment — asserting its absence would \
+         contradict the path assertion; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+}
+
+/// Scenario: Arm the stub so `gh api user --jq .login` fails (a read-only or
+/// expired token), then fire a plain single-agent dispatch. Assert the label
+/// and claim comment still land (best-effort, PRD fork#235 M2), no assignee
+/// is ever written, and the run is NOT reported as a failed dispatch — a
+/// claim-identity resolution failure must never turn an already-successful
+/// dispatch into `IssueDispatchFailed`, the exact defect PRD #421's Risks
+/// section named for the label/comment writes, now extended to the new
+/// assignee write.
+#[spec("scheduler/dispatch/022")]
+#[test]
+fn dispatch_022_gh_api_user_failure_skips_assignee_without_failing_dispatch() {
+    let stub = GhStub::new();
+    let repo = "acme/no-login";
+    stub.add_repo(repo, false);
+    stub.seed_labels(repo, &[IN_PROGRESS_LABEL]);
+    stub.set_issues(repo, &[51]);
+    stub.fail_api_user();
+
+    let (_work_td, work_str, daemon) =
+        spawn_dispatch_daemon(&stub, "claim-task-022", "NOLOGIN-{{issue_number}}", repo);
+
+    daemon
+        .run_now("claim-task-022")
+        .expect("run-now claim-task-022");
+
+    let paths = derive_issue_paths(Path::new(&work_str), "claim-task-022", 51);
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| single_card_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "the dispatch must succeed (precondition for a label/comment write)"
+    );
+
+    let labelled = common::wait_until(Duration::from_secs(10), || {
+        stub.label_applied(repo, 51, IN_PROGRESS_LABEL)
+    });
+    assert!(
+        labelled,
+        "the `in-progress` label must still land even when `gh api user` fails; observed gh \
+         calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+    let commented = common::wait_until(Duration::from_secs(5), || {
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment"))
+    });
+    // PRD fork#235 round 3: identity resolution (the dispatched worktree's
+    // absolute path plus its branch, CLAUDE.md rule 23) needs no `gh api
+    // user` call at all — only the ASSIGNEE login does — so the comment must
+    // still name the round-3 identity even when the login resolution that
+    // feeds the assignee write fails.
+    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&worktree_str)
+                && l.contains(&paths.branch)
+        })
+    });
+    assert!(
+        named_worktree_identity,
+        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
+         absolute path ({worktree_str:?}) and its branch ({:?}) — even when `gh api user` fails \
+         to resolve a login for the assignee write; observed gh calls:\n{}",
+        paths.branch,
+        stub.gh_calls().join("\n")
+    );
+    assert!(
+        commented,
+        "the claim comment must still be posted even when `gh api user` fails; observed gh \
+         calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+
+    // Give the (would-be) assignee write time to happen, then assert it
+    // never did. `wait_until` exits EARLY if an assignee appears (catching
+    // the bug fast); it only waits out the full timeout when none ever does.
+    let assigned = common::wait_until(Duration::from_secs(5), || {
+        !stub.assignees(repo, 51).is_empty()
+    });
+    assert!(
+        !assigned,
+        "no assignee may ever be written when `gh api user` fails to resolve a login — got \
+         assignees {:?}",
+        stub.assignees(repo, 51)
+    );
+
+    assert!(
+        !(daemon.stderr_contains("issue #51") && daemon.stderr_contains("failed")),
+        "a `gh api user` failure must never turn this already-successful dispatch into an \
+         IssueDispatchFailed — the exact defect PRD #421's Risks section named for the \
+         label/comment writes, now extended to the assignee write; stderr:\n{}",
+        daemon.stderr_text()
     );
 }

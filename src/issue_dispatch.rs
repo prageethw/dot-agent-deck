@@ -418,12 +418,14 @@ pub fn issue_comment_argv(repo: &str, issue: u64, body: &str) -> Vec<String> {
 }
 
 /// Build the `gh issue view` argv (arguments after `gh`) that reads back an
-/// issue's comments — the M1.3 claimant lookup, called ONLY once the
-/// `in-progress` label is already known present (from the `gh issue list`
-/// response `issue_list_argv` requests — see its doc comment), so an
-/// unlabelled issue never triggers this call at all. The issue number sits
-/// after the `--` end-of-options marker — see [`issue_edit_add_label_argv`]'s
-/// doc comment for why that placement matters.
+/// issue's comments and current assignees. Two callers: the M1.3 claimant
+/// lookup, called only once the `in-progress` label is already known present
+/// (from the `gh issue list` response `issue_list_argv` requests — see its
+/// doc comment); and, since PRD fork#235 FINAL round 5, `claim_issue`'s
+/// removal-target lookup (`current assignees − {claimant}`), called on
+/// EVERY claim regardless of label state. The issue number sits after the
+/// `--` end-of-options marker — see [`issue_edit_add_label_argv`]'s doc
+/// comment for why that placement matters.
 pub fn issue_view_comments_argv(repo: &str, issue: u64) -> Vec<String> {
     vec![
         "issue".to_string(),
@@ -431,43 +433,525 @@ pub fn issue_view_comments_argv(repo: &str, issue: u64) -> Vec<String> {
         "--repo".to_string(),
         repo.to_string(),
         "--json".to_string(),
-        "comments".to_string(),
+        "comments,assignees".to_string(),
         "--".to_string(),
         issue.to_string(),
     ]
 }
 
-/// The identity that claims an issue by posting a claim comment (PRD #421
-/// M1.1). `run_issue_dispatch` has exactly one caller and claims under
-/// [`Claimant::Task`] — `ScheduledTask.name`; that is the only write point
-/// that exists today. A second variant for a human orchestration's own claim
-/// was previously represented here for completeness even though nothing
-/// constructed it — removed (fork #421 review E1) as speculative generality:
-/// a `pub` enum's dead variant is never flagged by `dead_code`, so its unit
-/// test was coverage over unreachable code that read as reassurance without
-/// providing any. When a second write point appears it will come with
-/// concrete requirements about what identity it carries; re-adding a variant
-/// then is a small change made with better information than exists now. See
-/// `prds/421-automatic-issue-labelling.md`'s "Decisions taken during
-/// implementation" for the full record of why only one write point exists.
+/// The two forms of claimant identity (PRD fork#235 round 3). An issue's
+/// claim is a LOCK, not merely a record, so identity must name an INSTANCE,
+/// never a bare name — fork #201 records that orchestration-name uniqueness
+/// is only advisory (two forms open at once are suggested the same name and
+/// neither submit is refused — "this is the case #74 is actually about"),
+/// and fork #222 adds truncation collisions plus the `unknown` sentinel.
+/// Comparing bare names would make two DISTINCT holders compare EQUAL and
+/// wave both through in exactly the scenario the lock exists for
+/// (`issue/claim/007` pins this).
+///
+/// Round 3's anchor (CLAUDE.md rule 23, `prds/235-issue-claim-lock.md`'s
+/// "Identity, round 2" section) is the worktree an agent is actually running
+/// in: its absolute path plus its git branch — both of which CLAUDE.md rule
+/// 1 already obliges the orchestrator to create and name, so this invents no
+/// new mechanism. Two prior anchors were tried and rejected: the worktree
+/// ownership marker (round 1 — almost never present, since rule 1's mandated
+/// `git worktree add` flow writes none) and `DOT_AGENT_DECK_PANE_ID` (round 2
+/// — a small daemon-scoped integer that recycles across a daemon restart).
+///
+/// Comparison is always on the WHOLE composed [`Display`](std::fmt::Display)
+/// string, never a field in isolation, and — for [`Identity::Worktree`] — the
+/// `label` field is NEVER part of it: it is decoration only (see the field's
+/// own doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Claimant {
-    /// The scheduler-side dispatch: `ScheduledTask.name`.
-    Task { name: String },
+pub enum Identity {
+    /// An agent working a worktree — round 3's whole anchor. `path` and
+    /// `branch` are the ENTIRE compared identity (see [`Identity`]'s own
+    /// doc); `label`, when present, is a human-readable decoration (e.g. "the
+    /// orchestration `<name>`") that is rendered into the claim comment for a
+    /// reader's benefit but never compared. `None` for a CLI `issue claim`
+    /// caller (`src/issue_claim.rs`): round 3 drops the worktree ownership
+    /// marker read entirely, so the CLI has no name to decorate with, only
+    /// the anchor itself — matching rule 23's own bare example, "the
+    /// orchestration working `<path>` on branch `<branch>`". `Some(_)` for
+    /// the async dispatch path (`issue_dispatch_run.rs`), which knows its
+    /// bound `SpawnKind`'s own name.
+    Worktree {
+        path: PathBuf,
+        branch: String,
+        /// The claiming machine's own hostname (round-3 audit A1): without
+        /// this, two decks on two DIFFERENT physical machines whose
+        /// worktrees happen to share an absolute path (ordinary under
+        /// Codespaces/devcontainers' `/workspaces/<repo>` convention) compare
+        /// EQUAL and both take the idempotent-refresh row — #74 verbatim.
+        /// Always populated fresh (via [`crate::issue_dispatch_run::local_hostname`])
+        /// by every constructor below; a [`ParsedClaim`] reconstructed from a
+        /// comment with no discoverable host clause (an older-shaped or
+        /// hand-typed comment) simply omits it from the compared string,
+        /// which can then never equal a freshly-resolved caller's identity —
+        /// failing closed rather than assuming same-host.
+        host: String,
+        label: Option<String>,
+    },
+    /// A human claiming outside any worktree: `human:<login>@<host>`. `login`
+    /// is a validated `gh` login (see [`validate_gh_login`]), not free text,
+    /// so it needs no further sanitization here.
+    Human { login: String, host: String },
 }
 
-impl Claimant {
-    fn describe(&self) -> String {
-        match self {
-            Claimant::Task { name } => {
-                format!("scheduled task `{}`", sanitize_claimant_name(name))
-            }
+/// Best-effort canonicalisation for an [`Identity::Worktree`]'s `path`
+/// (round-3 audit R2/A6), applied HERE — the one place every constructor
+/// below funnels through — so the CLI's physical `getcwd()`-derived path and
+/// the dispatch path's lexical, possibly symlink-containing configured path
+/// always converge on the same string without either call site needing to
+/// remember to normalise itself. Falls back to the given path unchanged when
+/// canonicalization fails (a synthetic/non-existent path in a unit test, or
+/// a real filesystem error) — an identity is still buildable, it just can no
+/// longer promise the normalized form.
+fn canonicalize_identity_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+impl Identity {
+    /// Build a bare [`Identity::Worktree`] with no decorative label — the CLI
+    /// `issue claim` path (`src/issue_claim.rs`), which resolves purely from
+    /// `git` (round 3 reads no marker, so it has no name to decorate with).
+    pub fn worktree(path: &Path, branch: &str) -> Self {
+        Identity::Worktree {
+            path: canonicalize_identity_path(path),
+            branch: branch.to_string(),
+            host: crate::issue_dispatch_run::local_hostname(),
+            label: None,
+        }
+    }
+
+    /// Build an [`Identity::Worktree`] decorated as an orchestration. `name`
+    /// is run through [`sanitize_claimant_name`] before being embedded in its
+    /// own backtick-wrapped code span in the rendered label — it comes from
+    /// the bound [`crate::spawn::SpawnKind::Orchestration`]'s own typed name,
+    /// untrusted text landing in a public GitHub comment.
+    pub fn orchestration(name: &str, worktree_path: &Path, branch: &str) -> Self {
+        Identity::Worktree {
+            path: canonicalize_identity_path(worktree_path),
+            branch: branch.to_string(),
+            host: crate::issue_dispatch_run::local_hostname(),
+            label: Some(format!(
+                "the orchestration `{}`",
+                sanitize_claimant_name(name)
+            )),
+        }
+    }
+
+    /// Build an [`Identity::Worktree`] decorated as a single-agent
+    /// issue-dispatch fire. `task` (`ScheduledTask.name`) is sanitized for
+    /// the same reason as [`Identity::orchestration`]'s `name`.
+    pub fn issue_dispatch(task: &str, issue: u64, worktree_path: &Path, branch: &str) -> Self {
+        Identity::Worktree {
+            path: canonicalize_identity_path(worktree_path),
+            branch: branch.to_string(),
+            host: crate::issue_dispatch_run::local_hostname(),
+            label: Some(format!(
+                "the issue-dispatch task `{}` (issue #{issue})",
+                sanitize_claimant_name(task)
+            )),
+        }
+    }
+
+    /// Build an [`Identity::Human`]. `login` is assumed already validated by
+    /// the caller via [`validate_gh_login`] — a `gh` login is not free text.
+    pub fn human(login: &str, host: &str) -> Self {
+        Identity::Human {
+            login: login.to_string(),
+            host: host.to_string(),
         }
     }
 }
 
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The compared string names the anchor (path + branch) PLUS the
+            // claiming host (round-3 audit A1) — `label` is decoration and
+            // must never affect comparison
+            // (`identity_comparison_is_on_the_whole_string_not_the_name_alone`
+            // pins this: two callers sharing a `label` but rooted in
+            // different worktrees must still compare unequal). `|` separates
+            // the host from `path@branch` — distinct from the pre-existing
+            // `@` separator so a host can never be misread as part of the
+            // branch, and not a control character, so
+            // [`sanitize_claimant_name`] never mangles it when this string
+            // is later echoed into a "taking over from" tail.
+            Identity::Worktree {
+                path, branch, host, ..
+            } => {
+                write!(f, "worktree:{}@{branch}|{host}", path.display())
+            }
+            Identity::Human { login, host } => write!(f, "human:{login}@{host}"),
+        }
+    }
+}
+
+/// Accept only `^[A-Za-z0-9][A-Za-z0-9-]*$` (PRD fork#235 M1). A `gh` login
+/// reaches both a public comment body and a `gh` argv (`--add-assignee`,
+/// `--remove-assignee`), so unlike an orchestration/task name it is
+/// validated rather than merely sanitized — GitHub logins are already
+/// restricted to this shape, so a value failing this check is not a real
+/// login at all.
+pub fn validate_gh_login(login: &str) -> bool {
+    let mut chars = login.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Build the `gh api user --jq .login` argv (arguments after `gh`) that
+/// resolves the currently-authenticated `gh` login — "whoever `gh` is
+/// authenticated as on this host" (PRD fork#235 M1/M2), the human who owns
+/// the agent making the claim.
+pub fn gh_current_login_argv() -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "user".to_string(),
+        "--jq".to_string(),
+        ".login".to_string(),
+    ]
+}
+
+/// Build the `gh issue edit --add-assignee/--remove-assignee` argv
+/// (arguments after `gh`) implementing replace-to-one assignment (PRD
+/// fork#235 M2, round 5): `add` is the new assignee, `remove` the current
+/// assignees being displaced — `current GitHub assignees − {add}` (empty for
+/// the very first claim on an issue, or an idempotent refresh where `add` was
+/// already the sole assignee). One `--remove-assignee` flag per entry, so a
+/// hand-assigned issue carrying more than one prior assignee is fully
+/// cleared, not just narrowed to one survivor. Mirrors
+/// [`issue_edit_add_label_argv`]'s `--` end-of-options placement.
+pub fn issue_edit_assignee_argv(
+    repo: &str,
+    issue: u64,
+    add: Option<&str>,
+    remove: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        "issue".to_string(),
+        "edit".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+    ];
+    if let Some(a) = add {
+        argv.push("--add-assignee".to_string());
+        argv.push(a.to_string());
+    }
+    for r in remove {
+        argv.push("--remove-assignee".to_string());
+        argv.push(r.clone());
+    }
+    argv.push("--".to_string());
+    argv.push(issue.to_string());
+    argv
+}
+
+/// The literal prefix [`claim_comment_body`] always renders — the terminal
+/// character a claim comment can be recognized by (`.rfind` in
+/// `issue_dispatch_run::parse_claim_comment` / [`parse_claim_state`]).
+/// **Load-bearing**: a takeover comment MUST keep this exact prefix — wording
+/// it e.g. `Taken over by …` would make it invisible to every reader that
+/// looks for this string, leaving the system convinced the PREVIOUS holder
+/// still holds the issue (a silent regression of the whole feature).
+pub const CLAIM_COMMENT_PREFIX: &str = "Claimed by ";
+
+/// The fields [`parse_claim_fields`] extracts from one already-located claim
+/// comment (a comment whose body starts with [`CLAIM_COMMENT_PREFIX`]). Feeds
+/// the M3 lock decision (`identity` compared against the caller's own,
+/// `timestamp` rendered into a refusal). `login` is rendered for a human
+/// reader only (PRD fork#235 FINAL round 5) — never read back into a write;
+/// the assignee-replacement target comes from `gh issue view`'s own
+/// `assignees` field instead, via [`parse_current_assignees`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedClaim {
+    /// The composed identity string (an [`Identity`]'s `Display` output) —
+    /// compared verbatim, never decomposed, per the whole-string comparison
+    /// rule every `Identity` variant's doc already states. Reconstructed here
+    /// from the parsed `path`+`branch` (worktree form) or `login`+`host`
+    /// (human form) using the exact same shape [`Identity`]'s own `Display`
+    /// impl produces, so a freshly-resolved caller identity and a
+    /// previously-posted one compare equal whenever they name the same
+    /// worktree/branch or the same human.
+    pub identity: String,
+    pub timestamp: String,
+    /// The `@<login>` clause. `Some` for a worktree-form claim that resolved
+    /// one, or unconditionally for a human-form claim (the login IS the
+    /// identity there). `None` for an older-shaped or best-effort claim
+    /// comment that carries no login clause (a fork#235 claim made when `gh
+    /// api user` failed).
+    pub login: Option<String>,
+    /// The full, unparsed comment body — preserved for callers that render
+    /// the whole thing (the PRD #421 skip-reason claimant text), so parsing
+    /// out structured fields doesn't lose the ability to show the original.
+    pub raw: String,
+}
+
+/// Parse the structured fields out of one already-located claim comment body
+/// (PRD fork#235 M1, re-keyed for round 3's worktree-path-plus-branch
+/// anchor). `raw` is assumed to already start with [`CLAIM_COMMENT_PREFIX`]
+/// — callers locate it via `.rfind` on that prefix (see
+/// `issue_dispatch_run::parse_claim_comment` / [`parse_claim_state`]) before
+/// calling this. `None` if the body doesn't match either of the two shapes
+/// [`claim_comment_body`] renders (a genuinely malformed/hand-edited comment,
+/// or an older-round comment predating this format) — never partial-fills a
+/// result an M3 caller could misread as a smaller, but still valid, claim.
+///
+/// Two shapes, disambiguated by which of two mutually-exclusive markers is
+/// present (`" working from \`"` can never also match `" working \`"` — the
+/// literal text between `working` and the backtick differs):
+///   - Human: ``@<login> working from `<host>` at <ts>[, taking over from
+///     <tail>].``
+///   - Worktree: ``<decoration>working `<path>` on branch `<branch>`[ on host
+///     <host>] at <ts>[, for @<login>][, taking over from <tail>].``
+pub fn parse_claim_fields(raw: &str) -> Option<ParsedClaim> {
+    let rest = raw.strip_prefix(CLAIM_COMMENT_PREFIX)?;
+    let line = claim_line(rest);
+
+    if let Some(after_at) = line.strip_prefix('@') {
+        return parse_human_claim(after_at, raw);
+    }
+    parse_worktree_claim(line, raw)
+}
+
+/// Bound one claim's own text (round-3 audit: reviewer/auditor found the
+/// SAME "scan the whole remaining body" shape independently in the
+/// timestamp search AND the login search — `issue/claim/012`). A forged
+/// SECOND `Claimed by` line injected across a raw newline must never be
+/// reachable by any field's sub-search, so every sub-search below operates
+/// on THIS bounded slice rather than the unbounded rest of the comment.
+/// Bounded at whichever comes first: the next newline, or (defence in depth,
+/// even absent a newline) the next literal [`CLAIM_COMMENT_PREFIX`]
+/// occurrence.
+fn claim_line(rest: &str) -> &str {
+    let newline_at = rest.find('\n').unwrap_or(rest.len());
+    let next_claim_at = rest.find(CLAIM_COMMENT_PREFIX).unwrap_or(rest.len());
+    &rest[..newline_at.min(next_claim_at)]
+}
+
+/// Parse the human-form claim body (everything after the `Claimed by @`
+/// already stripped): `<login> working from \`<host>\` at <ts>[, taking over
+/// from <tail>].`.
+fn parse_human_claim(after_at: &str, raw: &str) -> Option<ParsedClaim> {
+    let marker = " working from `";
+    let marker_idx = after_at.find(marker)?;
+    let login = after_at[..marker_idx].to_string();
+    // Round-4 audit, cause 1 (`issue/claim/025`): validate at the parser
+    // boundary, same as `parse_worktree_claim`'s login clause — a
+    // hand-typed or hostile human-shaped comment is not restricted to a
+    // real login's shape either.
+    if !validate_gh_login(&login) {
+        return None;
+    }
+    let after_marker = &after_at[marker_idx + marker.len()..];
+    let host_end = after_marker.find('`')?;
+    let host = after_marker[..host_end].to_string();
+    let after_host = &after_marker[host_end + 1..];
+    let (timestamp, _) = extract_timestamp(after_host)?;
+    Some(ParsedClaim {
+        identity: format!("human:{login}@{host}"),
+        timestamp,
+        login: Some(login),
+        raw: raw.to_string(),
+    })
+}
+
+/// Parse the worktree-form claim body (everything after `Claimed by `, NOT
+/// starting with `@`): `<decoration>working \`<path>\` on branch
+/// \`<branch>\` at <ts>[, for @<login>][, taking over from <tail>].`.
+/// `decoration` (e.g. `"the orchestration \`orch-A\` "`) is skipped over via
+/// the `" working \`"` marker search rather than parsed — it is display-only
+/// (see [`Identity::Worktree`]'s `label` field doc) and never feeds the
+/// compared identity string.
+fn parse_worktree_claim(rest: &str, raw: &str) -> Option<ParsedClaim> {
+    let working_marker = " working `";
+    let working_idx = rest.find(working_marker)?;
+    let after_working = &rest[working_idx + working_marker.len()..];
+    let path_end = after_working.find('`')?;
+    let path = after_working[..path_end].to_string();
+    let after_path = &after_working[path_end + 1..];
+
+    let branch_marker = " on branch `";
+    let branch_idx = after_path.find(branch_marker)?;
+    let after_branch_marker = &after_path[branch_idx + branch_marker.len()..];
+    let branch_end = after_branch_marker.find('`')?;
+    let branch = after_branch_marker[..branch_end].to_string();
+    let after_branch = &after_branch_marker[branch_end + 1..];
+
+    // The host clause (round-3 audit A1) is OPTIONAL: present only in a
+    // comment posted by this round's own writer (`claim_comment_body`),
+    // never in an older-shaped or hand-typed comment. When absent, the
+    // reconstructed identity carries NO host component at all — it can then
+    // never compare equal to a freshly-resolved caller identity (which
+    // always knows its own host), refusing rather than assuming same-host
+    // (`issue/claim/016`). Not backtick-wrapped: the host is locally
+    // resolved, never attacker-influenceable (this PRD's Threat model
+    // excludes a hostile local process), so it needs no code-span escaping.
+    let host_marker = " on host ";
+    let (host_suffix, after_host_or_branch) = match after_branch.strip_prefix(host_marker) {
+        Some(after_host) => {
+            let host_end = after_host.find(" at ")?;
+            (
+                format!("|{}", &after_host[..host_end]),
+                &after_host[host_end..],
+            )
+        }
+        None => (String::new(), after_branch),
+    };
+
+    let (timestamp, after_timestamp) = extract_timestamp(after_host_or_branch)?;
+    // Round-4 audit (`issue/claim/024`): bound the START of this search to
+    // AFTER the timestamp clause's own span (`after_timestamp`, a suffix of
+    // `rest` starting right where `extract_timestamp` stopped), not the
+    // whole remaining line from the very start. `claim_line()` already
+    // bounds the END; without this, an EARLIER field — the decorative
+    // label, the path, or the branch, none of which are restricted from
+    // containing the literal substring `, for @` — can shadow a genuine
+    // trailing login clause, which can only ever appear after the
+    // timestamp in a comment this format actually renders.
+    let login = after_timestamp.find(", for @").and_then(|idx| {
+        let after = &after_timestamp[idx + ", for @".len()..];
+        let end = after.find(',').unwrap_or(after.len());
+        let candidate = after[..end].trim_end_matches('.').to_string();
+        // Round-4 audit, cause 1 (`issue/claim/025`): validate at the parser
+        // boundary — `validate_gh_login`'s two pre-existing call sites both
+        // validate the deck's own `gh api user` reply, never a login PARSED
+        // out of a comment. `login` is rendered for a human reader only
+        // (PRD fork#235 FINAL round 5 — no write path reads it back), but it
+        // is still untrusted text reaching operator-facing output, so it is
+        // dropped here rather than shown malformed.
+        validate_gh_login(&candidate).then_some(candidate)
+    });
+    Some(ParsedClaim {
+        identity: format!("worktree:{path}@{branch}{host_suffix}"),
+        timestamp,
+        login,
+        raw: raw.to_string(),
+    })
+}
+
+/// Extract the timestamp out of `after_marker`, which is assumed to start
+/// with (optionally after other text) the literal `" at "` marker followed by
+/// the RFC3339 timestamp, ending at the next `,` or the end of the string
+/// (with a trailing `.` trimmed). Returns the timestamp alongside the
+/// REMAINDER of `after_marker` starting at that same terminator — a suffix
+/// of the caller's own string, not a copy — so a caller can bound any
+/// further sub-search within the same claim line to start only after the
+/// timestamp clause has consumed its own span (round-4 audit,
+/// `issue/claim/024`: [`parse_worktree_claim`]'s login search used to scan
+/// from the very start of the line, so an EARLIER field could shadow a
+/// genuine trailing login clause — see that function's own doc).
+fn extract_timestamp(after_marker: &str) -> Option<(String, &str)> {
+    let ts_marker = " at ";
+    let ts_start = after_marker.find(ts_marker)? + ts_marker.len();
+    let after_ts = &after_marker[ts_start..];
+    let ts_end = after_ts.find(',').unwrap_or(after_ts.len());
+    let timestamp = after_ts[..ts_end].trim_end_matches('.').to_string();
+    Some((timestamp, &after_ts[ts_end..]))
+}
+
+/// Build the `gh issue view --json labels,comments,assignees` argv (arguments
+/// after `gh`) M3's `issue claim` reads to decide: whether `in-progress` is
+/// present, who the newest claim comment names (display only, PRD fork#235
+/// FINAL round 5), and the current GitHub assignees (the round-5 removal
+/// target: `current assignees − {claimant}`). One call carries all three
+/// signals the CLI write path needs.
+pub fn issue_view_claim_state_argv(repo: &str, issue: u64) -> Vec<String> {
+    vec![
+        "issue".to_string(),
+        "view".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--json".to_string(),
+        "labels,comments,assignees".to_string(),
+        "--".to_string(),
+        issue.to_string(),
+    ]
+}
+
+/// Parse whatever [`parse_claim_fields`] extracts from `comment`'s `body` —
+/// the shared step between [`parse_claim_state`] (the CLI path) and
+/// `issue_dispatch_run::parse_claim_comment` (the async dispatch path) so
+/// both read "what does the newest claim comment say?" the exact same way.
+pub(crate) fn parsed_claim_from_comment_json(comment: &serde_json::Value) -> Option<ParsedClaim> {
+    let body = comment.get("body").and_then(serde_json::Value::as_str)?;
+    parse_claim_fields(body)
+}
+
+/// The current assignee logins out of a `gh issue view` document's own
+/// `assignees` field — shared by [`parse_claim_state`] and
+/// [`parse_current_assignees`], the PRD fork#235 FINAL round-5 removal
+/// target's SOLE source (`current assignees − {claimant}`, never a claim
+/// comment). Missing or malformed `assignees` degrades to empty, same
+/// discipline as `label_present`/`held` above.
+fn assignee_logins(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("assignees")
+        .and_then(serde_json::Value::as_array)
+        .map(|assignees| {
+            assignees
+                .iter()
+                .filter_map(|a| a.get("login").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a `gh issue view --json labels,comments,assignees` document into
+/// (label present, newest claim, current assignees). PRD fork#235 M3/round 5:
+/// the pure counterpart to [`issue_view_claim_state_argv`], kept separate
+/// from the subprocess call so the JSON-shape logic is unit-testable.
+pub fn parse_claim_state(json: &str) -> Result<(bool, Option<ParsedClaim>, Vec<String>), String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
+    let label_present = value
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|labels| {
+            labels.iter().any(|l| {
+                l.get("name").and_then(serde_json::Value::as_str) == Some(IN_PROGRESS_LABEL)
+            })
+        });
+    let held = value
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|comments| {
+            comments
+                .iter()
+                .rfind(|c| {
+                    c.get("body")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|body| body.starts_with(CLAIM_COMMENT_PREFIX))
+                })
+                .and_then(parsed_claim_from_comment_json)
+        });
+    let assignees = assignee_logins(&value);
+    Ok((label_present, held, assignees))
+}
+
+/// Parse a `gh issue view --json ...,assignees` document into the current
+/// assignee logins alone — the dispatch path's own entry point onto
+/// [`assignee_logins`], for `issue_dispatch_run::claim_issue`'s round-5
+/// removal-target lookup, which (unlike the CLI path's [`parse_claim_state`])
+/// has no use for `labels` or `comments` at all.
+pub fn parse_current_assignees(json: &str) -> Result<Vec<String>, String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
+    Ok(assignee_logins(&value))
+}
+
 /// Neutralise a claimant-supplied task name for safe interpolation into a
-/// public GitHub comment (PRD #421 review C5 / auditor F3). `ScheduledTask.name`
+/// public GitHub comment (PRD #421 review C5 / auditor F3; PRD fork#235
+/// round-3 review also applies this to a HELD claim's reconstructed
+/// `identity` string before it is echoed back into a new comment's `taking
+/// over from …` tail or a refusal message — see
+/// `issue_claim::decide_claim`'s call site). `ScheduledTask.name`
 /// is hand-edited config with no character restriction, and the un-escaped
 /// backtick wrapper around it in `Claimant::describe` lets a name that itself
 /// contains a backtick close the code span early — after which a crafted
@@ -477,7 +961,7 @@ impl Claimant {
 /// backslash-escaped backtick does not render as literal inside a CommonMark
 /// code span — newlines/carriage returns collapse to a space, and every other
 /// C0/DEL control character is dropped outright.
-fn sanitize_claimant_name(name: &str) -> String {
+pub(crate) fn sanitize_claimant_name(name: &str) -> String {
     name.chars()
         .filter_map(|c| match c {
             '`' => None,
@@ -488,15 +972,73 @@ fn sanitize_claimant_name(name: &str) -> String {
         .collect()
 }
 
-/// Render the claim-comment body posted on a successful dispatch (PRD #421
-/// M1.1): who claimed it, on which host, and when. `dispatch/010` asserts only
-/// that the body names the claiming task; the exact wording around
-/// host/timestamp beyond that is this function's choice.
-pub fn claim_comment_body(claimant: &Claimant, host: &str, timestamp: &str) -> String {
-    format!(
-        "Claimed by {} on `{host}` at {timestamp}.",
-        claimant.describe()
-    )
+/// Render the claim-comment body posted on a claim (PRD #421 M1.1; PRD
+/// fork#235 round 3 re-keys it onto the worktree-path-plus-branch anchor,
+/// CLAUDE.md rule 23): who claimed it, when, for which human (`login`,
+/// omitted for a worktree-form claim that resolved none; always present for
+/// a human-form claim, since the login IS the identity there), and — on a
+/// takeover — who it was taken over from. `dispatch/010` asserts the body
+/// names both the claiming task (decoration) and the dispatched worktree's
+/// path+branch (the compared anchor); `dispatch/021` asserts it names the
+/// orchestration, not the scheduled task, as that decoration.
+///
+/// **The `Claimed by ` prefix is load-bearing** (see
+/// [`CLAIM_COMMENT_PREFIX`]) and must survive every variant of this
+/// rendering, including a takeover — provenance goes in the tail
+/// (`, taking over from …`), never by changing the verb.
+///
+/// Mirrors [`parse_claim_fields`]'s two shapes exactly — a change to one
+/// without the other breaks round-tripping.
+pub fn claim_comment_body(
+    identity: &Identity,
+    timestamp: &str,
+    login: Option<&str>,
+    takeover_from: Option<&str>,
+) -> String {
+    let mut body = match identity {
+        Identity::Worktree {
+            path,
+            branch,
+            host,
+            label,
+        } => {
+            let label = label.as_deref().unwrap_or("the orchestration");
+            // Round-3 audit A3 (`issue/claim/020`): `path` and `branch` can
+            // both be attacker-influenceable with NO forged comment involved
+            // at all — a scheduled-task NAME reaches `path` via
+            // `sanitize_clone_segment`, which strips only `/ \ \0 ..`, not
+            // backticks, and a raw git branch name is not restricted from
+            // containing one either. Sanitize both, exactly like a claimant
+            // NAME, before they go inside their own backtick-wrapped span —
+            // otherwise an embedded backtick closes that span early and
+            // whatever follows (an `@mention`, a forged `Claimed by` line)
+            // renders as LIVE markdown. Sanitizing here (not in the stored
+            // `Identity`) leaves the compared identity string untouched.
+            let path_str = sanitize_claimant_name(&path.display().to_string());
+            let branch_str = sanitize_claimant_name(branch);
+            format!(
+                "{CLAIM_COMMENT_PREFIX}{label} working `{path_str}` on branch `{branch_str}` on \
+                 host {host} at {timestamp}"
+            )
+        }
+        Identity::Human { login, host } => {
+            format!("{CLAIM_COMMENT_PREFIX}@{login} working from `{host}` at {timestamp}")
+        }
+    };
+    // The `for @<login>` clause is meaningful only for the worktree form —
+    // a human-form claim already names the login as the identity itself
+    // (rendered above), so repeating it would be redundant and would make
+    // `parse_human_claim`'s single `@` after the prefix ambiguous.
+    if matches!(identity, Identity::Worktree { .. })
+        && let Some(login) = login
+    {
+        body.push_str(&format!(", for @{login}"));
+    }
+    if let Some(prev) = takeover_from {
+        body.push_str(&format!(", taking over from `{prev}`"));
+    }
+    body.push('.');
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,7 +1542,7 @@ mod tests {
                 "--repo",
                 "acme/widgets",
                 "--json",
-                "comments",
+                "comments,assignees",
                 "--",
                 "7",
             ]
@@ -1027,33 +1569,52 @@ mod tests {
     }
 
     #[test]
-    fn claim_comment_body_names_task_claimant() {
-        let claimant = Claimant::Task {
-            name: "dispatch-task".to_string(),
-        };
-        let body = claim_comment_body(&claimant, "host-1", "2026-08-09T00:00:00Z");
+    fn claim_comment_body_names_task_identity() {
+        let identity = Identity::issue_dispatch(
+            "dispatch-task",
+            7,
+            Path::new("/work/dispatch-task/.worktrees/issue-7"),
+            "agent/issue-7",
+        );
+        let body = claim_comment_body(&identity, "2026-08-09T00:00:00Z", None, None);
+        assert!(body.starts_with(CLAIM_COMMENT_PREFIX), "got {body:?}");
         assert!(
             body.contains("dispatch-task"),
             "body must name the claiming task, got {body:?}"
         );
-        assert!(body.contains("host-1"));
+        assert!(body.contains("/work/dispatch-task/.worktrees/issue-7"));
+        assert!(body.contains("agent/issue-7"));
         assert!(body.contains("2026-08-09T00:00:00Z"));
+        assert!(
+            !body.contains("for @"),
+            "no login was supplied, so the `for @<login>` clause must be omitted entirely, got {body:?}"
+        );
     }
 
     #[test]
     fn claim_comment_body_neutralizes_backtick_and_newline_in_task_name() {
         // C5 / auditor F3: a backtick would close the surrounding code span
         // early; a raw newline could then start a fabricated second line.
-        let claimant = Claimant::Task {
-            name: "x` cc @nobody\ninjected".to_string(),
-        };
-        let body = claim_comment_body(&claimant, "host-1", "2026-08-09T00:00:00Z");
-        // Every backtick in the rendered body must be one of the two fixed
-        // wrapper pairs (around the host, around the sanitized name) — none
-        // contributed by the task name itself.
+        let identity = Identity::issue_dispatch(
+            "x` cc @nobody\ninjected",
+            7,
+            Path::new("/work/x/.worktrees/issue-7"),
+            "agent/issue-7",
+        );
+        let body = claim_comment_body(&identity, "2026-08-09T00:00:00Z", None, None);
+        // Round 3's format wraps THREE fields in their own backtick pair: the
+        // decorated task name (`Identity::issue_dispatch`'s `label`), the
+        // worktree path, and the branch — reviewer F5: the name must sit
+        // inside a code span exactly like the other two, restoring the
+        // mention-injection protection PRD #421's C5 fix established and a
+        // prior round's bare `orchestration:name@host:wt` rendering dropped
+        // (that regression is why this test's expected count was wrongly
+        // relaxed from PRD #421's original 4 down to 2 — round 3's shape has
+        // one more backtick-wrapped field than PRD #421's did, so the
+        // restored count is 6, not 4).
         assert_eq!(
             body.matches('`').count(),
-            4,
+            6,
             "task name must not be able to introduce extra backticks, got {body:?}"
         );
         assert!(
@@ -1063,6 +1624,291 @@ mod tests {
         assert!(
             !body.contains("x`"),
             "the name's own backtick must not survive verbatim, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn claim_comment_body_includes_login_and_takeover_clause() {
+        let holder =
+            Identity::orchestration("orch-A", Path::new("/work/wt-a"), "branch-a").to_string();
+        let identity = Identity::orchestration("orch-B", Path::new("/work/wt-b"), "branch-b");
+        let body = claim_comment_body(
+            &identity,
+            "2026-08-09T00:00:00Z",
+            Some("bob"),
+            Some(&holder),
+        );
+        assert!(body.starts_with(CLAIM_COMMENT_PREFIX));
+        assert!(
+            body.contains(", for @bob"),
+            "must carry the login clause, got {body:?}"
+        );
+        assert!(
+            body.contains(&format!("taking over from `{holder}`")),
+            "must name who it was taken over from, backtick-wrapped, got {body:?}"
+        );
+        // The takeover clause must never displace the load-bearing prefix.
+        assert!(body.starts_with(CLAIM_COMMENT_PREFIX));
+    }
+
+    #[test]
+    fn human_claim_comment_body_names_login_and_host_not_for_clause() {
+        let identity = Identity::human("alice", "host-1");
+        let body = claim_comment_body(&identity, "2026-08-09T00:00:00Z", Some("alice"), None);
+        assert!(body.starts_with(CLAIM_COMMENT_PREFIX));
+        assert!(body.starts_with("Claimed by @alice working from `host-1` at"));
+        // The login is already the identity itself for a human claim, so a
+        // redundant `, for @alice` clause must never be appended — appending
+        // one would also make `parse_human_claim`'s single-`@`-after-prefix
+        // shape ambiguous.
+        assert!(
+            !body.contains(", for @"),
+            "a human-form claim must not carry a redundant `for @<login>` clause, got {body:?}"
+        );
+    }
+
+    // --- PRD fork#235 round 3: Identity composition ---
+
+    #[test]
+    fn identity_renders_each_form() {
+        // Round-3 audit A1: `Identity::Worktree` always carries the local
+        // machine's own host (see the field's doc) as part of the compared
+        // string, so the expected strings below reference the SAME
+        // `local_hostname()` this process would resolve, rather than a
+        // hardcoded value — the assertion must hold on every machine, not
+        // just the one it was written on.
+        let host = crate::issue_dispatch_run::local_hostname();
+        assert_eq!(
+            Identity::orchestration("orch-A", Path::new("/work/wt-a"), "branch-a").to_string(),
+            format!("worktree:/work/wt-a@branch-a|{host}")
+        );
+        assert_eq!(
+            Identity::issue_dispatch("dispatch-task", 7, Path::new("/work/wt"), "branch-x")
+                .to_string(),
+            format!("worktree:/work/wt@branch-x|{host}")
+        );
+        assert_eq!(
+            Identity::human("alice", "host-1").to_string(),
+            "human:alice@host-1"
+        );
+    }
+
+    #[test]
+    fn identity_comparison_is_on_the_whole_string_not_the_name_alone() {
+        // fork #201/#222 + `issue/claim/007`: two orchestrations sharing the
+        // exact same typed name but rooted in different worktrees must
+        // compose to DIFFERENT identities.
+        let a = Identity::orchestration("same-name", Path::new("/work/wt-1"), "branch-1");
+        let b = Identity::orchestration("same-name", Path::new("/work/wt-2"), "branch-1");
+        assert_ne!(a, b);
+        assert_ne!(a.to_string(), b.to_string());
+    }
+
+    #[test]
+    fn identity_comparison_ignores_the_decorative_label() {
+        // Round 3: the SAME worktree+branch compares EQUAL regardless of
+        // which decoration (or none) names it — `label` is display-only.
+        let bare = Identity::worktree(Path::new("/work/wt-a"), "branch-a");
+        let named = Identity::orchestration("orch-A", Path::new("/work/wt-a"), "branch-a");
+        assert_eq!(bare.to_string(), named.to_string());
+    }
+
+    #[test]
+    fn validate_gh_login_accepts_and_rejects() {
+        assert!(validate_gh_login("alice"));
+        assert!(validate_gh_login("a"));
+        assert!(validate_gh_login("alice-bob9"));
+        assert!(!validate_gh_login(""));
+        assert!(!validate_gh_login("-alice"));
+        assert!(!validate_gh_login("alice bob"));
+        assert!(!validate_gh_login("alice`"));
+        assert!(!validate_gh_login("alice\nbob"));
+    }
+
+    #[test]
+    fn gh_current_login_argv_shape() {
+        assert_eq!(
+            gh_current_login_argv(),
+            vec!["api", "user", "--jq", ".login"]
+        );
+    }
+
+    #[test]
+    fn issue_edit_assignee_argv_shapes() {
+        assert_eq!(
+            issue_edit_assignee_argv("acme/widgets", 7, Some("bob"), &["alice".to_string()]),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "acme/widgets",
+                "--add-assignee",
+                "bob",
+                "--remove-assignee",
+                "alice",
+                "--",
+                "7",
+            ]
+        );
+        // First-ever claim: no prior assignees to remove.
+        assert_eq!(
+            issue_edit_assignee_argv("acme/widgets", 7, Some("bob"), &[]),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "acme/widgets",
+                "--add-assignee",
+                "bob",
+                "--",
+                "7"
+            ]
+        );
+        // A hand-assigned issue carrying more than one prior assignee: one
+        // `--remove-assignee` flag per entry (PRD fork#235 FINAL round 5).
+        assert_eq!(
+            issue_edit_assignee_argv(
+                "acme/widgets",
+                7,
+                Some("bob"),
+                &["alice".to_string(), "carol".to_string()]
+            ),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "acme/widgets",
+                "--add-assignee",
+                "bob",
+                "--remove-assignee",
+                "alice",
+                "--remove-assignee",
+                "carol",
+                "--",
+                "7",
+            ]
+        );
+    }
+
+    #[test]
+    fn issue_view_claim_state_argv_shape() {
+        assert_eq!(
+            issue_view_claim_state_argv("acme/widgets", 7),
+            vec![
+                "issue",
+                "view",
+                "--repo",
+                "acme/widgets",
+                "--json",
+                "labels,comments,assignees",
+                "--",
+                "7",
+            ]
+        );
+    }
+
+    // --- PRD fork#235 round 3: claim-comment parsing ---
+
+    #[test]
+    fn parse_claim_fields_extracts_worktree_identity_timestamp_login() {
+        let comment = "Claimed by the orchestration `orch-A` working `/work/wt-a` on branch `branch-a` at 2026-08-09T00:00:00Z, for @alice.";
+        let parsed = parse_claim_fields(comment).expect("must parse");
+        assert_eq!(parsed.identity, "worktree:/work/wt-a@branch-a");
+        assert_eq!(parsed.timestamp, "2026-08-09T00:00:00Z");
+        assert_eq!(parsed.login.as_deref(), Some("alice"));
+        assert_eq!(parsed.raw, comment);
+    }
+
+    #[test]
+    fn parse_claim_fields_extracts_human_identity_and_login() {
+        let comment = "Claimed by @dave working from `host-1` at 2026-08-09T00:00:00Z.";
+        let parsed = parse_claim_fields(comment).expect("must parse");
+        assert_eq!(parsed.identity, "human:dave@host-1");
+        assert_eq!(parsed.timestamp, "2026-08-09T00:00:00Z");
+        // The login IS the identity for a human claim, so it is always
+        // reported even though there is no separate `for @<login>` clause.
+        assert_eq!(parsed.login.as_deref(), Some("dave"));
+    }
+
+    #[test]
+    fn parse_claim_fields_no_login_clause() {
+        let comment = "Claimed by the orchestration working `/work/wt-bare` on branch `bare-branch` at 2026-08-09T00:00:00Z.";
+        let parsed = parse_claim_fields(comment).expect("must parse");
+        assert_eq!(parsed.identity, "worktree:/work/wt-bare@bare-branch");
+        assert_eq!(parsed.login, None);
+    }
+
+    #[test]
+    fn parse_claim_fields_takeover_clause_does_not_break_login_parse() {
+        let comment = "Claimed by the orchestration `orch-B` working `/work/wt-b` on branch `branch-b` at 2026-08-09T00:00:00Z, for @bob, taking over from `worktree:/work/wt-a@branch-a`.";
+        let parsed = parse_claim_fields(comment).expect("must parse");
+        assert_eq!(parsed.identity, "worktree:/work/wt-b@branch-b");
+        assert_eq!(parsed.login.as_deref(), Some("bob"));
+        assert_eq!(parsed.timestamp, "2026-08-09T00:00:00Z");
+    }
+
+    #[test]
+    fn parse_claim_fields_rejects_unrelated_text() {
+        assert_eq!(parse_claim_fields("just a comment"), None);
+    }
+
+    #[test]
+    fn parse_claim_fields_rejects_old_format_comment() {
+        // An older-round (or hostile/hand-edited) comment in the PRE-round-3
+        // shape must not be misread as a round-3 claim — `issue/claim/012`
+        // relies on this failing closed to `None` rather than partial-fitting.
+        let comment = "Claimed by orchestration:orch-A@host-1:a1b2c3d4 on `host-1` at 2026-08-09T00:00:00Z, for @alice.";
+        assert_eq!(parse_claim_fields(comment), None);
+    }
+
+    #[test]
+    fn parse_claim_state_reads_label_and_newest_claim() {
+        let json = r#"{"labels":[{"name":"in-progress"}],"comments":[
+            {"body":"unrelated"},
+            {"body":"Claimed by the orchestration `orch-A` working `/work/wt-a` on branch `branch-a` at 2026-08-01T00:00:00Z, for @alice."},
+            {"body":"Claimed by the orchestration `orch-B` working `/work/wt-b` on branch `branch-b` at 2026-08-09T00:00:00Z, for @bob."}
+        ],"assignees":[{"login":"alice"}]}"#;
+        let (label_present, held, assignees) = parse_claim_state(json).unwrap();
+        assert!(label_present);
+        let held = held.expect("a claim comment must be found");
+        assert_eq!(held.identity, "worktree:/work/wt-b@branch-b");
+        assert_eq!(held.login.as_deref(), Some("bob"));
+        assert_eq!(assignees, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn parse_claim_state_no_label_no_comments() {
+        let (label_present, held, assignees) =
+            parse_claim_state(r#"{"labels":[],"comments":[]}"#).unwrap();
+        assert!(!label_present);
+        assert_eq!(held, None);
+        assert_eq!(assignees, Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_claim_state_labelled_with_no_claim_comment() {
+        let json = r#"{"labels":[{"name":"in-progress"}],"comments":[{"body":"unrelated"}]}"#;
+        let (label_present, held, assignees) = parse_claim_state(json).unwrap();
+        assert!(label_present);
+        assert_eq!(held, None);
+        assert_eq!(assignees, Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_claim_state_rejects_non_json() {
+        assert!(parse_claim_state("not json").is_err());
+    }
+
+    #[test]
+    fn parse_current_assignees_reads_logins_missing_field_is_empty() {
+        let json = r#"{"comments":[],"assignees":[{"login":"alice"},{"login":"bob"}]}"#;
+        assert_eq!(
+            parse_current_assignees(json).unwrap(),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert_eq!(
+            parse_current_assignees(r#"{"comments":[]}"#).unwrap(),
+            Vec::<String>::new()
         );
     }
 }

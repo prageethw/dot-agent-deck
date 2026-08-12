@@ -271,6 +271,16 @@ enum Commands {
         #[command(subcommand)]
         cmd: WorktreeCmd,
     },
+    /// Claim a GitHub issue against concurrent agents — cooperative
+    /// coordination, not an adversarial lock (PRD fork#235, fork-only —
+    /// layered over PRD #421's claim record). Refuses with a non-zero exit
+    /// when a DIFFERENT identity already holds the issue, naming the
+    /// holder's worktree (path and branch, or the claiming human), rather
+    /// than merely recording who claimed it.
+    Issue {
+        #[command(subcommand)]
+        cmd: IssueCmd,
+    },
     /// Wrap an agent command, passing its stdio through transparently while
     /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
     /// — the generic stdout-wrapper integration strategy). The child stays
@@ -471,6 +481,34 @@ enum WorktreeCmd {
         /// (dirty, PR not merged, PR state unresolvable).
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IssueCmd {
+    /// Claim issue `<n>`, refusing (non-zero exit) when a DIFFERENT identity
+    /// already holds it. Idempotent when the caller already holds it. See
+    /// `dot_agent_deck::issue_claim`'s module doc for the full decision
+    /// table.
+    Claim {
+        /// The GitHub issue number.
+        issue: u64,
+        /// `owner/name`; derived from the current directory's `origin`
+        /// remote when omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Signal intent to take over from a different holder. Alone, this
+        /// still refuses — deliberate friction, so an agent can't satisfy
+        /// the override in the same breath it discovers the conflict. Pass
+        /// `--confirm-stopped` too, once you have confirmed the other
+        /// agent has stopped.
+        #[arg(long)]
+        takeover: bool,
+        /// Confirms the previous holder's agent has been stopped. Only
+        /// takes effect together with `--takeover`; nothing verifies the
+        /// assertion.
+        #[arg(long = "confirm-stopped")]
+        confirm_stopped: bool,
     },
 }
 
@@ -1438,6 +1476,14 @@ fn main() -> ExitCode {
             WorktreeCmd::List { json, mine } => run_worktree_list_cli(json, mine),
             WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
         },
+        Some(Commands::Issue { cmd }) => match cmd {
+            IssueCmd::Claim {
+                issue,
+                repo,
+                takeover,
+                confirm_stopped,
+            } => run_issue_claim_cli(issue, repo, takeover, confirm_stopped),
+        },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
         Some(Commands::Snapshot { cmd }) => match cmd {
@@ -2128,6 +2174,45 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
         }
         Err(e) => {
             eprintln!("worktree reclaim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck issue claim <n> [--repo owner/name] [--takeover]
+/// [--confirm-stopped]` — PRD fork#235 M3. Pure CLI-subprocess operation
+/// over `git`/`gh` in the current directory — no daemon involved (rule 12),
+/// synchronous like the `worktree` verbs above. The exit code is the
+/// mechanism: a refusal and an operational failure both map to
+/// `ExitCode::FAILURE` here (distinguished only by the printed message) —
+/// `dot_agent_deck::issue_claim::run_issue_claim` is where the actual
+/// decision lives.
+fn run_issue_claim_cli(
+    issue: u64,
+    repo: Option<String>,
+    takeover: bool,
+    confirm_stopped: bool,
+) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("issue claim: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match dot_agent_deck::issue_claim::run_issue_claim(
+        &cwd,
+        repo.as_deref(),
+        issue,
+        takeover,
+        confirm_stopped,
+    ) {
+        Ok(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("issue claim: {e}");
             ExitCode::FAILURE
         }
     }
