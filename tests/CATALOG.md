@@ -880,7 +880,49 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact resulting `PrState`/verdict label (only the observable removal); non-ASCII/homoglyph login handling (GitHub logins are ASCII-only, so this is out of scope).
 - **Platform coverage:** mac+linux.
 
-##### worktree/reclaim/017 — A reclaimable worktree whose DIRECTORY NAME contains a non-UTF-8 byte is still removed by `reclaim --yes`.
+##### worktree/reclaim/017 — A worktree marked owned by orchestration `orch-x` via `mark_worktree_owned` reports that exact name back via a new `owner_of` query, and `ownership_of`'s existing `Ours`/`Foreign` bit still agrees it is owned (fork #166 M2.0/M2.1).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/008`'s precedent (a real git repo via `init_repo_with_origin`, a linked worktree via a real `git worktree add`).
+- **Agent:** none.
+- **Asserts:** `owner_of(repo, worktree)` returns `Some("orch-x")` after `mark_worktree_owned(worktree, "orch-x")`; `ownership_of(repo, worktree)` still returns `Ownership::Ours`.
+- **Does not assert:** the marker's on-disk byte format (only that it round-trips through `mark_worktree_owned`/`owner_of`); `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/018 — A pre-#166-legacy marker (the literal `"deck\n"` content `mark_worktree_owned` wrote before this PRD encoded a name) still resolves `Ownership::Ours`, but `owner_of` reports the owner as unknown (`None`) rather than guessing (fork #166 — protects every worktree created before this ships from silently becoming un-reclaimable).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (a worktree with the marker file written directly as the literal legacy bytes `"deck\n"`, bypassing `mark_worktree_owned` so the fixture controls the exact on-disk content — the same fixture PR #173's own `bare_deck_marker_from_older_build_still_reads_as_ours` test uses).
+- **Asserts:** `ownership_of` still returns `Ownership::Ours` (the presence-only check `reclaim` depends on is unchanged, already pinned by #173's own test — asserted again here only as the precondition for the next line) and `owner_of` returns `None`.
+- **Does not assert:** the presence/`Ours` half in isolation — that is #173's `bare_deck_marker_from_older_build_still_reads_as_ours`, not duplicated here; any other unparseable-content shape (empty marker, etc.); `WorktreeReport`/JSON surfacing (covered by `021`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/019 — `main` (the enumerating repo's own checkout, not a linked worktree) is never owned, even when its own directory is named to match the `<name>-<change>` convention and even with a marker planted directly in its own git-dir. Expected GREEN from the start — fork #144's existing containment check already guarantees this; no new ownership-identity code is needed to satisfy it.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (a repo directory literally named `myorch-feature`, with `dot-agent-deck-owner` written directly into its own resolved git-dir).
+- **Asserts:** `ownership_of(repo, repo)` returns `Ownership::Foreign`.
+- **Does not assert:** the containment mechanism itself (already pinned by `014`/`015`); anything about `owner_of` (this test exercises only the pre-existing `Ownership`/`ownership_of` surface, deliberately unchanged by fork #166).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/020 — A worktree owned by orchestration `Y` reports `Y`, never a different name `X`; a directory carrying NO marker at all is never owned, whatever it is named (fork #166 — ownership is decided by the marker, never by a directory's name).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, as `017`.
+- **Agent:** none (one worktree marked owned by `"Y"`; one unmarked worktree deliberately named `X-decoy` to look like it belongs to a different orchestration's naming convention).
+- **Asserts:** `owner_of` on the first returns `Some("Y")` and is asserted `!= Some("X")`; on the second, `ownership_of` returns `Ownership::Foreign` and `owner_of` returns `None`, despite the `X`-matching name.
+- **Does not assert:** cross-repo collisions; more than two orchestration names at once.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/021 — `dot-agent-deck worktree list --json` carries the recorded owner name in each `WorktreeReport` entry (fork #166 M2.2).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/008`'s precedent for a stubbed `gh` reached via a `PATH` prepend (here answering unconditionally with an empty PR list — the reclaim verdict itself is not this test's concern).
+- **Agent:** none.
+- **Asserts:** `examine_worktrees` returns a report whose `owner` field is `Some("orch-x")` for a worktree marked owned by that name; the report's serialized JSON (via `WorktreeListDocument`) contains `"owner":"orch-x"`.
+- **Does not assert:** the human-table (`format_list_human`) rendering, which this fork does not require to surface the owner; the `schema_version` bump question (the field is additive).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, as `008`).
+
+##### worktree/reclaim/022 — Two live orchestrations of the SAME config type (`review`) but with DISTINCT typed names each record a DISTINCT owner in their own worktree's marker, not the identical `orchestration:review` string (fork #166 — instance identity, not just provenance).
+- **Layer:** fast synthetic real-dispatch integration, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`, following `orchestration/worktree/004`'s precedent (a real git repo, the real `Action::SpawnPane` dispatch, a fresh `TabManager`/`AppState` per spawn) — placed in `ui.rs` rather than `src/worktree_reclaim.rs` because the property under test is produced by `ui.rs`'s own `SpawnPane` handler (the `format!("orchestration:{}", orch_config.name)` creator-identity line), which no helper outside that file's private test module (`CapturingPaneController`, `default_ui`) can drive.
+- **Agent:** none.
+- **Asserts:** `crate::worktree_reclaim::owner_of` on the two independently-spawned worktrees returns two different values, both spawned from `make_orchestration("review")` but given the distinct typed names `review-orchestrator-1` and `review-orchestrator-2` — the precondition M1.0 makes required (Name is required and unique), so an empty or shared name is not a reachable fixture state.
+- **Does not assert:** the exact string either owner resolves to (the interactive path is expected to move from `orch_config.name` to the typed unique name, and this test must survive that spelling change); role-pane cwd threading (already covered by `orchestration/worktree/003`/`004`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/023 — A reclaimable worktree whose DIRECTORY NAME contains a non-UTF-8 byte is still removed by `reclaim --yes`.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (a worktree directory built from raw bytes via `OsStr::from_bytes`/`Command::arg`, never through a `&str`/`to_string_lossy` conversion that would corrupt the byte before git ever saw it).
 - **Asserts:** first, a **fixture precondition** that the scratch dir genuinely contains an entry whose raw bytes exactly match the intended non-UTF-8 name — ruling out "the filesystem silently normalised or rejected it" as the reason later assertions pass; then, as in `003`/`004`/`005`, that the exit code/stderr rule out clap's own unrecognized-subcommand error; then that the human report actually carries a non-empty `Removed:` section (not `Removed: none`) — ruling out "the directory was simply never created" as the reason it's absent; and finally that the worktree directory is gone. Pins Greptile P1 (upstream PR #427, `src/worktree_reclaim.rs:482`): `examine_worktrees` lossy-converts the parsed `PathBuf` into a `String`, and `run_reclaim` feeds that mangled string to `git worktree remove`, so a worktree whose path contains non-UTF-8 bytes is never reclaimed even though it is otherwise fully eligible.
