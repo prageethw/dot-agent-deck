@@ -816,7 +816,6 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     );
 
     registry.close_agent(&id).unwrap();
-    let _ = std::fs::remove_file(&ready_marker);
 }
 
 // ---------------------------------------------------------------------------
