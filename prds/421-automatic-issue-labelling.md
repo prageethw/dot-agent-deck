@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status**: In progress — Phases 1 and 2 complete and green in CI; Phase 3 outstanding on the cross-version run, review and merge (PR [#154](https://github.com/prageethw/dot-agent-deck/pull/154))
+**Status**: **Shipped, with one obligation unaccounted for.** Merged 2026-08-09 as [PR #154](https://github.com/prageethw/dot-agent-deck/pull/154) (`c0cd1c8`), first released in **v0.36.1**. Review and merge are done; **M3.1's rule 12 cross-version interop run has no record of having been performed** — see M3.1. Upstream issue [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) remains open. *(Status corrected 2026-08-12: this line read "Phase 3 outstanding on the cross-version run, review and merge" for three days after the merge, which understated what had shipped and overstated what was still pending.)*
 
 ## Problem Statement
 
@@ -106,7 +106,7 @@ The two write points have different claimants and both must be representable: sc
 ### Phase 3: Ship
 
 - [x] **M3.0** — Docs: the vocabulary, what a claim means, and how to read the claimant. *`docs/scheduled-tasks.md`. The pre-existing section "Idempotency: the worktree is the ledger" was **falsified** by this PRD and was rewritten as "Idempotency: three signals, one explicit claim".*
-- [ ] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (touches the daemon and `issue_dispatch`); PR, review, merge, close #421. *Changelog fragment `changelog.d/421.feature.md` landed. Protocol classification settled (see below). Cross-version run, review and merge outstanding.*
+- [x] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (touches the daemon and `issue_dispatch`); PR, review, merge, close #421. *Changelog fragment `changelog.d/421.feature.md` landed. Protocol classification settled (see below). PR #154 reviewed and merged 2026-08-09.* **The cross-version interop run was never recorded as done, and this milestone was ticked at merge without it.** Checked 2026-08-12: nothing in this PRD, PR #154, or the fork's issues records the run being performed or waived. The protocol classification below argues persuasively that no `PROTOCOL_VERSION` bump was needed — but it says in its own words that *"the manual cross-version interop run still applies, since that is what catches a semantic break behind a stable wire."* So the classification is not a substitute for the run, and the run has no evidence. Either perform it against a pre-`v0.36.1` daemon and record the result here, or record an explicit waiver with its reasoning; a milestone ticked on neither is the state rule 12 exists to prevent.
 
 ### Also delivered, beyond the original milestones
 
