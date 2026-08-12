@@ -7840,8 +7840,27 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             mode_config: None,
             orchestration_config: None,
             seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
+            // Fork #122: the dispatcher option is a single-agent card, never
+            // an orchestration -- no worktree slug field exists for it to
+            // resolve, so this preserves today's exact behavior (panes spawn
+            // in `dir`), same as every other non-orchestration branch here.
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
         };
     }
+    // fork #166 reviewer F1: trimmed once here, at the single place every
+    // `NewPaneRequest.name` value is built, so every consumer of `req.name`
+    // downstream (the ownership marker's `creator`, and `display_title`, in
+    // `dispatch_action`) tests blankness and reads content from the same
+    // trimmed value — instead of two consumers independently deciding
+    // whether to trim and silently disagreeing on a whitespace-only Name.
+    // This guarantee holds only by convention — `build_new_pane_request` is
+    // the sole `NewPaneRequest` constructor today, not an enforced
+    // invariant — so a future second constructor that skips this trim would
+    // reintroduce #174 at a site that no longer defends itself (fork #166
+    // N4).
+    let name = form.name.trim().to_string();
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
     // plain "schedule" option it is a throwaway single-agent authoring CARD, but
     // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead
@@ -7856,7 +7875,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         };
         return NewPaneRequest {
             dir: form.dir.clone(),
-            name: form.name.clone(),
+            name: name.clone(),
             command,
             mode_config: None,
             orchestration_config: None,
@@ -7900,7 +7919,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         // the working_dir line.
         return NewPaneRequest {
             dir: form.dir.clone(),
-            name: form.name.clone(),
+            name: name.clone(),
             command,
             mode_config: None,
             orchestration_config: None,
@@ -7915,7 +7934,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         resolve_orchestration_worktree_request(&form.dir, &form.worktree_slug);
     NewPaneRequest {
         dir: form.dir.clone(),
-        name: form.name.clone(),
+        name: name.clone(),
         command: form.command.clone(),
         mode_config: form.selected_mode().cloned(),
         orchestration_config: form.selected_orchestration().cloned(),
@@ -9562,23 +9581,41 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
-                            // issue #425: name the orchestration that
-                            // created this worktree, using the canonical
-                            // config name (not the form name — see the
-                            // "do NOT overwrite orch_config.name" note
-                            // below) so the marker matches the identity the
-                            // daemon itself uses. `load_project_config`
-                            // normalises an empty `name` to the dir
-                            // basename at load time
+                            // fork #166: name the ownership marker's creator
+                            // with the typed instance Name (`req.name` — the
+                            // same value that becomes `display_title` below,
+                            // trimmed once in `build_new_pane_request` so
+                            // both consumers test blankness and read content
+                            // from the identical value; reviewer F1) when
+                            // one was typed, since that is what distinguishes
+                            // two live orchestrations of the same config
+                            // type. Fall back to the canonical config name —
+                            // as issue #425 originally did — when no typed
+                            // Name was given. The blankness test below is on
+                            // an already-trimmed value (fork issue #174: a
+                            // whitespace-only name must fall back too, not
+                            // become the identity) rather than the bare
+                            // `is_empty()` #174 flags elsewhere. This
+                            // fallback is deliberate and interim: this PRD's
+                            // M1.0 will make the Name required and unique,
+                            // at which point the blank case becomes
+                            // unreachable, but M1.0 is not built yet.
+                            //
+                            // `load_project_config` normalises an empty
+                            // `name` to the dir basename at load time
                             // (`src/project_config.rs:268-272`, via
                             // `resolve_orchestration_name`), and this form's
                             // orchestration list comes from that same
-                            // loader — so `orch_config.name` is non-empty
-                            // by construction and this arm is unreachable
-                            // in production. It stays as defence-in-depth,
-                            // purely so a future constructor that bypasses
-                            // the loader can't write a bare `orchestration:`.
-                            let creator = if orch_config.name.is_empty() {
+                            // loader — so `orch_config.name` is non-empty by
+                            // construction and the inner `orch_config.name
+                            // .is_empty()` arm is unreachable in production.
+                            // It stays as defence-in-depth, purely so a
+                            // future constructor that bypasses the loader
+                            // can't write a bare `orchestration:`.
+                            let typed_name = req.name.as_str();
+                            let creator = if !typed_name.is_empty() {
+                                format!("orchestration:{typed_name}")
+                            } else if orch_config.name.is_empty() {
                                 "orchestration:unknown".to_string()
                             } else {
                                 format!("orchestration:{}", orch_config.name)
@@ -30158,6 +30195,118 @@ mod tests {
         for cwd in st.pane_cwd_map.values() {
             assert_eq!(cwd, &worktree_str);
         }
+    }
+
+    /// Scenario: Two SEPARATE live orchestrations, both of the SAME config
+    /// type (`make_orchestration("review")`, dispatched independently) but
+    /// each given a DISTINCT typed Name -- the state M1.0 makes required and
+    /// unique, so this is the only fixture shape M1.0 permits -- are each
+    /// spawned through the real `Action::SpawnPane` path against their own
+    /// sibling worktree. On `main` today the interactive path (this file's
+    /// `SpawnPane` handler) derives the ownership marker's creator identity
+    /// from `orch_config.name` alone (`format!("orchestration:{}",
+    /// orch_config.name)`), ignoring the typed Name entirely, so two
+    /// `review`-type orchestrations both record the identical owner
+    /// `orchestration:review` even though their typed Names differ -- their
+    /// worktrees are indistinguishable by owner. That is not a gap in #173:
+    /// its scope is WHICH TASK created a worktree (provenance), not WHICH
+    /// INSTANCE. Fork #166 adds instance identity, so the two recorded
+    /// owners must differ. This pins the PROPERTY (distinctness), not the
+    /// spelling -- the fix is expected to replace `orch_config.name` with
+    /// the typed unique identity whose exact string this test does not
+    /// predict.
+    #[spec("worktree/reclaim/022")]
+    #[test]
+    fn worktree_reclaim_022_two_orchestrations_of_the_same_config_type_with_distinct_names_record_distinct_owners()
+     {
+        fn spawn_and_read_owner(
+            tmp: &std::path::Path,
+            repo: &std::path::Path,
+            suffix: &str,
+            name: &str,
+        ) -> Option<String> {
+            let worktree = tmp.join(format!("repo-{suffix}"));
+            let config = make_orchestration("review");
+            let req = NewPaneRequest {
+                dir: repo.to_path_buf(),
+                name: name.to_string(),
+                command: String::new(),
+                mode_config: None,
+                orchestration_config: Some(config.clone()),
+                seed_prompt: None,
+                orchestration_worktree_path: Some(worktree.clone()),
+                orchestration_worktree_slug: None,
+                orchestration_worktree_error: None,
+            };
+
+            let pc = Arc::new(CapturingPaneController::new());
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let snapshot = AppState::default();
+
+            let _ = dispatch_action(
+                Action::SpawnPane(Box::new(req)),
+                &mut ui,
+                pc.as_ref(),
+                &state,
+                &mut tm,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 200, 50),
+            );
+
+            assert!(
+                worktree.is_dir(),
+                "SpawnPane must have created the worktree on disk at {}",
+                worktree.display()
+            );
+
+            crate::worktree_reclaim::owner_of(repo, &worktree)
+        }
+
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree_022 fixture\n").expect("write README");
+        run_git(&["add", "-A"]);
+        // CI runners carry no global git identity; pin it inline so the
+        // commit succeeds regardless of host config.
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let owner_a =
+            spawn_and_read_owner(tmp.path(), &repo, "instance-a", "review-orchestrator-1");
+        let owner_b =
+            spawn_and_read_owner(tmp.path(), &repo, "instance-b", "review-orchestrator-2");
+
+        assert_ne!(
+            owner_a, owner_b,
+            "two live orchestrations of the same config type ('review') must record \
+             DISTINCT owners in their respective worktree markers, got {owner_a:?} and \
+             {owner_b:?} -- on main today both format `orchestration:{{name}}` from the \
+             shared config name, making per-instance ownership indistinguishable"
+        );
     }
 
     /// Scenario: Call `resolve_orchestration_worktree_path` with four slugs,
