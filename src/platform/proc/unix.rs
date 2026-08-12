@@ -172,6 +172,67 @@ fn signal_child_pgroup_or_fallback(
     true
 }
 
+/// Fork issue #163 rework: observe whether the process named by `pid` has
+/// exited, **without reaping it**. `try_wait`'s underlying `waitpid(WNOHANG)`
+/// reaps as a side effect of merely checking, which releases the pid back to
+/// the kernel for recycling before the caller gets a chance to signal its
+/// group — the exact hazard this issue is about. `libc::waitid` with
+/// `WNOWAIT` reports the same exit `try_wait` would, but leaves the process a
+/// zombie, which keeps its process group reserved for as long as the caller
+/// needs it (POSIX keeps a process group alive while any member is within
+/// its process lifetime, and a zombie still is — see
+/// `signal_child_pgroup_or_fallback` and `spawn_in_new_process_group`'s
+/// `setsid`, which is what makes this pid equal its own pgid).
+///
+/// Returns `Ok(true)` once `pid` has exited, `Ok(false)` while it is still
+/// running. A `waitid` failure is returned as `Err` rather than guessed at;
+/// the caller distinguishes `ECHILD` (meaning `pid` was already reaped by
+/// something else) from any other error, since only `ECHILD` legitimately
+/// means "stop polling" — see this function's precondition below.
+///
+/// # Precondition: the caller must be the sole reaper of `pid`
+///
+/// The pid-recycling safety this function exists to provide (fork #163)
+/// depends entirely on **nothing else in this process reaping `pid` between
+/// this peek and the caller's own unconditional signal-and-reap step**. As
+/// of this writing that holds: there is no wildcard `waitpid(-1, …)`
+/// anywhere in the process, `SIGCHLD` is never set to `SIG_IGN`, no
+/// exit-watcher thread calls `wait()` on an agent's child, and tokio's
+/// process driver only reaps children it owns via per-pid `try_wait`, never
+/// a wildcard wait. If a future change introduces any of those — a
+/// `waitpid(-1)` reaper, a `SIG_IGN` on `SIGCHLD`, or a per-agent wait
+/// thread — this function's `ECHILD` arm silently stops being "already
+/// reaped, safe to signal anyway" and starts being exactly the recycled-pid
+/// hazard fork #163 was about, with no test or comment left to object.
+pub fn peek_child_exited_without_reaping(pid: u32) -> std::io::Result<bool> {
+    // SAFETY: `waitid` is async-signal-safe. `info` is zeroed before the
+    // call because a successful `WNOHANG` call that finds no reportable
+    // state change is documented to leave `si_pid` untouched rather than
+    // zeroing it itself (a known kernel quirk, not specific to this
+    // codebase) — zeroing here first is what makes `si_pid() == pid` a
+    // reliable "did anything happen" signal instead of stale stack memory.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `&mut info` is a valid, uniquely-owned `siginfo_t` for the
+    // duration of this call; `WNOWAIT` means the kernel only reports state,
+    // it does not reap, so this cannot race any other reaper of `pid`.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `info` was just populated by the successful `waitid` call
+    // above (or left at its zeroed default when nothing changed), and
+    // `si_pid` is the field `waitid`'s `SIGCHLD`-shaped report always uses.
+    let observed_pid = unsafe { info.si_pid() };
+    Ok(observed_pid == pid as libc::pid_t)
+}
+
 /// Forcefully terminate the child *and every descendant in its process group*
 /// with SIGKILL and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
