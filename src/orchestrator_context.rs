@@ -348,8 +348,39 @@ mod tests {
     #[spec("orchestration/delegate/032")]
     #[test]
     fn delegate_032_orchestrator_context_names_the_running_binary() {
+        // `binary_name()`'s $PATH-resolvability gate would otherwise always
+        // take the fallback branch under `cargo test` (the throwaway test
+        // binary is never on $PATH), which is exactly what would make the
+        // `assert_ne!` below fail instead of prove anything. See
+        // `DOT_AGENT_DECK_TEST_BINARY_ON_PATH`'s doc comment.
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH).ok();
+        // SAFETY: env-var lock held; restored below.
+        unsafe {
+            std::env::set_var(
+                crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
+                "1",
+            );
+        }
+
         let c = build_orchestrator_context(&config());
         let bin = crate::platform::paths::binary_name();
+
+        // SAFETY: same lock held; restoring the previous value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(
+                    crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
+                    v,
+                ),
+                None => {
+                    std::env::remove_var(crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH)
+                }
+            }
+        }
+
         assert_ne!(
             bin, "dot-agent-deck",
             "this test only proves anything when the test binary's own file name differs \
@@ -362,6 +393,17 @@ mod tests {
         assert!(
             c.contains(&format!("{bin} work-done --done")),
             "the work-done examples must name the running binary ({bin:?}), got: {c}"
+        );
+        // Reviewer finding F6: pin the ABSENCE of the old literal too, so a
+        // later edit that reintroduces a hardcoded `dot-agent-deck` example
+        // fails this test instead of staying green alongside the dynamic one.
+        assert!(
+            !c.contains("dot-agent-deck delegate --to"),
+            "a hardcoded literal must not appear in the delegate examples, got: {c}"
+        );
+        assert!(
+            !c.contains("dot-agent-deck work-done --done"),
+            "a hardcoded literal must not appear in the work-done examples, got: {c}"
         );
     }
 }

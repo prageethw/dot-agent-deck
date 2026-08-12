@@ -4691,9 +4691,39 @@ mod tests {
     #[spec("orchestration/delegate/033")]
     #[test]
     fn delegate_033_work_done_footer_names_the_running_binary() {
+        // See the identical guard in `orchestrator_context::delegate_032...`:
+        // `binary_name()`'s $PATH-resolvability gate would otherwise always
+        // take the fallback branch under `cargo test`, which is exactly what
+        // would make the `assert_ne!` below fail instead of prove anything.
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH).ok();
+        // SAFETY: env-var lock held; restored below.
+        unsafe {
+            std::env::set_var(
+                crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
+                "1",
+            );
+        }
+
         let content =
             compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
         let bin = crate::platform::paths::binary_name();
+
+        // SAFETY: same lock held; restoring the previous value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(
+                    crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
+                    v,
+                ),
+                None => {
+                    std::env::remove_var(crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH)
+                }
+            }
+        }
+
         assert_ne!(
             bin, "dot-agent-deck",
             "this test only proves anything when the test binary's own file name differs \
@@ -4706,6 +4736,17 @@ mod tests {
         assert!(
             content.contains(&format!("{bin} work-done --task \"")),
             "the inline --task example must name the running binary ({bin:?}), got: {content}"
+        );
+        // Reviewer finding F6: pin the ABSENCE of the old literal too, so a
+        // later edit that reintroduces a hardcoded `dot-agent-deck` example
+        // fails this test instead of staying green alongside the dynamic one.
+        assert!(
+            !content.contains("dot-agent-deck work-done --task-file"),
+            "a hardcoded literal must not appear in the --task-file example, got: {content}"
+        );
+        assert!(
+            !content.contains("dot-agent-deck work-done --task \""),
+            "a hardcoded literal must not appear in the inline --task example, got: {content}"
         );
     }
 

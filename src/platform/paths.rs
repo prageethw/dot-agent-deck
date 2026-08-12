@@ -264,31 +264,120 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// the deck **by name through `$PATH`** (the `delegate` / `work-done` CLI
 /// examples in `orchestrator_context::build_orchestrator_context` and
 /// `state::work_done_footer`). A build installed under a different file name
-/// (a renamed copy, or invoked through a symlink whose target resolves to a
-/// different real name) must generate instructions naming ITSELF, not a
-/// baked-in literal — otherwise the generated command resolves to a
-/// different binary than the one that wrote it.
+/// must generate instructions naming ITSELF, not a baked-in literal —
+/// otherwise the generated command resolves to a different binary than the
+/// one that wrote it.
 ///
-/// Falls back to [`DEFAULT_BINARY_NAME`] when `current_exe()` errors, or its
-/// file name is empty or not valid UTF-8. The fallback matters more here than
-/// at most other `current_exe()` call sites: `delegate` and `work-done` write
-/// to the unversioned hook socket, both call sites are fire-and-forget, and
-/// the daemon drops any frame it cannot parse without logging it — so a name
-/// that resolves to a binary that cannot run produces no error anywhere, only
-/// a signal that silently never arrives.
+/// **Symlink resolution is platform-dependent — this is a fact about the
+/// platform, not a choice this function makes, and any doc comment asserting
+/// a single cross-platform behavior here is wrong on one of the two.** On
+/// macOS `current_exe()` is backed by `_NSGetExecutablePath`, which reports
+/// the path the process was INVOKED as: a symlink stays a symlink, confirmed
+/// directly (not assumed) with a four-way probe on this crate's dev machine
+/// covering direct invocation, a same-directory symlink, an absolute-target
+/// symlink in another directory, and `$PATH` lookup of a symlink name — all
+/// four returned the symlink's own path, never the target. On Linux
+/// `current_exe()` reads `/proc/self/exe`, which the kernel resolves fully: a
+/// symlink returns its TARGET's path. So `~/bin/deck ->
+/// /opt/x/dot-agent-deck` generates `deck` (still on `$PATH`) on macOS but
+/// `dot-agent-deck` (possibly not on `$PATH` at all) on Linux, for the exact
+/// same install.
+///
+/// Two gates keep the resolved name usable rather than merely well-formed
+/// (issue #253 review/audit):
+///
+/// - **`$PATH`-resolvability.** The resolved file name is used ONLY when it
+///   actually resolves via a `$PATH` lookup ([`resolves_on_path`]); otherwise
+///   this falls back to [`DEFAULT_BINARY_NAME`]. `wrap.rs`'s
+///   `deck_binary_for_wrap` already documents the policy this crate commits
+///   to for "which name do I tell an agent to run": *"behaviour only ever
+///   improves on what `$PATH` would have found."* Without this gate, a build
+///   renamed but not installed on `$PATH` would regress from "resolves to
+///   the wrong-but-runnable literal, by accident" to "resolves to nothing at
+///   all" — trading a case that happened to work for one that silently never
+///   does, which is precisely the failure this function exists to eliminate.
+/// - **Shell safety.** A name outside [`is_safe_binary_name`]'s conservative
+///   allowlist is rejected — not quoted — for the same reason `wrap.rs`'s
+///   `usable()` rejects rather than quotes: this name is interpolated
+///   UNQUOTED into ```` ```bash ```` blocks an agent executes verbatim, and
+///   quoting an unsafe name would still resolve to nothing on a normal
+///   `$PATH` — converting an injection into a silent no-op rather than a
+///   name that at least works.
+///
+/// Falls back to [`DEFAULT_BINARY_NAME`] when `current_exe()` errors, its
+/// file name is empty or not valid UTF-8, it fails the shell-safety check, or
+/// it does not resolve on `$PATH`. The fallback matters more here than at
+/// most other `current_exe()` call sites: `delegate` and `work-done` write to
+/// the unversioned hook socket, both call sites are fire-and-forget, and the
+/// daemon drops any frame it cannot parse without logging it — so a name
+/// that resolves to a binary that cannot run produces no error anywhere,
+/// only a signal that silently never arrives.
 pub fn binary_name() -> String {
-    resolve_binary_name(std::env::current_exe())
+    resolve_binary_name(std::env::current_exe(), resolves_on_path)
 }
 
-/// Pure seam behind [`binary_name`], so the fallback branch is unit-testable
-/// without needing a `current_exe()` that actually fails.
-fn resolve_binary_name(current_exe: std::io::Result<PathBuf>) -> String {
+/// Pure seam behind [`binary_name`]. `resolves_on_path` is injected so both
+/// the malformed-input fallback ([`delegate/034`]) and the two usability
+/// gates (shell safety, `$PATH` resolvability) are unit-testable with a
+/// synthetic `current_exe()` and a synthetic resolver, without needing a
+/// real unusable `current_exe()` or a real `$PATH` entry.
+fn resolve_binary_name(
+    current_exe: std::io::Result<PathBuf>,
+    resolves_on_path: impl Fn(&str) -> bool,
+) -> String {
     current_exe
         .ok()
         .and_then(|path| path.file_name().map(|name| name.to_os_string()))
         .and_then(|name| name.into_string().ok())
-        .filter(|name| !name.is_empty())
+        .filter(|name| is_safe_binary_name(name))
+        .filter(|name| resolves_on_path(name))
         .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
+}
+
+/// Whether `name` is safe to interpolate UNQUOTED into the generated `bash`
+/// command examples [`binary_name`] feeds (issue #253 review F2 / audit F1):
+/// a conservative ALLOWLIST rather than a denylist, since the failure mode
+/// this guards against is an agent's shell reinterpreting whatever falls
+/// outside it. Rejects an empty name, a leading `-` (would be read as a flag
+/// by whatever runs the generated line), and anything outside ASCII
+/// alphanumerics plus `-`, `_`, `.`, `+` — which also rejects the mundane
+/// motivating cases (`dot-agent-deck (1)` from a browser download,
+/// `dot-agent-deck copy` from a Finder duplicate) alongside the adversarial
+/// ones (`;`, `` ` ``, `$`, a literal newline).
+fn is_safe_binary_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+}
+
+/// Test-only override: when set to a non-empty value, [`binary_name`]'s
+/// `$PATH`-resolvability gate ([`resolves_on_path`]) is treated as satisfied
+/// unconditionally. Production never sets it.
+///
+/// `cargo test`/`cargo nextest` compiles each test into its own throwaway
+/// binary under `target/<profile>/deps/`, which is never actually
+/// discoverable on `$PATH` — so without this escape hatch, `binary_name()`
+/// would ALWAYS take the fallback branch under test, which would make
+/// `orchestration/delegate/032`/`033` (which assert that the RUNNING
+/// binary's own name — not the fallback — propagates into generated text)
+/// either vacuous or permanently red. Same pattern as `wrap.rs`'s
+/// `DOT_AGENT_DECK_WRAP_BIN`; nextest gives each test its own process, so
+/// setting this for one test's duration cannot leak into another.
+pub const DOT_AGENT_DECK_TEST_BINARY_ON_PATH: &str = "DOT_AGENT_DECK_TEST_BINARY_ON_PATH";
+
+/// Whether `name` resolves via a `$PATH` lookup — the real resolver
+/// [`binary_name`] injects into [`resolve_binary_name`]. Checked with a bare
+/// existence probe (`is_file()`), matching `wrap.rs`'s `usable()` precedent
+/// rather than also requiring the execute bit: the value here is read-only
+/// generated text, not something this process itself spawns.
+fn resolves_on_path(name: &str) -> bool {
+    if std::env::var(DOT_AGENT_DECK_TEST_BINARY_ON_PATH).is_ok_and(|v| !v.is_empty()) {
+        return true;
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 /// Hook-ingestion endpoint. Unix: a Unix-domain-socket path
@@ -497,13 +586,17 @@ mod tests {
     #[spec("orchestration/delegate/034")]
     #[test]
     fn delegate_034_binary_name_falls_back_to_the_default_literal_when_current_exe_is_unusable() {
+        // The resolver is irrelevant to every case here — each fails before
+        // `resolve_binary_name` would ever consult it — so an always-true
+        // stub isolates that these are genuinely malformed-input failures,
+        // not incidental `$PATH`/shell-safety rejections.
         assert_eq!(
-            resolve_binary_name(Err(std::io::Error::other("no such process"))),
+            resolve_binary_name(Err(std::io::Error::other("no such process")), |_| true),
             DEFAULT_BINARY_NAME,
             "an current_exe() error must fall back to the default literal"
         );
         assert_eq!(
-            resolve_binary_name(Ok(PathBuf::from("/"))),
+            resolve_binary_name(Ok(PathBuf::from("/")), |_| true),
             DEFAULT_BINARY_NAME,
             "a path with no file name component must fall back to the default literal"
         );
@@ -514,11 +607,69 @@ mod tests {
             // 0xFF is not valid UTF-8 in any position, so `into_string()` fails.
             let invalid = OsStr::from_bytes(&[0xFF]);
             assert_eq!(
-                resolve_binary_name(Ok(PathBuf::from("/usr/local/bin").join(invalid))),
+                resolve_binary_name(Ok(PathBuf::from("/usr/local/bin").join(invalid)), |_| true),
                 DEFAULT_BINARY_NAME,
                 "a non-UTF-8 file name must fall back to the default literal"
             );
         }
+    }
+
+    /// Reviewer finding F5: nothing previously pinned the SUCCESS branch, so
+    /// a `resolve_binary_name` that returned the full path (instead of just
+    /// the file name) would have passed the entire suite — every other test
+    /// only exercises fallback inputs. This asserts the happy path returns a
+    /// BARE file name, not an absolute path.
+    #[test]
+    fn resolve_binary_name_returns_the_bare_file_name_on_the_success_path() {
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/usr/local/bin/deck-x")), |_| true),
+            "deck-x",
+            "the success branch must return a bare file name, not the full path"
+        );
+    }
+
+    /// Reviewer F2 / auditor F1: a well-formed name that WOULD resolve on
+    /// `$PATH` must still fall back when it is not shell-safe — the
+    /// shell-safety gate has to reject independently of the `$PATH` gate,
+    /// not rely on an unsafe name also happening to be absent from `$PATH`.
+    #[test]
+    fn resolve_binary_name_falls_back_when_the_name_is_shell_unsafe() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("/usr/local/bin/dot-agent-deck (1)")),
+                |_| true
+            ),
+            DEFAULT_BINARY_NAME,
+            "a name containing shell metacharacters must fall back even when it resolves \
+             on $PATH"
+        );
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("/usr/local/bin/dot-agent-deck copy")),
+                |_| true
+            ),
+            DEFAULT_BINARY_NAME,
+            "a name containing whitespace must fall back (the Finder-duplicate case)"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/usr/local/bin/-rf")), |_| true),
+            DEFAULT_BINARY_NAME,
+            "a name with a leading '-' must fall back — it would be read as a flag"
+        );
+    }
+
+    /// Reviewer F1 / auditor F1 (the pre-merge fix): a well-formed, shell-safe
+    /// name that does NOT resolve on `$PATH` must fall back rather than
+    /// emitting an unrunnable command — this is the case that regressed from
+    /// "wrong but runnable by accident" to "resolves to nothing" before the
+    /// gate existed.
+    #[test]
+    fn resolve_binary_name_falls_back_when_the_name_is_not_on_path() {
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/opt/build/worker-agent-deck")), |_| false),
+            DEFAULT_BINARY_NAME,
+            "a well-formed name that does not resolve on $PATH must fall back"
+        );
     }
 
     /// The Windows per-user pipe segment must be a *non-colliding*, namespace-safe
