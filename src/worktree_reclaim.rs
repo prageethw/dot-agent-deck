@@ -196,6 +196,52 @@ pub struct WorktreeReport {
     pub real_path: PathBuf,
 }
 
+/// Reports where the on-disk marker names `owner`, but the independent
+/// `owned` resolution says otherwise (issue #221). `ownership_of` and
+/// `owner_of` each spawn their own `git rev-parse`s to answer a related but
+/// distinct question, and `owner_of`'s own doc records that under
+/// concurrent worktree-admin-dir writes the two can disagree: `owned=false`
+/// landing alongside a non-`None` `owner`. `worktree list --mine`'s retain
+/// filter (`src/main.rs`) correctly excludes such a row -- `owned` must stay
+/// a conjunct, not a relaxation -- but excluding it silently turns a
+/// disagreement into indistinguishable-from-"nothing found", which is worse
+/// than surfacing it. Callers use this to warn on stderr before filtering,
+/// never to change what gets filtered.
+pub fn owner_disagreements<'a>(reports: &'a [WorktreeReport], owner: &str) -> Vec<&'a Path> {
+    reports
+        .iter()
+        .filter(|r| !r.owned && r.owner.as_deref() == Some(owner))
+        .map(|r| r.real_path.as_path())
+        .collect()
+}
+
+/// The `--mine` fail-closed predicate (PR #215 round-1 reviewer F4 / auditor
+/// L1 item 3): a row counts as "mine" only when `owned` AND the marker's
+/// `owner` matches -- `owned` must stay a conjunct, never dropped, or a
+/// foreign worktree whose marker happens to name this caller would pass.
+/// Extracted (issue #221 review round) so `run_worktree_list_cli`'s retain
+/// and its test share one definition instead of two independently typed
+/// copies of the same predicate that could silently drift apart.
+pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
+    report.owned && report.owner.as_deref() == Some(owner)
+}
+
+/// Formats the issue #221 disagreement warning printed by `--mine` before
+/// filtering. Pulled out of `run_worktree_list_cli` so the exact
+/// user-visible text is assertable by a unit test without needing to stage
+/// the `owned_git_dir` race that produces the state it describes (that state
+/// cannot be reached through the real-binary `Fixture` -- see
+/// `tests/CATALOG.md`'s `worktree/reclaim/030` entry).
+pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
+    format!(
+        "worktree list --mine: {path} is marked owned by {owner}, but the ownership check \
+         disagrees -- excluding it rather than trusting either signal (often a `git \
+         rev-parse` race; persisting past a re-run rules that out -- check the marker and \
+         admin dir)",
+        path = path.display()
+    )
+}
+
 /// Top-level `--json` document.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeListDocument {
@@ -535,10 +581,10 @@ fn read_marker_owner(marker_path: &Path) -> Option<String> {
 /// disagreement was accepted as cosmetic because "no consumer treats
 /// `owner`'s mere presence as an ownership signal." That is no longer
 /// true — `worktree list --mine` (`src/main.rs::run_worktree_list_cli`) is
-/// exactly such a consumer as of this PR, and now filters on `r.owned &&
-/// r.owner == Some(..)` rather than `owner` alone, so a foreign worktree
-/// whose marker happens to read back a matching identity is excluded
-/// rather than reported as mine.
+/// exactly such a consumer as of this PR, and now filters through
+/// [`is_mine`] rather than `owner` alone, so a foreign worktree whose
+/// marker happens to read back a matching identity is excluded rather
+/// than reported as mine.
 ///
 /// [`examine_worktrees`] calls this immediately after [`ownership_of`], with
 /// no I/O of any kind — no `gh` call, no other filesystem work — in between,
@@ -2072,6 +2118,131 @@ mod tests {
             Some(&DASH),
             "the OWNER column must render the existing DASH placeholder for a report whose \
              owner is None; got row: {legacy_row:?}"
+        );
+    }
+
+    /// Scenario: Five `WorktreeReport`s are constructed directly -- one
+    /// whose marker names `orch-x` but whose independent `owned` resolution
+    /// came back `false` (the issue #221 disagreement shape), one genuinely
+    /// owned by `orch-x`, one owned by a different name entirely, one
+    /// `owned: false` with that different name, and one `owned: false` with
+    /// no marker owner at all (the ordinary shape of an unmarked foreign
+    /// worktree). `owner_disagreements` must return exactly the first
+    /// report's path -- not the two other `owned: false` rows, which would
+    /// leak if the owner half of the predicate were ever dropped -- and the
+    /// shared `is_mine` predicate that `run_worktree_list_cli`'s retain also
+    /// calls must keep excluding the disagreeing row afterward, pinning
+    /// that surfacing the disagreement never relaxes the fail-closed
+    /// filter. The exact stderr text `format_disagreement_warning` produces
+    /// for the disagreeing row is asserted too.
+    #[spec("worktree/reclaim/036")]
+    #[test]
+    fn worktree_reclaim_036_owner_disagreements_finds_owned_false_with_matching_owner() {
+        let disagreeing = WorktreeReport {
+            path: PathBuf::from("/repo/wt-disagree"),
+            branch: Some("feat/disagree".to_string()),
+            clean: true,
+            owned: false,
+            owner: Some("orch-x".to_string()),
+            pr_state: "unknown".to_string(),
+            verdict: "keep".to_string(),
+            reason: None,
+            real_path: PathBuf::from("/repo/wt-disagree"),
+        };
+        let genuinely_owned = WorktreeReport {
+            path: PathBuf::from("/repo/wt-owned"),
+            branch: Some("feat/owned".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("orch-x".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: PathBuf::from("/repo/wt-owned"),
+        };
+        let different_owner = WorktreeReport {
+            path: PathBuf::from("/repo/wt-other"),
+            branch: Some("feat/other".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("orch-y".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: PathBuf::from("/repo/wt-other"),
+        };
+        // P2-1: without these two, an owner-blind `owner_disagreements` --
+        // e.g. `filter(|r| !r.owned)` -- would still pass this test, because
+        // the only other `owned: false` row already matches "orch-x". These
+        // two carry `owned: false` under a DIFFERENT owner and under no
+        // owner at all, so an owner-blind implementation would wrongly pull
+        // them into the disagreement list too.
+        let owned_false_different_owner = WorktreeReport {
+            path: PathBuf::from("/repo/wt-foreign-marked"),
+            branch: Some("feat/foreign-marked".to_string()),
+            clean: true,
+            owned: false,
+            owner: Some("orch-y".to_string()),
+            pr_state: "unknown".to_string(),
+            verdict: "keep".to_string(),
+            reason: None,
+            real_path: PathBuf::from("/repo/wt-foreign-marked"),
+        };
+        let owned_false_no_owner = WorktreeReport {
+            path: PathBuf::from("/repo/wt-unmarked"),
+            branch: Some("feat/unmarked".to_string()),
+            clean: true,
+            owned: false,
+            owner: None,
+            pr_state: "unknown".to_string(),
+            verdict: "keep".to_string(),
+            reason: None,
+            real_path: PathBuf::from("/repo/wt-unmarked"),
+        };
+        let reports = vec![
+            disagreeing.clone(),
+            genuinely_owned.clone(),
+            different_owner.clone(),
+            owned_false_different_owner.clone(),
+            owned_false_no_owner.clone(),
+        ];
+
+        let disagreements = owner_disagreements(&reports, "orch-x");
+        assert_eq!(
+            disagreements,
+            vec![Path::new("/repo/wt-disagree")],
+            "owner_disagreements must return exactly the row whose owner matches but whose \
+             owned flag is false, not the genuinely-owned row, the different-owner row, or \
+             either owned:false row belonging to someone else or no one"
+        );
+
+        // P2-2 / F3: assert against the SAME `is_mine` predicate
+        // `run_worktree_list_cli`'s retain calls, not a hand-written copy --
+        // a copy would stay green even if production later dropped the
+        // `owned` conjunct.
+        let filtered: Vec<&str> = reports
+            .iter()
+            .filter(|r| is_mine(r, "orch-x"))
+            .map(|r| r.path.to_str().expect("test path is valid UTF-8"))
+            .collect();
+        assert_eq!(
+            filtered,
+            vec!["/repo/wt-owned"],
+            "is_mine must still exclude the disagreeing row -- surfacing the disagreement must \
+             never relax what gets filtered"
+        );
+
+        // P3-4 / P3-6: pin the exact user-visible stderr text, including the
+        // likely-cause/remedy clause, for the one path this test can prove
+        // triggers it.
+        assert_eq!(
+            format_disagreement_warning(Path::new("/repo/wt-disagree"), "orch-x"),
+            "worktree list --mine: /repo/wt-disagree is marked owned by orch-x, but the \
+             ownership check disagrees -- excluding it rather than trusting either signal \
+             (often a `git rev-parse` race; persisting past a re-run rules that out -- check \
+             the marker and admin dir)",
+            "the disagreement warning's user-visible text must name the path and owner, state \
+             what disagreed, and give a likely cause with a remedy"
         );
     }
 }
