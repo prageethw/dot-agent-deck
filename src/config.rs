@@ -293,6 +293,19 @@ pub struct OrchestrationSnapshot {
     /// (the title then falls back to the resolved canonical name on restore).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
+    /// Fork #166 M3.0 / PR #215 fixup: the exact creator string this
+    /// orchestration stamped into its worktree marker and every role pane's
+    /// `DOT_AGENT_DECK_WORKTREE_OWNER` when it created a worktree
+    /// (`orchestration_creator_string`'s output) — captured here so restore
+    /// can carry the identity forward instead of fabricating or losing it.
+    /// `None` when this orchestration owned no worktree (started directly
+    /// in `main`), matching `AgentSpawnOptions::owner`'s own `None` case.
+    /// `#[serde(default)]` like every other field here: a snapshot written
+    /// before this field existed loads with `None`, so a tab reopened after
+    /// upgrading mid-session restores with no identity and `--mine` refuses
+    /// loudly rather than guessing — see `docs/orchestration.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1406,12 +1419,17 @@ command = "vim"
 
     /// Scenario: Build a `SavedSession` whose single pane carries an
     /// `OrchestrationSnapshot` (3 roles in display order, a start-role cursor,
-    /// an orchestrator prompt, the resolved config name + project path, and a
-    /// started-roles list), serialize it to TOML and deserialize it back —
-    /// asserting every orchestration field round-trips intact. Then deserialize
-    /// a legacy `session.toml` string that has NO `orchestration` key and
-    /// assert the pane still parses with `orchestration == None`, proving the
-    /// `#[serde(default)]` forward-compat guarantee for old snapshots.
+    /// an orchestrator prompt, the resolved config name + project path, a
+    /// started-roles list, and — fork #166 M3.0 — a persisted `owner`
+    /// identity string), serialize it to TOML and deserialize it back —
+    /// asserting every orchestration field round-trips intact, `owner`
+    /// included. Then deserialize two backward-compat `session.toml`
+    /// strings: one with NO `orchestration` key at all, and one WITH an
+    /// `[panes.orchestration]` block but no `owner` key (a snapshot written
+    /// before this field existed) — asserting both still parse, the first
+    /// with `orchestration == None` and the second with `owner == None`,
+    /// proving the `#[serde(default)]` forward-compat guarantee for both the
+    /// whole block and the new field individually.
     #[spec("config/saved-session/001")]
     #[test]
     fn saved_session_001_orchestration_serde_round_trip_and_legacy_parse() {
@@ -1435,6 +1453,7 @@ command = "vim"
                     project_path: "/repo/app".to_string(),
                     started_role_indices: vec![0, 1],
                     display_title: Some("My TDD Run".to_string()),
+                    owner: Some("orchestration:tdd-cycle".to_string()),
                 }),
             }],
             last_command: None,
@@ -1462,6 +1481,7 @@ command = "vim"
         assert_eq!(orch.project_path, "/repo/app");
         assert_eq!(orch.started_role_indices, vec![0, 1]);
         assert_eq!(orch.display_title.as_deref(), Some("My TDD Run"));
+        assert_eq!(orch.owner.as_deref(), Some("orchestration:tdd-cycle"));
 
         // (b) A legacy session.toml predating the orchestration field still
         // parses, with orchestration == None (the #[serde(default)] guarantee).
@@ -1477,6 +1497,36 @@ command = "vim"
         assert!(
             legacy_loaded.panes[0].orchestration.is_none(),
             "a legacy snapshot with no orchestration key must parse with orchestration == None"
+        );
+
+        // (c) Fork #166 M3.0: an orchestration snapshot written BEFORE the
+        // `owner` field existed (has `[panes.orchestration]` but no `owner`
+        // key) must still parse, with `owner == None` — the honest
+        // "no identity captured" outcome for a pre-upgrade snapshot, not a
+        // parse failure.
+        let pre_owner_field = r#"
+[[panes]]
+dir = "/repo/app"
+name = "orchestrator"
+command = "claude"
+
+[panes.orchestration]
+version = 1
+roles = ["orchestrator", "coder"]
+start_role_index = 0
+orchestrator_prompt = ""
+config_name = "tdd-cycle"
+project_path = "/repo/app"
+"#;
+        let pre_owner_loaded: SavedSession = toml::from_str(pre_owner_field).unwrap();
+        let pre_owner_orch = pre_owner_loaded.panes[0]
+            .orchestration
+            .as_ref()
+            .expect("orchestration block must still parse without an owner key");
+        assert!(
+            pre_owner_orch.owner.is_none(),
+            "a pre-M3.0 snapshot with no owner key must restore with owner == None, \
+             not a fabricated or defaulted identity"
         );
     }
 

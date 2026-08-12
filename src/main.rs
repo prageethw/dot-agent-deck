@@ -417,6 +417,14 @@ enum WorktreeCmd {
         /// instead of the human table.
         #[arg(long)]
         json: bool,
+        /// Fork #166 M3.0: list only worktrees this orchestration created,
+        /// determined by matching each worktree's marker owner against
+        /// `DOT_AGENT_DECK_WORKTREE_OWNER`. Fails loudly (non-zero exit) if
+        /// the variable is absent or set to the `orchestration:unknown`
+        /// sentinel, rather than silently returning everything or nothing —
+        /// a wrong answer here hands one orchestration another's worktree.
+        #[arg(long)]
+        mine: bool,
     },
     /// Remove every merged, clean worktree the deck can PROVE it created and
     /// which holds no gitignored content; list the rest for confirmation. A
@@ -1444,7 +1452,7 @@ fn main() -> ExitCode {
             }
         },
         Some(Commands::Worktree { cmd }) => match cmd {
-            WorktreeCmd::List { json } => run_worktree_list_cli(json),
+            WorktreeCmd::List { json, mine } => run_worktree_list_cli(json, mine),
             WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
         },
         Some(Commands::Connect { name }) => run_connect(name),
@@ -1881,15 +1889,78 @@ async fn run_daemon_status_cli(json: bool) -> ExitCode {
     }
 }
 
-/// `dot-agent-deck worktree list [--json]` — PRD #422. Pure CLI-subprocess
-/// operation over `git`/`gh` in the current directory's repo — no daemon
-/// involved, so unlike the `daemon status`/`daemon stop` wrappers below this
-/// is plain synchronous code, no `#[tokio::main]`. Row shaping and the gate
-/// itself live in [`dot_agent_deck::worktree_reclaim`]; this wrapper only
-/// translates the outcome into stdout/stderr text and an exit code.
-fn run_worktree_list_cli(json: bool) -> ExitCode {
+/// `dot-agent-deck worktree list [--json] [--mine]` — PRD #422, `--mine` added
+/// by fork #166 M3.0. Pure CLI-subprocess operation over `git`/`gh` in the
+/// current directory's repo — no daemon involved, so unlike the `daemon
+/// status`/`daemon stop` wrappers below this is plain synchronous code, no
+/// `#[tokio::main]`. `--mine` must keep this property (M3.0's own
+/// correctness bar is "correct immediately after a daemon restart"), so it
+/// filters on the on-disk marker owner against `DOT_AGENT_DECK_WORKTREE_OWNER`
+/// rather than querying the daemon. Row shaping and the gate itself live in
+/// [`dot_agent_deck::worktree_reclaim`]; this wrapper only translates the
+/// outcome into stdout/stderr text and an exit code.
+fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
+    use dot_agent_deck::agent_pty::{
+        DOT_AGENT_DECK_WORKTREE_OWNER, ORCHESTRATION_UNKNOWN_SENTINEL,
+    };
     use dot_agent_deck::worktree_reclaim::{
-        WorktreeListDocument, examine_worktrees, format_list_human,
+        WorktreeListDocument, examine_worktrees, format_list_human, sanitize_marker_creator,
+    };
+
+    let owner_filter = if mine {
+        match std::env::var(DOT_AGENT_DECK_WORKTREE_OWNER) {
+            // PR #215 round-3 fixup (reviewer F4): an exported-but-empty
+            // (or whitespace-only) variable is exactly as meaningless as an
+            // absent one -- `std::env::var` returns `Ok("")` for it, so
+            // without this arm it fell through to "use it as the filter"
+            // and produced a definitive-looking `no worktrees owned by `
+            // with a blank subject and exit 0. This must run on the RAW
+            // value and precede sanitization (round-4 fixup, R4-1):
+            // `sanitize_marker_creator("")` returns its `"unknown"` floor,
+            // not an empty string, so sanitizing first would let an empty
+            // variable slip past this guard as a non-empty, non-sentinel
+            // value.
+            Ok(v) if v.trim().is_empty() => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set but empty -- \
+                     cannot determine which worktrees belong to this orchestration; supply it or \
+                     drop --mine"
+                );
+                return ExitCode::FAILURE;
+            }
+            // Round-4 fixup (R4-1): compare the SANITIZED value against the
+            // sentinel, not the merely-trimmed one -- `trim` strips
+            // whitespace, not control characters, so a value like
+            // `"orchestration:unknown\u{7}"` used to trim to itself, fail
+            // this check, and reach the filter as an unmatchable near-miss
+            // of the sentinel instead of being refused by it.
+            Ok(v) if sanitize_marker_creator(&v) == ORCHESTRATION_UNKNOWN_SENTINEL => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is set to the \
+                     `{ORCHESTRATION_UNKNOWN_SENTINEL}` sentinel, which is never a real \
+                     identity -- refusing rather than matching another nameless orchestration's \
+                     worktrees"
+                );
+                return ExitCode::FAILURE;
+            }
+            // Round-4 fixup (R4-1): filter on the SAME sanitized value used
+            // above, not the raw one -- `read_marker_owner` always
+            // sanitizes the on-disk marker, so a raw filter value could
+            // never match a legitimate identity that carried stray
+            // whitespace, and would silently report "no worktrees owned by
+            // ..." for an identity that in fact owns one.
+            Ok(v) => Some(sanitize_marker_creator(&v)),
+            Err(_) => {
+                eprintln!(
+                    "worktree list --mine: {DOT_AGENT_DECK_WORKTREE_OWNER} is not set -- cannot \
+                     determine which worktrees belong to this orchestration; supply it or drop \
+                     --mine"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
     };
 
     let cwd = match std::env::current_dir() {
@@ -1899,13 +1970,24 @@ fn run_worktree_list_cli(json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let reports = match examine_worktrees(&cwd) {
+    let mut reports = match examine_worktrees(&cwd) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("worktree list: {e}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(owner) = &owner_filter {
+        // PR #215 fixup (reviewer F4 / auditor L1 item 3): `owned` must be a
+        // conjunct, not just a non-`None` `owner`. `owner_of`'s own doc
+        // records that `owned=false` can land alongside a non-`None`
+        // `owner` (two independent `owned_git_dir` resolutions), and
+        // explicitly accepted that divergence as cosmetic ONLY because "no
+        // consumer treats `owner`'s mere presence as an ownership signal."
+        // `--mine` is now such a consumer, so the conjunct restores the
+        // precondition that comment relies on.
+        reports.retain(|r| r.owned && r.owner.as_deref() == Some(owner.as_str()));
+    }
 
     if json {
         match serde_json::to_string(&WorktreeListDocument::new(reports)) {
@@ -1919,6 +2001,31 @@ fn run_worktree_list_cli(json: bool) -> ExitCode {
             }
         }
     } else {
+        // PR #215 fixup (reviewer F7 / auditor L1): a filtered-to-empty
+        // `--mine` used to fall through to `format_list_human`'s generic
+        // "no worktrees found", which conflates "this repo has no
+        // worktrees" with "none are yours" and with "yours failed to
+        // match" -- the last of which is a wrong answer arriving
+        // silently, against this feature's own fail-loud bar. Name the
+        // identity that was filtered on instead.
+        if reports.is_empty()
+            && let Some(owner) = &owner_filter
+        {
+            // PR #215 round-3 fixup (auditor M1): `owner` is the ONE string
+            // in this feature that reaches here with no sanitizer applied --
+            // round 1 verified "the failure messages never print the
+            // variable's value" as load-bearing, and printing it raw
+            // reintroduced that terminal-escape / forged-line sink.
+            // Round-4 fixup (R4-1): `owner` is now already sanitized at
+            // construction (the single `Ok(v) => Some(sanitize_marker_creator(&v))`
+            // arm above), so printing it directly satisfies M1 by
+            // construction and, unlike a second `sanitize_marker_creator`
+            // call here, guarantees this is the exact string the filter
+            // compared against -- not a second, possibly-divergent
+            // normalization of it.
+            println!("no worktrees owned by {owner}");
+            return ExitCode::SUCCESS;
+        }
         print!("{}", format_list_human(&reports));
         ExitCode::SUCCESS
     }

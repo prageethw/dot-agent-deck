@@ -47,6 +47,9 @@ use dot_agent_deck::platform::proc::{ProcessTableOutcome, process_table_async};
 
 use spec::spec;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 /// Fork issue #160: every deadline below that polls [`process_table`] must
 /// leave real headroom beyond `unix.rs`'s real [`PS_SAMPLE_BUDGET`] (now
 /// `pub`, so this derives from the actual constant rather than a hand-kept
@@ -564,8 +567,7 @@ struct TriggerFile {
 #[cfg(unix)]
 impl TriggerFile {
     fn new() -> Self {
-        let dir =
-            tempfile::TempDir::new().unwrap_or_else(|e| panic!("create trigger tempdir: {e}"));
+        let dir = test_temp::tempdir().unwrap_or_else(|e| panic!("create trigger tempdir: {e}"));
         let path = dir.path().join("trigger");
         Self { _dir: dir, path }
     }
@@ -816,7 +818,6 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
     );
 
     registry.close_agent(&id).unwrap();
-    let _ = std::fs::remove_file(&ready_marker);
 }
 
 // ---------------------------------------------------------------------------
