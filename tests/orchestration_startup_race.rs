@@ -42,7 +42,7 @@
 //!
 //! Assertions are outcome-based (seed-consumption timing, final pointer
 //! count), not a pin on which role spawns first — see `src/tab.rs`'s
-//! `delegate_030_pi_last_spawn_order_keeps_pane_ids_declaration_indexed`
+//! `delegate_039_pi_last_spawn_order_keeps_pane_ids_declaration_indexed`
 //! for the separate, spawn-order-agnostic pane-id-indexing guard.
 
 use std::os::unix::fs::PermissionsExt;
@@ -370,6 +370,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
                 &config,
                 &cwd_str,
                 Some(SEED_TEXT.to_string()),
+                None,
                 None,
                 (24, 80),
             )

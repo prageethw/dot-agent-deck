@@ -1021,11 +1021,22 @@ impl EmbeddedPaneController {
         // PRD #201: seed/prompt to stash daemon-side for native pull (Pi
         // orchestrator panes only); `None` keeps the unchanged inject path.
         seed: Option<String>,
+        // Fork #166 M2.4: the creator string this orchestration stamped
+        // into its own worktree marker, forwarded into the pane's
+        // environment as DOT_AGENT_DECK_WORKTREE_OWNER. `None` for a pane
+        // outside a worktree-owning orchestration.
+        owner: Option<String>,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so daemon-spawned agents see
         // DOT_AGENT_DECK_PANE_ID and can emit hook events back to this
         // UI's pane.
-        let env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
+        let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
+        if let Some(owner) = owner {
+            env.push((
+                crate::agent_pty::DOT_AGENT_DECK_WORKTREE_OWNER.to_string(),
+                owner,
+            ));
+        }
 
         // Already resolved by `create_pane_with_display_name` (single
         // source of truth via `resolve_display_name`). Sending it as-is
@@ -3546,6 +3557,7 @@ impl PaneController for EmbeddedPaneController {
             opts.rows,
             opts.cols,
             opts.seed,
+            opts.owner,
         );
         result.map(|id| (id, resolved))
     }
