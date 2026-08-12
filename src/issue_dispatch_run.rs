@@ -496,7 +496,15 @@ async fn dispatch_one_issue(
     let creator = crate::worktree_reclaim::sanitize_marker_creator(&format!(
         "issue-dispatch:{task_name}#{issue}"
     ));
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true, &creator).await? {
+    match create_worktree(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        true,
+        &creator,
+    )
+    .await?
+    {
         WorktreeCreation::Created => {}
         // `reuse_existing_branch: true` above means `BranchExists` is never
         // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
@@ -1176,7 +1184,9 @@ pub(crate) enum WorktreeCreation {
     /// a reused name report a worktree conflict that the user could see was not
     /// true — the directory is plainly gone — with no hint of the real cause.
     BranchExists,
-    TimedOut { cleaned_up: bool },
+    TimedOut {
+        cleaned_up: bool,
+    },
 }
 
 /// Ensure the worktree's parent directory exists before `git worktree add`

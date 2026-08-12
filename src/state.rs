@@ -4201,8 +4201,7 @@ impl AppState {
                     Some(None) => false,
                     Some(Some(pending)) => Some(pending.as_str()) == event.tool_name.as_deref(),
                 };
-                let asserted =
-                    session.status != SessionStatus::WaitingForInput || matches_pending;
+                let asserted = session.status != SessionStatus::WaitingForInput || matches_pending;
                 if asserted {
                     session.status = SessionStatus::Working;
                 }
