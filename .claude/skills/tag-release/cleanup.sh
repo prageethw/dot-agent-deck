@@ -7,6 +7,13 @@ set -euo pipefail
 # This script is detection-only: it never removes a worktree or deletes a branch.
 # It does run `git fetch --prune` to refresh remote-tracking refs, which only
 # updates local bookkeeping and never modifies the remote.
+#
+# Bash 3.2 safe on purpose: macOS ships bash 3.2 as `/bin/bash`, and
+# `#!/usr/bin/env bash` resolves to it on the `macos-latest` CI runner. No
+# associative arrays, no `${var,,}`/`${var^^}`, no `mapfile`/`readarray`, no
+# `declare -n`.
+
+tab="$(printf '\t')"
 
 # --- Determine the default branch ---
 default_branch="main"
@@ -14,11 +21,123 @@ if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
   default_branch="${ref#refs/remotes/origin/}"
 fi
 
+# Branches that are long-lived BY DESIGN and are never cleanup candidates,
+# whatever their merge state. `fork-only` is the fork's customisation stack:
+# after a sync `main` is reset to it, so it is trivially "merged" while being
+# the one branch that must never be deleted (docs/develop/fork-sync-workflow.md).
+long_lived="$default_branch
+fork-only"
+is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
+
+# --- Degradation tracking ---
+#
+# Any time the script cannot fully trust its own PR-state or ref-freshness
+# data, it sets `pr_state_degraded=true` rather than silently proceeding as if
+# everything were clean (fork issue #140). `mark_degraded` also records a
+# short, human-readable reason so the marker tells an operator something
+# actionable instead of just "something, somewhere, failed".
+pr_state_degraded=false
+degraded_reasons=""
+mark_degraded() {
+  pr_state_degraded=true
+  if [ -n "${1:-}" ]; then
+    degraded_reasons="${degraded_reasons}${1}
+"
+  fi
+}
+
+# Two reusable scratch files for capturing a command's stdout and stderr
+# separately without a command-substitution subshell swallowing the reason
+# (`$(...)` runs in a subshell, so a variable set inside it never reaches the
+# caller). Reused sequentially across every `git fetch`/`gh` call below; each
+# call truncates and re-reads them before the next one runs.
+_stdout_file=$(mktemp)
+_stderr_file=$(mktemp)
+trap 'rm -f "$_stdout_file" "$_stderr_file"' EXIT
+
+# capture_cmd <command...>: runs the command, leaving its stdout in
+# $_stdout_file and, on failure, a short reason in $last_err (A2). Returns the
+# command's own exit status.
+last_err=""
+capture_cmd() {
+  if "$@" >"$_stdout_file" 2>"$_stderr_file"; then
+    last_err=""
+    return 0
+  fi
+  last_err=$(head -n1 "$_stderr_file")
+  return 1
+}
+
 # --- Refresh remote-tracking refs (drops refs for branches deleted upstream) ---
-git fetch --prune --quiet origin 2>/dev/null || true
+if ! capture_cmd git fetch --prune --quiet origin; then
+  mark_degraded "git fetch --prune failed: ${last_err:-unknown error}"
+fi
 
 current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+
+# The MAIN working tree's own path — the root checkout, as opposed to any
+# linked worktree. `git worktree list --porcelain` always emits it as the
+# first `worktree ` line (there is no per-entry marker), and this is the
+# portable equivalent that does not depend on iteration order. Excluding by
+# this identity (rather than by matching branch name) means the root checkout
+# stays excluded no matter what branch it happens to be on (fork issue #140
+# target behaviour 1) — a name-based check only catches it while it sits on
+# `main`.
+git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")
+main_worktree_path=""
+if [ -n "$git_common_dir" ]; then
+  main_worktree_path=$(dirname "$git_common_dir")
+fi
+
+# --- Determine this fork's repository slugs (owner/repo) ---
+#
+# `gh` resolves a `--repo`-less query against this repository's PARENT when no
+# default repo is configured -- the same trap docs/develop/fork-sync-workflow.md
+# records for `gh pr create` (fork issue #140, D3). Derive both slugs from the
+# actual git remotes so this script stays portable if it is ever copied
+# elsewhere. A remote whose slug cannot be determined is never guessed at: the
+# corresponding query is skipped and, since a missing PR-state query means the
+# output can no longer be trusted as complete, the run is marked degraded
+# (fork issue #140 target behaviour 2) -- except a genuinely UNCONFIGURED
+# `upstream` remote, which is legitimately optional and not a degradation
+# (target behaviour 3).
+#
+# `git config --get remote.<name>.url` reads the raw configured value. This is
+# deliberately NOT `git remote get-url`, which APPLIES `url.<base>.insteadOf`
+# rewriting (verified against git 2.55.0) and would silently derive an
+# `insteadOf`-configured mirror's slug instead of the intended GitHub one.
+is_owner_repo() {
+  grep -Eq -- '^[^/]+/[^/]+$' <<< "$1"
+}
+slug_from_url() {
+  sed -E 's#^(ssh://|git://|https?://)?([^@/]*@)?github\.com[:/]##; s#\.git$##' <<< "$1"
+}
+
+origin_slug=""
+if origin_url=$(git config --get remote.origin.url 2>/dev/null); then
+  candidate=$(slug_from_url "$origin_url")
+  if is_owner_repo "$candidate"; then
+    origin_slug="$candidate"
+  else
+    mark_degraded "origin remote URL does not resolve to a GitHub owner/repo slug: $origin_url"
+  fi
+else
+  mark_degraded "origin remote is not configured"
+fi
+
+upstream_slug=""
+if upstream_url=$(git config --get remote.upstream.url 2>/dev/null); then
+  candidate=$(slug_from_url "$upstream_url")
+  if is_owner_repo "$candidate"; then
+    upstream_slug="$candidate"
+  else
+    mark_degraded "upstream remote URL does not resolve to a GitHub owner/repo slug: $upstream_url"
+  fi
+fi
+# A missing `upstream` remote is left as-is here (empty, no `mark_degraded`
+# call) -- not every checkout carries one, and that is a routine, not
+# degraded, state (target behaviour 3).
 
 # --- Gather PR state ---
 #
@@ -44,7 +163,11 @@ current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 merged_pairs=$'\n'   # lines of "<branch name> <head sha>" for merged PRs
 open_names=$'\n'     # lines of "<branch name>" with an open PR, never candidates
 
-if command -v gh >/dev/null 2>&1; then
+if [ -z "$origin_slug" ]; then
+  : # slug derivation above already marked this run degraded; nothing to query
+elif ! command -v gh >/dev/null 2>&1; then
+  mark_degraded "gh is not installed or not on PATH"
+else
   # Head SHAs of merged same-repo PRs. Covers squash & rebase merges, where the
   # branch's commits never land verbatim on the default branch and so are
   # invisible to an ancestry test. Cross-repo (fork) PRs are excluded: their
@@ -68,6 +191,16 @@ if command -v gh >/dev/null 2>&1; then
     open_names="${open_names}${b}"$'\n'
   done < <(gh pr list --state open --limit 1000 --json headRefName --jq '.[].headRefName' 2>/dev/null || true)
 fi
+
+open_pr_has() {
+  [ -n "$1" ] && grep -Fxq -- "$1" <<< "$open_prs"
+}
+
+merged_sha_matches() {
+  local needle
+  needle=$(printf '%s\t%s' "$1" "$2")
+  grep -Fxq -- "$needle" <<< "$merged_shas_lines"
+}
 
 # is_merged <branch-name> <ref-to-its-tip>
 # Resolves the ref's OWN tip, so a local branch and its same-named remote are
@@ -130,19 +263,19 @@ while IFS= read -r line; do
   esac
 done < <(git worktree list --porcelain 2>/dev/null || true)
 
-# --- Local branches that are merged (never current / default) ---
+# --- Local branches that are merged (never current / long-lived) ---
 # A branch checked out in another worktree is still listed here; it is only
 # deletable once its worktree is removed, hence the worktree-first ordering in
 # the skill's cleanup step.
 local_out=()
 while IFS= read -r b; do
   [ -z "$b" ] && continue
-  [ "$b" = "$default_branch" ] && continue
+  is_long_lived "$b" && continue
   [ "$b" = "$current_branch" ] && continue
   if is_merged "$b" "refs/heads/${b}"; then local_out+=("${b} ${vetted_tip}"); fi
 done < <(git branch --format='%(refname:short)' 2>/dev/null || true)
 
-# --- Remote branches that are merged (never default) ---
+# --- Remote branches that are merged (never long-lived) ---
 remote_out=()
 while IFS= read -r b; do
   b="${b#origin/}"
@@ -160,6 +293,15 @@ done < <(git branch -r --format='%(refname:short)' 2>/dev/null | grep '^origin/'
 # squash merge never puts the branch's commits on the default branch). The skill
 # compares the branch's current tip against this value before deleting it.
 echo "DEFAULT_BRANCH=${default_branch}"
+if [ "$pr_state_degraded" = "true" ]; then
+  echo "PR_STATE_DEGRADED=true"
+  if [ -n "$degraded_reasons" ]; then
+    echo "DEGRADED_REASONS:"
+    while IFS= read -r reason; do
+      [ -n "$reason" ] && echo "  ${reason}"
+    done <<< "$degraded_reasons"
+  fi
+fi
 
 total=$(( ${#worktrees_out[@]} + ${#local_out[@]} + ${#remote_out[@]} ))
 if [ "$total" -eq 0 ]; then
