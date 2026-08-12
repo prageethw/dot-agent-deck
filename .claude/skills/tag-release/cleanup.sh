@@ -15,20 +15,6 @@ set -euo pipefail
 
 tab="$(printf '\t')"
 
-# --- Determine the default branch ---
-default_branch="main"
-if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
-  default_branch="${ref#refs/remotes/origin/}"
-fi
-
-# Branches that are long-lived BY DESIGN and are never cleanup candidates,
-# whatever their merge state. `fork-only` is the fork's customisation stack:
-# after a sync `main` is reset to it, so it is trivially "merged" while being
-# the one branch that must never be deleted (docs/develop/fork-sync-workflow.md).
-long_lived="$default_branch
-fork-only"
-is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
-
 # --- Degradation tracking ---
 #
 # Any time the script cannot fully trust its own PR-state or ref-freshness
@@ -38,6 +24,11 @@ is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
 # actionable instead of just "something, somewhere, failed".
 pr_state_degraded=false
 degraded_reasons=""
+
+# A truncated MERGED-PR page is informational, not a degradation (fork issue
+# #152 S4) -- kept separate from `pr_state_degraded` so it never blocks
+# SKILL.md Step 6's "delete nothing until it comes back clean".
+merged_list_truncated=false
 mark_degraded() {
   pr_state_degraded=true
   if [ -n "${1:-}" ]; then
@@ -45,6 +36,31 @@ mark_degraded() {
 "
   fi
 }
+
+# --- Determine the default branch ---
+#
+# `refs/remotes/origin/HEAD` is unset on a routine `actions/checkout` clone,
+# or any `git remote add` + `git fetch` setup that never runs `remote
+# set-head`. B1's fix made default-branch protection NAME-based
+# (`is_long_lived` is built from `$default_branch`), so a silent `"main"`
+# guess here would leave that guard protecting a name that may not exist on a
+# repo whose real default is something else -- the B1 scenario through
+# another door (fork issue #152 R5 / A-N4). Degrade instead of guessing.
+default_branch=""
+if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
+  default_branch="${ref#refs/remotes/origin/}"
+else
+  default_branch="main"
+  mark_degraded "refs/remotes/origin/HEAD is not set; could not reliably determine the default branch (guessed '$default_branch', which may not exist or may not be the branch this repo actually protects)"
+fi
+
+# Branches that are long-lived BY DESIGN and are never cleanup candidates,
+# whatever their merge state. `fork-only` is the fork's customisation stack:
+# after a sync `main` is reset to it, so it is trivially "merged" while being
+# the one branch that must never be deleted (docs/develop/fork-sync-workflow.md).
+long_lived="$default_branch
+fork-only"
+is_long_lived() { grep -Fxq -- "$1" <<< "$long_lived"; }
 
 # Two reusable scratch files for capturing a command's stdout and stderr
 # separately without a command-substitution subshell swallowing the reason
@@ -77,17 +93,57 @@ current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 
 # The MAIN working tree's own path — the root checkout, as opposed to any
-# linked worktree. `git worktree list --porcelain` always emits it as the
-# first `worktree ` line (there is no per-entry marker), and this is the
-# portable equivalent that does not depend on iteration order. Excluding by
-# this identity (rather than by matching branch name) means the root checkout
-# stays excluded no matter what branch it happens to be on (fork issue #140
-# target behaviour 1) — a name-based check only catches it while it sits on
-# `main`.
+# linked worktree. Excluding by this identity (rather than by matching branch
+# name) means the root checkout stays excluded no matter what branch it
+# happens to be on (fork issue #140 target behaviour 1) — a name-based check
+# only catches it while it sits on `main`.
+#
+# Two independent ways this derivation can go wrong (fork issue #152 S2),
+# both verified by direct measurement against a throwaway repo:
+#   1. Pre-2.31 git does not recognise `--path-format`, and unlike most
+#      subcommands `git rev-parse` echoes an unrecognised flag straight back
+#      instead of failing -- so `git_common_dir` ends up holding the flag
+#      text plus a relative `.git`, on two lines, exit 0. Fed unguarded to
+#      `dirname`, that two-line string is one argument starting with `--`,
+#      which `dirname` refuses (non-zero exit) -- and with no `||`/`if`
+#      guard on that assignment, `set -e` killed the whole script before any
+#      output was printed.
+#   2. A relocated git directory (`git init --separate-git-dir`, or an
+#      equivalent real-world setup) makes `git rev-parse --git-common-dir`
+#      succeed and return the RELOCATED directory's own absolute path --
+#      `dirname` of that is the relocated directory's PARENT, not the actual
+#      worktree. Silently wrong, no crash, no degradation.
+#
+# Both failure modes are handled the same way: derive a candidate, then
+# VERIFY it by asking git itself whether that candidate is genuinely THIS
+# repository's own main working tree -- not merely "is this path inside SOME
+# working tree" (`--is-inside-work-tree` answers the latter, and git
+# discovers upward, so it silently returns true when the candidate happens to
+# sit inside a wholly unrelated repo -- the realistic case being a relocated
+# git dir stored under a dotfiles/notes `$HOME` that is itself a repo; fork
+# issue #152 R1 / A2, measured against a throwaway fixture). Comparing
+# `--show-toplevel` run FROM the candidate back against the candidate itself
+# answers the right question: it equals the candidate only when the candidate
+# truly is a working tree's own root. A crash-avoided-but-still-wrong
+# candidate from failure mode 1, the wrong-parent candidate from failure mode
+# 2, and the wrong-but-inside-another-repo candidate above all fail this
+# check and degrade the run -- rather than crashing with no output, or
+# silently trusting a path that was never confirmed to be THIS repo's own.
 git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")
 main_worktree_path=""
 if [ -n "$git_common_dir" ]; then
-  main_worktree_path=$(dirname "$git_common_dir")
+  candidate=""
+  if candidate=$(dirname "$git_common_dir" 2>/dev/null); then
+    if [ "$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null || echo "")" != "$candidate" ]; then
+      candidate=""
+    fi
+  else
+    candidate=""
+  fi
+  main_worktree_path="$candidate"
+fi
+if [ -z "$main_worktree_path" ]; then
+  mark_degraded "could not reliably determine the main working tree's own path (old git flag handling or a relocated git directory can make the derivation crash or silently resolve to the wrong path)"
 fi
 
 # --- Determine this fork's repository slugs (owner/repo) ---
@@ -108,7 +164,15 @@ fi
 # rewriting (verified against git 2.55.0) and would silently derive an
 # `insteadOf`-configured mirror's slug instead of the intended GitHub one.
 is_owner_repo() {
-  grep -Eq -- '^[^/]+/[^/]+$' <<< "$1"
+  # An scp-style remote (`git@host:owner/repo.git`) has exactly one `/`, so a
+  # bare "two non-slash halves" pattern accepts the whole `user@host:owner/repo`
+  # string as a slug when `slug_from_url` doesn't recognise the host -- and
+  # that accepted slug is then interpolated into a `gh ... failed:` reason,
+  # disclosing an internal hostname and username on every run (fork issue
+  # #152 A3 / R-N1). GitHub owner/repo names are alnum plus `._-`; anchoring
+  # to that character class rejects `@`/`:` outright, before the slug ever
+  # reaches a `gh` call.
+  grep -Eq -- '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' <<< "$1"
 }
 slug_from_url() {
   sed -E 's#^(ssh://|git://|https?://)?([^@/]*@)?github\.com[:/]##; s#\.git$##' <<< "$1"
@@ -120,7 +184,13 @@ if origin_url=$(git config --get remote.origin.url 2>/dev/null); then
   if is_owner_repo "$candidate"; then
     origin_slug="$candidate"
   else
-    mark_degraded "origin remote URL does not resolve to a GitHub owner/repo slug: $origin_url"
+    # Name the remote, never the URL: `slug_from_url`'s userinfo-stripping
+    # only fires on the github.com branch, so a non-github.com remote (a GHES
+    # host, say) can carry a raw, credential-bearing URL straight into this
+    # message -- and DEGRADED_REASONS: is printed to stdout on every run
+    # (fork issue #152 S1/S5). Inspect the URL with `git config --get
+    # remote.origin.url` directly instead.
+    mark_degraded "origin remote URL does not resolve to a GitHub owner/repo slug (run 'git config --get remote.origin.url' to inspect it)"
   fi
 else
   mark_degraded "origin remote is not configured"
@@ -132,7 +202,8 @@ if upstream_url=$(git config --get remote.upstream.url 2>/dev/null); then
   if is_owner_repo "$candidate"; then
     upstream_slug="$candidate"
   else
-    mark_degraded "upstream remote URL does not resolve to a GitHub owner/repo slug: $upstream_url"
+    # Same redaction as the origin branch above (fork issue #152 S1/S5).
+    mark_degraded "upstream remote URL does not resolve to a GitHub owner/repo slug (run 'git config --get remote.upstream.url' to inspect it)"
   fi
 fi
 # A missing `upstream` remote is left as-is here (empty, no `mark_degraded`
@@ -147,49 +218,106 @@ fi
 # been recreated at a new, unmerged tip for the next open PR. Judging by name
 # there offers a live PR's branch up for deletion.
 #
-# Held as newline-delimited strings rather than `declare -A` associative arrays,
-# which are bash 4. macOS ships /bin/bash 3.2.57, where `declare -A` does not go
-# quietly unsupported: the assignment degrades to an ordinary INDEXED one, the
-# subscript is evaluated arithmetically, and `set -u` kills the script on that
-# line with a message naming a variable that appears nowhere in it. The same
-# defect was fixed in `scripts/assemble-changelog.sh`, `verify-pr/scan.sh` and
-# `demo-reel-adapter/build.sh` (issues #521, #582); this file was the one
-# instance knowingly left behind, because it was a `dot-ai-` synced mirror and a
-# fix would have been reverted by the next sync. Issue #1089 forked it, so the
-# reason expired and the fix lands here.
-#
-# A newline is the one delimiter that is safe: git refuses a ref name containing
-# one, so no branch name can forge a record boundary.
-merged_pairs=$'\n'   # lines of "<branch name> <head sha>" for merged PRs
-open_names=$'\n'     # lines of "<branch name>" with an open PR, never candidates
+# No associative arrays (bash 3.2). `merged_shas_lines` holds "name<TAB>sha"
+# lines, queried with an exact-line grep; `open_prs` holds one branch name per
+# line, the same shape as `long_lived` above. Held as newline-delimited
+# strings rather than `declare -A`, which is bash 4: macOS ships /bin/bash
+# 3.2.57, where `declare -A` does not go quietly unsupported -- the
+# assignment degrades to an ordinary INDEXED one, the subscript is evaluated
+# arithmetically, and `set -u` kills the script on that line with a message
+# naming a variable that appears nowhere in it.
+merged_shas_lines=""
+open_prs=""
 
 if [ -z "$origin_slug" ]; then
   : # slug derivation above already marked this run degraded; nothing to query
 elif ! command -v gh >/dev/null 2>&1; then
   mark_degraded "gh is not installed or not on PATH"
 else
-  # Head SHAs of merged same-repo PRs. Covers squash & rebase merges, where the
+  # Head SHAs of merged PRs. Covers squash & rebase merges, where the
   # branch's commits never land verbatim on the default branch and so are
   # invisible to an ancestry test. Cross-repo (fork) PRs are excluded: their
   # head names describe branches in the fork, not ours, so a merged fork PR for
-  # `fix/thing` says nothing about our own `fix/thing`.
-  while IFS=$'\t' read -r name sha; do
-    if [ -z "$name" ] || [ -z "$sha" ]; then continue; fi
-    merged_pairs="${merged_pairs}${name} ${sha}"$'\n'
-  done < <(gh pr list --state merged --limit 200 --json headRefName,headRefOid,isCrossRepository \
-             --jq '.[] | select(.isCrossRepository | not) | [.headRefName, .headRefOid] | @tsv' 2>/dev/null || true)
+  # `fix/thing` says nothing about our own `fix/thing`. Pinned to
+  # `$origin_slug` (fork issue #140, D3) -- unpinned, `gh` resolves against
+  # this repo's parent.
+  #
+  # ONE query (fork issue #152 R2/R3/A1): `isCrossRepository` comes back as a
+  # third TSV field on every row, unfiltered, so `--limit 200` bounding what
+  # this call fetches and the truncation count below being over ALL returned
+  # rows (fork issue #152 S3) are the same page -- no reconstruction, no
+  # second round trip. Cross-repo rows are filtered out of
+  # `merged_shas_lines` here in the shell loop instead of by a separate `gh`
+  # query. This also closes two problems the prior two-query design had: that
+  # query existed only to count rows, yet its own failure (a secondary rate
+  # limit, say) called `mark_degraded` and blocked SKILL.md Step 6 on a query
+  # whose result feeds nothing else -- directly contradicting S4's premise
+  # that merged-page truncation must never block cleanup; and two separate API
+  # calls meant a PR merging between them could shift the second page and
+  # produce a wrong "not truncated" verdict.
+  merged_raw_count=0
+  if capture_cmd gh pr list --state merged --limit 200 --repo "$origin_slug" \
+                  --json headRefName,headRefOid,isCrossRepository \
+                  --jq '.[] | [.headRefName, .headRefOid, .isCrossRepository] | @tsv'; then
+    merged_tsv=$(cat "$_stdout_file")
+    merged_raw_count=$(awk 'END { print NR }' "$_stdout_file")
+    while IFS=$'\t' read -r name sha cross_repo; do
+      [ -z "$name" ] || [ -z "$sha" ] && continue
+      [ "$cross_repo" = "true" ] && continue
+      line=$(printf '%s\t%s' "$name" "$sha")
+      merged_shas_lines="${merged_shas_lines}${line}
+"
+    done <<< "$merged_tsv"
+  else
+    mark_degraded "gh pr list --state merged --repo $origin_slug failed: ${last_err:-unknown error}"
+  fi
+
+  if [ "$merged_raw_count" -ge 200 ]; then
+    # Fork issue #152 S4: at 200+ merged PRs this repo hits a full page on
+    # EVERY run (91/200 today), which would make `PR_STATE_DEGRADED=true`
+    # permanent and disable SKILL.md Step 6's "delete nothing until it comes
+    # back clean" for good. Truncation here only means a later merged branch
+    # goes unoffered (benign, under-offers) -- surface it informationally
+    # instead of degrading.
+    merged_list_truncated=true
+  fi
 
   # Any open PR protects its head branch. Deleting the branch closes the PR, so
-  # this is the guard that matters most. Fork PRs are deliberately INCLUDED
-  # here: matching a fork's head name against ours can only over-protect (we
-  # keep a branch we might have pruned), which is the safe direction to err.
-  # The limit is higher than the merged query's on purpose: truncating merged
-  # PRs just leaves a branch unoffered, but truncating OPEN ones would offer a
-  # live PR's branch for deletion.
-  while IFS= read -r b; do
-    if [ -z "$b" ]; then continue; fi
-    open_names="${open_names}${b}"$'\n'
-  done < <(gh pr list --state open --limit 1000 --json headRefName --jq '.[].headRefName' 2>/dev/null || true)
+  # this is the guard that matters most. Queried against BOTH this fork and
+  # upstream: an open upstream PR's head name IS our branch name (the fork
+  # proposes its own branches upstream -- docs/develop/fork-sync-workflow.md),
+  # so matching it can only over-protect (keep a branch we might have
+  # pruned), which is the safe direction to err. The limit is higher than the
+  # merged query's on purpose: truncating merged PRs just leaves a branch
+  # unoffered, but truncating OPEN ones would offer a live PR's branch for
+  # deletion.
+  if capture_cmd gh pr list --state open --limit 1000 --repo "$origin_slug" \
+                  --json headRefName --jq '.[].headRefName'; then
+    open_fork=$(cat "$_stdout_file")
+    open_fork_count=$(awk 'END { print NR }' "$_stdout_file")
+    open_prs="${open_prs}${open_fork}
+"
+    if [ "$open_fork_count" -ge 1000 ]; then
+      mark_degraded "gh pr list --state open --repo $origin_slug returned a full page ($open_fork_count rows); results may be truncated"
+    fi
+  else
+    mark_degraded "gh pr list --state open --repo $origin_slug failed: ${last_err:-unknown error}"
+  fi
+
+  if [ -n "$upstream_slug" ] && [ "$upstream_slug" != "$origin_slug" ]; then
+    if capture_cmd gh pr list --state open --limit 1000 --repo "$upstream_slug" \
+                    --json headRefName --jq '.[].headRefName'; then
+      open_upstream=$(cat "$_stdout_file")
+      open_upstream_count=$(awk 'END { print NR }' "$_stdout_file")
+      open_prs="${open_prs}${open_upstream}
+"
+      if [ "$open_upstream_count" -ge 1000 ]; then
+        mark_degraded "gh pr list --state open --repo $upstream_slug returned a full page ($open_upstream_count rows); results may be truncated"
+      fi
+    else
+      mark_degraded "gh pr list --state open --repo $upstream_slug failed: ${last_err:-unknown error}"
+    fi
+  fi
 fi
 
 open_pr_has() {
@@ -210,11 +338,11 @@ merged_sha_matches() {
 # not moved since (see the skill's cleanup step).
 vetted_tip=""
 is_merged() {
-  local name="$1" ref="$2" tip mname msha
+  local name="$1" ref="$2" tip
   vetted_tip=""
-  case "$open_names" in
-    *$'\n'"$name"$'\n'*) return 1 ;;
-  esac
+  if open_pr_has "$name"; then
+    return 1
+  fi
   tip=$(git rev-parse --verify --quiet "$ref") || return 1
   if [ -z "$tip" ]; then return 1; fi
   # Real merge or fast-forward: the tip is already reachable from the default.
@@ -224,44 +352,45 @@ is_merged() {
   fi
   # Squash/rebase merge: the tip must still be exactly what the merged PR
   # carried. A recreated or advanced branch has moved on and is not merged.
-  while IFS=' ' read -r mname msha; do
-    if [ "$mname" = "$name" ] && [ "$msha" = "$tip" ]; then
-      vetted_tip="$tip"
-      return 0
-    fi
-  done <<< "$merged_pairs"
+  if merged_sha_matches "$name" "$tip"; then
+    vetted_tip="$tip"
+    return 0
+  fi
   return 1
 }
 
-# --- Worktrees on merged branches (never the current worktree, never default) ---
+# --- Worktrees on merged branches (never the current worktree, the main
+# working tree, or a long-lived branch name) ---
 #
-# The default-branch exclusion is NOT redundant with the local-branch loop below,
-# which has always had its own. Without it this loop offers the MAIN CHECKOUT for
-# removal whenever the script is run from a linked worktree: the main tree sits on
-# `main`, `main`'s tip is by definition an ancestor of `origin/main`, and the only
-# other guard here is "not the worktree I am standing in". Measured on this repo
-# while forking the skill (issue #1089) — a run from a dispatch worktree printed
-# `WORKTREES: /home/vfarcic/code/dot-agent-deck|main`. `git worktree remove`
-# refuses a main working tree, so the blast radius was a confusing failure rather
-# than a deletion; but the skill presents this list for confirmation, and a list
-# that routinely contains the main checkout teaches the operator to confirm
-# without reading. It also made the skill's own "cleanup.sh already excludes the
-# default branch" a false claim.
+# `-z` NUL-delimits each porcelain field instead of newline-terminating it
+# (fork issue #152 A-N2, subsumes S6's TAB handling). Default text mode emits
+# a path completely raw and unescaped, so a path containing a literal newline
+# splits a single "worktree <path>" line in two: a line-oriented `IFS= read
+# -r line` loop captures only the fragment before the embedded newline as
+# `wt_path`, the continuation matches no `case` arm below and is silently
+# dropped, and the following `branch refs/heads/...` line then pairs with
+# that TRUNCATED path -- which SKILL.md Step 6.1 hands straight to `git
+# worktree remove` as a wrong-target removal, not merely a display glitch. A
+# path can never contain a NUL byte, so splitting on NUL is unambiguous
+# regardless of what the path itself contains. Git terminates the last
+# record with an extra NUL too (mirroring the blank-line separator `-z`
+# replaces), so the final `read` below always completes on a delimiter
+# rather than losing data at EOF.
 worktrees_out=()
 wt_path=""
-while IFS= read -r line; do
-  case "$line" in
-    "worktree "*) wt_path="${line#worktree }" ;;
+while IFS= read -r -d '' field; do
+  case "$field" in
+    "worktree "*) wt_path="${field#worktree }" ;;
     "branch refs/heads/"*)
-      br="${line#branch refs/heads/}"
-      if [ "$wt_path" != "$current_worktree" ] && [ "$br" != "$default_branch" ] \
-         && is_merged "$br" "refs/heads/${br}"; then
-        worktrees_out+=("${wt_path}|${br}")
+      br="${field#branch refs/heads/}"
+      if [ "$wt_path" != "$current_worktree" ] && [ "$wt_path" != "$main_worktree_path" ] \
+        && ! is_long_lived "$br" && is_merged "$br" "refs/heads/${br}"; then
+        worktrees_out+=("${wt_path}${tab}${br}")
       fi
       ;;
     "") wt_path="" ;;
   esac
-done < <(git worktree list --porcelain 2>/dev/null || true)
+done < <(git worktree list --porcelain -z 2>/dev/null || true)
 
 # --- Local branches that are merged (never current / long-lived) ---
 # A branch checked out in another worktree is still listed here; it is only
@@ -301,6 +430,9 @@ if [ "$pr_state_degraded" = "true" ]; then
       [ -n "$reason" ] && echo "  ${reason}"
     done <<< "$degraded_reasons"
   fi
+fi
+if [ "$merged_list_truncated" = "true" ]; then
+  echo "MERGED_LIST_TRUNCATED=true"
 fi
 
 total=$(( ${#worktrees_out[@]} + ${#local_out[@]} + ${#remote_out[@]} ))
