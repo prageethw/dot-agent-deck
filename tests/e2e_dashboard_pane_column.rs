@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, find_pane_box_left_edge, pane_box_left_edge};
+use common::{TuiDeck, find_pane_box_left_edge};
 use spec::spec;
 
 /// Scenario: Extends the Ctrl+l split-toggle to Dashboard tabs — launch with
@@ -43,51 +43,51 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // Baseline: the Dashboard tab's own default 33/67 split (distinct from
     // Orchestration's 34/66) puts the pane column's left edge at col 33 of
     // the 100-col frame (no rounding ambiguity — 33% of 100 is exact).
-    let default_edge = pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE);
+    let default_edge = find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE);
     assert_eq!(
         default_edge,
-        33,
+        Some(33),
         "expected the Dashboard tab's default 33/67 split's pane-column \
-         edge at col 33, got {default_edge}\nGrid:\n{}",
+         edge at col 33, got {default_edge:?}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
     // Ctrl+l: Default -> Narrow (25/75).
     deck.send_bytes(b"\x0c"); // Ctrl+l == 0x0c
     let narrowed = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 25
+        find_pane_box_left_edge(grid, DASH_PANE) == Some(25)
     });
     assert!(
         narrowed,
         "Ctrl+l did not narrow the Dashboard sidebar to the 25/75 split \
-         within 3s — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+         within 3s — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
         deck.snapshot_grid()
     );
 
     // Ctrl+l: Narrow -> Hidden (0/100, sidebar collapsed).
     deck.send_bytes(b"\x0c");
     let hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 0
+        find_pane_box_left_edge(grid, DASH_PANE) == Some(0)
     });
     assert!(
         hidden,
         "a second Ctrl+l did not collapse the Dashboard sidebar to the \
-         Hidden stage within 3s — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+         Hidden stage within 3s — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
         deck.snapshot_grid()
     );
 
     // Ctrl+l: Hidden -> Default, completing the loop.
     deck.send_bytes(b"\x0c");
     let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 33
+        find_pane_box_left_edge(grid, DASH_PANE) == Some(33)
     });
     assert!(
         restored,
         "a third Ctrl+l did not restore the Dashboard tab's 33/67 default \
-         split within 3s — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+         split within 3s — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
         deck.snapshot_grid()
     );
 
@@ -95,13 +95,13 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // precondition the Orchestration tab must adopt below.
     deck.send_bytes(b"\x0c");
     let narrowed_again = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 25
+        find_pane_box_left_edge(grid, DASH_PANE) == Some(25)
     });
     assert!(
         narrowed_again,
         "Ctrl+l did not narrow the Dashboard sidebar to the 25/75 split \
-         within 3s (second time) — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+         within 3s (second time) — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
         deck.snapshot_grid()
     );
 
@@ -118,12 +118,10 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     deck.wait_for_absence("New Agent"); // new-pane form closed -> the orchestration tab is up
     // The form closing only means the modal is gone, not that the active
     // view has switched to the new Orchestration tab yet — wait for its
-    // role pane box to actually render before reading the exact edge. A
-    // panicking `pane_box_left_edge` used directly as a
-    // `wait_for_grid_predicate_within` predicate would abort on the first
-    // sampled grid instead of retrying if that switch hasn't rendered yet
-    // (the first sample can still show the Dashboard tab, in the brief
-    // window before the switch renders).
+    // role pane box to actually render before reading the exact edge (the
+    // first sample can still show the Dashboard tab, in the brief window
+    // before the switch renders, which is exactly what
+    // `find_pane_box_left_edge` returning `None` here tolerates).
     let orch_tab_rendered = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         find_pane_box_left_edge(grid, "orchestrator").is_some()
     });
@@ -134,13 +132,13 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
         deck.snapshot_grid()
     );
 
-    let orch_narrow_edge = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
+    let orch_narrow_edge = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert_eq!(
         orch_narrow_edge,
-        25,
+        Some(25),
         "a brand-new Orchestration tab must open AT the deck-global Narrow \
          stage the Dashboard tab was just toggled to, not its own untoggled \
-         Default, got {orch_narrow_edge}\nGrid:\n{}",
+         Default, got {orch_narrow_edge:?}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -151,10 +149,6 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // byte forwards straight to the pane instead of cycling the split.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
-    // Non-panicking form (see `find_pane_box_left_edge`'s doc comment in
-    // `tests/common/mod.rs`, and the same fix applied below): the panicking
-    // `pane_box_left_edge` would abort on the first sampled grid if the box
-    // were momentarily absent instead of letting this 3s loop actually retry.
     let orch_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         find_pane_box_left_edge(grid, "orchestrator") == Some(0)
     });
@@ -180,22 +174,19 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // PaneInput on that tab and break the Shift+Tab below.
     deck.send_bytes(b"\x1b[Z"); // Shift+Tab -> previous tab -> Dashboard
     // Confirm the tab switch itself landed (DASH_PANE's title is only ever
-    // drawn on the Dashboard tab) before polling for its exact edge — a
-    // panicking `pane_box_left_edge` used directly as a
-    // `wait_for_grid_predicate_within` predicate aborts on the first sampled
-    // grid instead of retrying, and that first sample can still show the
-    // Orchestration tab (DASH_PANE genuinely absent, not just moved) in the
-    // brief window before the switch renders.
+    // drawn on the Dashboard tab) before polling for its exact edge — that
+    // first sample can still show the Orchestration tab (DASH_PANE genuinely
+    // absent, not just moved) in the brief window before the switch renders.
     deck.wait_for_string(DASH_PANE);
     let dash_also_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 0
+        find_pane_box_left_edge(grid, DASH_PANE) == Some(0)
     });
     assert!(
         dash_also_hidden,
         "toggling the Orchestration tab's split must move the Dashboard \
          tab's split too — expected the Dashboard tab ALSO Hidden (edge 0) \
-         after switching back, got {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+         after switching back, got {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
         deck.snapshot_grid()
     );
 
@@ -204,13 +195,13 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // `UiMode`, so the deck is still in Normal mode from above.
     deck.send_bytes(b"\x0c");
     let dash_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, DASH_PANE) == 33
+        find_pane_box_left_edge(grid, DASH_PANE) == Some(33)
     });
     assert!(
         dash_restored,
         "Ctrl+l did not restore the Dashboard tab's 33/67 default split \
-         within 3s — pane-column edge stayed at {}\nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
+         within 3s — pane-column edge stayed at {:?}\nGrid:\n{}",
+        find_pane_box_left_edge(&deck.snapshot_grid(), DASH_PANE),
         deck.snapshot_grid()
     );
 

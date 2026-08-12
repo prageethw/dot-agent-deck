@@ -10,7 +10,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, find_pane_box_left_edge, pane_box_left_edge};
+use common::{TuiDeck, find_pane_box_left_edge};
 use spec::spec;
 
 /// Scenario: launch the deck with a Dashboard pane already live and
@@ -107,13 +107,13 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
     // read Narrow (pane-column edge at column 25), not have reset to
     // Default (which would put the edge at column 34 for an Orchestration
     // tab's own untoggled default).
-    let orch_edge_after_open = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
+    let orch_edge_after_open = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert_eq!(
         orch_edge_after_open,
-        25,
+        Some(25),
         "the deck-global split stage must stay Narrow (25/75) after opening \
          an Orchestration tab over a live Dashboard pane, not reset to \
-         Default — got pane-column edge {orch_edge_after_open}\nGrid:\n{}",
+         Default — got pane-column edge {orch_edge_after_open:?}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -142,14 +142,14 @@ fn dashboard_002_orchestration_tab_opened_over_live_dashboard_pane_stays_active(
 
     // And the split stage must have advanced from Narrow to Hidden (the
     // correct effect of the Ctrl+l just sent), not have reset to Default.
-    let orch_edge_after_input = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
+    let orch_edge_after_input = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert_eq!(
         orch_edge_after_input,
-        0,
+        Some(0),
         "after Ctrl+D/Ctrl+l was sent to the freshly-opened Orchestration \
          tab, the split stage must advance to Hidden (0/100) from the \
          Narrow stage it opened at, not reset to Default — got pane-column \
-         edge {orch_edge_after_input}\nGrid:\n{}",
+         edge {orch_edge_after_input:?}\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
