@@ -3053,7 +3053,7 @@ mod hook_ingestion_tests {
                     let samples = samples.clone();
                     async move {
                         samples.fetch_add(1, AtomicOrdering::SeqCst);
-                        Ok(Vec::new())
+                        Err(crate::platform::proc::ProcessTableOutcome::Failed)
                     }
                 })
                 .await
