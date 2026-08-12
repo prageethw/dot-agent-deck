@@ -371,6 +371,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
                 &cwd_str,
                 Some(SEED_TEXT.to_string()),
                 None,
+                None,
                 (24, 80),
             )
         });

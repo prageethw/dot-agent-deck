@@ -424,6 +424,18 @@ git worktree add ../myproject-feature-x -b feature-x
 
 If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.com/vfarcic/dot-ai)), ask an agent in the deck to run it and it creates the worktree and branch for you. Then open a new orchestration tab with `Ctrl+n` and point the directory field at the worktree.
 
+### Listing worktrees by owner
+
+`dot-agent-deck worktree list` shows every linked worktree with its resolved PR state, cleanliness, and gate verdict, including an OWNER column naming which orchestration created it (a dash when the worktree predates this feature, or was not created by the deck).
+
+Run with `--mine` from inside an orchestration pane, it lists only the worktrees *that orchestration* created — useful for an autonomous agent that needs to enumerate its own work without seeing every other orchestration's worktrees too:
+
+```bash
+dot-agent-deck worktree list --mine
+```
+
+This works immediately after a daemon restart: ownership is matched by comparing the worktree's on-disk marker against the pane's own `DOT_AGENT_DECK_WORKTREE_OWNER` environment variable (set automatically in every pane of an orchestration that **created a worktree** — not every orchestration pane; one started directly in an existing checkout, with no worktree slug typed, carries no variable at all. `DOT_AGENT_DECK_PANE_ID` really is set in every orchestration pane, so do not read the two as equivalent), never by asking the daemon. This identity is also saved in your session, so closing and reopening a tab restores it with the SAME identity — `--mine` still matches the worktrees it created earlier, with two exceptions: a tab whose saved session predates this — one saved before the identity was captured at all, or before this specific field was added — restores with no identity; and a tab that was reattached to a still-running ("warm") daemon has its metadata rebuilt without the saved identity, so a session saved in that state also restores with none. Either way, `--mine` from that tab fails loudly, the same as from outside any orchestration pane — rather than guessing, which could hand it another orchestration's worktrees. Run outside an orchestration pane, or in a pane whose orchestration created no worktree, `--mine` fails loudly rather than falling back to "everything" or silently printing "none" — a wrong answer here would hand one orchestration another's worktrees.
+
 ### Same-directory orchestrations are discouraged
 
 Opening a second orchestration in a directory that already runs one is allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:

@@ -371,6 +371,7 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
                 project_path: project_dir.to_string(),
                 started_role_indices: vec![0],
                 display_title: None,
+                owner: None,
             }),
         }],
         // PRD #196: `SavedSession` carries the global `last_command`; a restored
