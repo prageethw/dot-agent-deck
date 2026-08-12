@@ -1,0 +1,168 @@
+name: Drift Check
+
+# FORK-ONLY. `fork-only` does not exist upstream (`vfarcic/dot-agent-deck` has
+# no such branch), so this workflow has no meaning there — same basis as
+# `e2e.yml`, `issue-label-hygiene.yml` and the Semgrep/Sonar jobs in `ci.yml`.
+# A future `git rebase upstream/main` should never carry this file upstream;
+# if it ever does, drop it the same way those are excluded.
+#
+# WHY THIS EXISTS
+#
+# This fork runs a two-branch model (docs/develop/fork-sync-workflow.md):
+# `fork-only` holds the fork's stack and is what rebases onto upstream; `main`
+# is reset to `fork-only` after each sync. Between syncs, `main` legitimately
+# drifts ahead as fork PRs merge into it — that part is normal. What is not
+# normal is how far it gets before anyone notices: every sync so far has
+# discovered the drift late rather than caught it early (7, then 184, then 30,
+# then 61 uncurated commits). The doc's own "Keep it current" note says to
+# re-curate whenever a PR merges, and that has not happened on its own — this
+# is the gate that was missing, not a discipline problem to nag about harder.
+#
+# This job is deliberately NEVER required and NEVER blocks a PR — see
+# `docs/develop/fork-sync-workflow.md` and CLAUDE.md rule 8's "empty gate"
+# discussion. It runs on its own schedule/dispatch/push trigger, well away
+# from any PR's check list, and only ever fails its OWN run when drift crosses
+# the threshold below. Read a red run here as "go re-curate", not "something
+# is broken".
+on:
+  schedule:
+    # Daily is enough — drift accrues over days, not minutes. 03:00 UTC, clear
+    # of stale.yml's 01:30 UTC run above.
+    - cron: '0 3 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      threshold_override:
+        description: >-
+          Override the drift threshold for this run only (default: 10 — see
+          the THRESHOLD comment in the job below). Use this to test the job's
+          pass/fail behavior on demand without waiting for the schedule.
+        required: false
+        type: string
+      fork_branch_override:
+        description: >-
+          Override the fork-only branch name for this run only (default:
+          fork-only). Use this to exercise the "could not determine" path on
+          demand, e.g. by pointing it at a branch that does not exist.
+        required: false
+        type: string
+
+concurrency:
+  group: drift-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is required here, not cosmetic: a shallow default clone
+      # only has history for the checked-out ref, and `git rev-list
+      # origin/fork-only..origin/main` needs both branches' full history to
+      # produce a meaningful count.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Measure main vs fork-only drift
+        run: |
+          set -uo pipefail
+
+          THRESHOLD="${{ inputs.threshold_override }}"
+          if [ -z "$THRESHOLD" ]; then
+            # Default 10. Chosen because it would have caught every drift
+            # incident on record early instead of late:
+            #   2026-08-05:   7 commits
+            #   2026-08-07: 184 commits
+            #   2026-08-08:  30 commits
+            #   2026-08-12:  61 commits
+            # Re-curating ~10 commits is routine; re-curating dozens is a
+            # multi-hour job. Bump this one value if normal day-to-day drift
+            # routinely trips it — that is the only edit tuning requires.
+            THRESHOLD=10
+          fi
+
+          FORK_BRANCH="${{ inputs.fork_branch_override }}"
+          if [ -z "$FORK_BRANCH" ]; then
+            FORK_BRANCH="fork-only"
+          fi
+
+          echo "Comparing origin/main against origin/$FORK_BRANCH (threshold: $THRESHOLD commits)"
+
+          # "Could not determine" must never look like a pass — a job that
+          # silently reports success when it could not measure is the same
+          # empty-gate failure mode CLAUDE.md rule 8 documents for Greptile/
+          # Semgrep/Sonar. A missing or unreachable fork-only branch is exactly
+          # that case, not "zero drift".
+          if ! git rev-parse --verify "origin/$FORK_BRANCH" >/dev/null 2>&1; then
+            {
+              echo "## Drift check: COULD NOT DETERMINE"
+              echo ""
+              echo "\`origin/$FORK_BRANCH\` does not exist or is unreachable from this checkout."
+              echo "This is NOT the same as \"no drift\" — the branch may have been renamed,"
+              echo "deleted, or the fetch may have failed. Investigate before trusting this"
+              echo "job again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::could not resolve origin/$FORK_BRANCH — treating as could-not-determine, not a pass"
+            exit 1
+          fi
+
+          if ! git rev-parse --verify origin/main >/dev/null 2>&1; then
+            {
+              echo "## Drift check: COULD NOT DETERMINE"
+              echo ""
+              echo "\`origin/main\` does not exist or is unreachable from this checkout."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::could not resolve origin/main — treating as could-not-determine, not a pass"
+            exit 1
+          fi
+
+          if ! COUNT=$(git rev-list --count "origin/$FORK_BRANCH..origin/main" 2>&1); then
+            {
+              echo "## Drift check: COULD NOT DETERMINE"
+              echo ""
+              echo "\`git rev-list\` failed:"
+              echo '```'
+              echo "$COUNT"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::git rev-list failed measuring drift — treating as could-not-determine, not a pass"
+            exit 1
+          fi
+
+          OLDEST_ISO=""
+          OLDEST_AGE_DAYS=""
+          if [ "$COUNT" -gt 0 ]; then
+            OLDEST_ISO=$(git log --reverse --format=%cI "origin/$FORK_BRANCH..origin/main" | head -1)
+            if [ -n "$OLDEST_ISO" ]; then
+              OLDEST_EPOCH=$(date -d "$OLDEST_ISO" +%s)
+              NOW_EPOCH=$(date +%s)
+              OLDEST_AGE_DAYS=$(( (NOW_EPOCH - OLDEST_EPOCH) / 86400 ))
+            fi
+          fi
+
+          {
+            echo "## \`main\` vs \`$FORK_BRANCH\` drift"
+            echo ""
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Commits ahead | $COUNT |"
+            echo "| Threshold | $THRESHOLD |"
+            if [ -n "$OLDEST_AGE_DAYS" ]; then
+              echo "| Oldest un-curated commit | $OLDEST_ISO ($OLDEST_AGE_DAYS days old) |"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "main is $COUNT commits ahead of $FORK_BRANCH (threshold $THRESHOLD)"
+
+          if [ "$COUNT" -gt "$THRESHOLD" ]; then
+            echo "**Action needed:** re-curate the \`fork-only\` stack per \`docs/develop/fork-sync-workflow.md\`'s \"Keep it current\" note before this grows further." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::main is $COUNT commits ahead of $FORK_BRANCH (threshold $THRESHOLD) — re-curate per docs/develop/fork-sync-workflow.md"
+            exit 1
+          fi
+
+          echo "Drift is within threshold — nothing to do."
