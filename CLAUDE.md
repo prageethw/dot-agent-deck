@@ -140,5 +140,18 @@
     **Note the shape, because worktrees do not help here.** Both orchestrations had their own worktrees and their own branches; the isolation worked exactly as designed. What collided was *subject matter* — both were editing `src/worktree_reclaim.rs` — and no filesystem boundary can prevent that. Do not let a worktree-per-change discipline create the impression that concurrent orchestrations cannot overlap; they overlap in the code, not on disk.
 
     **Also search when a PRD is already underway.** Upstream's tracker moves independently of this fork's, so an issue filed there after your PRD started is exactly as invisible as one filed before it. Re-checking at the point you open the implementation PR costs one command.
+21. **Call the Fork's Product `worker-agent-deck` in Prose**: In anything you write — docs, PRDs, changelog fragments, release prose, issue and PR text, commit messages — refer to **this fork's** product and binary as **`worker-agent-deck`**. Reserve `dot-agent-deck` for [upstream](https://github.com/vfarcic/dot-agent-deck) and for the things genuinely still named that. The two are diverging (this fork shipped features upstream has not merged, and upstream PRs sit in review for long stretches), so prose that calls both "dot-agent-deck" makes it impossible to tell which one a sentence is about — and that ambiguity is worst exactly where it matters most, in release notes and in issues filed against one tracker about behaviour in the other.
+
+    **Three names are in play today and only one of them is this convention.** Do not "correct" the other two on sight:
+
+    | Where | Name | Status |
+    |---|---|---|
+    | Prose — docs, PRDs, changelog, issues, PRs | **`worker-agent-deck`** | **This rule.** |
+    | The crate and binary (`Cargo.toml`) | `dot-agent-deck` | Unchanged. Renaming it would move release-asset names, the `~/.claude/settings.json` hook invocations that call the binary by name, and every documented command — a real change with real blast radius, deliberately not done. |
+    | The TUI title (`src/ui.rs`) | `worker-deck` | Fork-only commit `b33cec2`, tagged **PERMANENT** in [`docs/develop/fork-sync-workflow.md`](docs/develop/fork-sync-workflow.md)'s stack table. Re-applied on every rebase; leave it alone. |
+
+    So this is a **naming convention for what you write**, not a claim about what the code is called. When you need to name the executable in a command a reader will paste, that is still `dot-agent-deck` — write the real command and let the prose around it say `worker-agent-deck`. A rule that made docs print a command nobody can run would be worse than the ambiguity it was meant to fix.
+
+    **Upstream-bound text is the exception.** Anything destined for `vfarcic/dot-agent-deck` — an upstream PR body, an upstream issue, a doc correction offered upstream (rule 19) — uses upstream's own naming. The fork's product name has no meaning there and would read as a mistake.
 
     *(The orchestrator's own workflow text lives in `.dot-agent-deck.toml` and is regenerated into `.dot-agent-deck/orchestrator-context.md` on every orchestration start — editing that Markdown is silently reverted, see [`docs/develop/orchestrator-context-generation.md`](docs/develop/orchestrator-context-generation.md). This rule is stated here rather than there because this file is re-injected every turn while the role prompt is delivered once at spawn, which is rule 17's lesson. Adding it to the toml as well is reasonable; it was not done here because that file carries uncommitted machine-local role-command config, and committing it is the exact hazard rule 1 was written for.)*
