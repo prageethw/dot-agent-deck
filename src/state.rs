@@ -5845,6 +5845,7 @@ mod tests {
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
+                last_user_prompt_seq: 0,
                 first_prompts: Vec::new(),
                 pane_id: Some(UNTAGGED_PANE.to_string()),
                 agent_id: Some("some-other-agent".to_string()),
