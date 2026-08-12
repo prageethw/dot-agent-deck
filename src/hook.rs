@@ -232,11 +232,25 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
     Some(detail)
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Reviewer F9 (fork #197): the width `user_prompt` is truncated to below.
+/// `src/ui.rs`'s TEXT confirmation path (`prompt_text_confirms`) compares a
+/// pane's observed `last_user_prompt` — which passed through this truncation
+/// — against the full, un-truncated seed text we wrote. A seed longer than
+/// this many bytes can therefore never satisfy `starts_with`/`==` there: the
+/// observed side is short, the sent side is not. Exposed so the comparison
+/// site can truncate `sent` the same way before comparing, instead of the
+/// mismatch silently defeating confirmation until the 60s deadline.
+pub(crate) const USER_PROMPT_TRUNCATE_LEN: usize = 200;
+
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let mut cap = max;
+        while cap > 0 && !s.is_char_boundary(cap) {
+            cap -= 1;
+        }
+        format!("{}…", &s[..cap])
     }
 }
 
@@ -325,7 +339,22 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     }
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
-    let user_prompt = prompt.map(|p| truncate(&p, 200));
+    // Audit F2 (Medium, DOCUMENT ONLY — fork #197): `user_prompt` is set
+    // here from whatever `prompt` the hook payload carried, for ANY
+    // `event_type` this function maps to — not gated to a submission event.
+    // `AppState::apply_event` (`src/state.rs`) and, downstream,
+    // `src/ui.rs`'s TEXT confirmation path both rely on `user_prompt` being
+    // populated only for a genuine submission. Adding a new event source
+    // here that sets `prompt` on a non-submission event would silently
+    // violate that invariant — nothing downstream enforces it.
+    //
+    // Audit A3: fork #197 M3's multi-byte `truncate` fix re-arms this route
+    // on the dispatch (`--task`) path — a 207-byte pointer could never
+    // satisfy TEXT confirmation before that fix, so a non-submission event
+    // carrying `prompt` could not have produced a false confirm there
+    // either. That immunity was an accident of the truncation bug, not a
+    // guarantee; F2's document-only disposition now covers this path too.
+    let user_prompt = prompt.map(|p| truncate(&p, USER_PROMPT_TRUNCATE_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     // PRD #92 F9 followup-7: the daemon injects DOT_AGENT_DECK_AGENT_ID
     // on spawn (same pattern as DOT_AGENT_DECK_PANE_ID). Forwarding it
@@ -393,7 +422,10 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
 fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
     let event_type = map_opencode_event_type(&input.event, input.status.as_deref())?;
     let tool_detail = extract_tool_detail(input.tool_name.as_deref(), input.tool_input.as_ref());
-    let user_prompt = input.prompt.map(|p| truncate(&p, 200));
+    // Audit F2 (Medium, DOCUMENT ONLY — fork #197): see the matching note in
+    // `build_event_typed` above — this harvest is equally unguarded, for
+    // whatever `event_type` `map_opencode_event_type` produced.
+    let user_prompt = input.prompt.map(|p| truncate(&p, USER_PROMPT_TRUNCATE_LEN));
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
 
@@ -790,6 +822,80 @@ mod tests {
         let input: Value = serde_json::json!({"command": long_cmd});
         let detail = extract_tool_detail(Some("Bash"), Some(&input)).unwrap();
         assert!(detail.len() <= 124); // 120 + "…" (3 bytes)
+    }
+
+    // Audit A1: both tests above (and `build_event_prompt_truncated_to_200`
+    // below) are ASCII-only, so `s.len()` and character count coincide and
+    // the cut byte always lands on a character boundary — none of them
+    // could ever have caught the panic below. `truncate` byte-sliced
+    // `&s[..max]` directly; a multi-byte character straddling `max` made
+    // that slice land mid-character and panic (a 100-char Japanese prompt is
+    // ~300 bytes, so byte 200 sits inside character 67). These tests call
+    // `truncate` directly at the two widths actually used in production
+    // (`USER_PROMPT_TRUNCATE_LEN` = 200 for the prompt path, 80 for the
+    // generic tool-input-value path) with the cut deliberately landing
+    // inside a multi-byte character, across two different encoding widths
+    // so the walk-back is exercised over more than one byte-per-char count.
+
+    #[test]
+    fn truncate_walks_back_out_of_a_3byte_char_at_the_prompt_width() {
+        // "日" is 3 bytes in UTF-8; 100 of them is 300 bytes. Byte 200 is not
+        // a multiple of 3, so it lands inside character 67 (bytes 198-200),
+        // reproducing A1's exact scenario at the real production width.
+        let input = "日".repeat(100);
+        assert_eq!(input.len(), 300);
+        assert!(!input.is_char_boundary(USER_PROMPT_TRUNCATE_LEN));
+
+        let result = truncate(&input, USER_PROMPT_TRUNCATE_LEN);
+
+        assert_eq!(result, format!("{}…", "日".repeat(66)));
+    }
+
+    #[test]
+    fn truncate_walks_back_out_of_a_3byte_char_at_the_tool_input_width() {
+        // Same shape as above at the OTHER production width (80, the
+        // generic tool-input-value path's `truncate(val, 80)`). 80 is not a
+        // multiple of 3, so byte 80 lands inside character 27 (bytes 78-81).
+        let input = "日".repeat(40);
+        assert_eq!(input.len(), 120);
+        assert!(!input.is_char_boundary(80));
+
+        let result = truncate(&input, 80);
+
+        assert_eq!(result, format!("{}…", "日".repeat(26)));
+    }
+
+    #[test]
+    fn truncate_walks_back_out_of_a_2byte_char_at_the_tool_input_width() {
+        // A different encoding width (Cyrillic "б", 2 bytes) exercises a
+        // different walk-back distance than the 3-byte case above. A
+        // 2-byte-per-char run alone would keep every even cut position
+        // (including 80) aligned to a boundary, so a single ASCII byte is
+        // prefixed to shift parity — byte 80 then lands inside the 40th
+        // Cyrillic character (bytes 79-81).
+        let input = format!("A{}", "б".repeat(50));
+        assert_eq!(input.len(), 101);
+        assert!(!input.is_char_boundary(80));
+
+        let result = truncate(&input, 80);
+
+        assert_eq!(result, format!("A{}…", "б".repeat(39)));
+    }
+
+    #[test]
+    fn truncate_cut_exactly_on_a_multibyte_char_boundary_is_a_noop_walk_back() {
+        // The counterpart to the three cases above: when the cut byte
+        // already lands ON a character boundary, the walk-back loop must
+        // not move it. 100 Cyrillic characters (2 bytes each) is exactly
+        // 200 bytes — the real `USER_PROMPT_TRUNCATE_LEN` — so this also
+        // pins that a prompt cut at a clean boundary is left untouched.
+        let input = "б".repeat(150);
+        assert_eq!(input.len(), 300);
+        assert!(input.is_char_boundary(USER_PROMPT_TRUNCATE_LEN));
+
+        let result = truncate(&input, USER_PROMPT_TRUNCATE_LEN);
+
+        assert_eq!(result, format!("{}…", "б".repeat(100)));
     }
 
     #[test]

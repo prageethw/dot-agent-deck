@@ -198,6 +198,7 @@ mod tests {
             tool_count: 0,
             first_prompts: Vec::new(),
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             live_target: None,
             shell_synthetic_working: false,
         }

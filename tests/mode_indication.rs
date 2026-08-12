@@ -112,6 +112,7 @@ fn selected_card_fixture() -> SessionState {
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
+        last_user_prompt_seq: 0,
         first_prompts: Vec::new(),
         pane_id: Some("pane-mode-card".to_string()),
         agent_id: None,

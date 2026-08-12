@@ -248,6 +248,7 @@ fn make_session(
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: Some(last_prompt.to_string()),
+        last_user_prompt_seq: 0,
         first_prompts: vec![last_prompt.to_string()],
         pane_id: Some(pane_id.to_string()),
         agent_id: Some(agent_id.to_string()),
@@ -2253,6 +2254,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         tool_count: 2,
         first_prompts: vec!["build the feature".into()],
         last_user_prompt: Some("build the feature".into()),
+        last_user_prompt_seq: 0,
         live_target: None,
         shell_synthetic_working: false,
     };
@@ -2386,6 +2388,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_user_prompt: Some(format!(
                             "run \x1b[31mhostile\x07 \x00prompt {over_long}"
                         )),
+                        last_user_prompt_seq: 0,
                         live_target: None,
                         shell_synthetic_working: false,
                     }),
@@ -2546,6 +2549,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
+        last_user_prompt_seq: 0,
         first_prompts: Vec::new(),
         pane_id: Some(pane.to_string()),
         agent_id: Some(agent_id.to_string()),
@@ -2991,6 +2995,7 @@ async fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             tool_count: 0,
             first_prompts: Vec::new(),
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             live_target: None,
             shell_synthetic_working: true,
         }),
@@ -3283,6 +3288,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             tool_count: 0,
             first_prompts: Vec::new(),
             last_user_prompt: None,
+            last_user_prompt_seq: 0,
             live_target: None,
             shell_synthetic_working: false,
         }),
