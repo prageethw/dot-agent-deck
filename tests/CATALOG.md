@@ -846,6 +846,48 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the interactive `SpawnPane` handler that derives these owner strings from the typed Name (covered end-to-end by `worktree/reclaim/022`, `src/ui.rs`); `mark_worktree_owned`/`owner_of` themselves, which are unchanged by fork#192 and already covered by `017`/`020`.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/030 — `format_list_human` renders an OWNER column: the marker identity for an owned worktree, and the existing `DASH` placeholder for one whose marker carries no `created-by:` line (fork #166 M2.3, the human-table half).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — no fixture repo needed, two `WorktreeReport` literals constructed directly.
+- **Agent:** none.
+- **Asserts:** the header row of `format_list_human`'s output carries a field literally equal to `"OWNER"`; at that same column index, a report with `owner: Some("orchestration:owner-x")` renders that exact string, and a report with `owner: None` renders the existing `DASH` (`"-"`) placeholder. Both reports carry a non-`None` `reason`, so the only unexplained dash in either row is the owner column under test.
+- **Does not assert:** the OWNER column's position relative to the other columns (only that one exists and both rows' entries can be read from it); `worktree list --json`'s owner field (already covered by `021`); the `--mine` filter (covered by `031`–`034`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/031 — With `DOT_AGENT_DECK_WORKTREE_OWNER` set, `worktree list --mine` keeps a worktree whose owner equals it and excludes a same-repo worktree owned by a different orchestration (fork #166 M3.0 — the happy path).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with `DOT_AGENT_DECK_WORKTREE_OWNER` set explicitly on the spawned subprocess's environment rather than left to the ambient one.
+- **Agent:** none (two worktrees of the same repo, each marked owned by a distinct `orchestration:<name>` creator via the full fork #166 marker format).
+- **Asserts:** `--mine`, run with the env var set to one worktree's exact owner string, succeeds and names that worktree; it does not name the other, same-repo worktree owned by a different orchestration.
+- **Does not assert:** behaviour when the env var is absent or set to the `orchestration:unknown` sentinel (covered by `033`/`034`); restart/process-independence (covered by `032`); the OWNER column's rendering (covered by `030`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/032 — A marker written directly to disk, standing in for a prior orchestration process, is matched by `worktree list --mine` run in a brand-new subprocess with no shared in-memory state — the milestone's actual "correct after a restart" claim (fork #166 M3.0).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the ownership marker written via a plain filesystem call rather than through any `dot-agent-deck` invocation, and `--mine` run via a fresh `Command::new` subprocess spawn.
+- **Agent:** none.
+- **Asserts:** `--mine`, run in a fresh subprocess against a marker written earlier and independently, with the env var set to the exact owner string in that marker, succeeds and names the worktree.
+- **Does not assert:** the exclusion half (covered by `031`); any daemon or in-process cache (`--mine` has no daemon dependency at all, by design — see the PRD's M2.4 "why an env var" rationale).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/033 — With `DOT_AGENT_DECK_WORKTREE_OWNER` entirely absent, `--mine` fails loudly: non-zero exit and a message naming what is missing — never falling back to "everything" or silently printing "nothing" (fork #166 M3.0).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly removed from the spawned subprocess's environment regardless of the ambient one.
+- **Agent:** none (one owned worktree present, so a silent-empty-list failure mode and a silent-list-everything failure mode are both distinguishable from the correct refusal).
+- **Asserts:** the process exits non-zero; the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`; the output does not name the worktree present in the fixture (rules out the "list everything" failure mode).
+- **Does not assert:** the exact wording of the failure message beyond naming the missing variable; the `orchestration:unknown` sentinel case (covered by `034`, deliberately a separate spec since a wrong answer here hands one orchestration another's worktrees per fork #74).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/034 — With `DOT_AGENT_DECK_WORKTREE_OWNER` set to the literal `orchestration:unknown` sentinel, `--mine` refuses exactly as it does when the variable is absent — two nameless orchestrations must never match each other's worktrees (fork #166 M2.4/M3.0).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly set to the sentinel string.
+- **Agent:** none (the fixture worktree is marked owned by the SAME sentinel string, so a wrong sentinel-matches-sentinel implementation would wrongly hand it over).
+- **Asserts:** the process exits non-zero, exactly as `033`'s absent-variable case; the output names the problem (the variable or the word "unknown"); the output does not name the sentinel-owned worktree present in the fixture.
+- **Does not assert:** the absent-variable case itself (covered by `033`); any handling of a non-sentinel, genuinely-set owner (covered by `031`/`032`); an exported-but-empty value (covered by `035`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/035 — With `DOT_AGENT_DECK_WORKTREE_OWNER` exported but literal-empty (`Some("")`) or whitespace-only, `--mine` refuses exactly as it does when the variable is absent — an empty identity is exactly as meaningless as an absent one; conversely a legitimate identity carrying stray whitespace still matches once both sides are sanitized identically, and the sentinel is still refused with a trailing control character (fork #166 M3.0, PR #215 round-3 reviewer F4, round-4 R4-1).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the env var explicitly set to a literal-empty string, a whitespace-only string, a whitespace-padded legitimate identity, and the sentinel plus a trailing control character, in turn.
+- **Agent:** none (one owned worktree present, so a silent "use the value as the filter" failure mode is distinguishable from the correct refusal, and a genuine match is distinguishable from a silent non-match).
+- **Asserts:** for `""` and `"   "`, the process exits non-zero, the combined output names `DOT_AGENT_DECK_WORKTREE_OWNER`, and the output does not name the worktree present in the fixture (rules out the "list everything" failure mode); for `" orchestration:someone "` against a marker of `orchestration:someone`, the process exits zero and names the worktree (rules out the raw-vs-sanitized filter mismatch, round-4 R4-1); for the sentinel plus a trailing control character, the process exits non-zero and does not name the fixture's worktree (rules out `trim` alone being mistaken for full sanitization).
+- **Does not assert:** the absent-variable case itself (covered by `033`); the plain sentinel case with no control character (covered by `034`).
+- **Platform coverage:** mac+linux.
+
 #### daemon/protocol
 
 ##### daemon/protocol/001 — A `SubscribeEvents` receiver that falls behind the broadcast capacity is torn down with `KIND_STREAM_END` carrying exactly the documented `"lagged"` reason (`handle_subscribe_events`'s doc comment, src/daemon_protocol.rs).
@@ -1473,6 +1515,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
 - **Asserts:** an orchestration tab made the ACTIVE tab with a non-idle (`Error`) pane renders with NO status `fg` tint at all — its `fg` and modifiers must match an active non-orchestration (Dashboard) tab exactly (`REVERSED | BOLD`, no absolute color), since stacking a status `fg` on `Modifier::REVERSED` would invert the color into a background at display time (defect A). Also asserts an INACTIVE orchestration tab whose aggregate status is `Idle` renders with the same base label color as an ordinary tab, not `Color::DarkGray` (defect B), and that an INACTIVE orchestration tab with a non-idle (`Error`) aggregate status still colors its label text with neither `REVERSED` nor `BOLD` (regression guard, unchanged from before).
 - **Does not assert:** the aggregate-priority resolver (covered by `tabs/orchestration/009`); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/011 — The render loop actually APPLIES `TabManager::auto_focus_waiting_pane`'s result via `pane.focus_pane`, and the resulting focus change is visible in the rendered layout (PR #5 Greptile gap — the resolver alone was pinned, not its wiring into the real per-frame call site).
+- **Layer:** L1 (in-process `TestBackend`; drives `TabManager::auto_focus_waiting_pane` + `pane.focus_pane` + `compute_frame_layout` + `render_frame` in the same sequence `run_tui`'s render loop uses, rather than asserting on `TabManager`'s internal field the way `tabs/orchestration/013` does).
+- **Agent:** none (synthetic `SessionStatus` map, no panes/PTYs).
+- **Asserts:** with the higher-order `coder` role manually focused and the lower-order `orchestrator` role marked `WaitingForInput`, applying the resolver's result through `focus_pane` and reading focus back off the SAME pane controller — the value the render loop actually feeds `compute_frame_layout` — shows the auto-focused `orchestrator` role reclaiming the full `PaneLayout::Stacked` pane-column height while the manually-focused-but-superseded `coder` role cedes its slot to zero height.
+- **Does not assert:** the resolver's own selection logic in isolation (`tabs/orchestration/013` and the `orchestration/focus/*` suite); any other layout mode.
 - **Platform coverage:** mac+linux+windows.
 
 ##### tabs/orchestration/024 — `Ctrl+l` must forward to a focused orchestration role pane's PTY, not be claimed as the split-cycle action, while the deck is in `PaneInput` mode (PRD #387 Defect 1 / M1b — the reported bug, in a real pane).
@@ -2637,6 +2686,20 @@ without depending on the config struct API.
 - **Does not assert:** the chip-click arm (`Action::FormSelectMode`, `src/ui.rs:9744`) that calls the same `suggest_name_if_orchestration_selected` — same production function as the keyboard path, not independently pinned; persistence of the distinction across a form rebuild (there is none — the state lives only in the live `NewPaneFormState`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/008 — For a given live orchestration, the string `mark_worktree_owned` writes into the worktree's `created-by:` marker and the string every role pane's `AgentSpawnOptions::owner` carries are the LITERAL SAME computed string, from one source — not two derivations of one input (fork #166 M2.4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`, driving the real `Action::SpawnPane` path (as `orchestration/identity/001`/`022`) against a real git repo + worktree via `CapturingPaneController`, extended to record `AgentSpawnOptions::owner` per spawned pane.
+- **Agent:** none.
+- **Asserts:** after a live orchestration spawn, `owner_of(repo, worktree)` (the marker read-back) is `Some`; every role pane's recorded `owner` equals that exact value; at least one role pane was spawned to compare.
+- **Does not assert:** anything about whether the recorded `owner` value reaches a real spawned process's environment — `CapturingPaneController` is a test double whose `create_pane_with_options` records `opts.owner` and returns, so this test stops exactly one hop short of `DOT_AGENT_DECK_WORKTREE_OWNER` (PR #215 reviewer F2 / auditor H1: `EmbeddedPaneController::create_stream_pane` dropped `opts.owner` on the floor entirely at the SHA this test was written, and this test stayed green through that bug). See `orchestration/identity/009` for the real-seam coverage. Also does not assert: the sentinel/absent-variable refusal behaviour of `worktree list --mine` itself (covered by `worktree/reclaim/027`/`028`/`029`); the issue-dispatch path's equivalent invariant (`issue-dispatch:<task>#<issue>` is threaded through the same `SpawnRequest::owner` field in-process, in the same function that writes the marker — not independently pinned here); session-restore, which passes the PERSISTED `owner` value through unchanged rather than recomputing it (see `session/restore/017`/`018`); the live-create path also has no single end-to-end test reaching a real spawned process's environment the way restore now does — the two create-path links share `create_pane_with_options`, so the chain is tight, but the asymmetry is worth naming rather than leaving implicit.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/identity/009 — `AgentSpawnOptions::owner` reaches a genuinely spawned process's own environment as `DOT_AGENT_DECK_WORKTREE_OWNER` — not merely a test double's recorded field (PR #215 reviewer F2 / auditor H1).
+- **Layer:** e2e (`tests/e2e_worktree_owner_env.rs`, `#[cfg(feature = "e2e")]` + `#[cfg(unix)]`). Spawns the real `dot-agent-deck daemon serve` BINARY as a subprocess (`common::spawn_daemon_serve`), attaches a real `EmbeddedPaneController` to it over its real Unix attach socket (the same client code the TUI uses), and calls `create_pane_with_options` with `AgentSpawnOptions::owner` set — the same production call path `src/ui.rs`/`src/tab.rs` use, spawning a genuine `portable_pty` child via `agent_pty::spawn`.
+- **Agent:** none (a plain `echo` shell command, no LLM).
+- **Asserts:** the spawned child's own stdout — read back over the attach socket via `common::wait_for_pane_text_on`, itself reading `$DOT_AGENT_DECK_WORKTREE_OWNER` out of the child's OWN environment — contains the exact owner string `create_pane_with_options` was called with. This is the join `orchestration/identity/008`'s mock cannot exercise: producer (`AgentSpawnOptions::owner`) and reader (`worktree/reclaim/024`–`028`, which set the variable by hand on a subprocess) were each tested; this is the missing middle.
+- **Does not assert:** anything about the marker file or `owner_of` (covered by `orchestration/identity/008` and the `worktree/reclaim` series); LLM-agent behaviour (no agent is spawned); the interactive form/restore paths that populate `AgentSpawnOptions::owner` in the first place (covered by `orchestration/identity/001`–`008` and the PRD's M2.4 milestone text) — this test starts from an already-populated `AgentSpawnOptions`, proving only that the value, once set, survives to the child's real environment.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
@@ -3229,6 +3292,20 @@ without depending on the config struct API.
 - **Does not assert:** the caller's `session_warnings` push or the plain-dashboard-pane fallback itself (`run_tui`, exercised end to end by `session/restore/009`/`010`'s L2 drift coverage, which predate this worktree-specific removal scenario); that the deck ever auto-removes a worktree (it does not — product decision); real `git worktree remove`.
 - **Platform coverage:** mac+linux+windows.
 
+##### session/restore/017 — A worktree-owner identity persisted in an `OrchestrationSnapshot` survives a full write → read → restore round trip: TOML serialize/deserialize, then `open_orchestration_tab` with the recovered value passed through, exactly as the daemon-empty restore branch calls it (fork #166 M3.0 / PR #215 fixup).
+- **Layer:** L1 (in-process — real `toml::to_string_pretty`/`toml::from_str` for the write/read half, then `resolve_orchestration_for_restore` against a real `.dot-agent-deck.toml` on disk and `TabManager::open_orchestration_tab` against a `CapturingPaneController` for the restore half; no PTY, no real agent).
+- **Agent:** none.
+- **Asserts:** a `SavedSession` whose orchestration pane's `OrchestrationSnapshot` carries `owner: Some("orchestration:my-feature")` round-trips that value unchanged through TOML serialize→deserialize (the real `session.toml` write/read path), and that feeding the recovered snapshot's `owner` through `open_orchestration_tab` as the `creator` argument — matching the production restore call in `run_tui` (`orch_snap.owner.as_deref()`) — records the identical string on every spawned role pane's `AgentSpawnOptions::owner`. Pins the milestone's headline claim: an orchestration tab, closed and reopened, restores under the SAME identity it stamped, so `--mine` still matches its earlier worktrees.
+- **Does not assert:** the `None`-owner case (an orchestration that owned no worktree restores with no identity — implicit in `session/restore/015`/`016`'s snapshots, which all set `owner: None`); a pre-M3.0 snapshot with no `owner` key at all deserializing to `None` (covered by `config/saved-session/001`); the live-create path that first populates `owner` onto the snapshot when the tab is opened (not independently pinned — `orchestration_identity_008` and `orchestration_identity_009` cover the same `creator` local reaching the marker/env, but not this specific snapshot-field write); real daemon/PTY spawn.
+- **Platform coverage:** mac+linux+windows.
+
+##### session/restore/018 — On the restore path, `DOT_AGENT_DECK_WORKTREE_OWNER` reaches EVERY restored role pane's genuinely spawned process environment — not merely a test double's recorded field, and not only the start role (PR #215 review round follow-up, findings-215-restart-manual.md).
+- **Layer:** e2e (`tests/e2e_worktree_owner_restore_env.rs`, `#[cfg(feature = "e2e")]` + `#[cfg(unix)]`). Spawns the real `dot-agent-deck daemon serve` BINARY as a subprocess (`common::spawn_daemon_serve`), attaches a real `EmbeddedPaneController` to it over its real Unix attach socket (the same client code the TUI uses), and calls `TabManager::open_orchestration_tab` with `creator: Some(owner)` — the exact argument shape `run_tui`'s daemon-empty restore branch uses (`orch_snap.owner.as_deref()`) once `resolve_orchestration_for_restore` succeeds — spawning two genuine `portable_pty` child processes via `agent_pty::spawn`.
+- **Agent:** none (plain `echo` shell commands, no LLM).
+- **Asserts:** both spawned role panes' own stdout — read back over the attach socket via `common::wait_for_pane_text_on`, itself reading `$DOT_AGENT_DECK_WORKTREE_OWNER` out of each child's OWN environment — contain the exact owner string `open_orchestration_tab` was called with. This is the join `session/restore/017`'s `CapturingPaneController` cannot exercise (producer proven, real-process reader not): the restore call reaches every role's real environment, not only the pane a manual spot-check happens to type into.
+- **Does not assert:** the private `resolve_orchestration_for_restore` re-resolution itself — config drift/tamper checks, the `project_path`-vs-`saved_dir` anti-tampering guard — which is not `pub` and stays L1-only (`session/restore/015`–`017`); a real `SavedSession` save → process-exit → reload cycle (`session/restore/017` covers the TOML round trip); the `should_apply_snapshot` daemon-empty gate (`session/restore/005`); LLM-agent behaviour.
+- **Platform coverage:** mac+linux.
+
 ### Live session status on reconnect (PRD #162)
 
 These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.
@@ -3373,11 +3450,11 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 
 #### config/saved-session
 
-##### config/saved-session/001 — An `OrchestrationSnapshot` on a saved pane round-trips through TOML, and a legacy snapshot without the field still parses (PRD #89 Phase 2b M2b.2).
+##### config/saved-session/001 — An `OrchestrationSnapshot` on a saved pane, including its `owner` identity field, round-trips through TOML, and both a fully-legacy snapshot and a pre-`owner`-field snapshot still parse (PRD #89 Phase 2b M2b.2; `owner` coverage added fork #166 M3.0 / PR #215 fixup).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession` / `SavedPane` / `OrchestrationSnapshot`; no TUI harness, no I/O).
 - **Agent:** none.
-- **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`) serializes to TOML and deserializes back with every field intact; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the field existed.
-- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot); any TUI rendering.
+- **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`, `owner: Some("orchestration:tdd-cycle")`) serializes to TOML and deserializes back with every field intact, `owner` included; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the block existed; (c) a `session.toml` string WITH an `[panes.orchestration]` block but no `owner` key (a snapshot written before that field existed) still parses, with `owner == None` — forward-compat for the field individually.
+- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); the restore branch passing `owner` through to a spawned pane (`session/restore/017`); capture (populating the fields when writing the snapshot); any TUI rendering.
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)
