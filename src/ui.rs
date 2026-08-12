@@ -2189,7 +2189,7 @@ fn prompt_text_confirms(
     let matches_text =
         observed_trimmed == sent_trimmed || observed_trimmed.starts_with(sent_trimmed);
     let text_changed_since_baseline = baseline != Some(observed_trimmed);
-    let genuine_resubmit_observed = observed_seq > baseline_seq;
+    let genuine_resubmit_observed = observed_seq >= baseline_seq;
     matches_text && (text_changed_since_baseline || genuine_resubmit_observed)
 }
 
