@@ -4439,6 +4439,86 @@ fn delegate_034_third_collision_destroys_the_first_archived_report() {
         });
 }
 
+#[cfg(unix)]
+struct CliDelegateResult {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run the real `dot-agent-deck delegate` CLI as a subprocess against
+/// `hook_path`, exactly as a role's shell would from inside a pane —
+/// `DOT_AGENT_DECK_PANE_ID` is the only thing that identifies the caller to
+/// the daemon.
+#[cfg(unix)]
+async fn run_delegate_cli(
+    hook_path: &std::path::Path,
+    pane_id: &str,
+    to: &str,
+    task: &str,
+) -> CliDelegateResult {
+    let hook_path = hook_path.to_path_buf();
+    let pane_id = pane_id.to_string();
+    let to = to.to_string();
+    let task = task.to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .arg("delegate")
+            .arg("--to")
+            .arg(&to)
+            .arg("--task")
+            .arg(&task)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .output()
+            .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
+        CliDelegateResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .expect("delegate CLI subprocess task did not panic")
+}
+
+/// Same as [`run_delegate_cli`] but with MULTIPLE `--to` flags, needed for
+/// `orchestration/delegate/033`'s duplicate-role scenario — a single `--to`
+/// cannot reproduce a `signal.to` containing a repeated role name.
+#[cfg(unix)]
+async fn run_delegate_cli_multi(
+    hook_path: &std::path::Path,
+    pane_id: &str,
+    to: &[&str],
+    task: &str,
+) -> CliDelegateResult {
+    let hook_path = hook_path.to_path_buf();
+    let pane_id = pane_id.to_string();
+    let to: Vec<String> = to.iter().map(|s| s.to_string()).collect();
+    let task = task.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        cmd.arg("delegate");
+        for role in &to {
+            cmd.arg("--to").arg(role);
+        }
+        cmd.arg("--task")
+            .arg(&task)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path);
+        let output = cmd
+            .output()
+            .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
+        CliDelegateResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .expect("delegate CLI subprocess task did not panic")
+}
+
 // --- fork #92: `delegate` confirms a delegation it never made -------------
 //
 // P3 follow-up to `orchestration/delegate/016`-`018`: none of that trio

@@ -200,7 +200,8 @@ fn idle_timeout_diagnostics(deck: &TuiDeck, waited_for: &str) -> String {
         orchestrator_scrollback.contains(&common::search_key(&idle_role_label("worker")));
 
     let grid = deck.snapshot_grid();
-    let waited_for_in_viewport = squeeze(&grid).contains(&squeeze(waited_for));
+    let waited_for_in_viewport =
+        common::squeeze_wrapped_text(&grid).contains(&common::squeeze_wrapped_text(waited_for));
 
     format!(
         "idle_worker_011 timeout diagnostics (fork #81):\n\

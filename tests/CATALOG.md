@@ -941,6 +941,12 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the marker file's *content* or format (the ownership gate is an existence check by design; the unit tests in `src/issue_dispatch_run.rs` cover the write's placement, tree-cleanliness and idempotency); the `reclaim` removal path for this fixture (`002`); retro-marking of pre-existing worktrees, which is deliberately not done at all.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/024 — Two markers written directly via `mark_worktree_owned` for two DIFFERENT worktrees of the SAME repo, using the exact owner strings the interactive path records for two live orchestrations of the SAME config type (`review`) in the SAME directory, report DISTINCT owners back via `owner_of` (fork#192 — the unit-level complement to `worktree/reclaim/022`'s real-dispatch pin of the same success criterion).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, following `worktree/reclaim/017`'s precedent (a real git repo via `init_repo_with_origin`, two linked worktrees via real `git worktree add`).
+- **Agent:** none.
+- **Asserts:** `mark_worktree_owned(wt_a, "orchestration:review-orchestrator-1")` and `mark_worktree_owned(wt_b, "orchestration:review-orchestrator-2")` on two worktrees of the same repo each round-trip through `owner_of` to their own exact string, and the two owners are `assert_ne!`.
+- **Does not assert:** the interactive `SpawnPane` handler that derives these owner strings from the typed Name (covered end-to-end by `worktree/reclaim/022`, `src/ui.rs`); `mark_worktree_owned`/`owner_of` themselves, which are unchanged by fork#192 and already covered by `017`/`020`.
+
 #### daemon/protocol
 
 ##### daemon/protocol/001 — A `SubscribeEvents` receiver that falls behind the broadcast capacity is torn down with `KIND_STREAM_END` carrying exactly the documented `"lagged"` reason (`handle_subscribe_events`'s doc comment, src/daemon_protocol.rs).
@@ -2844,6 +2850,34 @@ without depending on the config struct API.
 - **Does not assert:** exit-code value beyond success/failure, or the exact wording distinguishing the two roles.
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+##### orchestration/delegate/038 — A `delegate` that resolves to ZERO targets (a role name with no registered pane) must not report success (fork #92 P1).
+- **Layer:** fast real-CLI-subprocess integration (the real `dot-agent-deck delegate` binary run against a real in-process daemon over its hook socket; a `cat`-stub `coder` worker exists so the daemon is not empty, just missing the TARGETED role).
+- **Agent:** none.
+- **Asserts:** with a real orchestrator pane and a resolvable `coder` worker registered, running `delegate --to nonexistent-role` — a role with no pane at all — exits NON-ZERO. `delegate_targets` silently drops the unresolved role (no dispatch queued, no worker watch armed), but `handle_delegate` used to reply `DelegateResponse::accepted(signal.to)` unconditionally, echoing the requested role regardless of whether anything was actually armed — the false-positive confirmation that can induce the duplicate-delegation retry upstream #330 exists to prevent.
+- **Does not assert:** exit-code value, message wording, or `DelegateResponse` field shape (same discipline as `orchestration/delegate/016`-`018`) — only that a zero-target delegate does not report success.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/039 — A `delegate` that self-targets the orchestrator's OWN role name also resolves to ZERO targets and must not report success (fork #92 P1).
+- **Layer:** fast real-CLI-subprocess integration (same technique as `orchestration/delegate/038`).
+- **Agent:** none.
+- **Asserts:** with the orchestrator pane registered under role `orchestrator` and a `coder` worker also present, running `delegate --to orchestrator` from the orchestrator pane exits NON-ZERO. `delegate_targets` deliberately excludes any pane in `orchestrator_pane_ids` from role resolution, so this resolves to nothing even though a pane with that exact role name exists — the same false-positive-confirmation hazard as `orchestration/delegate/038`, from a different resolution path.
+- **Does not assert:** exit-code value, message wording, or `DelegateResponse` field shape.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/040 — A `delegate --to coder --to coder` (a duplicated target role) must confirm the role exactly ONCE, not once per request (fork #92 P2).
+- **Layer:** fast real-CLI-subprocess integration (same technique as `orchestration/delegate/038`).
+- **Agent:** none.
+- **Asserts:** with exactly one `coder` worker pane registered, running `delegate --to coder --to coder` exits ZERO (one real pane was armed, so the call must succeed — failing it would make a retry-on-non-zero orchestrator double-delegate the role that DID arm, upstream #330's harm from the other direction) and the confirmation names `coder` exactly once, not twice. `delegate_targets` de-duplicates the repeated role before dispatch, so a reply that echoes `signal.to` verbatim would name the role twice even though only one worker pane was actually armed — indistinguishable from a genuine second worker having been armed.
+- **Does not assert:** exit-code value beyond success/failure, or the exact confirmation wording beyond the role-name occurrence count.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
+##### orchestration/delegate/041 — A `delegate --to coder --to nonexistent-role` (one resolvable, one not) must succeed AND name both the armed role and the unresolved one, distinguishably — not fold them into one undifferentiated echo (fork #92 partial-resolution decision).
+- **Layer:** fast real-CLI-subprocess integration (same technique as `orchestration/delegate/038`).
+- **Agent:** none.
+- **Asserts:** with exactly one `coder` worker pane registered, running `delegate --to coder --to nonexistent-role` exits ZERO (something really did arm, so failing the call would make a retry-on-non-zero orchestrator double-delegate the role that DID arm) and both `coder` (armed) and `nonexistent-role` (unresolved) are named somewhere observable in the output, not simply reported as one plain comma-joined pair indistinguishable from a fully-resolved multi-target delegate — the same silent-drop failure `orchestration/delegate/038`/`039` pin, wearing the partial-resolution shape.
+- **Does not assert:** exit-code value beyond success/failure, or the exact wording distinguishing the two roles.
+- **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -2894,14 +2928,14 @@ without depending on the config struct API.
 - **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces today; no daemon, no PTY).
 - **Agent:** none.
 - **Asserts:** a form built with Name `"myproj"` (the basename pre-fill) and one orchestration, after a Right-arrow selects that orchestration, has `form.name == "myproj-orchestrator-1"`, not `"myproj"`; submitting from there (Enter Mode→Name, Enter to submit) with no further edit yields `Action::SpawnPane` carrying `req.name == "myproj-orchestrator-1"` unchanged.
-- **Does not assert:** the daemon round-trip `live_orchestration_cwds_and_titles()`/`transition_after_dir_pick` performs to learn live names (not unit-testable without a live daemon); rendering of the suggestion (no L1 render seam asserts the Name field's literal text here).
+- **Does not assert:** the daemon round-trip `live_orchestration_cwds_and_titles()`/`transition_after_dir_pick` performs to learn live names (not unit-testable without a live daemon — covered informally by `orchestration/identity/009`'s real-binary path); rendering of the suggestion (no L1 render seam asserts the Name field's literal text here).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/identity/003 — With `<folder>-orchestrator-1` already live (injected via a test-only `NewPaneFormState::with_live_orchestration_names` builder), selecting the orchestration suggests `<folder>-orchestrator-2` next, skipping the taken slot; submitting a name a live orchestration already holds is REFUSED — no `Action::SpawnPane`, form stays open.
 - **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, as `orchestration/identity/002`).
 - **Agent:** none.
 - **Asserts:** a form built with Name `"myproj"`, one orchestration, and `with_live_orchestration_names(vec!["myproj-orchestrator-1".into()])`, after a Right-arrow selects the orchestration, has `form.name == "myproj-orchestrator-2"`; overwriting the Name field back to the taken `"myproj-orchestrator-1"` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane`, and `ui.mode` stays `UiMode::NewPaneForm`.
-- **Does not assert:** the exact refusal UI copy/rendering; what N is counted over across multiple cwds (scoped global-over-live); a real-binary/PTY-attached end-to-end pass (no L2 test accompanies this port).
+- **Does not assert:** the exact refusal UI copy/rendering (covered by `orchestration/guard/002`); what N is counted over across multiple cwds (scoped global-over-live).
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/identity/004 — Re-clicking the already-selected orchestration chip, or arrowing off it and back, must not clobber a Name the user has typed over the suggestion (Greptile P1; the suggestion must only ever replace a generated default, never a human edit).
@@ -2914,16 +2948,44 @@ without depending on the config struct API.
 ##### orchestration/identity/005 — An empty Name field is checked against the RESOLVED title it will actually submit (the canonical config name), not the raw empty string — clearing the field can no longer silently bypass the collision guard.
 - **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path for the state transition, plus the `render_new_pane_orchestration_name_collision_to_buffer` seam and a direct `render_overlay_to_buffer`/`render_new_pane_form` render of the driven form for the render assertions; no daemon, no PTY).
 - **Agent:** none.
-- **Asserts:** a form with one orchestration and `with_live_orchestration_names(vec!["review".into()])`, after selecting the orchestration and clearing the Name field to empty via real `KeyCode::Backspace` events, `form.name_collision()` is `true` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane` (`ui.mode` stays `UiMode::NewPaneForm`); separately, rendering the dedicated collision seam with an empty typed name against a live title matching the seam's fixture orchestration name confirms `[Submit]` is absent from the action row (dropped, not dimmed); and rendering the form those keystrokes actually produced — focus on Name, the one field where Enter reaches the guard, which the seam does not cover because it opens focused on Mode — confirms the footer omits `Enter: submit` entirely (issue #589), while typing `review-2` over the empty name restores both `[Submit]` and the `Enter: submit` promise.
-- **Does not assert:** the daemon-side authoritative check deferred to a follow-up issue (form-time uniqueness stays advisory); a real-binary/PTY-attached end-to-end pass; the footer wording on a field where Enter only advances focus, or on the mode-locked schedule form (both covered by the `new_pane_form_footer_hint` unit test beside it).
+- **Asserts:** a form with one orchestration and `with_live_orchestration_names(vec!["review".into()])`, after selecting the orchestration and clearing the Name field to empty via real `KeyCode::Backspace` events, `form.name_collision()` is `true` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane` (`ui.mode` stays `UiMode::NewPaneForm`); separately, rendering the dedicated collision seam with an empty typed name against a live title matching the seam's fixture orchestration name confirms `[Submit]` renders DISABLED (dimmed, present in the buffer but excluded from the click hit-test — fork#192 review F3) rather than dropped from the action row.
+- **Does not assert:** the daemon-side authoritative check deferred to a follow-up issue (form-time uniqueness stays advisory); a real-binary/PTY-attached end-to-end pass.
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/identity/006 — Cycling AWAY from the orchestration restores the directory-basename pre-fill, so a plain pane, a workload-mode pane or a `schedule`/`dispatcher` card is never left holding the `<folder>-orchestrator-N` suggestion (issue #638).
 - **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` arrow-key path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces; no daemon, no PTY).
 - **Agent:** none.
 - **Asserts:** a form built with Name `"myproj"` and one orchestration, after Right selects the orchestration (control: `form.name == "myproj-orchestrator-1"`, so the failure below is attributable to the leave path and not to the whole suggestion), Left back to "No mode" restores `form.name == "myproj"` and submitting yields `Action::SpawnPane` with `req.name == "myproj"`; separately, two Rights landing on the built-in `schedule` option — the cycler orders orchestrations BEFORE it, so reaching it means passing over one — also leaves `form.name == "myproj"`.
-- **Does not assert:** that a name the user TYPED survives the same cycling (that is `orchestration/identity/004`, whose `name_touched` guard this shares and does not change); the render of the Name field's literal text; the daemon round-trip that learns live orchestration names.
+- **Does not assert:** that a name the user TYPED survives the same cycling (that is `orchestration/identity/004`, whose `name_is_suggestion` guard this shares and does not change); the render of the Name field's literal text; the daemon round-trip that learns live orchestration names.
 - **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/010 — The uniqueness gate (`name_collision`) and the suggestion loop (`suggest_orchestration_name`) normalize on the SAME trim the sink (`build_new_pane_request`) applies — not a looser, untrimmed comparison (fork#192 audit F1).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` and the form's builder methods directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** (a) with `myproj-orchestrator-1` live, a form whose typed Name is `"myproj-orchestrator-1 "` (that exact string plus one trailing space) reports `name_collision() == true`, and submitting it via `handle_new_pane_form_key` (Enter, Enter) does NOT yield `Action::SpawnPane`; (b) a form built for directory `/tmp/ myproj` (basename carries a leading space) with `myproj-orchestrator-1` already live (the TRIMMED identity a previous open recorded) has `suggest_orchestration_name() == "myproj-orchestrator-2"`, not a candidate built from the untrimmed basename.
+- **Does not assert:** the click-door (`Action::FormSubmit`) refusal for the same untrimmed-name case (covered generically by `orchestration/guard/003`, using a plain taken name rather than a whitespace variant); marker-truncation collisions past 200 chars (audit F8, out of scope — subsumed by `orchestration/identity/012`'s 128-byte cap).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/011 — Landing on an orchestration must not silently destroy a Name the user actually typed; a still-untouched suggestion must keep being replaced on a later landing (fork#192 review F4 / audit F7).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly through the Right/Tab/Backspace/Char/BackTab/Left key sequence a real user's round-trip produces; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** selecting the form's one orchestration (Right), tabbing to Name, backspacing out the suggestion and typing `"hotfix-triage"`, then Shift+Tabbing back to Mode and pressing Left (lands on "No mode", a no-op landing) then Right again (lands back on the orchestration) leaves `form.name == "hotfix-triage"` — unchanged by either landing. A SEPARATE case in the same test: with `myproj-orchestrator-1` live, selecting the orchestration leaves the field holding the untouched suggestion `myproj-orchestrator-2`; widening `live_orchestration_names` to also include `myproj-orchestrator-2` (simulating what a later daemon read would show) and repeating the Left/Right landing updates the field to `myproj-orchestrator-3` — an untouched suggestion still gets replaced.
+- **Does not assert:** the chip-click arm (`Action::FormSelectMode`, `src/ui.rs`) that calls the same `resuggest_name_for_selection` — same production function as the keyboard path, not independently pinned; persistence of the distinction across a form rebuild (there is none — the state lives only in the live `NewPaneFormState`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/012 — The Name field stops accepting input at the daemon's `DISPLAY_NAME_MAX_LEN` (128-byte) cap, so a name the form lets the user type always survives `is_valid_display_name`; a name at the cap still round-trips into the uniqueness check against an identical live name (fork#192 review round 2, F1).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving `handle_new_pane_form_key` directly; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** typing (via repeated `KeyCode::Char` events, simulating a paste) `DISPLAY_NAME_MAX_LEN + 40` bytes into a focused, empty Name field yields `form.name.len() <= DISPLAY_NAME_MAX_LEN`; the resulting name satisfies `crate::agent_pty::is_valid_display_name`; and with that exact string pushed into `live_orchestration_names` and the form's one orchestration selected directly, `form.name_collision()` is true.
+- **Does not assert:** WHERE the cap is enforced (keystroke-time rejection vs. submit-time truncation are both consistent with the assertions here); the daemon-side `spawn_agent` null-and-keep path itself (`src/agent_pty.rs`, unit-covered separately); multi-byte/Unicode boundary truncation (the paste here is single-byte ASCII, matching the reviewer's own GitHub-issue-title example).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/013 — Driving the real binary through TWO orchestration opens in the SAME directory, each accepting the form's suggested Name with a single Enter (no character typed), lands both as visible tabs with DISTINCT labels (`<basename>-orchestrator-1`, `<basename>-orchestrator-2`) — never the identical basename-derived title recorded twice, the fork #74 collision fork#192 exists to stop (fork#192 M1.0).
+- **Layer:** L2 (PTY-attached real binary via `TuiDeck`; stand-in `cat` agent, no real LLM tokens spent, no credentials required).
+- **Agent:** none (both roles of the `orch-deck` fixture run `cat`).
+- **Asserts:** after opening the fixture's one orchestration twice from the Dashboard (`Ctrl+n` → confirm dir → select orchestration → accept the suggested Name unedited → submit), the rendered tab strip contains both `" <basename>-orchestrator-1 "` and `" <basename>-orchestrator-2 "` as distinct substrings, where `<basename>` is the real launch directory's basename read from `TuiDeck::workdir()`. The second wait barrier is `wait_for_string(&second_label)` itself (fork#192 review round 2 F7 — the prior `wait_for_string(" worker ")` was vacuous there: the Dashboard already shows " worker " from the FIRST orchestration's panes before the second open even starts, since the fixture's second role is literally named "worker").
+- **Does not assert:** the suggestion/refusal MECHANISMS in isolation (covered by `orchestration/identity/002`/`003`); worktree creation (no worktree slug is typed on this path); ownership marker content (covered by `worktree/reclaim/022`/`023`).
+- **Platform coverage:** mac+linux (PTY-attached, `#[cfg(feature = "e2e")]`, as the other `e2e_orchestration_*.rs` files).
 
 #### orchestration/guard
 
@@ -2932,6 +2994,22 @@ without depending on the config struct API.
 - **Agent:** none (the render seam supplies synthetic live-daemon orchestration cwd records).
 - **Asserts:** an orchestration selected for a cwd matching an existing live orchestration renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh cwd renders neither warning substring.
 - **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/002 — A name collision (the typed Name matches a name a live orchestration already holds) renders a BLOCKING refusal on the same guard seam `guard/001` uses; `[Submit]` renders present-but-INERT rather than removed, and `[Cancel]`'s clickable rect does not overlap it; a distinct typed name renders normally (fork#192 M1.0; contract corrected twice in review round 2 — see below).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, driving the private `render_new_pane_form` directly through a `TestBackend` to access the click-hit-test rects it returns; no PTY, no subprocess). **Moved from `tests/render_orchestration_guard.rs`** (fork#192 review round 2, F3/F8) — the public buffer-only seam `render_new_pane_orchestration_name_collision_to_buffer` this test previously used discards those rects, which the corrected contract needs.
+- **Agent:** none (a synthetic typed Name plus synthetic live-orchestration names, as before).
+- **Asserts:** on collision, the rendered buffer contains `[Submit]` (present, not removed) AND the blocking-refusal copy (`"already in use"`, `NAME_COLLISION_WARNING`); the click-hit-test rects `render_new_pane_form` returns do NOT contain an `Action::FormSubmit` entry (inert — excluded from hit-testing, the same mechanism `render_modal_button_row` already applies to any disabled button); WITHIN that same colliding render, `[Cancel]`'s clickable rect does not intersect `[Submit]`'s on-screen rect (located by scanning the rendered text grid, since an inert button carries no click rect). A distinct typed name's rects DO contain `Action::FormSubmit`.
+- **Does not assert:** exact refusal copy beyond the `"already in use"` needle; the Name-field text content itself; the suggestion logic that produces a non-colliding name in the first place (`orchestration/identity/002`/`003`); the `Action::FormSubmit` DISPATCH-level guard (covered by `orchestration/guard/003`); any invariance of the modal's size or `[Cancel]`'s position across the colliding vs. distinct-name renders (withdrawn — see below).
+- **CORRECTED CONTRACT (fork#192 review round 2, reviewer F3):** the original assertion was `[Submit]` GONE from the row entirely. `render_modal_button_row` lays buttons out left-aligned, so removing `[Submit]` slides `[Cancel]` into `[Submit]`'s exact former screen cells — a muscle-memory click on where Submit has always been now hits the destructive Cancel instead, discarding the whole form. The render seam already has an inert-but-visible mechanism for exactly this (a disabled button renders dimmed and is excluded from the click rects); the corrected contract uses that instead of removing the button. Precedent for revising a catalog assertion in place: `worktree/reclaim/008`.
+- **CORRECTED CONTRACT, second pass (fork#192 review round 2, tester self-correction after the coder's fix round):** the first corrected contract still compared `[Cancel]`'s rect ACROSS the colliding and distinct-name renders and asserted equality. That comparison is wrong, not the production behavior: the two renders are legitimately different-sized popups — the collision's `NAME_COLLISION_WARNING` feeds both `desired_w` and `desired_h` (`src/ui.rs`'s `modal_rect` call site), which the distinct-name render never shows, so `modal_rect` re-centers differently. PRD #140's existing same-cwd warning reflows the modal the same way; this codebase deliberately does not guarantee modal-centring invariance under a warning appearing. The actual hazard (reviewer F3) never depended on cross-render position match — with `[Submit]` present-but-inert it still holds its row slot and lays out before `[Cancel]`, so `[Cancel]` structurally cannot occupy `[Submit]`'s cells regardless of the popup's size or position. The contract now pins that directly: WITHIN the colliding render, `[Cancel]`'s rect must not intersect `[Submit]`'s rect. Same precedent as the first correction: `worktree/reclaim/008`.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/guard/003 — The `Action::FormSubmit` click door independently refuses a colliding name — defense-in-depth for a state the render seam (`orchestration/guard/002`) is meant to make unreachable (fork#192 review F9).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests`, dispatching the real `Action::FormSubmit` through the production `dispatch_action` against a `CapturingPaneController`; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** dispatching `Action::FormSubmit` against a form whose typed Name (`myproj-orchestrator-1`) matches a live orchestration name results in zero recorded orchestration identities on the `CapturingPaneController` (no pane spawned), `ui.mode` still `UiMode::NewPaneForm`, and `ui.new_pane_form` still `Some` (not taken).
+- **Does not assert:** the render-layer inertness of the `[Submit]` button itself (covered by `orchestration/guard/002`); the Enter-key submit door (covered by `orchestration/identity/003`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/lock

@@ -1019,7 +1019,7 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// actually removed, so the caller can tell the user either "try again" or
 /// give them the exact manual command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorktreeCreation {
+pub enum WorktreeCreation {
     Created,
     /// The worktree DIRECTORY is already there — a concurrent fire claimed it in
     /// the benign TOCTOU window described below. Callers surface this as a skip
@@ -1035,7 +1035,9 @@ pub(crate) enum WorktreeCreation {
     /// a reused name report a worktree conflict that the user could see was not
     /// true — the directory is plainly gone — with no hint of the real cause.
     BranchExists,
-    TimedOut { cleaned_up: bool },
+    TimedOut {
+        cleaned_up: bool,
+    },
 }
 
 /// Attempts (the first included) at `git worktree add` when it fails because a
@@ -1570,7 +1572,7 @@ fn parse_open_issues(json: &str) -> Result<Vec<OpenIssue>, String> {
 /// for a process-group kill to fix, and no `AgentProcessGroup` handle worth
 /// threading through an await that never times out. The asymmetry with
 /// [`run_status_sync`] is intentional, not an oversight.
-async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+pub(crate) async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
