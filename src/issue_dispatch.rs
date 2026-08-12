@@ -418,12 +418,14 @@ pub fn issue_comment_argv(repo: &str, issue: u64, body: &str) -> Vec<String> {
 }
 
 /// Build the `gh issue view` argv (arguments after `gh`) that reads back an
-/// issue's comments — the M1.3 claimant lookup, called ONLY once the
-/// `in-progress` label is already known present (from the `gh issue list`
-/// response `issue_list_argv` requests — see its doc comment), so an
-/// unlabelled issue never triggers this call at all. The issue number sits
-/// after the `--` end-of-options marker — see [`issue_edit_add_label_argv`]'s
-/// doc comment for why that placement matters.
+/// issue's comments and current assignees. Two callers: the M1.3 claimant
+/// lookup, called only once the `in-progress` label is already known present
+/// (from the `gh issue list` response `issue_list_argv` requests — see its
+/// doc comment); and, since PRD fork#235 FINAL round 5, `claim_issue`'s
+/// removal-target lookup (`current assignees − {claimant}`), called on
+/// EVERY claim regardless of label state. The issue number sits after the
+/// `--` end-of-options marker — see [`issue_edit_add_label_argv`]'s doc
+/// comment for why that placement matters.
 pub fn issue_view_comments_argv(repo: &str, issue: u64) -> Vec<String> {
     vec![
         "issue".to_string(),
@@ -431,7 +433,7 @@ pub fn issue_view_comments_argv(repo: &str, issue: u64) -> Vec<String> {
         "--repo".to_string(),
         repo.to_string(),
         "--json".to_string(),
-        "comments".to_string(),
+        "comments,assignees".to_string(),
         "--".to_string(),
         issue.to_string(),
     ]
@@ -618,15 +620,18 @@ pub fn gh_current_login_argv() -> Vec<String> {
 
 /// Build the `gh issue edit --add-assignee/--remove-assignee` argv
 /// (arguments after `gh`) implementing replace-to-one assignment (PRD
-/// fork#235 M2): `add` is the new assignee, `remove` the prior one (`None`
-/// when there is no prior claim to displace — the very first claim on an
-/// issue). Mirrors [`issue_edit_add_label_argv`]'s `--` end-of-options
-/// placement.
+/// fork#235 M2, round 5): `add` is the new assignee, `remove` the current
+/// assignees being displaced — `current GitHub assignees − {add}` (empty for
+/// the very first claim on an issue, or an idempotent refresh where `add` was
+/// already the sole assignee). One `--remove-assignee` flag per entry, so a
+/// hand-assigned issue carrying more than one prior assignee is fully
+/// cleared, not just narrowed to one survivor. Mirrors
+/// [`issue_edit_add_label_argv`]'s `--` end-of-options placement.
 pub fn issue_edit_assignee_argv(
     repo: &str,
     issue: u64,
     add: Option<&str>,
-    remove: Option<&str>,
+    remove: &[String],
 ) -> Vec<String> {
     let mut argv = vec![
         "issue".to_string(),
@@ -638,9 +643,9 @@ pub fn issue_edit_assignee_argv(
         argv.push("--add-assignee".to_string());
         argv.push(a.to_string());
     }
-    if let Some(r) = remove {
+    for r in remove {
         argv.push("--remove-assignee".to_string());
-        argv.push(r.to_string());
+        argv.push(r.clone());
     }
     argv.push("--".to_string());
     argv.push(issue.to_string());
@@ -657,10 +662,12 @@ pub fn issue_edit_assignee_argv(
 pub const CLAIM_COMMENT_PREFIX: &str = "Claimed by ";
 
 /// The fields [`parse_claim_fields`] extracts from one already-located claim
-/// comment (a comment whose body starts with [`CLAIM_COMMENT_PREFIX`]).
-/// Feeds both the M3 lock decision (`identity` compared against the caller's
-/// own, `timestamp` rendered into a refusal) and M2's assignee replacement
-/// (`login`, the prior assignee to remove).
+/// comment (a comment whose body starts with [`CLAIM_COMMENT_PREFIX`]). Feeds
+/// the M3 lock decision (`identity` compared against the caller's own,
+/// `timestamp` rendered into a refusal). `login` is rendered for a human
+/// reader only (PRD fork#235 FINAL round 5) — never read back into a write;
+/// the assignee-replacement target comes from `gh issue view`'s own
+/// `assignees` field instead, via [`parse_current_assignees`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedClaim {
     /// The composed identity string (an [`Identity`]'s `Display` output) —
@@ -683,22 +690,6 @@ pub struct ParsedClaim {
     /// the whole thing (the PRD #421 skip-reason claimant text), so parsing
     /// out structured fields doesn't lose the ability to show the original.
     pub raw: String,
-    /// The GitHub login that AUTHORED this claim comment (`gh issue view
-    /// --json comments`'s `author.login`), attached alongside `body` from
-    /// the SAME comment object by [`parsed_claim_from_comment_json`] — never
-    /// a second call. Round-4 author gate (PRD fork#235): "who holds this
-    /// issue?" (the fields above) reads ANY discoverable claim comment, but
-    /// "whose assignment do we remove?" trusts only a comment whose
-    /// `author` is the deck's own currently-authenticated account —
-    /// comparing this field against that login is how both write paths
-    /// (`issue_claim::do_claim`, `issue_dispatch_run::claim_issue`) make
-    /// that decision, never `login` alone. `None` when the JSON carried no
-    /// `author.login` (an older-shaped record, a synthetic JSON that omits
-    /// it, or a hand-typed comment) — always fails the gate rather than
-    /// assuming a match. Also `None` for a [`ParsedClaim`] built directly
-    /// from a raw body string (e.g. [`parse_claim_fields`] called without a
-    /// surrounding comment object), since there is no author to attach.
-    pub author: Option<String>,
 }
 
 /// Parse the structured fields out of one already-located claim comment body
@@ -767,7 +758,6 @@ fn parse_human_claim(after_at: &str, raw: &str) -> Option<ParsedClaim> {
         timestamp,
         login: Some(login),
         raw: raw.to_string(),
-        author: None,
     })
 }
 
@@ -828,14 +818,13 @@ fn parse_worktree_claim(rest: &str, raw: &str) -> Option<ParsedClaim> {
         let after = &after_timestamp[idx + ", for @".len()..];
         let end = after.find(',').unwrap_or(after.len());
         let candidate = after[..end].trim_end_matches('.').to_string();
-        // Round-4 audit, cause 1 (`issue/claim/025`): validate at the
-        // parser boundary — `validate_gh_login`'s two pre-existing call
-        // sites both validate the deck's own `gh api user` reply, never a
-        // login PARSED out of a comment, so a malformed value used to sail
-        // straight through even once the author gate (`022`/`023`) was
-        // satisfied. Both write paths read `ParsedClaim.login`, so
-        // dropping an invalid candidate here means neither has to
-        // re-make this judgement.
+        // Round-4 audit, cause 1 (`issue/claim/025`): validate at the parser
+        // boundary — `validate_gh_login`'s two pre-existing call sites both
+        // validate the deck's own `gh api user` reply, never a login PARSED
+        // out of a comment. `login` is rendered for a human reader only
+        // (PRD fork#235 FINAL round 5 — no write path reads it back), but it
+        // is still untrusted text reaching operator-facing output, so it is
+        // dropped here rather than shown malformed.
         validate_gh_login(&candidate).then_some(candidate)
     });
     Some(ParsedClaim {
@@ -843,7 +832,6 @@ fn parse_worktree_claim(rest: &str, raw: &str) -> Option<ParsedClaim> {
         timestamp,
         login,
         raw: raw.to_string(),
-        author: None,
     })
 }
 
@@ -867,10 +855,12 @@ fn extract_timestamp(after_marker: &str) -> Option<(String, &str)> {
     Some((timestamp, &after_ts[ts_end..]))
 }
 
-/// Build the `gh issue view --json labels,comments` argv (arguments after
-/// `gh`) M3's `issue claim` reads to decide: whether `in-progress` is
-/// present, and — if so — who the newest claim comment names. One call
-/// carries both signals `decide_claim` needs.
+/// Build the `gh issue view --json labels,comments,assignees` argv (arguments
+/// after `gh`) M3's `issue claim` reads to decide: whether `in-progress` is
+/// present, who the newest claim comment names (display only, PRD fork#235
+/// FINAL round 5), and the current GitHub assignees (the round-5 removal
+/// target: `current assignees − {claimant}`). One call carries all three
+/// signals the CLI write path needs.
 pub fn issue_view_claim_state_argv(repo: &str, issue: u64) -> Vec<String> {
     vec![
         "issue".to_string(),
@@ -878,36 +868,46 @@ pub fn issue_view_claim_state_argv(repo: &str, issue: u64) -> Vec<String> {
         "--repo".to_string(),
         repo.to_string(),
         "--json".to_string(),
-        "labels,comments".to_string(),
+        "labels,comments,assignees".to_string(),
         "--".to_string(),
         issue.to_string(),
     ]
 }
 
-/// Parse [`ParsedClaim::author`] onto whatever [`parse_claim_fields`]
-/// extracts from `comment`'s `body` — reading BOTH from the SAME already-
-/// fetched comment object, never a second `gh` call. Round-4 author gate
-/// (PRD fork#235): shared by [`parse_claim_state`] (the CLI path) and
+/// Parse whatever [`parse_claim_fields`] extracts from `comment`'s `body` —
+/// the shared step between [`parse_claim_state`] (the CLI path) and
 /// `issue_dispatch_run::parse_claim_comment` (the async dispatch path) so
-/// the two write paths read "who authored the held claim?" the exact same
-/// way — the CLI-vs-dispatch asymmetry a round-3 audit already had to close
-/// once must not reopen here by each path re-implementing this lookup.
+/// both read "what does the newest claim comment say?" the exact same way.
 pub(crate) fn parsed_claim_from_comment_json(comment: &serde_json::Value) -> Option<ParsedClaim> {
     let body = comment.get("body").and_then(serde_json::Value::as_str)?;
-    let mut claim = parse_claim_fields(body)?;
-    claim.author = comment
-        .get("author")
-        .and_then(|a| a.get("login"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    Some(claim)
+    parse_claim_fields(body)
 }
 
-/// Parse a `gh issue view --json labels,comments` document into (label
-/// present, newest claim). PRD fork#235 M3: the pure counterpart to
-/// [`issue_view_claim_state_argv`], kept separate from the subprocess call so
-/// the JSON-shape logic is unit-testable.
-pub fn parse_claim_state(json: &str) -> Result<(bool, Option<ParsedClaim>), String> {
+/// The current assignee logins out of a `gh issue view` document's own
+/// `assignees` field — shared by [`parse_claim_state`] and
+/// [`parse_current_assignees`], the PRD fork#235 FINAL round-5 removal
+/// target's SOLE source (`current assignees − {claimant}`, never a claim
+/// comment). Missing or malformed `assignees` degrades to empty, same
+/// discipline as `label_present`/`held` above.
+fn assignee_logins(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("assignees")
+        .and_then(serde_json::Value::as_array)
+        .map(|assignees| {
+            assignees
+                .iter()
+                .filter_map(|a| a.get("login").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a `gh issue view --json labels,comments,assignees` document into
+/// (label present, newest claim, current assignees). PRD fork#235 M3/round 5:
+/// the pure counterpart to [`issue_view_claim_state_argv`], kept separate
+/// from the subprocess call so the JSON-shape logic is unit-testable.
+pub fn parse_claim_state(json: &str) -> Result<(bool, Option<ParsedClaim>, Vec<String>), String> {
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
     let label_present = value
@@ -931,7 +931,19 @@ pub fn parse_claim_state(json: &str) -> Result<(bool, Option<ParsedClaim>), Stri
                 })
                 .and_then(parsed_claim_from_comment_json)
         });
-    Ok((label_present, held))
+    let assignees = assignee_logins(&value);
+    Ok((label_present, held, assignees))
+}
+
+/// Parse a `gh issue view --json ...,assignees` document into the current
+/// assignee logins alone — the dispatch path's own entry point onto
+/// [`assignee_logins`], for `issue_dispatch_run::claim_issue`'s round-5
+/// removal-target lookup, which (unlike the CLI path's [`parse_claim_state`])
+/// has no use for `labels` or `comments` at all.
+pub fn parse_current_assignees(json: &str) -> Result<Vec<String>, String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("failed to parse `gh issue view` JSON: {e}"))?;
+    Ok(assignee_logins(&value))
 }
 
 /// Neutralise a claimant-supplied task name for safe interpolation into a
@@ -1530,7 +1542,7 @@ mod tests {
                 "--repo",
                 "acme/widgets",
                 "--json",
-                "comments",
+                "comments,assignees",
                 "--",
                 "7",
             ]
@@ -1724,7 +1736,7 @@ mod tests {
     #[test]
     fn issue_edit_assignee_argv_shapes() {
         assert_eq!(
-            issue_edit_assignee_argv("acme/widgets", 7, Some("bob"), Some("alice")),
+            issue_edit_assignee_argv("acme/widgets", 7, Some("bob"), &["alice".to_string()]),
             vec![
                 "issue",
                 "edit",
@@ -1738,9 +1750,9 @@ mod tests {
                 "7",
             ]
         );
-        // First-ever claim: no prior assignee to remove.
+        // First-ever claim: no prior assignees to remove.
         assert_eq!(
-            issue_edit_assignee_argv("acme/widgets", 7, Some("bob"), None),
+            issue_edit_assignee_argv("acme/widgets", 7, Some("bob"), &[]),
             vec![
                 "issue",
                 "edit",
@@ -1750,6 +1762,30 @@ mod tests {
                 "bob",
                 "--",
                 "7"
+            ]
+        );
+        // A hand-assigned issue carrying more than one prior assignee: one
+        // `--remove-assignee` flag per entry (PRD fork#235 FINAL round 5).
+        assert_eq!(
+            issue_edit_assignee_argv(
+                "acme/widgets",
+                7,
+                Some("bob"),
+                &["alice".to_string(), "carol".to_string()]
+            ),
+            vec![
+                "issue",
+                "edit",
+                "--repo",
+                "acme/widgets",
+                "--add-assignee",
+                "bob",
+                "--remove-assignee",
+                "alice",
+                "--remove-assignee",
+                "carol",
+                "--",
+                "7",
             ]
         );
     }
@@ -1764,7 +1800,7 @@ mod tests {
                 "--repo",
                 "acme/widgets",
                 "--json",
-                "labels,comments",
+                "labels,comments,assignees",
                 "--",
                 "7",
             ]
@@ -1831,31 +1867,48 @@ mod tests {
             {"body":"unrelated"},
             {"body":"Claimed by the orchestration `orch-A` working `/work/wt-a` on branch `branch-a` at 2026-08-01T00:00:00Z, for @alice."},
             {"body":"Claimed by the orchestration `orch-B` working `/work/wt-b` on branch `branch-b` at 2026-08-09T00:00:00Z, for @bob."}
-        ]}"#;
-        let (label_present, held) = parse_claim_state(json).unwrap();
+        ],"assignees":[{"login":"alice"}]}"#;
+        let (label_present, held, assignees) = parse_claim_state(json).unwrap();
         assert!(label_present);
         let held = held.expect("a claim comment must be found");
         assert_eq!(held.identity, "worktree:/work/wt-b@branch-b");
         assert_eq!(held.login.as_deref(), Some("bob"));
+        assert_eq!(assignees, vec!["alice".to_string()]);
     }
 
     #[test]
     fn parse_claim_state_no_label_no_comments() {
-        let (label_present, held) = parse_claim_state(r#"{"labels":[],"comments":[]}"#).unwrap();
+        let (label_present, held, assignees) =
+            parse_claim_state(r#"{"labels":[],"comments":[]}"#).unwrap();
         assert!(!label_present);
         assert_eq!(held, None);
+        assert_eq!(assignees, Vec::<String>::new());
     }
 
     #[test]
     fn parse_claim_state_labelled_with_no_claim_comment() {
         let json = r#"{"labels":[{"name":"in-progress"}],"comments":[{"body":"unrelated"}]}"#;
-        let (label_present, held) = parse_claim_state(json).unwrap();
+        let (label_present, held, assignees) = parse_claim_state(json).unwrap();
         assert!(label_present);
         assert_eq!(held, None);
+        assert_eq!(assignees, Vec::<String>::new());
     }
 
     #[test]
     fn parse_claim_state_rejects_non_json() {
         assert!(parse_claim_state("not json").is_err());
+    }
+
+    #[test]
+    fn parse_current_assignees_reads_logins_missing_field_is_empty() {
+        let json = r#"{"comments":[],"assignees":[{"login":"alice"},{"login":"bob"}]}"#;
+        assert_eq!(
+            parse_current_assignees(json).unwrap(),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert_eq!(
+            parse_current_assignees(r#"{"comments":[]}"#).unwrap(),
+            Vec::<String>::new()
+        );
     }
 }

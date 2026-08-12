@@ -72,8 +72,8 @@ use crate::issue_dispatch::{
     IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, claim_comment_body,
     derive_issue_paths, dispatch_decision, gh_current_login_argv, issue_comment_argv,
     issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv, issue_view_comments_argv,
-    label_create_argv, parsed_claim_from_comment_json, pr_list_for_issue_argv,
-    substitute_issue_number, triage_instruction, validate_gh_login,
+    label_create_argv, parse_current_assignees, parsed_claim_from_comment_json,
+    pr_list_for_issue_argv, substitute_issue_number, triage_instruction, validate_gh_login,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
@@ -540,10 +540,11 @@ async fn dispatch_one_issue(
 /// resolved human to assign). Comment-FIRST, mirroring `issue_claim::do_claim`
 /// (auditor A8, round-3 hardening): the OLD label-then-comment order could
 /// leave the issue LABELLED with no discoverable comment if the comment
-/// write failed after the label write already landed. The prior claimant's
-/// login (for the assignee's replace-to-one) is resolved before ANY of these
-/// three writes, so it always reads the ACTUAL prior holder, never this
-/// run's own just-posted comment.
+/// write failed after the label write already landed. The current GitHub
+/// assignees (for the assignee's replace-to-one, PRD fork#235 FINAL round 5)
+/// are resolved before ANY of these three writes, so the removal target
+/// always reads the ACTUAL prior state, never one this run's own writes
+/// below have already changed.
 ///
 /// Best-effort in the sense that mattered from the start (never propagated,
 /// never turns a successful dispatch into `IssueDispatchFailed` — see the
@@ -570,30 +571,22 @@ async fn claim_issue(
     login: Option<&str>,
     notifier: &dyn Notifier,
 ) {
-    // PRD fork#235 M2: `prior` is the login parsed from the newest EXISTING
-    // claim comment — the deck's own receipt for what it assigned last, not
-    // an assumption about who currently holds the GitHub-native assignee
-    // field. Resolved FIRST, before this run posts its own comment below —
-    // reading it any later would find this run's own just-posted comment
-    // instead of the actual prior holder's.
-    //
-    // Round-4 author gate (PRD fork#235 — "the removal target is
-    // author-gated"), mirroring `issue_claim::run_issue_claim`'s identical
-    // fix on the CLI path: "who holds this issue?" reads any claim
-    // comment, but the REMOVAL target is trusted only when that comment's
-    // AUTHOR is this run's own currently-authenticated `login` — never
-    // comment CONTENT alone. `c.author` is `None` for a comment the JSON
-    // carried no `author.login` for, which also fails this comparison.
-    let prior_login = if login.is_some() {
-        fetch_claim_comment(repo, issue).await.and_then(|c| {
-            if c.author.is_some() && c.author.as_deref() == login {
-                c.login
-            } else {
-                None
-            }
-        })
+    // PRD fork#235 FINAL round 5, mirroring `issue_claim::run_issue_claim`'s
+    // identical fix on the CLI path: the removal target is `current GitHub
+    // assignees − {claimant}`, read from `gh issue view`'s own `assignees`
+    // field — never from any claim comment's content or authorship (the
+    // round-4 author gate this superseded did not narrow that removal, it
+    // disabled it). Resolved FIRST, before this run posts its own comment
+    // below — reading it any later would find this run's own just-posted
+    // comment instead of the actual prior state.
+    let remove: Vec<String> = if let Some(login) = login {
+        fetch_current_assignees(repo, issue)
+            .await
+            .into_iter()
+            .filter(|a| a != login)
+            .collect()
     } else {
-        None
+        Vec::new()
     };
 
     // Auditor A8: `issue_claim::do_claim`'s comment-FIRST, label-SECOND
@@ -626,14 +619,13 @@ async fn claim_issue(
     }
 
     if let Some(login) = login {
-        // Reviewer R3 / auditor A8 (`issue/claim/019`): mirror
-        // `issue_claim::do_claim`'s same-identity-refresh fix
-        // (`issue/claim/011`) — a same-login `--add-assignee X
-        // --remove-assignee X` pair nets the issue UNASSIGNED under real
-        // `gh`'s add-then-remove ordering. That fix landed on the CLI path
-        // only; this is the dispatch path's own copy of the same defect.
-        let remove = prior_login.as_deref().filter(|prior| *prior != login);
-        let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), remove);
+        // `remove` is already `current assignees − {login}` (PRD fork#235
+        // FINAL round 5) — a same-identity refresh's own login is excluded
+        // by the set difference itself, so reviewer R3 / auditor A8's
+        // self-cancelling `--add-assignee X --remove-assignee X` pair
+        // (`issue/claim/019`) cannot arise here; no special-case guard
+        // needed.
+        let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), &remove);
         if let Err(e) = run_status_args("gh", &assignee_argv).await {
             notifier.notify(NotifyEvent::IssueClaimFailed {
                 task: task_name.to_string(),
@@ -729,16 +721,28 @@ async fn ensure_triage_labels(repo: &str) {
 }
 
 /// PRD #421 M1.3: look up the deck's own claim comment for an issue —
-/// called both from the label-skip arm of `dispatch_one_issue` (only when a
-/// skip is already decided) and from [`claim_issue`]'s prior-assignee lookup
-/// (PRD fork#235 M2). Best-effort: a `gh` failure here must not turn an
-/// already-correct SKIP decision (or a successful claim) into a per-issue
-/// failure, so any error degrades to `None` ("no claimant recorded") rather
-/// than propagating.
+/// called from the label-skip arm of `dispatch_one_issue` (only when a skip
+/// is already decided), to display which claimant is being skipped for.
+/// Best-effort: a `gh` failure here must not turn an already-correct SKIP
+/// decision into a per-issue failure, so any error degrades to `None` ("no
+/// claimant recorded") rather than propagating.
 async fn fetch_claim_comment(repo: &str, issue: u64) -> Option<ParsedClaim> {
     let argv = issue_view_comments_argv(repo, issue);
     let stdout = run_capture("gh", &argv).await.ok()?;
     parse_claim_comment(&stdout).ok().flatten()
+}
+
+/// [`claim_issue`]'s removal-target lookup (PRD fork#235 FINAL round 5):
+/// the current GitHub assignees, straight from `gh issue view`'s own
+/// `assignees` field — never a claim comment. Best-effort, same discipline
+/// as [`fetch_claim_comment`]: a `gh` failure degrades to no assignees known
+/// rather than failing the claim.
+async fn fetch_current_assignees(repo: &str, issue: u64) -> Vec<String> {
+    let argv = issue_view_comments_argv(repo, issue);
+    let Ok(stdout) = run_capture("gh", &argv).await else {
+        return Vec::new();
+    };
+    parse_current_assignees(&stdout).unwrap_or_default()
 }
 
 /// Pure parse of `gh issue view --json comments` output into the deck's own

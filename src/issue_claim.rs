@@ -294,7 +294,10 @@ fn run_gh_status(args: &[String]) -> Result<(), String> {
     run_gh_capture(args).map(|_| ())
 }
 
-fn read_current_claim(repo: &str, issue: u64) -> Result<(bool, Option<ParsedClaim>), String> {
+fn read_current_claim(
+    repo: &str,
+    issue: u64,
+) -> Result<(bool, Option<ParsedClaim>, Vec<String>), String> {
     let json = run_gh_capture(&issue_view_claim_state_argv(repo, issue))?;
     parse_claim_state(&json)
 }
@@ -318,7 +321,7 @@ fn do_claim(
     issue: u64,
     identity: &Identity,
     login: Option<&str>,
-    prior_login: Option<&str>,
+    remove: &[String],
     takeover_from: Option<&str>,
 ) -> Result<(), String> {
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -328,11 +331,11 @@ fn do_claim(
     run_gh_status(&issue_edit_add_label_argv(repo, issue, IN_PROGRESS_LABEL))?;
 
     if let Some(login) = login {
-        // Reviewer F3 (`issue/claim/011`): a same-identity refresh must not
-        // emit a self-cancelling `--add-assignee X --remove-assignee X` —
-        // real `gh` applies the two in argv order, and a `remove` matching
-        // the `add` nets the issue UNASSIGNED. Skip the redundant remove.
-        let remove = prior_login.filter(|prior| *prior != login);
+        // `remove` is already `current assignees − {login}` (PRD fork#235
+        // FINAL round 5) — a same-identity refresh's own login is excluded
+        // by the set difference itself, so reviewer F3's self-cancelling
+        // `--add-assignee X --remove-assignee X` pair (`issue/claim/011`)
+        // cannot arise here; no special-case guard needed.
         let assignee_argv = issue_edit_assignee_argv(repo, issue, Some(login), remove);
         // Best-effort (PRD fork#235 M2's discipline): GitHub silently drops
         // an assignee lacking repo access and `gh` may still exit 0, so a
@@ -374,7 +377,7 @@ pub fn run_issue_claim(
     };
 
     let identity = resolve_caller_identity(cwd)?;
-    let (label_present, held) = read_current_claim(&repo, issue)?;
+    let (label_present, held, current_assignees) = read_current_claim(&repo, issue)?;
 
     match decide_claim(
         label_present,
@@ -385,31 +388,24 @@ pub fn run_issue_claim(
     ) {
         ClaimDecision::Claim { takeover_from } => {
             let login = resolve_assignee_login(&identity);
-            // Round-4 author gate (PRD fork#235 — "the removal target is
-            // author-gated"): "who holds this issue?" (the `decide_claim`
-            // call above) reads ANY claim comment, but "whose assignment do
-            // we remove?" trusts only a comment whose AUTHOR is the deck's
-            // own currently-authenticated account (`login`, resolved just
-            // above) — never comment CONTENT alone. `held.author` is `None`
-            // for a comment the JSON carried no `author.login` for, which
-            // also fails this comparison and drops the removal
-            // (`issue/claim/022`: a stranger's well-formed `, for
-            // @victim.` clause on an issue this deck never labelled must
-            // never reach `--remove-assignee`; `issue/claim/023`: the SAME
-            // shape, self-authored, must still drive it).
-            let prior_login = held.as_ref().and_then(|h| {
-                if h.author.is_some() && h.author.as_deref() == login.as_deref() {
-                    h.login.clone()
-                } else {
-                    None
-                }
-            });
+            // PRD fork#235 FINAL round 5: the removal target is `current
+            // GitHub assignees − {claimant}`, read from `gh issue view`'s own
+            // `assignees` field — never from any claim comment's content or
+            // authorship (the round-4 author gate this superseded did not
+            // narrow that removal, it disabled it; see the PRD's "FINAL
+            // (round 5)" section). A same-identity refresh is handled by the
+            // set difference itself: `login` is excluded from `remove`
+            // structurally, with no special-casing required.
+            let remove: Vec<String> = match login.as_deref() {
+                Some(l) => current_assignees.into_iter().filter(|a| a != l).collect(),
+                None => Vec::new(),
+            };
             do_claim(
                 &repo,
                 issue,
                 &identity,
                 login.as_deref(),
-                prior_login.as_deref(),
+                &remove,
                 takeover_from.as_deref(),
             )?;
             Ok(format!(
@@ -478,11 +474,6 @@ mod tests {
             timestamp: timestamp.to_string(),
             login: login.map(str::to_string),
             raw: String::new(),
-            // None of these `decide_claim` unit tests exercise the round-4
-            // author gate (that's `do_claim`'s concern, covered by
-            // `tests/issue_claim.rs`'s `022`/`023`/`025`) — `decide_claim`
-            // itself never reads `author` at all.
-            author: None,
         }
     }
 
