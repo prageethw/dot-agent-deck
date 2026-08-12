@@ -23,6 +23,7 @@ pub mod hook;
 pub mod hooks_manage;
 pub mod hyperlink;
 pub mod init;
+pub mod issue_claim;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
