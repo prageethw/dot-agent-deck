@@ -33006,9 +33006,9 @@ mod tests {
     /// (`tests/e2e_worktree_owner_env.rs`) is the test that reaches the real
     /// seam: a genuinely spawned process reading the variable back out of
     /// its own environment.
-    #[spec("orchestration/identity/010")]
+    #[spec("orchestration/identity/014")]
     #[test]
-    fn orchestration_identity_010_marker_and_env_owner_share_one_source() {
+    fn orchestration_identity_014_marker_and_env_owner_share_one_source() {
         let tmp = tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
@@ -33285,9 +33285,9 @@ mod tests {
     /// the identity survives a full write → read → restore round trip
     /// instead of being fabricated or dropped, which is M3.0's headline
     /// claim (PR #215 fixup).
-    #[spec("session/restore/017")]
+    #[spec("session/restore/019")]
     #[test]
-    fn restore_017_persisted_owner_survives_write_read_restore_round_trip() {
+    fn restore_019_persisted_owner_survives_write_read_restore_round_trip() {
         let tmp = tempdir().expect("tempdir");
         let worktree = tmp.path().join("dot-agent-deck-my-feature");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");

@@ -51,9 +51,9 @@ const TEST_OWNER: &str = "orchestration:worktree-owner-env-011-fixture";
 /// spawned process's actual stdout back over the attach socket and confirm
 /// it contains the owner string — proving the value reached a genuinely
 /// spawned child's environment, not merely a mock's recorded field.
-#[spec("orchestration/identity/011")]
+#[spec("orchestration/identity/015")]
 #[test]
-fn identity_011_owner_reaches_a_genuinely_spawned_process_environment() {
+fn identity_015_owner_reaches_a_genuinely_spawned_process_environment() {
     let daemon = common::spawn_daemon_serve(None, "0");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -71,7 +71,7 @@ fn identity_011_owner_reaches_a_genuinely_spawned_process_environment() {
             // entries (fork #166 CI run 31444090426: 3/3 fails on
             // `wait_for_agent_where` below under load). Trailing `sleep 30`
             // keeps the child registered long enough for the poll to observe
-            // it, matching `restore_018`'s fix for the same race.
+            // it, matching `restore_020`'s fix for the same race.
             Some("echo OWNER-IS:$DOT_AGENT_DECK_WORKTREE_OWNER:OWNER-END; sleep 30"),
             None,
             AgentSpawnOptions {
