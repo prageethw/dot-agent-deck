@@ -1270,10 +1270,10 @@ fn worktree_reclaim_016_case_variant_head_owner_still_resolves_merged() {
 /// worktree remove`, so git is asked to remove a path that does not exist and
 /// the worktree survives `reclaim --yes` untouched. Asserts the directory is
 /// gone afterward, and that the report actually says so.
-#[spec("worktree/reclaim/017")]
+#[spec("worktree/reclaim/023")]
 #[test]
 #[cfg(target_os = "linux")]
-fn worktree_reclaim_017_non_utf8_path_is_reclaimed() {
+fn worktree_reclaim_023_non_utf8_path_is_reclaimed() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
