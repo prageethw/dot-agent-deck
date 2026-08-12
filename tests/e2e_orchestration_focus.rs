@@ -75,7 +75,7 @@ fn open_orchestration(deck: &TuiDeck) {
 /// The rendered grid's expanded-pane top border fuses the pane's title
 /// directly into the box-drawing corner as `┌<role>` in `PaneInput` mode
 /// (`TerminalWidget`, `src/terminal_widget.rs`; the precedent needle is
-/// `e2e_dashboard_pane_column.rs::pane_box_left_edge`'s `plain_needle`, reused
+/// `tests/common/mod.rs::find_pane_box_left_edge`'s `plain_needle`, reused
 /// verbatim by the deleted `orchestration_focus_001`). Only the currently
 /// focused role ever renders this way — every other role collapses to a
 /// small numbered card with no live PTY body (`orchestration/layout/004`) —

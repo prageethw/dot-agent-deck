@@ -2095,11 +2095,22 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
 /// `┏<pane_title>` (Thick, focused command-mode — `TerminalWidget` in
 /// `src/terminal_widget.rs`) — the boundary between the sidebar (deck cards /
 /// role list) and the pane column that the split-stage percentages control.
-/// Generalizes `e2e_orchestration_pane_column.rs`'s `pane_column_left_edge`
-/// (hardcoded to the "orchestrator" role name) to any pane title. Shared by
-/// `e2e_dashboard_pane_column.rs` and `e2e_dashboard_orchestration_open.rs`
-/// so both cover Dashboard sessions and orchestration role names from one
-/// copy instead of duplicating it per file.
+/// Shared by `e2e_dashboard_pane_column.rs`, `e2e_dashboard_orchestration_open.rs`,
+/// and `e2e_orchestration_pane_column.rs` (folded in by fork #237, which
+/// deleted that file's own `pane_column_left_edge` copy hardcoded to the
+/// "orchestrator" role name) so all three cover Dashboard sessions and
+/// orchestration role names from one copy instead of duplicating it per file.
+///
+/// Returns `None`, never panics, when the box is absent — including inside a
+/// `wait_for_grid_predicate_within` (or similar retry) closure, where a
+/// panic on a momentarily-absent box would abort the retry loop instead of
+/// letting it sample again (fork #237; see `docs/develop/empty-gates.md`).
+/// There used to be a panicking sibling of this function; it was removed
+/// rather than merely renamed once every call site — including ones the
+/// panicking form was genuinely safe at — turned out to convert cleanly to
+/// `assert_eq!(find_pane_box_left_edge(...), Some(n), ...)`, which also
+/// produces a better failure message (`None` instead of a panic that
+/// destroys the surrounding assertion's own diagnostic).
 pub fn find_pane_box_left_edge(grid: &str, pane_title: &str) -> Option<u16> {
     let plain_needle = format!("┌{pane_title}");
     let thick_needle = format!("┏{pane_title}");
@@ -2112,16 +2123,6 @@ pub fn find_pane_box_left_edge(grid: &str, pane_title: &str) -> Option<u16> {
         }
     }
     None
-}
-
-/// Panicking form of [`find_pane_box_left_edge`]. Only safe to call where the
-/// pane box is already known to be present — never inside a
-/// `wait_for_grid_predicate_within` (or similar retry) closure, since a
-/// momentarily-absent box would abort the retry loop instead of letting it
-/// sample again.
-pub fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
-    find_pane_box_left_edge(grid, pane_title)
-        .unwrap_or_else(|| panic!("{pane_title:?} pane box top border not found in grid:\n{grid}"))
 }
 
 /// Poll `path` until its contents contain `needle`, or panic after the
