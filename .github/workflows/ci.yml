@@ -199,6 +199,12 @@ jobs:
       # inert and the gap survived #436. Costs nothing measurable: all 48 are
       # under 40ms and the tier's wall clock is set by its slowest test.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
       # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
       # rule 7 fails the build if the Scenario comment is missing or the
       # generator fails"), and the build-macos/build-windows comment says these
@@ -356,6 +362,12 @@ jobs:
       # dependency (`symlinks_named_like_owned_dirs_are_skipped`) is already
       # `#[cfg(unix)]`; the rest are in-memory or tempdir-based.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
 
   # macOS (host = aarch64-apple-darwin) compile + clippy + unit-test gate,
   # mirroring build-windows. macOS is otherwise built ONLY in the release
@@ -397,6 +409,12 @@ jobs:
       # there is nothing to match-and-narrow here — the clippy divergence is
       # about `--all-targets --features e2e`, not about package selection.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:

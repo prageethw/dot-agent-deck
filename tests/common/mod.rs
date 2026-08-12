@@ -2259,6 +2259,40 @@ pub fn orchestration_pane_column(grid: &str) -> Option<String> {
     )
 }
 
+/// Left edge (in columns) of a Tiled pane's box whose title fuses into the
+/// top border as `┌<pane_title>` (Plain, unfocused/PaneInput) or
+/// `┏<pane_title>` (Thick, focused command-mode — `TerminalWidget` in
+/// `src/terminal_widget.rs`) — the boundary between the sidebar (deck cards /
+/// role list) and the pane column that the split-stage percentages control.
+/// Generalizes `e2e_orchestration_pane_column.rs`'s `pane_column_left_edge`
+/// (hardcoded to the "orchestrator" role name) to any pane title. Shared by
+/// `e2e_dashboard_pane_column.rs` and `e2e_dashboard_orchestration_open.rs`
+/// so both cover Dashboard sessions and orchestration role names from one
+/// copy instead of duplicating it per file.
+pub fn find_pane_box_left_edge(grid: &str, pane_title: &str) -> Option<u16> {
+    let plain_needle = format!("┌{pane_title}");
+    let thick_needle = format!("┏{pane_title}");
+    for line in grid.lines() {
+        if let Some(byte_idx) = line
+            .find(&plain_needle)
+            .or_else(|| line.find(&thick_needle))
+        {
+            return Some(line[..byte_idx].chars().count() as u16);
+        }
+    }
+    None
+}
+
+/// Panicking form of [`find_pane_box_left_edge`]. Only safe to call where the
+/// pane box is already known to be present — never inside a
+/// `wait_for_grid_predicate_within` (or similar retry) closure, since a
+/// momentarily-absent box would abort the retry loop instead of letting it
+/// sample again.
+pub fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
+    find_pane_box_left_edge(grid, pane_title)
+        .unwrap_or_else(|| panic!("{pane_title:?} pane box top border not found in grid:\n{grid}"))
+}
+
 /// Poll `path` until its contents contain `needle`, or panic after the
 /// harness wait ceiling ([`WAIT_TIMEOUT`]). Lives in the harness (not an
 /// `e2e_*` test file) because it sleeps between reads — Decision 21 forbids
