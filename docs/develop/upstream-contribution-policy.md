@@ -80,6 +80,23 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 
 `9fbd83a` — corrects an upstream doc's real-agent e2e file count from 4 to 19.
 
+## Offered upstream and awaiting review
+
+**These are not backlog and must not be re-offered.** They are open PRs on `vfarcic/dot-agent-deck`, green and mergeable, waiting on the maintainer's approving review — the fork's maintainer is the author and cannot self-approve, and the `main-protected` ruleset has no bypass actors. Nothing here needs work; it needs someone else's click.
+
+| Upstream PR | Commit | Opened | What |
+|---|---|---|---|
+| [#390](https://github.com/vfarcic/dot-agent-deck/pull/390) | — | 2026-08-06 | A pane reads Idle while its agent's shell command is still running (upstream #386) |
+| [#419](https://github.com/vfarcic/dot-agent-deck/pull/419) | — | 2026-08-08 | Bound `get-seed`'s socket read/write so a wedged daemon cannot hang forever |
+| [#427](https://github.com/vfarcic/dot-agent-deck/pull/427) | — | 2026-08-08 | Reclaim merged worktrees behind a PR-state + clean + ownership gate |
+| [#471](https://github.com/vfarcic/dot-agent-deck/pull/471) | `c0cd1c8` | 2026-08-09 | Claim dispatched issues and triage them on dispatch (upstream #421) |
+
+**Why this table exists.** On 2026-08-10 an orchestration asked to offer PRD #421 upstream searched both trackers' *issues*, correctly found upstream #421 open and unimplemented on `upstream/main`, and planned the entire port — which #471 had already delivered the day before. Nothing in this repository recorded that the offer had been made, so the only way to discover it was to query GitHub for PRs. That absence is what made the near-duplicate possible; this table is the fix, and CLAUDE.md rule 20 now requires a `gh pr list --state all` search over both trackers as well as the issue search.
+
+**Keep it current.** Add a row the moment a PR is opened upstream, not when it merges — the whole point is that the record exists during the window when the work is invisible from `upstream/main`. Delete the row when it merges; the next rebase deletes the commit.
+
+**A stalled queue is a reason not to extend it.** Four PRs sitting here at once is the state the "Order of operations" section below is about: adding a fifth just moves the pile.
+
 ## Offered upstream but closed without merging
 
 These are **not** in the backlog above — they were offered and did not land. Each needs an explicit decision to re-offer or abandon.
