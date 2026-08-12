@@ -1010,6 +1010,7 @@ impl TuiDeck {
     /// once `needle` is seen, `false` if `timeout` elapses first (the
     /// caller decides whether a miss is a hard failure or a flaky-network
     /// observation to report).
+    #[must_use]
     pub fn wait_for_stream_string_within(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1090,6 +1091,7 @@ impl TuiDeck {
     /// miss is a hard failure or a soft observation). Use this for
     /// persistent on-screen state; use [`wait_for_stream_string_within`]
     /// for transient PLAIN-text agent output that may scroll off.
+    #[must_use]
     pub fn wait_for_grid_string_within(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1117,6 +1119,7 @@ impl TuiDeck {
     /// SEND side rather than the read side. Safe to retry against a `cat`
     /// stub, which just re-echoes; not appropriate where a duplicate
     /// keystroke would have a side effect.
+    #[must_use]
     pub fn send_keys_until_grid_string_within(
         &self,
         bytes: &[u8],
@@ -1147,6 +1150,7 @@ impl TuiDeck {
     /// [`wait_until_quiescent`](Self::wait_until_quiescent) whenever a LIVE
     /// agent occupies a pane — an agent that animates a spinner never leaves the
     /// deck's byte stream idle, so quiescence never arrives.
+    #[must_use]
     pub fn wait_for_grid_predicate_within(
         &self,
         timeout: Duration,
@@ -1383,6 +1387,7 @@ impl TuiDeck {
     /// requested state. Live agent TUIs can repaint their prompt one frame
     /// after their final output, so cursor assertions need the same bounded
     /// observable-state wait as grid assertions.
+    #[must_use]
     pub fn wait_for_terminal_cursor_hidden_within(&self, hidden: bool, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2105,7 +2110,9 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
 /// `wait_for_grid_predicate_within` (or similar retry) closure, where a
 /// panic on a momentarily-absent box would abort the retry loop instead of
 /// letting it sample again (fork #237; see `docs/develop/empty-gates.md`).
-/// There used to be a panicking sibling of this function; it was removed
+/// There used to be a panicking sibling of this function (it was called
+/// `pane_box_left_edge`, in `tests/common/mod.rs` — not to be confused with
+/// the other deleted copy, `pane_column_left_edge`, above); it was removed
 /// rather than merely renamed once every call site — including ones the
 /// panicking form was genuinely safe at — turned out to convert cleanly to
 /// `assert_eq!(find_pane_box_left_edge(...), Some(n), ...)`, which also
