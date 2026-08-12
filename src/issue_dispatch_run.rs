@@ -2645,7 +2645,7 @@ mod tests {
             &worktree_dir,
             "agent/issue-77",
             true,
-            "issue-dispatch:my-task#77",
+            Creator::issue_dispatch("my-task", 77),
         )
         .await
         .expect("create_worktree must succeed against a real git repo");
@@ -2666,7 +2666,7 @@ mod tests {
             worktree_dir.join(git_dir_raw)
         };
         let content =
-            std::fs::read_to_string(git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME))
+            std::fs::read_to_string(git_dir.join(crate::worktree_owner::OWNER_MARKER_FILENAME))
                 .expect("marker file must exist and be readable");
         assert!(
             content.contains("created-by: issue-dispatch:my-task#77"),

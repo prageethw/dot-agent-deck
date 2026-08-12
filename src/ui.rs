@@ -8514,9 +8514,6 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             },
             mode_config: None,
             orchestration_config: None,
-            orchestration_worktree_path: None,
-            orchestration_worktree_slug: None,
-            orchestration_worktree_error: None,
             seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
             // Fork #122: the dispatcher option is a single-agent card, never
             // an orchestration -- no worktree slug field exists for it to
