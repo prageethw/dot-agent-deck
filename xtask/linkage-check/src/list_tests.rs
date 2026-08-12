@@ -286,10 +286,22 @@ impl Ord for AllowlistChange {
 /// Parse a set of `(file_path, source_text)` pairs into the per-id
 /// inventory. The path is preserved verbatim so it can be displayed
 /// in the rendered report.
+///
+/// Fork #156: a catalog id can legitimately be backed by more than one
+/// `#[spec]` test across more than one file (e.g. `mouse/form/001`, real
+/// five times over across two files) — a supported pattern, not a defect.
+/// Collecting every backer per id (instead of overwriting on insert) and
+/// then merging them in a traversal-order-independent way is what makes a
+/// shared id's Modified/unmodified status depend only on the SET of
+/// backing tests, never on the order `sources` happened to be supplied
+/// in — which otherwise differs between the git-ref collector
+/// (`collect_tests_at_ref`, alphabetical via `git ls-tree`) and the
+/// on-disk collector (`collect_tests_on_disk`, unsorted via
+/// `std::fs::read_dir`).
 pub fn collect_tests_from_sources(
     sources: &[(String, String)],
 ) -> Result<BTreeMap<String, TestEntry>, String> {
-    let mut out: BTreeMap<String, TestEntry> = BTreeMap::new();
+    let mut raw: BTreeMap<String, Vec<TestEntry>> = BTreeMap::new();
     for (path, source) in sources {
         let parsed = match syn::parse_file(source) {
             Ok(p) => p,
@@ -300,19 +312,25 @@ pub fn collect_tests_from_sources(
         // `tabs/selection/*` unit tests in `src/tab.rs`) are found, not
         // just top-level test fns in `tests/`. Mirrors the docs
         // generator's `collect_spec_tests_from_items` walk.
-        collect_entries_from_items(&parsed.items, path, &mut out);
+        collect_entries_from_items(&parsed.items, path, &mut raw);
     }
-    Ok(out)
+    Ok(raw
+        .into_iter()
+        .map(|(id, entries)| (id, merge_entries(entries)))
+        .collect())
 }
 
 /// Recurse through `items`, recording every `#[spec]`-annotated fn into
 /// `out`. Items inside inline `Item::Mod { content: Some(_) }` are
 /// walked the same way; external `mod foo;` declarations (no inline
 /// body) are skipped — resolving them would need a separate file read.
+///
+/// Every backer for a given id is pushed, not just the last one seen —
+/// see `collect_tests_from_sources` for why.
 fn collect_entries_from_items(
     items: &[syn::Item],
     path: &str,
-    out: &mut BTreeMap<String, TestEntry>,
+    out: &mut BTreeMap<String, Vec<TestEntry>>,
 ) {
     for item in items {
         match item {
@@ -321,16 +339,13 @@ fn collect_entries_from_items(
                     let fn_name = item_fn.sig.ident.to_string();
                     let scenario = read_scenario_doc(&item_fn.attrs).unwrap_or_default();
                     let body_fingerprint = fingerprint_block(&item_fn.block);
-                    out.insert(
-                        spec_id.clone(),
-                        TestEntry {
-                            spec_id,
-                            fn_name,
-                            file: path.to_string(),
-                            scenario,
-                            body_fingerprint,
-                        },
-                    );
+                    out.entry(spec_id.clone()).or_default().push(TestEntry {
+                        spec_id,
+                        fn_name,
+                        file: path.to_string(),
+                        scenario,
+                        body_fingerprint,
+                    });
                 }
             }
             syn::Item::Mod(item_mod) => {
@@ -340,6 +355,51 @@ fn collect_entries_from_items(
             }
             _ => {}
         }
+    }
+}
+
+/// Combine every `#[spec]` test backing one catalog id into a single
+/// canonical `TestEntry` (fork #156). The single-backer case (the
+/// overwhelming majority of ids) returns that one entry untouched, so
+/// existing single-id inventory rows and their Scenario/body-fingerprint
+/// values are unaffected.
+///
+/// For a shared id, backers are sorted by `(file, fn_name)` BEFORE
+/// combining — a fixed, content-derived order, not the order `sources`
+/// happened to list them in — so two collectors that visit the same
+/// unchanged files in different orders (`git ls-tree` vs
+/// `std::fs::read_dir`) produce byte-identical merged entries and no
+/// phantom "Modified" row (the false-positive direction). The merged
+/// `scenario` and `body_fingerprint` fold in EVERY backer, not just one
+/// winner, so a real edit to any backer — even one that would have lost
+/// a last-insert-wins race — still changes the merged fingerprint (the
+/// false-negative direction: a tool that reports `_(none)_` while a real
+/// change hides behind a shared id is exactly as untrustworthy as one
+/// that invents rows).
+fn merge_entries(mut entries: Vec<TestEntry>) -> TestEntry {
+    if entries.len() == 1 {
+        return entries.remove(0);
+    }
+    entries.sort_by(|a, b| (&a.file, &a.fn_name).cmp(&(&b.file, &b.fn_name)));
+    let spec_id = entries[0].spec_id.clone();
+    let fn_name = entries[0].fn_name.clone();
+    let file = entries[0].file.clone();
+    let scenario = entries
+        .iter()
+        .map(|e| format!("{}: {}", e.file, e.scenario))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let body_fingerprint = entries
+        .iter()
+        .map(|e| format!("{}\u{0}{}", e.file, e.body_fingerprint))
+        .collect::<Vec<_>>()
+        .join("\u{1}");
+    TestEntry {
+        spec_id,
+        fn_name,
+        file,
+        scenario,
+        body_fingerprint,
     }
 }
 
@@ -887,6 +947,111 @@ mod tests {
         assert_eq!(modified[1].spec_id, "hooks/delivery/002");
         assert!(!modified[1].scenario_changed);
         assert!(modified[1].body_changed);
+    }
+
+    /// Fork #156 — a catalog id legitimately shared by tests in more than
+    /// one file (e.g. `mouse/form/001`, which real annotations five times
+    /// across `tests/e2e_mouse_form.rs` and `tests/render_form_buttons.rs`)
+    /// is silently collapsed to ONE `TestEntry` per id by
+    /// `collect_tests_from_sources`'s `BTreeMap::insert`, so whichever file
+    /// is processed LAST for that id wins and every earlier one is
+    /// discarded without a trace. The git-ref collector orders files via
+    /// `git ls-tree` (alphabetical); the on-disk collector orders them via
+    /// `std::fs::read_dir` (filesystem-dependent, not sorted) — nothing
+    /// guarantees the two agree. When they disagree, base and head keep
+    /// DIFFERENT winners for the same shared id even though every file
+    /// backing it is byte-identical between the two refs, and the id is
+    /// reported "Modified" — this is the mechanism behind the false
+    /// positives observed at PR #153's merge gate.
+    #[test]
+    fn compute_modified_does_not_flag_a_shared_spec_id_whose_every_file_is_unchanged() {
+        let file_a = (
+            "tests/e2e_a.rs".to_string(),
+            r#"
+                #[spec("shared/id/001")]
+                #[test]
+                /// Scenario: exercised from file A.
+                fn shared_001_from_a() { let x = 1; }
+            "#
+            .to_string(),
+        );
+        let file_b = (
+            "tests/e2e_b.rs".to_string(),
+            r#"
+                #[spec("shared/id/001")]
+                #[test]
+                /// Scenario: exercised from file B.
+                fn shared_001_from_b() { let x = 2; }
+            "#
+            .to_string(),
+        );
+
+        // Neither file's bytes differ between "base" and "head" — only the
+        // traversal order does, exactly as it legitimately can between
+        // `git ls-tree` order and `std::fs::read_dir` order.
+        let base = collect_tests_from_sources(&[file_a.clone(), file_b.clone()]).expect("parses");
+        let head = collect_tests_from_sources(&[file_b, file_a]).expect("parses");
+
+        let modified = compute_modified(&base, &head);
+        assert!(
+            modified.is_empty(),
+            "shared/id/001 reported modified even though every file backing it \
+             is byte-identical between base and head — only collector traversal \
+             order differed: {modified:?}"
+        );
+    }
+
+    /// Fork #156's symmetric direction, per the issue's own note: "a tool
+    /// that invents rows is equally untrustworthy when it reports
+    /// `_(none)_`". If the SAME file happens to win the shared-id collision
+    /// on both sides (traversal order agrees, unlike the test above), a
+    /// real edit to the OTHER file sharing that id is silently swallowed —
+    /// the report says nothing changed when something did.
+    #[test]
+    fn compute_modified_can_miss_a_genuine_change_hidden_behind_a_shared_spec_id() {
+        let file_a_before = (
+            "tests/e2e_a.rs".to_string(),
+            r#"
+                #[spec("shared/id/002")]
+                #[test]
+                /// Scenario: exercised from file A, original.
+                fn shared_002_from_a() { let x = 1; }
+            "#
+            .to_string(),
+        );
+        let file_a_after = (
+            "tests/e2e_a.rs".to_string(),
+            r#"
+                #[spec("shared/id/002")]
+                #[test]
+                /// Scenario: exercised from file A, CHANGED.
+                fn shared_002_from_a() { let x = 999; }
+            "#
+            .to_string(),
+        );
+        let file_b = (
+            "tests/e2e_b.rs".to_string(),
+            r#"
+                #[spec("shared/id/002")]
+                #[test]
+                /// Scenario: exercised from file B, never touched.
+                fn shared_002_from_b() { let x = 2; }
+            "#
+            .to_string(),
+        );
+
+        // Both base and head process A then B, so B wins the collision both
+        // times — A's real edit never surfaces in either map.
+        let base = collect_tests_from_sources(&[file_a_before, file_b.clone()]).expect("parses");
+        let head = collect_tests_from_sources(&[file_a_after, file_b]).expect("parses");
+
+        let modified = compute_modified(&base, &head);
+        assert!(
+            modified.iter().any(|m| m.spec_id == "shared/id/002"),
+            "file A's body genuinely changed under shared/id/002, but the \
+             shared-id collision hid it because file B won the slot on both \
+             sides, so the report would say `_(none)_`: {modified:?}"
+        );
     }
 
     #[test]
