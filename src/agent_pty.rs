@@ -3301,6 +3301,32 @@ impl crate::state::AgentOwnership for AgentPtyRegistry {
     }
 }
 
+/// Built by the daemon's shell-activity poll loop (`run_shell_activity_monitor`
+/// in `src/daemon.rs`) from [`AgentPtyRegistry::shell_activity_candidates`]'s
+/// count plus its own (timeout- and retention-aware) call to
+/// [`AgentPtyRegistry::classify_shell_activity`] — there is no single method
+/// that produces one directly, since the poll's sampling strategy (issue
+/// #429/#500) has to sit between the two.
+///
+/// Fork issue #160 Q1 (PR #206 round-3 verification): a bare `Vec` of
+/// `statuses` cannot distinguish an idle deck (no live pane was ever a
+/// candidate for classification — every daemon starts in this state, and any
+/// deck returns to it whenever the last pane closes) from a degraded one
+/// (every candidate pane went unconfirmed). Both produce an empty `statuses`
+/// vec; only `candidates` tells them apart. See the daemon's poll loop,
+/// which is the only production caller, for how the two counts are combined
+/// into a three-way discriminator.
+pub struct ShellForegroundBusySnapshot {
+    /// `(pane_id, busy)` for every pane the scan actually classified this
+    /// tick.
+    pub statuses: Vec<(String, bool)>,
+    /// How many live, addressable panes (a known `pane_id_env` and a live
+    /// child pid) were *candidates* for classification this tick, whether or
+    /// not the scan could actually classify them. Zero candidates means
+    /// there was nothing to classify — not degradation, just an idle deck.
+    pub candidates: usize,
+}
+
 impl AgentPtyRegistry {
     pub fn new() -> Self {
         Self {
@@ -6986,6 +7012,14 @@ impl AgentPtyRegistry {
     /// classification time for the same reason: it is a plain field read on the
     /// child handle, so it is safe under the lock, and resolving it early means
     /// a pane whose pid is unavailable drops out before it can force a sample.
+    ///
+    /// Fork issue #160 Q1 (PR #206 round-3 verification): the daemon's async
+    /// poll loop (`run_shell_activity_monitor` in `src/daemon.rs`) counts
+    /// `.len()` of what this returns as the `candidates` half of a
+    /// [`ShellForegroundBusySnapshot`] it builds itself from this call plus
+    /// its own (timeout- and retention-aware) classification — see that
+    /// type's doc comment for why the count matters on its own, distinct
+    /// from `statuses`.
     pub fn shell_activity_candidates(
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],

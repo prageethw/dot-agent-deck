@@ -705,12 +705,20 @@ pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
     None
 }
 
-/// The async twin of [`process_table`], so the daemon's poll loop needs no
-/// `cfg` branch of its own (issue #429). Unconditionally `None` for the same
-/// reason, and it never awaits anything: there is no subprocess to bound, so the
-/// caller's timeout simply never fires here.
-pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
-    None
+/// The async form the daemon's shell-activity poll calls (see the Unix backend,
+/// where it exists to keep a slow `ps` off a Tokio worker). Windows has no
+/// sample to take at all, so this is the same unconditional non-answer — there
+/// is nothing to await and nothing that can block.
+///
+/// Fork issue #160: reports [`super::ProcessTableOutcome::Unsupported`] rather
+/// than the Unix backend's [`super::ProcessTableOutcome::Failed`] — this is
+/// permanent for the process's whole lifetime, not a transient sample miss.
+/// Fork issue #160 F7: the daemon's poll (`run_shell_activity_monitor` in
+/// `src/daemon.rs`) logs one `info!` line the first time it sees this and
+/// then ends the poll outright, rather than continuing to wake every 500ms
+/// to learn a fact that cannot change.
+pub async fn process_table_async() -> Result<Vec<super::ProcessInfo>, super::ProcessTableOutcome> {
+    Err(super::ProcessTableOutcome::Unsupported)
 }
 
 // ---------------------------------------------------------------------------
