@@ -10158,8 +10158,7 @@ fn dispatch_action(
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::BranchExists) => {
                                     ui.status_message = Some((
                                         format!(
-                                            "Orchestration failed: unexpected BranchExists from \
-                                             create_worktree_sync at {}",
+                                            "Orchestration failed: branch already exists for {}",
                                             worktree_path.display()
                                         ),
                                         std::time::Instant::now(),
