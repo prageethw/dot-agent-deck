@@ -798,6 +798,16 @@ impl TabManager {
         // would never match the role's `prompt_template` for
         // unnamed orchestrations.
         let resolved_name = resolve_orchestration_name(&config.name, std::path::Path::new(cwd));
+        // fork#192 review F11: the uniqueness check in
+        // `live_orchestration_cwds_and_titles` (`src/ui.rs`) computes its
+        // fallback as `display_title.filter(nonempty).unwrap_or(name)`,
+        // which silently yields `""` if this ever returns empty — a
+        // uniqueness-universe hole that would fail to fail loudly. Guard
+        // the invariant here rather than let it drift unnoticed.
+        debug_assert!(
+            !resolved_name.is_empty(),
+            "resolve_orchestration_name must never return an empty identity"
+        );
 
         // PRD #107 / orchestration-identity fix: decouple the display TITLE
         // from the orchestration IDENTITY. `resolved_name` is the canonical
