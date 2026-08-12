@@ -661,8 +661,15 @@ fn issue_claim_002_takeover_alone_still_refuses() {
 /// `parse_claim_comment` finds claims by, so any other wording would make it
 /// invisible and the system would still believe A holds the issue) and names
 /// A's worktree absolute path and branch — round 3's identity anchor
-/// (CLAUDE.md rule 23) — in its tail; and the final assignee is B's human
-/// ONLY (A's removed).
+/// (CLAUDE.md rule 23) — in its tail; and the final assignee list holds BOTH
+/// A's and B's humans, A's NOT removed. This is round-4's author gate (PRD
+/// fork#235, "The removal target is author-gated, because validation cannot
+/// close this"): A's claim comment was authored by `alice`, not by B's
+/// authenticated account, so B's takeover correctly refuses to remove it.
+/// This is the PRD's own accepted cost — "a cross-deck takeover no longer
+/// removes the previous human … Both remain assigned until the earlier
+/// holder's deck next acts … It fails safe: the error is an extra assignee,
+/// never a wrongly-removed one" — not a regression.
 #[spec("issue/claim/003")]
 #[test]
 #[cfg(unix)]
@@ -731,9 +738,12 @@ fn issue_claim_003_takeover_confirm_stopped_succeeds_and_records_succession() {
     let assignees = fx.assignees(repo, 3);
     assert_eq!(
         assignees,
-        vec!["bob".to_string()],
-        "the assignee must end up as B's human ONLY — replace-to-one, A's login removed; got \
-         {assignees:?}"
+        vec!["alice".to_string(), "bob".to_string()],
+        "the round-4 author gate (PRD fork#235) refuses to let B's takeover remove A's \
+         assignment — A's claim comment was authored by `alice`, not B's authenticated account \
+         — so BOTH remain assigned until A's own deck next acts; this is the PRD's accepted \
+         cost, not a regression: it fails safe, an extra assignee rather than a wrongly-removed \
+         one; got {assignees:?}"
     );
 }
 

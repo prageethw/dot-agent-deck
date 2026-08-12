@@ -1690,12 +1690,19 @@ mod tests {
     /// only — not the full stateful fixture `tests/issue_claim.rs` uses,
     /// since this test drives [`claim_issue`] directly rather than the CLI
     /// subprocess. `issue view --json comments` always reports ONE prior
-    /// claim naming `$PRIOR_LOGIN` (simulating a same-identity refresh);
-    /// `issue edit --add-assignee`/`--remove-assignee` apply into
-    /// `$GHSTUB_DIR/assignees.txt` in the SAME add-then-remove order real
-    /// `gh` applies (matching `tests/issue_claim.rs`'s `issue/claim/011`
-    /// fix), so a self-cancelling pair nets the file UNASSIGNED exactly as
-    /// it would against a real `gh`; every other verb is a no-op.
+    /// claim naming `$PRIOR_LOGIN`, its comment `author` set to that SAME
+    /// login (simulating a same-identity refresh where the prior claim was
+    /// authored by the deck's own currently-authenticated account) — the
+    /// round-4 author gate (`c.author.as_deref() == login`) would otherwise
+    /// unconditionally drop `prior_login` to `None` regardless of body
+    /// content, exercising only the "no prior login, nothing to remove"
+    /// path rather than the same-login self-cancelling-pair logic this test
+    /// is actually named for; `issue edit --add-assignee`/`--remove-assignee`
+    /// apply into `$GHSTUB_DIR/assignees.txt` in the SAME add-then-remove
+    /// order real `gh` applies (matching `tests/issue_claim.rs`'s
+    /// `issue/claim/011` fix), so a self-cancelling pair nets the file
+    /// UNASSIGNED exactly as it would against a real `gh`; every other verb
+    /// is a no-op.
     const CLAIM_019_GH_STUB: &str = r#"#!/bin/sh
 group="$1"; sub="$2"; shift 2 2>/dev/null || true
 add_assignee=""; remove_assignee=""
@@ -1708,7 +1715,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 if [ "$group" = "issue" ] && [ "$sub" = "view" ]; then
-    printf '{"comments":[{"body":"Claimed by the orchestration `prior` working `/ws/prior` on branch `prior-branch` at 2020-01-01T00:00:00Z, for @%s."}]}\n' "$PRIOR_LOGIN"
+    printf '{"comments":[{"body":"Claimed by the orchestration `prior` working `/ws/prior` on branch `prior-branch` at 2020-01-01T00:00:00Z, for @%s.","author":{"login":"%s"}}]}\n' "$PRIOR_LOGIN" "$PRIOR_LOGIN"
     exit 0
 fi
 if [ "$group" = "issue" ] && [ "$sub" = "edit" ]; then
@@ -1726,12 +1733,16 @@ exit 0
 
     /// Scenario: [`claim_issue`] (the unattended `issue_dispatch` claim
     /// path) is called with the SAME login as a claim comment already on
-    /// record — a same-identity refresh, e.g. the same task re-dispatching
-    /// an issue it already claimed. Reviewer R3 / auditor A8: the
-    /// `--add-assignee X --remove-assignee X` self-cancelling-pair fix
-    /// landed on `issue_claim::do_claim` only (`issue/claim/011`); this
-    /// function still emits the self-cancelling pair unconditionally. Assert
-    /// the assignee ends up STILL SET to that login afterward, never
+    /// record, that comment's `author` ALSO matching that login (so the
+    /// round-4 author gate lets `prior_login` resolve at all — otherwise
+    /// this test would exercise only "no prior login" and never reach the
+    /// self-cancelling-pair logic it is named for) — a same-identity
+    /// refresh, e.g. the same task re-dispatching an issue it already
+    /// claimed. Reviewer R3 / auditor A8: the `--add-assignee X
+    /// --remove-assignee X` self-cancelling-pair fix landed on
+    /// `issue_claim::do_claim` only (`issue/claim/011`); this function
+    /// still emits the self-cancelling pair unconditionally. Assert the
+    /// assignee ends up STILL SET to that login afterward, never
     /// unassigned.
     //
     // Written as a sync `#[test]` driving an explicit runtime rather than
@@ -1829,22 +1840,31 @@ exit 0
     /// survives intact into the task's derived worktree PATH (and its
     /// `Identity::issue_dispatch` label, which embeds the same task name),
     /// and from there into the deck's OWN claim-comment body when it
-    /// renders — genuinely self-inflicted, no attacker required. On the
-    /// NEXT fire, [`claim_issue`] reads that same comment back via
-    /// [`fetch_claim_comment`]/[`parse_claim_fields`]:
-    /// `parse_worktree_claim`'s `rest.find(", for @")` scans the WHOLE
-    /// remaining body from the very start, so it matches the embedded `,
+    /// renders — genuinely self-inflicted, no attacker required. Before fix
+    /// 3, `parse_worktree_claim`'s `rest.find(", for @")` scanned the WHOLE
+    /// remaining body from the very start, so it matched the embedded `,
     /// for @torvalds,` substring inside the task-name-decorated label/path —
     /// text that comes BEFORE the real timestamp clause — long before it
     /// would ever reach a genuine trailing `, for @<login>` clause (there is
-    /// none here; this comment was posted with `login: None`). The parsed
-    /// login therefore comes back `Some("torvalds")` — a value nobody ever
-    /// intended as a login at all — and reaches `claim_issue`'s
-    /// `prior_login`. Assert no `gh` call ever carries `--remove-assignee
-    /// torvalds`. Companion to `issue/claim/020`, which covered `@mention`
-    /// injection into the deck's own rendered comment but not this: a
-    /// self-inflicted, structurally-invisible-to-`claim_line` false parse of
-    /// the deck's OWN prior comment.
+    /// none here; this comment was posted with `login: None`), and the
+    /// parsed login came back `Some("torvalds")` — a value nobody ever
+    /// intended as a login at all. Fix 3 bounds that same search to start
+    /// AFTER the timestamp clause (`extract_timestamp`'s returned
+    /// remainder), so today's [`parse_claim_fields`] correctly returns
+    /// `login: None` for this exact body — pinned below as a sanity
+    /// precondition on TODAY's behaviour, not yesterday's bug. The removal
+    /// is refused on a SECOND, independent ground too: this fixture's `gh
+    /// issue view` JSON carries no `author` field on the comment at all, so
+    /// the round-4 author gate
+    /// (`c.author.is_some() && c.author.as_deref() == login`) in
+    /// [`claim_issue`] would refuse the removal regardless of what the
+    /// login parse returns — also pinned below, so a regression in either
+    /// fix alone still fails this test via the other rather than the test
+    /// quietly becoming a single-cause test. Assert no `gh` call ever
+    /// carries `--remove-assignee torvalds`. Companion to `issue/claim/020`,
+    /// which covered `@mention` injection into the deck's own rendered
+    /// comment but not this: a self-inflicted, structurally-mis-parsed
+    /// false parse of the deck's OWN prior comment.
     #[spec("issue/claim/024")]
     #[test]
     #[cfg(unix)]
@@ -1872,10 +1892,13 @@ exit 0
         let prior_parsed = parse_claim_fields(&prior_body);
         assert_eq!(
             prior_parsed.as_ref().and_then(|p| p.login.as_deref()),
-            Some("torvalds"),
-            "sanity precondition: `parse_claim_fields` must genuinely mis-parse `torvalds` out \
-             of the task-name-derived text for this test to be exercising the real defect \
-             rather than a hypothetical one; got {prior_parsed:?} from body {prior_body:?}"
+            None,
+            "sanity precondition (ground 1 of 2, today's CORRECT behaviour, not yesterday's \
+             bug): fix 3 bounds `parse_worktree_claim`'s `, for @` search to start AFTER the \
+             timestamp clause, so the earlier, task-name-derived `, for @torvalds,` substring — \
+             which appears only in the decorative label/path, BEFORE the timestamp — must no \
+             longer be mistaken for a genuine trailing login clause; got {prior_parsed:?} from \
+             body {prior_body:?}"
         );
 
         let scratch = tempfile::tempdir().unwrap();
@@ -1891,6 +1914,19 @@ exit 0
         std::fs::create_dir_all(&ghstub).unwrap();
         let comment_json = serde_json::json!({ "comments": [{ "body": prior_body }] }).to_string();
         std::fs::write(ghstub.join("comment.json"), &comment_json).unwrap();
+        // Sanity precondition (ground 2 of 2, independent of ground 1
+        // above): the fixture JSON must carry no `author` field at all, so
+        // the round-4 author gate refuses the removal on its own even if
+        // ground 1's parse-level fix ever regressed and `login` came back
+        // `Some("torvalds")` again — this test pins TWO independent
+        // grounds for the refusal, not one, so it doesn't quietly collapse
+        // into single-cause coverage.
+        let comment_value: serde_json::Value = serde_json::from_str(&comment_json).unwrap();
+        assert!(
+            comment_value["comments"][0].get("author").is_none(),
+            "sanity precondition (ground 2 of 2): the fixture JSON must carry no `author` field \
+             — got {comment_json:?}"
+        );
 
         let prior_path = std::env::var("PATH").unwrap_or_default();
         // SAFETY: see `issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`'s
@@ -1928,6 +1964,120 @@ exit 0
             "a self-inflicted, structurally-mis-parsed `torvalds` (from the task NAME's own `, \
              for @torvalds,` substring, embedded in the deck's OWN prior comment — no forged or \
              hostile comment involved) must never reach a `--remove-assignee` argv; observed \
+             gh-calls.log:\n{gh_calls}"
+        );
+    }
+
+    // --- PRD fork#235 round-4 author gate: issue/claim/026 ---
+
+    /// Scenario: the mirror image of
+    /// [`issue_claim_024_adversarial_task_name_cannot_self_inflict`]. The
+    /// SAME task-name-derived body carries an EARLIER, coincidental `, for
+    /// @` clause — inside the decorative label/path, BEFORE the timestamp —
+    /// AND a GENUINE trailing `, for @<login>` clause AFTER it (unlike
+    /// `024`, whose body carries no genuine clause at all, `login: None`).
+    /// `024` proves a fabricated match must not fire; it does not prove a
+    /// real match still wins when a fake one precedes it — those are
+    /// different properties, and only this one shows fix 3's
+    /// timestamp-bound search is PRECISE (finds the real clause) rather
+    /// than merely SUPPRESSIVE (finds nothing at all once any earlier match
+    /// exists). The comment is authored as the deck's own
+    /// currently-authenticated account (`stub-user`, matching the `login`
+    /// passed to [`claim_issue`]) so the round-4 author gate does not
+    /// itself mask this test's result — this test is about the PARSE, not
+    /// the gate (`022`/`023` cover the gate itself). Assert the genuine
+    /// login's removal IS attempted.
+    #[spec("issue/claim/026")]
+    #[test]
+    #[cfg(unix)]
+    fn issue_claim_026_genuine_trailing_login_wins_over_earlier_fake_match() {
+        let malicious_task_name = "nightly, for @torvalds,";
+        let paths = derive_issue_paths(Path::new("/ws"), malicious_task_name, 26);
+        assert!(
+            paths
+                .worktree_dir
+                .to_string_lossy()
+                .contains(", for @torvalds,"),
+            "sanity precondition: `sanitize_clone_segment` must leave the `, for @torvalds,` \
+             substring intact in the derived path for this test to be exercising anything real; \
+             got {:?}",
+            paths.worktree_dir
+        );
+
+        let identity =
+            Identity::issue_dispatch(malicious_task_name, 26, &paths.worktree_dir, &paths.branch);
+        // Unlike `024` (`login: None`, no genuine clause at all), this body
+        // carries a REAL trailing `, for @genuineuser.` clause after the
+        // timestamp — the case `024` does not cover.
+        let prior_body =
+            claim_comment_body(&identity, "2020-01-01T00:00:00Z", Some("genuineuser"), None);
+        let prior_parsed = parse_claim_fields(&prior_body);
+        assert_eq!(
+            prior_parsed.as_ref().and_then(|p| p.login.as_deref()),
+            Some("genuineuser"),
+            "sanity precondition: the GENUINE trailing `, for @genuineuser.` clause (after the \
+             timestamp) must win over the earlier, coincidental `, for @torvalds,` substring \
+             embedded in the task-name-decorated label/path (before the timestamp) — fix 3's \
+             search bound must be precise, not merely suppressive; got {prior_parsed:?} from \
+             body {prior_body:?}"
+        );
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh = bindir.join("gh");
+        std::fs::write(&gh, CLAIM_024_GH_STUB).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ghstub = scratch.path().join("ghstub");
+        std::fs::create_dir_all(&ghstub).unwrap();
+        // Authored as `stub-user`, the SAME login `claim_issue` is called
+        // with below, so the round-4 author gate does not mask this test's
+        // own result.
+        let comment_json = serde_json::json!({
+            "comments": [{ "body": prior_body, "author": { "login": "stub-user" } }]
+        })
+        .to_string();
+        std::fs::write(ghstub.join("comment.json"), &comment_json).unwrap();
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`'s
+        // identical comment above — every test run happens in CI via
+        // `cargo nextest`, one process per test, so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GHSTUB_DIR", &ghstub);
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(claim_issue(
+            "acme/widgets",
+            26,
+            "nightly",
+            &identity,
+            Some("stub-user"),
+            &crate::scheduler::StderrNotifier,
+        ));
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GHSTUB_DIR");
+        }
+
+        let gh_calls = std::fs::read_to_string(ghstub.join("gh-calls.log")).unwrap_or_default();
+        assert!(
+            gh_calls.contains("--remove-assignee genuineuser"),
+            "the GENUINE prior login `genuineuser` must still reach `--remove-assignee` when it \
+             wins over an earlier, coincidental fake match and the comment's author matches this \
+             run's own login — fix 3 must be precise, not merely suppressive; observed \
              gh-calls.log:\n{gh_calls}"
         );
     }
