@@ -3,7 +3,7 @@
 //!
 //! Several test fixtures build small `/bin/sh` programs by interpolating paths
 //! that derive from developer-controlled roots (`TMPDIR` via
-//! `tempfile::tempdir()`, the cargo target dir via `env!("CARGO_BIN_EXE_…")`).
+//! `common::harness_tempdir()`, the cargo target dir via `env!("CARGO_BIN_EXE_…")`).
 //! Interpolated raw into a double-quoted `"{path}"`, a `"`, `$`, backtick, `\`
 //! or newline terminates or expands the string — and PR #54 MEASURED that the
 //! result does not fail loudly: the quotes rebalanced into valid shell and the
@@ -109,7 +109,7 @@ fn sh_quote_wraps_a_leading_dash_as_one_literal_word() {
 #[cfg(unix)]
 #[test]
 fn sh_quoted_values_reach_a_real_shell_verbatim_and_unexecuted() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
 
     // Every character the double-quoted-interpolation bug is sensitive to, plus
     // a single quote so the `'\''` path is exercised end to end.
@@ -175,7 +175,7 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 #[cfg(unix)]
 #[test]
 fn sh_quote_path_rejects_a_non_utf8_path_loudly() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let bad = non_utf8_path(scratch.path());
 
     // The hazard, spelled out: `to_str()` refuses this path while
@@ -211,7 +211,7 @@ fn sh_quote_path_rejects_a_non_utf8_path_loudly() {
 #[cfg(unix)]
 #[test]
 fn login_shell_pinner_rejects_a_non_utf8_keep_dir_before_writing_anything() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let keep = non_utf8_path(scratch.path());
 
     let msg = panic_message(|| {
