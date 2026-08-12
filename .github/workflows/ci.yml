@@ -199,6 +199,12 @@ jobs:
       # inert and the gap survived #436. Costs nothing measurable: all 48 are
       # under 40ms and the tier's wall clock is set by its slowest test.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos` below — the masking is a property of re-running any job,
@@ -367,6 +373,12 @@ jobs:
       # dependency (`symlinks_named_like_owned_dirs_are_skipped`) is already
       # `#[cfg(unix)]`; the rest are in-memory or tempdir-based.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos` below — the masking is a property of re-running any job,
@@ -419,6 +431,12 @@ jobs:
       # there is nothing to match-and-narrow here — the clippy divergence is
       # about `--all-targets --features e2e`, not about package selection.
       - run: cargo nextest run --workspace
+        env:
+          # Fork issue #224: a panic inside a shared test helper pins the
+          # helper's line, not the call site, without this — see e2e.yml's
+          # RUST_BACKTRACE comment. Capture only happens on panic, so this
+          # tier's passing runs pay nothing.
+          RUST_BACKTRACE: "1"
       # Issue #564: preserve THIS attempt's test results, so a job-level re-run
       # cannot destroy the evidence from a failing one.
       #
