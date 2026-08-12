@@ -1351,11 +1351,11 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** an LLM response (the safety invariant and native prompt-edit behavior are proven without submitting a model turn).
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/023 — An `Applied` mode-seed write is not treated as delivered (fork #182 M2).
+##### prompt/pane-input/023 — An `Applied` mode-seed write is retained as bookkeeping rather than dropped (fork #182 M2).
 - **Layer:** L1 (in-process seed-prompt readiness consumer with a controllable `PaneController`).
 - **Agent:** none.
-- **Asserts:** with `SendResult::Applied` injected, `process_pending_seed_prompts` performs the one write, but the seed must remain in `ui.pending_seed_prompts` awaiting a genuine submit confirmation rather than being dropped in the same frame the write lands, and a second frame with no submit observed must not re-send the prompt text. This PR fixes it: `Ok(SendResult::Applied) | Ok(SendResult::Queued)` is no longer treated as terminal delivery — the seed is retained pending confirmation instead of being dropped immediately.
-- **Does not assert:** the confirmation mechanism itself (LEVEL/TEXT paths) — that is `prompt/pane-input/006`'s orchestrator-path sibling territory and M3 (#187), not yet built for the mode-seed path.
+- **Asserts:** with `SendResult::Applied` injected, `process_pending_seed_prompts` performs the one write and retains the seed in `ui.pending_seed_prompts` (`len() == 1`) rather than dropping it in the same frame the write lands, and a second frame with no submit observed does not re-send the prompt text. Re-review correction (F5): this pins internal bookkeeping, not an observable delivery difference — the mode-seed path has no confirmation check and no retry (issue #256), so the delivery OUTCOME on this `Applied` path is unchanged from `main`; `no_duplicate_write` was already true there too, where the seed was dropped outright rather than retained. The test cannot distinguish the fix from the bug it replaces, and that is expected: there is nothing observable to assert until #256 adds the confirmation check that makes retention matter.
+- **Does not assert:** the confirmation mechanism itself (LEVEL/TEXT paths) — that is `prompt/pane-input/006`'s orchestrator-path sibling territory, not yet built for the mode-seed path (issue #256).
 - **Platform coverage:** mac+linux+windows.
 
 ##### prompt/pane-input/024 — The mode-seed 10s no-SessionStart fallback must honor the readiness buffer (fork #182 M2).

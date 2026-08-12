@@ -824,6 +824,80 @@ mod tests {
         assert!(detail.len() <= 124); // 120 + "…" (3 bytes)
     }
 
+    // Audit A1: both tests above (and `build_event_prompt_truncated_to_200`
+    // below) are ASCII-only, so `s.len()` and character count coincide and
+    // the cut byte always lands on a character boundary — none of them
+    // could ever have caught the panic below. `truncate` byte-sliced
+    // `&s[..max]` directly; a multi-byte character straddling `max` made
+    // that slice land mid-character and panic (a 100-char Japanese prompt is
+    // ~300 bytes, so byte 200 sits inside character 67). These tests call
+    // `truncate` directly at the two widths actually used in production
+    // (`USER_PROMPT_TRUNCATE_LEN` = 200 for the prompt path, 80 for the
+    // generic tool-input-value path) with the cut deliberately landing
+    // inside a multi-byte character, across two different encoding widths
+    // so the walk-back is exercised over more than one byte-per-char count.
+
+    #[test]
+    fn truncate_walks_back_out_of_a_3byte_char_at_the_prompt_width() {
+        // "日" is 3 bytes in UTF-8; 100 of them is 300 bytes. Byte 200 is not
+        // a multiple of 3, so it lands inside character 67 (bytes 198-200),
+        // reproducing A1's exact scenario at the real production width.
+        let input = "日".repeat(100);
+        assert_eq!(input.len(), 300);
+        assert!(!input.is_char_boundary(USER_PROMPT_TRUNCATE_LEN));
+
+        let result = truncate(&input, USER_PROMPT_TRUNCATE_LEN);
+
+        assert_eq!(result, format!("{}…", "日".repeat(66)));
+    }
+
+    #[test]
+    fn truncate_walks_back_out_of_a_3byte_char_at_the_tool_input_width() {
+        // Same shape as above at the OTHER production width (80, the
+        // generic tool-input-value path's `truncate(val, 80)`). 80 is not a
+        // multiple of 3, so byte 80 lands inside character 27 (bytes 78-81).
+        let input = "日".repeat(40);
+        assert_eq!(input.len(), 120);
+        assert!(!input.is_char_boundary(80));
+
+        let result = truncate(&input, 80);
+
+        assert_eq!(result, format!("{}…", "日".repeat(26)));
+    }
+
+    #[test]
+    fn truncate_walks_back_out_of_a_2byte_char_at_the_tool_input_width() {
+        // A different encoding width (Cyrillic "б", 2 bytes) exercises a
+        // different walk-back distance than the 3-byte case above. A
+        // 2-byte-per-char run alone would keep every even cut position
+        // (including 80) aligned to a boundary, so a single ASCII byte is
+        // prefixed to shift parity — byte 80 then lands inside the 40th
+        // Cyrillic character (bytes 79-81).
+        let input = format!("A{}", "б".repeat(50));
+        assert_eq!(input.len(), 101);
+        assert!(!input.is_char_boundary(80));
+
+        let result = truncate(&input, 80);
+
+        assert_eq!(result, format!("A{}…", "б".repeat(39)));
+    }
+
+    #[test]
+    fn truncate_cut_exactly_on_a_multibyte_char_boundary_is_a_noop_walk_back() {
+        // The counterpart to the three cases above: when the cut byte
+        // already lands ON a character boundary, the walk-back loop must
+        // not move it. 100 Cyrillic characters (2 bytes each) is exactly
+        // 200 bytes — the real `USER_PROMPT_TRUNCATE_LEN` — so this also
+        // pins that a prompt cut at a clean boundary is left untouched.
+        let input = "б".repeat(150);
+        assert_eq!(input.len(), 300);
+        assert!(input.is_char_boundary(USER_PROMPT_TRUNCATE_LEN));
+
+        let result = truncate(&input, USER_PROMPT_TRUNCATE_LEN);
+
+        assert_eq!(result, format!("{}…", "б".repeat(100)));
+    }
+
     #[test]
     fn tool_detail_read_file_path() {
         let input: Value = serde_json::json!({"file_path": "/src/main.rs"});

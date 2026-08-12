@@ -4220,6 +4220,24 @@ fn deliver_orchestrator_prompt(
         // hazard: content meant to distinguish one seed's confirmation from
         // another's must stay within the first 200 bytes, or this silently
         // stops telling them apart.
+        //
+        // Re-review (fork #197 T10c, item F6): why that hazard is not live
+        // TODAY. `orchestrator_prompt` on THIS path (`deliver_orchestrator_prompt`,
+        // TUI-side) is always `prepare_orchestrator_prompt(_, _, None)`'s
+        // 151-byte ASCII no-task variant — both TUI callers of that function
+        // pass `task = None` (the interactive `Ctrl+n` re-arm here, and the
+        // sibling arm site). The 207-byte task-carrying variant
+        // (`prepare_orchestrator_prompt(_, _, Some(task))`) is composed at
+        // `src/spawn.rs:598` and delivered by `run_delivery`, a daemon-side
+        // path that never calls `deliver_orchestrator_prompt` and so never
+        // reaches `prompt_text_confirms` at all. Two 151-byte prompts can
+        // only collide on their full text (no truncation ever applies to
+        // them, since 151 < 200), so today's only inputs to this comparison
+        // are either identical or already distinguishable before hitting the
+        // 200-byte cap. Correction: an earlier characterization of TEXT
+        // confirmation as "structurally dead on the dispatch path" overstated
+        // this — the 207-byte pointer does not reach `prompt_text_confirms`
+        // at all, on any path, not merely on the dispatch one.
         let sent_prompt_truncated =
             crate::hook::truncate(sent_prompt.trim(), crate::hook::USER_PROMPT_TRUNCATE_LEN);
         let text_confirmed = target_session.is_some_and(|s| {
@@ -35834,13 +35852,21 @@ mod tests {
         );
     }
 
-    /// Scenario: call `prompt_text_confirms` directly with the four
-    /// combinations of (text matches / does not) x (seq advanced / did
-    /// not), rather than driving it indirectly through
-    /// `deliver_orchestrator_prompt`. Pins reviewer F3 (PRD fork#197,
-    /// MAJOR): the case where text matches an unchanged baseline and the
-    /// submission counter has NOT advanced is a leftover, not a genuine
-    /// resubmit, and must not confirm — no existing test
+    /// Scenario: call `prompt_text_confirms` directly with four cases along
+    /// the (text matches / does not) axis, rather than driving it
+    /// indirectly through `deliver_orchestrator_prompt`. Re-review
+    /// correction (F11): this is NOT the full (matches / does not) x (seq
+    /// advanced / did not) 2x2 an earlier version of this comment claimed —
+    /// the four asserts are (1) matches, baseline UNCHANGED, seq NOT
+    /// advanced: a leftover, rejected; (2) matches, baseline UNCHANGED, seq
+    /// advanced: a genuine resubmit, confirmed; (3) matches, baseline
+    /// CHANGED (differs from observed), seq NOT advanced: confirmed via the
+    /// baseline-changed signal alone, seq irrelevant; (4) does not match at
+    /// all (seq advanced): rejected regardless of either signal. The
+    /// (does-not-match, seq-NOT-advanced) cell is absent. Pins reviewer F3
+    /// (PRD fork#197, MAJOR): case (1) above — text matches an unchanged
+    /// baseline and the submission counter has NOT advanced is a leftover,
+    /// not a genuine resubmit, and must not confirm — no existing test
     /// (`orchestration/seed/013` included) exercises this negative
     /// directly, so mutating `observed_seq > baseline_seq` to `>=` at
     /// `prompt_text_confirms` passes every test in the repo today.
@@ -35894,6 +35920,90 @@ mod tests {
             Some("orchestrator prompt"),
             7,
             9,
+        ));
+    }
+
+    /// Scenario: call `prompt_text_confirms` with a `sent` value already
+    /// truncated to `crate::hook::USER_PROMPT_TRUNCATE_LEN` bytes — exactly
+    /// what `deliver_orchestrator_prompt` now passes as
+    /// `sent_prompt_truncated` after F9's fix — against an `observed` value
+    /// shaped like a real pane's `last_user_prompt` after the SAME text
+    /// went through hook-side ingestion truncation (`src/hook.rs`). Pins F9
+    /// / re-review item F6 (PRD fork#197): before the fix, `sent` here
+    /// would still be the full, un-truncated seed and could never
+    /// `==`/`starts_with` a truncated `observed` — confirmation would fail
+    /// forever, a silent 60s wait per cycle rather than an error. The
+    /// reviewer grepped `src/ui.rs` and all of `tests/` and found NO
+    /// existing test with a >200-byte prompt anywhere on this path, so
+    /// nothing previously exercised the fix at all.
+    #[test]
+    fn prompt_text_confirms_matches_after_hook_truncation_of_a_long_seed() {
+        let full_seed = format!("orchestrator prompt {}", "x".repeat(300));
+        assert!(full_seed.len() > crate::hook::USER_PROMPT_TRUNCATE_LEN);
+
+        let observed = crate::hook::truncate(&full_seed, crate::hook::USER_PROMPT_TRUNCATE_LEN);
+        let sent_truncated =
+            crate::hook::truncate(full_seed.trim(), crate::hook::USER_PROMPT_TRUNCATE_LEN);
+
+        assert!(prompt_text_confirms(
+            Some(&observed),
+            &sent_truncated,
+            None,
+            0,
+            0,
+        ));
+    }
+
+    /// Scenario: call `prompt_text_confirms` where `observed` carries extra
+    /// trailing text after the full `sent` pointer — the `starts_with` arm
+    /// of `matches_text`, not exact equality. Re-review item F11 (PRD
+    /// fork#197): the 2x2 test above only ever exercises exact-equality
+    /// inputs, so deleting the `starts_with` disjunct (`||
+    /// observed_trimmed.starts_with(sent_trimmed)`) survives it; this case
+    /// would fail under that mutation since `"orchestrator prompt" ==
+    /// "orchestrator prompt and then some trailing text"` is false.
+    #[test]
+    fn prompt_text_confirms_accepts_a_starts_with_prefix_match() {
+        assert!(prompt_text_confirms(
+            Some("orchestrator prompt and then some trailing text"),
+            "orchestrator prompt",
+            None,
+            0,
+            0,
+        ));
+    }
+
+    /// Scenario: call `prompt_text_confirms` with `observed = None` (no
+    /// `last_user_prompt` reported for the session at all) and, separately,
+    /// with a `sent`/`observed` pair that trims to an empty string. Neither
+    /// case is exercised by the 2x2 test above, which only ever passes
+    /// `Some(non_empty)` on both sides.
+    #[test]
+    fn prompt_text_confirms_rejects_missing_or_blank_text() {
+        assert!(!prompt_text_confirms(
+            None,
+            "orchestrator prompt",
+            Some("orchestrator prompt"),
+            7,
+            8,
+        ));
+
+        // `sent` trims to empty — the `sent_trimmed.is_empty()` guard.
+        assert!(!prompt_text_confirms(
+            Some("orchestrator prompt"),
+            "   ",
+            None,
+            0,
+            1,
+        ));
+
+        // `observed` trims to empty — the `observed_trimmed.is_empty()` guard.
+        assert!(!prompt_text_confirms(
+            Some("   "),
+            "orchestrator prompt",
+            None,
+            0,
+            1,
         ));
     }
 
