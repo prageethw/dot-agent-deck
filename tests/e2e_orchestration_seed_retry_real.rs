@@ -31,16 +31,30 @@
 //! default) to `CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS` below via a
 //! test-only, `cfg(any(test, debug_assertions))`-gated hook
 //! (`confirmation_grace_period()`, `src/ui.rs`) set through
-//! `TuiDeckBuilder::with_env`, so the retry path fires DETERMINISTICALLY
-//! on every run rather than only opportunistically when a real boot
-//! happens to outrun the production grace period. The assertion is still
-//! written at the level of the OBSERVABLE CONTRACT, so it would hold
-//! either way: the spawn-time pointer must reach the agent through
-//! exactly ONE native prompt-submission event, and that event's
-//! `user_prompt` must contain the pointer text exactly ONCE — never
-//! concatenated with itself, issue #194's exact observed symptom (a
-//! confirmation-retry re-writing the full prompt text into a composer
-//! that already held it, so one CR submits BOTH copies as one message).
+//! `TuiDeckBuilder::with_env` — but this does NOT make the confirmation-
+//! retry fire deterministically, and this file does not claim it does
+//! (corrected reviewer F2, PRD fork#197: it previously did). The retry is
+//! gated on TWO conditions ANDed together — the grace period above, and
+//! the separate fixed 500ms confirmation-retry backoff floor
+//! (`send_retry_delay(1)`, `src/ui.rs`), which this override cannot touch
+//! — so the earliest a retry can fire is `max(grace_period, 500ms)` ==
+//! 500ms for any override at or below that, making the override a no-op
+//! on timing by itself. Whether a retry actually fires is a race against
+//! the confirming event (`UserPromptSubmit`/`session.prompt`), which
+//! fires at SUBMISSION time — before any inference — typically a local
+//! hook round trip of tens of milliseconds, so in practice confirmation
+//! usually lands well inside that 500ms window and the retry usually does
+//! NOT fire. Measured directly: the retry fired at +503ms in one run and
+//! not at all in another. The assertions below hold identically either
+//! way — the spawn-time pointer must reach the agent through exactly ONE
+//! native prompt-submission event, and that event's `user_prompt` must
+//! contain the pointer text exactly ONCE, never concatenated with itself
+//! (issue #194's exact observed symptom) — so this file proves no
+//! duplication was observed in WHICHEVER branch actually ran on a given
+//! execution, not that the confirmation-retry's standalone-CR dedup path
+//! was positively exercised. Making that positive proof deterministic
+//! would require the backoff floor itself to become overridable, which is
+//! production code and out of scope for a test-only change.
 //!
 //! Cost note (Decision 23): one short interactive turn per agent. Both
 //! cases are local-only (Decision 8 / rule 5 exception (a)): gated on the
@@ -53,10 +67,10 @@
 //! PRD fork#197 M4 Part 2: both cases set
 //! `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` (see
 //! `CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS` below) on the spawned binary via
-//! `TuiDeckBuilder::with_env`, so the confirmation-retry this file exists
-//! to prove non-duplicating fires DETERMINISTICALLY on every run — not
-//! only opportunistically when a real boot happens to outrun the 2s
-//! production default (`CONFIRMATION_GRACE_PERIOD`, `src/ui.rs`).
+//! `TuiDeckBuilder::with_env`. See the paragraph above for why this does
+//! NOT make the confirmation-retry this file exists to prove non-
+//! duplicating fire deterministically — the fixed 500ms
+//! confirmation-retry backoff floor is unaffected by it either way.
 
 mod common;
 
@@ -114,13 +128,17 @@ const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 ///   (`send_retry_delay(1)`, `src/ui.rs`) that `schedule_send_retry` sets
 ///   after every landed write: the retry is ALSO gated on that backoff
 ///   regardless of this override, so anything at or below it makes 500ms
-///   the binding constraint either way — never this constant.
-/// - Far below the real per-turn latency of a genuine LLM call (network +
-///   inference for a first tool call/response is on the order of
-///   1s+): the confirmation hook event a genuinely-fast agent would
-///   produce cannot plausibly land before this elapses, so the retry
-///   fires DETERMINISTICALLY rather than racing that event — the whole
-///   point of wiring this in (fork#197 M4).
+///   the binding constraint either way — never this constant. This means
+///   the override CANNOT change when a retry fires, only when it becomes
+///   eligible to be attempted; see the module doc above for what that
+///   implies (corrected reviewer F2, PRD fork#197 — this bullet
+///   previously argued the opposite, that a genuine LLM call's ~1s+
+///   latency makes the retry fire deterministically before the
+///   confirming event can land. That argument was a category error: the
+///   confirming event is `UserPromptSubmit`/`session.prompt`, which fires
+///   at SUBMISSION time, before any inference — a local hook round trip
+///   of tens of milliseconds, not a full LLM turn — so it routinely beats
+///   the 500ms floor and the retry routinely does not fire at all).
 const CONFIRMATION_GRACE_PERIOD_OVERRIDE_MS: &str = "250";
 
 struct RealRetryCase<'a> {
@@ -188,8 +206,11 @@ fn run_real_seed_retry(deck: TuiDeck, case: RealRetryCase<'_>) {
     // Genuine end-to-end proof: the agent read `orchestrator-context.md`
     // and acted on the sentinel directive naming it. By the time this
     // returns, any confirmation-retry that was going to fire this cycle
-    // (grace period 2s, one budgeted retry, PRD fork#197 M4) has already
-    // resolved one way or the other — no arbitrary sleep needed.
+    // (grace period 250ms via DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS,
+    // gated together with the fixed 500ms send_retry_delay(1) backoff
+    // floor — see the module doc for why that makes firing a race rather
+    // than deterministic — one budgeted retry, PRD fork#197 M4) has
+    // already resolved one way or the other — no arbitrary sleep needed.
     assert!(
         deck.wait_for_stream_string_within(case.sentinel, Duration::from_secs(90)),
         "the real {} orchestrator never echoed the sentinel token {:?} within \
@@ -256,7 +277,7 @@ fn run_real_seed_retry(deck: TuiDeck, case: RealRetryCase<'_>) {
     );
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process, with the confirmation-retry grace period shrunk to a deterministic 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` so the confirmation-retry reliably fires, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — never duplicated by a confirmation-retry (fork #194, fork#197 M4's decided submit-only mechanism) — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process, with the confirmation-retry grace period shrunk to 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` (a no-op below the fixed 500ms retry backoff floor, so whether a retry actually fires is a race against the real confirming hook event, not a deterministic outcome — see the module doc), let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — never duplicated by a confirmation-retry (fork #194, fork#197 M4's decided submit-only mechanism), true whichever branch actually ran — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
 #[spec("orchestration/seed/015")]
 #[test]
 fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_prompt() {
@@ -286,7 +307,7 @@ fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_pr
     );
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Codex process on a cheap model, with the confirmation-retry grace period shrunk to a deterministic 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` so the confirmation-retry reliably fires, let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — verifying that Codex's documented CR-as-submit behavior (`src/agent_pty.rs:3566`, `:3668`) actually holds for the confirmation-retry's standalone CR, arriving seconds after a separate write, not only the CR fused to its own payload — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Codex process on a cheap model, with the confirmation-retry grace period shrunk to 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS` (a no-op below the fixed 500ms retry backoff floor, so whether a retry — and therefore a standalone CR arriving seconds after a separate write — actually fires this run is a race against the real confirming hook event, not a deterministic outcome; see the module doc), let the daemon deliver the spawn-time seed pointer through the production `deliver_orchestrator_prompt` path, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — true whichever branch actually ran, so this does not positively prove Codex's documented CR-as-submit behavior (`src/agent_pty.rs:3566`, `:3668`) held for a standalone retry CR specifically, only that no duplication was observed — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
 #[spec("orchestration/seed/016")]
 #[test]
 fn orchestration_seed_016_real_codex_confirmation_retry_never_duplicates_the_prompt() {
@@ -307,6 +328,25 @@ fn orchestration_seed_016_real_codex_confirmation_retry_never_duplicates_the_pro
         )
         .launch_with_fixture("minimal");
 
+    // `input_ready_needle` is the SAME needle `codex/live/001`
+    // (`tests/e2e_codex_wrapper.rs`) and `orchestration/delegate/009`
+    // (`tests/e2e_codex_delegate.rs`) already rely on for a genuine
+    // interactive Codex TUI, so it is not itself in question. PRD
+    // fork#197, resume item 5: a prior run of this test panicked at this
+    // wait with a COMPLETELY BLANK pane for the full 120s, even though the
+    // daemon's own event log showed Codex had booted. The captured
+    // recording (`.dot-agent-deck/recordings/orchestration_seed_016_…`)
+    // showed why: Codex was alive and rendering, but stuck at its own
+    // first-run "Do you trust the contents of this directory?" prompt
+    // instead of its normal interactive UI — `common::import_codex_credentials`
+    // seeded trust for the raw (symlinked) tempdir path only, while Codex's
+    // own `getcwd()` reports the macOS-resolved `/private/var/folders/…`
+    // form, so the exact-string `trust_level` lookup never matched. Fixed
+    // at the source (`tests/common/mod.rs`) by trusting both the raw and
+    // canonicalized path, mirroring `with_claude_trust_workdir`'s existing
+    // fix for the identical class of bug — not by picking a different
+    // needle here, since no needle can appear in a pane that never leaves
+    // the trust prompt.
     run_real_seed_retry(
         deck,
         RealRetryCase {

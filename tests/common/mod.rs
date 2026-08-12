@@ -3678,6 +3678,21 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// Copy only Codex's authentication state into the isolated test HOME and seed
 /// the fixture working directory as trusted. User configuration is deliberately
 /// not imported; real-agent tests pin their model for deterministic behavior.
+///
+/// Trusts BOTH the raw tempdir path AND its canonicalized form, mirroring
+/// `with_claude_trust_workdir`'s established fix for the same class of bug
+/// (`seed_claude_project_trust`'s call site above): `harness_temp_root()`
+/// resolves through `std::env::temp_dir()`, which on macOS returns the
+/// unresolved `/var/folders/...` path (a symlink), while a spawned Codex
+/// process's own `getcwd()` reports the fully resolved `/private/var/folders/...`
+/// target — so `trust_level` lookups keyed by exact string match on the raw
+/// path alone never match, and Codex falls back to its interactive
+/// do-you-trust-this-directory prompt. Confirmed empirically: a prior
+/// `orchestration/seed/016` recording (`.dot-agent-deck/recordings/`) captured
+/// that exact prompt verbatim in the pane that was expected to show the
+/// codex-live interactive UI, with the daemon's own event log showing Codex
+/// had booted (`SessionStart`/`Thinking`/`Idle`) — Codex was alive and
+/// rendering, just stuck at this gate instead of its normal prompt.
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
@@ -3692,12 +3707,24 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let project = test_home.parent().ok_or_else(|| {
         std::io::Error::other("isolated Codex HOME has no fixture working directory")
     })?;
-    let config = format!(
-        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-        toml_escape(project.to_str().ok_or_else(|| {
-            std::io::Error::other("isolated Codex fixture path is not UTF-8")
-        })?)
-    );
+    let project_str = project
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("isolated Codex fixture path is not UTF-8"))?
+        .to_string();
+    let mut trust_paths = vec![project_str];
+    if let Ok(canon) = std::fs::canonicalize(project)
+        && let Some(canon_str) = canon.to_str()
+        && !trust_paths.iter().any(|p| p == canon_str)
+    {
+        trust_paths.push(canon_str.to_string());
+    }
+    let mut config = String::new();
+    for path in &trust_paths {
+        config.push_str(&format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            toml_escape(path)
+        ));
+    }
     write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
 }
 

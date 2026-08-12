@@ -35743,6 +35743,69 @@ mod tests {
         );
     }
 
+    /// Scenario: call `prompt_text_confirms` directly with the four
+    /// combinations of (text matches / does not) x (seq advanced / did
+    /// not), rather than driving it indirectly through
+    /// `deliver_orchestrator_prompt`. Pins reviewer F3 (PRD fork#197,
+    /// MAJOR): the case where text matches an unchanged baseline and the
+    /// submission counter has NOT advanced is a leftover, not a genuine
+    /// resubmit, and must not confirm — no existing test
+    /// (`orchestration/seed/013` included) exercises this negative
+    /// directly, so mutating `observed_seq > baseline_seq` to `>=` at
+    /// `prompt_text_confirms` passes every test in the repo today.
+    #[test]
+    fn prompt_text_confirms_rejects_unchanged_leftover_at_equal_seq() {
+        // Text matches, baseline == observed (no change since the write),
+        // seq unchanged: a leftover from before this write, not a genuine
+        // resubmit — must NOT confirm. This is exactly the case `>` vs
+        // `>=` distinguishes: under `>=`, `observed_seq >= baseline_seq`
+        // is trivially true whenever the two are equal (which they always
+        // are at write time, since `baseline_seq` is captured from the
+        // same counter), so any already-matching pane would confirm
+        // instantly — the leftover-match defect `baseline_prompt` exists
+        // to reject (issue #424 round 4).
+        assert!(!prompt_text_confirms(
+            Some("orchestrator prompt"),
+            "orchestrator prompt",
+            Some("orchestrator prompt"),
+            7,
+            7,
+        ));
+
+        // Text matches, baseline == observed, but the counter genuinely
+        // advanced past baseline: a real resubmit of byte-identical text
+        // (the constant remit pointer this repo actually sends every
+        // cycle) — must confirm.
+        assert!(prompt_text_confirms(
+            Some("orchestrator prompt"),
+            "orchestrator prompt",
+            Some("orchestrator prompt"),
+            7,
+            8,
+        ));
+
+        // Text matches, baseline differs from observed (e.g. a fresh
+        // cycle's `None` baseline): must confirm even with the seq
+        // unchanged, since the text-changed signal alone is sufficient.
+        assert!(prompt_text_confirms(
+            Some("orchestrator prompt"),
+            "orchestrator prompt",
+            None,
+            0,
+            0,
+        ));
+
+        // Text does not match at all: must never confirm, regardless of
+        // baseline or seq.
+        assert!(!prompt_text_confirms(
+            Some("something else"),
+            "orchestrator prompt",
+            Some("orchestrator prompt"),
+            7,
+            9,
+        ));
+    }
+
     /// Scenario: drive `deliver_orchestrator_prompt` across two frames —
     /// frame 1 performs a genuine `Applied` write (bytes land, the tab
     /// enters `orchestration_awaiting_confirmation`); frame 2 runs past
