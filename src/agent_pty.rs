@@ -56,6 +56,32 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 
+/// Fork #166 M2.4: the exact creator string this orchestration stamped into
+/// its own worktree markers, injected into every pane so `worktree list
+/// --mine` can determine "mine" without a daemon round-trip. Carries
+/// `orchestration:<typed_name>` on the interactive path or
+/// `issue-dispatch:<task>#<issue>` on the dispatch path — the SAME computed
+/// string [`crate::worktree_reclaim::mark_worktree_owned`] writes into the
+/// marker, never a second derivation of it (a daemon-side reconstruction
+/// from `TabMembership`/`display_title` diverges from the sentinel case and
+/// produces a silently wrong, non-sentinel owner string — see PRD
+/// fork-166's M2.4). Same drift-safety pattern as
+/// [`DOT_AGENT_DECK_PANE_ID`] and [`DOT_AGENT_DECK_AGENT_ID`]: the spawn-side
+/// injector, the daemon scrub site in [`spawn`], and the `worktree list
+/// --mine` reader in `main.rs` all reference this one symbol.
+pub const DOT_AGENT_DECK_WORKTREE_OWNER: &str = "DOT_AGENT_DECK_WORKTREE_OWNER";
+
+/// Fork #166 M2.4's `orchestration:unknown` sentinel — the value
+/// [`crate::ui`]'s `orchestration_creator_string` writes into
+/// [`DOT_AGENT_DECK_WORKTREE_OWNER`] (and the worktree marker) when no typed
+/// orchestration name was available at spawn. It is never a real identity:
+/// two nameless orchestrations sharing it would otherwise match each other's
+/// worktrees, so `worktree list --mine` in `main.rs` must refuse it exactly
+/// like an absent variable. Declared once, here, so the producer and the
+/// consumer — which live on opposite sides of the lib/bin split — cannot
+/// drift apart the way three independent literals did in PR #215 round 3.
+pub const ORCHESTRATION_UNKNOWN_SENTINEL: &str = "orchestration:unknown";
+
 /// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
 ///
 /// The daemon injects its OWN bound hook-socket path into every agent it
@@ -1116,6 +1142,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // unfiltered inherit would tag every spawned agent with the
     // parent deck's id and the hook script would misroute events.
     cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
+    // Fork #166 M2.4: same scrub-then-overlay rule for the worktree-owner
+    // identity. Without this, a daemon launched from inside one
+    // orchestration's pane would leak that orchestration's owner string into
+    // every agent a DIFFERENT nested orchestration spawns from it — the same
+    // class of bug the two scrubs above already exist to prevent.
+    cmd.env_remove(DOT_AGENT_DECK_WORKTREE_OWNER);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.
@@ -12529,7 +12561,11 @@ mod spawn_tests {
                 child,
                 process_group: group,
                 master: pair.master,
-                writer: Arc::new(AsyncMutex::new(writer)),
+                writer: Arc::new(AsyncMutex::new(PaneWriter::new(
+                    writer,
+                    None,
+                    Arc::new(Mutex::new(PaneInputState::default())),
+                ))),
                 bus: Arc::new(AgentBus::new()),
                 pane_id_env: None,
                 display_name: None,
@@ -12543,6 +12579,8 @@ mod spawn_tests {
                 exited: Arc::new(AtomicBool::new(false)),
                 pending_seed: None,
                 seed_delivered_native: false,
+                pane_handed_over: false,
+                spawned_at: None,
             };
             (agent, log, pid)
         }

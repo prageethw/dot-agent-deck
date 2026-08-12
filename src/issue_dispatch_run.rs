@@ -652,12 +652,27 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
+    // issue #425: name the issue-dispatch task and issue this worktree is
+    // for, rather than only recording that some deck created it.
+    //
+    // PR #215 fixup: sanitized at the point of computation (mirroring
+    // `orchestration_creator_string` in `src/ui.rs`), not left to the
+    // downstream `mark_worktree_owned` call inside `create_worktree` to
+    // sanitize alone — `creator` also reaches `AgentSpawnOptions::owner`
+    // below (the `DOT_AGENT_DECK_WORKTREE_OWNER` env var), which had no
+    // sanitizer of its own. `sanitize_marker_creator` is a fixed point
+    // (`f(f(x)) == f(x)`), so the marker write's own call stays harmless.
+    let creator_ident = Creator::issue_dispatch(task_name, issue);
+    let creator = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+        "{}:{}",
+        creator_ident.kind, creator_ident.subject
+    ));
     match create_worktree(
         clone_dir,
         &paths.worktree_dir,
         &paths.branch,
         true,
-        Creator::issue_dispatch(task_name, issue),
+        creator_ident,
     )
     .await?
     {
@@ -724,6 +739,10 @@ async fn dispatch_one_issue(
         // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
         // the orchestrator context is #222's work, not this PR's.
         compose_orchestrator_context: false,
+        // Fork #166 M2.4: the SAME string just written into the worktree's
+        // `created-by:` marker above (`create_worktree`), not a second
+        // derivation of it.
+        owner: Some(creator),
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
         // The spawn failed after the worktree was created/recorded: no agent
