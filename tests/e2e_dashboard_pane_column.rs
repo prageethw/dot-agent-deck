@@ -23,7 +23,7 @@ use spec::spec;
 /// (hardcoded to the "orchestrator" role name) to any pane title, so it
 /// covers both a Dashboard pane's session name and an orchestration role name
 /// from the same helper.
-fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
+fn find_pane_box_left_edge(grid: &str, pane_title: &str) -> Option<u16> {
     let plain_needle = format!("┌{pane_title}");
     let thick_needle = format!("┏{pane_title}");
     for line in grid.lines() {
@@ -31,10 +31,15 @@ fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
             .find(&plain_needle)
             .or_else(|| line.find(&thick_needle))
         {
-            return line[..byte_idx].chars().count() as u16;
+            return Some(line[..byte_idx].chars().count() as u16);
         }
     }
-    panic!("{pane_title:?} pane box top border not found in grid:\n{grid}");
+    None
+}
+
+fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
+    find_pane_box_left_edge(grid, pane_title)
+        .unwrap_or_else(|| panic!("{pane_title:?} pane box top border not found in grid:\n{grid}"))
 }
 
 /// Scenario: Extends the Ctrl+l split-toggle to Dashboard tabs — launch with
@@ -139,6 +144,23 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     deck.send_keys(b"\r"); // Mode -> Name
     deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
     deck.wait_for_absence("New Agent"); // new-pane form closed -> the orchestration tab is up
+    // The form closing only means the modal is gone, not that the active
+    // view has switched to the new Orchestration tab yet — wait for its
+    // role pane box to actually render before reading the exact edge. A
+    // panicking `pane_box_left_edge` used directly as a
+    // `wait_for_grid_predicate_within` predicate would abort on the first
+    // sampled grid instead of retrying if that switch hasn't rendered yet
+    // (the first sample can still show the Dashboard tab, in the brief
+    // window before the switch renders).
+    let orch_tab_rendered = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        find_pane_box_left_edge(grid, "orchestrator").is_some()
+    });
+    assert!(
+        orch_tab_rendered,
+        "the new Orchestration tab's role pane box never rendered within \
+         3s after the new-pane form closed\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 
     let orch_narrow_edge = pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert_eq!(
