@@ -708,13 +708,22 @@ fn build_issue_dispatch_authoring_seed(working_dir: &std::path::Path) -> String 
 const DAEMON_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PRD #140 review: the deadline for a query whose answer is only an
-/// INFORMATIONAL HINT — currently just [`live_orchestration_cwds`], which runs
-/// on the `Ctrl+n` form-open key path. A local unix-socket round-trip against a
+/// INFORMATIONAL HINT — currently just [`live_orchestration_cwds_and_titles`],
+/// which runs on the `Ctrl+n` form-open key path. A local unix-socket round-trip against a
 /// healthy daemon completes in well under a millisecond, so 250 ms is orders of
-/// magnitude of headroom while capping the worst case (wedged daemon, socket
-/// file present but nothing draining it) at a quarter second instead of
-/// [`DAEMON_REQUEST_TIMEOUT`]'s five. Blowing the deadline fails OPEN — the form
-/// opens with no warning rather than freezing.
+/// magnitude of headroom while capping the worst case at a quarter second
+/// instead of [`DAEMON_REQUEST_TIMEOUT`]'s five. Blowing the deadline fails
+/// OPEN — the form opens with no warning rather than freezing.
+///
+/// fork#192 audit F4: "capping the worst case" is only true for a SILENT
+/// peer (a wedged daemon, socket file present but nothing draining it) —
+/// `set_timeouts` sets `SO_RCVTIMEO`/`SO_SNDTIMEO` on the socket, which is a
+/// PER-SYSCALL timeout, not a total deadline. A peer that dribbles one byte
+/// every 200ms keeps `read_exact` alive past this constant indefinitely.
+/// Same-uid threat model only (the attach socket is `0o600` under a
+/// per-user directory), so this is not fixed here — filed upstream as
+/// [vfarcic/dot-agent-deck#478](https://github.com/vfarcic/dot-agent-deck/issues/478)
+/// alongside the missing `MAX_FRAME_LEN` check below.
 const DAEMON_HINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Send a one-shot `AttachRequest` to the local daemon over the attach socket
@@ -785,6 +794,13 @@ fn read_resp_frame_blocking<R: std::io::Read>(
             resp_header[0]
         )));
     }
+    // fork#192 audit F4: unlike `daemon_protocol::read_frame`, this reader
+    // applies no `MAX_FRAME_LEN` bound before allocating — a peer answering
+    // with a forged length prefix (e.g. `0xFFFFFFFF`) triggers an ~4 GiB
+    // allocation before a single body byte is read. Same-uid threat model
+    // only (see `DAEMON_HINT_TIMEOUT`'s doc comment above); not fixed here,
+    // filed upstream as
+    // [vfarcic/dot-agent-deck#478](https://github.com/vfarcic/dot-agent-deck/issues/478).
     let len = u32::from_be_bytes([
         resp_header[1],
         resp_header[2],
@@ -846,6 +862,14 @@ const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
     "    and one working tree; /worktree-prd isolates.",
 ];
 
+/// fork#192 M1.0: the BLOCKING refusal shown on the same guard seam as
+/// [`SAME_CWD_ORCHESTRATION_WARNING`] when the typed Name matches a name a
+/// live orchestration already holds. Unlike that warning, submitting is
+/// refused — see [`NewPaneFormState::name_collision`] — so the render side
+/// also drops `[Submit]` from the action row entirely.
+const NAME_COLLISION_WARNING: [&str; 1] =
+    ["  ! This name is already in use by a live orchestration."];
+
 /// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
 /// any directory the daemon reports as hosting a live orchestration? The single
 /// code path behind both the L1 seam
@@ -882,42 +906,77 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
         .any(|c| std::fs::canonicalize(c).is_ok_and(|live| live == form_canonical))
 }
 
-/// PRD #140 M4.0: directories that currently host a live orchestration, derived
-/// from the daemon's `ListAgents` — the same one-shot socket query
-/// [`live_schedule_names`] uses at dialog-open time, and the same records the
-/// hydration path buckets. A down daemon degrades to "no live orchestrations"
-/// (no warning), which is the right failure direction for an informational hint.
+/// PRD #140 M4.0 / fork#192 M1.0: directories that currently host a live
+/// orchestration, AND the live orchestration TITLES (for the M1.0
+/// name-uniqueness suggestion/refusal) — both derived from ONE daemon
+/// `ListAgents` snapshot, the same one-shot socket query [`live_schedule_names`]
+/// uses at dialog-open time, and the same records the hydration path buckets.
+/// A down daemon degrades to "nothing live" (no warning, suggest `-orchestrator-1`,
+/// never block submit), which is the right failure direction for a best-effort
+/// hint. Kept as ONE query (not two) so extending the same-cwd warning's call to
+/// also carry names costs no extra daemon round-trip on the `Ctrl+n` path.
 ///
-/// Only `TabMembership::Orchestration` panes contribute, and only via the
+/// Only `TabMembership::Orchestration` panes contribute. Cwds come from the
 /// tab-wide `orchestration_cwd` (never the per-pane cwd, which round-9 #2 let
-/// diverge into sub-directories). Duplicates are dropped so N role panes of one
-/// orchestration don't inflate the list.
+/// diverge into sub-directories); titles mirror the exact fallback
+/// `TabManager::open_orchestration_tab_with_existing_role_panes` (`src/tab.rs`)
+/// uses to compute the tab TITLE — `display_title` when non-empty, else the
+/// canonical `name` — so a name is only ever suggested/refused against what a
+/// user would actually SEE as another orchestration's tab label. Duplicates are
+/// dropped in both lists so N role panes of one orchestration don't inflate them.
 ///
 /// PRD #140 review: time-boxed at [`DAEMON_HINT_TIMEOUT`] rather than the
 /// default five seconds. This runs SYNCHRONOUSLY on the `Ctrl+n` key path, so a
 /// wedged daemon (socket file present, nothing draining it) used to freeze
-/// form-open for the whole default deadline. The warning is a best-effort hint,
-/// never a correctness gate — routing does not consult it — so a slow or down
-/// daemon fails open to "no live orchestrations" and the form opens instantly.
-fn live_orchestration_cwds() -> Vec<String> {
+/// form-open for the whole default deadline. The warning/suggestion/refusal are
+/// all best-effort hints, never a correctness gate — routing does not consult
+/// them — so a slow or down daemon fails open and the form opens instantly.
+///
+/// fork#192 audit F6: unlike the daemon's `StartAgent` ingest
+/// (`validate_tab_membership`/`validate_orchestration_surface`,
+/// `src/agent_pty.rs`) and the TUI hydration path (`sanitize_record_tab_membership`,
+/// `src/daemon_client.rs`), this path deserializes `AttachResponse` straight
+/// into consumption — it never validates `cwd`/`display_title`/`name`. That
+/// is safe TODAY only by accident of the current consumers: both values
+/// returned below are compared as plain `String`s (`name_collision`,
+/// `suggest_orchestration_name`) or `std::fs::canonicalize`d, and
+/// `NAME_COLLISION_WARNING` is a static literal, so no attacker-controlled
+/// byte from this response ever reaches the terminal. A future consumer
+/// added to either returned list inherits an unvalidated string — compare
+/// only, never render, without first routing through the same sanitizers
+/// the other two paths use.
+fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
         DAEMON_HINT_TIMEOUT,
     ) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut seen: HashSet<String> = HashSet::new();
-    resp.agent_records
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|r| match r.tab_membership {
-            Some(TabMembership::Orchestration {
-                orchestration_cwd, ..
-            }) => orchestration_cwd,
-            _ => None,
-        })
-        .filter(|cwd| seen.insert(cwd.clone()))
-        .collect()
+    let mut seen_cwds: HashSet<String> = HashSet::new();
+    let mut seen_titles: HashSet<String> = HashSet::new();
+    let mut cwds = Vec::new();
+    let mut titles = Vec::new();
+    for r in resp.agent_records.unwrap_or_default() {
+        let Some(TabMembership::Orchestration {
+            name,
+            display_title,
+            orchestration_cwd,
+            ..
+        }) = r.tab_membership
+        else {
+            continue;
+        };
+        if let Some(cwd) = orchestration_cwd
+            && seen_cwds.insert(cwd.clone())
+        {
+            cwds.push(cwd);
+        }
+        let title = display_title.filter(|t| !t.is_empty()).unwrap_or(name);
+        if seen_titles.insert(title.clone()) {
+            titles.push(title);
+        }
+    }
+    (cwds, titles)
 }
 
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
@@ -1008,9 +1067,10 @@ struct NewPaneFormState {
     /// Only ever `Some` when `schedule_locked` is `true`.
     schedule_existing: Option<config::ScheduledTask>,
     /// PRD #140 M4.0: whether this form's directory already hosts one of the
-    /// live orchestrations the daemon reported (see [`live_orchestration_cwds`]),
-    /// decided ONCE by [`live_orchestration_in_same_cwd`] when the form opens.
-    /// Drives the non-blocking same-cwd warning via
+    /// live orchestrations the daemon reported (see
+    /// [`live_orchestration_cwds_and_titles`]), decided ONCE by
+    /// [`live_orchestration_in_same_cwd`] when the form opens. Drives the
+    /// non-blocking same-cwd warning via
     /// [`NewPaneFormState::same_cwd_orchestration_warning`].
     ///
     /// Stored as the decided verdict rather than the raw cwd list because the
@@ -1021,6 +1081,30 @@ struct NewPaneFormState {
     /// warning, so every other form construction site renders byte-for-byte as
     /// before.
     live_orchestration_in_same_cwd: bool,
+    /// fork#192 M1.0: the live orchestration TITLES the daemon reported (see
+    /// [`live_orchestration_cwds_and_titles`]) — the uniqueness universe both
+    /// [`NewPaneFormState::suggest_orchestration_name`] and
+    /// [`NewPaneFormState::name_collision`] check against. Unlike
+    /// `live_orchestration_in_same_cwd`, kept as the raw list rather than a
+    /// pre-decided verdict: the typed Name changes every keystroke, so there is
+    /// no single "decided" answer to cache — the collision check re-reads this
+    /// list every frame, which costs nothing (plain string compares, no
+    /// filesystem). Empty (the `new` default) means "nothing known live" — the
+    /// suggestion starts at `-orchestrator-1` and nothing is ever refused.
+    live_orchestration_names: Vec<String>,
+    /// fork#192 review F4 / audit F7: whether the Name field still holds a
+    /// value [`Self::suggest_name_if_orchestration_selected`] itself wrote
+    /// (or the untouched construction-time pre-fill), as opposed to
+    /// something the user typed. `true` from `new` (the bare directory
+    /// basename `transition_after_dir_pick` pre-fills is fair game to
+    /// replace with a suggestion) and after every suggestion overwrite;
+    /// cleared to `false` by any keystroke that edits Name directly
+    /// (`KeyCode::Char`/`KeyCode::Backspace` while Name is focused). Selection
+    /// changes only overwrite the field while this is `true` — landing on an
+    /// orchestration must not silently destroy a name the user actually
+    /// typed, since it is what lands in the tab title and the worktree
+    /// ownership marker.
+    name_is_suggestion: bool,
     /// Fork #122: the typed slug for the orchestration's own worktree. Empty
     /// (the `new` default) means no worktree — panes spawn in `dir`, today's
     /// exact behavior. Only meaningful when an orchestration is selected.
@@ -1115,6 +1199,15 @@ impl NewPaneFormState {
             // cwds via `with_live_orchestration_cwds`; unattached means no
             // warning.
             live_orchestration_in_same_cwd: false,
+            // fork#192 M1.0: the caller attaches the daemon's live-orchestration
+            // titles via `with_live_orchestration_names`; unattached means
+            // nothing is known live, so the suggestion starts at
+            // `-orchestrator-1` and nothing is ever refused.
+            live_orchestration_names: Vec::new(),
+            // fork#192 review F4 / audit F7: an untyped construction-time
+            // value (the bare basename pre-fill) is fair game to overwrite
+            // with the first suggestion.
+            name_is_suggestion: true,
             // Fork #122: no worktree by default — preserves today's behavior.
             worktree_slug: String::new(),
         }
@@ -1132,6 +1225,102 @@ impl NewPaneFormState {
     fn with_live_orchestration_cwds(mut self, cwds: Vec<String>) -> Self {
         self.live_orchestration_in_same_cwd = live_orchestration_in_same_cwd(&self.dir, &cwds);
         self
+    }
+
+    /// fork#192 M1.0: attach the daemon's live-orchestration TITLES to the
+    /// form — the uniqueness universe [`Self::suggest_orchestration_name`] and
+    /// [`Self::name_collision`] check against. Mirrors
+    /// [`Self::with_live_orchestration_cwds`]'s shape; unlike that one, the raw
+    /// list is kept (not a pre-decided verdict) since the typed Name changes
+    /// every keystroke — see the field doc.
+    fn with_live_orchestration_names(mut self, names: Vec<String>) -> Self {
+        self.live_orchestration_names = names;
+        self
+    }
+
+    /// fork#192 M1.0: the next free `<foldername>-orchestrator-N` for this
+    /// form's directory, skipping any `N` a live orchestration's title already
+    /// holds (see [`Self::live_orchestration_names`]). `N` is counted globally
+    /// over ALL live orchestrations, not per-directory — uniqueness is the
+    /// whole point of the name, and a per-cwd counter would offer
+    /// `-orchestrator-1` in two different directories at once (PRD decision,
+    /// not reopened here).
+    fn suggest_orchestration_name(&self) -> String {
+        // fork#192 audit F1b: trim the basename before comparing — the sink
+        // (`build_new_pane_request`) stores `form.name.trim()`, so an
+        // untrimmed basename (e.g. a directory named ` myproj`) never
+        // matches the trimmed stored identity and every open from that
+        // directory silently reoffers an already-taken name.
+        let base = self
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().trim().to_string())
+            .unwrap_or_default();
+        // fork#192 audit F5: a `HashSet` turns each membership check into
+        // O(1) instead of an O(K) linear scan, making the whole suggestion
+        // loop O(K) instead of O(K^2).
+        let live: HashSet<&str> = self
+            .live_orchestration_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // fork#192 review F14: bounded to `live.len() + 1` candidates rather
+        // than an open `loop` — with K distinct live titles, at most K of
+        // the K+1 candidates `-orchestrator-1..=K+1` can be blocking, so one
+        // is always free (pigeonhole) and termination no longer depends on
+        // reasoning about the caller's data. Makes form-open O(K) on a
+        // malformed/hostile `ListAgents` response instead of unbounded.
+        let bound = live.len() + 1;
+        for n in 1..=bound {
+            let candidate = format!("{base}-orchestrator-{n}");
+            if !live.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+        // Unreachable in practice per the pigeonhole argument above; kept as
+        // a defensive fallback rather than `unreachable!()`.
+        format!("{base}-orchestrator-{}", bound + 1)
+    }
+
+    /// fork#192 M1.0: overwrite the Name field with the next free suggested
+    /// name whenever the selection LANDS on an orchestration — called from
+    /// every path that can change `selection_index` (arrow keys, click). A
+    /// no-op when the current selection isn't an orchestration (a plain
+    /// mode/card/authoring option keeps whatever the user already typed).
+    ///
+    /// fork#192 review F4 / audit F7: only overwrites while
+    /// [`Self::name_is_suggestion`] is still `true` — a user-typed name
+    /// (any Name-field keystroke clears the flag) survives a later
+    /// selection landing, since it is what lands in the tab title and the
+    /// worktree ownership marker. An untouched suggestion keeps being
+    /// replaced, so the live-name universe widening between two selections
+    /// still skips a slot that became taken in between.
+    fn suggest_name_if_orchestration_selected(&mut self) {
+        if self.selected_orchestration().is_some() && self.name_is_suggestion {
+            self.name = self.suggest_orchestration_name();
+        }
+    }
+
+    /// fork#192 M1.0: whether the typed Name matches a name a live
+    /// orchestration already holds. Only meaningful when an orchestration is
+    /// selected — a plain mode/card/authoring option carries no identity
+    /// uniqueness constraint. Drives the blocking refusal at submit and the
+    /// `[Submit]`-button-gone render on the guard seam.
+    fn name_collision(&self) -> bool {
+        // fork#192 audit F1a: compare on the same trim the sink
+        // (`build_new_pane_request`) applies before storing — an untrimmed
+        // gate against trimmed stored identities is a one-keypress bypass
+        // (type the taken name plus a trailing space). Audit F8 is the same
+        // root cause one layer down, at the marker: `sanitize_marker_creator`
+        // (`src/worktree_reclaim.rs`) also normalizes differently than this
+        // gate (200-char truncation, embedded-newline-to-space collapsing),
+        // so two names this gate treats as distinct can still collapse to
+        // one `created-by:` value. Not fixed here — the general rule this
+        // fix and F8 both point at is that the gate must ultimately compare
+        // POST-`sanitize_marker_creator` values, not just post-trim ones.
+        let trimmed = self.name.trim();
+        self.selected_orchestration().is_some()
+            && self.live_orchestration_names.iter().any(|l| l == trimmed)
     }
 
     /// Fork #122 test-only seam: attach a typed worktree slug without
@@ -1215,6 +1404,14 @@ impl NewPaneFormState {
             // PRD #140 M4.0: the locked schedule form can't select an
             // orchestration, so the same-cwd warning never applies to it.
             live_orchestration_in_same_cwd: false,
+            // fork#192 M1.0: the locked schedule form can't select an
+            // orchestration either, so there is never a name to suggest or
+            // collide.
+            live_orchestration_names: Vec::new(),
+            // fork#192 review F4 / audit F7: unreachable on a locked
+            // schedule form (no orchestration to select), but the value
+            // must still be set.
+            name_is_suggestion: true,
             // Fork #122: the locked schedule form can't select an
             // orchestration, so there is never a worktree slug to type.
             worktree_slug: String::new(),
@@ -1289,11 +1486,17 @@ impl NewPaneFormState {
     fn select_next_mode(&mut self) {
         if self.selection_index + 1 < self.mode_option_count() {
             self.selection_index += 1;
+            // fork#192 M1.0: selecting an orchestration suggests the next free
+            // name in place of whatever was in the field.
+            self.suggest_name_if_orchestration_selected();
         }
     }
 
     fn select_previous_mode(&mut self) {
         self.selection_index = self.selection_index.saturating_sub(1);
+        // fork#192 M1.0: symmetric to `select_next_mode` — cycling backward
+        // onto an orchestration suggests the next free name too.
+        self.suggest_name_if_orchestration_selected();
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
@@ -7653,21 +7856,25 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 Ok(Some(config)) => (config.modes, config.orchestrations),
                 _ => (vec![], vec![]),
             };
-            // PRD #140 M4.0: snapshot the daemon's live-orchestration
-            // directories now — before any orchestration can be opened from this
-            // form — so selecting an orchestration whose cwd already hosts one
-            // renders the non-blocking shared-resource warning above `[Submit]`.
-            // One-shot `ListAgents`, exactly like `live_schedule_names` at
-            // manager-open time; a down daemon just yields no warning. The query
-            // is skipped when the project offers no orchestration to select, so
+            // PRD #140 M4.0 / fork#192 M1.0: snapshot the daemon's live
+            // orchestrations now — before any orchestration can be opened from
+            // this form — so selecting one whose cwd already hosts a live
+            // orchestration renders the non-blocking shared-resource warning,
+            // AND so the Name field can be suggested/refused against titles
+            // that are actually live. ONE `ListAgents` round-trip serves both
+            // (see `live_orchestration_cwds_and_titles`), exactly like
+            // `live_schedule_names` at manager-open time; a down daemon just
+            // yields no warning and suggests `-orchestrator-1`. The query is
+            // skipped when the project offers no orchestration to select, so
             // the common plain-pane `Ctrl+n` costs no extra round-trip.
-            let live_orch_cwds = if orchestrations.is_empty() {
-                Vec::new()
+            let (live_orch_cwds, live_orch_names) = if orchestrations.is_empty() {
+                (Vec::new(), Vec::new())
             } else {
-                live_orchestration_cwds()
+                live_orchestration_cwds_and_titles()
             };
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
                 .with_live_orchestration_cwds(live_orch_cwds)
+                .with_live_orchestration_names(live_orch_names)
         }
         // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
         // the Command field pre-fills from the resolved authoring command so a
@@ -8042,6 +8249,14 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
             // orchestration launch's Enter-to-submit muscle memory. The field
             // is still reachable via Tab, and Enter submits from there too.
             FormField::Name | FormField::Command | FormField::WorktreeSlug => {
+                // fork#192 M1.0: a name a live orchestration already holds is
+                // REFUSED at submit — no SpawnPane, form stays open. Checked
+                // before building the request so a stale/resubmitted taken
+                // name (e.g. the user typed over the suggestion) never reaches
+                // the daemon as a second orchestration under the same title.
+                if form.name_collision() {
+                    return Action::Continue;
+                }
                 // The blank-command -> `default_command` authoring default now
                 // lives in `build_new_pane_request`, so both this Enter door and
                 // the [Submit] button door apply it identically.
@@ -8062,6 +8277,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 FormField::Name | FormField::Command | FormField::WorktreeSlug
             ) =>
         {
+            // fork#192 review F4 / audit F7: any direct edit to Name marks
+            // it user-typed, so a later selection landing won't overwrite it.
+            if form.focused == FormField::Name {
+                form.name_is_suggestion = false;
+            }
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
@@ -8076,6 +8296,22 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 FormField::Name | FormField::Command | FormField::WorktreeSlug
             ) =>
         {
+            // fork#192 review F1: cap Name at the daemon's own
+            // `DISPLAY_NAME_MAX_LEN` so a paste can never produce a value
+            // `is_valid_display_name` rejects — an over-long name was
+            // nulled at spawn-time validation and silently dropped out of
+            // the uniqueness universe, reopening the fork #74 collision
+            // with no hostile peer needed.
+            if form.focused == FormField::Name
+                && form.name.len() + c.len_utf8() > crate::agent_pty::DISPLAY_NAME_MAX_LEN
+            {
+                return Action::Continue;
+            }
+            // fork#192 review F4 / audit F7: any direct edit to Name marks
+            // it user-typed, so a later selection landing won't overwrite it.
+            if form.focused == FormField::Name {
+                form.name_is_suggestion = false;
+            }
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
@@ -9501,25 +9737,42 @@ fn dispatch_action(
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_default()
                                 });
-                            // fork #166: name the ownership marker's creator
-                            // with the typed instance Name (`req.name` — the
-                            // same value that becomes `display_title` below,
-                            // trimmed once in `build_new_pane_request` so
-                            // both consumers test blankness and read content
-                            // from the identical value; reviewer F1) when
-                            // one was typed, since that is what distinguishes
-                            // two live orchestrations of the same config
-                            // type. Fall back to the canonical config name —
-                            // as issue #425 originally did — when no typed
-                            // Name was given. The blankness test below is on
-                            // an already-trimmed value (fork issue #174: a
-                            // whitespace-only name must fall back too, not
-                            // become the identity) rather than the bare
-                            // `is_empty()` #174 flags elsewhere. This
-                            // fallback is deliberate and interim: this PRD's
-                            // M1.0 will make the Name required and unique,
-                            // at which point the blank case becomes
-                            // unreachable, but M1.0 is not built yet.
+                            // fork #166 / fork #184: this is a three-way
+                            // precedence, and the FIRST branch is the one
+                            // that actually fires in practice — read it in
+                            // that order, not top-to-bottom-as-rare-cases.
+                            // `typed_name` (`req.name`, the same value that
+                            // becomes `display_title` below, trimmed once in
+                            // `build_new_pane_request` so both consumers
+                            // test blankness and read content from the
+                            // identical value; reviewer F1) is the Name the
+                            // user typed or accepted into this specific
+                            // pane/tab. fork#192's M1.0 pre-fills it with a
+                            // suggested `<foldername>-orchestrator-N` and
+                            // refuses a submit colliding with a live
+                            // orchestration, so a non-empty, DISTINCT typed
+                            // name is what a user submits in the common
+                            // case — this is a deliberate choice, not an
+                            // accident it happens to fall into: the marker
+                            // records WHICH tab owns the worktree, and the
+                            // pane's own identity answers that better than
+                            // `orch_config.name`, a value shared by every
+                            // tab of the same orchestration config (#184).
+                            // Fall back to the canonical config name — as
+                            // issue #425 originally did — only when the
+                            // field was cleared to empty. That fallback is
+                            // still reachable after M1.0: M1.0 suggests and
+                            // refuses collisions, it does not forbid an
+                            // empty submit (see
+                            // `orchestration_form_empty_name_keeps_config_name`),
+                            // so this is not the "becomes unreachable once
+                            // M1.0 ships" case an earlier version of this
+                            // comment predicted before M1.0 existed. The
+                            // blankness test below is on an already-trimmed
+                            // value (fork issue #174: a whitespace-only name
+                            // must fall back too, not become the identity)
+                            // rather than the bare `is_empty()` #174 flags
+                            // elsewhere.
                             //
                             // `load_project_config` normalises an empty
                             // `name` to the dir basename at load time
@@ -10281,11 +10534,26 @@ fn dispatch_action(
             {
                 form.selection_index = idx;
                 form.focused = FormField::Mode;
+                // fork#192 M1.0: clicking a chip lands on the selection the
+                // same way the arrow keys do — suggest a name if it landed on
+                // an orchestration.
+                form.suggest_name_if_orchestration_selected();
             }
         }
         // [Submit] → spawn the pane from the form values (== Enter on the final
         // field). Reuses the SpawnPane arm so click and key spawn identically.
         Action::FormSubmit => {
+            // fork#192 M1.0: same refusal as the Enter-submit key door — the
+            // render seam already hides this button in that state
+            // (`render_new_pane_form`), but a routed click event is guarded
+            // here too rather than trusted to have been unreachable.
+            let collision = ui
+                .new_pane_form
+                .as_ref()
+                .is_some_and(|f| f.name_collision());
+            if collision {
+                return Flow::Continue;
+            }
             if let Some(form) = ui.new_pane_form.take() {
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form, &ui.config.default_command);
@@ -17716,11 +17984,17 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     } else {
         0
     };
-    // PRD #140 M4.0: the same-cwd orchestration warning block — a blank
-    // separator row plus the copy lines — shown only when the selected
-    // orchestration's directory already hosts a live one. Empty otherwise, so
-    // every other form state keeps its exact prior geometry.
-    let warning_lines: &[&str] = if form.same_cwd_orchestration_warning() {
+    // fork#192 M1.0: decided once and reused below to also drop `[Submit]`
+    // from the action row.
+    let name_collision = form.name_collision();
+    // PRD #140 M4.0 / fork#192 M1.0: the warning/refusal block — a blank
+    // separator row plus the copy lines. A name collision takes priority over
+    // the non-blocking same-cwd warning (it's the more urgent of the two and
+    // blocks submit); empty when neither applies, so every other form state
+    // keeps its exact prior geometry.
+    let warning_lines: &[&str] = if name_collision {
+        &NAME_COLLISION_WARNING
+    } else if form.same_cwd_orchestration_warning() {
         &SAME_CWD_ORCHESTRATION_WARNING
     } else {
         &[]
@@ -18094,9 +18368,16 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         }
     }
 
-    // [Submit] / [Cancel] buttons on the reserved row.
-    let buttons = [
-        Button::new("Submit", "", Action::FormSubmit, true),
+    // [Submit] / [Cancel] buttons on the reserved row. fork#192 review F3:
+    // a name collision renders [Submit] DISABLED rather than dropping it
+    // from the row — `render_modal_button_row` already paints a disabled
+    // button dimmed and excludes its rect from the click hit-test
+    // (present-but-INERT), which keeps [Cancel] in its ordinary second slot
+    // instead of sliding it into [Submit]'s former screen position. Removing
+    // the button entirely turned a muscle-memory click on the old [Submit]
+    // location into a destructive [Cancel] that discards the whole form.
+    let buttons: Vec<Button> = vec![
+        Button::new("Submit", "", Action::FormSubmit, !name_collision),
         Button::new("Cancel", "", Action::FormCancel, true),
     ];
     let btn_row = Rect {
@@ -20011,10 +20292,10 @@ pub fn render_new_pane_form_to_buffer(
 /// Drives the production `render_new_pane_form` through a `TestBackend`, so the
 /// warning decision it exercises is literally the one the interactive `Ctrl+n`
 /// flow runs ([`live_orchestration_in_same_cwd`], fed there by
-/// [`live_orchestration_cwds`] instead of this parameter). A `form_cwd` present
-/// in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a fresh one renders
-/// the form unchanged. Either way the `[Submit]` action stays — the warning
-/// never blocks. Mirrors [`render_new_pane_form_to_buffer`].
+/// [`live_orchestration_cwds_and_titles`] instead of this parameter). A
+/// `form_cwd` present in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a
+/// fresh one renders the form unchanged. Either way the `[Submit]` action stays
+/// — the warning never blocks. Mirrors [`render_new_pane_form_to_buffer`].
 pub fn render_new_pane_orchestration_guard_to_buffer(
     form_cwd: &str,
     live_orchestration_cwds: &[&str],
@@ -20047,6 +20328,53 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     );
     // Select the single orchestration option (index 0 is "No mode"; there are no
     // plain modes) — the state the guard applies to.
+    form.selection_index = 1;
+    render_overlay_to_buffer(width, height, |frame| {
+        render_new_pane_form(frame, &form);
+    })
+}
+
+/// fork#192 M1.0 L1 seam: render the new-pane form with an ORCHESTRATION
+/// selected and its Name field set to `typed_name`, against the
+/// `live_orchestration_names` the daemon reports as already held by a live
+/// orchestration. Sibling of [`render_new_pane_orchestration_guard_to_buffer`]
+/// on the SAME guard seam — unlike that one's non-blocking same-cwd warning,
+/// a name collision here BLOCKS: the rendered form drops `[Submit]` from the
+/// action row entirely (see [`NewPaneFormState::name_collision`]). A distinct
+/// `typed_name` renders the form normally, `[Submit]` intact.
+pub fn render_new_pane_orchestration_name_collision_to_buffer(
+    typed_name: &str,
+    live_orchestration_names: &[&str],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let orchestrations = vec![OrchestrationConfig {
+        name: "tdd-cycle".to_string(),
+        roles: vec![crate::project_config::OrchestrationRoleConfig {
+            name: "orchestrator".to_string(),
+            command: "claude".to_string(),
+            start: true,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }],
+    }];
+    let mut form = NewPaneFormState::new(
+        std::path::PathBuf::from("/work/collision-check"),
+        typed_name.to_string(),
+        "mycmd".to_string(),
+        Vec::new(),
+        orchestrations,
+    )
+    .with_live_orchestration_names(
+        live_orchestration_names
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect(),
+    );
+    // Select the single orchestration option directly (bypassing
+    // `select_next_mode`'s auto-suggest) so `typed_name` renders exactly as
+    // given — the state the guard applies to.
     form.selection_index = 1;
     render_overlay_to_buffer(width, height, |frame| {
         render_new_pane_form(frame, &form);
@@ -28941,6 +29269,16 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
 
+        // fork#192 M1.0: selecting the orchestration just pre-filled Name
+        // with a suggested `proj-orchestrator-1`. Clear it — as a user
+        // overwriting the suggestion would backspace first — before typing a
+        // fully custom name, so the assertion below is unambiguous.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+
         // Type a custom name
         for c in "user-typed-name".chars() {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
@@ -28985,12 +29323,21 @@ mod tests {
             vec![make_orchestration("config-name")],
         ));
 
-        // Select orchestration, skip Name field (leave it empty), submit.
-        // PRD #106: Command is hidden, so Enter on Name submits.
+        // Select orchestration, then explicitly clear the Name field (leave
+        // it empty), submit. PRD #106: Command is hidden, so Enter on Name
+        // submits. fork#192 M1.0: selecting the orchestration pre-fills Name
+        // with a suggested `proj-orchestrator-1` — backspace it out, as a
+        // user clearing the suggestion would, to reach the empty-name state
+        // this test is actually about.
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         handle_new_pane_form_key(right, &mut ui);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode → Name
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
         let result = handle_new_pane_form_key(enter, &mut ui); // submit
 
         let req = match result {
@@ -30107,6 +30454,543 @@ mod tests {
             ),
             _ => panic!("expected an Orchestration tab to be active after SpawnPane"),
         }
+    }
+
+    /// Scenario: Build the new-pane form the way `transition_after_dir_pick`
+    /// does today — the Name field pre-filled with the bare directory
+    /// basename `myproj` — then select the form's one orchestration (Right
+    /// arrow). With no orchestration live yet, selecting it must suggest
+    /// `myproj-orchestrator-1` in the Name field in place of the bare
+    /// basename (fork#192 M1.0). A single further keystroke (Enter, no
+    /// character typed) then accepts that suggestion as-is at submit.
+    #[spec("orchestration/identity/002")]
+    #[test]
+    fn identity_002_selecting_orchestration_suggests_orchestrator_1_and_one_keystroke_accepts_it() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            // The bare basename `transition_after_dir_pick` pre-fills today.
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-1",
+            "selecting the orchestration with none live yet must suggest N=1, \
+             not keep the bare basename pre-fill"
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        // One further keystroke — no characters typed — submits the
+        // suggestion as-is.
+        let result = handle_new_pane_form_key(enter, &mut ui);
+
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.name, "myproj-orchestrator-1",
+                "the accepted name must be the suggestion, untouched"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
+    }
+
+    /// Scenario: With `myproj-orchestrator-1` already live (a name a running
+    /// orchestration in the same folder currently holds, injected via the
+    /// test-only `with_live_orchestration_names` builder that mirrors
+    /// `with_live_orchestration_cwds`), selecting the form's orchestration
+    /// must suggest `myproj-orchestrator-2`, skipping the taken slot
+    /// (fork#192 M1.0). Then simulate a stale/resubmitted taken name still
+    /// sitting in the Name field and confirm submit is REFUSED — no
+    /// `Action::SpawnPane`, and the form stays open — rather than silently
+    /// recording a second orchestration under an identical owner.
+    #[spec("orchestration/identity/003")]
+    #[test]
+    fn identity_003_next_open_suggests_orchestrator_2_and_refuses_a_taken_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-2",
+            "with -orchestrator-1 already live, selecting the orchestration must \
+             suggest N=2, skipping the taken slot"
+        );
+
+        // Simulate a stale/resubmitted taken name still sitting in the field
+        // (e.g. the user typed over the suggestion with a value someone
+        // else's live orchestration already holds).
+        ui.new_pane_form.as_mut().unwrap().name = "myproj-orchestrator-1".to_string();
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting a name a live orchestration already holds must be refused, got {result:?}"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused submit must keep the form open, not close it"
+        );
+    }
+
+    /// Scenario: Type into the new-pane form's Name field far past the
+    /// daemon's `is_valid_display_name` byte cap (`DISPLAY_NAME_MAX_LEN`,
+    /// `src/agent_pty.rs`) — simulating a pasted GitHub-issue-title-shaped
+    /// name, the exact kind of thing a human names an orchestration after.
+    /// Confirm the field itself stops accepting bytes at the cap, that the
+    /// resulting name is still a well-formed display name, and that a name
+    /// sitting exactly at the cap still round-trips into the uniqueness
+    /// check when a live orchestration already holds the identical string
+    /// (fork#192 review F1). Today the field has no cap: an over-long paste
+    /// reaches the daemon, gets nulled by spawn-time validation, and the
+    /// orchestration silently drops out of the uniqueness universe —
+    /// reopening the fork #74 collision with no hostile peer needed.
+    #[spec("orchestration/identity/005")]
+    #[test]
+    fn identity_005_name_field_is_bounded_to_the_daemons_display_name_cap() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+        // Land on Name directly — no orchestration selected yet, so no
+        // suggestion overwrites what we're about to type.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui); // Mode -> Name
+
+        // Simulate a paste well past the cap.
+        let pasted: String = "a".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN + 40);
+        for c in pasted.chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+
+        let name = ui.new_pane_form.as_ref().unwrap().name.clone();
+        assert!(
+            name.len() <= crate::agent_pty::DISPLAY_NAME_MAX_LEN,
+            "the Name field must stop accepting input at DISPLAY_NAME_MAX_LEN \
+             ({} bytes), got {} bytes — a name this long is nulled by the \
+             daemon's spawn-time validation and silently drops out of the \
+             uniqueness universe (fork#192 review F1)",
+            crate::agent_pty::DISPLAY_NAME_MAX_LEN,
+            name.len()
+        );
+        assert!(
+            crate::agent_pty::is_valid_display_name(&name),
+            "a Name the form actually let the user type must survive the \
+             daemon's own validator, got {name:?}"
+        );
+
+        // A name sitting exactly at the cap must still round-trip into the
+        // uniqueness check: if a live orchestration already holds that exact
+        // (capped) string, submitting it again must collide.
+        ui.new_pane_form
+            .as_mut()
+            .unwrap()
+            .live_orchestration_names
+            .push(name.clone());
+        // Select the orchestration directly (bypassing the arrow-key path,
+        // which would overwrite `name` with a fresh suggestion) so
+        // `name_collision()` — which requires a selected orchestration —
+        // applies to the capped name we just typed.
+        ui.new_pane_form.as_mut().unwrap().selection_index = 1;
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "a name at the cap must still be recognized by the uniqueness \
+             gate when a live orchestration already holds the identical string"
+        );
+    }
+
+    /// Scenario: Two RED cases pinning that the uniqueness gate normalizes
+    /// on the SAME trim the sink (`build_new_pane_request`) applies, not a
+    /// looser comparison (fork#192 audit F1). (a) A live orchestration holds
+    /// `myproj-orchestrator-1`; typing that name plus one trailing space
+    /// must still collide — `build_new_pane_request` trims before storing,
+    /// so an untrimmed gate lets the space through as a one-keypress bypass
+    /// of both submit doors. (b) A directory whose basename carries a
+    /// leading space (` myproj`) must still suggest the trimmed name's next
+    /// free slot — `suggest_orchestration_name` trims `base` before
+    /// comparing, so a stray space in the directory name doesn't make every
+    /// open from that directory silently reoffer an already-taken identity.
+    #[spec("orchestration/identity/006")]
+    #[test]
+    fn identity_006_gate_and_sink_normalize_the_same_way() {
+        // (a) live name + trailing space must still collide.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj-orchestrator-1 ".to_string(), // taken name + one trailing space
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+        ui.new_pane_form.as_mut().unwrap().selection_index = 1;
+
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "a live-held name plus a trailing space must still collide — the \
+             sink trims before storing, so an untrimmed gate is a \
+             one-keypress bypass (fork#192 audit F1a)"
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting a live-held name plus a trailing space must be \
+             refused, got {result:?}"
+        );
+
+        // (b) a whitespace-padded directory basename must not make the
+        // suggestion loop blind to an already-taken (trimmed) identity.
+        let padded_dir_form = NewPaneFormState::new(
+            PathBuf::from("/tmp/ myproj"), // basename " myproj" carries a leading space
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        // The trimmed identity a previous open from this same directory
+        // already recorded.
+        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+
+        assert_eq!(
+            padded_dir_form.suggest_orchestration_name(),
+            "myproj-orchestrator-2",
+            "the suggestion must trim the directory basename before \
+             comparing — otherwise ' myproj-orchestrator-1' never matches \
+             the trimmed stored identity 'myproj-orchestrator-1' and every \
+             open from a whitespace-padded directory silently reoffers the \
+             identical taken name (fork#192 audit F1b)"
+        );
+    }
+
+    /// Scenario: A user selects an orchestration (Name gets suggested),
+    /// tabs to Name, backspaces the suggestion out and types a deliberate
+    /// name, then Shift+Tabs back to Mode to double-check the selection —
+    /// pressing Left then Right, landing back on the same orchestration
+    /// without retyping anything. The user-typed name must survive that
+    /// round-trip: it is what lands in the tab title and the worktree
+    /// ownership marker (fork#192 review F4 / audit F7). Today
+    /// `suggest_name_if_orchestration_selected` overwrites unconditionally
+    /// on every selection landing, silently destroying it. A SEPARATE case
+    /// in the same test pins the flip side as a regression guard: a
+    /// still-untouched suggestion (the user never typed into Name) must
+    /// keep being replaced when a later selection lands with a different
+    /// candidate available — the fix must not freeze the suggestion outright.
+    #[spec("orchestration/identity/007")]
+    #[test]
+    fn identity_007_selection_change_preserves_a_typed_name_but_still_updates_a_suggestion() {
+        // A user-typed name survives a selection round-trip.
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration -> suggests "myproj-orchestrator-1"
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_new_pane_form_key(tab, &mut ui); // Mode -> Name
+
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0.."myproj-orchestrator-1".len() {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "hotfix-triage".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "hotfix-triage",
+            "sanity: the typed name must be in the field before the round-trip"
+        );
+
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        handle_new_pane_form_key(backtab, &mut ui); // Name -> Mode
+
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(left, &mut ui); // -> "No mode"; no orchestration selected, no-op
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "hotfix-triage",
+            "landing on a plain option must not touch a user-typed name"
+        );
+
+        handle_new_pane_form_key(right, &mut ui); // back onto the orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "hotfix-triage",
+            "landing on an orchestration again must not silently destroy a \
+             name the user actually typed — it is what lands in the tab \
+             title and the worktree ownership marker (fork#192 review F4 / \
+             audit F7)"
+        );
+
+        // Regression guard: an untouched suggestion must still be replaced
+        // when a later selection lands with a different candidate available
+        // — the fix above must not freeze the Name field outright.
+        let mut ui2 = default_ui();
+        ui2.mode = UiMode::NewPaneForm;
+        ui2.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]),
+        );
+        handle_new_pane_form_key(right, &mut ui2); // select -> suggestion skips the taken slot
+        assert_eq!(
+            ui2.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-2",
+            "sanity: initial suggestion must skip the taken slot"
+        );
+
+        // Nothing was typed into Name — it still holds the untouched
+        // suggestion. Widen the live-name universe (as a later form-open
+        // would observe) directly on the form, then land off and back onto
+        // the orchestration without retyping.
+        ui2.new_pane_form
+            .as_mut()
+            .unwrap()
+            .live_orchestration_names
+            .push("myproj-orchestrator-2".to_string());
+        handle_new_pane_form_key(left, &mut ui2); // -> "No mode"
+        handle_new_pane_form_key(right, &mut ui2); // -> orchestration reselected
+
+        assert_eq!(
+            ui2.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-3",
+            "an untouched suggestion must still be replaced on a later \
+             selection landing, skipping the now-taken slot — the fix for \
+             the typed-name case above must not freeze the field outright"
+        );
+    }
+
+    /// Scenario: Render the new-pane form with an orchestration selected,
+    /// once with its typed Name colliding with a live orchestration and
+    /// once with a distinct name, driving the private `render_new_pane_form`
+    /// directly (via a `TestBackend`) so the click-hit-test rects it returns
+    /// are available — the public buffer-only seam this test previously used
+    /// (`render_new_pane_orchestration_name_collision_to_buffer`) discards
+    /// them. On collision, `[Submit]` must render (present, not removed —
+    /// removing it slides `[Cancel]` into `[Submit]`'s former screen
+    /// position, turning a muscle-memory click into a destructive cancel —
+    /// fork#192 review F3) but must be excluded from the click rects
+    /// (present-but-INERT, the same mechanism `render_modal_button_row`
+    /// already uses for any disabled button). The hazard is pinned WITHIN
+    /// the colliding render — `[Cancel]`'s clickable rect must not overlap
+    /// inert `[Submit]`'s screen position — rather than by comparing
+    /// `[Cancel]`'s rect across the colliding and distinct-name renders:
+    /// those are two different-sized popups by design (the collision's
+    /// warning widens/heightens `desired_w`/`desired_h`, same as PRD #140's
+    /// existing same-cwd warning), so a cross-render position match would
+    /// pin modal-centring invariance under a warning appearing, which this
+    /// codebase deliberately does not provide (fork#192 review round 2,
+    /// F3/F8 correction). The collision must also render the
+    /// blocking-refusal copy, not merely omit a button with no explanation
+    /// (fork#192 review F8).
+    #[spec("orchestration/guard/002")]
+    #[test]
+    fn guard_002_name_collision_blocks_submit_distinct_name_does_not() {
+        fn render(name: &str, live: &[&str]) -> (String, FormClickTargets) {
+            let mut form = NewPaneFormState::new(
+                PathBuf::from("/work/collision-check"),
+                name.to_string(),
+                "mycmd".to_string(),
+                Vec::new(),
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(live.iter().map(|s| s.to_string()).collect());
+            form.selection_index = 1; // the only orchestration
+
+            let backend = TestBackend::new(100, 28);
+            let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+            let mut targets = None;
+            terminal
+                .draw(|frame| {
+                    targets = Some(render_new_pane_form(frame, &form));
+                })
+                .expect("TestBackend draw should succeed");
+            let text = buffer_to_string(terminal.backend().buffer());
+            (
+                text,
+                targets.expect("render_new_pane_form must run inside draw"),
+            )
+        }
+
+        // Locate a label's on-screen `Rect` by scanning the rendered text
+        // grid for it directly — needed for `[Submit]` here because an
+        // inert button is (by design) excluded from the click-rect list
+        // this test otherwise reads from, so its position isn't available
+        // any other way. Column indices come from `.chars()`, not byte
+        // offsets, so a multi-byte border glyph earlier on the line can't
+        // shift the result.
+        fn rect_of_text(text: &str, needle: &str) -> Rect {
+            let needle: Vec<char> = needle.chars().collect();
+            for (y, line) in text.lines().enumerate() {
+                let chars: Vec<char> = line.chars().collect();
+                if let Some(x) = chars
+                    .windows(needle.len())
+                    .position(|window| window == needle.as_slice())
+                {
+                    return Rect {
+                        x: x as u16,
+                        y: y as u16,
+                        width: needle.len() as u16,
+                        height: 1,
+                    };
+                }
+            }
+            panic!("{needle:?} not found in rendered text:\n{text}");
+        }
+
+        let (colliding_text, (_, _, colliding_buttons)) =
+            render("review-orchestrator-1", &["review-orchestrator-1"]);
+        let (distinct_text, (_, _, distinct_buttons)) =
+            render("review-orchestrator-2", &["review-orchestrator-1"]);
+
+        assert!(
+            colliding_text.contains("[Submit]"),
+            "a name collision must still render [Submit] — present, not \
+             removed — so [Cancel] doesn't slide into its screen position, \
+             got:\n{colliding_text}"
+        );
+        assert!(
+            colliding_text.contains("already in use"),
+            "the collision must render the blocking-refusal copy, not \
+             merely hide Submit with no explanation, got:\n{colliding_text}"
+        );
+        assert!(
+            !colliding_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, Action::FormSubmit)),
+            "a colliding [Submit] must be rendered INERT — excluded from \
+             the click hit-test rects — not merely dimmed cosmetically"
+        );
+
+        let colliding_cancel = colliding_buttons
+            .iter()
+            .find(|(action, _)| matches!(action, Action::FormCancel))
+            .map(|(_, rect)| *rect)
+            .expect("[Cancel] must always be clickable");
+        let colliding_submit_rect = rect_of_text(&colliding_text, "[Submit]");
+        assert!(
+            !colliding_cancel.intersects(colliding_submit_rect),
+            "[Cancel] at {colliding_cancel:?} must not overlap the inert \
+             [Submit] at {colliding_submit_rect:?} within the SAME \
+             (colliding) render — an overlap is exactly the muscle-memory \
+             misclick hazard this pin exists to catch: with [Submit] \
+             present but laid out first, [Cancel] structurally cannot slide \
+             into its cells regardless of the popup's size or position, \
+             got:\n{colliding_text}"
+        );
+
+        assert!(
+            distinct_buttons
+                .iter()
+                .any(|(action, _)| matches!(action, Action::FormSubmit)),
+            "a distinct typed name must not be blocked, got:\n{distinct_text}"
+        );
+    }
+
+    /// Scenario: Dispatch the real `Action::FormSubmit` — the SAME
+    /// production `dispatch_action` arm the mouse-click `[Submit]` button
+    /// routes through — against a form whose typed Name collides with a
+    /// live orchestration. `identity/003` only exercises the Enter-key
+    /// door; nothing before this test drives the CLICK door (fork#192
+    /// review F9). The click door's own `name_collision()` guard is
+    /// defense-in-depth for a state the render seam is meant to make
+    /// unreachable — pin that it independently refuses the submit (no pane
+    /// spawned, the form stays open) so a future drift between the render
+    /// guard and the dispatch guard is caught here even if the render-layer
+    /// inertness (`orchestration/guard/002`) ever regressed.
+    #[spec("orchestration/guard/003")]
+    #[test]
+    fn guard_003_form_submit_click_door_refuses_a_colliding_name() {
+        let mut form = NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj-orchestrator-1".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_live_orchestration_names(vec!["myproj-orchestrator-1".to_string()]);
+        form.selection_index = 1; // the only orchestration, already selected
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(form);
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::FormSubmit,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "a colliding name must not spawn any pane via the [Submit] click door"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused click-door submit must keep the form open, not close it"
+        );
+        assert!(
+            ui.new_pane_form.is_some(),
+            "the form must not be taken/dropped on a refused click-door submit"
+        );
     }
 
     /// Scenario: Build the new-pane form for an orchestration with a
