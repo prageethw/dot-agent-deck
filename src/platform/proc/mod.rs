@@ -49,6 +49,30 @@ pub use scan::{
     descendant_shell_activity, descendants,
 };
 
+/// Why one [`process_table_async`] sample did not produce a table (fork issue
+/// #160) — the distinction [`process_table`]'s plain `Option` cannot make.
+///
+/// A caller that polls repeatedly (the daemon's shell-activity monitor is the
+/// only one today) needs to tell these apart: `Unsupported` never changes —
+/// retrying next tick is pointless and logging every tick is pure noise —
+/// while `Failed` is an environmental, transient condition (this attempt's
+/// `ps` exceeded its budget, exited non-zero, or produced nothing parseable)
+/// that a later sample may well not repeat. Collapsing both into one `None`,
+/// as [`process_table`] still does for its wider set of callers, is what let
+/// budget exhaustion masquerade as "nothing to report" instead of "the sample
+/// failed" — see `docs/develop/shell-activity-signal.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessTableOutcome {
+    /// This platform cannot enumerate processes at all (Windows today; see
+    /// [`process_table`]'s doc comment). Permanent for the life of the
+    /// process — never worth retrying or warning about on every tick.
+    Unsupported,
+    /// This platform can answer in general, but this particular sample did
+    /// not produce a table. Transient: the budget, the `ps` invocation, and
+    /// machine load all vary sample to sample.
+    Failed,
+}
+
 /// Result of delivering the daemon-stop graceful signal to a PID via
 /// [`terminate_pid`].
 ///
@@ -320,9 +344,9 @@ pub(crate) fn detach_reap_or_fallback_sync_with_cap(
 
 #[cfg(unix)]
 pub use unix::{
-    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
-    spawn_in_new_process_group,
+    AgentProcessGroup, PS_SAMPLE_BUDGET, PinnedProcess, current_ppid, force_kill_child_and_wait,
+    force_kill_pid, foreground_pgid, pin_process, process_table, process_table_async,
+    send_sigterm_to_child_group, spawn_in_new_process_group,
     terminate_child_with_grace_and_detached_reap_forcing_group_backstop,
     terminate_child_with_grace_and_wait,
     terminate_child_with_grace_and_wait_forcing_group_backstop, terminate_pid,
