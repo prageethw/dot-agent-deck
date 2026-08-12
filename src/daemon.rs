@@ -936,6 +936,9 @@ fn make_schedule_callback(
         // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
         // the orchestrator context is #222's work, not this PR's.
         compose_orchestrator_context: false,
+        // A plain scheduled fire creates no worktree, so there is no marker
+        // owner for `--mine` to match against.
+        owner: None,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {
