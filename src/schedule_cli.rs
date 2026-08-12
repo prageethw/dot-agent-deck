@@ -353,7 +353,9 @@ mod tests {
         assert!(err.contains("already exists"), "got: {err}");
     }
 
-    fn sample_issue_dispatch_add(name: &str, repo: &str) -> AddArgs {
+    // PRD #421 M3.0: `triage` is a parameter, not a hardcoded `false`, so
+    // callers can exercise both states of the flag through the same fixture.
+    fn sample_issue_dispatch_add(name: &str, repo: &str, triage: bool) -> AddArgs {
         AddArgs {
             name: name.to_string(),
             cron: "0 9 * * *".to_string(),
@@ -368,6 +370,7 @@ mod tests {
                 max_per_run: 2,
                 label: Some("agent-eligible".to_string()),
                 query: Some("is:open label:bug".to_string()),
+                triage,
             }),
         }
     }
@@ -375,38 +378,48 @@ mod tests {
     // scheduler/cli/004 (arg→config mapping) — an issue-dispatch `add` needs NO
     // --command, appends a task carrying the `issue_dispatch` sub-table, and the
     // serialized TOML round-trips every field back into an `IssueDispatchConfig`.
+    // PRD #421 M3.0: covers `triage` in BOTH states — `false` (the default) and
+    // `true` — since a hardcoded `false` here would silently mask the CLI flag
+    // never threading through.
     #[test]
     fn add_issue_dispatch_without_command_round_trips() {
-        let mut tasks = Vec::new();
-        add(
-            &mut tasks,
-            sample_issue_dispatch_add("issues-task", "acme/widgets"),
-        )
-        .expect("issue-dispatch add (no --command) should succeed");
-        assert_eq!(tasks.len(), 1);
-        let disp = tasks[0]
-            .issue_dispatch
-            .as_ref()
-            .expect("issue_dispatch sub-table present");
-        assert_eq!(disp.repo, "acme/widgets");
-        assert_eq!(disp.max_per_run, 2);
-        assert_eq!(disp.label.as_deref(), Some("agent-eligible"));
-        assert_eq!(disp.query.as_deref(), Some("is:open label:bug"));
+        for triage in [false, true] {
+            let mut tasks = Vec::new();
+            add(
+                &mut tasks,
+                sample_issue_dispatch_add("issues-task", "acme/widgets", triage),
+            )
+            .expect("issue-dispatch add (no --command) should succeed");
+            assert_eq!(tasks.len(), 1);
+            let disp = tasks[0]
+                .issue_dispatch
+                .as_ref()
+                .expect("issue_dispatch sub-table present");
+            assert_eq!(disp.repo, "acme/widgets");
+            assert_eq!(disp.max_per_run, 2);
+            assert_eq!(disp.label.as_deref(), Some("agent-eligible"));
+            assert_eq!(disp.query.as_deref(), Some("is:open label:bug"));
+            assert_eq!(disp.triage, triage);
 
-        // The serialized form carries the sub-table and round-trips with no
-        // load errors — the same contract the CLI e2e (scheduler/cli/004) checks.
-        let doc = SchedulesDoc {
-            scheduled_tasks: &tasks,
-        };
-        let toml = toml::to_string_pretty(&doc).unwrap();
-        assert!(
-            toml.contains("[scheduled_tasks.issue_dispatch]"),
-            "serialized TOML must carry the issue_dispatch sub-table, got:\n{toml}"
-        );
-        let reloaded = crate::config::LoadedSchedules::parse(&toml);
-        assert!(reloaded.errors.is_empty(), "errors: {:?}", reloaded.errors);
-        assert_eq!(reloaded.tasks.len(), 1);
-        assert!(reloaded.tasks[0].issue_dispatch.is_some());
+            // The serialized form carries the sub-table and round-trips with no
+            // load errors — the same contract the CLI e2e (scheduler/cli/004) checks.
+            let doc = SchedulesDoc {
+                scheduled_tasks: &tasks,
+            };
+            let toml = toml::to_string_pretty(&doc).unwrap();
+            assert!(
+                toml.contains("[scheduled_tasks.issue_dispatch]"),
+                "serialized TOML must carry the issue_dispatch sub-table, got:\n{toml}"
+            );
+            let reloaded = crate::config::LoadedSchedules::parse(&toml);
+            assert!(reloaded.errors.is_empty(), "errors: {:?}", reloaded.errors);
+            assert_eq!(reloaded.tasks.len(), 1);
+            let reloaded_disp = reloaded.tasks[0]
+                .issue_dispatch
+                .as_ref()
+                .expect("issue_dispatch sub-table present after reload");
+            assert_eq!(reloaded_disp.triage, triage);
+        }
     }
 
     // scheduler/cli/004 (repo validation) — a malformed `--repo` (not an
@@ -416,7 +429,7 @@ mod tests {
     fn add_issue_dispatch_rejects_malformed_repo() {
         for bad in ["not-a-valid-slug", "a/b/c", "owner/", "/name", "-x/y"] {
             let mut tasks = Vec::new();
-            let err = add(&mut tasks, sample_issue_dispatch_add("bad", bad)).unwrap_err();
+            let err = add(&mut tasks, sample_issue_dispatch_add("bad", bad, false)).unwrap_err();
             let lowered = err.to_lowercase();
             assert!(
                 lowered.contains("repo") && lowered.contains("owner/name"),
@@ -430,19 +443,24 @@ mod tests {
     }
 
     // PRD #120 — a malformed `--label` / `--query` (leading `-`, a `gh` flag
-    // injection vector) is rejected at write time too.
+    // injection vector) is rejected at write time too, regardless of `triage`
+    // (PRD #421 M3.0: exercised both on and off — rejection must not depend on
+    // it).
     #[test]
     fn add_issue_dispatch_rejects_dash_label_or_query() {
-        let mut tasks = Vec::new();
-        let mut args = sample_issue_dispatch_add("dash-label", "acme/widgets");
-        args.issue_dispatch = Some(IssueDispatchConfig {
-            repo: "acme/widgets".to_string(),
-            max_per_run: 1,
-            label: Some("-rf".to_string()),
-            query: None,
-        });
-        assert!(add(&mut tasks, args).is_err());
-        assert!(tasks.is_empty());
+        for triage in [false, true] {
+            let mut tasks = Vec::new();
+            let mut args = sample_issue_dispatch_add("dash-label", "acme/widgets", triage);
+            args.issue_dispatch = Some(IssueDispatchConfig {
+                repo: "acme/widgets".to_string(),
+                max_per_run: 1,
+                label: Some("-rf".to_string()),
+                query: None,
+                triage,
+            });
+            assert!(add(&mut tasks, args).is_err());
+            assert!(tasks.is_empty());
+        }
     }
 
     // scheduler/cli/001 (rename rejection) — `update` keys by name and there is

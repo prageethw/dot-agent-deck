@@ -8215,15 +8215,42 @@ impl DaemonProc {
         want: usize,
         timeout: Duration,
     ) -> bool {
+        let needle_bytes = needle.as_bytes();
+        let acc =
+            self.attach_and_accumulate(agent_id, Duration::from_millis(500), timeout, |acc, _| {
+                count_occurrences(acc, needle_bytes) >= want
+            });
+        count_occurrences(&acc, needle_bytes) >= want
+    }
+
+    /// Shared attach wire protocol (PRD #421 review F11): connect to the
+    /// attach socket, send an `AttachStream` request, then read STREAM_OUT
+    /// frames into an accumulator until `stop(&acc, last_growth)` returns
+    /// true or `timeout` elapses. `last_growth` is the instant the
+    /// accumulator last grew (STREAM_OUT bytes arrived); `stop` is
+    /// re-evaluated on every idle tick (a `WouldBlock`/`TimedOut` read) AND
+    /// immediately after every STREAM_OUT chunk, so it works equally for a
+    /// "seen enough occurrences yet" predicate (checked as soon as it
+    /// becomes true) and a "gone quiet for long enough" predicate (checked
+    /// while idle). Returns whatever was accumulated — an empty `Vec` on a
+    /// connect/write failure, exactly like both callers' prior early-return
+    /// behavior, since neither depends on distinguishing that from "the stop
+    /// condition was simply never met".
+    fn attach_and_accumulate(
+        &self,
+        agent_id: &str,
+        read_timeout: Duration,
+        timeout: Duration,
+        mut stop: impl FnMut(&[u8], Instant) -> bool,
+    ) -> Vec<u8> {
         use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, KIND_STREAM_OUT};
         use std::io::{Read, Write};
 
+        let mut acc: Vec<u8> = Vec::new();
         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.attach_socket) else {
-            return false;
+            return acc;
         };
-        stream
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .ok();
+        stream.set_read_timeout(Some(read_timeout)).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
         let req = dot_agent_deck::daemon_protocol::AttachRequest::AttachStream {
@@ -8234,13 +8261,12 @@ impl DaemonProc {
         header[0] = KIND_REQ;
         header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
-            return false;
+            return acc;
         }
         let _ = stream.flush();
 
-        let mut acc: Vec<u8> = Vec::new();
-        let needle_bytes = needle.as_bytes();
         let deadline = Instant::now() + timeout;
+        let mut last_growth = Instant::now();
         while Instant::now() < deadline {
             let mut fh = [0u8; 5];
             match stream.read_exact(&mut fh) {
@@ -8249,26 +8275,30 @@ impl DaemonProc {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
+                    if stop(&acc, last_growth) {
+                        break;
+                    }
                     continue;
                 }
-                Err(_) => return false,
+                Err(_) => break,
             }
             let kind = fh[0];
             let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
             let mut body = vec![0u8; len];
             if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
-                return false;
+                break;
             }
             if kind == KIND_STREAM_OUT {
                 acc.extend_from_slice(&body);
-                if count_occurrences(&acc, needle_bytes) >= want {
-                    return true;
+                last_growth = Instant::now();
+                if stop(&acc, last_growth) {
+                    break;
                 }
             } else if kind == KIND_RESP {
                 continue;
             }
         }
-        false
+        acc
     }
 
     /// Simulate a user keystroke into a pane: attach to `agent_id` and send one
@@ -8317,11 +8347,44 @@ impl DaemonProc {
         self.attach_and_wait_for_output(agent_id, input, Duration::from_secs(5))
     }
 
+    /// Attach to an agent's PTY stream and capture cumulative STREAM_OUT bytes
+    /// until output goes quiet for `quiet` (no new bytes since the last read)
+    /// or `timeout` elapses, then return everything captured as a lossy UTF-8
+    /// string. Unlike [`attach_and_wait_for_output`], which pays the full
+    /// `timeout` once per needle, this captures the delivered text ONCE so a
+    /// caller can run several `.contains()` checks against one snapshot (PRD
+    /// #421 `scheduler/dispatch/018`'s multi-term triage-vocabulary check).
+    /// Quiescence is only evaluated after the first byte arrives, so an
+    /// initial multi-second gap before delivery starts (the documented
+    /// `SessionStart` fallback wait) does not cut the capture short.
+    pub fn attach_and_capture_output(
+        &self,
+        agent_id: &str,
+        quiet: Duration,
+        timeout: Duration,
+    ) -> String {
+        let acc = self.attach_and_accumulate(
+            agent_id,
+            Duration::from_millis(200),
+            timeout,
+            |acc, last_growth| !acc.is_empty() && last_growth.elapsed() >= quiet,
+        );
+        String::from_utf8_lossy(&acc).into_owned()
+    }
+
     /// Whether the captured daemon stderr currently contains `needle`.
     pub fn stderr_contains(&self, needle: &str) -> bool {
         std::fs::read_to_string(&self.stderr_path)
             .map(|s| s.contains(needle))
             .unwrap_or(false)
+    }
+
+    /// The full captured daemon stderr as of now (empty string if unreadable).
+    /// Unlike [`stderr_contains`], this lets a caller extract and compare
+    /// specific rendered lines (e.g. PRD #421's per-cause skip-reason text)
+    /// rather than only checking a loose substring.
+    pub fn stderr_text(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 
     /// Poll the captured daemon stderr until it contains `needle` or a bounded
