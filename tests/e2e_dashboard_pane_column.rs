@@ -11,36 +11,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, find_pane_box_left_edge, pane_box_left_edge};
 use spec::spec;
-
-/// Left edge (in columns) of a Tiled pane's box whose title fuses into the
-/// top border as `┌<pane_title>` (Plain, unfocused/PaneInput) or
-/// `┏<pane_title>` (Thick, focused command-mode — `TerminalWidget` in
-/// `src/terminal_widget.rs`) — the boundary between the sidebar (deck cards /
-/// role list) and the pane column that the split-stage percentages control.
-/// Generalizes `e2e_orchestration_pane_column.rs`'s `pane_column_left_edge`
-/// (hardcoded to the "orchestrator" role name) to any pane title, so it
-/// covers both a Dashboard pane's session name and an orchestration role name
-/// from the same helper.
-fn find_pane_box_left_edge(grid: &str, pane_title: &str) -> Option<u16> {
-    let plain_needle = format!("┌{pane_title}");
-    let thick_needle = format!("┏{pane_title}");
-    for line in grid.lines() {
-        if let Some(byte_idx) = line
-            .find(&plain_needle)
-            .or_else(|| line.find(&thick_needle))
-        {
-            return Some(line[..byte_idx].chars().count() as u16);
-        }
-    }
-    None
-}
-
-fn pane_box_left_edge(grid: &str, pane_title: &str) -> u16 {
-    find_pane_box_left_edge(grid, pane_title)
-        .unwrap_or_else(|| panic!("{pane_title:?} pane box top border not found in grid:\n{grid}"))
-}
 
 /// Scenario: Extends the Ctrl+l split-toggle to Dashboard tabs — launch with
 /// a live Dashboard pane, Ctrl+l cycle through Default (33%) -> Narrow (25%)
@@ -179,8 +151,12 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // byte forwards straight to the pane instead of cycling the split.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
+    // Non-panicking form (see `find_pane_box_left_edge`'s doc comment in
+    // `tests/common/mod.rs`, and the same fix applied below): the panicking
+    // `pane_box_left_edge` would abort on the first sampled grid if the box
+    // were momentarily absent instead of letting this 3s loop actually retry.
     let orch_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, "orchestrator") == 0
+        find_pane_box_left_edge(grid, "orchestrator") == Some(0)
     });
     assert!(
         orch_hidden,
@@ -246,22 +222,28 @@ fn dashboard_001_ctrl_l_cycles_dashboard_split_stage_shared_with_orchestration()
     // Orchestration tab just as the Orchestration tab's earlier toggle
     // propagated to the Dashboard tab.
     deck.send_bytes(b"\x1b[C"); // Right -> next tab -> Orchestration
-    // Same hazard as the Shift+Tab switch above (see the comment at line
-    // 184-190): confirm the tab switch itself landed before polling for the
-    // exact edge, so a panicking `pane_box_left_edge` isn't used directly as
-    // a predicate against a first-sampled grid that can still show the
-    // Dashboard tab ("orchestrator" genuinely absent, not just moved).
-    deck.wait_for_string("orchestrator");
+    // Round 4 (fork issue #224): `wait_for_string("orchestrator")` here was a
+    // guard that did not guard anything. The Orchestration tab's label (e.g.
+    // `.tmp6ozm36-orchestrator-1`, fork#192's suggested name) appears in the
+    // tab strip as soon as the tab exists, whether or not it is the active
+    // tab — so the wait matched immediately after the tab was created, before
+    // the `Right` keypress had any effect, every time. Use DASH_PANE's
+    // absence instead (DASH_PANE's title is only ever drawn on the Dashboard
+    // tab), which genuinely distinguishes having switched off of it, before
+    // polling for the Orchestration tab's exact edge with the non-panicking
+    // `find_pane_box_left_edge` form (see its doc comment in
+    // `tests/common/mod.rs`).
+    deck.wait_for_absence(DASH_PANE);
     let orch_also_restored = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        pane_box_left_edge(grid, "orchestrator") == 34
+        find_pane_box_left_edge(grid, "orchestrator") == Some(34)
     });
     assert!(
         orch_also_restored,
         "toggling the Dashboard tab's split back to Default must move the \
          Orchestration tab's split too — expected the Orchestration tab \
-         ALSO at its own 34/66 Default after switching to it, got {}\
+         ALSO at its own 34/66 Default after switching to it, got {:?}\
          \nGrid:\n{}",
-        pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
+        find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 }
