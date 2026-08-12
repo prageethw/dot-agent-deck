@@ -7473,12 +7473,27 @@ impl AgentPtyRegistry {
 
     /// PRD #92 F1: graceful shutdown of every agent in the registry. Sends
     /// SIGTERM to each child, waits up to `grace` for them to exit (polling
-    /// `try_wait` so an early exiter isn't penalised by the wall-clock
-    /// deadline), then SIGKILLs anything that's still alive. Idempotent —
-    /// a second call (e.g. from a second `KIND_SHUTDOWN` arriving during
-    /// teardown, or from a SIGTERM-triggered drop path racing the protocol
-    /// handler) returns immediately so we don't fight ourselves for
-    /// ownership of each `Child`.
+    /// a non-reaping peek so an early exiter isn't penalised by the
+    /// wall-clock deadline), then unconditionally SIGKILLs and reaps every
+    /// agent's process group/job, whether or not phase 2 observed it exit.
+    /// Idempotent — a second call (e.g. from a second `KIND_SHUTDOWN`
+    /// arriving during teardown, or from a SIGTERM-triggered drop path
+    /// racing the protocol handler) returns immediately so we don't fight
+    /// ourselves for ownership of each `Child`.
+    ///
+    /// Fork issue #163 rework (PR #207 review + audit): an earlier version
+    /// of this function tracked which agents phase 2's `try_wait` reaped
+    /// and skipped exactly those in phase 3. That saved a redundant signal,
+    /// but `try_wait`'s reap releases the agent's pid back to the kernel —
+    /// on Unix that let phase 3 skip precisely the agents fork #133's
+    /// descendant-kill guarantee exists to protect, and skipping was wrong
+    /// on Windows for an unrelated reason (phase 3 there targets a Job
+    /// Object *handle*, which cannot be recycled, so the skip bought no
+    /// safety and cost the only `TerminateJobObject` backstop on this
+    /// path). Phase 2 now observes exit without reaping — see
+    /// [`crate::platform::proc::peek_child_exited_without_reaping`] — so
+    /// phase 3 can stay unconditional on every platform: it always reaches
+    /// every agent, whether or not phase 2 saw it exit.
     ///
     /// The Drop impl still calls [`shutdown_all`] for the SIGKILL-without-grace
     /// path — that path is reached on idle shutdown and test cleanup where
@@ -7514,15 +7529,39 @@ impl AgentPtyRegistry {
             );
         }
 
-        // Phase 2: poll each child's `try_wait` until all have exited or
-        // the grace window elapses. Polling avoids the obvious "sleep for
-        // grace then SIGKILL" alternative — agents that exit promptly
-        // don't have to wait around for the slowest sibling.
+        // Phase 2: poll each child's exit status until all have exited or
+        // the grace window elapses, so agents that exit promptly don't have
+        // to wait around for the slowest sibling (the early break below is
+        // load-bearing: `shutdown_graceful_001` asserts a registry that has
+        // already exited returns in well under `grace`). The poll itself
+        // must never reap — see `observe_exit_without_reaping` — so phase 3
+        // can stay unconditional (fork issue #163) without re-deriving a
+        // pgid from a pid phase 2 already released.
+        //
+        // Reviewer P2-3: this loop polls every not-yet-exited agent every
+        // round rather than short-circuiting at the first one still
+        // running (the pre-#163 code's `.all()` did short-circuit, which
+        // made which agents got polled on a *timeout* break depend on
+        // `HashMap` iteration order). That no longer has any bearing on
+        // correctness now that phase 3 never skips an agent based on what
+        // phase 2 observed — it only affects how promptly the early break
+        // above can trigger — but is worth stating since the earlier,
+        // now-superseded fix changed this same loop and never recorded it
+        // anywhere a future reader would see it.
+        let mut observed_exited = vec![false; agents.len()];
         let deadline = std::time::Instant::now() + grace;
         loop {
-            let all_exited = agents
-                .iter_mut()
-                .all(|a| matches!(a.child.try_wait(), Ok(Some(_))));
+            let mut all_exited = true;
+            for (agent, exited) in agents.iter_mut().zip(observed_exited.iter_mut()) {
+                if *exited {
+                    continue;
+                }
+                if observe_exit_without_reaping(&mut agent.child) {
+                    *exited = true;
+                } else {
+                    all_exited = false;
+                }
+            }
             if all_exited {
                 break;
             }
@@ -7534,15 +7573,89 @@ impl AgentPtyRegistry {
 
         // Phase 3: SIGKILL any survivor and reap. The kill is no-op-safe on an
         // already-exited child (ESRCH is logged-but-ignored), so it runs
-        // unconditionally. On Windows this is where the `TerminateJobObject`
-        // backstop for each agent's descendant tree runs (PRD #163 M3) —
-        // phase 1's `CTRL_BREAK_EVENT` is best-effort only.
+        // unconditionally — regardless of what phase 2 observed. On Unix
+        // this is safe to do even for an agent phase 2 saw exit, because
+        // phase 2 never reaped it: the zombie (and therefore its process
+        // group, which equals its own pid — `spawn_in_new_process_group`'s
+        // `setsid`) is still reserved, so the kill below can't land on a
+        // recycled pid (fork #163). On Windows this is where the
+        // `TerminateJobObject` backstop for each agent's descendant tree
+        // runs (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort
+        // only, and unlike a pid, a Job Object handle is never recyclable,
+        // so there was never a reason to skip it here.
         //
         // Issue #581: the kill pass and the reap pass are SEPARATE, and
         // [`Self::force_kill_and_reap_all`] documents why.
         Self::force_kill_and_reap_all(agents);
 
         self.change_notify.notify_one();
+    }
+}
+
+/// Phase 2 helper for [`AgentPtyRegistry::shutdown_all_graceful`]: report
+/// whether `child` has exited, without reaping it — reaping is what fork
+/// issue #163 is about, and phase 3 depends on nothing in the grace window
+/// having reaped anything (see that function's doc comment).
+///
+/// Unix routes through [`crate::platform::proc::peek_child_exited_without_reaping`],
+/// a non-reaping `libc::waitid(WNOWAIT)` peek keyed on the real pid. There is
+/// deliberately no Windows counterpart in the `platform::proc` seam: Windows
+/// phase 3 targets a Job Object handle rather than a pid, so nothing there
+/// can be recycled by an intervening reap, and Windows's `try_wait` (a
+/// `GetExitCodeProcess` query) was never unsafe to call in the grace window
+/// to begin with.
+fn observe_exit_without_reaping(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(pid) = child.process_id() else {
+            // No pid to peek — practically unreachable in production (see
+            // `signal_child_pgroup_or_fallback`'s doc comment), and safe
+            // either way: without a pid, phase 3's `force_kill_child_and_wait`
+            // can't derive a pgid to signal in the first place, so there is
+            // no recycled-pid hazard for this agent regardless of what
+            // phase 2 does. Treat as still-running rather than falling
+            // back to the reaping `try_wait` — nothing in this grace
+            // window should reap.
+            return false;
+        };
+        loop {
+            match crate::platform::proc::peek_child_exited_without_reaping(pid) {
+                Ok(exited) => break exited,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Auditor F1: this comment previously read every error,
+                    // including a plain `EINTR`, as "already reaped, stop
+                    // polling". That was correct against the earlier
+                    // skip-based design (`be1fde4`), where phase 3 ran only
+                    // for agents phase 2 had *not* observed exiting, so
+                    // re-polling a genuinely-gone pid to no purpose was the
+                    // failure mode to avoid. Phase 3 is now unconditional,
+                    // which flips the calculus: continuing to poll is the
+                    // only thing preserving the grace window, so collapsing
+                    // it on a transient error throws away exactly what this
+                    // rework exists to give agents. `ECHILD` is the one
+                    // error that still means "already reaped by something
+                    // else" (see the precondition on
+                    // `peek_child_exited_without_reaping`), so it alone
+                    // stops polling here; any other error is treated as
+                    // still-running so the grace window survives it. Safety
+                    // is unaffected either way — phase 3 signals and reaps
+                    // unconditionally regardless of what phase 2 concluded.
+                    let is_echild = e.raw_os_error() == Some(libc::ECHILD);
+                    tracing::warn!(
+                        pid,
+                        error = %e,
+                        echild = is_echild,
+                        "peek_child_exited_without_reaping failed during graceful shutdown"
+                    );
+                    break is_echild;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(child.try_wait(), Ok(Some(_)))
     }
 }
 
@@ -8237,6 +8350,7 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use spec::spec;
     use std::time::Duration;
 
     // ---------------------------------------------------------------------
@@ -11733,6 +11847,7 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
     }
 
+
     // ---------------------------------------------------------------------
     // Issue #581 — one wedged agent's reap must not starve its siblings of
     // their phase-3 SIGKILL.
@@ -12114,5 +12229,376 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "every agent must still be reaped, not merely signalled"
         );
+    }
+
+
+    /// Fork issue #163, reworked contract (PR #207 review + audit both
+    /// converged: the shipped fix — tracking which agents phase 2 reaped
+    /// and skipping exactly those in phase 3 — is issue #163's option 1,
+    /// which the issue explicitly warned should not be chosen on cost
+    /// grounds: it forfeits fork #133's descendant kill in precisely the
+    /// case where phase 3 was doing real work, and it shipped unconditionally
+    /// across platforms although its entire safety justification is
+    /// Unix-only). The replacement: **phase 2 observes an agent's exit
+    /// without consuming it** (a non-reaping peek, `libc::waitid(P_PID,
+    /// pid, WEXITED | WNOHANG | WNOWAIT)` on Unix — reports the exit
+    /// without reaping, so the zombie and its pgid stay reserved for the
+    /// whole grace window), and **phase 3 signals every agent's group
+    /// unconditionally, then reaps** — no reaped-state skip at all. That
+    /// keeps all three properties at once: phase 2's early break, phase
+    /// 3's descendant kill (fork #133), and the recycled-pid fix (fork
+    /// #163) — because phase 3 never derives a pgid from a pid phase 2 has
+    /// already released.
+    ///
+    /// The observable seam: the stand-in this test used before (fake
+    /// `Child`, `process_id() -> None`) cannot exercise this — a real
+    /// `waitid` needs a real pid, and with no pid the peek has nothing to
+    /// act on. So the stand-in here wraps a **real, `setsid`'d OS process**
+    /// (via `crate::platform::proc::spawn_in_new_process_group`, the same
+    /// helper `orchestration/worktree/008-010`/`013` already use) behind a
+    /// logging `portable_pty::Child` adapter whose `process_id()` returns
+    /// the real pid. That has a load-bearing consequence for the log: once
+    /// `process_id()` is `Some`, `signal_child_pgroup_or_fallback` always
+    /// takes the real-`killpg` branch and never calls the adapter's
+    /// `ChildKiller::kill` — so `"kill"` never appears in these logs (both
+    /// SIGTERM and SIGKILL are real, invisible-to-the-adapter syscalls) —
+    /// and the coder's peek is a raw `libc::waitid` call on that same raw
+    /// pid, entirely outside the `Child` trait, so it never appears in the
+    /// log either. What the log *can* still see, because both go through
+    /// this adapter unconditionally, is the one call that distinguishes a
+    /// peek from a reap: whether phase 2 ever calls the reaping
+    /// `try_wait` (it must not — that is the whole fork #163 hazard), and
+    /// whether `wait` — the actual reap — happens in phase 3 rather than
+    /// being skipped. A naive implementation that reads correctly on its
+    /// own terms but still polls via `try_wait` internally is caught the
+    /// same way `orchestration/worktree/013` catches it on the sibling
+    /// forcing path: `try_wait` must never appear in the log at all.
+    ///
+    /// Scenario: three registries, each seeded with real short-lived OS
+    /// processes spawned as their own process-group leader. `solo-exits-promptly`
+    /// wraps `true`, which exits almost immediately — under today's shipped
+    /// fix phase 2 reaps it via `try_wait` and phase 3 skips it entirely
+    /// (no `wait`); under the reworked contract phase 2 must observe the
+    /// exit without reaping so phase 3 still signals and reaps it (`wait`
+    /// present, `try_wait` absent). `solo-never-exits` wraps `sh -c "trap ''
+    /// TERM; exec sleep 300"`, which ignores SIGTERM and can only be killed
+    /// by phase 3's SIGKILL — the control that already works today and
+    /// must keep working (its own process death is confirmed for real via
+    /// `kill(pid, 0)`, since a broken SIGKILL would otherwise just hang
+    /// this test's `wait()` forever rather than fail cleanly). `multi-agent`
+    /// puts one of each in a *single* shared registry (reviewer finding
+    /// P2-4: phase 2's old `.all()` short-circuit — which the shipped fix
+    /// already removed — used to make a shared multi-agent registry
+    /// order-dependent against `HashMap` iteration; with that short-circuit
+    /// gone, both agents' fates are deterministic regardless of iteration
+    /// order, so the two-agent case that was excused before is now covered
+    /// directly) and confirms both real processes are independently reaped
+    /// and gone.
+    #[cfg(unix)]
+    #[spec("lifecycle/shutdown-graceful/001")]
+    #[test]
+    fn shutdown_graceful_001_phase_two_peeks_without_reaping_phase_three_always_signals_and_reaps()
+    {
+        use std::process::Stdio;
+
+        /// Wraps a real OS child so `process_id()` reports a real pid (the
+        /// peek this contract requires has nothing to act on otherwise),
+        /// while still logging every `try_wait`/`wait`/`kill` call that
+        /// reaches it through the `Child` trait — the peek itself is a raw
+        /// `libc::waitid` call on the bare pid and is invisible to this
+        /// log by construction; what the log proves is that the reaping
+        /// `try_wait` is never used and that the eventual reap happens via
+        /// exactly one `wait`.
+        #[derive(Debug)]
+        struct RealChildAdapter {
+            log: Arc<Mutex<Vec<&'static str>>>,
+            inner: std::process::Child,
+        }
+
+        fn to_pty_status(status: std::process::ExitStatus) -> portable_pty::ExitStatus {
+            portable_pty::ExitStatus::with_exit_code(status.code().unwrap_or(0) as u32)
+        }
+
+        impl portable_pty::ChildKiller for RealChildAdapter {
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.log.lock().unwrap().push("kill");
+                self.inner.kill()
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                // Never reached: `signal_child_pgroup_or_fallback` only
+                // calls `clone_killer` from the `process_id() -> None`
+                // fallback branch, which this adapter's `Some` pid never
+                // takes.
+                unimplemented!("clone_killer is not reachable with a real pid")
+            }
+        }
+
+        impl portable_pty::Child for RealChildAdapter {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                self.log.lock().unwrap().push("try_wait");
+                Ok(self.inner.try_wait()?.map(to_pty_status))
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                self.log.lock().unwrap().push("wait");
+                self.inner.wait().map(to_pty_status)
+            }
+            fn process_id(&self) -> Option<u32> {
+                Some(self.inner.id())
+            }
+        }
+
+        // Builds a `RunningAgent` around a real, `setsid`'d OS process.
+        // The master/writer come from a real (but otherwise unused) pty
+        // pair — `shutdown_all_graceful` never touches them, but
+        // `RunningAgent` has no lighter-weight way to satisfy those
+        // fields. Returns the real pid alongside the log so callers can
+        // confirm the process is actually gone afterward.
+        fn real_stand_in_agent(
+            mut command: std::process::Command,
+        ) -> (RunningAgent, Arc<Mutex<Vec<&'static str>>>, libc::pid_t) {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let (inner, group) = crate::platform::proc::spawn_in_new_process_group(&mut command)
+                .expect("spawn a real process-group-leader stand-in");
+            let pid = inner.id() as libc::pid_t;
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(RealChildAdapter {
+                log: log.clone(),
+                inner,
+            });
+            let pty_system = NativePtySystem::default();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open a real pty for the stand-in's unused master/writer");
+            let writer = pair.master.take_writer().expect("take_writer");
+            let agent = RunningAgent {
+                child,
+                process_group: group,
+                master: pair.master,
+                writer: Arc::new(AsyncMutex::new(writer)),
+                bus: Arc::new(AgentBus::new()),
+                pane_id_env: None,
+                display_name: None,
+                cwd: None,
+                tab_membership: None,
+                agent_type: None,
+                spawn_agent_type: None,
+                spawn_env: Vec::new(),
+                pty_rows: 24,
+                pty_cols: 80,
+                exited: Arc::new(AtomicBool::new(false)),
+                pending_seed: None,
+                seed_delivered_native: false,
+            };
+            (agent, log, pid)
+        }
+
+        fn command_exits_promptly() -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        // Builds the SIGTERM-resistant stand-in's command together with a
+        // readiness marker: the shell installs its trap, then announces
+        // that fact by creating `marker` before it execs into `sleep 300`.
+        // Without this, phase 1's SIGTERM can reach the child before
+        // `/bin/sh` has reached the `trap` builtin, killing it for real and
+        // making the whole test setup racy rather than the code under test.
+        // `tempfile::tempdir` hands back a unique directory per call, so
+        // concurrent test invocations can never see each other's marker;
+        // the `TempDir` guard is returned alongside so callers keep it
+        // alive for as long as the marker might still be read.
+        fn command_ignores_sigterm() -> (std::process::Command, tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("create tempdir for trap-ready marker");
+            let marker = dir.path().join("trap-ready");
+            let mut command = std::process::Command::new("sh");
+            command.args([
+                "-c",
+                &format!("trap '' TERM; : > \"{}\"; exec sleep 300", marker.display()),
+            ]);
+            (command, dir, marker)
+        }
+
+        // Blocks until the stand-in from `command_ignores_sigterm` has
+        // installed its trap and announced readiness, so nothing below
+        // starts timing or signals the child before that is true. The
+        // bound is a failure deadline, not a settle time: reaching it means
+        // the shell genuinely never got there (or died first), not that
+        // the number needs tuning.
+        fn wait_for_trap_ready(marker: &std::path::Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stand-in never installed its SIGTERM trap: marker {} did not appear \
+                     within {:?}",
+                    marker.display(),
+                    Duration::from_secs(10)
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // SAFETY: signal 0 sends nothing; it only probes whether `pid`
+        // still exists (ESRCH means it is gone). Matches
+        // `orchestration/worktree/009`/`010`'s idiom.
+        fn alive(pid: libc::pid_t) -> bool {
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        // Agent that exits almost immediately: under the reworked contract
+        // phase 2 must observe that exit without reaping it, so phase 3
+        // still reaches it and reaps it — the inversion of today's shipped
+        // behavior, which reaps it in phase 2 (`try_wait`) and then skips
+        // it entirely in phase 3 (no `wait`).
+        {
+            let (agent, log, pid) = real_stand_in_agent(command_exits_promptly());
+            let registry = AgentPtyRegistry::new();
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .insert("solo-exits-promptly".to_string(), agent);
+            let grace = Duration::from_secs(2);
+            let started = Instant::now();
+            registry.shutdown_all_graceful(grace);
+            let elapsed = started.elapsed();
+
+            let calls = log.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec!["wait"],
+                "phase 2 must observe this agent's exit via a non-reaping peek (never the \
+                 reaping `try_wait`), and phase 3 must still signal and reap it via exactly one \
+                 `wait` rather than skipping it — calls were: {calls:?}"
+            );
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "an all-exited registry must not burn the full {grace:?} grace window — phase \
+                 2's early break is load-bearing (elapsed {elapsed:?})"
+            );
+            assert!(
+                !alive(pid),
+                "expected the promptly-exiting stand-in (pid {pid}) to be gone once \
+                 shutdown_all_graceful returns"
+            );
+        }
+
+        // Control: an agent that ignores SIGTERM cannot be reaped by phase
+        // 2 at all, so it must still legitimately receive phase 3's
+        // SIGKILL and be reaped — proves the rework discriminates on real
+        // exit rather than silencing phase 3 for every agent (which would
+        // just reintroduce fork #133's orphan-descendant gap). Already
+        // true today; must keep being true after the rework.
+        {
+            let (command, _marker_dir, marker) = command_ignores_sigterm();
+            let (agent, log, pid) = real_stand_in_agent(command);
+            wait_for_trap_ready(&marker);
+            let registry = AgentPtyRegistry::new();
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .insert("solo-never-exits".to_string(), agent);
+            let grace = Duration::from_millis(300);
+            let started = Instant::now();
+            registry.shutdown_all_graceful(grace);
+            let elapsed = started.elapsed();
+
+            let calls = log.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec!["wait"],
+                "an agent phase 2 never observes exiting must still be signalled (SIGTERM, then \
+                 phase 3's SIGKILL — both real killpg calls, invisible to this log once \
+                 process_id() is Some) and reaped via exactly one `wait`, never via the reaping \
+                 `try_wait`; calls were: {calls:?}"
+            );
+            // Auditor F2: pins the `Ok(false)` half of the peek's contract,
+            // which nothing else here does — every other assertion in this
+            // test still passes if the peek always reported `exited` or
+            // always errored. This agent traps `TERM` and cannot exit, so
+            // correct behavior must burn the full grace window; a peek that
+            // wrongly reports it as exited (F1's failure mode) breaks phase
+            // 2 out early and collapses `elapsed` to near zero, failing this
+            // lower-bound assertion deterministically.
+            assert!(
+                elapsed >= grace,
+                "a peek that never observes this SIGTERM-resistant agent as exited must burn \
+                 the full {grace:?} grace window before phase 3 signals it — got {elapsed:?}, \
+                 which means phase 2 broke out early"
+            );
+            // A broken SIGKILL would leave `wait()` blocked on a live,
+            // SIGTERM-resistant process rather than failing this
+            // assertion — so reaching this line at all is already partial
+            // evidence, and the explicit check makes the failure mode
+            // legible instead of a CI-wide timeout.
+            assert!(
+                !alive(pid),
+                "expected the SIGTERM-resistant stand-in (pid {pid}) to be gone once \
+                 shutdown_all_graceful returns — its own `wait()` completing without this being \
+                 true would mean pid reuse, not a real kill"
+            );
+        }
+
+        // Multi-agent (reviewer P2-4): one promptly-exiting agent and one
+        // SIGTERM-ignoring agent in a *single* shared registry. Phase 2's
+        // old `.all()` short-circuit — which made which agent phase 2
+        // actually reached order-dependent against `HashMap` iteration —
+        // is already gone from the shipped fix; with it gone, both
+        // agents' fates must be independent of iteration order. This is
+        // the one behavior `shutdown_all_graceful` has that the
+        // already-covered single-pane path doesn't: index alignment
+        // between the agents and their per-agent phase-2 state across two
+        // separate loops.
+        {
+            let (command_b, _marker_dir_b, marker_b) = command_ignores_sigterm();
+            let (agent_a, log_a, pid_a) = real_stand_in_agent(command_exits_promptly());
+            let (agent_b, log_b, pid_b) = real_stand_in_agent(command_b);
+            wait_for_trap_ready(&marker_b);
+            let registry = AgentPtyRegistry::new();
+            {
+                let mut inner = registry.inner.lock().unwrap();
+                inner
+                    .agents
+                    .insert("multi-exits-promptly".to_string(), agent_a);
+                inner
+                    .agents
+                    .insert("multi-ignores-sigterm".to_string(), agent_b);
+            }
+            registry.shutdown_all_graceful(Duration::from_millis(300));
+
+            let calls_a = log_a.lock().unwrap().clone();
+            let calls_b = log_b.lock().unwrap().clone();
+            assert_eq!(
+                calls_a,
+                vec!["wait"],
+                "the promptly-exiting agent in a shared two-agent registry must still be \
+                 reaped in phase 3, regardless of HashMap iteration order; calls were: \
+                 {calls_a:?}"
+            );
+            assert_eq!(
+                calls_b,
+                vec!["wait"],
+                "the SIGTERM-ignoring agent in a shared two-agent registry must still be \
+                 signalled and reaped in phase 3, regardless of HashMap iteration order; calls \
+                 were: {calls_b:?}"
+            );
+            assert!(
+                !alive(pid_a) && !alive(pid_b),
+                "expected both stand-ins in the shared registry to be gone once \
+                 shutdown_all_graceful returns (pid_a={pid_a} alive={}, pid_b={pid_b} alive={})",
+                alive(pid_a),
+                alive(pid_b)
+            );
+        }
     }
 }
