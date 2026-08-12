@@ -923,11 +923,12 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
 /// the fallback is inline `--task`, never a heredoc.
 fn work_done_footer(role: &str) -> String {
     let slug = role_path_slug(role);
+    let bin = crate::platform::paths::binary_name();
     format!(
         "## When done\n\n\
          Signal completion by running this command via Bash:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
+         {bin} work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
          ```\n\n\
          Write that report with your **file-writing tool**. Do not construct it with shell \
          redirection or a heredoc: a line of your own text can terminate the heredoc, and \
@@ -947,9 +948,9 @@ fn work_done_footer(role: &str) -> String {
          that is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
          `!`**:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         {bin} work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
          ```\n\n\
-         Anything outside that allowlist is rewritten by your own shell before dot-agent-deck \
+         Anything outside that allowlist is rewritten by your own shell before {bin} \
          sees it: backticks and `$(…)` are executed and replaced by their output (usually empty), \
          `$VAR` becomes its value or nothing, a balanced inner `\"` is removed and changes how the \
          rest of the argument is quoted, a `\\` before `$`, a backtick, `\"` or `\\` removes \

@@ -465,7 +465,7 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
 fn current_binary_path() -> String {
     std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into())
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into())
 }
 
 /// Startup entry: install the deck's Devin hooks into the user's Devin config,

@@ -437,7 +437,7 @@ pub fn auto_install() {
     };
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into());
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
     if let Err(e) = install_to(&home, &binary_path) {
         tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
     }

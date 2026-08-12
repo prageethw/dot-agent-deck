@@ -75,12 +75,13 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
     // unguaranteed permission produces exactly the silent stall #303 is about,
     // so all three branches (file / short plain inline / say you cannot) are now
     // stated outright rather than left to inference.
+    let bin = crate::platform::paths::binary_name();
     content.push_str("\n## Delegation protocol\n\n");
-    content.push_str(
+    content.push_str(&format!(
         "To delegate work to an agent, use `delegate` with one command per agent. \
          Pass the task as a **file** — `--task-file` is the default, not an escape hatch:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
+         {bin} delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
          ```\n\n\
          Four rules for producing that file. The last two are about the *path*, not the \
          contents:\n\n\
@@ -103,10 +104,10 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          task is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
          `!`**:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task \"Short plain task description.\"\n\
+         {bin} delegate --to <role-name> --task \"Short plain task description.\"\n\
          ```\n\n\
          Why the allowlist is that narrow: everything after `--task` is processed by **your own \
-         shell** before dot-agent-deck receives it. Backticks and `$(…)` are executed and \
+         shell** before {bin} receives it. Backticks and `$(…)` are executed and \
          replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
          balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
          `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
@@ -120,18 +121,18 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          a way around the allowlist.\n\n\
          To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
-         dot-agent-deck delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
+         {bin} delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
+         {bin} delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
          ```\n\n\
          If all agents should receive the **exact same task**, you may combine them in one call:\n\n\
          ```bash\n\
-         dot-agent-deck delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
+         {bin} delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
          ```\n\n\
          When all work is complete and you are satisfied with the results:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
+         {bin} work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
          ```\n\
-         (or `dot-agent-deck work-done --done --task \"Final summary.\"` when that summary really is \
+         (or `{bin} work-done --done --task \"Final summary.\"` when that summary really is \
          one plain line). The same four rules apply to that file: `<summary-slug>` is a fresh slug \
          you invent, the path must not already exist before you write it, and you delete exactly \
          that path once the command has exited successfully.\n\n\
@@ -140,11 +141,11 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          task description short, but the description itself still goes through your shell. Passing \
          the file with `--task-file` is what keeps the shell out of the text. One file solves both \
          at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
-         `--task-file`.\n",
-    );
+         `--task-file`.\n"
+    ));
 
     // 4. Important guidelines.
-    content.push_str(
+    content.push_str(&format!(
         "\n## Important\n\n\
          Wait for the user to tell you what to work on.\n\n\
          Once you know the task, delegate immediately via the CLI commands above. \
@@ -156,7 +157,7 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Wait for its work-done signal before delegating again to the same worker. \
          Delegating to different workers in parallel is fine.\n\n\
          Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
-         — a `dot-agent-deck delegate` call from inside a worker does not route back through your \
+         — a `{bin} delegate` call from inside a worker does not route back through your \
          notification stream, so the downstream task is silently dropped and the calling worker \
          waits forever (or signals work-done in a paused state). When briefing a worker, never \
          instruct them to \"delegate the fix to coder\" or \"hand off to <other role>\". \
@@ -164,8 +165,8 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
          you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
          When a task related to a PRD is fully completed (all workers done, reviews passed), \
-         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
-    );
+         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n"
+    ));
 
     content
 }
