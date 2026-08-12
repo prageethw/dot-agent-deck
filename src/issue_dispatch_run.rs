@@ -1196,7 +1196,9 @@ pub enum WorktreeCreation {
     /// a reused name report a worktree conflict that the user could see was not
     /// true — the directory is plainly gone — with no hint of the real cause.
     BranchExists,
-    TimedOut { cleaned_up: bool },
+    TimedOut {
+        cleaned_up: bool,
+    },
 }
 
 /// Attempts (the first included) at `git worktree add` when it fails because a

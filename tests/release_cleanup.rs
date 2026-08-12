@@ -285,7 +285,7 @@ struct RepoFixture {
 /// `origin` but is irrelevant here), so a plain configured URL with no
 /// backing bare repo is enough to stay hermetic.
 fn build_repo_fixture(upstream_url: Option<&str>) -> RepoFixture {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
     let (origin_git_dir, clone_dir) = init_repo(
         root.path(),
         Some(&format!("https://github.com/{FORK_SLUG}.git")),
@@ -475,7 +475,7 @@ struct RootOnMergedFixture {
 }
 
 fn build_fixture_root_on_merged_branch() -> RootOnMergedFixture {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
     let (_origin_git_dir, clone_dir) = init_repo(root.path(), None);
 
     run_git(&clone_dir, &["checkout", "-b", "feat/root-merged"]);
@@ -538,7 +538,7 @@ struct DefaultBranchLinkedWorktreeFixture {
 }
 
 fn build_fixture_default_branch_linked_worktree() -> DefaultBranchLinkedWorktreeFixture {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
     let (_origin_git_dir, clone_dir) = init_repo(root.path(), None);
 
     // A genuinely merged feature branch/worktree — the positive anchor.
@@ -605,7 +605,7 @@ struct MinimalRepo {
 /// needs — neither fixture touches branches or worktrees, since both only
 /// exercise `slug_from_remote` and the `gh` queries it feeds.
 fn build_minimal_repo(origin_remote_url: Option<&str>, upstream_url: Option<&str>) -> MinimalRepo {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
     let (_origin_git_dir, clone_dir) = init_repo(root.path(), origin_remote_url);
     if let Some(url) = upstream_url {
         run_git(&clone_dir, &["remote", "add", "upstream", url]);
@@ -649,7 +649,7 @@ fn build_fixture_unparseable_upstream() -> MinimalRepo {
 /// degrade the run for an UNRELATED reason (slug derivation, not
 /// `default_branch`), making the pinning test pass for the wrong reason.
 fn build_fixture_default_branch_undetermined() -> MinimalRepo {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
     let (_origin_git_dir, clone_dir) = init_repo(
         root.path(),
         Some(&format!("https://github.com/{FORK_SLUG}.git")),
@@ -685,7 +685,7 @@ struct MainWorktreeUndeterminableFixture {
 }
 
 fn build_fixture_separate_git_dir() -> MainWorktreeUndeterminableFixture {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
     let origin_dir = root.path().join("origin.git");
     let clone_dir = root.path().join("clone");
     let gitdir_elsewhere = root.path().join("gitdir-elsewhere");
@@ -781,7 +781,7 @@ struct MainWorktreeInsideAnotherRepoFixture {
 }
 
 fn build_fixture_separate_git_dir_inside_another_repo() -> MainWorktreeInsideAnotherRepoFixture {
-    let root = tempfile::tempdir().expect("tempdir for git fixture root");
+    let root = common::harness_tempdir().expect("tempdir for git fixture root");
 
     // The OUTER repo standing in for a dotfiles `$HOME` — an ordinary
     // (non-bare) repo whose own work tree the relocated store's PARENT will
@@ -891,7 +891,7 @@ const GH_STUB_RESPONSE_FILES: &[&str] = &[
 
 impl GhStub {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir for gh stub");
+        let dir = common::harness_tempdir().expect("tempdir for gh stub");
         for name in GH_STUB_RESPONSE_FILES {
             std::fs::write(dir.path().join(name), "")
                 .unwrap_or_else(|e| panic!("seed empty {name}: {e}"));

@@ -1568,10 +1568,10 @@ fn worktree_reclaim_025_worktree_created_by_the_deck_reads_as_owned() {
 /// The same worktree is checked before and after that truncation: it must go
 /// from `owned: true` / `remove` to `owned: false` / `ask`, and a bare
 /// `worktree reclaim` must then leave the directory on disk.
-#[spec("worktree/reclaim/026")]
+#[spec("worktree/reclaim/027")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_026_a_zero_byte_marker_is_not_proof_of_ownership() {
+fn worktree_reclaim_027_a_zero_byte_marker_is_not_proof_of_ownership() {
     let fx = Fixture::new();
 
     // Created the way production creates one, as in `025` — the marker has to
