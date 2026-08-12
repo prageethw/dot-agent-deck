@@ -56,6 +56,8 @@ git push --force origin main   # force-with-lease won't help here: we didn't fet
 
 ## The current `fork-only` stack
 
+**A commit tagged UPSTREAM-WORTHY below does not belong in this stack.** It is paying rebase tax on every sync to keep a change upstream would take for free — see [`upstream-contribution-policy.md`](upstream-contribution-policy.md) for the policy, the backlog of ones never offered, and why draining them is a byproduct of merging rather than a separate purification pass. Keep the tags here and that document's backlog table consistent: when a row is offered, merged, or reclassified, update both.
+
 Oldest to newest, rooted at an upstream base commit. Always re-verify against the live branch before trusting exact SHAs — run `git log origin/fork-only --oneline -50`, since a sync rewrites every SHA below the base:
 
 | SHA | Commit | Status |
