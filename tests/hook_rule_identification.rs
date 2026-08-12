@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 use dot_agent_deck::hooks_manage::{install_to, uninstall_from};
 use serde_json::{Value, json};
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 fn settings_path() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("create settings dir");
+    let dir = test_temp::tempdir().expect("create settings dir");
     let path = dir.path().join("settings.json");
     (dir, path)
 }
@@ -366,7 +369,7 @@ fn hook_rule_identification_009_historical_unquoted_spaced_rule_is_still_recogni
 #[cfg(unix)]
 #[test]
 fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
-    let binary_dir = tempfile::tempdir().expect("create binary tempdir");
+    let binary_dir = test_temp::tempdir().expect("create binary tempdir");
     let real_binary = binary_dir.path().join("worker-agent-deck");
     std::fs::write(&real_binary, b"#!/bin/sh\n").expect("write real binary");
     let symlink_path = binary_dir.path().join("dot-agent-deck");
@@ -397,11 +400,11 @@ fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
 /// exercises the canonicalize-success branch `_003` cannot reach.
 #[test]
 fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse() {
-    let build_a_dir = tempfile::tempdir().expect("build a tempdir");
+    let build_a_dir = test_temp::tempdir().expect("build a tempdir");
     let build_a = build_a_dir.path().join("dot-agent-deck");
     std::fs::write(&build_a, b"#!/bin/sh\n").expect("write build a");
 
-    let build_b_dir = tempfile::tempdir().expect("build b tempdir");
+    let build_b_dir = test_temp::tempdir().expect("build b tempdir");
     let build_b = build_b_dir.path().join("dot-agent-deck");
     std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
 
@@ -478,12 +481,12 @@ fn hook_rule_identification_012_fragment_match_mutation_guard() {
 /// delete user hooks for tools not currently installed.
 #[test]
 fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
-    let build_a_dir = tempfile::tempdir().expect("build a tempdir");
+    let build_a_dir = test_temp::tempdir().expect("build a tempdir");
     let build_a = build_a_dir.path().join("dot-agent-deck");
     std::fs::write(&build_a, b"#!/bin/sh\n").expect("write build a");
     let build_a_str = build_a.to_str().expect("build a path is utf8").to_string();
 
-    let build_b_dir = tempfile::tempdir().expect("build b tempdir");
+    let build_b_dir = test_temp::tempdir().expect("build b tempdir");
     let build_b = build_b_dir.path().join("dot-agent-deck");
     std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
     let build_b_str = build_b.to_str().expect("build b path is utf8").to_string();

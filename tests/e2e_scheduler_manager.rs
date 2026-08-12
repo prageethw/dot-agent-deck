@@ -617,7 +617,7 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
 /// Also covers `manager_002`'s inline recorder, which is quoted the same way.
 #[test]
 fn recorder_shim_survives_shell_metacharacters_in_the_record_path() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let shim_dir = scratch.path().join("shim");
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
 
@@ -688,7 +688,7 @@ fn recorder_shim_survives_shell_metacharacters_in_the_record_path() {
 /// (issue #57 folded their hand-rolled copies onto the shared helper).
 #[test]
 fn login_shell_fixture_survives_shell_metacharacters_in_the_shim_path() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     // Every character the double-quoted-interpolation bug is sensitive to:
     // a quote, a command substitution, a backtick and a backslash.
     let shim_dir = scratch

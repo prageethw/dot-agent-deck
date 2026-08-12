@@ -66,7 +66,7 @@ const TEST_OWNER: &str = "orchestration:worktree-owner-restore-018-fixture";
 #[spec("session/restore/018")]
 #[test]
 fn restore_018_owner_reaches_every_restored_role_panes_real_environment() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = common::harness_tempdir().expect("tempdir");
     let worktree = tmp.path().join("dot-agent-deck-restore-018");
     std::fs::create_dir_all(&worktree).expect("create worktree dir");
     // `open_orchestration_tab` spawns non-start roles BEFORE the start role

@@ -63,6 +63,9 @@ use dot_agent_deck::issue_dispatch::{
 use dot_agent_deck::worktree_reclaim::OWNER_MARKER_FILENAME;
 use spec::spec;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -240,7 +243,7 @@ fn combined(out: &std::process::Output) -> String {
 
 impl Fixture {
     fn new() -> Self {
-        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let scratch = test_temp::tempdir().expect("scratch tempdir");
         let repo = scratch.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
         git(&repo, &["init", "--initial-branch=main", "--quiet"]);
