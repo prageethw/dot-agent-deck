@@ -483,7 +483,15 @@ async fn dispatch_one_issue(
     // issue #425: name the issue-dispatch task and issue this worktree is
     // for, rather than only recording that some deck created it.
     let creator = format!("issue-dispatch:{task_name}#{issue}");
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true, &creator).await? {
+    match create_worktree(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        true,
+        &creator,
+    )
+    .await?
+    {
         WorktreeCreation::Created => {}
         // `reuse_existing_branch: true` above means `BranchExists` is never
         // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
@@ -1001,7 +1009,7 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// actually removed, so the caller can tell the user either "try again" or
 /// give them the exact manual command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorktreeCreation {
+pub enum WorktreeCreation {
     Created,
     /// The worktree DIRECTORY is already there — a concurrent fire claimed it in
     /// the benign TOCTOU window described below. Callers surface this as a skip
@@ -1017,7 +1025,9 @@ pub(crate) enum WorktreeCreation {
     /// a reused name report a worktree conflict that the user could see was not
     /// true — the directory is plainly gone — with no hint of the real cause.
     BranchExists,
-    TimedOut { cleaned_up: bool },
+    TimedOut {
+        cleaned_up: bool,
+    },
 }
 
 /// Attempts (the first included) at `git worktree add` when it fails because a
@@ -1528,7 +1538,7 @@ fn parse_open_issues(json: &str) -> Result<Vec<OpenIssue>, String> {
 /// for a process-group kill to fix, and no `AgentProcessGroup` handle worth
 /// threading through an await that never times out. The asymmetry with
 /// [`run_status_sync`] is intentional, not an oversight.
-async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+pub(crate) async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -2411,13 +2421,27 @@ mod tests {
         let worktree_dir = scratch.path().join("repo-dispatch-claimed");
 
         assert_eq!(
-            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false, "test").await,
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-claimed",
+                false,
+                "test"
+            )
+            .await,
             Ok(WorktreeCreation::Created),
             "precondition: the first dispatch claims the name"
         );
 
         assert_eq!(
-            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false, "test").await,
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-claimed",
+                false,
+                "test"
+            )
+            .await,
             Ok(WorktreeCreation::AlreadyClaimed),
             "a second dispatch of a name whose worktree is still THERE is a live \
              claim; reporting BranchExists would tell the user their worktree is \

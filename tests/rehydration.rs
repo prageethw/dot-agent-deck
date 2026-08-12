@@ -3018,7 +3018,7 @@ async fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
 
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3290,7 +3290,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
 
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();

@@ -290,7 +290,16 @@ pub async fn handle_dispatch(
         }
     };
 
-    match create_worktree(&clone_dir, &paths.worktree_dir, &paths.branch, false).await {
+    let creator = format!("dispatch:{name}");
+    match create_worktree(
+        &clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        false,
+        &creator,
+    )
+    .await
+    {
         Ok(WorktreeCreation::Created) => {}
         Ok(WorktreeCreation::AlreadyClaimed) => {
             return DispatchResult {
@@ -321,6 +330,28 @@ pub async fn handle_dispatch(
                     name = name,
                     clone = clone_dir.display(),
                 ),
+            };
+        }
+        // Issue #541: the async `create_worktree`'s own retry loop only ever
+        // produces `Created`/`AlreadyClaimed`/`Err` — it has no bounded wait
+        // of its own, so `TimedOut` is unreachable from this call site today
+        // (see `create_worktree`'s doc comment). Kept as an explicit arm
+        // rather than a wildcard so a future change that gives this path a
+        // bound fails loudly here instead of silently falling through.
+        Ok(WorktreeCreation::TimedOut { cleaned_up }) => {
+            let detail = if cleaned_up {
+                "the half-created directory was removed automatically — try again".to_string()
+            } else {
+                format!(
+                    "run `git -C {} worktree remove --force {}` to clear it, then try again",
+                    clone_dir.display(),
+                    paths.worktree_dir.display()
+                )
+            };
+            return DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: false,
+                message: format!("dispatch: worktree add timed out — {detail}"),
             };
         }
         Err(e) => {
@@ -535,7 +566,7 @@ mod tests {
 
         // First dispatch claims the name.
         assert_eq!(
-            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false).await,
+            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test").await,
             Ok(WorktreeCreation::Created)
         );
 
@@ -549,7 +580,7 @@ mod tests {
 
         // Second dispatch of the SAME name: refused, but for the real reason.
         assert_eq!(
-            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false).await,
+            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test").await,
             Ok(WorktreeCreation::BranchExists),
             "a leftover branch must be distinguishable from a claimed worktree"
         );
@@ -564,7 +595,7 @@ mod tests {
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "fix-auth");
 
-        create_worktree(&repo, &paths.worktree_dir, &paths.branch, false)
+        create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test")
             .await
             .unwrap();
         remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
@@ -575,7 +606,7 @@ mod tests {
             .expect("git available");
 
         assert_eq!(
-            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false).await,
+            create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test").await,
             Ok(WorktreeCreation::Created),
             "after deleting the branch the same dispatch name must work again"
         );
@@ -591,7 +622,7 @@ mod tests {
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "unit");
-        create_worktree(&repo, &paths.worktree_dir, &paths.branch, false)
+        create_worktree(&repo, &paths.worktree_dir, &paths.branch, false, "test")
             .await
             .unwrap();
         std::fs::write(paths.worktree_dir.join("uncommitted.txt"), "work").unwrap();
@@ -614,7 +645,7 @@ mod tests {
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let worktree_dir = repo.join(".worktrees").join("issue-7");
-        create_worktree(&repo, &worktree_dir, "agent/issue-7", true)
+        create_worktree(&repo, &worktree_dir, "agent/issue-7", true, "test")
             .await
             .unwrap();
         std::fs::write(worktree_dir.join("uncommitted.txt"), "wip").unwrap();
