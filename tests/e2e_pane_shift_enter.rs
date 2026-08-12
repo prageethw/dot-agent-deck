@@ -273,7 +273,10 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
     // quiescence would simply time out. This wait does not decide the outcome —
     // the assertion below re-checks the settled grid either way, so a layout
     // that never settles still produces the detailed diagnostic.
-    deck.wait_for_grid_predicate_within(Duration::from_secs(15), |g| {
+    // Deliberately discarded: as the comment above says, this wait does not
+    // decide the outcome — the assertion below re-checks the settled grid
+    // either way.
+    let _ = deck.wait_for_grid_predicate_within(Duration::from_secs(15), |g| {
         draft_is_two_lines_of_one_box(g) == Some(true)
     });
 
