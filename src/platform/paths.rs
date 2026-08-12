@@ -253,6 +253,44 @@ fn current_user_sid_string() -> std::io::Result<String> {
     Ok(sid_string)
 }
 
+/// The crate's own package name — the literal fallback [`binary_name`] returns
+/// when `current_exe()` is unavailable or unusable, and the single source of
+/// truth every other such fallback in the crate should read rather than
+/// re-typing the literal `"dot-agent-deck"`.
+pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The command name this build was invoked as — the file name component of
+/// [`std::env::current_exe`] — for generated text that tells an agent to run
+/// the deck **by name through `$PATH`** (the `delegate` / `work-done` CLI
+/// examples in `orchestrator_context::build_orchestrator_context` and
+/// `state::work_done_footer`). A build installed under a different file name
+/// (a renamed copy, or invoked through a symlink whose target resolves to a
+/// different real name) must generate instructions naming ITSELF, not a
+/// baked-in literal — otherwise the generated command resolves to a
+/// different binary than the one that wrote it.
+///
+/// Falls back to [`DEFAULT_BINARY_NAME`] when `current_exe()` errors, or its
+/// file name is empty or not valid UTF-8. The fallback matters more here than
+/// at most other `current_exe()` call sites: `delegate` and `work-done` write
+/// to the unversioned hook socket, both call sites are fire-and-forget, and
+/// the daemon drops any frame it cannot parse without logging it — so a name
+/// that resolves to a binary that cannot run produces no error anywhere, only
+/// a signal that silently never arrives.
+pub fn binary_name() -> String {
+    resolve_binary_name(std::env::current_exe())
+}
+
+/// Pure seam behind [`binary_name`], so the fallback branch is unit-testable
+/// without needing a `current_exe()` that actually fails.
+fn resolve_binary_name(current_exe: std::io::Result<PathBuf>) -> String {
+    current_exe
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
+}
+
 /// Hook-ingestion endpoint. Unix: a Unix-domain-socket path
 /// (`$XDG_RUNTIME_DIR/dot-agent-deck.sock` else `/tmp/dot-agent-deck-{uid}.sock`).
 /// Windows: the named-pipe `\\.\pipe\dot-agent-deck-{user}-hook`, where
@@ -448,6 +486,40 @@ fn state_dir_platform_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// Scenario: Drive `resolve_binary_name` — the pure seam behind
+    /// `binary_name` — directly with a synthetic `current_exe()` result for
+    /// each unusable case a real call can produce: an `Err`, a path with no
+    /// file name (`/`), and (Unix-only) a file name that is not valid UTF-8.
+    /// Every case must fall back to `DEFAULT_BINARY_NAME`, never panic or
+    /// produce an empty string.
+    #[spec("orchestration/delegate/034")]
+    #[test]
+    fn delegate_034_binary_name_falls_back_to_the_default_literal_when_current_exe_is_unusable() {
+        assert_eq!(
+            resolve_binary_name(Err(std::io::Error::other("no such process"))),
+            DEFAULT_BINARY_NAME,
+            "an current_exe() error must fall back to the default literal"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("/"))),
+            DEFAULT_BINARY_NAME,
+            "a path with no file name component must fall back to the default literal"
+        );
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            // 0xFF is not valid UTF-8 in any position, so `into_string()` fails.
+            let invalid = OsStr::from_bytes(&[0xFF]);
+            assert_eq!(
+                resolve_binary_name(Ok(PathBuf::from("/usr/local/bin").join(invalid))),
+                DEFAULT_BINARY_NAME,
+                "a non-UTF-8 file name must fall back to the default literal"
+            );
+        }
+    }
 
     /// The Windows per-user pipe segment must be a *non-colliding*, namespace-safe
     /// token (PRD #163). Pure data, so the rule is checked on Linux CI too.

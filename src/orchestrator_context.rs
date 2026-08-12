@@ -221,6 +221,7 @@ pub fn prepare_orchestrator_prompt(
 mod tests {
     use super::*;
     use crate::project_config::OrchestrationRoleConfig;
+    use spec::spec;
 
     fn role(
         name: &str,
@@ -336,5 +337,30 @@ mod tests {
                     .unwrap();
             assert!(!written.contains("## Your task"));
         }
+    }
+
+    /// Scenario: Build the orchestrator context and check that its `delegate`
+    /// and `work-done` command examples name the file name
+    /// `std::env::current_exe()` reports for the running process — the test
+    /// binary itself under `cargo test` — rather than the crate's baked-in
+    /// literal name, which the test binary's file name never matches.
+    #[spec("orchestration/delegate/032")]
+    #[test]
+    fn delegate_032_orchestrator_context_names_the_running_binary() {
+        let c = build_orchestrator_context(&config());
+        let bin = crate::platform::paths::binary_name();
+        assert_ne!(
+            bin, "dot-agent-deck",
+            "this test only proves anything when the test binary's own file name differs \
+             from the literal the pre-fix code always emitted"
+        );
+        assert!(
+            c.contains(&format!("{bin} delegate --to")),
+            "the delegate examples must name the running binary ({bin:?}), got: {c}"
+        );
+        assert!(
+            c.contains(&format!("{bin} work-done --done")),
+            "the work-done examples must name the running binary ({bin:?}), got: {c}"
+        );
     }
 }

@@ -22944,7 +22944,10 @@ mod tests {
         assert!(!content.contains("**orchestrator**"));
         // Contains delegation protocol.
         assert!(content.contains("Delegation protocol"));
-        assert!(content.contains("dot-agent-deck work-done"));
+        assert!(content.contains(&format!(
+            "{} work-done",
+            crate::platform::paths::binary_name()
+        )));
         // Issue #303: the protocol advertises the shell-safe input path, says
         // when it is required, and explains why — an orchestrator told only
         // "use --task-file" without the reason drifts back to `--task`.

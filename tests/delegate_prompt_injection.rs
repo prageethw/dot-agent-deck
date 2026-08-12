@@ -588,8 +588,10 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let bin = dot_agent_deck::platform::paths::binary_name();
     assert!(
-        file_body.contains("## When done") && file_body.contains("dot-agent-deck work-done --task"),
+        file_body.contains("## When done")
+            && file_body.contains(&format!("{bin} work-done --task")),
         "worker task file must carry the work-done footer; got: {file_body:?}"
     );
     assert!(
