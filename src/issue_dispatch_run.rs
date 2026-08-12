@@ -492,7 +492,10 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true).await? {
+    // issue #425: name the issue-dispatch task and issue this worktree is
+    // for, rather than only recording that some deck created it.
+    let creator = format!("issue-dispatch:{task_name}#{issue}");
+    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true, &creator).await? {
         WorktreeCreation::Created => {}
         // `reuse_existing_branch: true` above means `BranchExists` is never
         // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
@@ -1287,6 +1290,7 @@ pub async fn create_worktree(
     worktree_dir: &Path,
     branch: &str,
     reuse_existing_branch: bool,
+    creator: &str,
 ) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
@@ -1373,7 +1377,7 @@ pub async fn create_worktree(
     };
     match add {
         Ok(()) => {
-            mark_worktree_owned_best_effort(worktree_dir);
+            mark_worktree_owned_best_effort(worktree_dir, creator);
             Ok(WorktreeCreation::Created)
         }
         // Concurrent claim (TOCTOU): the dir is present now though we arrived
@@ -1397,8 +1401,12 @@ pub async fn create_worktree(
 /// succeeded; a missing marker only means a future `reclaim` lands this
 /// worktree on `Ask` instead of `Remove` (annoying, never unsafe — see
 /// [`crate::worktree_reclaim::mark_worktree_owned`]'s doc comment).
-fn mark_worktree_owned_best_effort(worktree_dir: &Path) {
-    if let Err(e) = crate::worktree_reclaim::mark_worktree_owned(worktree_dir) {
+///
+/// `creator` (issue #425) names the task or orchestration responsible for
+/// this worktree — forwarded verbatim to `mark_worktree_owned`, which
+/// sanitises it before writing.
+fn mark_worktree_owned_best_effort(worktree_dir: &Path, creator: &str) {
+    if let Err(e) = crate::worktree_reclaim::mark_worktree_owned(worktree_dir, creator) {
         tracing::warn!(
             worktree = %worktree_dir.display(),
             error = %e,
@@ -1423,6 +1431,7 @@ pub(crate) fn create_worktree_sync(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
+    creator: &str,
 ) -> Result<WorktreeCreation, String> {
     ensure_worktree_parent_dir(worktree_dir)?;
     let branch_exists = run_status_sync(
@@ -1438,7 +1447,7 @@ pub(crate) fn create_worktree_sync(
     );
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
-            mark_worktree_owned_best_effort(worktree_dir);
+            mark_worktree_owned_best_effort(worktree_dir, creator);
             WorktreeCreation::Created
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
@@ -2054,7 +2063,8 @@ mod tests {
         // Simulate the concurrent fire having already created the worktree dir.
         std::fs::create_dir_all(&worktree_dir).unwrap();
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7", false).await;
+        let outcome =
+            create_worktree(&clone_dir, &worktree_dir, "agent/issue-7", false, "test").await;
         assert_eq!(
             outcome,
             Ok(WorktreeCreation::AlreadyClaimed),
@@ -2072,10 +2082,81 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9", false).await;
+        let outcome =
+            create_worktree(&clone_dir, &worktree_dir, "agent/issue-9", false, "test").await;
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
+        );
+    }
+
+    /// Scenario: the async `create_worktree` (this loop's own creation
+    /// path, distinct from the sync `create_worktree_sync` the TUI uses) is
+    /// asked to create a worktree with a specific creator identity. The
+    /// written marker must record that identity (issue #425) — proving the
+    /// ASYNC path threads `creator` through too, since the two
+    /// implementations don't share this plumbing.
+    /// `worktree_reclaim`'s own tests cover the sync path, the marker's
+    /// two-line format, backward compatibility with an older bare `"deck"`
+    /// marker, and sanitization of a hostile creator name in depth.
+    #[tokio::test]
+    async fn create_worktree_records_creator_identity() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let worktree_dir = clone_dir.join(".worktrees").join("issue-77");
+        let outcome = create_worktree(
+            &clone_dir,
+            &worktree_dir,
+            "agent/issue-77",
+            true,
+            "issue-dispatch:my-task#77",
+        )
+        .await
+        .expect("create_worktree must succeed against a real git repo");
+        assert_eq!(outcome, WorktreeCreation::Created);
+
+        let git_dir_out = std::process::Command::new("git")
+            .current_dir(&worktree_dir)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .expect("git rev-parse --git-dir must spawn");
+        assert!(git_dir_out.status.success());
+        let git_dir_raw = String::from_utf8_lossy(&git_dir_out.stdout)
+            .trim()
+            .to_string();
+        let git_dir = if Path::new(&git_dir_raw).is_absolute() {
+            PathBuf::from(git_dir_raw)
+        } else {
+            worktree_dir.join(git_dir_raw)
+        };
+        let content =
+            std::fs::read_to_string(git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME))
+                .expect("marker file must exist and be readable");
+        assert!(
+            content.contains("created-by: issue-dispatch:my-task#77"),
+            "the async creation path must record the creator identity too, got {content:?}"
         );
     }
 
@@ -2189,7 +2270,8 @@ mod tests {
             let worktree_dir = scratch.path().join(format!("repo-dispatch-{name}"));
             fires.push(tokio::spawn(async move {
                 let branch = format!("agent/dispatch-{name}");
-                let outcome = create_worktree(&clone_dir, &worktree_dir, &branch, false).await;
+                let outcome =
+                    create_worktree(&clone_dir, &worktree_dir, &branch, false, "test").await;
                 (name, worktree_dir, branch, outcome)
             }));
         }
@@ -2242,7 +2324,7 @@ mod tests {
         let _entry = begin_half_created_entry(&repo, "abandoned-add");
         let worktree_dir = scratch.path().join("repo-dispatch-stuck");
 
-        let err = create_worktree(&repo, &worktree_dir, "agent/dispatch-stuck", false)
+        let err = create_worktree(&repo, &worktree_dir, "agent/dispatch-stuck", false, "test")
             .await
             .expect_err("a permanently unreadable commondir must surface as an error");
         assert!(
@@ -2294,6 +2376,7 @@ mod tests {
                 &worktree_dir,
                 "agent/dispatch-serialized",
                 false,
+                "test",
             )
             .await
         });
@@ -2340,13 +2423,13 @@ mod tests {
         let worktree_dir = scratch.path().join("repo-dispatch-claimed");
 
         assert_eq!(
-            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false, "test").await,
             Ok(WorktreeCreation::Created),
             "precondition: the first dispatch claims the name"
         );
 
         assert_eq!(
-            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false, "test").await,
             Ok(WorktreeCreation::AlreadyClaimed),
             "a second dispatch of a name whose worktree is still THERE is a live \
              claim; reporting BranchExists would tell the user their worktree is \
