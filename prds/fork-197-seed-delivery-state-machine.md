@@ -4,7 +4,22 @@
 
 **Priority**: High
 
-**Status**: **PARKED mid-review**, 2026-08-11. All four milestones are implemented and green on PR #219 (draft, HEAD `9ab04b7`, fast tier 1942/1942). Reviewer and auditor have both reported. **One blocker is confirmed live by a real-Codex run and its resolution is decided but not yet executed** — see *Resume here* at the bottom of this document before doing anything else.
+**Status**: **RESUMED and awaiting re-review**, 2026-08-12/13. The park below is retained as the historical record; this line supersedes it. All four milestones are implemented, the parked blocker is resolved, and every item in *Work remaining* has been executed. PR #219 (draft) is at HEAD `c128823c`, `MERGEABLE`, fast tier **3090 run / 3076 passed / 14 failed**.
+
+**Read the 14 before reading anything into them.** `main` itself is red at `66077b2a` and this branch inherits its failing set **byte-identically** — ten `keybindings::tests::*`, `mode_scroll_002`, `remap_003`, `state::tests::a_tagged_frame_…`, `ui::tests::orchestration_011_…`, plus a red `semgrep` (4 findings under `--error`). Tracked as [#255](https://github.com/prageethw/dot-agent-deck/issues/255) and deliberately **not** fixed here. This PR therefore cannot show a green board; the achievable bar is "the same 14 as `main`, and no more", which is what it meets.
+
+**What changed on resume:**
+
+- **The parked blocker is resolved.** `7cd091e` (the LEVEL removal) is reverted. #187 closes **partially** — TEXT is fixed, LEVEL stays — and the LEVEL half is now [#254](https://github.com/prageethw/dot-agent-deck/issues/254), which carries the measurement (the `Thinking` event lands 0–160 ms after the write, i.e. the classifier's boot heuristic rather than a submit) and the contract a replacement must satisfy: **a confirmation must be capable of returning false when the write was genuinely lost.**
+- **Four findings were mooted by that revert** and were deliberately NOT actioned, because doing so would have been wrong work rather than merely wasted: reviewer F1 (blocker) and audit F3 are resolved outright; reviewer F6 and audit F1's `seed/004`/`seed/007` items assumed a LEVEL-less tree — with LEVEL restored, session B's `Thinking` is live bait again, `expected_session_id` is load-bearing again, and `seed/004`'s frames test LEVEL's falling edge again.
+- **Reviewer F3 is closed with falsifiable evidence**, not a green run: `prompt_text_confirms` now has a direct unit test, and the `>` → `>=` mutation was pushed to prove it bites — CI [31613154740](https://github.com/prageethw/dot-agent-deck/actions/runs/31613154740) RED on exactly that test, [31613905410](https://github.com/prageethw/dot-agent-deck/actions/runs/31613905410) GREEN once reverted.
+- **`orchestration/seed/016` passes for the first time.** Its root cause was never the readiness needle: Codex was stuck at its own first-run trust gate, because `import_codex_credentials` seeded `trust_level` against the raw `/var/folders/…` tempdir path while Codex's `getcwd()` reports the resolved `/private/var/folders/…` form. `with_claude_trust_workdir` already guarded this exact bug for Claude and was never applied to Codex. Confirmed by the authorised carve-out (a) run: **`seed/016` PASS (20.71s), `seed/015` PASS (14.69s), `seed/011` PASS (15.07s)**, none skipped.
+- **Rebased onto `origin/main`** after the 2026-08-12 upstream sync left the branch `CONFLICTING` (171 ahead / 329 behind). PRD-197 **builds on** upstream #424's machine rather than colliding with it: `main` carries `orchestration_seed_001`–`010`; this branch adds only `seed_012`/`013`/`014`, `pane_input_023`/`024` and a `confirmation_grace_period()` test helper.
+
+**Two things a re-reviewer should look at specifically**, because they are new since the last review rather than carried over:
+
+1. **F9's fix is a behavioural change, not a comment.** The *sent* prompt is now truncated to 200 bytes before comparison so it matches the hook-side truncation of the *observed* prompt, making the prefix match reachable for prompts over 200 bytes. The cost: two prompts sharing their first 200 bytes would now confirm each other.
+2. **`DOT_AGENT_DECK_LOG` does not reach a harness-spawned deck.** `TuiDeckBuilder` calls `cmd.env_clear()` and forwards only `PATH` plus a pinned list, and no seed test adds it via `.with_env(...)`. Log-based verification of the delivery cycle in real-agent tests is therefore structurally unreachable without a harness change — which is why the carve-out run could not answer whether a confirmation-retry fired.
 
 ## Decisions taken
 
