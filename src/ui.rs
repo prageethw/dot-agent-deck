@@ -36637,4 +36637,125 @@ mod tests {
             texts.get(1)
         );
     }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` across two frames on a
+    /// FRESHLY spawned session — `Idle` at write time, not pre-existing
+    /// `Thinking` — unlike `orchestration/seed/004`, whose frame 1 sets
+    /// `Thinking` BEFORE the write specifically to poison LEVEL for the
+    /// whole cycle. Frame 1 performs the genuine `Applied` write; frame 2,
+    /// 100ms later, flips the session to `Thinking` while leaving
+    /// `last_user_prompt` at `None` — exactly the shape the wrapper's
+    /// generic stdout-classification fallback produces on ANY non-blank
+    /// Codex TUI output line (`DetectedEvent::Working` -> `EventType::
+    /// Thinking`, `src/wrap.rs:80`), attributing nothing to our prompt.
+    /// Pins PRD fork#254's falsifiability contract: a genuinely lost write
+    /// must NOT be confirmed by this. Expected RED while LEVEL is present:
+    /// with `pre_write_thinking` captured `false` (the session was `Idle`,
+    /// not `Thinking`, at write time), LEVEL is unpoisoned and confirms on
+    /// `status == Thinking` alone, with no attribution check at all — the
+    /// exact defect PRD fork#254 N1 measured in production. Must pass
+    /// unchanged once N2 removes LEVEL, since TEXT still correctly
+    /// declines (`last_user_prompt` never matches `sent_prompt`).
+    #[spec("orchestration/seed/017")]
+    #[test]
+    fn orchestration_seed_017_unattributed_thinking_after_fresh_write_must_not_confirm() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 447;
+        let write_time = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, write_time);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            write_time
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let sent_prompt = "orchestrator prompt".to_string();
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-447".into());
+        // `insert_placeholder_session` defaults to `Idle` — the session is
+        // NOT `Thinking` at write time, unlike `orchestration/seed/004`.
+        snapshot.insert_placeholder_session(
+            "orch-pane-447".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-447".into()),
+        );
+
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(sent_prompt.clone());
+
+        // Frame 1: the write lands (`Applied`) against an `Idle` session, so
+        // `pre_write_thinking` is captured `false` for this cycle — LEVEL is
+        // NOT poisoned, unlike `orchestration/seed/004`.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time,
+            tab_id,
+            &["orch-pane-447".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        let awaiting = ui
+            .orchestration_awaiting_confirmation
+            .get(&tab_id)
+            .cloned()
+            .expect("precondition: frame 1's write must land and await confirmation");
+        assert!(
+            !awaiting.pre_write_thinking,
+            "precondition: the session must be unpoisoned (was `Idle`, not \
+             `Thinking`, at write time) for this test to exercise the case \
+             `orchestration/seed/004` does not cover — LEVEL confirming a \
+             session that only becomes `Thinking` AFTER the write, with \
+             nothing attributing it to our prompt"
+        );
+
+        // Frame 2: the wrapper's generic stdout-classification fallback
+        // fires — `DetectedEvent::Working` -> `EventType::Thinking`
+        // (`src/wrap.rs:80`) on ANY non-blank output line, carrying no
+        // `user_prompt` at all. Model that exactly: `status` flips to
+        // `Thinking`, `last_user_prompt` stays `None` — nothing attributes
+        // this sample to our prompt.
+        snapshot
+            .sessions
+            .get_mut("pane-orch-pane-447")
+            .expect("placeholder session")
+            .status = SessionStatus::Thinking;
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time + std::time::Duration::from_millis(100),
+            tab_id,
+            &["orch-pane-447".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        let gate_open_after_unattributed_thinking =
+            prompt.is_some() && !ui.orchestration_prompted.contains(&tab_id);
+        let role_status_after_unattributed_thinking = role_statuses[0];
+
+        assert!(
+            gate_open_after_unattributed_thinking
+                && role_status_after_unattributed_thinking != OrchestrationRoleStatus::Working,
+            "a genuinely lost write must NOT be confirmed by a `Thinking` \
+             sample carrying no attribution (`user_prompt: None`), exactly \
+             the shape the wrapper's stdout-classification fallback \
+             produces on any non-blank line: \
+             gate_open_after_unattributed_thinking={gate_open_after_unattributed_thinking}, \
+             role_status_after_unattributed_thinking={role_status_after_unattributed_thinking:?} \
+             (PRD fork#254 N1: LEVEL confirms on \"the TUI printed a line\", \
+             which is unfalsifiable — a genuinely lost write still redraws \
+             the pane, so it still confirms)",
+        );
+    }
 }
