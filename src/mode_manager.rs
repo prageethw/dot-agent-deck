@@ -12,14 +12,18 @@ use crate::project_config::ModeConfig;
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
 /// <command>` — the invocation typed into a mode pane's shell for a
 /// `watch = true` pane or reactive rule. `exe` and `command` are each quoted
-/// as one shell word via [`quote_shell_arg`] so neither can be split or
-/// reinterpreted by that outer shell: `exe` may contain a space (issue
-/// #157), and `command` is whatever the user configured — it must arrive at
-/// clap's single positional `command: String` (`Commands::Watch` in
-/// `main.rs`) as exactly one shell token, which `{:?}` Debug-escaping does
-/// not guarantee (POSIX shells still expand `$` and backticks inside double
-/// quotes, and Rust's escapes are not a faithful encoding for every
-/// character, e.g. a real newline).
+/// via [`quote_shell_arg`]: `exe` may contain a space (issue #157), and
+/// `command` is whatever the user configured — it must arrive at clap's
+/// single positional `command: String` (`Commands::Watch` in `main.rs`) as
+/// exactly one shell token, which `{:?}` Debug-escaping does not guarantee
+/// (POSIX shells still expand `$` and backticks inside double quotes, and
+/// Rust's escapes are not a faithful encoding for every character, e.g. a
+/// real newline).
+///
+/// **This protection is Unix-only.** On Windows, `quote_shell_arg` is
+/// currently a no-op (issue #157 finding A1 — see its doc comment): `exe`
+/// and `command` reach the outer `cmd.exe` bare, with the same splitting and
+/// reinterpretation risk this function exists to close on Unix.
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
         "{} watch --interval {} {}",
@@ -616,25 +620,19 @@ mod tests {
         );
     }
 
-    /// Round-trips a command packed with shell metacharacters (spaces,
-    /// single/double quotes, `$`, backticks, backslashes, a real newline,
-    /// `;`, `&`, `|`, redirection, glob characters, parentheses) through an
-    /// actual `sh -c` invocation and confirms `sh` recovers the exact
-    /// original bytes as a single word — proving the quoting is not just
-    /// plausible-looking but round-trips through the real interpreter.
+    /// Runs `quote_shell_arg(value)` through a real `sh -c` invocation via a
+    /// sentinel-prefixed `printf` and returns what the shell recovered.
+    ///
+    /// The separator is the literal control character itself, embedded
+    /// directly in the `printf` format word — not a `\xHH`/`\NNN` `printf`
+    /// escape, whose support varies across POSIX `printf` implementations.
+    /// `Command::arg` passes `script` to `sh -c` as raw bytes (no further
+    /// shell parses it), so embedding it here is safe and portable.
     #[cfg(unix)]
-    #[test]
-    fn quote_shell_arg_round_trips_through_posix_shell() {
+    fn round_trip_through_posix_shell(value: &str) -> String {
         let sentinel = "prd157-round-trip";
-        let tricky =
-            "spaced 'single' \"double\" $VAR `backtick` \\backslash\nnewline; & | (sub) *.rs";
-        // The separator is the literal control character itself, embedded
-        // directly in the printf format word — not a `\xHH`/`\NNN` printf
-        // escape, whose support varies across POSIX `printf` implementations.
-        // `Command::arg` passes `script` to `sh -c` as raw bytes (no further
-        // shell parses it), so embedding it here is safe and portable.
         let sep = '\u{1f}';
-        let script = format!("printf '%s{sep}%s' {sentinel} {}", quote_shell_arg(tricky));
+        let script = format!("printf '%s{sep}%s' {sentinel} {}", quote_shell_arg(value));
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(&script)
@@ -644,43 +642,83 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).expect("utf8 output");
         let (marker, recovered) = stdout.split_once('\u{1f}').expect("sentinel separator");
         assert_eq!(marker, sentinel);
-        assert_eq!(recovered, tricky);
+        recovered.to_string()
     }
 
+    /// Round-trips a command packed with shell metacharacters (spaces,
+    /// single/double quotes, `$`, backticks, backslashes, a real newline,
+    /// `;`, `&`, `|`, redirection, glob characters, parentheses) through an
+    /// actual `sh -c` invocation and confirms `sh` recovers the exact
+    /// original bytes as a single word — proving the quoting is not just
+    /// plausible-looking but round-trips through the real interpreter.
+    #[cfg(unix)]
+    #[test]
+    fn quote_shell_arg_round_trips_through_posix_shell() {
+        let tricky =
+            "spaced 'single' \"double\" $VAR `backtick` \\backslash\nnewline; & | (sub) *.rs";
+        assert_eq!(round_trip_through_posix_shell(tricky), tricky);
+    }
+
+    /// An empty command is a legal (if odd) input — the empty-string case
+    /// of the general single-quoting contract, cheap to pin and the input
+    /// most likely to be skipped by hand-testing.
+    #[cfg(unix)]
+    #[test]
+    fn quote_shell_arg_round_trips_an_empty_string() {
+        assert_eq!(round_trip_through_posix_shell(""), "");
+    }
+
+    /// A value that is *only* the one character single-quoting cannot
+    /// contain — the escape/reopen path (`'\''`) exercised with nothing
+    /// else around it to fall back on.
+    #[cfg(unix)]
+    #[test]
+    fn quote_shell_arg_round_trips_a_lone_single_quote() {
+        assert_eq!(round_trip_through_posix_shell("'"), "'");
+    }
+
+    /// A single quote sitting directly against a real newline on both
+    /// sides — the two characters most likely to interact badly in a
+    /// future change to the escape (the close/escape/reopen sequence
+    /// inserts literal `'` and `\` bytes right next to whatever the
+    /// original text already had there).
+    #[cfg(unix)]
+    #[test]
+    fn quote_shell_arg_round_trips_a_quote_adjacent_to_a_real_newline() {
+        let tricky = "before'\n'after";
+        assert_eq!(round_trip_through_posix_shell(tricky), tricky);
+    }
+
+    /// Windows argument quoting is explicitly unsupported (issue #157
+    /// finding A1 — see the doc comment on `quote_shell_arg`'s Windows arm):
+    /// `quote_shell_arg` is a deliberate no-op there, so the outer shell
+    /// command line carries the executable and command bare, with no
+    /// implied protection.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_quotes_spaced_executable_windows() {
+    fn watch_invocation_does_not_quote_on_windows() {
         let exe = Path::new(r"C:\Program Files\My Deck\dot-agent-deck.exe");
         let line = watch_invocation(exe, 10, "npm run dev");
         assert_eq!(
             line,
-            "\"C:\\Program Files\\My Deck\\dot-agent-deck.exe\" watch --interval 10 \"npm run dev\""
+            r"C:\Program Files\My Deck\dot-agent-deck.exe watch --interval 10 npm run dev"
         );
     }
 
+    /// The finding A1 exploit itself, pinned as a no-quoting-claimed
+    /// passthrough: `quote_shell_arg` must not attempt — and must not
+    /// appear to attempt — any protection here. A future change that adds
+    /// quoting must update this test alongside a `cmd.exe`-verified
+    /// round-trip test proving the new scheme actually holds.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_escapes_embedded_double_quote_windows() {
+    fn watch_invocation_passes_the_a1_exploit_through_unquoted() {
         let exe = Path::new(r"C:\deck\dot-agent-deck.exe");
-        let line = watch_invocation(exe, 10, r#"echo "quoted""#);
+        let command = r#"echo ok" & calc.exe & rem ""#;
+        let line = watch_invocation(exe, 5, command);
         assert_eq!(
             line,
-            "\"C:\\deck\\dot-agent-deck.exe\" watch --interval 10 \"echo \\\"quoted\\\"\""
-        );
-    }
-
-    /// `%VAR%`/`!VAR!` expansion is a known, documented gap (issue #238) —
-    /// this test pins that the quoter does NOT attempt to neutralise them,
-    /// so a regression that silently "fixes" this without updating the
-    /// documented scope is caught rather than passing by accident.
-    #[cfg(windows)]
-    #[test]
-    fn watch_invocation_does_not_neutralize_percent_and_bang_windows() {
-        let exe = Path::new(r"C:\deck\dot-agent-deck.exe");
-        let line = watch_invocation(exe, 10, "echo %PATH% !VAR!");
-        assert_eq!(
-            line,
-            "\"C:\\deck\\dot-agent-deck.exe\" watch --interval 10 \"echo %PATH% !VAR!\""
+            format!(r"C:\deck\dot-agent-deck.exe watch --interval 5 {command}")
         );
     }
 }

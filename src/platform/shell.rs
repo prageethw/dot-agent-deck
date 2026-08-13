@@ -90,19 +90,41 @@ pub fn shell_command_flag() -> &'static str {
 /// special between single quotes, so this preserves whitespace, double
 /// quotes, `$`, backticks, backslashes, real newlines, `;`, `&`, `|`,
 /// redirection, glob characters and parentheses.
-///
-/// Windows: double-quotes `arg`, escaping an embedded `"` as `\"`. This keeps
-/// whitespace and most metacharacters inside one literal argument, but it
-/// does **not** neutralise `cmd.exe`'s own expansions — `%VAR%` is expanded
-/// (and, under delayed expansion, so is `!VAR!`) even inside double quotes.
-/// That is the same open class as issue #238 and is not resolved by this
-/// helper; do not read a call to this function as closing it.
 #[cfg(unix)]
 pub fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
+/// Windows: **returns `arg` unmodified — no `cmd.exe` quoting is applied.**
+///
+/// A prior version double-quoted `arg` and backslash-escaped an embedded `"`
+/// as `\"`. That is a CRT/`argv` escaping convention, not a `cmd.exe` one:
+/// `cmd.exe` keeps the literal backslash and treats the following `"` as
+/// **closing** the quoted word, so an embedded quote ends the protection and
+/// everything after it is parsed by the already-running outer shell as a
+/// fresh command line (issue #157 finding A1, audit-verified). Concretely, a
+/// configured command of
+///
+/// ```text
+/// echo ok" & calc.exe & rem "
+/// ```
+///
+/// produced `"...\watch.exe" watch --interval N "echo ok\" & calc.exe & rem \""`,
+/// and `cmd.exe` ran `calc.exe` from the now-unquoted `& calc.exe &` before
+/// `watch` was ever invoked.
+///
+/// A correct `cmd.exe`-safe quoting scheme exists (caret-escaping
+/// metacharacters, doubling embedded quotes so `cmd.exe` never toggles
+/// out of quoted parsing) but is real, easy-to-get-subtly-wrong work that
+/// this repo cannot verify from a non-Windows host — and a quoting scheme
+/// that *looks* like protection without being proven against a real
+/// `cmd.exe` is worse than none, because it reads as fixed when it is not.
+/// So, until a `cmd.exe`-verified implementation lands (tracked as a
+/// follow-up issue), Windows argument quoting is **explicitly unsupported**:
+/// this is a deliberate no-op, not an oversight. That is no worse than the
+/// pre-#157 behaviour, which already interpolated the command bare — do not
+/// read a call to this function as having closed issue #157 on Windows.
 #[cfg(windows)]
 pub fn quote_shell_arg(arg: &str) -> String {
-    format!("\"{}\"", arg.replace('"', "\\\""))
+    arg.to_string()
 }
