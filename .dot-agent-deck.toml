@@ -58,6 +58,17 @@
 # `0` disables the detector; accepted range is 1..=10080 minutes.
 worker_response_timeout_minutes = 120
 
+# Master gate for in-flight experimental surfaces (PRD #139). Off by default.
+# Turned on here for the command-entry lock: with the flag OFF, `Ctrl+E` is not
+# claimed anywhere, keystrokes reach a focused worker pane untouched, and no
+# automatic focus movement happens. Enabling it also turns on every OTHER
+# experimental surface, since this is one master switch rather than a per-feature
+# one. `DOT_AGENT_DECK_EXPERIMENTAL` overrides this value when set.
+# Must stay above the first `[[table]]` header below, for the same reason the
+# comment above says a bare key must.
+[features]
+experimental = true
+
 [[modes]]
 name = "dev"
 init_command = "devbox shell"
@@ -177,14 +188,14 @@ prompt_template = "Implement the requested change. If the task references a PRD 
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run codex-devbox"
+command = "devbox run claude-opus-devbox"
 # command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. Write your findings to the exact absolute path under the root checkout's `.dot-agent-deck/` directory that the task names — never resolve a relative findings path from your worktree or guess the root checkout. If the task does not name that absolute root-checkout path, report that missing context through `work-done` and stop. Keep the `work-done` signal to a short verdict plus a pointer to that path. If that path turns out to be unwritable, say so as the first line of `work-done` and inline the findings there instead, kept short, rather than losing them. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you. Begin every `work-done` report with a short **Summary** section — two or three sentences naming the PRD number and/or issue number the work belongs to, what changed, and the outcome (done / blocked / needs a decision); the detail follows underneath. Someone reading only the summary should be able to tell which PRD it is and whether it needs their attention."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run codex-devbox"
+command = "devbox run claude-opus-devbox"
 # command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. Write your findings to the exact absolute path under the root checkout's `.dot-agent-deck/` directory that the task names — never resolve a relative findings path from your worktree or guess the root checkout. If the task does not name that absolute root-checkout path, report that missing context through `work-done` and stop. Keep the `work-done` signal to a short verdict plus a pointer to that path. If that path turns out to be unwritable, say so as the first line of `work-done` and inline the findings there instead, kept short, rather than losing them. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you. Begin every `work-done` report with a short **Summary** section — two or three sentences naming the PRD number and/or issue number the work belongs to, what changed, and the outcome (done / blocked / needs a decision); the detail follows underneath. Someone reading only the summary should be able to tell which PRD it is and whether it needs their attention."
