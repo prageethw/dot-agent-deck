@@ -51,9 +51,20 @@ failure (after reaping the agent), not a silent clean exit.
 fork#257 review round (P2b/audit, teardown): `pty.fork()` makes the agent a
 session/process-group leader via its implicit `setsid()`, so cleanup now
 signals the whole process GROUP (`os.killpg`), escalates to SIGKILL if the
-child has not exited within a bounded timeout, and blocks on `waitpid`
-before the relay itself exits -- no orphaned descendant of the real agent
-can survive relay teardown.
+child has not exited within a bounded timeout, and waits (also bounded) for
+it to be reaped before the relay itself exits. Both bounds matter, found by
+testing rather than assumed: the signal handler ignores further
+SIGTERM/SIGHUP the instant one fires, else a second signal landing while
+cleanup is already in flight re-enters the handler and restarts it,
+compounding the wait with every extra signal instead of exiting; and the
+final wait for the KILLed child itself has a timeout rather than blocking
+forever, because a real `claude` process was observed sitting in the
+kernel's own "trying to exit" teardown for well over a minute after
+SIGKILL -- unrelated to this script, and not something userspace can hurry
+along. Once both signals are sent and the bounded wait elapses, the relay
+gives up waiting on that specific child and exits anyway: the kill cannot
+be un-sent, so whenever the kernel actually finishes, init/launchd
+reparents and reaps it without this relay needing to be the one watching.
 
 fork#257 review round (audit, credential-execution surface): the real
 agent's argv[0] is resolved to an absolute, executable path BEFORE
@@ -122,33 +133,48 @@ def write_all(fd, data):
         view = view[n:]
 
 
-def reap_process_tree(pid, timeout=5.0):
-    """Terminate `pid`'s entire process group -- `pty.fork()`'s child is
-    always a session/process-group leader via its implicit `setsid()` -- and
-    block until it is actually reaped, escalating to SIGKILL if it has not
-    exited within `timeout`. Never leaves an orphaned descendant of the real
-    agent running past the relay's own lifetime."""
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
+def _wait_for_exit(pid, timeout):
+    """Poll for `pid` having been reaped, up to `timeout` seconds. Returns
+    True once it has (or was already gone), False if the deadline passed
+    first."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             reaped, _status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
-            return
+            return True
         if reaped == pid:
-            return
+            return True
         time.sleep(0.05)
+    return False
+
+
+def reap_process_tree(pid, term_timeout=5.0, kill_timeout=5.0):
+    """Terminate `pid`'s entire process group -- `pty.fork()`'s child is
+    always a session/process-group leader via its implicit `setsid()` --
+    escalating from SIGTERM to SIGKILL if it has not exited within
+    `term_timeout`. Bounded overall: observed in practice that even a
+    SIGKILLed real `claude` process can sit in the kernel's own "trying to
+    exit" teardown for well over a minute (a hardened-runtime/sandbox
+    characteristic of the binary, not something userspace can hurry along)
+    -- an unconditional final `waitpid` would then hang the RELAY itself
+    indefinitely, which is worse than the orphan this function exists to
+    prevent. Once both signals have been sent and `kill_timeout` has still
+    not seen it reaped, this gives up waiting on it directly: the kill
+    cannot be un-sent, so whenever the kernel actually finishes tearing the
+    process down, init/launchd reparents and reaps it -- the relay does not
+    need to be the one to observe that."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if _wait_for_exit(pid, term_timeout):
+        return
     try:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
+    _wait_for_exit(pid, kill_timeout)
 
 
 def resolve_marker_path():
@@ -273,7 +299,18 @@ def main() -> int:
             pass
         os._exit(code)
 
-    def handle_signal(*_args):
+    def handle_signal(signum, _frame):
+        # Stop handling BOTH signals the instant one arrives, before doing
+        # anything else. `reap_process_tree` below can block for several
+        # seconds (its own bounded escalation), and a second SIGTERM or
+        # SIGHUP landing while that is still in flight would otherwise
+        # re-enter this handler and restart `cleanup_and_exit` on top of
+        # the still-running outer call -- unbounded recursion, discovered
+        # by hand: a manual SIGTERM sent to an already-signalled relay
+        # left it alive and growing its Python call stack indefinitely
+        # instead of exiting.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         cleanup_and_exit(0)
 
     # Never leak the real agent process past this relay's own lifetime: a

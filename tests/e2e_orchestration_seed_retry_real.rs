@@ -88,10 +88,25 @@
 //! marker), and the relay validates `CR_SUPPRESS_MARKER` and creates the
 //! marker with `O_CREAT|O_EXCL` before ever trusting it (P2c/audit —
 //! closes the symlink-race window a predictable path left open). The
-//! relay's teardown now signals the agent's whole process group and
-//! `waitpid`s for it instead of signalling only the direct child and
-//! `_exit`ing immediately (P2b/audit — no orphaned descendant of the real
-//! agent can survive relay teardown), both forwarding directions use a
+//! relay's teardown now signals the agent's whole process group and waits
+//! (bounded) for it to be reaped instead of signalling only the direct
+//! child and `_exit`ing immediately (P2b/audit — no orphaned descendant of
+//! the real agent can survive relay teardown as a live, still-running
+//! process). Two bounds were added by hand while verifying this fix
+//! locally, not assumed up front: the signal handler stops handling
+//! SIGTERM/SIGHUP the instant one fires, before doing anything else,
+//! because a second signal landing while `reap_process_tree` was still in
+//! its own wait otherwise re-entered the handler and restarted cleanup on
+//! top of the still-running outer call; and the final wait for the KILLed
+//! child is itself bounded rather than an unconditional blocking
+//! `waitpid`, because a real `claude` process was observed sitting in
+//! macOS's own "trying to exit" kernel teardown for well over a minute
+//! after SIGKILL — an unbounded wait would have hung the relay itself
+//! indefinitely, trading the orphan this fix exists to prevent for a hung
+//! test. Once both signals are sent and the bound elapses, the relay gives
+//! up waiting on that specific child and exits anyway — the kill cannot be
+//! un-sent, so init/launchd reparents and reaps it once the kernel
+//! actually finishes. Both forwarding directions also use a
 //! write-all loop with EINTR/EAGAIN handling instead of a single
 //! best-effort `os.write` (P1b/audit — POSIX permits short writes to a
 //! PTY, so the old code could silently drop bytes other than the intended
