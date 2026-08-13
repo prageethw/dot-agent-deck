@@ -12,6 +12,45 @@
 
 **Fork-only?** **No.** `src/wrap.rs`, the classifier and the confirmation cycle are all upstream code. Offer upstream per rule 19 — see M4.
 
+## RESCOPED (2026-08-13) — read this before anything below it
+
+**Two observation rounds refuted this PRD's founding premise. Everything below is retained as the record; this section supersedes it.**
+
+The premise was: *"TEXT is **structurally unavailable** for wrapper-strategy agents"*, because `emit_with_metadata` hardcodes `user_prompt: None` (`src/wrap.rs:304`). That is true of the **wrapper's** event path and irrelevant, because Codex's **native `UserPromptSubmit` hook** already supplies the text by a different road. Established empirically in M2.0b, five questions, all yes:
+
+| Question | Answer |
+|---|---|
+| Are Codex's native hooks installed before the child spawns? | **Yes, by construction.** `codex_spawn_prep` (`src/wrap.rs:679-710`) calls `auto_install()` + `trust_deck_hooks_in()` synchronously at `:1096-1097`, strictly before the spawn at `:1113`/`:1115`. No boot race. |
+| Does the event reach the daemon? | **Yes.** `hook::handle_hook("codex")` reuses the Claude-compatible parser; `map_event_type("UserPromptSubmit")` → `EventType::Thinking`, posted through the same `send_to_socket` as every other producer. |
+| Does it carry the seed text? | **Yes, verbatim.** Raw capture shows `"prompt":"… sentinel: SENTINEL-254-M2-0B-PROBE-…"` — byte for byte what was submitted. |
+| Does it carry usable identity? | **Yes, via an existing reconciliation.** Codex's own `session_id` is a fresh internal UUID and is *not* the deck's, but `AppState::apply_event`'s same-agent reuse guard (`state.rs:3707-3757`) remaps a `pane_id`+`agent_id`-matching event onto the wrapper's fork-time `SessionStart` session — the exact session `AwaitingConfirmation::expected_session_id` tracks. `DOT_AGENT_DECK_PANE_ID`/`_AGENT_ID` were confirmed to reach the hook subprocess unchanged. |
+| Is `prompt_text_confirms` therefore already reachable for Codex? | **Yes.** It and its caller read `session.last_user_prompt`, populated by `apply_event` whenever `event.user_prompt.is_some()`, with **no branch on `agent_type` anywhere in that path.** |
+
+**So LEVEL's dependence for Codex is a missed wiring, not a structural gap.** This PRD is no longer "invent a confirmation signal". It is "find out why the existing one is not being used, and make its falsifiability provable".
+
+### The one question that now decides everything
+
+**If TEXT was available all along, why did removing LEVEL break Codex?**
+
+That removal (`7cd091e`, fork#197 M3) was reverted on a hard measurement: with LEVEL gone, *every* Codex delivery waited out the full 60 s deadline and fired a stray CR. That measurement is not in doubt. What is now in doubt is its **diagnosis** — "there is no confirmation path at all" — because M2.0b shows there is one.
+
+Something prevented TEXT from confirming. Candidates, none yet eliminated:
+
+1. **The comparison fails.** `prompt_text_confirms` compares a 200-byte prefix; PR #219's F9 changed the *sent* side's truncation to match the observed side. If that fix postdates the LEVEL-removal measurement, TEXT may simply have been mismatching then and would work now.
+2. **Hook install or trust was not yet in place** at the time of that measurement, and has since been fixed — M2.0b confirms it is in place *today*.
+3. **The event arrives but is not attributed** to the awaiting cycle — the reuse-guard remap exists, but whether it fired in that build is unverified.
+4. **`map_event_type` maps `UserPromptSubmit` → `Thinking`**, which is *also* LEVEL's signal. So with LEVEL present the two are indistinguishable, and removing LEVEL may have removed the only consumer that was actually firing — meaning TEXT never confirmed even once, and its reachability is theoretical.
+
+**Candidate 4 is the most dangerous and the most likely**, because it would mean today's Codex confirmations are still LEVEL's, that TEXT has never actually fired, and that this PRD's problem is entirely intact under a new description. It must be eliminated first.
+
+### What M2.0b deliberately did NOT establish
+
+The tester was explicit, and this matters more than the positive result:
+
+> `orchestration/seed/016` proves the qualifying event reaches the daemon broadcast; it does not by itself prove `prompt_text_confirms` (rather than LEVEL, which still reliably-but-falsely confirms for Codex) was what finalized that particular delivery cycle.
+
+**The two are indistinguishable from a passing test.** That is the same trap the whole PRD is about — a signal that cannot fail looks exactly like one that works. Do not treat `seed/016` passing as proof the native-hook path confirms anything.
+
 ## Problem Statement
 
 Seed-prompt delivery confirms a prompt actually reached the agent through two signals:
@@ -108,7 +147,40 @@ This is **direction 2** from the issue (*"a submit-shaped event distinct from `T
 - **The mode-seed path** (fork #256) and **the retry-floor override** (fork #257).
 - **Other wrapper agents** beyond establishing that the seam is per-`RuleSet` and Codex is the first consumer. Pi, opencode and any future wrapper agent inherit the seam, not a hardcoded Codex pattern.
 
-## Milestones
+## Milestones (RESCOPED 2026-08-13) — these supersede M1–M4 below
+
+### N1 — eliminate candidate 4, or confirm it
+
+- [ ] Establish whether `prompt_text_confirms` has **ever** fired for Codex, or whether every Codex confirmation to date has been LEVEL's. `map_event_type("UserPromptSubmit")` → `EventType::Thinking` means both consumers see the same event, so distinguish them **at the consumer**, not by observing the event.
+- [ ] The decisive experiment is cheap: **re-apply `7cd091e`'s LEVEL removal on a scratch branch and run `orchestration/seed/016`.** If it confirms via TEXT, LEVEL can go and the original removal was right on a wrong diagnosis. If it still waits out 60 s, TEXT is not firing and N2 is where the real work is.
+- [ ] Whichever way it lands, record **which of the four candidates** it was. "It works now" without a named cause is how this PRD got its wrong premise in the first place.
+
+### N2 — make TEXT actually fire for Codex, if N1 says it does not
+
+- [ ] Fix whatever N1 identifies — a truncation mismatch, an attribution miss, a consumer that LEVEL was shadowing.
+- [ ] Scope note: this is expected to be **small** — a wiring fix, not a mechanism. If it starts looking like a mechanism, stop and re-report; that would mean N1's diagnosis was wrong too.
+
+### N3 — the falsifiability proof, which is still the deliverable
+
+- [ ] A test exhibiting a **genuinely lost write** that the signal **declines** to confirm. This was the deliverable before the rescope and it is unchanged by it — everything above only changes *which* signal is being proved.
+- [ ] It must discriminate TEXT from LEVEL explicitly. A test that passes with either is worthless here, for exactly the reason M2.0b flagged.
+
+### N4 — remove LEVEL
+
+- [ ] Once N3 proves TEXT falsifiable for Codex, delete LEVEL, finishing what `7cd091e` started. fork #187 closes **fully**.
+- [ ] Re-answer the four findings PR #219 recorded as "mooted by the revert" (reviewer F6, audit F1's `seed/004`/`/007` items, `expected_session_id`'s load-bearingness) — with LEVEL gone again they stop being mooted.
+
+### N5 — decide the wrapper seam's fate
+
+- [ ] The original M1 (`emit_with_metadata`'s `user_prompt` seam) is **no longer required for Codex**. Decide whether to keep it for a future wrapper-strategy agent with no native hooks (Gemini, Aider), or drop it as speculative generality. A rule-19 judgement, and explicitly **not** a reason to keep this PRD open.
+
+### N6 — offer upstream
+
+- [ ] `src/wrap.rs`, `hook.rs` and the confirmation cycle are all upstream code. Branch from `upstream/main` and offer it there. Note that upstream **#540** (the dead `CODEX` ruleset) came out of this work and is related but separate.
+
+---
+
+## Milestones (ORIGINAL — superseded by N1–N6 above, retained as the record)
 
 ### M1 — the seam
 
