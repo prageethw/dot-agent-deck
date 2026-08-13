@@ -68,10 +68,13 @@ jobs:
           fetch-depth: 0
 
       - name: Measure main vs fork-only drift
+        env:
+          THRESHOLD_OVERRIDE: ${{ inputs.threshold_override }}
+          FORK_BRANCH_OVERRIDE: ${{ inputs.fork_branch_override }}
         run: |
           set -uo pipefail
 
-          THRESHOLD="${{ inputs.threshold_override }}"
+          THRESHOLD="${THRESHOLD_OVERRIDE:-}"
           if [ -z "$THRESHOLD" ]; then
             # Default 10. Chosen because it would have caught every drift
             # incident on record early instead of late:
@@ -85,7 +88,7 @@ jobs:
             THRESHOLD=10
           fi
 
-          FORK_BRANCH="${{ inputs.fork_branch_override }}"
+          FORK_BRANCH="${FORK_BRANCH_OVERRIDE:-}"
           if [ -z "$FORK_BRANCH" ]; then
             FORK_BRANCH="fork-only"
           fi
