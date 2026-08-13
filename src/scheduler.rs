@@ -113,6 +113,26 @@ pub enum NotifyEvent {
         issue: u64,
         message: String,
     },
+    /// Issue #164: an `issue_dispatch` task created a per-issue worktree
+    /// (`git worktree add` succeeded — `IssueDispatched` still fires
+    /// alongside this) but the best-effort `dot-agent-deck-owner` ownership
+    /// marker could not be written. Not a failure: the worktree is fully
+    /// usable and dispatch proceeds exactly as before. The only
+    /// consequence, and the reason this is surfaced at all rather than left
+    /// to `tracing::warn!` alone, is that a later `worktree reclaim` will
+    /// land this one on `Ask` instead of `Remove` until `--yes` is passed —
+    /// see `src/worktree_reclaim.rs`'s module doc. `worktree` and `error`
+    /// are raw and unsanitized (mirroring every other `message`-carrying
+    /// variant here): sanitizing for terminal display is
+    /// `format_marker_warning`'s job, applied by the render sink below, not
+    /// this event's.
+    IssueWorktreeMarkerWarning {
+        task: String,
+        repo: String,
+        issue: u64,
+        worktree: String,
+        error: String,
+    },
 }
 
 /// PRD #421 M1.3: why an issue was skipped — the four causes `dispatch_decision`
@@ -264,6 +284,18 @@ impl Notifier for StderrNotifier {
             } => {
                 eprintln!(
                     "[scheduler] task {task:?}: issue #{issue} of {repo} was dispatched, but the claim could not be written: {message}"
+                );
+            }
+            NotifyEvent::IssueWorktreeMarkerWarning {
+                task,
+                repo,
+                issue,
+                worktree,
+                error,
+            } => {
+                eprintln!(
+                    "[scheduler] task {task:?}: issue #{issue} of {repo}: {}",
+                    crate::worktree_reclaim::format_marker_warning(&worktree, &error)
                 );
             }
         }

@@ -1539,7 +1539,9 @@ fn worktree_reclaim_025_worktree_created_by_the_deck_reads_as_owned() {
         .expect("the deck's creation path must create the worktree");
     assert_eq!(
         outcome,
-        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created,
+        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created {
+            marker_warning: None
+        },
         "fixture precondition: the worktree must have been genuinely CREATED here — an \
          already-claimed directory is somebody else's and is never marked"
     );
@@ -1643,7 +1645,9 @@ fn worktree_reclaim_027_a_zero_byte_marker_is_not_proof_of_ownership() {
         .expect("the deck's creation path must create the worktree");
     assert_eq!(
         outcome,
-        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created,
+        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created {
+            marker_warning: None
+        },
         "fixture precondition: the worktree must have been genuinely CREATED here — the \
          already-claimed arm is never marked, so nothing would be left to truncate"
     );

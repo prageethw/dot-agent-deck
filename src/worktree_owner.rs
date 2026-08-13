@@ -346,50 +346,70 @@ pub fn write_marker(
 }
 
 /// [`write_marker`], made best-effort and non-blocking for the async creation
-/// path: a failure warns and is dropped, because the cost of a missing marker
-/// is one confirmation prompt at reclaim time and the cost of propagating it
-/// would be a failed dispatch.
+/// path: a failure warns and is returned to the caller rather than failing
+/// the creation, because the cost of a missing marker is one confirmation
+/// prompt at reclaim time and the cost of propagating it as an error would be
+/// a failed dispatch. Issue #164: the warning used to be logged and dropped;
+/// returning it lets the caller surface it (e.g. `WorktreeCreation::Created`'s
+/// `marker_warning` field) instead of the failure being silent everywhere but
+/// the log.
 ///
 /// Runs on the blocking pool — it spawns `git rev-parse` and touches the
 /// filesystem — so it cannot stall the daemon's runtime.
-pub async fn write_marker_best_effort(worktree_path: &Path, branch: &str, creator: Creator) {
+pub async fn write_marker_best_effort(
+    worktree_path: &Path,
+    branch: &str,
+    creator: Creator,
+) -> Option<String> {
     let worktree = worktree_path.to_path_buf();
     let branch = branch.to_string();
     let result =
         tokio::task::spawn_blocking(move || write_marker(&worktree, &branch, &creator)).await;
     match result {
-        Ok(Ok(path)) => tracing::debug!(
-            worktree = %worktree_path.display(),
-            marker = %path.display(),
-            "wrote the worktree ownership marker"
-        ),
-        Ok(Err(MarkerWriteError::Clear(e))) => tracing::warn!(
-            worktree = %worktree_path.display(),
-            error = %e,
-            "could not write the worktree ownership marker, and nothing is left at the \
-             marker path; the worktree will read as foreign at reclaim time and need an \
-             explicit confirmation (this does not affect the worktree itself)"
-        ),
-        Ok(Err(MarkerWriteError::ClaimRemains(e))) => tracing::warn!(
-            worktree = %worktree_path.display(),
-            error = %e,
-            "could not write the worktree ownership marker, and the marker path still holds \
-             a file the ownership gate reads as this deck's claim; the worktree may be \
-             reclaimed WITHOUT the usual confirmation, so check that path before running \
-             `worktree reclaim` (this does not affect the worktree itself)"
-        ),
+        Ok(Ok(path)) => {
+            tracing::debug!(
+                worktree = %worktree_path.display(),
+                marker = %path.display(),
+                "wrote the worktree ownership marker"
+            );
+            None
+        }
+        Ok(Err(MarkerWriteError::Clear(e))) => {
+            tracing::warn!(
+                worktree = %worktree_path.display(),
+                error = %e,
+                "could not write the worktree ownership marker, and nothing is left at the \
+                 marker path; the worktree will read as foreign at reclaim time and need an \
+                 explicit confirmation (this does not affect the worktree itself)"
+            );
+            Some(e)
+        }
+        Ok(Err(MarkerWriteError::ClaimRemains(e))) => {
+            tracing::warn!(
+                worktree = %worktree_path.display(),
+                error = %e,
+                "could not write the worktree ownership marker, and the marker path still holds \
+                 a file the ownership gate reads as this deck's claim; the worktree may be \
+                 reclaimed WITHOUT the usual confirmation, so check that path before running \
+                 `worktree reclaim` (this does not affect the worktree itself)"
+            );
+            Some(e)
+        }
         // Its own arm rather than a `MarkerWriteError`, because a `JoinError`
         // is a panic inside the closure or a cancellation — so unlike the two
         // above, which are classified by probing the marker path, this one
         // cannot say whether anything was written. It must not borrow either
         // arm's promise.
-        Err(e) => tracing::warn!(
-            worktree = %worktree_path.display(),
-            error = %e,
-            "the worktree ownership marker task did not complete, so whether the marker was \
-             written is unknown; check the worktree's git metadata dir before running \
-             `worktree reclaim` (this does not affect the worktree itself)"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                worktree = %worktree_path.display(),
+                error = %e,
+                "the worktree ownership marker task did not complete, so whether the marker was \
+                 written is unknown; check the worktree's git metadata dir before running \
+                 `worktree reclaim` (this does not affect the worktree itself)"
+            );
+            Some(e.to_string())
+        }
     }
 }
 
