@@ -66,6 +66,42 @@
 //! from the test-harness-side relay, not from a production timing knob.
 //! Confirmed on two consecutive real Claude runs (~22s each).
 //!
+//! Fork#257 review round: the marker used to be created inside the same
+//! branch that removes the byte, so a relay mutation that stopped removing
+//! it while leaving the marker-creation call intact would still pass —
+//! proving only "this code path ran", not "a byte actually went missing"
+//! (reviewer P1). The relay (`CR_SUPPRESSING_WRAPPER_PY`) now tracks two
+//! cumulative byte counters — total bytes read from the daemon and total
+//! bytes actually forwarded to the agent, on the daemon->agent direction
+//! only, via a write-all loop that reports genuine completion — and writes
+//! those counts, not a flag, into the marker at drop time. The assertion
+//! below reads those counts and requires the difference to be exactly 1,
+//! so a mutation that retains the byte is caught by the counts even if it
+//! leaves every other line of the drop branch untouched. Mutation-checked
+//! locally (rule 5 exception (a) — this test self-skips in CI for lack of
+//! credentials, so CI cannot witness the check): reverting the byte-removal
+//! slice while leaving `dropped_cr`/the marker write intact reproducibly
+//! fails this assertion with a reported difference of 0. The marker
+//! directory is now a fresh, private, per-run `common::harness_tempdir()`
+//! rather than a fixed global path keyed only by the sentinel (P2a — two
+//! concurrent runs could previously observe or delete each other's
+//! marker), and the relay validates `CR_SUPPRESS_MARKER` and creates the
+//! marker with `O_CREAT|O_EXCL` before ever trusting it (P2c/audit —
+//! closes the symlink-race window a predictable path left open). The
+//! relay's teardown now signals the agent's whole process group and
+//! `waitpid`s for it instead of signalling only the direct child and
+//! `_exit`ing immediately (P2b/audit — no orphaned descendant of the real
+//! agent can survive relay teardown), both forwarding directions use a
+//! write-all loop with EINTR/EAGAIN handling instead of a single
+//! best-effort `os.write` (P1b/audit — POSIX permits short writes to a
+//! PTY, so the old code could silently drop bytes other than the intended
+//! CR while still reporting success), and the real agent's argv[0] is
+//! resolved to an absolute, executable path before `pty.fork()` so a
+//! reordered or poisoned `PATH` cannot substitute a different binary at
+//! the point the relay holds real agent credentials (audit). See
+//! `tests/fixtures/cr_suppressing_wrapper.py`'s own doc comment for the
+//! full mechanism.
+//!
 //! `seed/016` (Codex) is UNCHANGED and still only proves the older, weaker
 //! claim — no duplication was observed in WHICHEVER branch actually ran,
 //! not that the standalone-CR dedup path was positively exercised. The
@@ -203,14 +239,22 @@ const CR_SUPPRESS_MARKER_ENV: &str = "CR_SUPPRESS_MARKER";
 /// The marker path must be decided BEFORE the deck launches (it rides in as
 /// an env var on `TuiDeckBuilder`, which only forwards vars set before
 /// `launch_with_fixture`), so it cannot live under `deck.workdir()` — that
-/// path is only known afterward. `std::env::temp_dir()` keyed by the
-/// per-case sentinel (already unique per test function) is used instead.
-/// Removes any stale file from a prior crashed run before returning, so a
-/// leftover marker can never be mistaken for evidence from THIS run.
-fn cr_suppress_marker_path(sentinel: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("dot-agent-deck-cr-suppress-{sentinel}"));
-    let _ = std::fs::remove_file(&path);
-    path
+/// path is only known afterward. Fork#257 review round (P2a/P2c): a fixed
+/// global path keyed only by the per-case sentinel let two concurrent runs
+/// observe or delete each other's marker, and its predictability opened a
+/// same-user symlink-race window. `common::harness_tempdir()` gives each
+/// call a fresh, private (0700) directory nothing else could have written
+/// into before this call created it, so no stale-file removal is needed —
+/// there is nothing to remove from a directory that did not exist a moment
+/// ago — and the relay itself creates the marker file with `O_CREAT|O_EXCL`
+/// (see `cr_suppressing_wrapper.py`), so a pre-existing object at the path
+/// would make the relay fail loudly rather than accept it as evidence. The
+/// returned `TempDir` guard must stay alive for the whole test — dropping
+/// it early removes the directory the relay is about to write into.
+fn cr_suppress_marker_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = common::harness_tempdir().expect("create marker dir");
+    let marker = dir.path().join("cr-suppress-marker");
+    (dir, marker)
 }
 
 struct RealRetryCase<'a> {
@@ -338,13 +382,48 @@ fn run_real_seed_retry(deck: TuiDeck, case: RealRetryCase<'_>) {
     // coverage. Skipped entirely for a case with no marker (`None`), which
     // never claims the suppressed-CR proof in the first place.
     if let Some(marker) = &case.cr_suppress_marker {
-        assert!(
-            marker.exists(),
-            "the CR-suppressing relay never reported dropping the original \
-             write's CR (no marker file at {marker:?}) — the suppression \
-             this scenario depends on did not engage, so the assertions \
-             below would only be re-proving the old whichever-branch-ran \
-             claim, not the suppressed-CR one"
+        let marker_contents = std::fs::read_to_string(marker).unwrap_or_else(|err| {
+            panic!(
+                "the CR-suppressing relay never reported dropping the original \
+                 write's CR (could not read marker file at {marker:?}: {err}) — \
+                 the suppression this scenario depends on did not engage, so the \
+                 assertions below would only be re-proving the old \
+                 whichever-branch-ran claim, not the suppressed-CR one"
+            )
+        });
+        // Fork#257 review P1: the marker used to be an empty flag file
+        // created inside the same branch that removes the byte, so it only
+        // proved "this code path ran". It now carries two cumulative byte
+        // counts — total bytes read from the daemon and total bytes
+        // actually forwarded to the agent (via a write-all loop that
+        // reports genuine completion) — tracked independently of the
+        // `dropped_cr` branch. A relay mutation that stops removing the
+        // byte but leaves the marker-creation call intact still creates a
+        // marker, but these counts show a difference of 0, not 1, which is
+        // what this assertion — not the marker's mere existence — catches.
+        let mut counts = marker_contents.split_whitespace();
+        let parse_next = |counts: &mut std::str::SplitWhitespace<'_>| -> u64 {
+            counts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    panic!("malformed CR-suppress marker contents: {marker_contents:?}")
+                })
+        };
+        let bytes_from_daemon = parse_next(&mut counts);
+        let bytes_to_agent = parse_next(&mut counts);
+        assert_eq!(
+            bytes_from_daemon.saturating_sub(bytes_to_agent),
+            1,
+            "the relay's marker reports {bytes_from_daemon} bytes read from the \
+             daemon and {bytes_to_agent} bytes actually forwarded to the agent \
+             at the moment it dropped the CR — these are independent byte \
+             counters derived from what was actually read and actually \
+             written, not the `dropped_cr` flag or the marker's mere \
+             existence, so a regression that stops removing the byte (even \
+             one that still sets the flag and still creates a marker) shows \
+             a difference of 0 here, not 1, which is what this assertion \
+             catches"
         );
         let _ = std::fs::remove_file(marker);
     }
@@ -414,7 +493,7 @@ fn run_real_seed_retry(deck: TuiDeck, case: RealRetryCase<'_>) {
     );
 }
 
-/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process hosted behind a test-only CR-suppressing relay (`CR_SUPPRESSING_WRAPPER_PY`) that drops the ORIGINAL spawn-time write's confirming CR before it reaches the agent, so the seed text lands in the composer but never submits; confirm via an independent marker file that the drop genuinely happened, then let the daemon's confirmation-retry (grace period shrunk to 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS`, now firing deterministically since nothing can ever confirm the suppressed original) send its own bare CR into that already-populated composer, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — a positive proof that the retry's CR, not the original write's, is what caused the submission (fork #194, fork#197 M4's decided submit-only mechanism) — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
+/// Scenario: Open a real orchestration whose orchestrator (start) role is a genuine interactive Haiku Claude Code process hosted behind a test-only CR-suppressing relay (`CR_SUPPRESSING_WRAPPER_PY`) that drops the ORIGINAL spawn-time write's confirming CR before it reaches the agent, so the seed text lands in the composer but never submits; confirm via a per-run private marker file — whose content is two independent cumulative byte counts (bytes read from the daemon, bytes actually forwarded to the agent) rather than a flag — that the drop genuinely happened and that exactly one byte went missing, then let the daemon's confirmation-retry (grace period shrunk to 250ms via `DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS`, now firing deterministically since nothing can ever confirm the suppressed original) send its own bare CR into that already-populated composer, and assert the pointer reached the agent through exactly one native prompt-submission event containing the pointer text exactly once — a positive proof that the retry's CR, not the original write's, is what caused the submission (fork #194, fork#197 M4's decided submit-only mechanism) — before confirming the agent genuinely read the file the pointer names via its fixed sentinel token.
 #[spec("orchestration/seed/015")]
 #[test]
 fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_prompt() {
@@ -422,7 +501,7 @@ fn orchestration_seed_015_real_claude_confirmation_retry_never_duplicates_the_pr
     // environmental condition, not a broken test.
     skip_unless!(common::check_claude_available());
 
-    let cr_suppress_marker = cr_suppress_marker_path(CLAUDE_SENTINEL);
+    let (_cr_suppress_marker_dir, cr_suppress_marker) = cr_suppress_marker_dir();
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .with_imported_claude_credentials()
