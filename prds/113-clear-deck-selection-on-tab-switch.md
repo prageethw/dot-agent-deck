@@ -1,6 +1,6 @@
 # PRD #113: Clear deck selection highlight when switching tabs
 
-**Status**: Implemented
+**Status**: **Complete** — merged as [PR #151](https://github.com/prageethw/dot-agent-deck/pull/151) (`2655c9fc`), first released in **v0.29.0**. *(Status corrected 2026-08-14: this line read "Implemented" for roughly two months after the change had shipped and been released. Verified by locating the landing commit on `origin/main` and the first release tag containing it, not by re-reading the prose.)*
 **Priority**: Medium
 **Created**: 2026-05-24
 **GitHub Issue**: [#113](https://github.com/vfarcic/dot-agent-deck/issues/113)

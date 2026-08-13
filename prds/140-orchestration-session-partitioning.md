@@ -1,6 +1,6 @@
 # PRD #140: Concurrent orchestration safety — routing correctness + worktree-per-orchestration model
 
-**Status**: Implementation complete — PR pending
+**Status**: **Complete** — merged as [PR #228](https://github.com/prageethw/dot-agent-deck/pull/228) (`cb307ca7`), first released in **v0.35.0**. M5.4's Greptile review never took place: Greptile has not run on this fork since 2026-08-11 (CLAUDE.md rule 8), so that half of the milestone was waiting on a gate that no longer exists. *(Status corrected 2026-08-14: this line still described unlanded work after the change had shipped. Verified by locating the landing commit on `origin/main` and the first release tag containing it, not by re-reading the prose.)*
 **Priority**: High
 **Created**: 2026-07-18
 **GitHub Issue**: [#140](https://github.com/vfarcic/dot-agent-deck/issues/140)
