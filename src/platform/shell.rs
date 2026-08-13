@@ -77,7 +77,7 @@ pub fn shell_command_flag() -> &'static str {
     }
 }
 
-/// Quote `arg` as a single word of the shell [`default_shell`]/
+/// Quote `arg` as a single word of the POSIX shell [`default_shell`]/
 /// [`shell_command_flag`] would run — for a caller that assembles a command
 /// *line* (rather than an argv vector) that is later parsed by an outer
 /// shell, e.g. `dot-agent-deck watch --interval N <command>` written into a
@@ -85,7 +85,23 @@ pub fn shell_command_flag() -> &'static str {
 /// pane silently failed to start once the deck was installed at a path
 /// containing a space).
 ///
-/// Unix: single-quotes `arg` unconditionally, closing/escaping/reopening an
+/// **POSIX-only.** This implements single-quoting per POSIX shell grammar
+/// and nothing else — it is not, and must not be treated as, a general
+/// shell-quoting contract for other interpreters. `cmd.exe` has no
+/// equivalent single-quote construct, so there is no Windows arm of this
+/// function; a caller that needs a `cmd.exe`-safe command line must build it
+/// itself (issue #157 finding A1, audit-verified — a `{:?}` Debug-escaped
+/// double-quoted string is *not* `cmd.exe`-safe either, since `cmd.exe`
+/// treats a literal backslash before an embedded `"` as not escaping it, so
+/// the quote still closes the word and everything after it is parsed as a
+/// fresh command line by the outer shell). A correct `cmd.exe`-safe quoting
+/// scheme (caret-escaping metacharacters, doubling embedded quotes so
+/// `cmd.exe` never toggles out of quoted parsing) is real, easy-to-get-
+/// subtly-wrong work that this repo cannot verify from a non-Windows host,
+/// and is tracked as a follow-up (fork issue #283) rather than attempted
+/// here.
+///
+/// Single-quotes `arg` unconditionally, closing/escaping/reopening an
 /// embedded `'` as `'\''` (the standard POSIX technique) — nothing else is
 /// special between single quotes, so this preserves whitespace, double
 /// quotes, `$`, backticks, backslashes, real newlines, `;`, `&`, `|`,
@@ -93,38 +109,4 @@ pub fn shell_command_flag() -> &'static str {
 #[cfg(unix)]
 pub fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
-}
-
-/// Windows: **returns `arg` unmodified — no `cmd.exe` quoting is applied.**
-///
-/// A prior version double-quoted `arg` and backslash-escaped an embedded `"`
-/// as `\"`. That is a CRT/`argv` escaping convention, not a `cmd.exe` one:
-/// `cmd.exe` keeps the literal backslash and treats the following `"` as
-/// **closing** the quoted word, so an embedded quote ends the protection and
-/// everything after it is parsed by the already-running outer shell as a
-/// fresh command line (issue #157 finding A1, audit-verified). Concretely, a
-/// configured command of
-///
-/// ```text
-/// echo ok" & calc.exe & rem "
-/// ```
-///
-/// produced `"...\watch.exe" watch --interval N "echo ok\" & calc.exe & rem \""`,
-/// and `cmd.exe` ran `calc.exe` from the now-unquoted `& calc.exe &` before
-/// `watch` was ever invoked.
-///
-/// A correct `cmd.exe`-safe quoting scheme exists (caret-escaping
-/// metacharacters, doubling embedded quotes so `cmd.exe` never toggles
-/// out of quoted parsing) but is real, easy-to-get-subtly-wrong work that
-/// this repo cannot verify from a non-Windows host — and a quoting scheme
-/// that *looks* like protection without being proven against a real
-/// `cmd.exe` is worse than none, because it reads as fixed when it is not.
-/// So, until a `cmd.exe`-verified implementation lands (tracked as a
-/// follow-up issue), Windows argument quoting is **explicitly unsupported**:
-/// this is a deliberate no-op, not an oversight. That is no worse than the
-/// pre-#157 behaviour, which already interpolated the command bare — do not
-/// read a call to this function as having closed issue #157 on Windows.
-#[cfg(windows)]
-pub fn quote_shell_arg(arg: &str) -> String {
-    arg.to_string()
 }

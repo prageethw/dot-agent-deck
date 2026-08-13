@@ -6,30 +6,50 @@ use regex::Regex;
 use thiserror::Error;
 
 use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError};
+#[cfg(unix)]
 use crate::platform::shell::quote_shell_arg;
 use crate::project_config::ModeConfig;
 
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
 /// <command>` — the invocation typed into a mode pane's shell for a
-/// `watch = true` pane or reactive rule. `exe` and `command` are each quoted
-/// via [`quote_shell_arg`]: `exe` may contain a space (issue #157), and
-/// `command` is whatever the user configured — it must arrive at clap's
-/// single positional `command: String` (`Commands::Watch` in `main.rs`) as
-/// exactly one shell token, which `{:?}` Debug-escaping does not guarantee
-/// (POSIX shells still expand `$` and backticks inside double quotes, and
-/// Rust's escapes are not a faithful encoding for every character, e.g. a
-/// real newline).
+/// `watch = true` pane or reactive rule.
 ///
-/// **This protection is Unix-only.** On Windows, `quote_shell_arg` is
-/// currently a no-op (issue #157 finding A1 — see its doc comment): `exe`
-/// and `command` reach the outer `cmd.exe` bare, with the same splitting and
-/// reinterpretation risk this function exists to close on Unix.
+/// **Unix**: `exe` and `command` are each quoted via [`quote_shell_arg`]:
+/// `exe` may contain a space (issue #157), and `command` is whatever the
+/// user configured — it must arrive at clap's single positional
+/// `command: String` (`Commands::Watch` in `main.rs`) as exactly one shell
+/// token, which `{:?}` Debug-escaping does not guarantee (POSIX shells
+/// still expand `$` and backticks inside double quotes, and Rust's escapes
+/// are not a faithful encoding for every character, e.g. a real newline).
+///
+/// **Windows**: `quote_shell_arg` has no `cmd.exe` arm (it is POSIX-only —
+/// see its doc comment), so this reproduces the pre-#157 format exactly,
+/// position for position: `exe` bare via `Display`, `command` via `{:?}`.
+/// That is deliberately unchanged from `main` and is **not** a `cmd.exe`
+/// quoting fix — `{:?}` is Rust `Debug` escaping, not a `cmd.exe` grammar,
+/// and remains vulnerable to issue #157 finding A1 (a configured command
+/// containing `" & calc.exe & rem "` still breaks out of the quoted word).
+/// That weakness is `main`'s pre-existing behaviour, not a regression
+/// introduced here, and a real `cmd.exe`-safe fix is tracked as fork issue
+/// #283. This function's Windows arm exists only so that behaviour, known-
+/// inadequate as it is, is not made worse in the course of fixing Unix.
+#[cfg(unix)]
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
         "{} watch --interval {} {}",
         quote_shell_arg(&exe.display().to_string()),
         interval_secs,
         quote_shell_arg(command)
+    )
+}
+
+#[cfg(windows)]
+fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
+    format!(
+        "{} watch --interval {} {:?}",
+        exe.display(),
+        interval_secs,
+        command
     )
 }
 
@@ -689,36 +709,42 @@ mod tests {
         assert_eq!(round_trip_through_posix_shell(tricky), tricky);
     }
 
-    /// Windows argument quoting is explicitly unsupported (issue #157
-    /// finding A1 — see the doc comment on `quote_shell_arg`'s Windows arm):
-    /// `quote_shell_arg` is a deliberate no-op there, so the outer shell
-    /// command line carries the executable and command bare, with no
-    /// implied protection.
+    /// Windows reproduces `main`'s pre-#157 format exactly, position for
+    /// position: the executable bare via `Display` (this is the site the
+    /// spaced-executable regression was about — `exe` still goes in bare on
+    /// Windows because `quote_shell_arg` has no `cmd.exe` arm), and the
+    /// command `{:?}`-quoted, matching `origin/main`'s
+    /// `format!("{} watch --interval {} {:?}", exe.display(), interval_secs,
+    /// command)` byte for byte. This is parity with `main`, not a fix.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_does_not_quote_on_windows() {
+    fn watch_invocation_matches_pre_157_main_on_windows() {
         let exe = Path::new(r"C:\Program Files\My Deck\dot-agent-deck.exe");
         let line = watch_invocation(exe, 10, "npm run dev");
         assert_eq!(
             line,
-            r"C:\Program Files\My Deck\dot-agent-deck.exe watch --interval 10 npm run dev"
+            r#"C:\Program Files\My Deck\dot-agent-deck.exe watch --interval 10 "npm run dev""#
         );
     }
 
-    /// The finding A1 exploit itself, pinned as a no-quoting-claimed
-    /// passthrough: `quote_shell_arg` must not attempt — and must not
-    /// appear to attempt — any protection here. A future change that adds
-    /// quoting must update this test alongside a `cmd.exe`-verified
-    /// round-trip test proving the new scheme actually holds.
+    /// The finding A1 exploit, pinned against the `{:?}`-quoted format this
+    /// function reproduces from `main` — **not** proof of safety. `{:?}` is
+    /// Rust `Debug` escaping, not a `cmd.exe` quoting contract: `cmd.exe`
+    /// treats the literal backslash before the embedded `"` as not escaping
+    /// it, so the quote still closes the word and `cmd.exe` still runs
+    /// `calc.exe` from the now-unquoted tail. This is `main`'s unchanged,
+    /// still-vulnerable behaviour, carried forward deliberately so Windows
+    /// is no worse after this fix than before it; a `cmd.exe`-verified fix
+    /// is tracked as fork issue #283, not attempted here.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_passes_the_a1_exploit_through_unquoted() {
+    fn watch_invocation_reproduces_mains_a1_vulnerability_on_windows() {
         let exe = Path::new(r"C:\deck\dot-agent-deck.exe");
         let command = r#"echo ok" & calc.exe & rem ""#;
         let line = watch_invocation(exe, 5, command);
         assert_eq!(
             line,
-            format!(r"C:\deck\dot-agent-deck.exe watch --interval 5 {command}")
+            format!(r"C:\deck\dot-agent-deck.exe watch --interval 5 {command:?}")
         );
     }
 }
