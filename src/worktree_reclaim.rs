@@ -32,6 +32,8 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
+
 /// Version of the `--json` document shape. Bump on a field removal or a
 /// meaning change; additive fields don't need a bump.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -231,13 +233,19 @@ pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
 /// the `owned_git_dir` race that produces the state it describes (that state
 /// cannot be reached through the real-binary `Fixture` -- see
 /// `tests/CATALOG.md`'s `worktree/reclaim/030` entry).
+///
+/// `path` is display-only here (issue #232): it goes through
+/// [`sanitize_path_for_terminal_display`], never the raw, byte-exact path --
+/// this warning is printed to stderr before the operator inspects the
+/// marker/admin state, so a hostile path component must not be able to forge
+/// or hide part of that warning.
 pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
     format!(
         "worktree list --mine: {path} is marked owned by {owner}, but the ownership check \
          disagrees -- excluding it rather than trusting either signal (often a `git \
          rev-parse` race; persisting past a re-run rules that out -- check the marker and \
          admin dir)",
-        path = path.display()
+        path = sanitize_path_for_terminal_display(path)
     )
 }
 
@@ -997,6 +1005,17 @@ fn cell(value: &Option<String>) -> &str {
 
 /// Render the `worktree list` human table: one row per examined worktree,
 /// including its verdict and reason so the output is self-explanatory.
+///
+/// PATH, BRANCH, OWNER and REASON are all untrusted -- attacker-reachable by
+/// varying provenance (a worktree directory name, a `git` ref name, marker
+/// content that survived [`sanitize_marker_creator`]'s `Cc`-only filter, or
+/// raw subprocess stderr) -- so each is routed through
+/// [`sanitize_for_terminal_display`] / [`sanitize_path_for_terminal_display`]
+/// (issue #232) before it reaches this TAB-separated row: an unescaped raw
+/// TAB in any of them would also forge a column boundary and shift every
+/// later cell. `PR`, `CLEAN`, `OWNED` and `VERDICT` are internal
+/// enum/boolean labels this crate produces itself, never attacker content,
+/// so they are not sanitized.
 pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     if reports.is_empty() {
         return "no worktrees found\n".to_string();
@@ -1004,17 +1023,20 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     let mut out = String::new();
     out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tOWNER\tVERDICT\tREASON\n");
     for r in reports {
-        let path = r.path.to_string_lossy();
+        let path = sanitize_path_for_terminal_display(&r.path);
+        let branch = sanitize_for_terminal_display(cell(&r.branch));
+        let owner = sanitize_for_terminal_display(cell(&r.owner));
+        let reason = sanitize_for_terminal_display(r.reason.as_deref().unwrap_or(DASH));
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             path,
-            cell(&r.branch),
+            branch,
             r.pr_state,
             if r.clean { "yes" } else { "no" },
             if r.owned { "yes" } else { "no" },
-            cell(&r.owner),
+            owner,
             r.verdict,
-            r.reason.as_deref().unwrap_or(DASH),
+            reason,
         ));
     }
     out
@@ -1127,7 +1149,10 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
             outcome.pending.len()
         ));
         for r in &outcome.pending {
-            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
+            out.push_str(&format!(
+                "  - {}\n",
+                sanitize_path_for_terminal_display(&r.path)
+            ));
         }
         out.push_str(
             "Run `dot-agent-deck worktree reclaim --yes` to remove worktrees in this state, \
@@ -1139,7 +1164,10 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     if !outcome.removed.is_empty() {
         out.push_str("Removed:\n");
         for r in &outcome.removed {
-            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
+            out.push_str(&format!(
+                "  - {}\n",
+                sanitize_path_for_terminal_display(&r.path)
+            ));
         }
     } else {
         out.push_str("Removed: none\n");
@@ -1150,8 +1178,8 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
         for r in &outcome.kept {
             out.push_str(&format!(
                 "  - {} ({})\n",
-                r.path.to_string_lossy(),
-                r.reason.as_deref().unwrap_or("no reason recorded")
+                sanitize_path_for_terminal_display(&r.path),
+                sanitize_for_terminal_display(r.reason.as_deref().unwrap_or("no reason recorded"))
             ));
         }
     }
