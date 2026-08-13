@@ -2095,4 +2095,265 @@ mod tests {
              what disagreed, and give a likely cause with a remedy"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Issue #232: `Path::display()` / `to_string_lossy()` are encoding-lossy,
+    // not content-sanitizing -- a worktree path built by `path_from_bytes`
+    // (byte-exact `OsStr::from_bytes` on Unix) can carry ESC, CR, LF, other
+    // C0/C1 controls, and Unicode bidi/format (Cf) controls straight through
+    // into every human render site below. Each is a destructive-decision
+    // surface: `worktree list --mine`'s disagreement warning, the `worktree
+    // list` table, and `worktree reclaim`'s three independently reachable
+    // sections (pending / Removed / Kept). The fix boundary is the render
+    // site itself (`.dot-agent-deck/findings-232-surfaces.md`) --
+    // `path_from_bytes`, `WorktreeReport`, and `serialize_path_lossy` must
+    // NOT change, so these tests assert on formatter *output* only, never on
+    // an intermediate value.
+    //
+    // `hostile_path_component` mixes six C0/C1 controls, four Unicode
+    // bidi/format controls, and printable Unicode plus a path separator in
+    // one path. `assert_hostile_content_is_sanitized` pins the expected
+    // escape spelling to `char::escape_default()` -- the same escaping
+    // `sanitize_for_terminal` in `src/keybindings.rs` already uses for C0/C1
+    // (that helper does not cover Cf; the coder's fix must extend it or add
+    // a sibling that does) -- and separately requires the printable
+    // Unicode/path separator content to survive verbatim, so an over-eager
+    // "escape every non-ASCII char" fix fails this test exactly as a no-op
+    // fix does.
+    // -------------------------------------------------------------------
+
+    /// C0/C1 controls the fix must escape: ESC, CR, LF, TAB, DEL, and one
+    /// C1 control (CSI, U+009B).
+    const HOSTILE_CONTROLS: [char; 6] = ['\u{1b}', '\r', '\n', '\t', '\u{7f}', '\u{9b}'];
+
+    /// Unicode bidi/format (`Cf`) controls the fix must escape: RTL
+    /// override, left-to-right isolate, zero-width space, and BOM.
+    const HOSTILE_BIDI: [char; 4] = ['\u{202e}', '\u{2066}', '\u{200b}', '\u{feff}'];
+
+    /// A path embedding every char in [`HOSTILE_CONTROLS`] and
+    /// [`HOSTILE_BIDI`], plus printable Unicode and a path separator that
+    /// must survive a fix unchanged.
+    fn hostile_path_component() -> PathBuf {
+        let mut s = String::from("/repo/wt-café-日本語");
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            s.push(*c);
+        }
+        s.push_str("-tail");
+        PathBuf::from(s)
+    }
+
+    /// Asserts `output` carries no raw byte of any [`HOSTILE_CONTROLS`] /
+    /// [`HOSTILE_BIDI`] char, carries each one's `char::escape_default()`
+    /// spelling instead, and still carries the printable Unicode / path
+    /// separator content verbatim. Both directions matter equally: silently
+    /// dropping a control character is exactly as wrong as leaving it raw,
+    /// since either way an operator can no longer tell two hostile
+    /// filenames apart.
+    fn assert_hostile_content_is_sanitized(output: &str) {
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            assert!(
+                !output.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in rendered \
+                 output, got {output:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                output.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) to appear in \
+                 rendered output so two hostile filenames stay distinguishable, got {output:?}",
+                *c as u32
+            );
+        }
+        assert!(
+            output.contains("café") && output.contains("日本語"),
+            "printable Unicode must survive a sanitizing fix unchanged, got {output:?}"
+        );
+        assert!(
+            output.contains("/repo/wt-"),
+            "the path separator and ordinary path content must survive unchanged, got {output:?}"
+        );
+    }
+
+    /// Scenario: `format_disagreement_warning` is given a path whose final
+    /// component embeds ESC/CR/LF/TAB/DEL/a C1 control and four Unicode
+    /// bidi/format controls, mixed with printable Unicode and an ordinary
+    /// path separator. The rendered warning -- shown on `worktree list
+    /// --mine`'s stderr before the operator inspects marker/admin state --
+    /// must carry no raw control byte and must carry each one's escaped
+    /// spelling instead, while the printable content survives unchanged.
+    #[test]
+    fn format_disagreement_warning_escapes_hostile_path_content() {
+        let path = hostile_path_component();
+        let out = format_disagreement_warning(&path, "test-owner");
+        assert_hostile_content_is_sanitized(&out);
+    }
+
+    /// Scenario: `format_list_human` renders one report whose `path` embeds
+    /// the same hostile mix. The PATH column of the `worktree list` table --
+    /// read to decide what to reclaim -- must carry no raw control byte and
+    /// must carry each one's escaped spelling instead; because the table is
+    /// TAB-separated, an unescaped raw TAB in the path would also corrupt
+    /// the column count, so this test additionally pins the row back to
+    /// exactly eight TAB-separated fields.
+    #[test]
+    fn format_list_human_escapes_hostile_path_content_in_path_column() {
+        let path = hostile_path_component();
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_hostile_content_is_sanitized(&out);
+
+        let row = out
+            .lines()
+            .nth(1)
+            .expect("format_list_human must emit a data row after the header");
+        assert_eq!(
+            row.split('\t').count(),
+            8,
+            "a raw TAB embedded in the path must not corrupt the TAB-separated column count, \
+             got row: {row:?}"
+        );
+    }
+
+    /// Scenario: `format_reclaim_human` renders a pending-confirmation
+    /// report (no `--yes` yet) whose path embeds the hostile mix. This is
+    /// the highest-risk site
+    /// (`.dot-agent-deck/findings-232-surfaces.md`): it names the exact
+    /// directories a following `--yes` run may remove, so a forged path
+    /// here is a direct path to removing the wrong directory.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_path_in_pending_section() {
+        let path = hostile_path_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: false,
+            owner: None,
+            pr_state: "merged".to_string(),
+            verdict: "ask".to_string(),
+            reason: Some(
+                "reclaimable: PR is merged and the tree is clean, but the deck cannot prove \
+                 it created this worktree"
+                    .to_string(),
+            ),
+            real_path: path,
+        };
+        let outcome = ReclaimOutcome {
+            removed: Vec::new(),
+            pending: vec![report],
+            kept: Vec::new(),
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_hostile_content_is_sanitized(&out);
+    }
+
+    /// Scenario: `format_reclaim_human` renders a `Removed:` entry -- the
+    /// record of a destructive action that already happened -- whose path
+    /// embeds the hostile mix. A control sequence here could forge or
+    /// obscure what was actually removed.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_path_in_removed_section() {
+        let path = hostile_path_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: None,
+            real_path: path,
+        };
+        let outcome = ReclaimOutcome {
+            removed: vec![report],
+            pending: Vec::new(),
+            kept: Vec::new(),
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_hostile_content_is_sanitized(&out);
+    }
+
+    /// Scenario: `format_reclaim_human` renders a `Kept:` entry -- read to
+    /// decide whether further cleanup/reclaim is safe, especially for a
+    /// pending/dirty reason -- whose path embeds the hostile mix.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_path_in_kept_section() {
+        let path = hostile_path_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: false,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "keep".to_string(),
+            reason: Some(
+                "dirty: uncommitted or untracked changes are present that were never part of \
+                 the merged PR"
+                    .to_string(),
+            ),
+            real_path: path,
+        };
+        let outcome = ReclaimOutcome {
+            removed: Vec::new(),
+            pending: Vec::new(),
+            kept: vec![report],
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_hostile_content_is_sanitized(&out);
+    }
+
+    /// Scenario: `WorktreeListDocument` serializes a report whose path
+    /// embeds the same hostile mix used by the human-formatter tests above.
+    /// Unlike those, this pins the OPPOSITE requirement: `worktree list
+    /// --json`'s `path` value is a machine contract
+    /// (`.dot-agent-deck/findings-232-surfaces.md`) and must NOT gain
+    /// terminal escaping -- only the existing lossy non-UTF-8 replacement --
+    /// so a script parsing this field keeps working. This test is expected
+    /// to be GREEN already, before any #232 fix lands: it exists so the fix
+    /// cannot "helpfully" sanitize the JSON path too.
+    #[test]
+    fn worktree_list_json_path_field_preserves_hostile_content_unescaped() {
+        let path = hostile_path_component();
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: None,
+            real_path: path.clone(),
+        }];
+
+        let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let json_path = parsed["worktrees"][0]["path"]
+            .as_str()
+            .expect("path field must be a JSON string");
+
+        assert_eq!(
+            json_path,
+            path.to_string_lossy(),
+            "the JSON path value must remain exactly `to_string_lossy()`'s output -- no \
+             terminal escaping applied -- so existing scripts parsing this field keep working"
+        );
+    }
 }
