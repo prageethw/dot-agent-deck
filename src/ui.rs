@@ -36118,4 +36118,254 @@ mod tests {
             texts[1]
         );
     }
+
+    /// Scenario: with `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS` unset,
+    /// `send_retry_delay` returns today's fixed 500ms floor unchanged. Set to
+    /// a valid low value, the floor honors it exactly — including zero, a
+    /// legitimate "retry as soon as the grace period allows" value — and the
+    /// exponential doubling shape (`BASE << (attempts-1)`) survives on the
+    /// lowered base. Set to a non-numeric string, it falls back to the fixed
+    /// floor rather than panicking. Set to an absurdly large value (past
+    /// `AUTOMATIC_PROMPT_DEADLINE`), the result still lands on a sane,
+    /// backoff-capped schedule rather than an effectively-disabled wait.
+    /// PRD fork#257 M1/M2: mirrors `confirmation_grace_period()`'s existing
+    /// override idiom (`src/ui.rs:2239-2270`) line for line. Expected RED:
+    /// `send_retry_delay` does not read this env var at all today, so every
+    /// overridden assertion below observes the unchanged 500ms floor.
+    #[spec("orchestration/seed/017")]
+    #[test]
+    fn orchestration_seed_017_send_retry_delay_honors_test_base_override() {
+        // Serialize against any other test reading this process-global env
+        // var — mirrors `spawn_readiness_buffer_parses_env_override_default_
+        // and_invalid`'s idiom, the sibling override this test is modeled on.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const VAR: &str = "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS";
+        let prev = std::env::var(VAR).ok();
+
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::remove_var(VAR);
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::from_millis(500),
+            "precondition: unset env var must leave today's fixed 500ms floor \
+             unchanged"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "10");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::from_millis(10),
+            "a valid override must replace the floor — send_retry_delay \
+             currently ignores DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS \
+             entirely and always returns the fixed 500ms BASE_MS regardless \
+             of what this env var is set to"
+        );
+        assert_eq!(
+            send_retry_delay(2),
+            std::time::Duration::from_millis(20),
+            "the exponential doubling shape (BASE << (attempts-1)) must \
+             survive on the lowered base — attempts=2 must be exactly 2x the \
+             overridden base, not a flattened schedule"
+        );
+        assert_eq!(
+            send_retry_delay(3),
+            std::time::Duration::from_millis(40),
+            "attempts=3 must be exactly 4x the overridden base — the curve \
+             keeps its shape with a lowered base, so a future change that \
+             flattens it fails here"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "0");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::ZERO,
+            "zero is a legitimate override value (retry as soon as the grace \
+             period allows) and must not be treated as unset or clamped up \
+             to the fixed floor"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "not-a-number");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::from_millis(500),
+            "a non-numeric override must fall back to the fixed 500ms floor, \
+             not panic"
+        );
+
+        // Out-of-range: past AUTOMATIC_PROMPT_DEADLINE, mirroring
+        // CONFIRMATION_GRACE_PERIOD_MAX's own ceiling (pinned 1ms below the
+        // deadline) — past that point the override is not a longer backoff,
+        // it is a silently disabled retry. Note (see this catalog entry's
+        // "Does not assert"): SEND_RETRY_BACKOFF_CAP (2s, untouched by this
+        // PR) already caps every attempts=1 schedule at 2s once the base
+        // exceeds it, so this assertion cannot by itself distinguish
+        // "clamped to the intended ceiling" from "left unclamped" — both
+        // land on exactly SEND_RETRY_BACKOFF_CAP. It still pins that an
+        // absurd override must not escape that cap into an
+        // effectively-disabled multi-minute wait, which is RED today (the
+        // override is ignored entirely, returning 500ms).
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "120000");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            SEND_RETRY_BACKOFF_CAP,
+            "an out-of-range override must still land on a sane, \
+             backoff-capped schedule, not an effectively-disabled wait"
+        );
+
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` across two frames with
+    /// BOTH the confirmation-grace-period override
+    /// (`DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS`) and the new
+    /// retry-base override (`DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`) set to
+    /// 10ms. Frame 1 lands an `Applied` write; frame 2 runs only 50ms
+    /// later — comfortably past both lowered floors, but far short of
+    /// today's fixed 500ms backoff — and must deterministically produce a
+    /// second write whose payload is the empty string (M4's bare CR).
+    /// Unlike `orchestration/seed/005`/`014`, which reach the retry by
+    /// parking frame 2 five seconds out (satisfying any floor by
+    /// construction), this proves the retry is reachable BY TIMING once the
+    /// floor is movable. PRD fork#257 M2. Expected RED: today's code
+    /// ignores the base override and keeps the fixed 500ms floor, so the
+    /// retry cannot fire 50ms after the write — only the original write
+    /// reaches the pane double.
+    #[spec("orchestration/seed/018")]
+    #[test]
+    fn orchestration_seed_018_retry_fires_deterministically_once_floor_is_lowered() {
+        // Serialize against any other test reading these process-global env
+        // vars, mirroring `orchestration/seed/017`'s idiom.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const GRACE_VAR: &str = "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS";
+        const BASE_VAR: &str = "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS";
+        let prev_grace = std::env::var(GRACE_VAR).ok();
+        let prev_base = std::env::var(BASE_VAR).ok();
+        // SAFETY: lock held for the duration; restored below.
+        unsafe {
+            std::env::set_var(GRACE_VAR, "10");
+            std::env::set_var(BASE_VAR, "10");
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane_controller =
+            SendResultPaneController::new(InjectedSendOutcome::Applied, attempts.clone());
+        let pane: Arc<dyn PaneController> = Arc::new(pane_controller);
+        let mut ui = default_ui();
+        let tab_id: TabId = 438;
+        let write_time = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, write_time);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            write_time
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-438".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-438".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-438".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+
+        // Frame 1: the original write genuinely lands.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time,
+            tab_id,
+            &["orch-pane-438".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: frame 1's write must land and await confirmation"
+        );
+
+        // Frame 2: only 50ms later — comfortably past BOTH lowered overrides
+        // (10ms grace period, 10ms retry base), but far short of today's
+        // fixed 500ms `send_retry_delay(1)` floor. No confirmation observed.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time + std::time::Duration::from_millis(50),
+            tab_id,
+            &["orch-pane-438".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        // SAFETY: same lock; restore now, before any assertion below might
+        // panic (the lock guard's own drop during unwind would restore the
+        // lock, but not these env vars).
+        unsafe {
+            match prev_grace {
+                Some(v) => std::env::set_var(GRACE_VAR, v),
+                None => std::env::remove_var(GRACE_VAR),
+            }
+            match prev_base {
+                Some(v) => std::env::set_var(BASE_VAR, v),
+                None => std::env::remove_var(BASE_VAR),
+            }
+        }
+
+        let texts = pane
+            .as_any()
+            .downcast_ref::<SendResultPaneController>()
+            .expect("SendResultPaneController")
+            .texts();
+
+        assert_eq!(
+            texts.len(),
+            2,
+            "with both overrides lowered, a landed-but-unconfirmed write must \
+             deterministically produce a second write only 50ms later — \
+             observed payloads={texts:?} (expected exactly 2: the original \
+             write plus one genuinely ATTEMPTED confirmation-retry). Today's \
+             code ignores DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS and keeps \
+             the fixed 500ms floor, so the retry cannot fire this early — \
+             this is the exact gap PRD fork#257 exists to close: \
+             DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS alone cannot \
+             make the retry fire deterministically, since \
+             send_retry_delay(1)'s 500ms floor is unmovable"
+        );
+        assert_eq!(
+            texts.get(1).map(String::as_str),
+            Some(""),
+            "the confirmation-retry must send a BARE submit (empty payload), \
+             never the full prompt text again — observed retry \
+             payload={:?} (expected \"\")",
+            texts.get(1)
+        );
+    }
 }
