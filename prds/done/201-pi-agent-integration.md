@@ -1,6 +1,6 @@
 # PRD #201: Pi as a first-class agent — deterministic orchestrator + third agent type
 
-**Status**: Implemented — pre-PR (review resolved, e2e gate green; M5.3 manual cross-version test + M5.4 Greptile settle during `/prd-done`)
+**Status**: **Complete** — merged as [PR #209](https://github.com/prageethw/dot-agent-deck/pull/209) (`f5f53ba8`), first released in **v0.33.0**. M5.4's Greptile settle never took place: Greptile has not run on this fork since 2026-08-11 (CLAUDE.md rule 8), so that half of the milestone was waiting on a gate that no longer exists. *(Status corrected 2026-08-14: this line still described unlanded work after the change had shipped. Verified by locating the landing commit on `origin/main` and the first release tag containing it, not by re-reading the prose.)*
 **Priority**: Medium
 **Created**: 2026-07-10
 **GitHub Issue**: [#201](https://github.com/vfarcic/dot-agent-deck/issues/201)

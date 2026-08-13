@@ -1,6 +1,6 @@
 # PRD #231: Package dot-agent-deck as a Nix flake
 
-**Status**: Implementation complete (M1-M5); PR pending
+**Status**: **Complete** — landed as `5874d10d` (`feat(nix): package dot-agent-deck as a flake`), first released in **v0.35.10**. `flake.nix` and `flake.lock` are on `main` and CI runs a `nix` job against them; the version pin was bumped to `0.37.2` in [PR #252](https://github.com/prageethw/dot-agent-deck/pull/252) on 2026-08-14. *(Status corrected 2026-08-14: this line still described unlanded work after the change had shipped. Verified by locating the landing commit on `origin/main` and the first release tag containing it, not by re-reading the prose.)*
 **Priority**: Medium
 **Created**: 2026-08-06
 
