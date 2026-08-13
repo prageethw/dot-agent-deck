@@ -63,6 +63,19 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab A is up
+    // The form closing only means the modal is gone, not that tab A's role
+    // pane box has actually rendered yet — wait for it before reading the
+    // exact edge (mirrors `e2e_dashboard_pane_column.rs`'s identical guard
+    // after its own new-pane form closes).
+    let tab_a_rendered = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        find_pane_box_left_edge(grid, "orchestrator").is_some()
+    });
+    assert!(
+        tab_a_rendered,
+        "tab A's role pane box never rendered within 3s after the new-pane \
+         form closed\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 
     // Baseline: the default 34/66 split puts tab A's pane-column left edge at
     // 34% of the 120-col frame (col 40 or 41, depending on Percentage
@@ -107,6 +120,21 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // its own untoggled Default.
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
+    // Same render guard as tab A's open above. Tab A's own "orchestrator"
+    // box already satisfies `.is_some()`, so this cannot distinguish tab A
+    // from tab B by identity — but both read the SAME deck-global edge, so
+    // that is not the concern here. What it does rule out is a blank/
+    // transitional frame between the dialog closing and the next box
+    // actually drawing, which `.is_some()` alone is enough to filter out.
+    let tab_b_rendered = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        find_pane_box_left_edge(grid, "orchestrator").is_some()
+    });
+    assert!(
+        tab_b_rendered,
+        "tab B's role pane box never rendered within 3s after the new-pane \
+         form closed\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 
     let b_narrow_edge = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert!(
@@ -143,6 +171,9 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // marker (`" <role> "`, the same bounded needle `has_role_status` below
     // uses to find a sidebar deck card's title row) is present anywhere on
     // the settled grid, so Hidden is proven to render NO sidebar at all.
+    // No separate render guard needed here: `b_hidden` above already waited
+    // for the settled Hidden frame, and no input has been sent since — this
+    // read samples that same settled state, not a fresh transition.
     let hidden_grid = deck.snapshot_grid();
     assert!(
         !hidden_grid.contains(" orchestrator ") && !hidden_grid.contains(" worker "),
@@ -417,6 +448,10 @@ fn orchestration_008_stacked_pane_column_hides_collapsed_frames_while_agents_sta
 
     // (a) With `orchestrator` focused/expanded (the start role), neither
     // non-focused role may render a collapsed title-bar frame.
+    // No separate render guard needed here either: the `wait_until` above
+    // already polled `snapshot_grid()` for up to 15s, so the render loop is
+    // caught up by the time it returns, and no input has been sent since —
+    // this read samples that same settled state.
     let grid = deck.snapshot_grid();
     assert!(
         !has_collapsed_frame(&grid, "alpha"),
