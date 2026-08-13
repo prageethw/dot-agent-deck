@@ -88,6 +88,24 @@ jobs:
             THRESHOLD=10
           fi
 
+          # A caller who passed an explicit threshold_override and got a
+          # non-numeric value must not be silently redirected to the
+          # default — that would misreport what was actually evaluated. And
+          # because this script runs `set -uo pipefail` (deliberately
+          # without -e), a failing `[ -gt ]` comparison later would not be
+          # fatal on its own; validate up front instead of relying on that.
+          case "$THRESHOLD" in
+            ''|*[!0-9]*)
+              {
+                echo "## Drift check: COULD NOT DETERMINE"
+                echo ""
+                echo "\`threshold_override\` is not a non-negative integer: \`$THRESHOLD\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::threshold_override is not a non-negative integer: $THRESHOLD — refusing to silently fall back to the default"
+              exit 1
+              ;;
+          esac
+
           FORK_BRANCH="${FORK_BRANCH_OVERRIDE:-}"
           if [ -z "$FORK_BRANCH" ]; then
             FORK_BRANCH="fork-only"
@@ -123,22 +141,38 @@ jobs:
             exit 1
           fi
 
-          if ! COUNT=$(git rev-list --count "origin/$FORK_BRANCH..origin/main" 2>&1); then
+          # Both directions must be measured: a "main..fork-only" count of 0
+          # is NOT the same as "the branches agree" if fork-only holds
+          # commits main lacks (e.g. a sync's final reset/push was missed).
+          if ! MAIN_AHEAD=$(git rev-list --count "origin/$FORK_BRANCH..origin/main" 2>&1); then
             {
               echo "## Drift check: COULD NOT DETERMINE"
               echo ""
-              echo "\`git rev-list\` failed:"
+              echo "\`git rev-list\` failed measuring how far \`main\` is ahead of \`$FORK_BRANCH\`:"
               echo '```'
-              echo "$COUNT"
+              echo "$MAIN_AHEAD"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::git rev-list failed measuring drift — treating as could-not-determine, not a pass"
+            echo "::error::git rev-list failed measuring main-ahead drift — treating as could-not-determine, not a pass"
+            exit 1
+          fi
+
+          if ! FORK_AHEAD=$(git rev-list --count "origin/main..origin/$FORK_BRANCH" 2>&1); then
+            {
+              echo "## Drift check: COULD NOT DETERMINE"
+              echo ""
+              echo "\`git rev-list\` failed measuring how far \`$FORK_BRANCH\` is ahead of \`main\`:"
+              echo '```'
+              echo "$FORK_AHEAD"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::git rev-list failed measuring fork-ahead drift — treating as could-not-determine, not a pass"
             exit 1
           fi
 
           OLDEST_ISO=""
           OLDEST_AGE_DAYS=""
-          if [ "$COUNT" -gt 0 ]; then
+          if [ "$MAIN_AHEAD" -gt 0 ]; then
             OLDEST_ISO=$(git log --reverse --format=%cI "origin/$FORK_BRANCH..origin/main" | head -1)
             if [ -n "$OLDEST_ISO" ]; then
               OLDEST_EPOCH=$(date -d "$OLDEST_ISO" +%s)
@@ -152,7 +186,8 @@ jobs:
             echo ""
             echo "| Metric | Value |"
             echo "| --- | --- |"
-            echo "| Commits ahead | $COUNT |"
+            echo "| \`main\` ahead of \`$FORK_BRANCH\` | $MAIN_AHEAD |"
+            echo "| \`$FORK_BRANCH\` ahead of \`main\` | $FORK_AHEAD |"
             echo "| Threshold | $THRESHOLD |"
             if [ -n "$OLDEST_AGE_DAYS" ]; then
               echo "| Oldest un-curated commit | $OLDEST_ISO ($OLDEST_AGE_DAYS days old) |"
@@ -160,11 +195,21 @@ jobs:
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "main is $COUNT commits ahead of $FORK_BRANCH (threshold $THRESHOLD)"
+          echo "main is $MAIN_AHEAD commits ahead of $FORK_BRANCH; $FORK_BRANCH is $FORK_AHEAD commits ahead of main (threshold $THRESHOLD)"
 
-          if [ "$COUNT" -gt "$THRESHOLD" ]; then
+          # fork-only holding commits main lacks means a sync's final
+          # reset/push was missed. The threshold has no meaning in this
+          # direction — it is calibrated for re-curation volume, not this —
+          # so any non-zero count here fails regardless of threshold.
+          if [ "$FORK_AHEAD" -gt 0 ]; then
+            echo "**Action needed:** \`$FORK_BRANCH\` has $FORK_AHEAD commit(s) that \`main\` does not — the sync's final reset/push to \`main\` was likely missed. See \`docs/develop/fork-sync-workflow.md\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$FORK_BRANCH is $FORK_AHEAD commits ahead of main — the sync's final reset/push to main was likely missed"
+            exit 1
+          fi
+
+          if [ "$MAIN_AHEAD" -gt "$THRESHOLD" ]; then
             echo "**Action needed:** re-curate the \`fork-only\` stack per \`docs/develop/fork-sync-workflow.md\`'s \"Keep it current\" note before this grows further." >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::main is $COUNT commits ahead of $FORK_BRANCH (threshold $THRESHOLD) — re-curate per docs/develop/fork-sync-workflow.md"
+            echo "::error::main is $MAIN_AHEAD commits ahead of $FORK_BRANCH (threshold $THRESHOLD) — re-curate per docs/develop/fork-sync-workflow.md"
             exit 1
           fi
 
