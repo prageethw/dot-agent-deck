@@ -4212,6 +4212,15 @@ impl AppState {
         // both are done with, just below.
         let provenance_pane = event.pane_id.clone();
         let provenance_untagged = event.agent_id.is_none();
+        // Issue #262: whether the pane's CURRENT status is already marked as
+        // written by an unidentified producer. Captured here, next to the
+        // provenance fields above, for the same reason — `session` borrows
+        // `self` for the rest of this block, so `self.untagged_status_panes`
+        // cannot be read inside the `ToolStart` arm below.
+        let pane_status_untagged = event
+            .pane_id
+            .as_deref()
+            .is_some_and(|p| self.untagged_status_panes.contains(p));
 
         // Whether this frame ASSERTED a status, as opposed to leaving whatever
         // the session already had. Only an assertion may move the provenance
@@ -4252,7 +4261,17 @@ impl AppState {
                 // concurrent-subagent regression (#86/`4d31103`); it can only
                 // clear via the plain `WaitingForInput` notification path.
                 let matches_pending = match session.pending_permission_tool.as_ref() {
-                    None => true,
+                    // Issue #262: "no marker means this was not a permission
+                    // prompt, so a tool starting must be the human's reply"
+                    // only holds if the `WaitingForInput` on the card came
+                    // from an identified producer. If the pane is marked
+                    // untagged, there is no marker for the same reason there
+                    // is no trust — an untagged frame plants status without
+                    // ever setting `pending_permission_tool` — so falling
+                    // through to `true` here let a tagged `ToolStart` treat
+                    // the plant as its own pending prompt and clear it,
+                    // laundering an untagged status into a trusted one.
+                    None => !pane_status_untagged,
                     Some(None) => false,
                     Some(Some(pending)) => Some(pending.as_str()) == event.tool_name.as_deref(),
                 };
