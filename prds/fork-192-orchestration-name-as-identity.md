@@ -8,7 +8,7 @@
 
 **Parent**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166) — this PRD carves out its parked **Phase 1** (M1.0/M1.1/M1.2). Sibling of [fork #175](https://github.com/prageethw/dot-agent-deck/issues/175), which carved out provisioning.
 
-**Related**: fork #184 (the misleading comment on the exact derivation edited here — its fix rides this PR) · fork #144 (the ownership marker and its containment check) · fork #74 (the motivating collision) · PRD #140 (per-tab routing identity; its `display_title` contract changes here) · PRD #107 (the title-vs-identity split this must preserve) · PRD #120 (issue-dispatch, whose orchestrations carry no typed name) · [upstream #220](https://github.com/vfarcic/dot-agent-deck/issues/220) (the naming question this settles)
+**Related**: fork #184 (the misleading comment on the exact derivation edited here — its fix rides this PR) · fork #144 (the ownership marker and its containment check) · fork #74 (the motivating collision) · PRD #140 (per-tab routing identity; its `display_title` contract changes here) · PRD #107 (the title-vs-identity split this must preserve) · PRD #120 (issue-dispatch, whose orchestrations carry no typed name) · [upstream #538](https://github.com/vfarcic/dot-agent-deck/issues/538) (the upstream issue this answers — see M2.0; **not** upstream #220, which an earlier revision of this document wrongly named)
 
 **Filename convention**: `fork-<n>-` prefix, per fork#166 — a bare `192-` would be ambiguous against a future upstream #192.
 
@@ -123,9 +123,17 @@ Unchanged from fork#166 and restated so it is not re-litigated: fork #144's cont
 
 ### M2.0 — Offer upstream (trigger, not intention)
 
-- [ ] Once M1.0–M1.2 are merged here, open the form-level commit upstream against [#220](https://github.com/vfarcic/dot-agent-deck/issues/220).
+- [x] Once M1.0–M1.2 are merged here, open the form-level commit upstream against **[#538](https://github.com/vfarcic/dot-agent-deck/issues/538)** *(2026-08-13)*.
 
-**Why this is a milestone with a trigger rather than a note.** fork#166 declares itself fork-only and justifies it mechanically — `src/worktree_reclaim.rs` does not exist upstream and `worktree_slug` has 0 occurrences there. **That justification covers the ownership half, not this one**: the new-pane form and `display_title` are upstream code, and upstream #220's M1.1 carries an open naming question this answers. Building here first is right, because the only consumers of the identity are fork-only. Leaving it here permanently is not. CLAUDE.md rule 19 exists because "yes, but not yet" is how fourteen commits ended up stranded in `fork-only`, re-rebased and re-verified on every sync forever.
+**Correction — the target was wrong, and the milestone could not have been completed as written.** Every earlier revision of this document said *"open the form-level commit upstream against #220"*, on the claim that *"upstream #220's M1.1 carries an open naming question this answers."* **It does not.** Checked directly against `vfarcic/dot-agent-deck#220` and `prds/220-dispatcher-mode-worktree-dispatch.md`: #220 is *"Dispatcher mode + worktree dispatch"*, and its M1.1 is *"Worktree creation for a user-driven unit: reuse `create_worktree` … with a **non-issue naming/collision scheme**"* — git worktree and branch names for the `dispatch` CLI verb. It is already `[x]` and superseded by M1.3.
+
+**Two unrelated naming concerns that share a word.** #220/M1.1 is git worktree/branch naming for a headless CLI path; this PRD is the TUI new-pane form's Name field. #220's Open Questions say nothing about the form, and its only new-pane-form mentions concern the `dispatch` verb mirroring the form's *prompt composition*.
+
+Caught by the worker doing the port, which stopped before pushing rather than assert a false claim to upstream reviewers — the right call, and the reason the error did not reach them. No matching upstream issue existed, so one was filed: **#538**, *"The new-pane form's Name pre-fills with the directory basename and enforces no uniqueness, so two orchestrations in one repo are indistinguishable."*
+
+**Why this is a milestone with a trigger rather than a note.** fork#166 declares itself fork-only; **that justification covers the ownership half, not this one** — the new-pane form and `display_title` are upstream code. (fork#166's own stated basis has separately expired; see fork [#266](https://github.com/prageethw/dot-agent-deck/issues/266).) Building here first is right, because the only consumers of the identity are fork-only. Leaving it here permanently is not. CLAUDE.md rule 19 exists because "yes, but not yet" is how fourteen commits ended up stranded in `fork-only`, re-rebased and re-verified on every sync forever.
+
+**The lesson, since it generalises past this PRD:** a cross-tracker issue reference is an assertion about someone else's document, and nothing re-checks it when that document moves. This one sat unverified through the PRD's authoring, its review and its merge — and would have reached upstream reviewers as a confident, wrong claim about their own issue. Rule 20 tells you to search both trackers before filing; this is its sibling — **re-read the issue you are citing before you cite it at them.**
 
 Keep the form-level change a **clean separable commit** so the offer is a cherry-pick, not a rewrite.
 
