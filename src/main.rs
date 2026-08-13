@@ -1908,8 +1908,9 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     };
     use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
     use dot_agent_deck::worktree_reclaim::{
-        WorktreeListDocument, examine_worktrees, format_disagreement_warning, format_list_human,
-        is_mine, owner_disagreements, sanitize_marker_creator,
+        WorktreeListDocument, examine_worktrees, format_disagreement_warning,
+        format_list_error_for_cli, format_list_human, is_mine, owner_disagreements,
+        sanitize_marker_creator,
     };
 
     let owner_filter = if mine {
@@ -1981,7 +1982,7 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     let mut reports = match examine_worktrees(&cwd) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("worktree list: {}", sanitize_for_terminal_display(&e));
+            eprintln!("{}", format_list_error_for_cli(&e));
             return ExitCode::FAILURE;
         }
     };
@@ -2071,7 +2072,9 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
 /// repo) is reported as failure.
 fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
     use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
-    use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
+    use dot_agent_deck::worktree_reclaim::{
+        format_reclaim_error_for_cli, format_reclaim_human, run_reclaim,
+    };
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -2089,7 +2092,7 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("worktree reclaim: {}", sanitize_for_terminal_display(&e));
+            eprintln!("{}", format_reclaim_error_for_cli(&e));
             ExitCode::FAILURE
         }
     }

@@ -1050,6 +1050,17 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     out
 }
 
+/// Renders the exact line `dot-agent-deck worktree list` writes to stderr
+/// when enumeration itself fails (issue #232 round 4) -- the CLI wrapper in
+/// `main.rs` calls this instead of composing `sanitize_for_terminal_display`
+/// inline, so a test can call the identical production code rather than
+/// re-deriving its composition: reverting the sanitizer inside here breaks
+/// this function and the CLI sink together, because they are now the same
+/// call.
+pub fn format_list_error_for_cli(e: &str) -> String {
+    format!("worktree list: {}", sanitize_for_terminal_display(e))
+}
+
 /// Physically remove a worktree directory, preserving its branch:
 /// `git -C <repo_dir> worktree remove -- <path>` — deliberately WITHOUT
 /// `--force`, since [`examine_worktrees`] already gated on cleanliness; git's
@@ -1193,6 +1204,16 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     }
 
     out
+}
+
+/// Renders the exact line `dot-agent-deck worktree reclaim` writes to
+/// stderr when enumeration itself fails (issue #232 round 4) -- same
+/// rationale as [`format_list_error_for_cli`], but a separate function and a
+/// separate print site, because `worktree reclaim`'s prefix differs from
+/// `worktree list`'s and the two CLI sinks must stay independently fixed
+/// rather than sharing one.
+pub fn format_reclaim_error_for_cli(e: &str) -> String {
+    format!("worktree reclaim: {}", sanitize_for_terminal_display(e))
 }
 
 #[cfg(test)]
@@ -2731,21 +2752,20 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Issue #232 round 3: `list_linked_worktrees`' `Err` path embeds RAW
+    // Issue #232 round 3/4: `list_linked_worktrees`' `Err` path embeds RAW
     // `git worktree list` stderr (this function, a few lines above), which
     // `examine_worktrees` and `run_reclaim` both propagate unchanged via
     // `?`. `src/main.rs`'s `worktree list` and `worktree reclaim` CLI
     // wrappers are the only two places that ever print that `Err` to a
-    // terminal, and each now routes it through
-    // [`sanitize_for_terminal_display`] before printing. Neither wrapper
-    // function is reachable from a unit test (both are private free
-    // functions in `main.rs` that print via `eprintln!` rather than
-    // returning a string), so -- following `format_disagreement_warning`'s
-    // precedent just above, whose own catalog entry notes it does not
-    // assert the CLI's stderr text either, only the formatter it calls --
-    // these tests pin the exact composition `main.rs` now uses:
-    // `sanitize_for_terminal_display(&e)` applied to the library's raw
-    // `Err` string.
+    // terminal, and each now prints via [`format_list_error_for_cli`] /
+    // [`format_reclaim_error_for_cli`] instead of composing
+    // `sanitize_for_terminal_display` inline (round 4: round 3's tests
+    // called `sanitize_for_terminal_display` directly, so they stayed green
+    // even if the CLI wrapper's call to it were reverted -- they proved the
+    // sanitizer works, never that the CLI used it). These two functions ARE
+    // the CLI print sinks now, so calling them from a test calls the same
+    // code `main.rs`'s `eprintln!` calls; reverting the sanitizer inside
+    // either one fails both the CLI sink and the test in the same edit.
     //
     // A real `git worktree list` failure whose stderr echoes attacker
     // content is reproduced by standing a fake `git` in front of
@@ -2790,13 +2810,17 @@ mod tests {
 
     /// Scenario: `worktree list`'s enumeration fails because `git worktree
     /// list` itself fails, with a stderr that echoes hostile
-    /// repository/worktree path content (the substantive sink at
-    /// `src/main.rs`'s `run_worktree_list_cli`). `examine_worktrees` must
-    /// still propagate that stderr RAW in its `Err` -- sanitization is not
-    /// this library function's job -- but `sanitize_for_terminal_display`
-    /// applied to it, exactly as `main.rs` now does before printing, must
-    /// carry no raw hostile char and the escaped spelling of each instead,
-    /// while the surrounding printable text survives unchanged.
+    /// repository/worktree path content. `examine_worktrees` must still
+    /// propagate that stderr RAW in its `Err` -- sanitization is not this
+    /// library function's job -- and the error is then rendered through
+    /// [`format_list_error_for_cli`], the SAME function
+    /// `run_worktree_list_cli` in `src/main.rs` calls to build its
+    /// `eprintln!` line, not a re-derivation of what it does. The rendered
+    /// line must carry no raw hostile char and the escaped spelling of each
+    /// instead, while the surrounding printable text survives unchanged --
+    /// so reverting the `sanitize_for_terminal_display` call inside
+    /// `format_list_error_for_cli` fails this test AND `main.rs`'s actual
+    /// stderr output at once, because they are now one call.
     #[test]
     #[cfg(unix)]
     fn examine_worktrees_raw_error_is_sanitized_by_the_list_cli_sink() {
@@ -2820,7 +2844,14 @@ mod tests {
              CLI print sink's job, not the library's; got {err:?}"
         );
 
-        let sanitized = sanitize_for_terminal_display(&err);
+        // The same call `run_worktree_list_cli` makes before its `eprintln!`
+        // -- not `sanitize_for_terminal_display` called directly, or this
+        // test would stay green even if the CLI wrapper stopped calling it.
+        let sanitized = format_list_error_for_cli(&err);
+        assert!(
+            sanitized.starts_with("worktree list: "),
+            "expected the CLI sink's own prefix, got {sanitized:?}"
+        );
         for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
             assert!(
                 !sanitized.contains(*c),
@@ -2843,14 +2874,16 @@ mod tests {
         );
     }
 
-    /// Scenario: `worktree reclaim`'s enumeration fails the same way (the
-    /// substantive sink at `src/main.rs`'s `run_worktree_reclaim_cli`) --
+    /// Scenario: `worktree reclaim`'s enumeration fails the same way --
     /// `run_reclaim` calls `examine_worktrees` first and propagates its
-    /// `Err` via `?` unchanged, reaching a SEPARATE print site
-    /// (`"worktree reclaim: ..."` vs. `worktree list`'s `"worktree list:
-    /// ..."`) that needs its own sanitizing call, not a shared one -- this
-    /// pins that the `reclaim` sink is independently fixed, not merely
-    /// inherited from `list`'s fix.
+    /// `Err` via `?` unchanged, reaching a SEPARATE render function,
+    /// [`format_reclaim_error_for_cli`] (`"worktree reclaim: ..."` vs.
+    /// `worktree list`'s `"worktree list: ..."`), which is the SAME
+    /// function `run_worktree_reclaim_cli` in `src/main.rs` calls to build
+    /// its `eprintln!` line. This pins that the `reclaim` sink is
+    /// independently fixed, not merely inherited from `list`'s fix, and
+    /// that this test exercises the actual sink rather than re-deriving its
+    /// composition.
     #[test]
     #[cfg(unix)]
     fn run_reclaim_raw_error_is_sanitized_by_the_reclaim_cli_sink() {
@@ -2879,7 +2912,15 @@ mod tests {
              print sink's job, not the library's; got {err:?}"
         );
 
-        let sanitized = sanitize_for_terminal_display(&err);
+        // The same call `run_worktree_reclaim_cli` makes before its
+        // `eprintln!` -- not `sanitize_for_terminal_display` called
+        // directly, or this test would stay green even if the CLI wrapper
+        // stopped calling it.
+        let sanitized = format_reclaim_error_for_cli(&err);
+        assert!(
+            sanitized.starts_with("worktree reclaim: "),
+            "expected the CLI sink's own prefix, got {sanitized:?}"
+        );
         for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
             assert!(
                 !sanitized.contains(*c),
