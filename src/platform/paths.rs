@@ -935,13 +935,20 @@ mod tests {
     /// entry can never be trusted for an identity comparison (a shell
     /// resolves either against ITS OWN current directory, which this process
     /// cannot observe), while an absolute entry can. Pure data, no
-    /// filesystem access needed.
+    /// filesystem access needed. The "absolute" fixture is platform-gated:
+    /// `Path::is_absolute()` requires a drive or UNC prefix on Windows, so a
+    /// bare leading slash is merely rooted there, not absolute.
     #[test]
     fn is_untrustworthy_path_entry_rejects_empty_and_relative_but_accepts_absolute() {
         assert!(is_untrustworthy_path_entry(Path::new("")));
         assert!(is_untrustworthy_path_entry(Path::new(".")));
         assert!(is_untrustworthy_path_entry(Path::new("bin")));
+        #[cfg(unix)]
         assert!(!is_untrustworthy_path_entry(Path::new("/usr/local/bin")));
+        #[cfg(windows)]
+        assert!(!is_untrustworthy_path_entry(Path::new(
+            r"C:\Windows\System32"
+        )));
     }
 
     /// Scenario: Build two directories on a synthetic `$PATH`, each holding an
