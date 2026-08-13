@@ -81,6 +81,145 @@ pub enum Ownership {
     Foreign,
 }
 
+/// A three-state REPORTING owner (PRD fork#298 M1.0) — answers "who does
+/// this worktree belong to?", a different question from [`Ownership`]'s
+/// "may a bare `reclaim` remove this with no prompt?". The two must never be
+/// conflated: [`decide`] keeps reading [`Ownership`] alone, byte-for-byte as
+/// before this PRD, so a resolved [`WorktreeOwner::Human`] can never make a
+/// worktree removable without `--yes` (that would reopen fork #144's P1,
+/// which fork #166 explicitly refused to reopen — see `worktree/reclaim/039`
+/// for the pinned regression guard).
+///
+/// Resolution order (see [`resolve_worktree_owner`]):
+/// 1. Marker present, carrying a `created-by:` line → `Agent`.
+/// 2. Marker present, but legacy (bare `"deck\n"`, no `created-by:` line —
+///    fork issue #231's exact state) → `Unknown`. Not `Agent` (there is no
+///    identity to attribute it to — that would be a fabrication) and not
+///    `Human` (the marker DOES prove deck creation, so reporting it as
+///    human-owned would understate what is actually known).
+/// 3. No marker → `Human`. CLAUDE.md rule 1's dominant real path: the
+///    orchestrator's own hand-run `git worktree add` writes no marker.
+/// 4. Human resolution fails (no `gh`, unauthenticated, or a spawn/exit
+///    failure), or the worktree's own git metadata directory could not be
+///    resolved/verified at all → `Unknown`, with a reason — never a silent
+///    blank, and never a crash. `worktree list` must keep working with `gh`
+///    absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeOwner {
+    /// The marker's `created-by:` identity (`read_marker_owner`).
+    Agent { identity: String },
+    /// No marker; resolved via the same `gh api user` seam
+    /// `issue_claim::resolve_gh_login` uses, plus this host's own
+    /// `local_hostname()`.
+    Human { login: String, host: String },
+    /// Positively resolved as "cannot attribute an owner", with a stated
+    /// reason — distinct from a worktree this function was never asked
+    /// about at all.
+    Unknown { reason: &'static str },
+}
+
+impl WorktreeOwner {
+    /// The `owner_kind` value serialized into [`WorktreeReport`] —
+    /// `"agent"` / `"human"` / `"unknown"`.
+    fn kind(&self) -> &'static str {
+        match self {
+            WorktreeOwner::Agent { .. } => "agent",
+            WorktreeOwner::Human { .. } => "human",
+            WorktreeOwner::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// The identity string to carry in [`WorktreeReport::owner`] — `None`
+    /// for `Unknown`, matching `owner`'s pre-existing "no identity to
+    /// report" meaning. A `Human` renders as `human:<login>@<host>`,
+    /// matching `issue_dispatch::Identity::Human`'s own `Display` exactly,
+    /// so the two subsystems render an identity the same way.
+    fn identity_string(&self) -> Option<String> {
+        match self {
+            WorktreeOwner::Agent { identity } => Some(identity.clone()),
+            WorktreeOwner::Human { login, host } => Some(format!("human:{login}@{host}")),
+            WorktreeOwner::Unknown { .. } => None,
+        }
+    }
+}
+
+/// Fork issue #231's exact state: a pre-fork#166 marker, bare `"deck\n"`
+/// with no `created-by:` line.
+const LEGACY_MARKER_UNKNOWN_REASON: &str = "ownership marker predates fork #166's identity tracking (bare \"deck\\n\", no `created-by:` \
+     line) -- it proves deck-creation but names no identity to attribute it to (fork issue #231)";
+
+/// The worktree's own git metadata directory could not be resolved, or
+/// failed the containment check against the enumerating repo's common dir
+/// (see `owned_git_dir`) — e.g. a forged `.git` redirect
+/// (`worktree/reclaim/014`). Fails closed to `Unknown` rather than assuming
+/// `Human`: an unverifiable worktree structure is not evidence of anything.
+const GIT_DIR_UNRESOLVED_UNKNOWN_REASON: &str = "this worktree's own git metadata directory could not be resolved or verified as contained \
+     under the repository's common directory, so ownership cannot be determined";
+
+/// No marker, and `gh api user` could not resolve a login — `gh` absent,
+/// unauthenticated, or a spawn/exit failure. `worktree list` must keep
+/// working in this state, never crash and never guess an identity.
+const GH_LOGIN_UNRESOLVED_UNKNOWN_REASON: &str = "no ownership marker is present and `gh api user` could not resolve a login (gh absent, \
+     unauthenticated, or failing) -- worktree list keeps working rather than guessing an identity";
+
+/// Resolve a worktree's reporting owner (PRD fork#298 M1.0). `human_cache`
+/// is shared across one [`examine_worktrees`] call so that, in a repo with
+/// several unmarked (hand-made) worktrees, the `gh api user` round trip
+/// happens at most once per invocation rather than once per worktree — every
+/// unmarked worktree in a single `worktree list` run belongs to the same
+/// caller, so there is nothing to gain by re-resolving it.
+fn resolve_worktree_owner(
+    repo_dir: &Path,
+    worktree_path: &Path,
+    human_cache: &mut Option<WorktreeOwner>,
+) -> WorktreeOwner {
+    match owned_git_dir(repo_dir, worktree_path) {
+        Some(git_dir) => {
+            let marker_path = git_dir.join(OWNER_MARKER_FILENAME);
+            if marker_path.is_file() {
+                // Reuses `owner_of` (which itself reuses `read_marker_owner`
+                // -- no second parser) rather than reading the marker again
+                // here directly: a THIRD independent `owned_git_dir`
+                // resolution per worktree, on top of `ownership_of`'s and
+                // this function's own above, but it keeps exactly one
+                // function responsible for "what does this worktree's
+                // marker say", matching this module's existing tolerance
+                // for redundant independent resolutions over a shared,
+                // stateful one (see `owner_of`'s own doc on why
+                // `ownership_of` and `owner_of` already do this).
+                match owner_of(repo_dir, worktree_path) {
+                    Some(identity) => WorktreeOwner::Agent { identity },
+                    None => WorktreeOwner::Unknown {
+                        reason: LEGACY_MARKER_UNKNOWN_REASON,
+                    },
+                }
+            } else {
+                human_cache.get_or_insert_with(resolve_human_owner).clone()
+            }
+        }
+        None => WorktreeOwner::Unknown {
+            reason: GIT_DIR_UNRESOLVED_UNKNOWN_REASON,
+        },
+    }
+}
+
+/// The "no marker" branch of [`resolve_worktree_owner`]: resolve a human
+/// caller via the same seam `issue_claim::resolve_gh_login` already
+/// establishes (byte-identical `gh api user --jq .login` argv, via
+/// `issue_dispatch::gh_current_login_argv`), plus this host's own
+/// `local_hostname()`. Never panics, never shells out to anything other than
+/// `gh` — a failure resolves `Unknown` with a stated reason rather than
+/// crashing `worktree list`.
+fn resolve_human_owner() -> WorktreeOwner {
+    let host = crate::issue_dispatch_run::local_hostname();
+    match crate::issue_claim::resolve_gh_login() {
+        Ok(login) => WorktreeOwner::Human { login, host },
+        Err(_) => WorktreeOwner::Unknown {
+            reason: GH_LOGIN_UNRESOLVED_UNKNOWN_REASON,
+        },
+    }
+}
+
 /// The gate's outcome for one worktree. `Keep` and `Ask` both carry a reason;
 /// `Ask` additionally means "would be removed, but requires `--yes`".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,15 +320,24 @@ pub struct WorktreeReport {
     pub verdict: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The identity [`owner_of`] read back from the marker, when the
-    /// worktree is `Ours` and the marker carries a `created-by:` line.
-    /// `None` for a `Foreign` worktree, and `None` for an `Ours` worktree
-    /// whose marker predates fork #166 (the bare `"deck\n"` legacy content)
-    /// — omitted from JSON entirely rather than serialized as `null`,
+    /// The resolved identity string (PRD fork#298 M1.0's [`WorktreeOwner::identity_string`]):
+    /// the marker's `created-by:` line for an `Agent`, `human:<login>@<host>`
+    /// for a `Human` (no marker — CLAUDE.md rule 1's dominant real path),
+    /// `None` for `Unknown` — including an `Ours` worktree whose marker
+    /// predates fork #166 (the bare `"deck\n"` legacy content, fork issue
+    /// #231) — omitted from JSON entirely rather than serialized as `null`,
     /// mirroring `reason` above, so an older client reading this document
     /// still round-trips cleanly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// The three-state owner's kind (PRD fork#298 M2.0) — `"agent"` /
+    /// `"human"` / `"unknown"`, from [`WorktreeOwner::kind`]. Always
+    /// present, unlike `owner` above: every worktree resolves to exactly one
+    /// [`WorktreeOwner`] variant, so there is no "absent" case to omit.
+    /// Reporting-only — [`decide`] never reads this, only [`Ownership`]
+    /// (`owned` above), so a `Human`-owned worktree can never become
+    /// removable by a bare `reclaim`.
+    pub owner_kind: String,
     /// The worktree's real, byte-exact path (issue #144 finding 4) — never
     /// serialized; `path` above (`to_string_lossy`) is what the JSON document
     /// and the human report show. [`run_reclaim`] passes THIS to
@@ -260,11 +408,42 @@ pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
     )
 }
 
+/// Formats the fork issue #231 warning for a row `--mine` excludes because
+/// it is `owned: true` but carries no marker identity (`owner: None`) — most
+/// often a legacy pre-fork#166 marker (the bare `"deck\n"` content with no
+/// `created-by:` line, `owner_kind: "unknown"` as of PRD fork#298). Distinct
+/// from [`format_disagreement_warning`]'s #221 case: there `owned` and
+/// `owner` actively disagree; here `owned` is true and `owner` is simply
+/// absent, so nothing here signals forgery or a race, only that this row
+/// cannot be matched to any specific caller. Deliberately NOT also printed
+/// to stderr per-row (unlike the #221 warning above) — issue #231's own doc
+/// notes a blanket per-row stderr warning here would fire on every legacy
+/// worktree, every time, for a state that is working as designed; the
+/// `--json` document is where a consumer can decide, without a human
+/// terminal being spammed. `path` is display-only, sanitized the same way.
+pub fn format_excluded_unknown_owner_warning(path: &Path) -> String {
+    format!(
+        "worktree list --mine: {path} is deck-owned (owned: true) but carries no identifiable \
+         marker owner (often a legacy pre-fork#166 marker, owner_kind: \"unknown\") -- excluding \
+         it from --mine rather than guessing whether it is yours",
+        path = sanitize_path_for_terminal_display(path)
+    )
+}
+
 /// Top-level `--json` document.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeListDocument {
     pub schema_version: u32,
     pub worktrees: Vec<WorktreeReport>,
+    /// Machine-readable warnings a `--mine --json` consumer would otherwise
+    /// never see (fork issues #230, #231) — additive, so `SCHEMA_VERSION`
+    /// does not need a bump (per this file's own doc: "additive fields don't
+    /// need a bump"). Empty for a plain `worktree list --json` with no
+    /// `--mine` filtering: nothing has been excluded from the document, so
+    /// there is nothing to warn about. Reporting-only, exactly like
+    /// `owner_kind` — never changes which rows `--mine` retains.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl WorktreeListDocument {
@@ -272,7 +451,16 @@ impl WorktreeListDocument {
         Self {
             schema_version: SCHEMA_VERSION,
             worktrees,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Attach `--mine` filtering warnings (fork issues #230, #231) — a
+    /// separate step from [`Self::new`] so the three existing internal call
+    /// sites that never filter need no change.
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
     }
 }
 
@@ -1003,6 +1191,10 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
     let raw = list_linked_worktrees(repo_dir)?;
     let mut reports = Vec::with_capacity(raw.len());
+    // Shared across every worktree in this one call — see
+    // `resolve_worktree_owner`'s doc for why a `gh api user` resolution is
+    // reused rather than repeated per unmarked worktree.
+    let mut human_owner_cache: Option<WorktreeOwner> = None;
     for wt in raw {
         let cleanliness = check_cleanliness(&wt.path);
         let clean = cleanliness == Cleanliness::Clean;
@@ -1012,7 +1204,17 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         } else {
             Ownership::Foreign
         };
-        let owner = owner_of(repo_dir, &wt.path);
+        // PRD fork#298 M1.0: a SEPARATE `owned_git_dir` resolution from
+        // `ownership_of` above, deliberately mirroring the pre-existing
+        // `ownership_of` + `owner_of` split (fork #166 P2 / reviewer F5) —
+        // `owned` (removal authority) and `owner`/`owner_kind` (reporting)
+        // must never be derived from the same resolution, or a party able to
+        // flip the worktree's `.git` redirect between the two calls could
+        // make the containment check pass against the real admin dir while
+        // the content read lands in a forged one it controls.
+        let resolved_owner = resolve_worktree_owner(repo_dir, &wt.path, &mut human_owner_cache);
+        let owner = resolved_owner.identity_string();
+        let owner_kind = resolved_owner.kind().to_string();
         let pr_state = match &wt.branch {
             Some(branch) => resolve_pr_state(&wt.path, branch),
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
@@ -1037,6 +1239,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             reason: verdict.reason().map(str::to_string),
             verdict: verdict.label().to_string(),
             owner,
+            owner_kind,
             real_path,
         });
     }
@@ -1391,6 +1594,10 @@ mod tests {
             // assertion coverage for the field's content (see
             // worktree_reclaim_021 for that).
             owner: None,
+            // PRD fork#298: `owner_kind` alongside `owner` -- same reasoning
+            // as the comment above, updated only so this pre-existing test
+            // keeps compiling.
+            owner_kind: "unknown".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -2181,6 +2388,7 @@ mod tests {
                 clean: true,
                 owned: true,
                 owner: Some("orchestration:owner-x".to_string()),
+                owner_kind: "agent".to_string(),
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
@@ -2192,6 +2400,7 @@ mod tests {
                 clean: true,
                 owned: true,
                 owner: None,
+                owner_kind: "unknown".to_string(),
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
@@ -2259,6 +2468,7 @@ mod tests {
             clean: true,
             owned: false,
             owner: Some("orch-x".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
@@ -2270,6 +2480,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some("orch-x".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2281,6 +2492,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some("orch-y".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2298,6 +2510,7 @@ mod tests {
             clean: true,
             owned: false,
             owner: Some("orch-y".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
@@ -2309,6 +2522,7 @@ mod tests {
             clean: true,
             owned: false,
             owner: None,
+            owner_kind: "human".to_string(),
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
@@ -2483,6 +2697,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2525,6 +2740,7 @@ mod tests {
             clean: true,
             owned: false,
             owner: None,
+            owner_kind: "human".to_string(),
             pr_state: "merged".to_string(),
             verdict: "ask".to_string(),
             reason: Some(
@@ -2570,6 +2786,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -2612,6 +2829,7 @@ mod tests {
             clean: false,
             owned: true,
             owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
@@ -2661,6 +2879,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -2797,6 +3016,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2843,6 +3063,7 @@ mod tests {
             clean: true,
             owned: false,
             owner: None,
+            owner_kind: "unknown".to_string(),
             pr_state: "unresolvable".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason),
@@ -2911,6 +3132,7 @@ mod tests {
             clean: true,
             owned: true,
             owner: Some(owner),
+            owner_kind: "agent".to_string(),
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
