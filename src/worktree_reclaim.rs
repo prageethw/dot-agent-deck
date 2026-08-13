@@ -2356,4 +2356,222 @@ mod tests {
              terminal escaping applied -- so existing scripts parsing this field keep working"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Issue #232 part 2: `format_list_human`'s row carries three more
+    // untrusted cells beyond PATH -- OWNER, BRANCH, REASON. As decided for
+    // this round, `format_reclaim_human` does not render `owner` at all --
+    // its pending/Removed/Kept sections interpolate only `path` and
+    // `reason`, both already fully covered by part 1's path tests -- so no
+    // new cell tests are added there.
+    //
+    // OWNER's two hostile-char groups do NOT behave the same, and that
+    // asymmetry is why OWNER gets no full-mix cell test of its own here.
+    // The six `HOSTILE_CONTROLS` chars are all Unicode category Cc
+    // (control: U+0000-U+001F, U+007F-U+009F, which covers DEL and the C1
+    // control U+009B used here), and `owner_of` -> `read_marker_owner` is
+    // the ONLY call site that ever sets `WorktreeReport.owner` (verified by
+    // reading every construction site of the field) -- it unconditionally
+    // maps the parsed value through `sanitize_marker_creator`, whose
+    // `char::is_control()` filter strips every Cc char before the value is
+    // ever assigned. A full-mix OWNER test would therefore assert
+    // sanitization against six chars that provably cannot reach this cell
+    // today; per this task's own instruction that is noise, not coverage,
+    // and is skipped rather than written. The four `HOSTILE_BIDI` (Cf)
+    // chars are NOT filtered by `sanitize_marker_creator` -- that is the
+    // documented gap `read_marker_owner`'s own doc comment already calls
+    // out -- so OWNER's real, reachable hostile content is Cf/bidi only,
+    // and is covered by the dedicated Cf-gap test below instead of being
+    // duplicated in a second, near-identical OWNER test here.
+    //
+    // BRANCH has no analogous in-code filter: `wt.branch` is
+    // `String::from_utf8_lossy` straight off `git worktree list
+    // --porcelain`'s `branch refs/heads/<name>` field with nothing applied
+    // to it afterward. Verified empirically (`git check-ref-format
+    // --branch`) that git's own ref-name validation rejects all five
+    // plain-ASCII controls used here (ESC, CR, LF, TAB, DEL) on the normal
+    // branch-creation path, but ACCEPTS the C1 control U+009B (its UTF-8
+    // encoding's bytes fall outside the `<0x20 or ==0x7F` range that check
+    // enforces) and all four Cf/bidi chars unmodified. So on the ordinary
+    // `git branch` / `worktree add` path, only C1 + Cf/bidi are reachable
+    // -- but nothing in this crate re-validates a ref name it reads back,
+    // so a `.git` admin-dir a process could write directly (the exact
+    // threat model `read_marker_owner`'s own doc comment already accepts
+    // for the marker file) is not excluded either. The BRANCH test below
+    // still uses the full mix: `format_list_human` is the render boundary
+    // regardless of provenance, and nothing in the crate proves the
+    // ASCII-control chars can never reach it.
+    //
+    // REASON has no filter at all in either direction: `check_cleanliness`
+    // and `resolve_pr_state` interpolate raw, `String::from_utf8_lossy`
+    // subprocess stderr (`git status --porcelain`, `gh`) straight into the
+    // `Unresolvable` reason string with nothing stripped, so it is the
+    // least-filtered of the three cells and the full mix is used
+    // unreservedly.
+    // -------------------------------------------------------------------
+
+    /// The same hostile-content mix as [`hostile_path_component`], as a
+    /// bare `String` for cells (OWNER, BRANCH, REASON) that are
+    /// `Option<String>` rather than `PathBuf`.
+    fn hostile_string_component() -> String {
+        hostile_path_component().to_string_lossy().into_owned()
+    }
+
+    /// Asserts `output` carries no raw byte of any [`HOSTILE_BIDI`] char and
+    /// carries each one's `char::escape_default()` spelling instead. Unlike
+    /// [`assert_hostile_content_is_sanitized`], this does NOT also require
+    /// [`HOSTILE_CONTROLS`]' escaped spellings: the Cf-gap test below feeds
+    /// an input that has already had every `HOSTILE_CONTROLS` char stripped
+    /// (not escaped) by `sanitize_marker_creator`, so requiring their
+    /// escaped spelling too would fail on chars that were correctly removed
+    /// upstream rather than escaped at the render site.
+    fn assert_bidi_content_is_sanitized(output: &str) {
+        for c in HOSTILE_BIDI.iter() {
+            assert!(
+                !output.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in rendered \
+                 output, got {output:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                output.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) to appear in \
+                 rendered output, got {output:?}",
+                *c as u32
+            );
+        }
+    }
+
+    /// Scenario: `format_list_human` renders one report whose `branch`
+    /// embeds the same hostile mix used for PATH. The BRANCH column must
+    /// carry no raw control byte and must carry each one's escaped spelling
+    /// instead, while printable Unicode survives; a raw TAB here would also
+    /// forge a column boundary and shift every later cell, so this pins the
+    /// row back to eight TAB-separated fields too.
+    #[test]
+    fn format_list_human_escapes_hostile_content_in_branch_column() {
+        let branch = hostile_string_component();
+        let path = PathBuf::from("/repo/normal");
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some(branch),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_hostile_content_is_sanitized(&out);
+
+        let row = out
+            .lines()
+            .nth(1)
+            .expect("format_list_human must emit a data row after the header");
+        assert_eq!(
+            row.split('\t').count(),
+            8,
+            "a raw TAB embedded in the branch must not corrupt the TAB-separated column \
+             count, got row: {row:?}"
+        );
+    }
+
+    /// Scenario: `format_list_human` renders one report whose `reason`
+    /// embeds the same hostile mix. REASON is built from raw, unsanitized
+    /// subprocess stderr (`check_cleanliness` / `resolve_pr_state`
+    /// interpolate `git`/`gh` diagnostics verbatim into the `Unresolvable`
+    /// reason string), so it is the least-filtered of the three cells. The
+    /// REASON column must carry no raw control byte and must carry each
+    /// one's escaped spelling instead, while printable Unicode survives; a
+    /// raw TAB here is the same row-structure attack as the other cells,
+    /// pinned the same way.
+    #[test]
+    fn format_list_human_escapes_hostile_content_in_reason_column() {
+        let reason = hostile_string_component();
+        let path = PathBuf::from("/repo/normal");
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/normal".to_string()),
+            clean: true,
+            owned: false,
+            owner: None,
+            pr_state: "unresolvable".to_string(),
+            verdict: "keep".to_string(),
+            reason: Some(reason),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_hostile_content_is_sanitized(&out);
+
+        let row = out
+            .lines()
+            .nth(1)
+            .expect("format_list_human must emit a data row after the header");
+        assert_eq!(
+            row.split('\t').count(),
+            8,
+            "a raw TAB embedded in the reason must not corrupt the TAB-separated column \
+             count, got row: {row:?}"
+        );
+    }
+
+    /// Scenario: `sanitize_marker_creator` filters Unicode category Cc but
+    /// leaves Cf/bidi controls (RTL override, LTR isolate, zero-width
+    /// space, BOM) untouched, so a `created-by:` marker value carrying
+    /// U+202E reaches `WorktreeReport.owner` exactly as written -- this is
+    /// the gap `read_marker_owner`'s own doc comment already names. This
+    /// test feeds `format_list_human` the exact value
+    /// `sanitize_marker_creator` hands back for such a marker (sanity-
+    /// checked below to confirm the Cf/bidi chars really do survive it) and
+    /// pins the fix at the render site rather than the sanitizer: the OWNER
+    /// column must still not show the raw Cf/bidi char, even though
+    /// `sanitize_marker_creator` itself is untouched by this fix.
+    #[test]
+    fn format_list_human_escapes_cf_bidi_survivors_of_marker_sanitizer_in_owner_column() {
+        let raw_creator = "orchestration:demo-café\u{202e}\u{2066}\u{200b}\u{feff}-tail";
+        let owner = sanitize_marker_creator(raw_creator);
+        for c in HOSTILE_BIDI.iter() {
+            assert!(
+                owner.contains(*c),
+                "sanity check: sanitize_marker_creator must not strip Cf/bidi char {c:?} \
+                 (U+{:04X}), or this test no longer pins the gap it is named for; got \
+                 {owner:?}",
+                *c as u32
+            );
+        }
+        for c in HOSTILE_CONTROLS.iter() {
+            assert!(
+                !owner.contains(*c),
+                "sanity check: sanitize_marker_creator is expected to strip Cc char {c:?} \
+                 (U+{:04X}) -- if it no longer does, this test's premise (only Cf survives) \
+                 is stale; got {owner:?}",
+                *c as u32
+            );
+        }
+
+        let path = PathBuf::from("/repo/normal");
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/normal".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some(owner),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_bidi_content_is_sanitized(&out);
+        assert!(
+            out.contains("café"),
+            "printable Unicode must survive a sanitizing fix unchanged, got {out:?}"
+        );
+    }
 }
