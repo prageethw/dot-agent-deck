@@ -341,45 +341,15 @@ mod tests {
     }
 
     /// Scenario: Build the orchestrator context and check that its `delegate`
-    /// and `work-done` command examples name the file name
-    /// `std::env::current_exe()` reports for the running process — the test
-    /// binary itself under `cargo test` — rather than the crate's baked-in
-    /// literal name, which the test binary's file name never matches.
+    /// and `work-done` command examples name what `binary_name()` resolves
+    /// for the running process — under `cargo test` the throwaway test binary
+    /// is never on `$PATH`, so this is its own absolute `current_exe()` path,
+    /// never the crate's baked-in literal name.
     #[spec("orchestration/delegate/032")]
     #[test]
     fn delegate_032_orchestrator_context_names_the_running_binary() {
-        // `binary_name()`'s $PATH-resolvability gate would otherwise always
-        // take the fallback branch under `cargo test` (the throwaway test
-        // binary is never on $PATH), which is exactly what would make the
-        // `assert_ne!` below fail instead of prove anything. See
-        // `DOT_AGENT_DECK_TEST_BINARY_ON_PATH`'s doc comment.
-        let _guard = crate::config::STATE_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var(crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH).ok();
-        // SAFETY: env-var lock held; restored below.
-        unsafe {
-            std::env::set_var(
-                crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
-                "1",
-            );
-        }
-
         let c = build_orchestrator_context(&config());
         let bin = crate::platform::paths::binary_name();
-
-        // SAFETY: same lock held; restoring the previous value.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(
-                    crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
-                    v,
-                ),
-                None => {
-                    std::env::remove_var(crate::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH)
-                }
-            }
-        }
 
         assert_ne!(
             bin, "dot-agent-deck",

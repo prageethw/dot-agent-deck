@@ -162,25 +162,8 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
 fn build_command(binary_path: &str) -> String {
     format!(
         "{} {HOOK_COMMAND_SUFFIX}",
-        shell_quote_if_needed(binary_path)
+        crate::platform::paths::shell_quote_if_needed(binary_path)
     )
-}
-
-/// Single-quote `path` for a POSIX shell only when it contains a character
-/// outside a conservative safe set; otherwise return it unchanged.
-fn shell_quote_if_needed(path: &str) -> String {
-    fn is_safe(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
-            )
-    }
-    if !path.is_empty() && path.bytes().all(is_safe) {
-        path.to_string()
-    } else {
-        format!("'{}'", path.replace('\'', r"'\''"))
-    }
 }
 
 /// Merge the deck's command hooks for `command` into an existing `hooks.json`

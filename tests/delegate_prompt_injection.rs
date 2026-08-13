@@ -486,26 +486,6 @@ fn session_start_event(
 async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     common::init_test_env();
 
-    // `binary_name()`'s $PATH-resolvability gate would otherwise always take
-    // the fallback branch under `cargo test` (this integration test's own
-    // binary is never on $PATH), which would make the `assert_ne!` below fail
-    // instead of prove anything. See `DOT_AGENT_DECK_TEST_BINARY_ON_PATH`'s
-    // doc comment. Unlike every other `ENV_LOCK` use in this file, this test
-    // is `#[tokio::test] async fn` and awaits well past this point
-    // (`handle_delegate` writes the task file from a `tokio::spawn`d task),
-    // so holding a `std::sync::MutexGuard` across those awaits trips
-    // `clippy::await_holding_lock`. The lock is therefore scoped to just the
-    // `set` call, not `_env`'s full lifetime — safe here because nextest
-    // gives this test its own process, so no sibling test can race the same
-    // env var while `_env` is alive.
-    let _env = {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        EnvGuard::set(&[(
-            dot_agent_deck::platform::paths::DOT_AGENT_DECK_TEST_BINARY_ON_PATH,
-            "1",
-        )])
-    };
-
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd
         .path()

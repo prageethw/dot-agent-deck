@@ -2878,24 +2878,24 @@ without depending on the config struct API.
 - **Does not assert:** the symlink-defeated variants of the same rule (covered by `orchestration/delegate/027`/`028`); the exact refusal wording (stderr is not inspected — only the exit code).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
-##### orchestration/delegate/032 — The generated orchestrator context names the running binary's own file name, not a baked-in literal (issue #253).
+##### orchestration/delegate/032 — The generated orchestrator context names what `binary_name()` resolves for the running process, not a baked-in literal (issue #253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `orchestrator_context::build_orchestrator_context`; no TUI harness, no daemon).
 - **Agent:** none.
-- **Asserts:** with a synthetic role config, the composed context's `delegate` and `work-done` command examples both contain the file name `platform::paths::binary_name()` resolves for the running process (the `cargo test` test binary itself, which is never literally `dot-agent-deck`) — proving the text is generated from `current_exe()` rather than a hardcoded string.
-- **Does not assert:** the symlink-resolution behavior of `current_exe()` itself (a property of the platform, not this crate); the fallback branch (`orchestration/delegate/034`).
+- **Asserts:** with a synthetic role config, the composed context's `delegate` and `work-done` command examples both contain `platform::paths::binary_name()`'s resolution for the running process — under `cargo test` the throwaway test binary is never on `$PATH`, so this is its own absolute `current_exe()` path, never literally `dot-agent-deck` — proving the text is generated from `current_exe()` rather than a hardcoded string.
+- **Does not assert:** the symlink-resolution behavior of `current_exe()` itself (a property of the platform, not this crate); the malformed-`current_exe()` fallback branch (`orchestration/delegate/034`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/delegate/033 — The generated worker task file's `work-done` instruction names the running binary's own file name, not a baked-in literal (issue #253).
+##### orchestration/delegate/033 — The generated worker task file's `work-done` instruction names what `binary_name()` resolves for the running process, not a baked-in literal (issue #253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `state::compose_worker_task_file`; no TUI harness, no daemon).
 - **Agent:** none.
-- **Asserts:** the composed worker task file's `## When done` footer's `--task-file` and inline `--task` command examples both contain the file name `platform::paths::binary_name()` resolves for the running process (the `cargo test` test binary itself, which is never literally `dot-agent-deck`).
-- **Does not assert:** the fallback branch (`orchestration/delegate/034`); the rest of the footer's shell-safety content (covered by the pre-existing `compose_worker_task_file_appends_work_done_footer`).
+- **Asserts:** the composed worker task file's `## When done` footer's `--task-file` and inline `--task` command examples both contain `platform::paths::binary_name()`'s resolution for the running process (the `cargo test` test binary's own absolute `current_exe()` path, which is never literally `dot-agent-deck`).
+- **Does not assert:** the malformed-`current_exe()` fallback branch (`orchestration/delegate/034`); the rest of the footer's shell-safety content (covered by the pre-existing `compose_worker_task_file_appends_work_done_footer`).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/delegate/034 — The command-name resolver falls back to the crate's default literal when `current_exe()` is unavailable or unusable (issue #253).
+##### orchestration/delegate/034 — The command-name resolver falls back to the crate's default literal only when `current_exe()` itself is unavailable or unusable (issue #253).
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::resolve_binary_name`, the pure seam behind `binary_name`; no TUI harness, no daemon).
 - **Agent:** none.
-- **Asserts:** an `Err` result, a path with no file name (`/`), and (Unix-only) a non-UTF-8 file name all resolve to `DEFAULT_BINARY_NAME` (`env!("CARGO_PKG_NAME")`) rather than panicking or producing an empty string.
+- **Asserts:** an `Err` result, a path with no file name (`/`), and (Unix-only) a non-UTF-8 file name all resolve to `DEFAULT_BINARY_NAME` (`env!("CARGO_PKG_NAME")`) rather than panicking or producing an empty string. A well-formed `current_exe()` whose bare file name is merely shell-unsafe or absent from `$PATH` does NOT fall back to this literal — it falls back to the absolute `current_exe()` path instead (`platform::paths::resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe`/`_not_on_path`, plain `#[test]`s alongside this one, not separately cataloged).
 - **Does not assert:** a real `current_exe()` failure (not reproducible on demand); the happy path (`orchestration/delegate/032`–`033`).
 - **Platform coverage:** mac+linux+windows.
 

@@ -254,9 +254,10 @@ fn current_user_sid_string() -> std::io::Result<String> {
 }
 
 /// The crate's own package name — the literal fallback [`binary_name`] returns
-/// when `current_exe()` is unavailable or unusable, and the single source of
-/// truth every other such fallback in the crate should read rather than
-/// re-typing the literal `"dot-agent-deck"`.
+/// when `current_exe()` is unavailable or genuinely unusable (an error, an
+/// empty or non-UTF-8 path), and the single source of truth every other such
+/// fallback in the crate should read rather than re-typing the literal
+/// `"dot-agent-deck"`.
 pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 
 /// The command name this build was invoked as — the file name component of
@@ -283,55 +284,70 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// `dot-agent-deck` (possibly not on `$PATH` at all) on Linux, for the exact
 /// same install.
 ///
-/// Two gates keep the resolved name usable rather than merely well-formed
+/// Two gates keep the bare file name usable rather than merely well-formed
 /// (issue #253 review/audit):
 ///
-/// - **`$PATH`-resolvability.** The resolved file name is used ONLY when it
-///   actually resolves via a `$PATH` lookup ([`resolves_on_path`]); otherwise
-///   this falls back to [`DEFAULT_BINARY_NAME`]. `wrap.rs`'s
-///   `deck_binary_for_wrap` already documents the policy this crate commits
-///   to for "which name do I tell an agent to run": *"behaviour only ever
-///   improves on what `$PATH` would have found."* Without this gate, a build
-///   renamed but not installed on `$PATH` would regress from "resolves to
-///   the wrong-but-runnable literal, by accident" to "resolves to nothing at
-///   all" — trading a case that happened to work for one that silently never
-///   does, which is precisely the failure this function exists to eliminate.
+/// - **`$PATH`-resolvability.** The bare file name is used ONLY when it
+///   actually resolves, on the deck process's own `$PATH`, to an
+///   **executable** file ([`resolves_on_path`]) — a readable-but-non-executable
+///   regular file does not count. `wrap.rs`'s `deck_binary_for_wrap` already
+///   documents the policy this crate commits to for "which name do I tell an
+///   agent to run": *"behaviour only ever improves on what `$PATH` would have
+///   found."*
 /// - **Shell safety.** A name outside [`is_safe_binary_name`]'s conservative
 ///   allowlist is rejected — not quoted — for the same reason `wrap.rs`'s
-///   `usable()` rejects rather than quotes: this name is interpolated
+///   `usable()` rejects rather than quotes: the bare name is interpolated
 ///   UNQUOTED into ```` ```bash ```` blocks an agent executes verbatim, and
-///   quoting an unsafe name would still resolve to nothing on a normal
+///   quoting an unsafe *bare name* would still resolve to nothing on a normal
 ///   `$PATH` — converting an injection into a silent no-op rather than a
 ///   name that at least works.
 ///
-/// Falls back to [`DEFAULT_BINARY_NAME`] when `current_exe()` errors, its
-/// file name is empty or not valid UTF-8, it fails the shell-safety check, or
-/// it does not resolve on `$PATH`. The fallback matters more here than at
-/// most other `current_exe()` call sites: `delegate` and `work-done` write to
-/// the unversioned hook socket, both call sites are fire-and-forget, and the
-/// daemon drops any frame it cannot parse without logging it — so a name
-/// that resolves to a binary that cannot run produces no error anywhere,
-/// only a signal that silently never arrives.
+/// When either gate rejects the bare file name, this does **not** fall back to
+/// [`DEFAULT_BINARY_NAME`] — the deck process's own `$PATH` is only a *proxy*
+/// for the consuming agent's (agents commonly run through a login shell that
+/// sources profile files this process never saw), so a bare name absent from
+/// the deck's `$PATH` may still be perfectly runnable there, and conversely a
+/// literal `dot-agent-deck` fallback can name a binary that was never
+/// installed at all. Instead this falls back to `current_exe()`'s own
+/// **absolute path**, quoted with [`shell_quote_if_needed`] so a path
+/// containing whitespace still parses as one argument — a path is independent
+/// of whatever `$PATH` the agent's shell ends up with, so it resolves
+/// regardless of which proxy this process's own `$PATH` turned out to be.
+///
+/// [`DEFAULT_BINARY_NAME`] remains the fallback only when `current_exe()`
+/// itself is unusable: an error, an empty file name, or (Unix) a file name
+/// that is not valid UTF-8. The fallback matters more here than at most other
+/// `current_exe()` call sites: `delegate` and `work-done` write to the
+/// unversioned hook socket, both call sites are fire-and-forget, and the
+/// daemon drops any frame it cannot parse without logging it — so a name that
+/// resolves to a binary that cannot run produces no error anywhere, only a
+/// signal that silently never arrives.
 pub fn binary_name() -> String {
     resolve_binary_name(std::env::current_exe(), resolves_on_path)
 }
 
 /// Pure seam behind [`binary_name`]. `resolves_on_path` is injected so both
-/// the malformed-input fallback ([`delegate/034`]) and the two usability
-/// gates (shell safety, `$PATH` resolvability) are unit-testable with a
-/// synthetic `current_exe()` and a synthetic resolver, without needing a
-/// real unusable `current_exe()` or a real `$PATH` entry.
+/// the malformed-input fallback ([`delegate/034`]) and the two bare-name
+/// usability gates (shell safety, `$PATH` resolvability) are unit-testable
+/// with a synthetic `current_exe()` and a synthetic resolver, without needing
+/// a real unusable `current_exe()` or a real `$PATH` entry.
 fn resolve_binary_name(
     current_exe: std::io::Result<PathBuf>,
     resolves_on_path: impl Fn(&str) -> bool,
 ) -> String {
-    current_exe
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_os_string()))
-        .and_then(|name| name.into_string().ok())
-        .filter(|name| is_safe_binary_name(name))
-        .filter(|name| resolves_on_path(name))
-        .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string())
+    let Ok(path) = current_exe else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    if is_safe_binary_name(name) && resolves_on_path(name) {
+        return name.to_string();
+    }
+    match path.to_str() {
+        Some(path_str) => shell_quote_if_needed(path_str),
+        None => DEFAULT_BINARY_NAME.to_string(),
+    }
 }
 
 /// Whether `name` is safe to interpolate UNQUOTED into the generated `bash`
@@ -352,32 +368,83 @@ fn is_safe_binary_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
 }
 
-/// Test-only override: when set to a non-empty value, [`binary_name`]'s
-/// `$PATH`-resolvability gate ([`resolves_on_path`]) is treated as satisfied
-/// unconditionally. Production never sets it.
+/// Whether `name` resolves via a `$PATH` lookup to a genuinely **executable**
+/// file — the real resolver [`binary_name`] injects into
+/// [`resolve_binary_name`]. Unlike `wrap.rs`'s `usable()`, a bare existence
+/// probe (`is_file()`) is not enough here: `binary_name()` feeds an agent's
+/// shell a bare command name it is expected to *run*, so a readable-but-not-executable
+/// regular file of that name earlier on `$PATH` would report success while
+/// leaving the generated command unrunnable (issue #253 review). Same
+/// exec-bit check as `orchestrator_ext`'s `is_executable_file`: `is_file()`
+/// plus, on Unix, at least one exec permission bit; non-Unix has no cheap
+/// exec-bit probe, so a regular file is accepted there.
 ///
-/// `cargo test`/`cargo nextest` compiles each test into its own throwaway
-/// binary under `target/<profile>/deps/`, which is never actually
-/// discoverable on `$PATH` — so without this escape hatch, `binary_name()`
-/// would ALWAYS take the fallback branch under test, which would make
-/// `orchestration/delegate/032`/`033` (which assert that the RUNNING
-/// binary's own name — not the fallback — propagates into generated text)
-/// either vacuous or permanently red. Same pattern as `wrap.rs`'s
-/// `DOT_AGENT_DECK_WRAP_BIN`; nextest gives each test its own process, so
-/// setting this for one test's duration cannot leak into another.
-pub const DOT_AGENT_DECK_TEST_BINARY_ON_PATH: &str = "DOT_AGENT_DECK_TEST_BINARY_ON_PATH";
-
-/// Whether `name` resolves via a `$PATH` lookup — the real resolver
-/// [`binary_name`] injects into [`resolve_binary_name`]. Checked with a bare
-/// existence probe (`is_file()`), matching `wrap.rs`'s `usable()` precedent
-/// rather than also requiring the execute bit: the value here is read-only
-/// generated text, not something this process itself spawns.
+/// No test-only override is needed: under `cargo test`/`cargo nextest`, each
+/// test's own throwaway binary under `target/<profile>/deps/` is never on
+/// `$PATH` either way, so [`resolve_binary_name`] naturally takes its
+/// absolute-path fallback branch — which is itself the RUNNING binary's own
+/// path, not the [`DEFAULT_BINARY_NAME`] literal — and that is exactly what
+/// `orchestration/delegate/032`–`033` assert.
 fn resolves_on_path(name: &str) -> bool {
-    if std::env::var(DOT_AGENT_DECK_TEST_BINARY_ON_PATH).is_ok_and(|v| !v.is_empty()) {
-        return true;
+    match std::env::var_os("PATH") {
+        Some(paths) => path_contains_executable(&paths, name),
+        None => false,
     }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+/// Scan a `PATH`-shaped value for an executable file named `name`. Pure over
+/// its `path` argument (no environment read), matching `orchestrator_ext`'s
+/// `path_contains_binary` precedent, so the executable-vs-regular-file
+/// distinction is unit-testable with a synthetic `PATH` value rather than by
+/// mutating the process-global `PATH` env var.
+fn path_contains_executable(path: &std::ffi::OsStr, name: &str) -> bool {
+    std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+/// Whether `candidate` is a regular file that is *also* executable. Same
+/// rationale and shape as `orchestrator_ext::is_executable_file`: `is_file()`
+/// alone would accept a same-named regular-but-non-executable file earlier on
+/// `$PATH`. On Unix this additionally requires at least one exec bit
+/// (`mode & 0o111 != 0`); on non-Unix targets there is no cheap exec-bit
+/// check, so a regular file is accepted.
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    if !candidate.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(candidate) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Single-quote `path` for a POSIX shell only when it contains a character
+/// outside a conservative safe set; otherwise return it unchanged. Canonical
+/// copy of the identical helper duplicated in `codex_hooks_manage.rs` and
+/// `devin_hooks_manage.rs`, which both call this one rather than defining
+/// their own (issue #253: [`binary_name`]'s absolute-path fallback needed the
+/// same quoting, so the third call site is what pushed the helper here rather
+/// than re-duplicating it a third time).
+pub(crate) fn shell_quote_if_needed(path: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
+            )
+    }
+    if !path.is_empty() && path.bytes().all(is_safe) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
 }
 
 /// Hook-ingestion endpoint. Unix: a Unix-domain-socket path
@@ -628,47 +695,109 @@ mod tests {
         );
     }
 
-    /// Reviewer F2 / auditor F1: a well-formed name that WOULD resolve on
-    /// `$PATH` must still fall back when it is not shell-safe — the
-    /// shell-safety gate has to reject independently of the `$PATH` gate,
-    /// not rely on an unsafe name also happening to be absent from `$PATH`.
+    /// Reviewer F2 / auditor F1, updated for issue #253's Greptile P1: a
+    /// well-formed name that WOULD resolve on `$PATH` must still be rejected
+    /// when it is not shell-safe — the shell-safety gate has to reject
+    /// independently of the `$PATH` gate, not rely on an unsafe name also
+    /// happening to be absent from `$PATH`. It no longer falls back to
+    /// [`DEFAULT_BINARY_NAME`], though: since `current_exe()` is otherwise
+    /// usable, it falls back to that absolute path instead, quoted exactly
+    /// like [`shell_quote_if_needed`] would quote it directly.
     #[test]
-    fn resolve_binary_name_falls_back_when_the_name_is_shell_unsafe() {
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
         assert_eq!(
             resolve_binary_name(
                 Ok(PathBuf::from("/usr/local/bin/dot-agent-deck (1)")),
                 |_| true
             ),
-            DEFAULT_BINARY_NAME,
-            "a name containing shell metacharacters must fall back even when it resolves \
-             on $PATH"
+            "'/usr/local/bin/dot-agent-deck (1)'",
+            "a name containing shell metacharacters must fall back to the quoted absolute \
+             path even when it resolves on $PATH"
         );
         assert_eq!(
             resolve_binary_name(
                 Ok(PathBuf::from("/usr/local/bin/dot-agent-deck copy")),
                 |_| true
             ),
-            DEFAULT_BINARY_NAME,
-            "a name containing whitespace must fall back (the Finder-duplicate case)"
+            "'/usr/local/bin/dot-agent-deck copy'",
+            "a name containing whitespace must fall back to the quoted absolute path \
+             (the Finder-duplicate case)"
         );
         assert_eq!(
             resolve_binary_name(Ok(PathBuf::from("/usr/local/bin/-rf")), |_| true),
-            DEFAULT_BINARY_NAME,
-            "a name with a leading '-' must fall back — it would be read as a flag"
+            "/usr/local/bin/-rf",
+            "a name with a leading '-' must fall back to the absolute path — unquoted, \
+             since as a full path argument (not a bare token) a leading '-' in the file \
+             name component is not read as a flag"
         );
     }
 
-    /// Reviewer F1 / auditor F1 (the pre-merge fix): a well-formed, shell-safe
-    /// name that does NOT resolve on `$PATH` must fall back rather than
-    /// emitting an unrunnable command — this is the case that regressed from
-    /// "wrong but runnable by accident" to "resolves to nothing" before the
-    /// gate existed.
+    /// Reviewer F1 / auditor F1, updated for issue #253's Greptile P1: a
+    /// well-formed, shell-safe name that does NOT resolve on `$PATH` must
+    /// still avoid emitting an unrunnable command — this is the case that
+    /// regressed from "wrong but runnable by accident" to "resolves to
+    /// nothing" before the gate existed. It no longer falls back to
+    /// [`DEFAULT_BINARY_NAME`] (a proxy for the CONSUMING agent's `$PATH`,
+    /// which the deck process's own `$PATH` cannot reliably stand in for);
+    /// it falls back to the absolute `current_exe()` path instead, which
+    /// resolves regardless of either process's `$PATH`.
     #[test]
-    fn resolve_binary_name_falls_back_when_the_name_is_not_on_path() {
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
         assert_eq!(
             resolve_binary_name(Ok(PathBuf::from("/opt/build/worker-agent-deck")), |_| false),
-            DEFAULT_BINARY_NAME,
-            "a well-formed name that does not resolve on $PATH must fall back"
+            "/opt/build/worker-agent-deck",
+            "a well-formed name that does not resolve on $PATH must fall back to the \
+             (unquoted, since it needs no quoting) absolute path"
+        );
+    }
+
+    /// Issue #253 Greptile P1: when `current_exe()` itself is fine but
+    /// neither gate is satisfied, the fallback must be the absolute path,
+    /// never the generic [`DEFAULT_BINARY_NAME`] literal — an absolute path
+    /// is independent of whatever `$PATH` the CONSUMING agent's login shell
+    /// ends up with, whereas the deck process's own `$PATH` (what the two
+    /// gates check) is only a proxy for it and a `DEFAULT_BINARY_NAME`
+    /// fallback can name a binary that was never installed under that name
+    /// at all.
+    #[test]
+    fn resolve_binary_name_absolute_path_fallback_is_never_the_default_literal() {
+        let fallback =
+            resolve_binary_name(Ok(PathBuf::from("/opt/build/worker-agent-deck")), |_| false);
+        assert_ne!(fallback, DEFAULT_BINARY_NAME);
+        assert_eq!(fallback, "/opt/build/worker-agent-deck");
+    }
+
+    /// Issue #253 Greptile P1 (the smaller half): [`path_contains_executable`]
+    /// (the pure helper behind [`resolves_on_path`]) must require the execute
+    /// bit, not just file existence — a readable but non-executable regular
+    /// file must not be treated as resolving, since `binary_name()` feeds an
+    /// agent's shell a bare name it is expected to *run*. Same distinction
+    /// `orchestrator_ext`'s `is_executable_file` already draws for `pi`
+    /// discovery. Driven through a synthetic `PATH` value rather than the
+    /// real process-global `PATH`, so no env-var lock is needed.
+    #[cfg(unix)]
+    #[test]
+    fn path_contains_executable_requires_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("not-a-real-binary-253");
+        std::fs::write(&candidate, b"#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(&candidate).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&candidate, perms.clone()).unwrap();
+
+        let synthetic_path = tmp.path().as_os_str();
+        assert!(
+            !path_contains_executable(synthetic_path, "not-a-real-binary-253"),
+            "a regular, non-executable file on $PATH must not resolve"
+        );
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&candidate, perms).unwrap();
+        assert!(
+            path_contains_executable(synthetic_path, "not-a-real-binary-253"),
+            "the same file, once executable, must resolve"
         );
     }
 
