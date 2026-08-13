@@ -723,11 +723,21 @@ impl ModeConfig {
 
 /// Resolve an orchestration name with the cwd-basename fallback that
 /// the TUI applies when constructing `TabMembership::Orchestration` and
-/// when labelling the `Tab::Orchestration` record. Empty / whitespace
-/// config names — produced by `#[serde(default)]` on `OrchestrationConfig::name`
-/// or by the user not writing a `name = ...` line — resolve to the
-/// basename of `dir`; falls back to the path's `display()` form when the
-/// dir has no basename (e.g. `/`).
+/// when labelling the `Tab::Orchestration` record. An empty config name —
+/// produced by `#[serde(default)]` on `OrchestrationConfig::name` or by
+/// the user not writing a `name = ...` line — resolves to the basename
+/// of `dir`; falls back to the path's `display()` form when the dir has
+/// no basename (e.g. `/`).
+///
+/// A whitespace-only name (e.g. `"   "`) is treated as a real, present
+/// name and returned unchanged — deliberately, not an oversight. This
+/// value crosses the TUI↔daemon wire as `TabMembership::Orchestration.name`,
+/// so normalizing whitespace here would change that field's meaning while
+/// its shape stays identical (CLAUDE.md rule 12's "semantic break behind a
+/// stable wire"). #174's whitespace-only case is real but has no known
+/// occurrence; fixing it would require a compatibility shim or a
+/// `changelog.d/*.breaking.md` plus a version bump, which the defect does
+/// not warrant.
 ///
 /// Centralized so the TUI's tab construction site, the TUI's hydration
 /// site, and the daemon's `handle_delegate` lookup all agree on the
@@ -947,10 +957,21 @@ pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectC
             // `TabMembership` / `Tab::Orchestration::name`. Both sides
             // call this loader; doing the normalization here is the one
             // place that keeps the contract consistent.
+            //
+            // #174 round 2: call `resolve_orchestration_name`
+            // unconditionally rather than gating it behind a duplicate
+            // `is_empty()` pre-check here. Two guards deciding the same
+            // "is this name blank" question independently is how the
+            // whitespace-only case slipped through in round 1: fixing
+            // only the inner function's blankness test (`is_empty()` ->
+            // `trim().is_empty()`) would have left this outer check
+            // still blocking the call for a name like `"   "`, so
+            // `tab.rs:808`'s unconditional call would resolve to the
+            // basename while this loader kept the raw whitespace —
+            // breaking the three-way agreement `lookup_orchestration_role`
+            // depends on. One call site owns the decision now.
             for orch in &mut config.orchestrations {
-                if orch.name.is_empty() {
-                    orch.name = resolve_orchestration_name(&orch.name, dir);
-                }
+                orch.name = resolve_orchestration_name(&orch.name, dir);
             }
             Ok(Some(config))
         }
@@ -2190,6 +2211,32 @@ reactive_panes = 0
         assert!(
             rendered.contains("3 | bogus"),
             "the offending line is still quoted under its gutter; got {rendered:?}"
+        );
+    }
+
+    /// #174: an empty name resolves to the cwd-basename fallback. A
+    /// whitespace-only name is deliberately NOT treated as blank — see
+    /// `resolve_orchestration_name`'s doc comment — so it is not covered
+    /// here.
+    #[test]
+    fn resolve_orchestration_name_treats_empty_as_unnamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = dir
+            .path()
+            .file_name()
+            .expect("tempdir has a basename")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(resolve_orchestration_name("", dir.path()), expected);
+    }
+
+    #[test]
+    fn resolve_orchestration_name_returns_a_named_orchestration_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_orchestration_name("my-orchestration", dir.path()),
+            "my-orchestration"
         );
     }
 }
