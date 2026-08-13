@@ -39,7 +39,9 @@ use std::time::Duration;
 
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
 use dot_agent_deck::daemon_protocol::AttachRequest;
-use dot_agent_deck::issue_dispatch::{IN_PROGRESS_LABEL, derive_issue_paths};
+use dot_agent_deck::issue_dispatch::{
+    IN_PROGRESS_LABEL, Identity, claim_comment_body, derive_issue_paths,
+};
 use spec::spec;
 
 // ---------------------------------------------------------------------------
@@ -654,16 +656,67 @@ fn count_orchestrators(daemon: &common::DaemonProc) -> usize {
         .count()
 }
 
-/// Canonicalise `worktree_dir` exactly as production's
-/// `canonicalize_identity_path` does (best-effort — falls back to the given
-/// path on error — which is safe here because by the point every call site
-/// reaches this the worktree genuinely exists on disk), then assert that a
-/// recorded `gh issue comment` call names BOTH halves of the round-3 identity
-/// anchor: that canonical path AND `branch` (CLAUDE.md rule 23). Asserting
-/// the branch alone would let a regression that omits the path — or
-/// substitutes a DIFFERENT canonical worktree path alongside a correct
-/// branch — pass undetected; the branch is a genuinely stable component, not
-/// a substitute for the two-field identity. `decoration` fills the
+/// Render the exact delimited fragment production writes into a claim
+/// comment for a given worktree path + branch — `` working `<path>` on
+/// branch `<branch>` `` — by constructing the [`Identity`] production would
+/// build (canonicalising `path` exactly as `Identity::worktree` does,
+/// falling back to the given path unchanged on a canonicalisation error) and
+/// rendering it through the REAL [`claim_comment_body`], rather than
+/// reimplementing the format string here. Reimplementing it is exactly
+/// round 2's own mistake: `contains(path) && contains(branch)` as two
+/// independent, undelimited substring checks is what let a comment naming a
+/// SIBLING worktree — the expected path plus a `-stale` suffix — pass
+/// undetected as long as it also carried the correct branch (fork#243 round
+/// 3). Comparing against production's OWN rendering, backticks included,
+/// closes that hole: `<path>-stale` is never a substring of `` `<path>` ``
+/// (the closing backtick lands right after `<path>`, not after the suffix).
+///
+/// `Identity::worktree`'s bare, undecorated label doesn't affect this
+/// fragment — `label` only ever renders BEFORE it (see
+/// [`Identity::Worktree`]'s own doc) — so the same fragment is correct
+/// regardless of which decorated constructor (`Identity::orchestration` /
+/// `Identity::issue_dispatch`) a real dispatch site actually used to build
+/// its `Identity`.
+fn worktree_identity_fragment(path: &Path, branch: &str) -> String {
+    let identity = Identity::worktree(path, branch);
+    let body = claim_comment_body(&identity, "0000-00-00T00:00:00Z", None, None);
+    let start = body
+        .find(" working `")
+        .expect("claim_comment_body always renders ` working ` for an Identity::Worktree");
+    let end = body[start..]
+        .find(" on host ")
+        .map(|i| start + i)
+        .expect("claim_comment_body always renders ` on host ` right after the branch clause");
+    body[start..end].to_string()
+}
+
+/// Whether any recorded `gh` call line is an `issue comment` invocation
+/// whose body contains the EXACT delimited identity fragment
+/// ([`worktree_identity_fragment`]) for `path` + `branch`. This is the
+/// actual predicate [`assert_claim_names_worktree_identity`] asserts,
+/// pulled out into its own pure function — no `GhStub`, no `wait_until`, no
+/// daemon — so
+/// `worktree_identity_fragment_rejects_a_path_sharing_only_a_prefix` below
+/// can pin its rejection behaviour against synthetic input directly.
+fn gh_calls_name_worktree_identity(calls: &[String], path: &Path, branch: &str) -> bool {
+    let fragment = worktree_identity_fragment(path, branch);
+    calls
+        .iter()
+        .any(|l| l.contains("issue") && l.contains("comment") && l.contains(&fragment))
+}
+
+/// Assert that a recorded `gh issue comment` call names the round-3 identity
+/// anchor EXACTLY as production renders it — the delimited fragment ``
+/// working `<canonical path>` on branch `<branch>` `` (CLAUDE.md rule 23),
+/// matched via [`gh_calls_name_worktree_identity`] against the REAL
+/// `claim_comment_body` output, not two independently `contains()`-checked
+/// substrings. Round 2's independent-substrings version is bypassable by a
+/// comment naming a DIFFERENT worktree that merely shares the expected path
+/// as a PREFIX (`<path>-stale`) alongside the correct branch; see
+/// [`worktree_identity_fragment`]'s own doc for why the delimited-fragment
+/// match closes that hole, and
+/// `worktree_identity_fragment_rejects_a_path_sharing_only_a_prefix` for the
+/// counterexample that pins it (fork#243 round 3). `decoration` fills the
 /// site-specific tail of the failure message — pass a full clause such as
 /// `"decorate it with the claiming task name"` / `"decorate it with the
 /// orchestration name"`.
@@ -673,23 +726,75 @@ fn assert_claim_names_worktree_identity(
     branch: &str,
     decoration: &str,
 ) {
-    let canonical_path =
-        std::fs::canonicalize(worktree_dir).unwrap_or_else(|_| worktree_dir.to_path_buf());
-    let canonical_path = canonical_path.to_string_lossy().into_owned();
+    let fragment = worktree_identity_fragment(worktree_dir, branch);
     let named_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls().iter().any(|l| {
-            l.contains("issue")
-                && l.contains("comment")
-                && l.contains(&canonical_path)
-                && l.contains(branch)
-        })
+        gh_calls_name_worktree_identity(&stub.gh_calls(), worktree_dir, branch)
     });
     assert!(
         named_identity,
-        "the claim comment must name BOTH halves of the round-3 identity anchor — the canonical \
-         worktree path ({canonical_path:?}) and the branch ({branch:?}, CLAUDE.md rule 23) — not \
-         merely {decoration}; observed gh calls:\n{}",
+        "the claim comment must name the round-3 identity anchor exactly as production renders \
+         it ({fragment:?}, CLAUDE.md rule 23) — not merely {decoration}; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
+    );
+}
+
+/// The counterexample fork#243 round 3 exists for: pins that
+/// [`gh_calls_name_worktree_identity`] — the predicate
+/// [`assert_claim_names_worktree_identity`] asserts on — REJECTS a recorded
+/// claim comment naming a DIFFERENT worktree that merely shares the
+/// expected canonical path as a PREFIX (`<path>-stale`), even paired with
+/// the exactly correct branch. That is precisely the shape round 2's
+/// `contains(path) && contains(branch)` predicate let through undetected:
+/// three rounds of this same assertion each stayed green for a weaker
+/// reason than intended, and none of the first two shipped a test that
+/// could have caught its own weakness. No `GhStub`, no daemon, no dispatch
+/// run — a synthetic recorded-call line is built by hand in the exact shape
+/// `claim_comment_body` renders, so this pins pure predicate logic; it is
+/// gated behind the `e2e` feature only because this whole file is (rule 5),
+/// not because it needs a PTY, a daemon, or a subprocess of its own.
+#[test]
+fn worktree_identity_fragment_rejects_a_path_sharing_only_a_prefix() {
+    let dir = common::harness_tempdir().expect("tempdir");
+    // Canonicalise up front so every use of `expected_path` below already IS
+    // the canonical form `Identity::worktree`'s own (idempotent) internal
+    // canonicalisation would produce — otherwise a raw-vs-canonical
+    // divergence (e.g. a `/var` -> `/private/var` symlink on macOS) would
+    // make the `-stale` suffix built below land on the wrong string and the
+    // counterexample would prove nothing.
+    let expected_path = std::fs::canonicalize(dir.path()).expect("tempdir canonicalizes");
+    let branch = "agent/issue-41";
+
+    let correct_fragment = worktree_identity_fragment(&expected_path, branch);
+    let correct_calls = vec![format!(
+        "gh issue comment 41 --body \"Claimed by the orchestration{correct_fragment} on host h \
+         at 2026-08-13T00:00:00Z.\""
+    )];
+    assert!(
+        gh_calls_name_worktree_identity(&correct_calls, &expected_path, branch),
+        "the predicate must ACCEPT a call naming the exact canonical path and branch; built \
+         call:\n{}",
+        correct_calls.join("\n")
+    );
+
+    // The counterexample: a SIBLING worktree whose path has the expected
+    // canonical path as a PREFIX, still paired with the correct branch.
+    // Built by hand (not via `worktree_identity_fragment`, which would
+    // canonicalise this non-existent `-stale` path right back down to
+    // `expected_path` itself via its `unwrap_or_else` fallback and defeat
+    // the point of this test) in the exact delimited shape
+    // `claim_comment_body` renders.
+    let stale_path = format!("{}-stale", expected_path.display());
+    let stale_calls = vec![format!(
+        "gh issue comment 41 --body \"Claimed by the orchestration working `{stale_path}` on \
+         branch `{branch}` on host h at 2026-08-13T00:00:00Z.\""
+    )];
+    assert!(
+        !gh_calls_name_worktree_identity(&stale_calls, &expected_path, branch),
+        "the predicate must REJECT a call naming a different worktree that merely shares the \
+         expected canonical path as a prefix ({stale_path:?}) — round 2's \
+         `contains(path) && contains(branch)` predicate let exactly this shape through \
+         undetected (fork#243 round 3); observed synthetic calls:\n{}",
+        stale_calls.join("\n")
     );
 }
 
@@ -1644,12 +1749,15 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     // not `issue-dispatch:<task>#<issue>@…` — the task name above is
     // DECORATION, not the compared identity string. `derive_issue_paths`
     // builds `paths.worktree_dir` lexically, while the identity rendered
-    // into the comment is physically resolved
-    // (`canonicalize_identity_path`), so this canonicalises the same way
-    // production does before comparing (fork#243) — and asserts BOTH halves
-    // of the identity, not the branch alone: a regression that serialises
-    // the correct branch but omits the path, or pairs the branch with a
-    // DIFFERENT canonical path, must still fail here.
+    // into the comment is physically resolved (`canonicalize_identity_path`),
+    // so `assert_claim_names_worktree_identity` builds the `Identity`
+    // production would build and matches against production's OWN
+    // `claim_comment_body` rendering (fork#243 round 3) — the delimited
+    // fragment `` working `<path>` on branch `<branch>` ``, not two
+    // independently `contains()`-checked substrings: a regression that
+    // serialises the correct branch but omits the path, or pairs the branch
+    // with a DIFFERENT canonical path (including one sharing the expected
+    // path as a mere prefix), must still fail here.
     assert_claim_names_worktree_identity(
         &stub,
         &paths.worktree_dir,
@@ -2261,12 +2369,16 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
 /// separately anchors on the COMPLETE round-3 identity — the dispatched
 /// worktree's canonical absolute path AND its branch (`agent/issue-<n>`,
 /// CLAUDE.md rule 23) — regardless of which spawn kind fired it. The test
-/// canonicalises `derive_issue_paths`' lexically-built path itself before
-/// comparing (fork#243): the identity rendered into the comment is
-/// physically resolved (`canonicalize_identity_path`), so a raw lexical
-/// comparison would falsely diverge whenever the workspace root is reached
-/// through a symlink. What differs between an orchestration dispatch and a
-/// single-agent one (`scheduler/dispatch/010`) is only which name is
+/// matches against production's OWN `claim_comment_body` rendering of the
+/// `Identity` production would build for `derive_issue_paths`' lexically-built
+/// path (fork#243 round 3, via `worktree_identity_fragment`): the identity
+/// rendered into the comment is physically resolved
+/// (`canonicalize_identity_path`), so a raw lexical comparison would falsely
+/// diverge whenever the workspace root is reached through a symlink — and the
+/// delimited backtick-quoted fragment this matches on can't be satisfied by a
+/// path sharing only a prefix, closing the hole round 2's independent
+/// substring checks left open. What differs between an orchestration dispatch
+/// and a single-agent one (`scheduler/dispatch/010`) is only which name is
 /// rendered as decoration.
 #[spec("scheduler/dispatch/021")]
 #[test]
@@ -2308,11 +2420,14 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
     // kind — `dispatch-orch` above is decoration only. `derive_issue_paths`
     // builds `paths.worktree_dir` lexically, while the identity rendered
     // into the comment is physically resolved (`canonicalize_identity_path`),
-    // so this canonicalises the same way production does before comparing
-    // (fork#243) — and asserts BOTH halves of the identity, not the branch
-    // alone: a regression that serialises the correct branch but omits the
-    // path, or pairs the branch with a DIFFERENT canonical path, must still
-    // fail here.
+    // so `assert_claim_names_worktree_identity` builds the `Identity`
+    // production would build and matches against production's OWN
+    // `claim_comment_body` rendering (fork#243 round 3) — the delimited
+    // fragment `` working `<path>` on branch `<branch>` ``, not two
+    // independently `contains()`-checked substrings: a regression that
+    // serialises the correct branch but omits the path, or pairs the branch
+    // with a DIFFERENT canonical path (including one sharing the expected
+    // path as a mere prefix), must still fail here.
     assert_claim_names_worktree_identity(
         &stub,
         &paths.worktree_dir,
