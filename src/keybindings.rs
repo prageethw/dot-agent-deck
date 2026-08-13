@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::terminal_sanitize::sanitize_for_terminal_display;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
@@ -672,7 +674,7 @@ impl KeybindingConfig {
             if key != "global" && key != "dashboard" {
                 warnings.push(format!(
                     "unknown keybinding section '[{}]' — ignored",
-                    sanitize_for_terminal(key)
+                    sanitize_for_terminal_display(key)
                 ));
             }
         }
@@ -799,7 +801,7 @@ impl KeybindingConfig {
                         eprintln!(
                             "keybindings ({}): {}",
                             path.display(),
-                            sanitize_for_terminal(w)
+                            sanitize_for_terminal_display(w)
                         );
                     }
                     config
@@ -808,7 +810,7 @@ impl KeybindingConfig {
                     eprintln!(
                         "Invalid keybindings at {}: {}",
                         path.display(),
-                        sanitize_for_terminal(&err)
+                        sanitize_for_terminal_display(&err)
                     );
                     Self::default()
                 }
@@ -818,30 +820,12 @@ impl KeybindingConfig {
                 eprintln!(
                     "Failed to read keybindings at {}: {}",
                     path.display(),
-                    sanitize_for_terminal(&err.to_string())
+                    sanitize_for_terminal_display(&err.to_string())
                 );
                 Self::default()
             }
         }
     }
-}
-
-/// Escape control characters (including ESC `0x1b`, CR, LF, etc.) in a string
-/// destined for the live terminal, leaving printable and non-ASCII characters
-/// intact. Used on every keybinding warning so a planted `keybindings.toml`
-/// cannot smuggle terminal escape sequences through the pre-alt-screen stderr
-/// output (the warning text echoes attacker-controlled notation / action names
-/// / TOML-parser snippets verbatim).
-fn sanitize_for_terminal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 impl Action {

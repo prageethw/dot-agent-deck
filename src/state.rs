@@ -11051,11 +11051,12 @@ clear = false
         // straight from the raw config value exactly as `tab.rs:808` does.
         let stamped_identity = crate::project_config::resolve_orchestration_name("   ", dir.path());
 
-        let (_, role) = lookup_orchestration_role_indexed(
+        let role = lookup_orchestration_role_indexed(
             dir.path().to_str().expect("utf8 tempdir"),
             &stamped_identity,
             "coder",
         )
+        .map(|(_, role)| role)
         .expect(
             "the daemon's freshly-loaded config must resolve the same blank-name \
              identity the TUI already stamped, or role config silently stops \
