@@ -1949,9 +1949,11 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     use dot_agent_deck::agent_pty::{
         DOT_AGENT_DECK_WORKTREE_OWNER, ORCHESTRATION_UNKNOWN_SENTINEL,
     };
+    use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
     use dot_agent_deck::worktree_reclaim::{
-        WorktreeListDocument, examine_worktrees, format_disagreement_warning, format_list_human,
-        is_mine, owner_disagreements, sanitize_marker_creator,
+        WorktreeListDocument, examine_worktrees, format_disagreement_warning,
+        format_list_error_for_cli, format_list_human, is_mine, owner_disagreements,
+        sanitize_marker_creator,
     };
 
     let owner_filter = if mine {
@@ -2013,14 +2015,17 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("worktree list: failed to resolve current directory: {e}");
+            eprintln!(
+                "worktree list: failed to resolve current directory: {}",
+                sanitize_for_terminal_display(&e.to_string())
+            );
             return ExitCode::FAILURE;
         }
     };
     let mut reports = match examine_worktrees(&cwd) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("worktree list: {e}");
+            eprintln!("{}", format_list_error_for_cli(&e));
             return ExitCode::FAILURE;
         }
     };
@@ -2074,14 +2079,21 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             // round 1 verified "the failure messages never print the
             // variable's value" as load-bearing, and printing it raw
             // reintroduced that terminal-escape / forged-line sink.
-            // Round-4 fixup (R4-1): `owner` is now already sanitized at
+            // Round-4 fixup (R4-1): `owner` is already sanitized at
             // construction (the single `Ok(v) => Some(sanitize_marker_creator(&v))`
-            // arm above), so printing it directly satisfies M1 by
-            // construction and, unlike a second `sanitize_marker_creator`
-            // call here, guarantees this is the exact string the filter
-            // compared against -- not a second, possibly-divergent
-            // normalization of it.
-            println!("no worktrees owned by {owner}");
+            // arm above), which guarantees this is the exact string the
+            // filter compared against -- not a second, possibly-divergent
+            // normalization of it. Issue #232 round 2 (gap 3) corrects M1's
+            // premise, though: `sanitize_marker_creator` strips Unicode
+            // category `Cc` but deliberately preserves `Cf` (bidi/format)
+            // chars, so "already sanitized" does not mean "safe to print to
+            // a terminal" -- this is the same terminal-display sink
+            // `format_disagreement_warning` has, so it goes through the same
+            // display sanitizer immediately before printing.
+            println!(
+                "no worktrees owned by {}",
+                sanitize_for_terminal_display(owner)
+            );
             return ExitCode::SUCCESS;
         }
         print!("{}", format_list_human(&reports));
@@ -2102,12 +2114,18 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
 /// worktree; only a failure to enumerate worktrees at all (e.g. not a git
 /// repo) is reported as failure.
 fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
-    use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
+    use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
+    use dot_agent_deck::worktree_reclaim::{
+        format_reclaim_error_for_cli, format_reclaim_human, run_reclaim,
+    };
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("worktree reclaim: failed to resolve current directory: {e}");
+            eprintln!(
+                "worktree reclaim: failed to resolve current directory: {}",
+                sanitize_for_terminal_display(&e.to_string())
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -2117,7 +2135,7 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("worktree reclaim: {e}");
+            eprintln!("{}", format_reclaim_error_for_cli(&e));
             ExitCode::FAILURE
         }
     }
