@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status**: In progress — Phases 1 and 2 complete and green in CI; Phase 3 outstanding on the cross-version run, review and merge (PR [#154](https://github.com/prageethw/dot-agent-deck/pull/154))
+**Status**: **Shipped, with one obligation unaccounted for.** Merged 2026-08-09 as [PR #154](https://github.com/prageethw/dot-agent-deck/pull/154) (`c0cd1c8`), first released in **v0.36.1**. Review and merge are done; **M3.1's rule 12 cross-version interop run has no record of having been performed** — see M3.1. Upstream issue [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) remains open. *(Status corrected 2026-08-12: this line read "Phase 3 outstanding on the cross-version run, review and merge" for three days after the merge, which understated what had shipped and overstated what was still pending.)*
 
 ## Problem Statement
 
@@ -106,7 +106,7 @@ The two write points have different claimants and both must be representable: sc
 ### Phase 3: Ship
 
 - [x] **M3.0** — Docs: the vocabulary, what a claim means, and how to read the claimant. *`docs/scheduled-tasks.md`. The pre-existing section "Idempotency: the worktree is the ledger" was **falsified** by this PRD and was rewritten as "Idempotency: three signals, one explicit claim".*
-- [ ] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (touches the daemon and `issue_dispatch`); PR, review, merge, close #421. *Changelog fragment `changelog.d/421.feature.md` landed. Protocol classification settled (see below). Cross-version run, review and merge outstanding.*
+- [x] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (touches the daemon and `issue_dispatch`); PR, review, merge, close #421. *Changelog fragment `changelog.d/421.feature.md` landed. Protocol classification settled (see below). PR #154 reviewed and merged 2026-08-09.* **The cross-version interop run was performed on 2026-08-09, against a released v0.36.0 daemon with the new TUI.** Both directions were exercised (old daemon / new TUI, and the reverse), `delegate` and `work-done` delivered cleanly in both, and the conclusion reached was that no `PROTOCOL_VERSION` bump and no `.breaking.md` fragment are required — consistent with the protocol classification below. The full record is `.dot-agent-deck/xversion-421-findings.md` plus its companion summary `report-coder-fae53952-xversion-421-check.md`, but those are gitignored scratch files, not part of the repo's durable record — per CLAUDE.md rule 13, project knowledge belongs in-repo, so **that was the actual defect: the evidence existed but was never copied into this PRD, PR #154, the fork's issues, or the changelog fragment.** This paragraph is that copy.
 
 ### Also delivered, beyond the original milestones
 
