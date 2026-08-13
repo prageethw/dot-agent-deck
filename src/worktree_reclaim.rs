@@ -32,6 +32,8 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
+
 /// Version of the `--json` document shape. Bump on a field removal or a
 /// meaning change; additive fields don't need a bump.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -231,13 +233,27 @@ pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
 /// the `owned_git_dir` race that produces the state it describes (that state
 /// cannot be reached through the real-binary `Fixture` -- see
 /// `tests/CATALOG.md`'s `worktree/reclaim/030` entry).
+///
+/// `path` and `owner` are both display-only here (issue #232): they go
+/// through [`sanitize_path_for_terminal_display`] /
+/// [`sanitize_for_terminal_display`], never the raw, byte-exact values --
+/// this warning is printed to stderr before the operator inspects the
+/// marker/admin state, so neither a hostile path component nor a hostile
+/// marker `owner` can forge or hide part of that warning. `owner` needs its
+/// own sanitizing pass here even though it already went through
+/// [`sanitize_marker_creator`] upstream (issue #232 round 2, gap 1): that
+/// sanitizer strips Unicode category `Cc` but deliberately preserves `Cf`
+/// (bidi/format) chars, exactly the set this module treats as hostile for
+/// display, so a marker value like `orchestration:prod\u{202e}...` would
+/// otherwise reach this stderr line with a raw bidi control still in it.
 pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
     format!(
         "worktree list --mine: {path} is marked owned by {owner}, but the ownership check \
          disagrees -- excluding it rather than trusting either signal (often a `git \
          rev-parse` race; persisting past a re-run rules that out -- check the marker and \
          admin dir)",
-        path = path.display()
+        path = sanitize_path_for_terminal_display(path),
+        owner = sanitize_for_terminal_display(owner)
     )
 }
 
@@ -997,6 +1013,17 @@ fn cell(value: &Option<String>) -> &str {
 
 /// Render the `worktree list` human table: one row per examined worktree,
 /// including its verdict and reason so the output is self-explanatory.
+///
+/// PATH, BRANCH, OWNER and REASON are all untrusted -- attacker-reachable by
+/// varying provenance (a worktree directory name, a `git` ref name, marker
+/// content that survived [`sanitize_marker_creator`]'s `Cc`-only filter, or
+/// raw subprocess stderr) -- so each is routed through
+/// [`sanitize_for_terminal_display`] / [`sanitize_path_for_terminal_display`]
+/// (issue #232) before it reaches this TAB-separated row: an unescaped raw
+/// TAB in any of them would also forge a column boundary and shift every
+/// later cell. `PR`, `CLEAN`, `OWNED` and `VERDICT` are internal
+/// enum/boolean labels this crate produces itself, never attacker content,
+/// so they are not sanitized.
 pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     if reports.is_empty() {
         return "no worktrees found\n".to_string();
@@ -1004,20 +1031,34 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     let mut out = String::new();
     out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tOWNER\tVERDICT\tREASON\n");
     for r in reports {
-        let path = r.path.to_string_lossy();
+        let path = sanitize_path_for_terminal_display(&r.path);
+        let branch = sanitize_for_terminal_display(cell(&r.branch));
+        let owner = sanitize_for_terminal_display(cell(&r.owner));
+        let reason = sanitize_for_terminal_display(r.reason.as_deref().unwrap_or(DASH));
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             path,
-            cell(&r.branch),
+            branch,
             r.pr_state,
             if r.clean { "yes" } else { "no" },
             if r.owned { "yes" } else { "no" },
-            cell(&r.owner),
+            owner,
             r.verdict,
-            r.reason.as_deref().unwrap_or(DASH),
+            reason,
         ));
     }
     out
+}
+
+/// Renders the exact line `dot-agent-deck worktree list` writes to stderr
+/// when enumeration itself fails (issue #232 round 4) -- the CLI wrapper in
+/// `main.rs` calls this instead of composing `sanitize_for_terminal_display`
+/// inline, so a test can call the identical production code rather than
+/// re-deriving its composition: reverting the sanitizer inside here breaks
+/// this function and the CLI sink together, because they are now the same
+/// call.
+pub fn format_list_error_for_cli(e: &str) -> String {
+    format!("worktree list: {}", sanitize_for_terminal_display(e))
 }
 
 /// Physically remove a worktree directory, preserving its branch:
@@ -1127,7 +1168,10 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
             outcome.pending.len()
         ));
         for r in &outcome.pending {
-            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
+            out.push_str(&format!(
+                "  - {}\n",
+                sanitize_path_for_terminal_display(&r.path)
+            ));
         }
         out.push_str(
             "Run `dot-agent-deck worktree reclaim --yes` to remove worktrees in this state, \
@@ -1139,7 +1183,10 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     if !outcome.removed.is_empty() {
         out.push_str("Removed:\n");
         for r in &outcome.removed {
-            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
+            out.push_str(&format!(
+                "  - {}\n",
+                sanitize_path_for_terminal_display(&r.path)
+            ));
         }
     } else {
         out.push_str("Removed: none\n");
@@ -1150,13 +1197,23 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
         for r in &outcome.kept {
             out.push_str(&format!(
                 "  - {} ({})\n",
-                r.path.to_string_lossy(),
-                r.reason.as_deref().unwrap_or("no reason recorded")
+                sanitize_path_for_terminal_display(&r.path),
+                sanitize_for_terminal_display(r.reason.as_deref().unwrap_or("no reason recorded"))
             ));
         }
     }
 
     out
+}
+
+/// Renders the exact line `dot-agent-deck worktree reclaim` writes to
+/// stderr when enumeration itself fails (issue #232 round 4) -- same
+/// rationale as [`format_list_error_for_cli`], but a separate function and a
+/// separate print site, because `worktree reclaim`'s prefix differs from
+/// `worktree list`'s and the two CLI sinks must stay independently fixed
+/// rather than sharing one.
+pub fn format_reclaim_error_for_cli(e: &str) -> String {
+    format!("worktree reclaim: {}", sanitize_for_terminal_display(e))
 }
 
 #[cfg(test)]
@@ -2093,6 +2150,796 @@ mod tests {
              the marker and admin dir)",
             "the disagreement warning's user-visible text must name the path and owner, state \
              what disagreed, and give a likely cause with a remedy"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #232: `Path::display()` / `to_string_lossy()` are encoding-lossy,
+    // not content-sanitizing -- a worktree path built by `path_from_bytes`
+    // (byte-exact `OsStr::from_bytes` on Unix) can carry ESC, CR, LF, other
+    // C0/C1 controls, and Unicode bidi/format (Cf) controls straight through
+    // into every human render site below. Each is a destructive-decision
+    // surface: `worktree list --mine`'s disagreement warning, the `worktree
+    // list` table, and `worktree reclaim`'s three independently reachable
+    // sections (pending / Removed / Kept). The fix boundary is the render
+    // site itself (`.dot-agent-deck/findings-232-surfaces.md`) --
+    // `path_from_bytes`, `WorktreeReport`, and `serialize_path_lossy` must
+    // NOT change, so these tests assert on formatter *output* only, never on
+    // an intermediate value.
+    //
+    // `hostile_path_component` mixes six C0/C1 controls, four Unicode
+    // bidi/format controls, and printable Unicode plus a path separator in
+    // one path. `assert_hostile_content_is_sanitized` pins the expected
+    // escape spelling to `char::escape_default()` -- the same escaping
+    // `sanitize_for_terminal` in `src/keybindings.rs` already uses for C0/C1
+    // (that helper does not cover Cf; the coder's fix must extend it or add
+    // a sibling that does) -- and separately requires the printable
+    // Unicode/path separator content to survive verbatim, so an over-eager
+    // "escape every non-ASCII char" fix fails this test exactly as a no-op
+    // fix does.
+    // -------------------------------------------------------------------
+
+    /// C0/C1 controls the fix must escape: ESC, CR, LF, TAB, DEL, and one
+    /// C1 control (CSI, U+009B).
+    const HOSTILE_CONTROLS: [char; 6] = ['\u{1b}', '\r', '\n', '\t', '\u{7f}', '\u{9b}'];
+
+    /// Unicode bidi/format (`Cf`) controls the fix must escape: RTL
+    /// override, left-to-right isolate, zero-width space, and BOM.
+    const HOSTILE_BIDI: [char; 4] = ['\u{202e}', '\u{2066}', '\u{200b}', '\u{feff}'];
+
+    /// A path embedding every char in [`HOSTILE_CONTROLS`] and
+    /// [`HOSTILE_BIDI`], plus printable Unicode and a path separator that
+    /// must survive a fix unchanged.
+    fn hostile_path_component() -> PathBuf {
+        let mut s = String::from("/repo/wt-café-日本語");
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            s.push(*c);
+        }
+        s.push_str("-tail");
+        PathBuf::from(s)
+    }
+
+    /// Asserts `cell` -- content the caller has already isolated to a single
+    /// untrusted field (a TAB-split table column) or bullet body (a
+    /// `format_reclaim_human` line with its `"  - "` prefix and trailing
+    /// newline stripped), never a raw multi-field/multi-line rendered string
+    /// -- carries no raw byte of any [`HOSTILE_CONTROLS`] / [`HOSTILE_BIDI`]
+    /// char, carries each one's `char::escape_default()` spelling instead,
+    /// and still carries the printable Unicode / path separator content
+    /// verbatim. Both directions matter equally: silently dropping a control
+    /// character is exactly as wrong as leaving it raw, since either way an
+    /// operator can no longer tell two hostile filenames apart.
+    ///
+    /// Deliberately checks a single isolated cell, never a whole rendered
+    /// row/report (issue #232 rescope): `format_list_human`'s rows are
+    /// TAB-separated and `format_reclaim_human`'s bullets are
+    /// newline-terminated, by design -- asserting "no raw TAB/LF anywhere in
+    /// the whole output" would demand the row/bullet structure itself not
+    /// exist, which no fix can satisfy. Callers pin structural corruption
+    /// separately, via field/line counts on the raw output, BEFORE isolating
+    /// the cell this runs against.
+    fn assert_hostile_content_is_sanitized(cell: &str) {
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            assert!(
+                !cell.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in the isolated \
+                 cell, got {cell:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                cell.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) to appear in \
+                 the isolated cell so two hostile filenames stay distinguishable, got \
+                 {cell:?}",
+                *c as u32
+            );
+        }
+        assert!(
+            cell.contains("café") && cell.contains("日本語"),
+            "printable Unicode must survive a sanitizing fix unchanged, got {cell:?}"
+        );
+        assert!(
+            cell.contains("/repo/wt-"),
+            "the path separator and ordinary path content must survive unchanged, got {cell:?}"
+        );
+    }
+
+    /// Scenario: `format_disagreement_warning` is given a path whose final
+    /// component embeds ESC/CR/LF/TAB/DEL/a C1 control and four Unicode
+    /// bidi/format controls, mixed with printable Unicode and an ordinary
+    /// path separator. The rendered warning -- shown on `worktree list
+    /// --mine`'s stderr before the operator inspects marker/admin state --
+    /// must carry no raw control byte and must carry each one's escaped
+    /// spelling instead, while the printable content survives unchanged.
+    #[test]
+    fn format_disagreement_warning_escapes_hostile_path_content() {
+        let path = hostile_path_component();
+        let out = format_disagreement_warning(&path, "test-owner");
+        assert_hostile_content_is_sanitized(&out);
+    }
+
+    /// Scenario: `format_list_human` renders one report whose `path` embeds
+    /// the same hostile mix. The PATH column of the `worktree list` table --
+    /// read to decide what to reclaim -- must carry no raw control byte and
+    /// must carry each one's escaped spelling instead; because the table is
+    /// TAB-separated, an unescaped raw TAB in the path would also corrupt
+    /// the column count, so this test additionally pins the row back to
+    /// exactly eight TAB-separated fields.
+    #[test]
+    fn format_list_human_escapes_hostile_path_content_in_path_column() {
+        let path = hostile_path_component();
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the path must not corrupt the line count (header + \
+             one data row), got: {out:?}"
+        );
+        let row = out
+            .lines()
+            .nth(1)
+            .expect("format_list_human must emit a data row after the header");
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            8,
+            "a raw TAB embedded in the path must not corrupt the TAB-separated column count, \
+             got row: {row:?}"
+        );
+        assert_hostile_content_is_sanitized(fields[0]);
+    }
+
+    /// Scenario: `format_reclaim_human` renders a pending-confirmation
+    /// report (no `--yes` yet) whose path embeds the hostile mix. This is
+    /// the highest-risk site
+    /// (`.dot-agent-deck/findings-232-surfaces.md`): it names the exact
+    /// directories a following `--yes` run may remove, so a forged path
+    /// here is a direct path to removing the wrong directory.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_path_in_pending_section() {
+        let path = hostile_path_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: false,
+            owner: None,
+            pr_state: "merged".to_string(),
+            verdict: "ask".to_string(),
+            reason: Some(
+                "reclaimable: PR is merged and the tree is clean, but the deck cannot prove \
+                 it created this worktree"
+                    .to_string(),
+            ),
+            real_path: path,
+        };
+        let outcome = ReclaimOutcome {
+            removed: Vec::new(),
+            pending: vec![report],
+            kept: Vec::new(),
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_eq!(
+            out.lines().count(),
+            5,
+            "a raw newline embedded in the path must not corrupt the line count (header, \
+             bullet, run-command line, blank line, `Removed: none`), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(1)
+            .expect("format_reclaim_human must emit a pending bullet as the second line");
+        let cell = bullet
+            .strip_prefix("  - ")
+            .expect("pending bullet must start with the literal '  - ' prefix");
+        assert_hostile_content_is_sanitized(cell);
+    }
+
+    /// Scenario: `format_reclaim_human` renders a `Removed:` entry -- the
+    /// record of a destructive action that already happened -- whose path
+    /// embeds the hostile mix. A control sequence here could forge or
+    /// obscure what was actually removed.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_path_in_removed_section() {
+        let path = hostile_path_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: None,
+            real_path: path,
+        };
+        let outcome = ReclaimOutcome {
+            removed: vec![report],
+            pending: Vec::new(),
+            kept: Vec::new(),
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the path must not corrupt the line count (`Removed:` \
+             header, bullet), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(1)
+            .expect("format_reclaim_human must emit a removed bullet as the second line");
+        let cell = bullet
+            .strip_prefix("  - ")
+            .expect("removed bullet must start with the literal '  - ' prefix");
+        assert_hostile_content_is_sanitized(cell);
+    }
+
+    /// Scenario: `format_reclaim_human` renders a `Kept:` entry -- read to
+    /// decide whether further cleanup/reclaim is safe, especially for a
+    /// pending/dirty reason -- whose path embeds the hostile mix.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_path_in_kept_section() {
+        let path = hostile_path_component();
+        let reason = "dirty: uncommitted or untracked changes are present that were never \
+                       part of the merged PR";
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: false,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "keep".to_string(),
+            reason: Some(reason.to_string()),
+            real_path: path,
+        };
+        let outcome = ReclaimOutcome {
+            removed: Vec::new(),
+            pending: Vec::new(),
+            kept: vec![report],
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_eq!(
+            out.lines().count(),
+            3,
+            "a raw newline embedded in the path must not corrupt the line count \
+             (`Removed: none`, `Kept:` header, bullet), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(2)
+            .expect("format_reclaim_human must emit a kept bullet as the third line");
+        let without_prefix = bullet
+            .strip_prefix("  - ")
+            .expect("kept bullet must start with the literal '  - ' prefix");
+        let cell = without_prefix
+            .strip_suffix(&format!(" ({reason})"))
+            .expect("kept bullet must end with the literal ' ({reason})' suffix");
+        assert_hostile_content_is_sanitized(cell);
+    }
+
+    /// Scenario: `WorktreeListDocument` serializes a report whose path
+    /// embeds the same hostile mix used by the human-formatter tests above.
+    /// Unlike those, this pins the OPPOSITE requirement: `worktree list
+    /// --json`'s `path` value is a machine contract
+    /// (`.dot-agent-deck/findings-232-surfaces.md`) and must NOT gain
+    /// terminal escaping -- only the existing lossy non-UTF-8 replacement --
+    /// so a script parsing this field keeps working. This test is expected
+    /// to be GREEN already, before any #232 fix lands: it exists so the fix
+    /// cannot "helpfully" sanitize the JSON path too.
+    #[test]
+    fn worktree_list_json_path_field_preserves_hostile_content_unescaped() {
+        let path = hostile_path_component();
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: None,
+            real_path: path.clone(),
+        }];
+
+        let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let json_path = parsed["worktrees"][0]["path"]
+            .as_str()
+            .expect("path field must be a JSON string");
+
+        assert_eq!(
+            json_path,
+            path.to_string_lossy(),
+            "the JSON path value must remain exactly `to_string_lossy()`'s output -- no \
+             terminal escaping applied -- so existing scripts parsing this field keep working"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #232 part 2: `format_list_human`'s row carries three more
+    // untrusted cells beyond PATH -- OWNER, BRANCH, REASON. As decided for
+    // this round, `format_reclaim_human` does not render `owner` at all --
+    // its pending/Removed/Kept sections interpolate only `path` and
+    // `reason`, both already fully covered by part 1's path tests -- so no
+    // new cell tests are added there.
+    //
+    // OWNER's two hostile-char groups do NOT behave the same, and that
+    // asymmetry is why OWNER gets no full-mix cell test of its own here.
+    // The six `HOSTILE_CONTROLS` chars are all Unicode category Cc
+    // (control: U+0000-U+001F, U+007F-U+009F, which covers DEL and the C1
+    // control U+009B used here), and `owner_of` -> `read_marker_owner` is
+    // the ONLY call site that ever sets `WorktreeReport.owner` (verified by
+    // reading every construction site of the field) -- it unconditionally
+    // maps the parsed value through `sanitize_marker_creator`, whose
+    // `char::is_control()` filter strips every Cc char before the value is
+    // ever assigned. A full-mix OWNER test would therefore assert
+    // sanitization against six chars that provably cannot reach this cell
+    // today; per this task's own instruction that is noise, not coverage,
+    // and is skipped rather than written. The four `HOSTILE_BIDI` (Cf)
+    // chars are NOT filtered by `sanitize_marker_creator` -- that is the
+    // documented gap `read_marker_owner`'s own doc comment already calls
+    // out -- so OWNER's real, reachable hostile content is Cf/bidi only,
+    // and is covered by the dedicated Cf-gap test below instead of being
+    // duplicated in a second, near-identical OWNER test here.
+    //
+    // BRANCH has no analogous in-code filter: `wt.branch` is
+    // `String::from_utf8_lossy` straight off `git worktree list
+    // --porcelain`'s `branch refs/heads/<name>` field with nothing applied
+    // to it afterward. Verified empirically (`git check-ref-format
+    // --branch`) that git's own ref-name validation rejects all five
+    // plain-ASCII controls used here (ESC, CR, LF, TAB, DEL) on the normal
+    // branch-creation path, but ACCEPTS the C1 control U+009B (its UTF-8
+    // encoding's bytes fall outside the `<0x20 or ==0x7F` range that check
+    // enforces) and all four Cf/bidi chars unmodified. So on the ordinary
+    // `git branch` / `worktree add` path, only C1 + Cf/bidi are reachable
+    // -- but nothing in this crate re-validates a ref name it reads back,
+    // so a `.git` admin-dir a process could write directly (the exact
+    // threat model `read_marker_owner`'s own doc comment already accepts
+    // for the marker file) is not excluded either. The BRANCH test below
+    // still uses the full mix: `format_list_human` is the render boundary
+    // regardless of provenance, and nothing in the crate proves the
+    // ASCII-control chars can never reach it.
+    //
+    // REASON has no filter at all in either direction: `check_cleanliness`
+    // and `resolve_pr_state` interpolate raw, `String::from_utf8_lossy`
+    // subprocess stderr (`git status --porcelain`, `gh`) straight into the
+    // `Unresolvable` reason string with nothing stripped, so it is the
+    // least-filtered of the three cells and the full mix is used
+    // unreservedly.
+    // -------------------------------------------------------------------
+
+    /// The same hostile-content mix as [`hostile_path_component`], as a
+    /// bare `String` for cells (OWNER, BRANCH, REASON) that are
+    /// `Option<String>` rather than `PathBuf`.
+    fn hostile_string_component() -> String {
+        hostile_path_component().to_string_lossy().into_owned()
+    }
+
+    /// Asserts `output` carries no raw byte of any [`HOSTILE_BIDI`] char and
+    /// carries each one's `char::escape_default()` spelling instead. Unlike
+    /// [`assert_hostile_content_is_sanitized`], this does NOT also require
+    /// [`HOSTILE_CONTROLS`]' escaped spellings: the Cf-gap test below feeds
+    /// an input that has already had every `HOSTILE_CONTROLS` char stripped
+    /// (not escaped) by `sanitize_marker_creator`, so requiring their
+    /// escaped spelling too would fail on chars that were correctly removed
+    /// upstream rather than escaped at the render site.
+    ///
+    /// Deliberately kept as a second, narrower helper rather than folded
+    /// into [`assert_hostile_content_is_sanitized`] once that helper moved
+    /// to operating on an isolated cell (issue #232 rescope): the two no
+    /// longer differ over TAB/newline structure -- OWNER's Cf-gap test could
+    /// pass an isolated OWNER cell to either helper without hitting a
+    /// separator conflict. They differ over which *character set* is
+    /// reachable in that cell. `sanitize_marker_creator` already stripped
+    /// every `HOSTILE_CONTROLS` char before this cell's content was ever
+    /// assigned, so those chars' raw bytes are absent for a reason that has
+    /// nothing to do with the render-site fix under test; asserting their
+    /// escaped spellings too would demand a spelling for content that was
+    /// correctly removed, not escaped. Only [`HOSTILE_BIDI`] is genuinely
+    /// reachable here, so only it is asserted.
+    fn assert_bidi_content_is_sanitized(output: &str) {
+        for c in HOSTILE_BIDI.iter() {
+            assert!(
+                !output.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in rendered \
+                 output, got {output:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                output.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) to appear in \
+                 rendered output, got {output:?}",
+                *c as u32
+            );
+        }
+    }
+
+    /// Scenario: `format_list_human` renders one report whose `branch`
+    /// embeds the same hostile mix used for PATH. The BRANCH column must
+    /// carry no raw control byte and must carry each one's escaped spelling
+    /// instead, while printable Unicode survives; a raw TAB here would also
+    /// forge a column boundary and shift every later cell, so this pins the
+    /// row back to eight TAB-separated fields too.
+    #[test]
+    fn format_list_human_escapes_hostile_content_in_branch_column() {
+        let branch = hostile_string_component();
+        let path = PathBuf::from("/repo/normal");
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some(branch),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the branch must not corrupt the line count (header + \
+             one data row), got: {out:?}"
+        );
+        let row = out
+            .lines()
+            .nth(1)
+            .expect("format_list_human must emit a data row after the header");
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            8,
+            "a raw TAB embedded in the branch must not corrupt the TAB-separated column \
+             count, got row: {row:?}"
+        );
+        assert_hostile_content_is_sanitized(fields[1]);
+    }
+
+    /// Scenario: `format_list_human` renders one report whose `reason`
+    /// embeds the same hostile mix. REASON is built from raw, unsanitized
+    /// subprocess stderr (`check_cleanliness` / `resolve_pr_state`
+    /// interpolate `git`/`gh` diagnostics verbatim into the `Unresolvable`
+    /// reason string), so it is the least-filtered of the three cells. The
+    /// REASON column must carry no raw control byte and must carry each
+    /// one's escaped spelling instead, while printable Unicode survives; a
+    /// raw TAB here is the same row-structure attack as the other cells,
+    /// pinned the same way.
+    #[test]
+    fn format_list_human_escapes_hostile_content_in_reason_column() {
+        let reason = hostile_string_component();
+        let path = PathBuf::from("/repo/normal");
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/normal".to_string()),
+            clean: true,
+            owned: false,
+            owner: None,
+            pr_state: "unresolvable".to_string(),
+            verdict: "keep".to_string(),
+            reason: Some(reason),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the reason must not corrupt the line count (header + \
+             one data row), got: {out:?}"
+        );
+        let row = out
+            .lines()
+            .nth(1)
+            .expect("format_list_human must emit a data row after the header");
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            8,
+            "a raw TAB embedded in the reason must not corrupt the TAB-separated column \
+             count, got row: {row:?}"
+        );
+        assert_hostile_content_is_sanitized(fields[7]);
+    }
+
+    /// Scenario: `sanitize_marker_creator` filters Unicode category Cc but
+    /// leaves Cf/bidi controls (RTL override, LTR isolate, zero-width
+    /// space, BOM) untouched, so a `created-by:` marker value carrying
+    /// U+202E reaches `WorktreeReport.owner` exactly as written -- this is
+    /// the gap `read_marker_owner`'s own doc comment already names. This
+    /// test feeds `format_list_human` the exact value
+    /// `sanitize_marker_creator` hands back for such a marker (sanity-
+    /// checked below to confirm the Cf/bidi chars really do survive it) and
+    /// pins the fix at the render site rather than the sanitizer: the OWNER
+    /// column must still not show the raw Cf/bidi char, even though
+    /// `sanitize_marker_creator` itself is untouched by this fix.
+    #[test]
+    fn format_list_human_escapes_cf_bidi_survivors_of_marker_sanitizer_in_owner_column() {
+        let raw_creator = "orchestration:demo-café\u{202e}\u{2066}\u{200b}\u{feff}-tail";
+        let owner = sanitize_marker_creator(raw_creator);
+        for c in HOSTILE_BIDI.iter() {
+            assert!(
+                owner.contains(*c),
+                "sanity check: sanitize_marker_creator must not strip Cf/bidi char {c:?} \
+                 (U+{:04X}), or this test no longer pins the gap it is named for; got \
+                 {owner:?}",
+                *c as u32
+            );
+        }
+        for c in HOSTILE_CONTROLS.iter() {
+            assert!(
+                !owner.contains(*c),
+                "sanity check: sanitize_marker_creator is expected to strip Cc char {c:?} \
+                 (U+{:04X}) -- if it no longer does, this test's premise (only Cf survives) \
+                 is stale; got {owner:?}",
+                *c as u32
+            );
+        }
+
+        let path = PathBuf::from("/repo/normal");
+        let reports = vec![WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/normal".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some(owner),
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: Some("ready to remove".to_string()),
+            real_path: path,
+        }];
+
+        let out = format_list_human(&reports);
+        assert_bidi_content_is_sanitized(&out);
+        assert!(
+            out.contains("café"),
+            "printable Unicode must survive a sanitizing fix unchanged, got {out:?}"
+        );
+    }
+
+    /// Scenario: issue #232 round 2, gap 1. `format_disagreement_warning`
+    /// sanitized `path` but interpolated `owner` raw, even though `owner`
+    /// reaches it through `sanitize_marker_creator`, which strips Unicode
+    /// category `Cc` but deliberately preserves `Cf`/bidi controls -- the
+    /// same survivors [`format_list_human_escapes_cf_bidi_survivors_of_marker_sanitizer_in_owner_column`]
+    /// pins for the OWNER table column. A marker value like
+    /// `orchestration:prod\u{202e}...` must not reach `worktree list --mine`'s
+    /// stderr disagreement warning with a raw bidi control still in it.
+    #[test]
+    fn format_disagreement_warning_escapes_cf_bidi_survivors_of_marker_sanitizer_in_owner() {
+        let raw_creator = "orchestration:prod-café\u{202e}\u{2066}\u{200b}\u{feff}-tail";
+        let owner = sanitize_marker_creator(raw_creator);
+        for c in HOSTILE_BIDI.iter() {
+            assert!(
+                owner.contains(*c),
+                "sanity check: sanitize_marker_creator must not strip Cf/bidi char {c:?} \
+                 (U+{:04X}), or this test no longer pins the gap it is named for; got \
+                 {owner:?}",
+                *c as u32
+            );
+        }
+
+        let path = hostile_path_component();
+        let out = format_disagreement_warning(&path, &owner);
+
+        assert_hostile_content_is_sanitized(&out);
+        assert_bidi_content_is_sanitized(&out);
+        assert!(
+            out.contains("café"),
+            "printable Unicode in the owner must survive a sanitizing fix unchanged, got \
+             {out:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #232 round 3/4: `list_linked_worktrees`' `Err` path embeds RAW
+    // `git worktree list` stderr (this function, a few lines above), which
+    // `examine_worktrees` and `run_reclaim` both propagate unchanged via
+    // `?`. `src/main.rs`'s `worktree list` and `worktree reclaim` CLI
+    // wrappers are the only two places that ever print that `Err` to a
+    // terminal, and each now prints via [`format_list_error_for_cli`] /
+    // [`format_reclaim_error_for_cli`] instead of composing
+    // `sanitize_for_terminal_display` inline (round 4: round 3's tests
+    // called `sanitize_for_terminal_display` directly, so they stayed green
+    // even if the CLI wrapper's call to it were reverted -- they proved the
+    // sanitizer works, never that the CLI used it). These two functions ARE
+    // the CLI print sinks now, so calling them from a test calls the same
+    // code `main.rs`'s `eprintln!` calls; reverting the sanitizer inside
+    // either one fails both the CLI sink and the test in the same edit.
+    //
+    // A real `git worktree list` failure whose stderr echoes attacker
+    // content is reproduced by standing a fake `git` in front of
+    // `list_linked_worktrees`' `Command::new("git")` call (the same
+    // `PathEnvGuard`/`GH_PATH_ENV_LOCK` mocking `worktree_reclaim_021`
+    // already uses for `gh`) that fails `worktree list` with a stderr
+    // carrying the same hostile mix [`hostile_path_component`] uses.
+    // -------------------------------------------------------------------
+
+    /// A synthetic `git worktree list` failure message embedding every char
+    /// in [`HOSTILE_CONTROLS`] and [`HOSTILE_BIDI`] between printable text,
+    /// standing in for a real `git worktree list` stderr that echoes back
+    /// hostile repository/worktree path content.
+    fn hostile_git_worktree_list_stderr() -> String {
+        let mut s =
+            String::from("fatal: worktree administrative files are corrupt at path-café-日本語");
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            s.push(*c);
+        }
+        s.push_str("-tail");
+        s
+    }
+
+    /// Writes a fake `git` executable into `bindir` that fails ONLY a
+    /// `worktree list ...` invocation, with `stderr` set to
+    /// `hostile_stderr` and exit code 1; any other argv exits 1 with no
+    /// output, since `examine_worktrees`/`run_reclaim` return via `?` on
+    /// the very first `git` call and never reach a second one on this
+    /// path.
+    #[cfg(unix)]
+    fn write_fake_git_failing_worktree_list(bindir: &Path, hostile_stderr: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = list ]; then\n  printf '%s' '{hostile_stderr}' >&2\n  exit 1\nfi\nexit 1\n"
+        );
+        let git_path = bindir.join("git");
+        std::fs::write(&git_path, script).expect("must write fake git script");
+        std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755))
+            .expect("must make fake git script executable");
+    }
+
+    /// Scenario: `worktree list`'s enumeration fails because `git worktree
+    /// list` itself fails, with a stderr that echoes hostile
+    /// repository/worktree path content. `examine_worktrees` must still
+    /// propagate that stderr RAW in its `Err` -- sanitization is not this
+    /// library function's job -- and the error is then rendered through
+    /// [`format_list_error_for_cli`], the SAME function
+    /// `run_worktree_list_cli` in `src/main.rs` calls to build its
+    /// `eprintln!` line, not a re-derivation of what it does. The rendered
+    /// line must carry no raw hostile char and the escaped spelling of each
+    /// instead, while the surrounding printable text survives unchanged --
+    /// so reverting the `sanitize_for_terminal_display` call inside
+    /// `format_list_error_for_cli` fails this test AND `main.rs`'s actual
+    /// stderr output at once, because they are now one call.
+    #[test]
+    #[cfg(unix)]
+    fn examine_worktrees_raw_error_is_sanitized_by_the_list_cli_sink() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let hostile_stderr = hostile_git_worktree_list_stderr();
+        write_fake_git_failing_worktree_list(&bindir, &hostile_stderr);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let repo_dir = scratch.path().join("wherever");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let err = examine_worktrees(&repo_dir)
+            .expect_err("the mocked git worktree list failure must propagate as Err");
+        assert!(
+            err.contains(&hostile_stderr),
+            "examine_worktrees must propagate the raw git stderr unchanged -- sanitizing is the \
+             CLI print sink's job, not the library's; got {err:?}"
+        );
+
+        // The same call `run_worktree_list_cli` makes before its `eprintln!`
+        // -- not `sanitize_for_terminal_display` called directly, or this
+        // test would stay green even if the CLI wrapper stopped calling it.
+        let sanitized = format_list_error_for_cli(&err);
+        assert!(
+            sanitized.starts_with("worktree list: "),
+            "expected the CLI sink's own prefix, got {sanitized:?}"
+        );
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            assert!(
+                !sanitized.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in what \
+                 `worktree list`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                sanitized.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) in what \
+                 `worktree list`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+        }
+        assert!(
+            sanitized.contains("path-café-日本語"),
+            "printable text surrounding the hostile content must survive unchanged, got \
+             {sanitized:?}"
+        );
+    }
+
+    /// Scenario: `worktree reclaim`'s enumeration fails the same way --
+    /// `run_reclaim` calls `examine_worktrees` first and propagates its
+    /// `Err` via `?` unchanged, reaching a SEPARATE render function,
+    /// [`format_reclaim_error_for_cli`] (`"worktree reclaim: ..."` vs.
+    /// `worktree list`'s `"worktree list: ..."`), which is the SAME
+    /// function `run_worktree_reclaim_cli` in `src/main.rs` calls to build
+    /// its `eprintln!` line. This pins that the `reclaim` sink is
+    /// independently fixed, not merely inherited from `list`'s fix, and
+    /// that this test exercises the actual sink rather than re-deriving its
+    /// composition.
+    #[test]
+    #[cfg(unix)]
+    fn run_reclaim_raw_error_is_sanitized_by_the_reclaim_cli_sink() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let hostile_stderr = hostile_git_worktree_list_stderr();
+        write_fake_git_failing_worktree_list(&bindir, &hostile_stderr);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let repo_dir = scratch.path().join("wherever");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let err = match run_reclaim(&repo_dir, false) {
+            Err(e) => e,
+            // `ReclaimOutcome` derives no `Debug`, so this cannot print what it
+            // got -- the arm is unreachable anyway, since the mocked `git`
+            // fails every invocation.
+            Ok(_) => panic!("the mocked git worktree list failure must propagate as Err"),
+        };
+        assert!(
+            err.contains(&hostile_stderr),
+            "run_reclaim must propagate the raw git stderr unchanged -- sanitizing is the CLI \
+             print sink's job, not the library's; got {err:?}"
+        );
+
+        // The same call `run_worktree_reclaim_cli` makes before its
+        // `eprintln!` -- not `sanitize_for_terminal_display` called
+        // directly, or this test would stay green even if the CLI wrapper
+        // stopped calling it.
+        let sanitized = format_reclaim_error_for_cli(&err);
+        assert!(
+            sanitized.starts_with("worktree reclaim: "),
+            "expected the CLI sink's own prefix, got {sanitized:?}"
+        );
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            assert!(
+                !sanitized.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in what `worktree \
+                 reclaim`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                sanitized.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) in what \
+                 `worktree reclaim`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+        }
+        assert!(
+            sanitized.contains("path-café-日本語"),
+            "printable text surrounding the hostile content must survive unchanged, got \
+             {sanitized:?}"
         );
     }
 }
