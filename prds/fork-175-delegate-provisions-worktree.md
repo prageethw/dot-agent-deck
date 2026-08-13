@@ -51,7 +51,45 @@ Three properties, and the last two are what make it safe to call repeatedly:
 2. **Reuse.** Delegating the same change twice returns the **existing owned** worktree rather than re-creating it or failing. A retried delegation must be a no-op, not an error.
 3. **Refusal.** A target owned by a *different* orchestration is refused, with a reason **naming the owner** — never raw git output. This is fork #74's exact failure, converted from a silent join into a loud refusal.
 
-### Decision: provisioning happens CLI-side, not daemon-side
+### PROBE RESULT (2026-08-13) — the decision below was WRONG, and here is what replaces it
+
+A feasibility probe tested the premise before any code was written. Full evidence: `.dot-agent-deck/findings-175-probe.md` in the root checkout.
+
+**The propagation half is fine.** `DOT_AGENT_DECK_WORKTREE_OWNER` would reach a pane's shell subprocess — verified live, and `src/main.rs:890`'s `Delegate` handler already reads `DOT_AGENT_DECK_PANE_ID` from its own environment today, so this is a working mechanism rather than a theory.
+
+**The premise is false anyway.** `creator` is only computed on the branch of the New Pane form that *creates a worktree* — an **optional** "Worktree:" field (`resolve_orchestration_worktree_request`, `src/ui.rs:7708`), where blank is valid and never assigns `creator`. So an orchestration opened the ordinary way carries no owner identity at all.
+
+Measured against the running deck, not inferred:
+
+| Check | Result |
+|---|---|
+| Orchestrator-shaped panes carrying `DOT_AGENT_DECK_WORKTREE_OWNER` | **0 of 8** |
+| Those panes' `cwd` | all 8 = the root checkout |
+| `dot-agent-deck-owner` marker files anywhere in the workspace | **zero** |
+| Persisted orchestrations in the real `session.toml` with an `owner` | **0 of 2** |
+
+That is not an edge case, it is the normal workflow — and it matches CLAUDE.md rule 1's model exactly (orchestrator in the root checkout, worktrees hand-created per task). CLI-side provisioning would therefore hit *"absent identity, refuse loudly"* on **nearly every real invocation**, defeating this PRD's entire goal.
+
+### The replacement decision: make the identity unconditional, from the required unique name
+
+The identity problem is upstream of the CLI-vs-daemon question, and it already has an answer that shipped: **fork#192 made the orchestration Name required and unique** (released in v0.37.0). Every orchestration has one. What is missing is that the owner string is derived from it **only on the worktree-creating branch** of the form.
+
+So: compute the creator identity for **every** orchestration pane, from the typed unique name, rather than only when the form happens to create a worktree. `orchestration_creator_string` (`src/ui.rs`) already builds `format!("orchestration:{typed_name}")` and already applies `sanitize_marker_creator`; the work is to reach it on every spawn path, not to invent anything.
+
+**Why this over the alternatives the probe offered:**
+
+- **Daemon-side resolution from `TabMembership`/`orch_config.name`** would work, but fork#166 M2.4 explicitly prohibits reconstructing the owner daemon-side. The probe rightly notes that prohibition was written for `--mine`'s *read-only listing* and that whether it should bind a *provisioning* decision deserves an explicit ruling rather than inheritance. It is still the wrong trade here: it adds a daemon round trip, **flips this PRD's rule 12 answer to a protocol change**, and leaves the identity a derived guess rather than the value the user actually typed.
+- **Passing the identity as an explicit `delegate` argument** re-opens rule 16's supply problem at exactly the seam this PRD exists to close — the orchestrator would once again be hand-supplying a value nothing guarantees.
+
+**Fallback, stated so it is not rediscovered:** if reaching `orchestration_creator_string` on every spawn path turns out to be structurally impossible, fall back to daemon-side resolution **and accept the `PROTOCOL_VERSION` bump** — the conditional framing in the rule 12 section below already anticipates exactly this trigger. Do not quietly keep the CLI-side answer while the identity is absent.
+
+### Also established by the probe, and independently important
+
+- **`resolve_orchestration_worktree_path` (`src/ui.rs:7792`) is private.** Its body is pure path/string logic with no TUI or daemon state, so this is a one-word visibility change (`fn` → `pub(crate) fn`), not a relocation. Stated precisely here rather than left as "callable as-is".
+- **`git worktree add` does NOT safely serialise the reuse path.** For `-b` (new branch) git's ref-lock genuinely serialises — 3-way race, 1 winner, 2 clean failures. For **attaching an existing branch**, which is exactly M2's reuse case, a 2-way race over 25 trials corrupted twice (**~8%**): both processes exit 0 and git registers two admin entries for the identical path. The Risk table's guess was right for creation and wrong for reuse. **M2 needs a real lock**, and this affects issue-dispatch today, not only this PRD — filed as fork [#282](https://github.com/prageethw/dot-agent-deck/issues/282).
+- **Issue-dispatch synthesises its own identity** (`issue-dispatch:{task_name}#{issue}`) rather than reading the env var, so a `delegate` inside a dispatch-spawned pane would name the dispatch task rather than a human orchestration. A gap this PRD does not currently address; decide it in M1.
+
+### Decision (SUPERSEDED — retained as the record): provisioning happens CLI-side, not daemon-side
 
 The `Delegate` command already runs **inside the orchestrator's own pane** (`src/main.rs:885`), which is where `DOT_AGENT_DECK_WORKTREE_OWNER` lives — fork#166 M2.4 put it there, beside `DOT_AGENT_DECK_PANE_ID`, threaded from one computed value through both spawn paths.
 
