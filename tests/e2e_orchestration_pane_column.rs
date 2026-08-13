@@ -63,6 +63,19 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
 
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab A is up
+    // The form closing only means the modal is gone, not that tab A's role
+    // pane box has actually rendered yet — wait for it before reading the
+    // exact edge (mirrors `e2e_dashboard_pane_column.rs`'s identical guard
+    // after its own new-pane form closes).
+    let tab_a_rendered = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        find_pane_box_left_edge(grid, "orchestrator").is_some()
+    });
+    assert!(
+        tab_a_rendered,
+        "tab A's role pane box never rendered within 3s after the new-pane \
+         form closed\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 
     // Baseline: the default 34/66 split puts tab A's pane-column left edge at
     // 34% of the 120-col frame (col 40 or 41, depending on Percentage
@@ -107,7 +120,11 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // its own untoggled Default.
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
-
+    // Deliberately unguarded: three separate guard attempts here were each
+    // satisfiable by a stale tab-A frame instead of tab B's real one (any
+    // border weight; the wrong tab title; assuming tab A stays Thick through
+    // the DirPicker/NewPaneForm sequence, which it does not). See issue #248
+    // for the full analysis.
     let b_narrow_edge = find_pane_box_left_edge(&deck.snapshot_grid(), "orchestrator");
     assert!(
         b_narrow_edge.is_some_and(|edge| (29..=30).contains(&edge)),
@@ -124,8 +141,20 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // unconditionally), so Ctrl+D is required again here.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode
     deck.send_bytes(b"\x0c");
+    // PRD #387 M5: `find_pane_box_left_edge(grid, "orchestrator") == Some(0)`
+    // alone proves only that the pane column's own box starts at column 0 —
+    // a DISTINCT condition from sidebar content being gone (e.g. a stray
+    // card fragment this substring search never looks for). A terminal
+    // update can expose the column-zero box before every sidebar cell is
+    // cleared, so a grid satisfying only the edge check can still be
+    // transitional. Fold both conditions into the SAME wait predicate so it
+    // cannot report settled until neither role's sidebar card marker
+    // (`" <role> "`, the same bounded needle `has_role_status` below uses)
+    // remains, together with the column-zero box.
     let b_hidden = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
         find_pane_box_left_edge(grid, "orchestrator") == Some(0)
+            && !grid.contains(" orchestrator ")
+            && !grid.contains(" worker ")
     });
     assert!(
         b_hidden,
@@ -135,14 +164,12 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
         deck.snapshot_grid()
     );
 
-    // PRD #387 M5: `find_pane_box_left_edge(grid, "orchestrator") == Some(0)`
-    // above proves the pane column's own box starts at column 0, which is
-    // necessary but not sufficient — it does not rule out sidebar content
-    // still being drawn (e.g. a stray card fragment) that this substring
-    // search never looks for. Directly assert NEITHER role's sidebar card
-    // marker (`" <role> "`, the same bounded needle `has_role_status` below
-    // uses to find a sidebar deck card's title row) is present anywhere on
-    // the settled grid, so Hidden is proven to render NO sidebar at all.
+    // PRD #387 M5: re-sample and assert directly rather than trusting the
+    // wait's own sample — `b_hidden` above proved both facts true together
+    // on SOME grid it read, but sidebar content is proven absent (not
+    // merely the pane column's left edge reaching column 0) on the read
+    // below too, so Hidden is proven to render NO sidebar at all on the
+    // grid this test actually inspects next.
     let hidden_grid = deck.snapshot_grid();
     assert!(
         !hidden_grid.contains(" orchestrator ") && !hidden_grid.contains(" worker "),
@@ -406,17 +433,32 @@ fn orchestration_008_stacked_pane_column_hides_collapsed_frames_while_agents_sta
     // (b) The non-focused `beta` role keeps running and its sidebar status
     // transitions live (Idle -> Working) purely from its own self-posted hook
     // events, while its pane is not the expanded/focused slot.
+    // (a) is bundled into this SAME wait rather than trusted after it: the
+    // render loop catching up because `beta`'s status flipped to Working is
+    // UNRELATED to whether a non-focused role's collapsed title-bar frame is
+    // gone — those are two independent facts about the frame, and `beta`
+    // keeps emitting asynchronous hook-driven updates the whole time this
+    // test runs, so "no test-sent input since the wait returned" is not
+    // quiescence. Fold the frame-absence predicate the assertions below
+    // actually use into this wait, so it cannot report settled before both
+    // facts are simultaneously true on the grid it just sampled.
     assert!(
         common::wait_until(Duration::from_secs(15), || {
-            has_role_status(&deck.snapshot_grid(), "beta", "Working")
+            let grid = deck.snapshot_grid();
+            has_role_status(&grid, "beta", "Working")
+                && !has_collapsed_frame(&grid, "alpha")
+                && !has_collapsed_frame(&grid, "beta")
         }),
-        "the non-focused beta role's sidebar status never transitioned to \
-         Working while its pane was collapsed/not drawn:\n{}",
+        "either the non-focused beta role's sidebar status never \
+         transitioned to Working, or a non-focused role's collapsed \
+         title-bar frame was still present, within 15s:\n{}",
         deck.snapshot_grid()
     );
 
-    // (a) With `orchestrator` focused/expanded (the start role), neither
-    // non-focused role may render a collapsed title-bar frame.
+    // (a) Re-sample and assert directly rather than trusting the wait's own
+    // sample — `beta` keeps emitting asynchronous updates, so a fresh one
+    // could in principle land between the wait returning and this read; the
+    // assertions below re-check on the grid this test actually inspects.
     let grid = deck.snapshot_grid();
     assert!(
         !has_collapsed_frame(&grid, "alpha"),
