@@ -4,7 +4,11 @@
 
 **Priority**: High
 
-**Status**: Planning — **blocked on [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254)**, see Sequencing.
+**Status** *(2026-08-13)*: **M1 complete, reviewed and green** — delivered in two rounds on PR [#270](https://github.com/prageethw/dot-agent-deck/pull/270), final commit `436b745f`. `"landed"` now lives as `PromptDelivery::landed: bool`, a **single pane-keyed field on a struct both delivery paths already populate and clear**; the separate `HashSet` is gone and both paths classify through `delivery_phase()`. CI fully green — fast tier 3098/3098, e2e 9114/9114, `prompt/pane-input/024` passing unmodified. Reviewer confirmed P1 closed and auditor found no safety issue.
+
+**M2 remains blocked on [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254)**, which has itself been rescoped — Codex's native `UserPromptSubmit` hook turns out to already carry the prompt text, so the open question there is why removing LEVEL broke Codex at all. **This PRD therefore does NOT close #256**, and PR #270 must not carry a closing keyword: M1 is a behaviour-neutral refactor that reduces the representation count, and the silent-loss half — the actual subject of the issue — is untouched.
+
+Round 1 shipped a **rename** rather than a migration and was caught the same day; see the note under Success Criteria for what the gameable criterion was and why it mattered.
 
 **Parent**: [fork #197](https://github.com/prageethw/dot-agent-deck/issues/197), merged as PR [#219](https://github.com/prageethw/dot-agent-deck/pull/219). This PRD carries the half of fork [#182](https://github.com/prageethw/dot-agent-deck/issues/182) that M2 did not ship.
 
