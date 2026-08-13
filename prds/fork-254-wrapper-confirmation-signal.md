@@ -61,6 +61,30 @@ The wrapper also pumps **stdin** (byte-exact raw stdin on the pipe path; stdin �
 
 The agent's own echo of the prompt is downstream of acceptance, which is what makes it falsifiable: if the agent never took the prompt, it never echoes it, and the signal correctly returns false.
 
+### Finding (2026-08-13): Codex emits a STRUCTURED event stream, which changes the leading candidate
+
+The design above assumed the wrapper would have to pattern-match a **rendered transcript line**. Inspecting `src/wrap.rs`'s `CODEX` ruleset shows that assumption is wrong:
+
+```rust
+pub static CODEX: RuleSet = RuleSet {
+    error_markers: &["\"type\":\"error\""],
+    idle_markers: &["\"type\":\"turn.completed\""],
+};
+```
+
+Codex emits **JSON events**, not free-form text, and the classifier already matches on them. Event types referenced across `src/` and `tests/`: `turn.started`, `turn.completed`, `item.started`, `command_execution`, `reasoning`, `api`, `error`.
+
+**`turn.started` is a submit-shaped event.** A turn begins when a prompt is submitted — which is exactly the signal LEVEL only approximates, and unlike `Thinking` it has no reason to fire on boot. That makes it falsifiable in the required sense: no submission, no turn, no confirmation.
+
+This is **direction 2** from the issue (*"a submit-shaped event distinct from `Thinking`"*), and it is now the leading candidate over the echo-matching in direction 1 — structured parsing beats pattern-matching rendered text, which is fragile to reflow, ANSI and wrapping, and whose normalisation this PRD's Risks table was already worried about.
+
+**This is grep evidence, not observation, and must not be implemented on that basis.** Two questions are unanswered and only a real Codex session can answer them:
+
+1. Does `turn.started` fire on a genuine user submit, and **only** then? (If it also fires on boot or on a resumed session, it is LEVEL again in better clothing.)
+2. Does it — or a neighbouring `item.started` — **carry the prompt text**? If yes, TEXT becomes available and `prompt_text_confirms` works unchanged, which is strictly better than a bare submit signal because it also distinguishes *our* prompt from any other.
+
+**M2 therefore begins with an empirical step, not an implementation step.** See M2.0.
+
 ### Alternatives considered and rejected
 
 | Direction | Verdict |
@@ -94,7 +118,10 @@ The agent's own echo of the prompt is downstream of acceptance, which is what ma
 
 ### M2 — the Codex signal
 
-- [ ] The `CODEX` `RuleSet` recognises Codex echoing a submitted user message and emits an event carrying it.
+- [ ] **M2.0 — observe the real event stream first.** Capture a real Codex session's JSON events around a genuine submit, and answer the two questions in the Finding above: does `turn.started` fire on submit and *only* on submit, and does it or a neighbouring `item.started` carry the prompt text? **Nothing is implemented before this is answered** — implementing on grep evidence is how LEVEL got adopted in the first place, and the whole point of this PRD is not to repeat that.
+
+  This needs a **real-agent run** (CI has no Codex credentials), so it is CLAUDE.md rule 5 carve-out (a) and requires an explicit orchestrator authorisation naming the tests. Record the captured events **in this PRD** — the observation is the deliverable, and a finding that lives only in a worker's context is one interruption from being lost.
+- [ ] The `CODEX` `RuleSet` recognises whichever event M2.0 establishes, and emits it carrying the prompt where available.
 - [ ] **The falsifiability test is the deliverable, not a nicety:** a scenario where the write is genuinely lost, in which the signal returns **false** and the delivery is correctly reported unconfirmed. A test that only shows the happy path confirming does not close this issue — that is precisely what LEVEL already does.
 - [ ] A real-Codex run showing confirmation in milliseconds rather than at the 60 s deadline, with no stray CR.
 
