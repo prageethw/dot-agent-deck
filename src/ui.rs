@@ -2266,10 +2266,22 @@ const CONFIRMATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from
 /// not a production knob, unlike `DOT_AGENT_DECK_SPAWN_READINESS_BUFFER_MS`
 /// which stays live in release builds. Exists so a real-agent e2e run
 /// (`orchestration/seed/015`/`016`) can shrink the grace period far below a
-/// real agent's boot time and make the confirmation-retry path fire
-/// deterministically, rather than only opportunistically when a real boot
-/// happens to be slower than the 2s production default. An invalid or
-/// unset value falls back to [`CONFIRMATION_GRACE_PERIOD`] unchanged.
+/// real agent's boot time — but it only moves this gate, not the
+/// independent `send_retry_delay` backoff (`BASE_MS: u64 = 500`, unaffected
+/// by this override) that a retry is also held behind, and it does not
+/// remove the real confirmation race against the hook-side confirmation
+/// that ordinarily arrives first: the earliest a retry can fire is
+/// `max(send_retry_delay(1), confirmation_grace_period())`, so this
+/// override makes the grace gate controllable rather than making the
+/// confirmation-retry path fire deterministically. At this SHA the
+/// production grace period is 2s ([`CONFIRMATION_GRACE_PERIOD`]), so the
+/// production floor on that side of the `max` is 2s, not
+/// `send_retry_delay`'s 500ms. The retry branch already has deterministic
+/// positive proof at the unit level, driven with an injected
+/// [`std::time::Instant`] and asserting the bare-submit payload — see
+/// `orchestration_seed_014_confirmation_retry_sends_bare_submit_not_prompt_text_again`
+/// — so no new seam is needed here. An invalid or unset value falls back to
+/// [`CONFIRMATION_GRACE_PERIOD`] unchanged.
 /// Audit F5: the ceiling for [`confirmation_grace_period`]'s test override —
 /// mirrors [`spawn_readiness_buffer`]'s clamp idiom
 /// (`SPAWN_READINESS_BUFFER_MIN`/`_MAX`), which this function is the sibling
