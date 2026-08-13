@@ -514,7 +514,7 @@ fn install_to_roots(
 pub fn auto_install() {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into());
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
 
     auto_install_to(&candidate_roots(), &binary_path);
 }
@@ -522,7 +522,7 @@ pub fn auto_install() {
 pub fn install() -> std::io::Result<()> {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into());
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
 
     install_to_roots(
         &candidate_roots(),

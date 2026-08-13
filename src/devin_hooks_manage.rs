@@ -120,8 +120,8 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
 /// the path we would have to guess belongs to a *third-party* tool, and Devin —
 /// not this project — decides where its config lives on Windows. Writing hooks
 /// into a location Devin does not read would look like success while delivering
-/// nothing, and the POSIX quoting [`shell_quote_if_needed`] applies to the hook
-/// command is not what Windows command parsing expects either. Native Windows
+/// nothing, and the POSIX quoting [`crate::platform::paths::shell_quote_if_needed`]
+/// applies to the hook command is not what Windows command parsing expects either. Native Windows
 /// support for the deck is itself still open (#42); today Windows users run
 /// under WSL, where the Unix branch below is the correct one.
 ///
@@ -223,25 +223,8 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
 fn build_command(binary_path: &str) -> String {
     format!(
         "{} {HOOK_COMMAND_SUFFIX}",
-        shell_quote_if_needed(binary_path)
+        crate::platform::paths::shell_quote_if_needed(binary_path)
     )
-}
-
-/// Single-quote `path` for a POSIX shell only when it contains a character
-/// outside a conservative safe set; otherwise return it unchanged.
-fn shell_quote_if_needed(path: &str) -> String {
-    fn is_safe(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
-            )
-    }
-    if !path.is_empty() && path.bytes().all(is_safe) {
-        path.to_string()
-    } else {
-        format!("'{}'", path.replace('\'', r"'\''"))
-    }
 }
 
 /// Merge the deck's command hooks for `command` into an existing config value
@@ -465,7 +448,7 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
 fn current_binary_path() -> String {
     std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into())
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into())
 }
 
 /// Startup entry: install the deck's Devin hooks into the user's Devin config,

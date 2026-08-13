@@ -2878,6 +2878,34 @@ without depending on the config struct API.
 - **Does not assert:** the symlink-defeated variants of the same rule (covered by `orchestration/delegate/027`/`028`); the exact refusal wording (stderr is not inspected — only the exit code).
 - **Platform coverage:** mac+linux (unix-only — spawns a real daemon subprocess).
 
+##### orchestration/delegate/032 — The generated orchestrator context names what `binary_name()` resolves for the running process, not a baked-in literal (issue #253).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `orchestrator_context::build_orchestrator_context`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** with a synthetic role config, the composed context's `delegate` and `work-done` command examples both contain `platform::paths::binary_name()`'s resolution for the running process — under `cargo test` the throwaway test binary is never on `$PATH`, so this is its own absolute `current_exe()` path, never literally `dot-agent-deck` — proving the text is generated from `current_exe()` rather than a hardcoded string.
+- **Does not assert:** the symlink-resolution behavior of `current_exe()` itself (a property of the platform, not this crate); the malformed-`current_exe()` fallback branch (`orchestration/delegate/034`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/033 — The generated worker task file's `work-done` instruction names what `binary_name()` resolves for the running process, not a baked-in literal (issue #253).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `state::compose_worker_task_file`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** the composed worker task file's `## When done` footer's `--task-file` and inline `--task` command examples both contain `platform::paths::binary_name()`'s resolution for the running process (the `cargo test` test binary's own absolute `current_exe()` path, which is never literally `dot-agent-deck`).
+- **Does not assert:** the malformed-`current_exe()` fallback branch (`orchestration/delegate/034`); the rest of the footer's shell-safety content (covered by the pre-existing `compose_worker_task_file_appends_work_done_footer`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/034 — The command-name resolver falls back to the crate's default literal only when `current_exe()` itself is unavailable or unusable (issue #253).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::resolve_binary_name`, the pure seam behind `binary_name`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** an `Err` result, a path with no file name (`/`), and (Unix-only) a non-UTF-8 file name all resolve to `DEFAULT_BINARY_NAME` (`env!("CARGO_PKG_NAME")`) rather than panicking or producing an empty string. A well-formed `current_exe()` whose bare file name is merely shell-unsafe or absent from `$PATH` does NOT fall back to this literal — it falls back to the absolute `current_exe()` path instead (`platform::paths::resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe`/`_not_on_path`, plain `#[test]`s alongside this one, not separately cataloged).
+- **Does not assert:** a real `current_exe()` failure (not reproducible on demand); the happy path (`orchestration/delegate/032`–`033`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/delegate/035 — A same-named binary shadowing the running executable earlier on `$PATH` is rejected by identity, not merely resolved (issue #253 `$PATH`-identity tightening).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::path_identity_match` and `platform::paths::resolve_binary_name`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** with a synthetic `$PATH` value (never the real process-global `PATH`) listing two directories that each hold an executable file sharing one basename — a "shadow" file first, the "real" (`current_exe()`-standing-in) file second — `path_identity_match` reports no match for the shadow-first ordering and a match once the roles are reversed (proving the rejection is genuinely about file identity, not mere absence), and `resolve_binary_name` driven through that shadow-first `$PATH` falls back to the shell-quoted absolute `current_exe()` path rather than emitting the bare name a consuming shell would resolve to the shadowing binary.
+- **Does not assert:** the real process-global `$PATH` (a synthetic value is used throughout); the empty/relative-`$PATH`-entry branch (`platform::paths::is_untrustworthy_path_entry_rejects_empty_and_relative_but_accepts_absolute`, a plain `#[test]` alongside this one, not separately cataloged).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
