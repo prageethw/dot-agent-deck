@@ -466,11 +466,11 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The Determinate installer rather than cachix/install-nix-action: it is
       # what the cache action below is built to pair with, and it turns on
       # flakes (`nix-command`, `flakes`) without a hand-written extra-conf.
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           # `determinate` defaults to TRUE, which installs Determinate Nix (a
           # downstream distribution) and runs its FlakeHub login on every job.
@@ -495,7 +495,7 @@ jobs:
       # dependency tree. Magic Nix Cache stores that in GitHub Actions' own
       # cache, so there is no third-party service and no secret, and forks and
       # PRs get the cache too.
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
           # GitHub Actions cache only. Left at its default, this action
           # opportunistically reaches for FlakeHub Cache, which wants an OIDC
