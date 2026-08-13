@@ -7,12 +7,15 @@
 //! can still hold uncommitted files that were never part of the PR, and
 //! `--porcelain` never reports gitignored content, so a worktree still
 //! holding a `target/` or a `.env` also counts as "clean" here). A THIRD
-//! signal — whether the deck can prove it created the worktree, AND whether
-//! that clean tree still holds gitignored content — decides *how* a
-//! merged-and-clean worktree is removed: a deck-created worktree with no
-//! gitignored content is removed by a bare `reclaim`, with no `--yes` needed;
-//! a worktree the deck cannot prove it created, OR one that still holds
-//! gitignored content regardless of provenance, is instead reported as
+//! signal — whether the deck can prove it created the worktree AND
+//! successfully wrote its ownership marker, AND whether that clean tree
+//! still holds gitignored content — decides *how* a merged-and-clean
+//! worktree is removed: a deck-created-and-marked worktree with no
+//! gitignored content is removed by a bare `reclaim`, with no `--yes`
+//! needed; a worktree the deck cannot prove it both created and marked
+//! (including one it created but whose marker write failed — issue #164;
+//! see [`format_marker_warning`]), OR one that still holds gitignored
+//! content regardless of provenance, is instead reported as
 //! reclaimable-pending-confirmation, naming its exact path, and removed only
 //! once the user passes `--yes` — at which point it is removed regardless of
 //! provenance or ignored content, exactly like a deck-created one. `--yes`
@@ -677,34 +680,57 @@ pub(crate) fn owner_of(repo_dir: &Path, worktree_path: &Path) -> Option<String> 
 /// is the fail-closed default `ownership_of` already returns for anything it
 /// can't prove).
 ///
-/// No atomic write-then-rename for the `Ours`/`Foreign` decision:
-/// [`ownership_of`] only checks the marker's PRESENCE (`Path::is_file`),
-/// never its content, so there is no partially-written state a concurrent
-/// `ownership_of` reader could observe as wrong — a short write from e.g. a
-/// disk-full mid-write still resolves to `Ours` exactly as a complete write
-/// would. This also means an older-build marker — the bare `"deck\n"` this
-/// function used to write before issue #425 — still resolves to `Ours`:
-/// `ownership_of` never inspects content, so a first line other than `deck`
-/// would be the only way to regress that, and this function always writes
-/// `deck` first for exactly that reason. Re-marking an already-marked
-/// worktree (idempotent by construction: `std::fs::write` truncates rather
-/// than appends) simply overwrites the identity line rather than
-/// accumulating one per call.
+/// Atomic write-then-rename, mirroring `SavedSession::save`'s pattern in
+/// `config.rs`: the full content is written to a sibling temp file in the
+/// same git-admin directory (same-filesystem, so `rename(2)` is atomic),
+/// then renamed into place. The pid suffix on the temp name avoids
+/// collisions between concurrently-marking decks; same-directory placement
+/// is required, since `rename` is only atomic within one filesystem.
 ///
-/// **This no-longer covers [`owner_of`], which fork #166 added as this
-/// file's first content reader.** A short write (disk full, or the process
-/// killed between the two lines `format!` produces) still resolves `Ours`
-/// exactly as documented above, but `owner_of` now returns whatever prefix
-/// of the identity happened to land on disk — a silently truncated value
-/// reported as authoritative in `worktree list --json`, with nothing to
-/// distinguish it from a genuine, complete identity. Still not asking for
-/// atomic writes here: the consequence today is a display-only
-/// misattribution, not a removal-gate bypass (`owner` never feeds `decide`
-/// or `remove_worktree_dir`). **PR #215 (`worktree list --mine`) is the
-/// milestone that changed this**: an orchestration now matches its own
-/// worktrees on this identity, so a truncated read is a failed match rather
-/// than a cosmetic one, and atomic writes are no longer merely optional —
-/// tracked as fork **#218**.
+/// This closes a real gap, not a theoretical one (fork #164/#218):
+/// `std::fs::write` is `File::create` followed by `write_all`, so on
+/// ENOSPC or a process kill mid-write, `File::create` had already
+/// succeeded and left a **created, partially-written, regular file** at
+/// the marker path — [`ownership_of`] checks presence only
+/// (`Path::is_file`), so that half-written file used to resolve `Ours`
+/// exactly as a complete write would, even though [`mark_worktree_owned`]
+/// itself had returned `Err`. Once issue #164 made that `Err` a
+/// user-visible warning promising the worktree would need `--yes` on a
+/// later `reclaim`, that stale reasoning became actively wrong: a merged,
+/// clean worktree with a truncated marker would still land on
+/// `Verdict::Remove` under a bare `reclaim`, contradicting the warning
+/// just shown.
+///
+/// The invariant this now establishes: **the final marker path is only
+/// ever created by a rename of a fully-written file.** Any failure along
+/// the way — temp create, write, or rename — is cleaned up (the temp file
+/// is removed on every error path) and leaves **no** file at the final
+/// marker path, so [`ownership_of`] returns `Foreign` and a later
+/// `reclaim` asks rather than silently removing. [`ownership_of`] itself
+/// still checks presence only, which remains correct *given* this
+/// invariant — presence now implies a complete write, not merely an
+/// attempted one — and that is also what keeps an older-build marker (the
+/// bare `"deck\n"` this function wrote before issue #425) resolving
+/// `Ours`: [`ownership_of`] never inspects content, so a first line other
+/// than `deck` would be the only way to regress that, and this function
+/// always writes `deck` first for exactly that reason.
+///
+/// Re-marking an already-marked worktree stays idempotent: `rename` onto
+/// an existing destination replaces it (verified cross-platform — Windows'
+/// `MoveFileExW` is invoked with `MOVEFILE_REPLACE_EXISTING`), so the net
+/// effect is the same truncate-and-overwrite `std::fs::write` used to give,
+/// just via a path that never exposes a partial file to a concurrent
+/// reader.
+///
+/// **This also finally covers [`owner_of`]**, which fork #166 added as
+/// this file's first content reader, closing fork #218: a short write can
+/// no longer land at the final marker path at all, so there is no more
+/// silently-truncated identity for `owner_of` to read back as
+/// authoritative.
+///
+/// [`ownership_of`]'s presence-only check and [`owner_of`]'s read path /
+/// byte cap are unchanged by this — content parsing was never the fix,
+/// completeness-before-visibility was.
 pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result<(), String> {
     let git_dir = resolve_git_dir(worktree_path).ok_or_else(|| {
         format!(
@@ -713,8 +739,20 @@ pub(crate) fn mark_worktree_owned(worktree_path: &Path, creator: &str) -> Result
         )
     })?;
     let content = format!("deck\ncreated-by: {}\n", sanitize_marker_creator(creator));
-    std::fs::write(git_dir.join(OWNER_MARKER_FILENAME), content)
-        .map_err(|e| format!("failed to write ownership marker: {e}"))
+    let marker_path = git_dir.join(OWNER_MARKER_FILENAME);
+    let tmp_path = git_dir.join(format!(
+        "{OWNER_MARKER_FILENAME}.{}.tmp",
+        std::process::id()
+    ));
+
+    std::fs::write(&tmp_path, &content).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to write ownership marker: {e}")
+    })?;
+    std::fs::rename(&tmp_path, &marker_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to write ownership marker: {e}")
+    })
 }
 
 /// Neutralise a creator identity before it is written into the
@@ -1216,6 +1254,29 @@ pub fn format_reclaim_error_for_cli(e: &str) -> String {
     format!("worktree reclaim: {}", sanitize_for_terminal_display(e))
 }
 
+/// Renders the marker-write-warning surfaced when a newly created worktree's
+/// `dot-agent-deck-owner` ownership marker could not be written (issue
+/// #164) -- creation itself already succeeded (see [`mark_worktree_owned`]'s
+/// doc comment), so this is a non-fatal, user-facing notice, not an error.
+/// Shared by two render sinks that both interpolate a local path and an I/O
+/// error string into terminal-facing output -- the TUI's post-creation
+/// status message (`src/ui.rs`) and the scheduled dispatch's
+/// `NotifyEvent::IssueWorktreeMarkerWarning` render (`StderrNotifier` in
+/// `src/scheduler.rs`) -- mirroring [`format_list_error_for_cli`]'s
+/// established shape (issue #232 round 4): both sinks call this exact
+/// function rather than composing `sanitize_for_terminal_display` inline, so
+/// a test can call the identical production render and reverting the
+/// sanitizer here breaks both sinks' tests at once, because they are now the
+/// same call.
+pub fn format_marker_warning(worktree: &str, error: &str) -> String {
+    format!(
+        "the ownership marker for {} could not be written ({}) -- a later `reclaim` of it will \
+         need `--yes`",
+        sanitize_for_terminal_display(worktree),
+        sanitize_for_terminal_display(error),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1496,7 +1557,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created,
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            },
             "the production creation path must report Created for a fresh worktree dir, got {creation:?}"
         );
         assert!(
@@ -1545,7 +1608,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            }
         );
 
         let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
@@ -1586,7 +1651,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            }
         );
 
         // Overwrite with the OLDER, bare-form marker content -- simulating a
@@ -1624,7 +1691,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            }
         );
 
         let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
@@ -1742,6 +1811,145 @@ mod tests {
             ownership_of(&repo, &wt),
             Ownership::Ours,
             "the existing Ours/Foreign bit must still agree the worktree is owned"
+        );
+    }
+
+    /// Scenario: issue #164 round 2. `mark_worktree_owned`'s first write to
+    /// a fresh worktree is made to fail at the TEMP-write step
+    /// deterministically -- no chmod, no timing, no disk-filling -- by
+    /// pre-occupying the exact temp path (`<marker>.<pid>.tmp`, computed the
+    /// same way the production code computes it, since both this test and
+    /// the call under test run in the same process and therefore share a
+    /// pid) with a directory, so `std::fs::write` to it fails with an
+    /// `Is a directory` style error before any rename is attempted. The
+    /// property under test is the one the whole round exists for: a failed
+    /// `mark_worktree_owned` must leave **no** file at the final marker
+    /// path, so `ownership_of` resolves `Foreign` rather than the stale
+    /// `Ours` a pre-atomic `std::fs::write` could leave behind on a genuine
+    /// ENOSPC.
+    #[test]
+    fn mark_worktree_owned_temp_write_failure_leaves_no_marker() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        let wt = scratch.path().join("wt-temp-write-fails");
+        add_worktree(&repo, &wt, "feat/temp-write-fails");
+
+        let git_dir = resolve_git_dir(&wt).expect("must resolve the worktree's git-dir");
+        let tmp_path = git_dir.join(format!(
+            "{OWNER_MARKER_FILENAME}.{}.tmp",
+            std::process::id()
+        ));
+        std::fs::create_dir(&tmp_path)
+            .expect("must be able to pre-occupy the deterministic temp path with a directory");
+
+        let result = mark_worktree_owned(&wt, "creator-that-never-lands");
+        assert!(
+            result.is_err(),
+            "a temp-write failure must be reported, not swallowed"
+        );
+        assert!(
+            !git_dir.join(OWNER_MARKER_FILENAME).exists(),
+            "no file must exist at the final marker path when the temp write never completed"
+        );
+        assert_eq!(
+            ownership_of(&repo, &wt),
+            Ownership::Foreign,
+            "with no marker at the final path, ownership_of must resolve Foreign, not Ours"
+        );
+    }
+
+    /// Scenario: issue #164 round 2. A worktree is marked successfully once
+    /// (a real, complete marker at the final path), then a SECOND
+    /// `mark_worktree_owned` call is made to fail at the temp-write step by
+    /// the same deterministic pre-occupied-directory mechanism as the test
+    /// above. This pins the other half of the atomicity invariant: a failed
+    /// write must never disturb a marker that is already complete at the
+    /// final path -- `rename` is never reached, so the original, complete
+    /// content must still be exactly what is there afterwards, not
+    /// corrupted, not partially overwritten, not removed.
+    #[test]
+    fn mark_worktree_owned_failed_remark_does_not_corrupt_existing_marker() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        let wt = scratch.path().join("wt-remark-fails");
+        add_worktree(&repo, &wt, "feat/remark-fails");
+
+        mark_worktree_owned(&wt, "first-creator").expect("first mark must succeed");
+        assert_eq!(owner_of(&repo, &wt), Some("first-creator".to_string()));
+
+        let git_dir = resolve_git_dir(&wt).expect("must resolve the worktree's git-dir");
+        let tmp_path = git_dir.join(format!(
+            "{OWNER_MARKER_FILENAME}.{}.tmp",
+            std::process::id()
+        ));
+        std::fs::create_dir(&tmp_path)
+            .expect("must be able to pre-occupy the deterministic temp path with a directory");
+
+        let result = mark_worktree_owned(&wt, "second-creator");
+        assert!(
+            result.is_err(),
+            "the second mark's temp-write failure must be reported, not swallowed"
+        );
+        assert_eq!(
+            owner_of(&repo, &wt),
+            Some("first-creator".to_string()),
+            "a failed re-mark must leave the existing complete marker exactly as it was -- \
+             never a corrupted or partial identity, and never the failed call's identity"
+        );
+        assert_eq!(
+            ownership_of(&repo, &wt),
+            Ownership::Ours,
+            "the pre-existing complete marker must still resolve Ours after the failed re-mark"
+        );
+    }
+
+    /// Scenario: issue #164 round 2. A worktree is marked successfully once,
+    /// then the marker is replaced with a directory -- the same fixture
+    /// `mark_worktree_owned_best_effort_surfaces_a_failed_write` in
+    /// `issue_dispatch_run.rs` uses, reused here to drive `mark_worktree_owned`
+    /// directly rather than through its wrapper -- so the SECOND call's temp
+    /// write succeeds (a fresh temp filename) but the rename into place
+    /// fails (`rename` onto an existing directory fails). This pins the
+    /// cleanup half of the invariant: a rename failure must not leave the
+    /// temp file behind as litter in the git-admin directory.
+    #[test]
+    fn mark_worktree_owned_rename_failure_cleans_up_temp_file() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        let wt = scratch.path().join("wt-rename-fails");
+        add_worktree(&repo, &wt, "feat/rename-fails");
+
+        mark_worktree_owned(&wt, "first-creator").expect("first mark must succeed");
+        let git_dir = resolve_git_dir(&wt).expect("must resolve the worktree's git-dir");
+        let marker_path = git_dir.join(OWNER_MARKER_FILENAME);
+        std::fs::remove_file(&marker_path).expect("marker must exist after a successful mark");
+        std::fs::create_dir(&marker_path)
+            .expect("must be able to replace the marker file with a directory");
+
+        let result = mark_worktree_owned(&wt, "second-creator");
+        assert!(
+            result.is_err(),
+            "a directory occupying the marker path must make the rename fail and be reported"
+        );
+        assert_eq!(
+            ownership_of(&repo, &wt),
+            Ownership::Foreign,
+            "a directory at the final marker path is not `is_file`, so this must resolve Foreign"
+        );
+
+        let leftover_tmp: Vec<_> = std::fs::read_dir(&git_dir)
+            .expect("must be able to list the git-admin directory")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(OWNER_MARKER_FILENAME) && name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "the temp file must be cleaned up on a rename failure, not left behind as litter, \
+             found: {leftover_tmp:?}"
         );
     }
 
@@ -2940,6 +3148,38 @@ mod tests {
             sanitized.contains("path-café-日本語"),
             "printable text surrounding the hostile content must survive unchanged, got \
              {sanitized:?}"
+        );
+    }
+
+    /// Scenario: issue #164. `format_marker_warning` interpolates a local
+    /// worktree path and a raw I/O error string -- both are local,
+    /// uncontrolled content that can still carry hostile terminal-control
+    /// characters, exactly the concern issue #232 exists for. Mirrors
+    /// `format_disagreement_warning`'s own sanitization test above: calls
+    /// the exact function both the TUI's post-creation status message
+    /// (`src/ui.rs`) and the scheduled dispatch's `StderrNotifier` render
+    /// (`src/scheduler.rs`, `NotifyEvent::IssueWorktreeMarkerWarning`) call,
+    /// not a re-derivation of what it does -- reverting the
+    /// `sanitize_for_terminal_display` calls inside `format_marker_warning`
+    /// would fail this test AND both production sinks at once, because they
+    /// are now the same call.
+    #[test]
+    fn format_marker_warning_sanitizes_path_and_error() {
+        let hostile_path = hostile_path_component();
+        let hostile_error = hostile_git_worktree_list_stderr();
+
+        let out = format_marker_warning(&hostile_path.to_string_lossy(), &hostile_error);
+
+        assert_hostile_content_is_sanitized(&out);
+        assert!(
+            out.contains("café") && out.contains("日本語"),
+            "printable Unicode surrounding the hostile content must survive unchanged, got \
+             {out:?}"
+        );
+        assert!(
+            out.contains("could not be written"),
+            "expected the warning's own wording to survive alongside the sanitized content, \
+             got {out:?}"
         );
     }
 }
