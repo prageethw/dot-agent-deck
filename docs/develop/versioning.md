@@ -71,6 +71,32 @@ The `prepare` job **validates that version as SemVer before it writes it to `GIT
 
 The resolution logic itself lives in `build_version_resolve.rs` at the repo root as pure functions, compiled as an out-of-line module by both `build.rs` (`mod build_version_resolve;`) and `tests/build_version.rs` (`#[path = "../build_version_resolve.rs"] mod …`) — `cargo test` cannot reach code inside a build script, so this is what makes the order testable. A module rather than an `include!` on purpose: rustfmt does not follow `include!`, so the shared file would otherwise escape the mandatory `cargo fmt --check` gate. `lifecycle/version/001` (`tests/e2e_version_injection.rs`) covers the whole chain by rebuilding the binary with the vars injected, twice over changing one variable at a time to pin the rerun directives.
 
+### The fork's own tags are orphaned by every sync
+
+Step 2 has a fork-specific failure mode that is **worse than the placeholder fall-through above, because it does not degrade to an obviously-wrong number and emits no `cargo:warning`**. `git describe --tags --abbrev=0` considers only tags **reachable from `HEAD`**. The sync procedure ([`fork-sync-workflow.md`](fork-sync-workflow.md)) rebases `fork-only` onto `upstream/main` and then hard-resets `main` to it — which rewrites the commits the fork's release tags point at. The tags keep pointing at the pre-rebase commits, those commits stop being ancestors of `main`, and `describe` walks straight past them to the newest tag it can still reach: **upstream's**.
+
+Measured on `origin/main` (`5ffe2351`) 2026-08-13:
+
+| Fork tag | Commit | Ancestor of `origin/main`? |
+|---|---|---|
+| `v0.37.2` | `66077b2a` | **yes** |
+| `v0.37.1` | `f057ba65` | no |
+| `v0.37.0` | `a6de0062` | no |
+| `v0.36.1` | `7233a55a` | no |
+| `v0.36.0` | `f4e6e4a3` | no |
+
+Every fork release tag cut **before the most recent sync** is unreachable — the four `no` rows are exactly the pattern the mechanism above predicts. The newest tag, `v0.37.2`, is not a contradiction of that: it was cut *after* the most recent sync, on a commit that is still an ancestor of `main` today, so it stays reachable **only until the next sync rewrites that commit too**. The accurate statement is that every fork release tag cut before the most recent sync is unreachable, while the newest one — cut after it — stays reachable until the following sync orphans it in turn.
+
+`git describe --tags --abbrev=0` on `origin/main` currently returns **`v0.37.2`**, correctly, because `v0.37.2` is (for now) the newest reachable tag. That correctness is a snapshot, not a property: the next sync orphans `v0.37.2` exactly as the previous one orphaned `v0.37.1`, and `describe` will walk straight past it to whatever upstream tag is newest and reachable — **a local build of post-sync `main` reports a real, plausible, wrong version**, and every consumer of it (the upgrade nudge, `remote add` pre-flight, the PRD #161 negotiation, the version inventory in [`upgrading-a-running-deck.md`](upgrading-a-running-deck.md)) inherits it. Nothing warns, because step 2 succeeded — it just answered from the wrong lineage. Re-measure rather than trust either the table or the `describe` output above at face value; both drift with the next sync.
+
+Three consequences worth knowing:
+
+- **Published release artifacts are unaffected.** `release.yml`'s `prepare` job injects the version as `DAD_VERSION` (step 1), which wins over `describe` — the same seam described above for `workflow_dispatch` releases covers this case for free.
+- **Do not use `describe` to work out the next release number.** `.claude/skills/dot-ai-tag-release/analyze.sh` sorts the full tag list by version (`git tag --sort=-v:refname`) instead of walking reachability, which is why it correctly proposed `v0.37.2` from `v0.37.1` on a checkout where `describe` said `v0.35.10`.
+- **To build a binary that reports honestly, do not build from `main`.** Build from a detached checkout **at the tag** — the procedure in [`upgrading-a-running-deck.md`](upgrading-a-running-deck.md) § "Installing a fork build" — or inject `DAD_VERSION` explicitly. A tag checkout is reachable from itself, so `describe` resolves it correctly.
+
+The orphaning recurs on **every** sync by construction, so a freshly-cut fork tag is orphaned again the next time `main` is reset. Re-tagging the post-sync commit does not fix it retroactively either: the tag is only reachable until the following sync rewrites that commit too.
+
 ## Where this lives across repos
 
 - The **0.x recalibration** in `analyze.sh` and the generic changelog-fragment guidance are generically correct and belong in the shared skill **source** (the `prompts` repo); the vendored copy here is kept in sync.
