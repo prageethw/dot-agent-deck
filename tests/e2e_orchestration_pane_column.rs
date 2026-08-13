@@ -127,25 +127,32 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     // `.is_some()` IMMEDIATELY once the dialog closes — a false positive
     // that would let the assertion below pass whether or not tab B ever
     // rendered, or if it opened at the wrong stage. Wait instead for
-    // something true ONLY once tab B's own tab-strip entry has been drawn:
-    // with Dashboard + tab A open, the tab strip carries exactly ONE
-    // "demo-orch" label (tab A's, from the fixture's single orchestration
-    // definition — see `open_orchestration`'s doc comment); a SECOND
-    // "demo-orch" substring can appear on the grid only once tab B's own
-    // `Tab::Orchestration { name: "demo-orch", .. }` has been pushed onto
-    // `TabManager` and drawn by `render_tab_strip` (src/ui.rs). This
-    // predicate is false in the exact state we are leaving (tab A alone,
-    // one "demo-orch" label) and becomes true only in the state we are
-    // waiting for (tab B added, two labels) — unlike `.is_some()`, it
-    // cannot be satisfied by state that already existed before this call.
+    // something true ONLY once tab B's own tab-strip entry has been drawn.
+    // The tab's TITLE is not the orchestration config's `name` ("demo-orch")
+    // — `suggest_orchestration_name` (src/ui.rs) fills the new-pane form's
+    // Name field with `"{cwd_basename}-orchestrator-{n}"`, incrementing `n`
+    // past every currently-live orchestration name with that prefix, so tab
+    // A's title is `"{base}-orchestrator-1"` and tab B's is
+    // `"{base}-orchestrator-2"` — DISTINCT per tab, unlike the shared
+    // "orchestrator" pane-box title. `"{base}-orchestrator-2"` cannot be on
+    // the grid before tab B's own tab exists (it is false in the exact state
+    // we are leaving: tab A alone, suggesting "1" not "2") and becomes true
+    // only once tab B has been pushed onto `TabManager` and drawn by
+    // `render_tab_strip`.
+    let base = deck
+        .workdir()
+        .file_name()
+        .expect("deck workdir has a file name")
+        .to_string_lossy()
+        .into_owned();
+    let tab_b_title = format!("{base}-orchestrator-2");
     let tab_b_rendered = deck.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
-        grid.matches("demo-orch").count() >= 2
-            && find_pane_box_left_edge(grid, "orchestrator").is_some()
+        grid.contains(&tab_b_title) && find_pane_box_left_edge(grid, "orchestrator").is_some()
     });
     assert!(
         tab_b_rendered,
-        "tab B's own tab-strip entry (a second \"demo-orch\" label) and role \
-         pane box never both rendered within 3s after the new-pane form \
+        "tab B's own tab-strip entry ({tab_b_title:?}) and role pane box \
+         never both rendered within 3s after the new-pane form \
          closed\nGrid:\n{}",
         deck.snapshot_grid()
     );
