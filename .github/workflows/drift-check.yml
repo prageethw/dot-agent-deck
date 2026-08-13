@@ -173,7 +173,7 @@ jobs:
           OLDEST_ISO=""
           OLDEST_AGE_DAYS=""
           if [ "$MAIN_AHEAD" -gt 0 ]; then
-            OLDEST_ISO=$(git log --reverse --format=%cI "origin/$FORK_BRANCH..origin/main" | head -1)
+            OLDEST_ISO=$(git log --format=%cI "origin/$FORK_BRANCH..origin/main" | tail -1)
             if [ -n "$OLDEST_ISO" ]; then
               OLDEST_EPOCH=$(date -d "$OLDEST_ISO" +%s)
               NOW_EPOCH=$(date +%s)
