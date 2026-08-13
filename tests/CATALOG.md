@@ -2899,6 +2899,13 @@ without depending on the config struct API.
 - **Does not assert:** a real `current_exe()` failure (not reproducible on demand); the happy path (`orchestration/delegate/032`–`033`).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/delegate/035 — A same-named binary shadowing the running executable earlier on `$PATH` is rejected by identity, not merely resolved (issue #253 `$PATH`-identity tightening).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `platform::paths::path_identity_match` and `platform::paths::resolve_binary_name`; no TUI harness, no daemon).
+- **Agent:** none.
+- **Asserts:** with a synthetic `$PATH` value (never the real process-global `PATH`) listing two directories that each hold an executable file sharing one basename — a "shadow" file first, the "real" (`current_exe()`-standing-in) file second — `path_identity_match` reports no match for the shadow-first ordering and a match once the roles are reversed (proving the rejection is genuinely about file identity, not mere absence), and `resolve_binary_name` driven through that shadow-first `$PATH` falls back to the shell-quoted absolute `current_exe()` path rather than emitting the bare name a consuming shell would resolve to the shadowing binary.
+- **Does not assert:** the real process-global `$PATH` (a synthetic value is used throughout); the empty/relative-`$PATH`-entry branch (`platform::paths::is_untrustworthy_path_entry_rejects_empty_and_relative_but_accepts_absolute`, a plain `#[test]` alongside this one, not separately cataloged).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
