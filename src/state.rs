@@ -6788,6 +6788,65 @@ mod tests {
         );
     }
 
+    /// #174 round 3: pins that `tab.rs:808`'s identity-stamping call to
+    /// `resolve_orchestration_name` and `load_project_config`'s
+    /// normalization loop stay in agreement — a round trip a unit test on
+    /// `resolve_orchestration_name` alone cannot see, because both sides
+    /// now call the same single guard rather than each deciding "is this
+    /// name blank" independently. `name = "   "` is used here specifically
+    /// because it is a real, present name under the current (non-trimming)
+    /// guard: both the TUI's stamped identity and the daemon's freshly
+    /// loaded config keep it as `"   "` unchanged, so the lookup must hit.
+    ///
+    /// This test fails the moment anyone reintroduces a second guard that
+    /// desyncs the two call sites — e.g. adding `.trim()` back to only one
+    /// of them — which is exactly the regression class round 1 shipped:
+    /// fixing `resolve_orchestration_name`'s guard alone would have passed
+    /// a unit test on that function in isolation while `load_project_config`
+    /// kept blocking the call behind its own separate `is_empty()`
+    /// pre-check, silently desyncing the stamped identity from the loaded
+    /// config. See `resolve_orchestration_name`'s doc comment for why
+    /// whitespace-only names are not normalized: doing so would change
+    /// `TabMembership::Orchestration.name`'s meaning across the
+    /// TUI↔daemon wire (CLAUDE.md rule 12).
+    #[test]
+    fn lookup_orchestration_role_matches_the_identity_the_tui_stamps_for_a_whitespace_only_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            r#"
+[[orchestrations]]
+name = "   "
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude"
+start = true
+prompt_template = "You are the coder."
+clear = false
+"#,
+        )
+        .expect("write project config");
+
+        // What `tab.rs::open_orchestration_tab` stamps onto `TabMembership`
+        // / `Tab::Orchestration` as the orchestration's identity, computed
+        // straight from the raw config value exactly as `tab.rs:808` does.
+        let stamped_identity = crate::project_config::resolve_orchestration_name("   ", dir.path());
+
+        let role = lookup_orchestration_role(
+            dir.path().to_str().expect("utf8 tempdir"),
+            &stamped_identity,
+            "coder",
+        )
+        .expect(
+            "the daemon's freshly-loaded config must resolve the same blank-name \
+             identity the TUI already stamped, or role config silently stops \
+             resolving for every whitespace-named orchestration",
+        );
+        assert_eq!(role.prompt_template.as_deref(), Some("You are the coder."));
+        assert!(!role.clear);
+    }
+
     // ---------------------------------------------------------------------
     // PRD #140 — routing identity. These exercise the pure halves of
     // `handle_delegate` / `handle_work_done` (`delegate_targets` /
