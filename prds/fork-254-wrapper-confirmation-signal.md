@@ -28,7 +28,35 @@ The premise was: *"TEXT is **structurally unavailable** for wrapper-strategy age
 
 **So LEVEL's dependence for Codex is a missed wiring, not a structural gap.** This PRD is no longer "invent a confirmation signal". It is "find out why the existing one is not being used, and make its falsifiability provable".
 
-### The one question that now decides everything
+### N1 ANSWERED (2026-08-13): candidate 4, confirmed and root-caused
+
+**LEVEL was never confirming Codex deliveries via a genuine signal at all.** It was confirming via the **wrapper's own generic stdout-classification fallback** — `DetectedEvent::Working` → `EventType::Thinking` (`src/wrap.rs:80`) — which fires on **any non-blank output line** from the interactive Codex TUI. Nothing to do with Codex's native hooks.
+
+This is the direct consequence of upstream **#540**: because the `CODEX` `RuleSet`'s JSON markers can never match the interactive process (which emits no JSON), *every* line falls through to the generic `Working` classification. #540 is therefore not cosmetic dead code — **it is the mechanism that made LEVEL falsely confirm.**
+
+Three real-agent runs of `orchestration/seed/016`, with file-based diagnostic instrumentation:
+
+| Run | Configuration | Result |
+|---|---|---|
+| 1 | LEVEL removed, no instrumentation | Passed in 27.87s — **and proves nothing.** See below. |
+| 2 | Both signals live, instrumented | **LEVEL confirmed at t+549 ms while `last_user_prompt` was still `None`** — direct proof the confirming event carried no prompt text, i.e. LEVEL, not TEXT. |
+| 3 | LEVEL forced off, instrumented | **TEXT confirmed at t+8.45 s** via the genuine native-hook event, exact byte match, submission counter 0→1. LEVEL would have falsely fired at t+778 ms had it been active. |
+
+**The race was never close: ~550–780 ms versus ~8.45 s.** The generic fallback beats the real hook by roughly 10×, every time, so LEVEL always won and TEXT never got to decide anything. That is why removing LEVEL looked like "there is no confirmation path" — the path was there and had simply never been reached.
+
+**Run 1 is the part worth keeping.** The coder flagged that its pass does **not** distinguish "TEXT confirmed" from "confirmation never fired", because the original write lands before confirmation is checked and the 60 s-deadline path has no observable side effect the test asserts on. Had it been reported as the answer, it would have been a green run standing in for a cause — the exact failure this PRD keeps encountering. The decisive evidence is Runs 2 and 3, not the passing test.
+
+**Method note worth reusing:** the harness's `env_clear()` blocks `DOT_AGENT_DECK_LOG`, but **not** a filesystem path — instrumentation writing to an absolute path sidesteps the isolation entirely. That reopens log-based verification inside the harness, which fork#197 recorded as structurally unreachable. Also flagged: `grep -n "EventType::Thinking" src/wrap.rs src/agent_pty.rs` might have found this **before** spending any real-agent run.
+
+### Consequences for the remaining milestones
+
+- **N2 plausibly collapses to re-landing `7cd091e`.** Run 3 shows TEXT confirming cleanly with no change beyond the LEVEL removal itself. One run is not a distribution, so N3 must confirm it rather than assume it — but there is no wiring defect to fix.
+- **N3 is unchanged and is now the whole job:** a test that exhibits a genuinely lost write and shows the signal **declining** to confirm. It must be written to **fail while LEVEL is present** — because LEVEL will falsely confirm — which makes the TDD order load-bearing rather than ceremonial.
+- **LEVEL is not merely unfalsifiable in theory.** It confirms on "the TUI printed a line". Restoring any narrowed variant of it is off the table.
+
+### The original question, retained
+
+
 
 **If TEXT was available all along, why did removing LEVEL break Codex?**
 
