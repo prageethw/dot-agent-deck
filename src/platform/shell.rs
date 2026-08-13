@@ -76,3 +76,37 @@ pub fn shell_command_flag() -> &'static str {
         "/C"
     }
 }
+
+/// Quote `arg` as a single word of the POSIX shell [`default_shell`]/
+/// [`shell_command_flag`] would run — for a caller that assembles a command
+/// *line* (rather than an argv vector) that is later parsed by an outer
+/// shell, e.g. `dot-agent-deck watch --interval N <command>` written into a
+/// pane's shell (issue #157: the executable path went in bare and a watch
+/// pane silently failed to start once the deck was installed at a path
+/// containing a space).
+///
+/// **POSIX-only.** This implements single-quoting per POSIX shell grammar
+/// and nothing else — it is not, and must not be treated as, a general
+/// shell-quoting contract for other interpreters. `cmd.exe` has no
+/// equivalent single-quote construct, so there is no Windows arm of this
+/// function; a caller that needs a `cmd.exe`-safe command line must build it
+/// itself (issue #157 finding A1, audit-verified — a `{:?}` Debug-escaped
+/// double-quoted string is *not* `cmd.exe`-safe either, since `cmd.exe`
+/// treats a literal backslash before an embedded `"` as not escaping it, so
+/// the quote still closes the word and everything after it is parsed as a
+/// fresh command line by the outer shell). A correct `cmd.exe`-safe quoting
+/// scheme (caret-escaping metacharacters, doubling embedded quotes so
+/// `cmd.exe` never toggles out of quoted parsing) is real, easy-to-get-
+/// subtly-wrong work that this repo cannot verify from a non-Windows host,
+/// and is tracked as a follow-up (fork issue #283) rather than attempted
+/// here.
+///
+/// Single-quotes `arg` unconditionally, closing/escaping/reopening an
+/// embedded `'` as `'\''` (the standard POSIX technique) — nothing else is
+/// special between single quotes, so this preserves whitespace, double
+/// quotes, `$`, backticks, backslashes, real newlines, `;`, `&`, `|`,
+/// redirection, glob characters and parentheses.
+#[cfg(unix)]
+pub fn quote_shell_arg(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
