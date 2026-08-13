@@ -28493,6 +28493,12 @@ mod tests {
             self.focused.lock().unwrap().push(id.to_string());
             Ok(())
         }
+        /// Echo the last `focus_pane` target as the live focused pane — the
+        /// value the render loop reads back off this SAME controller after
+        /// applying auto-focus (`orchestration_013`).
+        fn focused_pane_id(&self) -> Option<String> {
+            self.focused.lock().unwrap().last().cloned()
+        }
         fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
             Ok(Vec::new())
         }
@@ -37127,12 +37133,11 @@ mod tests {
     }
 
     /// Pane controller like `OpenTabPC` (unique `mock-pane-N` ids, records every
-    /// `focus_pane`) but it ALSO reports the last-focused pane back through
+    /// `focus_pane`) that reports the last-focused pane back through
     /// `focused_pane_id()` — the live process-wide focus a real controller
-    /// exposes. `OpenTabPC` leaves `focused_pane_id()` at the trait default
-    /// (`None`), which makes `TabManager::capture_focus_on_switch_out` a no-op
-    /// (it returns early on `None`), so it can't exercise the switch-out focus
-    /// capture under test in `tabs/spawn/004`. This mock can.
+    /// exposes — so `TabManager::capture_focus_on_switch_out` (which returns
+    /// early on `None`) can exercise the switch-out focus capture under test
+    /// in `tabs/spawn/004`.
     struct FocusEchoPC {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,

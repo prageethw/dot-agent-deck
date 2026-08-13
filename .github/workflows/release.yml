@@ -837,7 +837,7 @@ jobs:
     # that path has to be canaried first (governance.md step 5). Keep the
     # forwarding until then; do not read this line as an endorsement of
     # `inherit` over a narrow map.
-    secrets: inherit
+    secrets: inherit  # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit
     with:
       image_tag: v${{ needs.prepare.outputs.version }}
       chart_version: ${{ needs.prepare.outputs.version }}
