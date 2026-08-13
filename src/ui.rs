@@ -36355,14 +36355,27 @@ mod tests {
         // caps the result afterwards — this is what makes a broken or
         // removed clamp (e.g. raising `SEND_RETRY_BASE_MAX`, or dropping the
         // `.clamp(...)` call) actually fail this test.
+        // Deliberately compared against `SEND_RETRY_BACKOFF_CAP` — the
+        // PRD-decided ceiling value ("Decision: the clamp ceiling is
+        // SEND_RETRY_BACKOFF_CAP, not AUTOMATIC_PROMPT_DEADLINE") — and NOT
+        // against `SEND_RETRY_BASE_MAX` itself: `SEND_RETRY_BASE_MAX` is the
+        // very constant a mutation would change, so an assertion that reads
+        // it back would compare a mutated value against itself and could
+        // never fail. Comparing against the independent
+        // `SEND_RETRY_BACKOFF_CAP` constant is what makes a broken clamp
+        // (raising `SEND_RETRY_BASE_MAX`) or a removed one (dropping the
+        // `.clamp(...)` call) actually fail this test — mutation-verified on
+        // CI (temporarily setting `SEND_RETRY_BASE_MAX` to 120_000ms
+        // produced exactly one RED test, this one, then was reverted).
         assert_eq!(
             send_retry_base(),
-            SEND_RETRY_BASE_MAX,
-            "an out-of-range override must clamp to SEND_RETRY_BASE_MAX at \
-             the accessor itself — asserting only through send_retry_delay \
-             cannot distinguish a correct clamp from a broken or missing \
-             one, since SEND_RETRY_BACKOFF_CAP reapplies the same ceiling \
-             downstream regardless"
+            SEND_RETRY_BACKOFF_CAP,
+            "an out-of-range override must clamp to SEND_RETRY_BACKOFF_CAP \
+             (the PRD-decided ceiling) at the accessor itself — asserting \
+             only through send_retry_delay cannot distinguish a correct \
+             clamp from a broken or missing one, since \
+             SEND_RETRY_BACKOFF_CAP reapplies the same ceiling downstream \
+             regardless"
         );
     }
 
