@@ -304,7 +304,12 @@ pub async fn handle_dispatch(
     )
     .await
     {
-        Ok(WorktreeCreation::Created) => {}
+        // Issue #164: a marker-write warning is not surfaced on this
+        // ad hoc `dispatch` CLI path -- out of scope here, which covers
+        // only the TUI's `SpawnPane` creation and the scheduled
+        // `issue_dispatch` task (see `src/ui.rs` / `src/issue_dispatch_run.rs`).
+        // `ownership_of` still fails closed for it regardless.
+        Ok(WorktreeCreation::Created { marker_warning: _ }) => {}
         Ok(WorktreeCreation::AlreadyClaimed) => {
             return DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
@@ -571,7 +576,9 @@ mod tests {
                 "dispatch:test"
             )
             .await,
-            Ok(WorktreeCreation::Created)
+            Ok(WorktreeCreation::Created {
+                marker_warning: None
+            })
         );
 
         // Tab close: the worktree goes away, the branch does not.
@@ -631,7 +638,9 @@ mod tests {
                 "dispatch:test"
             )
             .await,
-            Ok(WorktreeCreation::Created),
+            Ok(WorktreeCreation::Created {
+                marker_warning: None
+            }),
             "after deleting the branch the same dispatch name must work again"
         );
     }

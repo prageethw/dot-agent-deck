@@ -9728,6 +9728,12 @@ fn dispatch_action(
                     // below, e.g. an unnamed orchestration reopened directly
                     // in `main`).
                     let mut creator: Option<String> = None;
+                    // Issue #164: `Some(raw error)` when `create_worktree_sync`
+                    // below created the worktree but its ownership marker
+                    // write failed. Hoisted the same way `creator` is, above,
+                    // so it survives past the `match` arm into the final
+                    // status message set after `open_orchestration_tab`.
+                    let mut worktree_marker_warning: Option<String> = None;
                     let dir_str = match req.orchestration_worktree_path.as_ref() {
                         Some(worktree_path) => {
                             // Fork #122 audit (P1): use the validated raw
@@ -9796,7 +9802,10 @@ fn dispatch_action(
                                 &branch,
                                 creator.as_deref().expect("just assigned above"),
                             ) {
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::Created) => {
+                                Ok(crate::issue_dispatch_run::WorktreeCreation::Created {
+                                    marker_warning,
+                                }) => {
+                                    worktree_marker_warning = marker_warning;
                                     worktree_path.display().to_string()
                                 }
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed) => {
@@ -10065,10 +10074,28 @@ fn dispatch_action(
                                 // display intent): the user's form name when
                                 // typed, else the canonical config name. This is
                                 // display-only and does not affect identity.
-                                format!(
-                                    "Activated orchestration: {}",
-                                    display_title.as_deref().unwrap_or(&orch_config.name)
-                                ),
+                                //
+                                // Issue #164: when `create_worktree_sync` above
+                                // created the worktree but its ownership marker
+                                // write failed, append that warning here — this
+                                // is the ONE status message this whole flow
+                                // sets on success, so it is the only place a
+                                // caller can still tell the user at creation
+                                // time (the moment this fact is known) rather
+                                // than only via a daemon trace.
+                                match &worktree_marker_warning {
+                                    Some(error) => format!(
+                                        "Activated orchestration: {} — {}",
+                                        display_title.as_deref().unwrap_or(&orch_config.name),
+                                        crate::worktree_reclaim::format_marker_warning(
+                                            &dir_str, error
+                                        )
+                                    ),
+                                    None => format!(
+                                        "Activated orchestration: {}",
+                                        display_title.as_deref().unwrap_or(&orch_config.name)
+                                    ),
+                                },
                                 std::time::Instant::now(),
                             ));
                         }
