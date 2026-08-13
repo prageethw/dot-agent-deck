@@ -7,12 +7,15 @@
 //! can still hold uncommitted files that were never part of the PR, and
 //! `--porcelain` never reports gitignored content, so a worktree still
 //! holding a `target/` or a `.env` also counts as "clean" here). A THIRD
-//! signal — whether the deck can prove it created the worktree, AND whether
-//! that clean tree still holds gitignored content — decides *how* a
-//! merged-and-clean worktree is removed: a deck-created worktree with no
-//! gitignored content is removed by a bare `reclaim`, with no `--yes` needed;
-//! a worktree the deck cannot prove it created, OR one that still holds
-//! gitignored content regardless of provenance, is instead reported as
+//! signal — whether the deck can prove it created the worktree AND
+//! successfully wrote its ownership marker, AND whether that clean tree
+//! still holds gitignored content — decides *how* a merged-and-clean
+//! worktree is removed: a deck-created-and-marked worktree with no
+//! gitignored content is removed by a bare `reclaim`, with no `--yes`
+//! needed; a worktree the deck cannot prove it both created and marked
+//! (including one it created but whose marker write failed — issue #164;
+//! see [`format_marker_warning`]), OR one that still holds gitignored
+//! content regardless of provenance, is instead reported as
 //! reclaimable-pending-confirmation, naming its exact path, and removed only
 //! once the user passes `--yes` — at which point it is removed regardless of
 //! provenance or ignored content, exactly like a deck-created one. `--yes`
@@ -1216,6 +1219,29 @@ pub fn format_reclaim_error_for_cli(e: &str) -> String {
     format!("worktree reclaim: {}", sanitize_for_terminal_display(e))
 }
 
+/// Renders the marker-write-warning surfaced when a newly created worktree's
+/// `dot-agent-deck-owner` ownership marker could not be written (issue
+/// #164) -- creation itself already succeeded (see [`mark_worktree_owned`]'s
+/// doc comment), so this is a non-fatal, user-facing notice, not an error.
+/// Shared by two render sinks that both interpolate a local path and an I/O
+/// error string into terminal-facing output -- the TUI's post-creation
+/// status message (`src/ui.rs`) and the scheduled dispatch's
+/// `NotifyEvent::IssueWorktreeMarkerWarning` render (`StderrNotifier` in
+/// `src/scheduler.rs`) -- mirroring [`format_list_error_for_cli`]'s
+/// established shape (issue #232 round 4): both sinks call this exact
+/// function rather than composing `sanitize_for_terminal_display` inline, so
+/// a test can call the identical production render and reverting the
+/// sanitizer here breaks both sinks' tests at once, because they are now the
+/// same call.
+pub fn format_marker_warning(worktree: &str, error: &str) -> String {
+    format!(
+        "the ownership marker for {} could not be written ({}) -- a later `reclaim` of it will \
+         need `--yes`",
+        sanitize_for_terminal_display(worktree),
+        sanitize_for_terminal_display(error),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1496,7 +1522,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created,
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            },
             "the production creation path must report Created for a fresh worktree dir, got {creation:?}"
         );
         assert!(
@@ -1545,7 +1573,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            }
         );
 
         let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
@@ -1586,7 +1616,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            }
         );
 
         // Overwrite with the OLDER, bare-form marker content -- simulating a
@@ -1624,7 +1656,9 @@ mod tests {
         .expect("create_worktree_sync must succeed against a real git repo");
         assert_eq!(
             creation,
-            crate::issue_dispatch_run::WorktreeCreation::Created
+            crate::issue_dispatch_run::WorktreeCreation::Created {
+                marker_warning: None
+            }
         );
 
         let git_dir = resolve_git_dir(&worktree_dir).expect("must resolve the worktree's git-dir");
@@ -2940,6 +2974,38 @@ mod tests {
             sanitized.contains("path-café-日本語"),
             "printable text surrounding the hostile content must survive unchanged, got \
              {sanitized:?}"
+        );
+    }
+
+    /// Scenario: issue #164. `format_marker_warning` interpolates a local
+    /// worktree path and a raw I/O error string -- both are local,
+    /// uncontrolled content that can still carry hostile terminal-control
+    /// characters, exactly the concern issue #232 exists for. Mirrors
+    /// `format_disagreement_warning`'s own sanitization test above: calls
+    /// the exact function both the TUI's post-creation status message
+    /// (`src/ui.rs`) and the scheduled dispatch's `StderrNotifier` render
+    /// (`src/scheduler.rs`, `NotifyEvent::IssueWorktreeMarkerWarning`) call,
+    /// not a re-derivation of what it does -- reverting the
+    /// `sanitize_for_terminal_display` calls inside `format_marker_warning`
+    /// would fail this test AND both production sinks at once, because they
+    /// are now the same call.
+    #[test]
+    fn format_marker_warning_sanitizes_path_and_error() {
+        let hostile_path = hostile_path_component();
+        let hostile_error = hostile_git_worktree_list_stderr();
+
+        let out = format_marker_warning(&hostile_path.to_string_lossy(), &hostile_error);
+
+        assert_hostile_content_is_sanitized(&out);
+        assert!(
+            out.contains("café") && out.contains("日本語"),
+            "printable Unicode surrounding the hostile content must survive unchanged, got \
+             {out:?}"
+        );
+        assert!(
+            out.contains("could not be written"),
+            "expected the warning's own wording to survive alongside the sanitized content, \
+             got {out:?}"
         );
     }
 }
