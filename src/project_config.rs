@@ -241,7 +241,7 @@ fn default_clear() -> bool {
 /// misses — silently dropping per-role `prompt_template` wrapping
 /// (round-10 reviewer #1).
 pub fn resolve_orchestration_name(config_name: &str, dir: &Path) -> String {
-    if !config_name.is_empty() {
+    if !config_name.trim().is_empty() {
         return config_name.to_string();
     }
     dir.file_name()
@@ -265,10 +265,21 @@ pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectC
             // `TabMembership` / `Tab::Orchestration::name`. Both sides
             // call this loader; doing the normalization here is the one
             // place that keeps the contract consistent.
+            //
+            // #174 round 2: call `resolve_orchestration_name`
+            // unconditionally rather than gating it behind a duplicate
+            // `is_empty()` pre-check here. Two guards deciding the same
+            // "is this name blank" question independently is how the
+            // whitespace-only case slipped through in round 1: fixing
+            // only the inner function's blankness test (`is_empty()` ->
+            // `trim().is_empty()`) would have left this outer check
+            // still blocking the call for a name like `"   "`, so
+            // `tab.rs:808`'s unconditional call would resolve to the
+            // basename while this loader kept the raw whitespace —
+            // breaking the three-way agreement `lookup_orchestration_role`
+            // depends on. One call site owns the decision now.
             for orch in &mut config.orchestrations {
-                if orch.name.is_empty() {
-                    orch.name = resolve_orchestration_name(&orch.name, dir);
-                }
+                orch.name = resolve_orchestration_name(&orch.name, dir);
             }
             Ok(Some(config))
         }
@@ -773,5 +784,33 @@ watch = true
 "#;
         let result: Result<ProjectConfig, _> = toml::from_str(toml);
         assert!(result.is_err());
+    }
+
+    /// #174: an empty name and a whitespace-only name must both resolve
+    /// to the same cwd-basename fallback — a `.trim().is_empty()` guard
+    /// treats them identically, unlike the pre-fix `.is_empty()` guard
+    /// which returned `"   "` unchanged as if it were a meaningful name.
+    #[test]
+    fn resolve_orchestration_name_treats_blank_and_whitespace_as_unnamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = dir
+            .path()
+            .file_name()
+            .expect("tempdir has a basename")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(resolve_orchestration_name("", dir.path()), expected);
+        assert_eq!(resolve_orchestration_name("   ", dir.path()), expected);
+        assert_eq!(resolve_orchestration_name("\t\n", dir.path()), expected);
+    }
+
+    #[test]
+    fn resolve_orchestration_name_returns_a_named_orchestration_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            resolve_orchestration_name("my-orchestration", dir.path()),
+            "my-orchestration"
+        );
     }
 }

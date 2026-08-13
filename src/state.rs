@@ -4964,6 +4964,62 @@ mod tests {
         );
     }
 
+    /// #174 round 2: the round trip a unit test on `resolve_orchestration_name`
+    /// alone cannot see. `tab.rs:808` stamps an orchestration's IDENTITY by
+    /// calling `resolve_orchestration_name` unconditionally on the raw config
+    /// name; `lookup_orchestration_role` matches against whatever
+    /// `load_project_config`'s normalization loop wrote into `orch.name`. The
+    /// two must agree for a whitespace-only `name = "   "` exactly as they do
+    /// for an empty one, or the `orch.name == orchestration_name` match
+    /// misses and a role's `prompt_template`/`clear` config silently stops
+    /// resolving.
+    ///
+    /// Before this fix, fixing only `resolve_orchestration_name`'s inner
+    /// guard (`is_empty()` -> `trim().is_empty()`) without also removing
+    /// `load_project_config`'s outer `is_empty()` pre-check would have
+    /// passed a unit test on `resolve_orchestration_name` in isolation while
+    /// failing exactly this: the stamped identity would resolve to the
+    /// basename, but `load_project_config` would still normalize `"   "` to
+    /// itself (outer guard still blocking the call), so this lookup would go
+    /// from `Some` to `None`.
+    #[test]
+    fn lookup_orchestration_role_matches_the_identity_the_tui_stamps_for_a_whitespace_only_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            r#"
+[[orchestrations]]
+name = "   "
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude"
+start = true
+prompt_template = "You are the coder."
+clear = false
+"#,
+        )
+        .expect("write project config");
+
+        // What `tab.rs::open_orchestration_tab` stamps onto `TabMembership`
+        // / `Tab::Orchestration` as the orchestration's identity, computed
+        // straight from the raw config value exactly as `tab.rs:808` does.
+        let stamped_identity = crate::project_config::resolve_orchestration_name("   ", dir.path());
+
+        let role = lookup_orchestration_role(
+            dir.path().to_str().expect("utf8 tempdir"),
+            &stamped_identity,
+            "coder",
+        )
+        .expect(
+            "the daemon's freshly-loaded config must resolve the same blank-name \
+             identity the TUI already stamped, or role config silently stops \
+             resolving for every whitespace-named orchestration",
+        );
+        assert_eq!(role.prompt_template.as_deref(), Some("You are the coder."));
+        assert!(!role.clear);
+    }
+
     // ---------------------------------------------------------------------
     // PRD #140 — routing identity. These exercise the pure halves of
     // `handle_delegate` / `handle_work_done` (`delegate_targets` /
