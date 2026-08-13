@@ -234,18 +234,26 @@ pub fn is_mine(report: &WorktreeReport, owner: &str) -> bool {
 /// cannot be reached through the real-binary `Fixture` -- see
 /// `tests/CATALOG.md`'s `worktree/reclaim/030` entry).
 ///
-/// `path` is display-only here (issue #232): it goes through
-/// [`sanitize_path_for_terminal_display`], never the raw, byte-exact path --
+/// `path` and `owner` are both display-only here (issue #232): they go
+/// through [`sanitize_path_for_terminal_display`] /
+/// [`sanitize_for_terminal_display`], never the raw, byte-exact values --
 /// this warning is printed to stderr before the operator inspects the
-/// marker/admin state, so a hostile path component must not be able to forge
-/// or hide part of that warning.
+/// marker/admin state, so neither a hostile path component nor a hostile
+/// marker `owner` can forge or hide part of that warning. `owner` needs its
+/// own sanitizing pass here even though it already went through
+/// [`sanitize_marker_creator`] upstream (issue #232 round 2, gap 1): that
+/// sanitizer strips Unicode category `Cc` but deliberately preserves `Cf`
+/// (bidi/format) chars, exactly the set this module treats as hostile for
+/// display, so a marker value like `orchestration:prod\u{202e}...` would
+/// otherwise reach this stderr line with a raw bidi control still in it.
 pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
     format!(
         "worktree list --mine: {path} is marked owned by {owner}, but the ownership check \
          disagrees -- excluding it rather than trusting either signal (often a `git \
          rev-parse` race; persisting past a re-run rules that out -- check the marker and \
          admin dir)",
-        path = sanitize_path_for_terminal_display(path)
+        path = sanitize_path_for_terminal_display(path),
+        owner = sanitize_for_terminal_display(owner)
     )
 }
 
@@ -2685,6 +2693,40 @@ mod tests {
         assert!(
             out.contains("café"),
             "printable Unicode must survive a sanitizing fix unchanged, got {out:?}"
+        );
+    }
+
+    /// Scenario: issue #232 round 2, gap 1. `format_disagreement_warning`
+    /// sanitized `path` but interpolated `owner` raw, even though `owner`
+    /// reaches it through `sanitize_marker_creator`, which strips Unicode
+    /// category `Cc` but deliberately preserves `Cf`/bidi controls -- the
+    /// same survivors [`format_list_human_escapes_cf_bidi_survivors_of_marker_sanitizer_in_owner_column`]
+    /// pins for the OWNER table column. A marker value like
+    /// `orchestration:prod\u{202e}...` must not reach `worktree list --mine`'s
+    /// stderr disagreement warning with a raw bidi control still in it.
+    #[test]
+    fn format_disagreement_warning_escapes_cf_bidi_survivors_of_marker_sanitizer_in_owner() {
+        let raw_creator = "orchestration:prod-café\u{202e}\u{2066}\u{200b}\u{feff}-tail";
+        let owner = sanitize_marker_creator(raw_creator);
+        for c in HOSTILE_BIDI.iter() {
+            assert!(
+                owner.contains(*c),
+                "sanity check: sanitize_marker_creator must not strip Cf/bidi char {c:?} \
+                 (U+{:04X}), or this test no longer pins the gap it is named for; got \
+                 {owner:?}",
+                *c as u32
+            );
+        }
+
+        let path = hostile_path_component();
+        let out = format_disagreement_warning(&path, &owner);
+
+        assert_hostile_content_is_sanitized(&out);
+        assert_bidi_content_is_sanitized(&out);
+        assert!(
+            out.contains("café"),
+            "printable Unicode in the owner must survive a sanitizing fix unchanged, got \
+             {out:?}"
         );
     }
 }
