@@ -2331,6 +2331,65 @@ fn confirmation_grace_period() -> std::time::Duration {
 /// that is a coincidence, not an invariant, so retune either independently.
 const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// PRD #20 R20-005 / PRD fork#257: the floor `send_retry_delay` starts its
+/// exponential schedule from. Shared by both `send_retry_base` variants below
+/// so the release build's unmovable value and the test override's fallback
+/// can never drift apart.
+const SEND_RETRY_BASE_MS: u64 = 500;
+
+/// PRD fork#257: ceiling for [`send_retry_base`]'s test override, in
+/// milliseconds via `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`. Unlike
+/// [`CONFIRMATION_GRACE_PERIOD_MAX`], which is pinned 1ms below
+/// [`AUTOMATIC_PROMPT_DEADLINE`], this is pinned to
+/// [`SEND_RETRY_BACKOFF_CAP`] itself: `send_retry_delay` applies
+/// `.min(SEND_RETRY_BACKOFF_CAP)` to the shifted base for every `attempts`
+/// value, so a base above the cap is unreachable by construction — the cap
+/// always wins regardless of how large the base is. Clamping the base to the
+/// cap is therefore the honest bound, not an analogy borrowed from the grace
+/// period's ceiling: it is the largest value that can ever actually change
+/// `send_retry_delay`'s result.
+#[cfg(any(test, debug_assertions))]
+const SEND_RETRY_BASE_MAX: std::time::Duration = SEND_RETRY_BACKOFF_CAP;
+
+/// PRD fork#257: `#[cfg(any(test, debug_assertions))]` override for
+/// [`send_retry_delay`]'s floor, mirroring [`confirmation_grace_period`]'s
+/// idiom line for line. Extracted as its own directly-callable accessor
+/// rather than inlined into `send_retry_delay`, because `send_retry_delay`
+/// applies `.min(SEND_RETRY_BACKOFF_CAP)` AFTER the base for every `attempts`
+/// value — so for any out-of-range override the result is `SEND_RETRY_BACKOFF_CAP`
+/// regardless of whether the clamp below landed correctly, incorrectly, or
+/// was omitted entirely. A broken clamp and a correct one are
+/// indistinguishable through `send_retry_delay`'s return value alone; calling
+/// this function directly is what makes the clamp observable.
+#[cfg(any(test, debug_assertions))]
+fn send_retry_base() -> std::time::Duration {
+    static OUT_OF_RANGE_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let Some(raw_ms) = std::env::var("DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    else {
+        return std::time::Duration::from_millis(SEND_RETRY_BASE_MS);
+    };
+    let requested = std::time::Duration::from_millis(raw_ms);
+    let clamped = requested.clamp(std::time::Duration::ZERO, SEND_RETRY_BASE_MAX);
+    if clamped != requested && !OUT_OF_RANGE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            requested_ms = requested.as_millis(),
+            clamped_ms = clamped.as_millis(),
+            max_ms = SEND_RETRY_BASE_MAX.as_millis(),
+            "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS is out of range; clamped"
+        );
+    }
+    clamped
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn send_retry_base() -> std::time::Duration {
+    std::time::Duration::from_millis(SEND_RETRY_BASE_MS)
+}
+
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
 /// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
 /// 1 s, then capped at 2 s — so a permanent non-delivery settles into an
@@ -2339,10 +2398,14 @@ const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_se
 /// PROMPTLY once the target transitions, rather than languishing behind a
 /// minutes-long exponential delay. The cap is the "wait for a matching target
 /// transition" bound from the finding: it keeps the catch-up latency small.
+/// The floor comes from [`send_retry_base`] — overridable under
+/// `cfg(any(test, debug_assertions))`, fixed at [`SEND_RETRY_BASE_MS`]
+/// otherwise — so the exponential shape and [`SEND_RETRY_BACKOFF_CAP`] stay
+/// untouched regardless of which floor is in effect.
 fn send_retry_delay(attempts: u32) -> std::time::Duration {
-    const BASE_MS: u64 = 500;
     let shift = attempts.saturating_sub(1).min(6);
-    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift))
+    send_retry_base()
+        .saturating_mul(1u32 << shift)
         .min(SEND_RETRY_BACKOFF_CAP)
 }
 
@@ -36211,6 +36274,340 @@ mod tests {
              so re-sending the text can only duplicate what the agent will \
              see when it submits)",
             texts[1]
+        );
+    }
+
+    /// Reviewer P2 (fork#257): serializes `orchestration/seed/017` and
+    /// `orchestration/seed/018`, the two tests that mutate the
+    /// process-global `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, against EACH
+    /// OTHER. Each test previously declared its own function-local `static
+    /// Mutex` (mirroring `spawn_readiness_buffer_parses_env_override_
+    /// default_and_invalid`, whose var is different and so needs no
+    /// sharing) — two distinct mutexes guarding one process-global var let
+    /// parallel unit-test threads interleave their set/read/restore
+    /// sequences, so `017` could observe `018`'s override (or vice versa)
+    /// instead of the value each test itself set. Mirrors the split
+    /// lock/guard idiom `CONFIG_GEN_STATE_ENV_LOCK` / `ConfigGenStateEnvGuard`
+    /// already use in `src/config.rs` for the same job over a different var.
+    static SEND_RETRY_BASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard for `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`: captures
+    /// whatever value is in effect when constructed and restores exactly
+    /// that value on drop — including on unwind, so a test that panics
+    /// mid-assertion cannot leave the variable set for its neighbour.
+    /// Callers must hold `SEND_RETRY_BASE_ENV_LOCK` for this guard's entire
+    /// lifetime; the guard itself only captures/restores — callers make
+    /// their own `std::env::set_var` calls under the held lock.
+    struct SendRetryBaseEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl SendRetryBaseEnvGuard {
+        const VAR: &'static str = "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS";
+
+        fn capture() -> Self {
+            Self {
+                prev: std::env::var(Self::VAR).ok(),
+            }
+        }
+    }
+
+    impl Drop for SendRetryBaseEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold SEND_RETRY_BASE_ENV_LOCK for this guard's
+            // entire lifetime, serializing access to the process-global var.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(Self::VAR, v),
+                    None => std::env::remove_var(Self::VAR),
+                }
+            }
+        }
+    }
+
+    /// Scenario: with `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS` unset,
+    /// `send_retry_delay` returns today's fixed 500ms floor unchanged. Set to
+    /// a valid low value, the floor honors it exactly — including zero, a
+    /// legitimate "retry as soon as the grace period allows" value — and the
+    /// exponential doubling shape (`BASE << (attempts-1)`) survives on the
+    /// lowered base. Set to a non-numeric string, it falls back to the fixed
+    /// floor rather than panicking. Set to an absurdly large value, the
+    /// override's own ceiling clamp is asserted directly against
+    /// `send_retry_base()` (reviewer P1, fork#257) — not only through
+    /// `send_retry_delay`, whose trailing `.min(SEND_RETRY_BACKOFF_CAP)`
+    /// reapplies the same 2s ceiling downstream and so cannot tell a broken
+    /// clamp from a correct one — while the `send_retry_delay` assertion is
+    /// kept alongside it as the sane-schedule pin. PRD fork#257 M1/M2:
+    /// mirrors `confirmation_grace_period()`'s existing override idiom
+    /// (`src/ui.rs:2239-2270`) line for line. Expected RED (original round):
+    /// `send_retry_delay` did not read this env var at all, so every
+    /// overridden assertion observed the unchanged 500ms floor.
+    #[spec("orchestration/seed/017")]
+    #[test]
+    fn orchestration_seed_017_send_retry_delay_honors_test_base_override() {
+        // Reviewer P2: shared module-level lock (not a function-local one)
+        // serializes this test against `orchestration/seed/018`, the other
+        // test mutating the same process-global var; the guard restores the
+        // pre-test value on drop, including on unwind.
+        let _lock = SEND_RETRY_BASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = SendRetryBaseEnvGuard::capture();
+        const VAR: &str = SendRetryBaseEnvGuard::VAR;
+
+        // SAFETY: lock held for the duration; `_restore`'s Drop restores the
+        // captured pre-test value.
+        unsafe {
+            std::env::remove_var(VAR);
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::from_millis(500),
+            "precondition: unset env var must leave today's fixed 500ms floor \
+             unchanged"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "10");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::from_millis(10),
+            "a valid override must replace the floor — send_retry_delay \
+             currently ignores DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS \
+             entirely and always returns the fixed 500ms BASE_MS regardless \
+             of what this env var is set to"
+        );
+        assert_eq!(
+            send_retry_delay(2),
+            std::time::Duration::from_millis(20),
+            "the exponential doubling shape (BASE << (attempts-1)) must \
+             survive on the lowered base — attempts=2 must be exactly 2x the \
+             overridden base, not a flattened schedule"
+        );
+        assert_eq!(
+            send_retry_delay(3),
+            std::time::Duration::from_millis(40),
+            "attempts=3 must be exactly 4x the overridden base — the curve \
+             keeps its shape with a lowered base, so a future change that \
+             flattens it fails here"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "0");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::ZERO,
+            "zero is a legitimate override value (retry as soon as the grace \
+             period allows) and must not be treated as unset or clamped up \
+             to the fixed floor"
+        );
+
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "not-a-number");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            std::time::Duration::from_millis(500),
+            "a non-numeric override must fall back to the fixed 500ms floor, \
+             not panic"
+        );
+
+        // Out-of-range: past AUTOMATIC_PROMPT_DEADLINE, mirroring
+        // CONFIRMATION_GRACE_PERIOD_MAX's own ceiling (pinned 1ms below the
+        // deadline) — past that point the override is not a longer backoff,
+        // it is a silently disabled retry. Note (see this catalog entry's
+        // "Does not assert"): SEND_RETRY_BACKOFF_CAP (2s, untouched by this
+        // PR) already caps every attempts=1 schedule at 2s once the base
+        // exceeds it, so this assertion cannot by itself distinguish
+        // "clamped to the intended ceiling" from "left unclamped" — both
+        // land on exactly SEND_RETRY_BACKOFF_CAP. It still pins that an
+        // absurd override must not escape that cap into an
+        // effectively-disabled multi-minute wait, which is RED today (the
+        // override is ignored entirely, returning 500ms).
+        // SAFETY: same lock.
+        unsafe {
+            std::env::set_var(VAR, "120000");
+        }
+        assert_eq!(
+            send_retry_delay(1),
+            SEND_RETRY_BACKOFF_CAP,
+            "an out-of-range override must still land on a sane, \
+             backoff-capped schedule, not an effectively-disabled wait"
+        );
+
+        // Reviewer P1: the assertion above cannot, by itself, tell a broken
+        // ceiling clamp from a correct one — `send_retry_delay`'s trailing
+        // `.min(SEND_RETRY_BACKOFF_CAP)` reapplies the same 2s ceiling to
+        // ANY base at or above it, so a `send_retry_base()` that returned
+        // the raw 120s override unclamped would produce an identical
+        // `send_retry_delay(1)` result to a correctly clamped one. Assert
+        // the clamp directly against `send_retry_base()`, where nothing
+        // caps the result afterwards — this is what makes a broken or
+        // removed clamp (e.g. raising `SEND_RETRY_BASE_MAX`, or dropping the
+        // `.clamp(...)` call) actually fail this test.
+        // Deliberately compared against `SEND_RETRY_BACKOFF_CAP` — the
+        // PRD-decided ceiling value ("Decision: the clamp ceiling is
+        // SEND_RETRY_BACKOFF_CAP, not AUTOMATIC_PROMPT_DEADLINE") — and NOT
+        // against `SEND_RETRY_BASE_MAX` itself: `SEND_RETRY_BASE_MAX` is the
+        // very constant a mutation would change, so an assertion that reads
+        // it back would compare a mutated value against itself and could
+        // never fail. Comparing against the independent
+        // `SEND_RETRY_BACKOFF_CAP` constant is what makes a broken clamp
+        // (raising `SEND_RETRY_BASE_MAX`) or a removed one (dropping the
+        // `.clamp(...)` call) actually fail this test — mutation-verified on
+        // CI (temporarily setting `SEND_RETRY_BASE_MAX` to 120_000ms
+        // produced exactly one RED test, this one, then was reverted).
+        assert_eq!(
+            send_retry_base(),
+            SEND_RETRY_BACKOFF_CAP,
+            "an out-of-range override must clamp to SEND_RETRY_BACKOFF_CAP \
+             (the PRD-decided ceiling) at the accessor itself — asserting \
+             only through send_retry_delay cannot distinguish a correct \
+             clamp from a broken or missing one, since \
+             SEND_RETRY_BACKOFF_CAP reapplies the same ceiling downstream \
+             regardless"
+        );
+    }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` across two frames with
+    /// BOTH the confirmation-grace-period override
+    /// (`DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS`) and the new
+    /// retry-base override (`DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`) set to
+    /// 10ms. Frame 1 lands an `Applied` write; frame 2 runs only 50ms
+    /// later — comfortably past both lowered floors, but far short of
+    /// today's fixed 500ms backoff — and must deterministically produce a
+    /// second write whose payload is the empty string (M4's bare CR).
+    /// Unlike `orchestration/seed/005`/`014`, which reach the retry by
+    /// parking frame 2 five seconds out (satisfying any floor by
+    /// construction), this proves the retry is reachable BY TIMING once the
+    /// floor is movable. PRD fork#257 M2. Expected RED: today's code
+    /// ignores the base override and keeps the fixed 500ms floor, so the
+    /// retry cannot fire 50ms after the write — only the original write
+    /// reaches the pane double.
+    #[spec("orchestration/seed/018")]
+    #[test]
+    fn orchestration_seed_018_retry_fires_deterministically_once_floor_is_lowered() {
+        // Reviewer P2: the SAME shared module-level lock `orchestration/
+        // seed/017` uses — the two tests mutate the same process-global
+        // `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, so a second, unrelated
+        // function-local mutex here would not serialize against seed/017 at
+        // all. `GRACE_VAR` has no sibling test touching it, so it keeps a
+        // plain manual restore below rather than a guard.
+        let _lock = SEND_RETRY_BASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore_base = SendRetryBaseEnvGuard::capture();
+        const GRACE_VAR: &str = "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS";
+        const BASE_VAR: &str = SendRetryBaseEnvGuard::VAR;
+        let prev_grace = std::env::var(GRACE_VAR).ok();
+        // SAFETY: lock held for the duration; `_restore_base`'s Drop
+        // restores BASE_VAR (even on unwind). GRACE_VAR is restored
+        // manually below.
+        unsafe {
+            std::env::set_var(GRACE_VAR, "10");
+            std::env::set_var(BASE_VAR, "10");
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane_controller =
+            SendResultPaneController::new(InjectedSendOutcome::Applied, attempts.clone());
+        let pane: Arc<dyn PaneController> = Arc::new(pane_controller);
+        let mut ui = default_ui();
+        let tab_id: TabId = 438;
+        let write_time = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, write_time);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            write_time
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane-438".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane-438".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-438".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+
+        // Frame 1: the original write genuinely lands.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time,
+            tab_id,
+            &["orch-pane-438".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_some() && ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            "precondition: frame 1's write must land and await confirmation"
+        );
+
+        // Frame 2: only 50ms later — comfortably past BOTH lowered overrides
+        // (10ms grace period, 10ms retry base), but far short of today's
+        // fixed 500ms `send_retry_delay(1)` floor. No confirmation observed.
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            write_time + std::time::Duration::from_millis(50),
+            tab_id,
+            &["orch-pane-438".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        // SAFETY: same lock. GRACE_VAR is restored manually here, before any
+        // assertion below might panic; BASE_VAR is restored automatically by
+        // `_restore_base`'s Drop, including on unwind, so it needs no manual
+        // restore here.
+        unsafe {
+            match prev_grace {
+                Some(v) => std::env::set_var(GRACE_VAR, v),
+                None => std::env::remove_var(GRACE_VAR),
+            }
+        }
+
+        let texts = pane
+            .as_any()
+            .downcast_ref::<SendResultPaneController>()
+            .expect("SendResultPaneController")
+            .texts();
+
+        assert_eq!(
+            texts.len(),
+            2,
+            "with both overrides lowered, a landed-but-unconfirmed write must \
+             deterministically produce a second write only 50ms later — \
+             observed payloads={texts:?} (expected exactly 2: the original \
+             write plus one genuinely ATTEMPTED confirmation-retry). Today's \
+             code ignores DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS and keeps \
+             the fixed 500ms floor, so the retry cannot fire this early — \
+             this is the exact gap PRD fork#257 exists to close: \
+             DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS alone cannot \
+             make the retry fire deterministically, since \
+             send_retry_delay(1)'s 500ms floor is unmovable"
+        );
+        assert_eq!(
+            texts.get(1).map(String::as_str),
+            Some(""),
+            "the confirmation-retry must send a BARE submit (empty payload), \
+             never the full prompt text again — observed retry \
+             payload={:?} (expected \"\")",
+            texts.get(1)
         );
     }
 }
