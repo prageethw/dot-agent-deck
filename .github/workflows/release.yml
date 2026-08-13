@@ -528,6 +528,9 @@ jobs:
     # exactly how v0.35.9's "Commit chart changes" step failed. The image had
     # already been pushed to GHCR by then, so the symptom was a docs site that
     # never rolled forward rather than an obviously broken release.
+    # nosemgrep: yaml.github-actions.security.secrets-inherit
+    # Justified above (lines 523-530): docs-publish.yml needs RELEASE_TOKEN,
+    # and restricting this once already produced v0.35.9's silently stalled docs site.
     secrets: inherit
     with:
       image_tag: v${{ needs.prepare.outputs.version }}
