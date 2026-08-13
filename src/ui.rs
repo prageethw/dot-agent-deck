@@ -36656,9 +36656,9 @@ mod tests {
     /// exact defect PRD fork#254 N1 measured in production. Must pass
     /// unchanged once N2 removes LEVEL, since TEXT still correctly
     /// declines (`last_user_prompt` never matches `sent_prompt`).
-    #[spec("orchestration/seed/017")]
+    #[spec("orchestration/seed/019")]
     #[test]
-    fn orchestration_seed_017_unattributed_thinking_after_fresh_write_must_not_confirm() {
+    fn orchestration_seed_019_unattributed_thinking_after_fresh_write_must_not_confirm() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
             InjectedSendOutcome::Applied,
