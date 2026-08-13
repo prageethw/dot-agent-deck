@@ -2275,6 +2275,65 @@ fn confirmation_grace_period() -> std::time::Duration {
 /// that is a coincidence, not an invariant, so retune either independently.
 const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// PRD #20 R20-005 / PRD fork#257: the floor `send_retry_delay` starts its
+/// exponential schedule from. Shared by both `send_retry_base` variants below
+/// so the release build's unmovable value and the test override's fallback
+/// can never drift apart.
+const SEND_RETRY_BASE_MS: u64 = 500;
+
+/// PRD fork#257: ceiling for [`send_retry_base`]'s test override, in
+/// milliseconds via `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`. Unlike
+/// [`CONFIRMATION_GRACE_PERIOD_MAX`], which is pinned 1ms below
+/// [`AUTOMATIC_PROMPT_DEADLINE`], this is pinned to
+/// [`SEND_RETRY_BACKOFF_CAP`] itself: `send_retry_delay` applies
+/// `.min(SEND_RETRY_BACKOFF_CAP)` to the shifted base for every `attempts`
+/// value, so a base above the cap is unreachable by construction — the cap
+/// always wins regardless of how large the base is. Clamping the base to the
+/// cap is therefore the honest bound, not an analogy borrowed from the grace
+/// period's ceiling: it is the largest value that can ever actually change
+/// `send_retry_delay`'s result.
+#[cfg(any(test, debug_assertions))]
+const SEND_RETRY_BASE_MAX: std::time::Duration = SEND_RETRY_BACKOFF_CAP;
+
+/// PRD fork#257: `#[cfg(any(test, debug_assertions))]` override for
+/// [`send_retry_delay`]'s floor, mirroring [`confirmation_grace_period`]'s
+/// idiom line for line. Extracted as its own directly-callable accessor
+/// rather than inlined into `send_retry_delay`, because `send_retry_delay`
+/// applies `.min(SEND_RETRY_BACKOFF_CAP)` AFTER the base for every `attempts`
+/// value — so for any out-of-range override the result is `SEND_RETRY_BACKOFF_CAP`
+/// regardless of whether the clamp below landed correctly, incorrectly, or
+/// was omitted entirely. A broken clamp and a correct one are
+/// indistinguishable through `send_retry_delay`'s return value alone; calling
+/// this function directly is what makes the clamp observable.
+#[cfg(any(test, debug_assertions))]
+fn send_retry_base() -> std::time::Duration {
+    static OUT_OF_RANGE_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let Some(raw_ms) = std::env::var("DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    else {
+        return std::time::Duration::from_millis(SEND_RETRY_BASE_MS);
+    };
+    let requested = std::time::Duration::from_millis(raw_ms);
+    let clamped = requested.clamp(std::time::Duration::ZERO, SEND_RETRY_BASE_MAX);
+    if clamped != requested && !OUT_OF_RANGE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            requested_ms = requested.as_millis(),
+            clamped_ms = clamped.as_millis(),
+            max_ms = SEND_RETRY_BASE_MAX.as_millis(),
+            "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS is out of range; clamped"
+        );
+    }
+    clamped
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn send_retry_base() -> std::time::Duration {
+    std::time::Duration::from_millis(SEND_RETRY_BASE_MS)
+}
+
 /// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
 /// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
 /// 1 s, then capped at 2 s — so a permanent non-delivery settles into an
@@ -2283,10 +2342,14 @@ const SEND_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_se
 /// PROMPTLY once the target transitions, rather than languishing behind a
 /// minutes-long exponential delay. The cap is the "wait for a matching target
 /// transition" bound from the finding: it keeps the catch-up latency small.
+/// The floor comes from [`send_retry_base`] — overridable under
+/// `cfg(any(test, debug_assertions))`, fixed at [`SEND_RETRY_BASE_MS`]
+/// otherwise — so the exponential shape and [`SEND_RETRY_BACKOFF_CAP`] stay
+/// untouched regardless of which floor is in effect.
 fn send_retry_delay(attempts: u32) -> std::time::Duration {
-    const BASE_MS: u64 = 500;
     let shift = attempts.saturating_sub(1).min(6);
-    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift))
+    send_retry_base()
+        .saturating_mul(1u32 << shift)
         .min(SEND_RETRY_BACKOFF_CAP)
 }
 

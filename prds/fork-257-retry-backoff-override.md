@@ -49,11 +49,11 @@ PR #219 recorded this rationale for not fixing it:
 
 **Extend the override idiom the codebase already has** — do not invent a second one.
 
-`src/ui.rs:2239-2270` is the template, and it is followed literally:
+`src/ui.rs:2239-2270` is the template, and it is followed literally — **with one supersession recorded in the "Decision" subsection under M1 below**: the override pair is not `send_retry_delay` itself, but a new directly-callable accessor, `send_retry_base()`, that `send_retry_delay` calls. `send_retry_delay`'s trailing `.min(SEND_RETRY_BACKOFF_CAP)` would otherwise make the clamp unobservable for any override at or above the cap, which is not true of `confirmation_grace_period()` (nothing caps it afterwards).
 
-1. A `#[cfg(any(test, debug_assertions))]` `send_retry_delay` reading `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, clamped, warning **once** through a `static AtomicBool`.
-2. A `#[cfg(not(any(test, debug_assertions)))]` twin returning today's schedule unchanged.
-3. A documented clamp range, with the ceiling justified in the doc comment the way `CONFIRMATION_GRACE_PERIOD_MAX`'s is.
+1. A `#[cfg(any(test, debug_assertions))]` `send_retry_base()` reading `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, clamped, warning **once** through a `static AtomicBool`.
+2. A `#[cfg(not(any(test, debug_assertions)))]` twin returning today's fixed 500ms floor unchanged.
+3. A documented clamp range — ceiling `SEND_RETRY_BACKOFF_CAP`, not `AUTOMATIC_PROMPT_DEADLINE` (see the Decision below M1) — justified in the doc comment the way `CONFIRMATION_GRACE_PERIOD_MAX`'s is.
 
 The override moves only the **base**; the exponential shape (`BASE << (attempts-1)`, capped at `SEND_RETRY_BACKOFF_CAP`) and the cap itself are untouched, so a test that lowers the base still exercises the real backoff curve rather than a flattened one.
 
@@ -88,10 +88,23 @@ That also retires a risk PRD fork#197 records as accepted-but-unverified:
 
 ### M1 — the override seam
 
-- [ ] `send_retry_delay` splits into the `cfg`-gated pair, mirroring `confirmation_grace_period` line for line.
-- [ ] `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS` is read, parsed, and **clamped** to a documented range. Zero is legitimate (retry as soon as the grace period allows). The ceiling is pinned below `AUTOMATIC_PROMPT_DEADLINE` for the same reason `CONFIRMATION_GRACE_PERIOD_MAX` is: past that point the override is not a longer backoff, it is a silently disabled retry.
-- [ ] Out-of-range values warn **once** via a `static AtomicBool`, not once per call.
-- [ ] The release build is byte-identical in behaviour — the override cannot be reached without `debug_assertions` or `cfg(test)`.
+- [x] `send_retry_delay`'s floor is extracted into its own directly-callable accessor, `send_retry_base()`, which splits into the `cfg`-gated pair, mirroring `confirmation_grace_period` line for line. **Superseded during the GREEN round** (below) from the PRD's original plan of gating `send_retry_delay` itself — the extraction is what makes the clamp observable at all.
+- [x] `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS` is read, parsed, and **clamped** to a documented range. Zero is legitimate (retry as soon as the grace period allows). **Superseded**: the ceiling is `SEND_RETRY_BACKOFF_CAP`, not a value pinned below `AUTOMATIC_PROMPT_DEADLINE` — see "Decision: the clamp ceiling is `SEND_RETRY_BACKOFF_CAP`, not `AUTOMATIC_PROMPT_DEADLINE`" below.
+- [x] Out-of-range values warn **once** via a `static AtomicBool`, not once per call.
+- [x] The release build is byte-identical in behaviour — the override cannot be reached without `debug_assertions` or `cfg(test)`.
+
+#### Decision: the clamp ceiling is `SEND_RETRY_BACKOFF_CAP`, not `AUTOMATIC_PROMPT_DEADLINE`
+
+This supersedes the M1 wording above, which by analogy with `CONFIRMATION_GRACE_PERIOD_MAX` proposed pinning the base's clamp ceiling just below `AUTOMATIC_PROMPT_DEADLINE`. The tester writing `orchestration/seed/017` found the analogy does not hold, and correctly refused to decide it, since it is a production-code shape decision:
+
+> `send_retry_delay`'s existing `.min(SEND_RETRY_BACKOFF_CAP)` (2 s) is applied *after* the base, for every `attempts` value — so for any out-of-range override the result is `2s` regardless of whether the override's clamp landed correctly, incorrectly, or was omitted entirely. A broken ceiling clamp and a correct one are indistinguishable through `send_retry_delay`'s return value alone.
+
+`CONFIRMATION_GRACE_PERIOD_MAX`'s ceiling works as a testable clamp because `confirmation_grace_period()` **is** the directly-callable accessor, with nothing capping it afterwards. Pinning the base's clamp to `AUTOMATIC_PROMPT_DEADLINE` while leaving it buried inside `send_retry_delay` would copy that idiom's shape without its testability: `send_retry_delay(1)` for any override at or above `SEND_RETRY_BACKOFF_CAP` (2s) — whether the override is 3s or 3 minutes — always returns exactly `SEND_RETRY_BACKOFF_CAP`, so a broken clamp would be unobservable through it. That is the same class of defect as the seven surviving mutations filed upstream as fork #537.
+
+The fix has two parts:
+
+1. **Extract the clamped base into its own directly-callable accessor**, `send_retry_base()`, carrying the `cfg` pair, the env read, the clamp and the warn-once. `send_retry_delay` calls it and applies the shift and `SEND_RETRY_BACKOFF_CAP` as before — so the clamp itself is now callable and assertable independent of the shift/cap that sits downstream of it.
+2. **Set the ceiling to `SEND_RETRY_BACKOFF_CAP` itself, not `AUTOMATIC_PROMPT_DEADLINE - 1ms`.** A base above `SEND_RETRY_BACKOFF_CAP` is unreachable by construction, since `send_retry_delay`'s `.min(SEND_RETRY_BACKOFF_CAP)` always wins regardless of how large the base is. Clamping the base to the cap is the honest bound — the largest value that can ever actually change `send_retry_delay`'s result — rather than a value borrowed by analogy from a sibling override whose downstream shape is different.
 
 ### M2 — the proof
 
@@ -114,10 +127,9 @@ That also retires a risk PRD fork#197 records as accepted-but-unverified:
 
 ## Key Files
 
-- `src/ui.rs:2286-2291` — `send_retry_delay`, the floor being made overridable.
-- `src/ui.rs:2239-2270` — `confirmation_grace_period`, the idiom to mirror exactly.
-- `src/ui.rs:2276` — `SEND_RETRY_BACKOFF_CAP`, untouched.
-- `src/ui.rs:2299` — `AUTOMATIC_PROMPT_DEADLINE`, the clamp ceiling's reference point.
+- `src/ui.rs` — `send_retry_base()`, the extracted directly-callable accessor carrying the override, and `send_retry_delay`, which now calls it.
+- `src/ui.rs:2239-2270` — `confirmation_grace_period`, the idiom mirrored (with the ceiling decision above superseding the analogy for the clamp bound).
+- `src/ui.rs:2276` (pre-change line numbers) — `SEND_RETRY_BACKOFF_CAP`, untouched by the shift/cap logic and now also the clamp ceiling's reference point (see the Decision above; `AUTOMATIC_PROMPT_DEADLINE` is not used here).
 - `tests/e2e_orchestration_seed_retry_real.rs` — `orchestration/seed/015`, `/016`.
 - `tests/CATALOG.md` — entries for `/015`, `/016`, plus new `/017`, `/018`.
 
