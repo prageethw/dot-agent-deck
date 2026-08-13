@@ -2170,36 +2170,49 @@ mod tests {
         PathBuf::from(s)
     }
 
-    /// Asserts `output` carries no raw byte of any [`HOSTILE_CONTROLS`] /
-    /// [`HOSTILE_BIDI`] char, carries each one's `char::escape_default()`
-    /// spelling instead, and still carries the printable Unicode / path
-    /// separator content verbatim. Both directions matter equally: silently
-    /// dropping a control character is exactly as wrong as leaving it raw,
-    /// since either way an operator can no longer tell two hostile
-    /// filenames apart.
-    fn assert_hostile_content_is_sanitized(output: &str) {
+    /// Asserts `cell` -- content the caller has already isolated to a single
+    /// untrusted field (a TAB-split table column) or bullet body (a
+    /// `format_reclaim_human` line with its `"  - "` prefix and trailing
+    /// newline stripped), never a raw multi-field/multi-line rendered string
+    /// -- carries no raw byte of any [`HOSTILE_CONTROLS`] / [`HOSTILE_BIDI`]
+    /// char, carries each one's `char::escape_default()` spelling instead,
+    /// and still carries the printable Unicode / path separator content
+    /// verbatim. Both directions matter equally: silently dropping a control
+    /// character is exactly as wrong as leaving it raw, since either way an
+    /// operator can no longer tell two hostile filenames apart.
+    ///
+    /// Deliberately checks a single isolated cell, never a whole rendered
+    /// row/report (issue #232 rescope): `format_list_human`'s rows are
+    /// TAB-separated and `format_reclaim_human`'s bullets are
+    /// newline-terminated, by design -- asserting "no raw TAB/LF anywhere in
+    /// the whole output" would demand the row/bullet structure itself not
+    /// exist, which no fix can satisfy. Callers pin structural corruption
+    /// separately, via field/line counts on the raw output, BEFORE isolating
+    /// the cell this runs against.
+    fn assert_hostile_content_is_sanitized(cell: &str) {
         for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
             assert!(
-                !output.contains(*c),
-                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in rendered \
-                 output, got {output:?}",
+                !cell.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in the isolated \
+                 cell, got {cell:?}",
                 *c as u32
             );
             let escaped: String = c.escape_default().collect();
             assert!(
-                output.contains(&escaped),
+                cell.contains(&escaped),
                 "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) to appear in \
-                 rendered output so two hostile filenames stay distinguishable, got {output:?}",
+                 the isolated cell so two hostile filenames stay distinguishable, got \
+                 {cell:?}",
                 *c as u32
             );
         }
         assert!(
-            output.contains("café") && output.contains("日本語"),
-            "printable Unicode must survive a sanitizing fix unchanged, got {output:?}"
+            cell.contains("café") && cell.contains("日本語"),
+            "printable Unicode must survive a sanitizing fix unchanged, got {cell:?}"
         );
         assert!(
-            output.contains("/repo/wt-"),
-            "the path separator and ordinary path content must survive unchanged, got {output:?}"
+            cell.contains("/repo/wt-"),
+            "the path separator and ordinary path content must survive unchanged, got {cell:?}"
         );
     }
 
@@ -2240,18 +2253,24 @@ mod tests {
         }];
 
         let out = format_list_human(&reports);
-        assert_hostile_content_is_sanitized(&out);
-
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the path must not corrupt the line count (header + \
+             one data row), got: {out:?}"
+        );
         let row = out
             .lines()
             .nth(1)
             .expect("format_list_human must emit a data row after the header");
+        let fields: Vec<&str> = row.split('\t').collect();
         assert_eq!(
-            row.split('\t').count(),
+            fields.len(),
             8,
             "a raw TAB embedded in the path must not corrupt the TAB-separated column count, \
              got row: {row:?}"
         );
+        assert_hostile_content_is_sanitized(fields[0]);
     }
 
     /// Scenario: `format_reclaim_human` renders a pending-confirmation
@@ -2285,7 +2304,20 @@ mod tests {
         };
 
         let out = format_reclaim_human(&outcome);
-        assert_hostile_content_is_sanitized(&out);
+        assert_eq!(
+            out.lines().count(),
+            5,
+            "a raw newline embedded in the path must not corrupt the line count (header, \
+             bullet, run-command line, blank line, `Removed: none`), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(1)
+            .expect("format_reclaim_human must emit a pending bullet as the second line");
+        let cell = bullet
+            .strip_prefix("  - ")
+            .expect("pending bullet must start with the literal '  - ' prefix");
+        assert_hostile_content_is_sanitized(cell);
     }
 
     /// Scenario: `format_reclaim_human` renders a `Removed:` entry -- the
@@ -2313,7 +2345,20 @@ mod tests {
         };
 
         let out = format_reclaim_human(&outcome);
-        assert_hostile_content_is_sanitized(&out);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the path must not corrupt the line count (`Removed:` \
+             header, bullet), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(1)
+            .expect("format_reclaim_human must emit a removed bullet as the second line");
+        let cell = bullet
+            .strip_prefix("  - ")
+            .expect("removed bullet must start with the literal '  - ' prefix");
+        assert_hostile_content_is_sanitized(cell);
     }
 
     /// Scenario: `format_reclaim_human` renders a `Kept:` entry -- read to
@@ -2322,6 +2367,8 @@ mod tests {
     #[test]
     fn format_reclaim_human_escapes_hostile_path_in_kept_section() {
         let path = hostile_path_component();
+        let reason = "dirty: uncommitted or untracked changes are present that were never \
+                       part of the merged PR";
         let report = WorktreeReport {
             path: path.clone(),
             branch: Some("feat/hostile".to_string()),
@@ -2330,11 +2377,7 @@ mod tests {
             owner: Some("test-owner".to_string()),
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
-            reason: Some(
-                "dirty: uncommitted or untracked changes are present that were never part of \
-                 the merged PR"
-                    .to_string(),
-            ),
+            reason: Some(reason.to_string()),
             real_path: path,
         };
         let outcome = ReclaimOutcome {
@@ -2344,7 +2387,23 @@ mod tests {
         };
 
         let out = format_reclaim_human(&outcome);
-        assert_hostile_content_is_sanitized(&out);
+        assert_eq!(
+            out.lines().count(),
+            3,
+            "a raw newline embedded in the path must not corrupt the line count \
+             (`Removed: none`, `Kept:` header, bullet), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(2)
+            .expect("format_reclaim_human must emit a kept bullet as the third line");
+        let without_prefix = bullet
+            .strip_prefix("  - ")
+            .expect("kept bullet must start with the literal '  - ' prefix");
+        let cell = without_prefix
+            .strip_suffix(&format!(" ({reason})"))
+            .expect("kept bullet must end with the literal ' ({reason})' suffix");
+        assert_hostile_content_is_sanitized(cell);
     }
 
     /// Scenario: `WorktreeListDocument` serializes a report whose path
@@ -2453,6 +2512,20 @@ mod tests {
     /// (not escaped) by `sanitize_marker_creator`, so requiring their
     /// escaped spelling too would fail on chars that were correctly removed
     /// upstream rather than escaped at the render site.
+    ///
+    /// Deliberately kept as a second, narrower helper rather than folded
+    /// into [`assert_hostile_content_is_sanitized`] once that helper moved
+    /// to operating on an isolated cell (issue #232 rescope): the two no
+    /// longer differ over TAB/newline structure -- OWNER's Cf-gap test could
+    /// pass an isolated OWNER cell to either helper without hitting a
+    /// separator conflict. They differ over which *character set* is
+    /// reachable in that cell. `sanitize_marker_creator` already stripped
+    /// every `HOSTILE_CONTROLS` char before this cell's content was ever
+    /// assigned, so those chars' raw bytes are absent for a reason that has
+    /// nothing to do with the render-site fix under test; asserting their
+    /// escaped spellings too would demand a spelling for content that was
+    /// correctly removed, not escaped. Only [`HOSTILE_BIDI`] is genuinely
+    /// reachable here, so only it is asserted.
     fn assert_bidi_content_is_sanitized(output: &str) {
         for c in HOSTILE_BIDI.iter() {
             assert!(
@@ -2494,18 +2567,24 @@ mod tests {
         }];
 
         let out = format_list_human(&reports);
-        assert_hostile_content_is_sanitized(&out);
-
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the branch must not corrupt the line count (header + \
+             one data row), got: {out:?}"
+        );
         let row = out
             .lines()
             .nth(1)
             .expect("format_list_human must emit a data row after the header");
+        let fields: Vec<&str> = row.split('\t').collect();
         assert_eq!(
-            row.split('\t').count(),
+            fields.len(),
             8,
             "a raw TAB embedded in the branch must not corrupt the TAB-separated column \
              count, got row: {row:?}"
         );
+        assert_hostile_content_is_sanitized(fields[1]);
     }
 
     /// Scenario: `format_list_human` renders one report whose `reason`
@@ -2534,18 +2613,24 @@ mod tests {
         }];
 
         let out = format_list_human(&reports);
-        assert_hostile_content_is_sanitized(&out);
-
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in the reason must not corrupt the line count (header + \
+             one data row), got: {out:?}"
+        );
         let row = out
             .lines()
             .nth(1)
             .expect("format_list_human must emit a data row after the header");
+        let fields: Vec<&str> = row.split('\t').collect();
         assert_eq!(
-            row.split('\t').count(),
+            fields.len(),
             8,
             "a raw TAB embedded in the reason must not corrupt the TAB-separated column \
              count, got row: {row:?}"
         );
+        assert_hostile_content_is_sanitized(fields[7]);
     }
 
     /// Scenario: `sanitize_marker_creator` filters Unicode category Cc but
