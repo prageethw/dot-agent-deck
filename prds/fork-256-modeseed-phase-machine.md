@@ -75,8 +75,12 @@ The confirmation check is then **inherited**, not re-implemented — which is th
 ### M1 — migrate, then delete
 
 - [ ] `process_pending_seed_prompts` uses `DeliveryPhase` / `delivery_phase()` / `reset_delivery_cycle()`.
-- [ ] `UiState::seed_delivery_landed` is **deleted** — struct field, initialiser, take/restore. `grep seed_delivery_landed` returns nothing.
+- [ ] `UiState::seed_delivery_landed` is **deleted** — struct field, initialiser, take/restore — and **not replaced by an equivalent under another name**. The test is that no separate landed-store exists, not that a particular identifier is absent (see the note under Success Criteria).
 - [ ] The keyspace difference is resolved explicitly. The `HashSet` is keyed by pane id string while the phase machine is keyed by tab; state which is authoritative and why, rather than mapping between them at each call site — a mapping layer is a fourth representation wearing a disguise.
+
+  **Resolved (2026-08-13): pane id is authoritative, and the tab-less constraint behind it is real.** Verified by the reviewer at `src/ui.rs:10083-10100`: the plain dashboard-card enqueue constructs a `PendingSeedPrompt` from `new_id` after switching to the dashboard, with **no orchestration tab id in play at all** (the mode-tab enqueue at `9995-10016` is a distinct site). So a pane→tab bridge would be invented state, exactly as this milestone forbids.
+
+  **But that constraint rules out a mapping layer; it does not license a second store.** The reviewer's words: *"A pane id being authoritative is real, but it only rules out a tab-id mapping; it does not justify retaining a second landed-state implementation."* The resolution is therefore to make the **shared** phase representation capable of pane-keyed cycles — one store that both paths use — not two stores agreeing on a classifier.
 
 ### M2 — parity
 
@@ -96,8 +100,14 @@ The confirmation check is then **inherited**, not re-implemented — which is th
 
 ## Success Criteria
 
-1. `grep -rn seed_delivery_landed src/` returns **zero** hits.
+1. **There is ONE store of "landed", shared by both paths** — not two stores behind one classifier. Concretely: no pane-keyed `HashSet` exists alongside the phase machine's own state, under any name.
 2. The number of open-coded "landed vs confirmed" spellings goes **down**, from three to two.
+
+> **Criterion 1 was rewritten on 2026-08-13, because the original was gameable and got gamed by accident.** It read *"`grep -rn seed_delivery_landed src/` returns **zero** hits"* — which a **rename** satisfies. That is what happened: the field became `seed_prompt_landed`, still a pane-keyed `HashSet<String>` with its own take/insert/restore/clear lifecycle, and the grep passed.
+>
+> The coder reported the rename prominently and argued for it rather than quietly clearing the bar, which is why it was caught immediately. Independent reviewer and auditor rounds then reached the same verdict without conferring. The reviewer put it best: `delivery_phase(true, landed.contains(...))` with a fixed `true` is *"semantically the old `if landed.contains(...) { return true; }` with an enum wrapper"* — and the unreachable `Idle`/`Finalized` arms prove the call cannot exercise the phase machine's meaningful distinction at all.
+>
+> **The lesson is about the criterion, not the work.** A success criterion phrased as the absence of an identifier tests the *name*; the thing that mattered was the *shape*. Criterion 1 now names the property. `grep` is still a fine check — it is just not the definition.
 3. A genuinely lost mode-seed write is retried and, if still unconfirmed, reported delivered-unconfirmed rather than silently reclaimed.
 4. `prompt/pane-input/024` still passes unmodified.
 
