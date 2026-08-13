@@ -1603,21 +1603,22 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     // PRD fork#235 round 3: the identity itself is the dispatched worktree's
     // absolute path plus its branch (`agent/issue-<n>`, CLAUDE.md rule 23),
     // not `issue-dispatch:<task>#<issue>@…` — the task name above is
-    // DECORATION, not the compared identity string.
-    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    // DECORATION, not the compared identity string. Assert on the branch —
+    // a canonicalisation-stable component unique to this issue's dispatch —
+    // rather than `paths.worktree_dir`: that path is built lexically
+    // (`derive_issue_paths` performs no canonicalisation) while the identity
+    // rendered into the comment is physically resolved (`canonicalize_identity_path`,
+    // PRD fork#235 round 3), so the two diverge whenever the workspace root is
+    // reached through a symlink (fork#243).
     let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls().iter().any(|l| {
-            l.contains("issue")
-                && l.contains("comment")
-                && l.contains(&worktree_str)
-                && l.contains(&paths.branch)
-        })
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains(&paths.branch))
     });
     assert!(
         named_worktree_identity,
-        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
-         absolute path ({worktree_str:?}) and its branch ({:?}, CLAUDE.md rule 23) — not merely \
-         decorate it with the task name; observed gh calls:\n{}",
+        "the claim comment must name the round-3 identity anchor's branch ({:?}, CLAUDE.md \
+         rule 23) — not merely decorate it with the task name; observed gh calls:\n{}",
         paths.branch,
         stub.gh_calls().join("\n")
     );
@@ -2223,15 +2224,16 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
 /// `.dot-agent-deck.toml` opens an ORCHESTRATION tab (`ORCH_TOML`'s
 /// `dispatch-orch`). Assert the posted claim comment names the
 /// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, and
-/// separately anchors on the round-3 identity — the dispatched worktree's
-/// absolute path plus its branch (CLAUDE.md rule 23) — regardless of which
-/// spawn kind fired it. Does NOT assert the scheduled task's name
-/// (`claim-task-021`) is absent from the comment: `derive_issue_paths` keys
-/// the clone directory on the task name for every `SpawnKind`, so the raw
-/// worktree path this test also requires present legitimately contains
-/// `claim-task-021` as a path segment — what differs between an
-/// orchestration dispatch and a single-agent one (`scheduler/dispatch/010`)
-/// is only which name is rendered as decoration.
+/// separately anchors on the round-3 identity's branch (`agent/issue-<n>`,
+/// CLAUDE.md rule 23) — regardless of which spawn kind fired it. Anchors on
+/// the branch rather than the dispatched worktree's absolute path
+/// (fork#243): the path rendered into the comment is physically resolved
+/// (`canonicalize_identity_path`), while `derive_issue_paths` builds a
+/// lexical path with no canonicalisation, so the two would silently diverge
+/// whenever the workspace root is reached through a symlink — the branch has
+/// no such dependency and is just as unique to this dispatch — what differs
+/// between an orchestration dispatch and a single-agent one
+/// (`scheduler/dispatch/010`) is only which name is rendered as decoration.
 #[spec("scheduler/dispatch/021")]
 #[test]
 fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
@@ -2269,21 +2271,22 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
 
     // PRD fork#235 round 3: the identity itself is the dispatched worktree's
     // absolute path plus its branch (CLAUDE.md rule 23) regardless of spawn
-    // kind — `dispatch-orch` above is decoration only.
-    let worktree_str = paths.worktree_dir.to_string_lossy().into_owned();
+    // kind — `dispatch-orch` above is decoration only. Assert on the branch —
+    // a canonicalisation-stable component unique to this issue's dispatch —
+    // rather than `paths.worktree_dir`: that path is built lexically
+    // (`derive_issue_paths` performs no canonicalisation) while the identity
+    // rendered into the comment is physically resolved (`canonicalize_identity_path`,
+    // PRD fork#235 round 3), so the two diverge whenever the workspace root is
+    // reached through a symlink (fork#243).
     let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls().iter().any(|l| {
-            l.contains("issue")
-                && l.contains("comment")
-                && l.contains(&worktree_str)
-                && l.contains(&paths.branch)
-        })
+        stub.gh_calls()
+            .iter()
+            .any(|l| l.contains("issue") && l.contains("comment") && l.contains(&paths.branch))
     });
     assert!(
         named_worktree_identity,
-        "the claim comment must name the round-3 identity anchor — the dispatched worktree's \
-         absolute path ({worktree_str:?}) and its branch ({:?}, CLAUDE.md rule 23) — not merely \
-         decorate it with the orchestration name; observed gh calls:\n{}",
+        "the claim comment must name the round-3 identity anchor's branch ({:?}, CLAUDE.md \
+         rule 23) — not merely decorate it with the orchestration name; observed gh calls:\n{}",
         paths.branch,
         stub.gh_calls().join("\n")
     );
