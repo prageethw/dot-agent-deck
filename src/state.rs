@@ -354,8 +354,11 @@ pub struct SessionState {
     /// `PermissionRequest` that most recently armed `WaitingForInput`,
     /// single-slot (not a queue — Claude Code only ever shows one
     /// outstanding prompt per pane). Three states, not two:
-    /// - `None` — no permission is pending (plain notification wait); any
-    ///   `ToolStart` clears the badge.
+    /// - `None` — no permission is pending (plain notification wait); a
+    ///   `ToolStart` clears the badge only when the pane's current status
+    ///   came from an identified producer — not when the pane is marked
+    ///   untagged, since an untagged frame plants status without ever
+    ///   setting this marker (issue #262).
     /// - `Some(None)` — a permission IS pending but its tool name is
     ///   unknown (OpenCode's `permissionPayload` never sends `tool_name`,
     ///   see `src/opencode_manage.rs`); an unrelated `ToolStart` must NOT
