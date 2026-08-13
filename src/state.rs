@@ -330,8 +330,11 @@ pub struct SessionState {
     /// `PermissionRequest` that most recently armed `WaitingForInput`,
     /// single-slot (not a queue — Claude Code only ever shows one
     /// outstanding prompt per pane). Three states, not two:
-    /// - `None` — no permission is pending (plain notification wait); any
-    ///   `ToolStart` clears the badge.
+    /// - `None` — no permission is pending (plain notification wait); a
+    ///   `ToolStart` clears the badge only when the pane's current status
+    ///   came from an identified producer — not when the pane is marked
+    ///   untagged, since an untagged frame plants status without ever
+    ///   setting this marker (issue #262).
     /// - `Some(None)` — a permission IS pending but its tool name is
     ///   unknown (OpenCode's `permissionPayload` never sends `tool_name`,
     ///   see `src/opencode_manage.rs`); an unrelated `ToolStart` must NOT
@@ -5338,6 +5341,15 @@ impl AppState {
         // both are done with, just below.
         let provenance_pane = event.pane_id.clone();
         let provenance_untagged = event.agent_id.is_none();
+        // Issue #262: whether the pane's CURRENT status is already marked as
+        // written by an unidentified producer. Captured here, next to the
+        // provenance fields above, for the same reason — `session` borrows
+        // `self` for the rest of this block, so `self.untagged_status_panes`
+        // cannot be read inside the `ToolStart` arm below.
+        let pane_status_untagged = event
+            .pane_id
+            .as_deref()
+            .is_some_and(|p| self.untagged_status_panes.contains(p));
 
         // Whether this frame ASSERTED a status, as opposed to leaving whatever
         // the session already had. Only an assertion may move the provenance
@@ -5378,7 +5390,17 @@ impl AppState {
                 // concurrent-subagent regression (#86/`4d31103`); it can only
                 // clear via the plain `WaitingForInput` notification path.
                 let matches_pending = match session.pending_permission_tool.as_ref() {
-                    None => true,
+                    // Issue #262: "no marker means this was not a permission
+                    // prompt, so a tool starting must be the human's reply"
+                    // only holds if the `WaitingForInput` on the card came
+                    // from an identified producer. If the pane is marked
+                    // untagged, there is no marker for the same reason there
+                    // is no trust — an untagged frame plants status without
+                    // ever setting `pending_permission_tool` — so falling
+                    // through to `true` here let a tagged `ToolStart` treat
+                    // the plant as its own pending prompt and clear it,
+                    // laundering an untagged status into a trusted one.
+                    None => !pane_status_untagged,
                     Some(None) => false,
                     Some(Some(pending)) => Some(pending.as_str()) == event.tool_name.as_deref(),
                 };
@@ -8061,6 +8083,53 @@ mod tests {
             state.untagged_status_panes.contains(UNTAGGED_PANE),
             "a frame that only PRESERVED an untagged status must not vouch for \
              it; the gate would then act on a status nobody identified"
+        );
+    }
+
+    /// Issue #262's trusted counterpart to the detector above. When the pane
+    /// carries no untagged mark at all, `None => !pane_status_untagged`
+    /// resolves to `true`, so a tagged `ToolStart` DOES clear a
+    /// `WaitingForInput` left by no marker — PRD #372's "no marker means no
+    /// permission prompt was pending, so a tool starting must be the human's
+    /// reply" heuristic, operating on a status the gate already trusts. Only
+    /// the untagged half of this arm is pinned above; a mutation that always
+    /// resolved the arm to `false` (`None => false`) would regress this
+    /// heuristic while still passing every other test in this module.
+    #[test]
+    fn a_tagged_tool_start_with_no_marker_clears_a_trusted_waiting_status() {
+        let mut state = pane_with_tagged_session();
+
+        // A tagged plain `WaitingForInput` — an identified producer, so it
+        // clears any marker and leaves the pane trusted.
+        let mut tagged_waiting =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::WaitingForInput);
+        tagged_waiting.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_waiting);
+        assert!(
+            !state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "precondition: a tagged WaitingForInput must leave the pane trusted"
+        );
+
+        // The pane's real agent starts a tool. With no marker at all and a
+        // trusted status, this must be read as the human's reply taking
+        // effect, not a guess.
+        let mut tagged_tool =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::ToolStart);
+        tagged_tool.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_tool);
+
+        let session = state
+            .sessions
+            .get(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("the pane's session");
+        assert_eq!(
+            session.status,
+            SessionStatus::Working,
+            "a trusted WaitingForInput with no marker must clear on ToolStart"
+        );
+        assert!(
+            !state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "the pane must remain trusted after the clear"
         );
     }
 
