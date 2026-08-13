@@ -76,3 +76,33 @@ pub fn shell_command_flag() -> &'static str {
         "/C"
     }
 }
+
+/// Quote `arg` as a single word of the shell [`default_shell`]/
+/// [`shell_command_flag`] would run — for a caller that assembles a command
+/// *line* (rather than an argv vector) that is later parsed by an outer
+/// shell, e.g. `dot-agent-deck watch --interval N <command>` written into a
+/// pane's shell (issue #157: the executable path went in bare and a watch
+/// pane silently failed to start once the deck was installed at a path
+/// containing a space).
+///
+/// Unix: single-quotes `arg` unconditionally, closing/escaping/reopening an
+/// embedded `'` as `'\''` (the standard POSIX technique) — nothing else is
+/// special between single quotes, so this preserves whitespace, double
+/// quotes, `$`, backticks, backslashes, real newlines, `;`, `&`, `|`,
+/// redirection, glob characters and parentheses.
+///
+/// Windows: double-quotes `arg`, escaping an embedded `"` as `\"`. This keeps
+/// whitespace and most metacharacters inside one literal argument, but it
+/// does **not** neutralise `cmd.exe`'s own expansions — `%VAR%` is expanded
+/// (and, under delayed expansion, so is `!VAR!`) even inside double quotes.
+/// That is the same open class as issue #238 and is not resolved by this
+/// helper; do not read a call to this function as closing it.
+#[cfg(unix)]
+pub fn quote_shell_arg(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+#[cfg(windows)]
+pub fn quote_shell_arg(arg: &str) -> String {
+    format!("\"{}\"", arg.replace('"', "\\\""))
+}
