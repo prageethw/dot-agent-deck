@@ -923,11 +923,12 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
 /// the fallback is inline `--task`, never a heredoc.
 fn work_done_footer(role: &str) -> String {
     let slug = role_path_slug(role);
+    let bin = crate::platform::paths::binary_name();
     format!(
         "## When done\n\n\
          Signal completion by running this command via Bash:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
+         {bin} work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
          ```\n\n\
          Write that report with your **file-writing tool**. Do not construct it with shell \
          redirection or a heredoc: a line of your own text can terminate the heredoc, and \
@@ -947,9 +948,9 @@ fn work_done_footer(role: &str) -> String {
          that is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
          `!`**:\n\n\
          ```bash\n\
-         dot-agent-deck work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         {bin} work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
          ```\n\n\
-         Anything outside that allowlist is rewritten by your own shell before dot-agent-deck \
+         Anything outside that allowlist is rewritten by your own shell before {bin} \
          sees it: backticks and `$(…)` are executed and replaced by their output (usually empty), \
          `$VAR` becomes its value or nothing, a balanced inner `\"` is removed and changes how the \
          rest of the argument is quoted, a `\\` before `$`, a backtick, `\"` or `\\` removes \
@@ -4427,6 +4428,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[test]
     fn compose_delegate_prompt_is_single_line_file_pointer() {
@@ -4517,7 +4519,10 @@ mod tests {
             "the task body must be inlined so the worker can still act: {body}"
         );
         assert!(
-            body.contains("dot-agent-deck work-done"),
+            body.contains(&format!(
+                "{} work-done",
+                crate::platform::paths::binary_name()
+            )),
             "the inlined body must keep the completion footer, or the worker \
              cannot signal done: {body}"
         );
@@ -4549,14 +4554,15 @@ mod tests {
     fn compose_worker_task_file_appends_work_done_footer() {
         let content =
             compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let bin = crate::platform::paths::binary_name();
         assert!(content.starts_with("You are coder.\n\n## Task\n\nImplement the thing."));
         assert!(
             content.contains("## When done"),
             "task file must include the completion heading"
         );
         assert!(
-            content.contains("dot-agent-deck work-done --task"),
-            "task file must instruct the worker to call dot-agent-deck work-done"
+            content.contains(&format!("{bin} work-done --task")),
+            "task file must instruct the worker to call {bin} work-done"
         );
 
         // Issue #303: BOTH forms must be offered — the shell-safe file one as
@@ -4566,10 +4572,10 @@ mod tests {
         // the `-file` suffix plus a single-quoted path, and the opening double
         // quote of the inline argument.
         let file_form = content
-            .find("dot-agent-deck work-done --task-file '.dot-agent-deck/")
+            .find(&format!("{bin} work-done --task-file '.dot-agent-deck/"))
             .expect("footer must offer the shell-safe --task-file form with a quoted path");
         let inline_form = content
-            .find("dot-agent-deck work-done --task \"")
+            .find(&format!("{bin} work-done --task \""))
             .expect("footer must keep the short inline --task form for a brief summary");
         // Reviewer finding 2 / auditor finding 2: the file form must be the
         // FIRST command the worker sees, or the footer keeps teaching the
@@ -4675,6 +4681,44 @@ mod tests {
 
         let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder");
         assert!(no_template.starts_with("Implement the fallback.\n\n## When done"));
+    }
+
+    /// Scenario: Build a worker task file's `## When done` footer and check
+    /// that both its `work-done` command examples name what `binary_name()`
+    /// resolves for the running process — under `cargo test` the throwaway
+    /// test binary is never on `$PATH`, so this is its own absolute
+    /// `current_exe()` path, never the crate's baked-in literal name.
+    #[spec("orchestration/delegate/033")]
+    #[test]
+    fn delegate_033_work_done_footer_names_the_running_binary() {
+        let content =
+            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let bin = crate::platform::paths::binary_name();
+
+        assert_ne!(
+            bin, "dot-agent-deck",
+            "this test only proves anything when the test binary's own file name differs \
+             from the literal the pre-fix code always emitted"
+        );
+        assert!(
+            content.contains(&format!("{bin} work-done --task-file")),
+            "the --task-file example must name the running binary ({bin:?}), got: {content}"
+        );
+        assert!(
+            content.contains(&format!("{bin} work-done --task \"")),
+            "the inline --task example must name the running binary ({bin:?}), got: {content}"
+        );
+        // Reviewer finding F6: pin the ABSENCE of the old literal too, so a
+        // later edit that reintroduces a hardcoded `dot-agent-deck` example
+        // fails this test instead of staying green alongside the dynamic one.
+        assert!(
+            !content.contains("dot-agent-deck work-done --task-file"),
+            "a hardcoded literal must not appear in the --task-file example, got: {content}"
+        );
+        assert!(
+            !content.contains("dot-agent-deck work-done --task \""),
+            "a hardcoded literal must not appear in the inline --task example, got: {content}"
+        );
     }
 
     /// The allowlist consistency guard is only worth having if it actually

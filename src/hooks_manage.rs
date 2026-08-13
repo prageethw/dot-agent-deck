@@ -559,7 +559,7 @@ pub fn auto_install() {
 
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into());
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
 
     let mut settings = match load_settings_or_refuse(&path) {
         Ok(settings) => settings,
@@ -615,7 +615,7 @@ pub fn auto_install_to(path: &PathBuf) {
 pub fn install() -> Result<(), String> {
     let binary_path = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "dot-agent-deck".into());
+        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
 
     let path = settings_path();
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
