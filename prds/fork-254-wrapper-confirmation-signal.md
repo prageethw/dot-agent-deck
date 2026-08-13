@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Planning
+**Status**: **Implementation complete — PR [#269](https://github.com/prageethw/dot-agent-deck/pull/269) pending review/merge.** N1 (candidate 4 root-caused to the wrapper's stdout-classification fallback), N2 (LEVEL confirmation path deleted) and N4 (LEVEL removal + PR #219's four mooted findings re-answered) are done. N3 (`orchestration/seed/019`, the falsifiability proof) is implemented and expected green now that LEVEL is gone — pending confirmation from this branch's CI run. N5 (decide the `emit_with_metadata` seam's fate) and N6 (offer upstream) remain outstanding and are **not blockers**: N5 is a rule-19 judgement call the PRD itself already says is not a reason to keep this open, and N6 is separate work requiring a branch cut from `upstream/main`. *(Status corrected 2026-08-13: this line previously read "Planning" despite N1, N2, N3 and N4 having already landed.)*
 
 **Parent**: [fork #197](https://github.com/prageethw/dot-agent-deck/issues/197), merged as PR [#219](https://github.com/prageethw/dot-agent-deck/pull/219). This PRD carries the half of fork [#187](https://github.com/prageethw/dot-agent-deck/issues/187) that closed only partially.
 
@@ -179,9 +179,9 @@ This is **direction 2** from the issue (*"a submit-shaped event distinct from `T
 
 ### N1 — eliminate candidate 4, or confirm it
 
-- [ ] Establish whether `prompt_text_confirms` has **ever** fired for Codex, or whether every Codex confirmation to date has been LEVEL's. `map_event_type("UserPromptSubmit")` → `EventType::Thinking` means both consumers see the same event, so distinguish them **at the consumer**, not by observing the event.
-- [ ] The decisive experiment is cheap: **re-apply `7cd091e`'s LEVEL removal on a scratch branch and run `orchestration/seed/016`.** If it confirms via TEXT, LEVEL can go and the original removal was right on a wrong diagnosis. If it still waits out 60 s, TEXT is not firing and N2 is where the real work is.
-- [ ] Whichever way it lands, record **which of the four candidates** it was. "It works now" without a named cause is how this PRD got its wrong premise in the first place.
+- [x] Establish whether `prompt_text_confirms` has **ever** fired for Codex, or whether every Codex confirmation to date has been LEVEL's. `map_event_type("UserPromptSubmit")` → `EventType::Thinking` means both consumers see the same event, so distinguish them **at the consumer**, not by observing the event.
+- [x] The decisive experiment is cheap: **re-apply `7cd091e`'s LEVEL removal on a scratch branch and run `orchestration/seed/016`.** If it confirms via TEXT, LEVEL can go and the original removal was right on a wrong diagnosis. If it still waits out 60 s, TEXT is not firing and N2 is where the real work is.
+- [x] Whichever way it lands, record **which of the four candidates** it was. "It works now" without a named cause is how this PRD got its wrong premise in the first place.
 
 ### N2 — make TEXT actually fire for Codex, if N1 says it does not
 
@@ -192,8 +192,9 @@ This is **direction 2** from the issue (*"a submit-shaped event distinct from `T
 
 ### N3 — the falsifiability proof, which is still the deliverable
 
-- [ ] A test exhibiting a **genuinely lost write** that the signal **declines** to confirm. This was the deliverable before the rescope and it is unchanged by it — everything above only changes *which* signal is being proved.
-- [ ] It must discriminate TEXT from LEVEL explicitly. A test that passes with either is worthless here, for exactly the reason M2.0b flagged.
+- [x] A test exhibiting a **genuinely lost write** that the signal **declines** to confirm. This was the deliverable before the rescope and it is unchanged by it — everything above only changes *which* signal is being proved.
+- [x] It must discriminate TEXT from LEVEL explicitly. A test that passes with either is worthless here, for exactly the reason M2.0b flagged.
+- [x] **Proof: `orchestration/seed/019`** (`src/ui.rs`, `tests/CATALOG.md`). Frame 1 lands an `Applied` write against an `Idle` session; frame 2 flips the session to `Thinking` with `last_user_prompt` still `None` — the unattributed-`Thinking` shape the wrapper's stdout-classification fallback produces on any non-blank output line. This satisfies both bullets above: (a) it is a genuinely lost write (nothing ever supplies matching `last_user_prompt` text, so TEXT has no basis to confirm) that the signal must decline to confirm, and (b) it discriminates TEXT from LEVEL explicitly, by construction — the test is RED while LEVEL is present (LEVEL confirms on `status == Thinking` alone, with no attribution check) and green once N2 removes LEVEL (TEXT correctly declines, since `last_user_prompt` never matches `sent_prompt`). A test that passed under either signal would not prove this; this one is written specifically to fail under LEVEL and pass only via TEXT's decline.
 
 ### N4 — remove LEVEL
 
@@ -371,7 +372,29 @@ This is **direction 2** from the issue (*"a submit-shaped event distinct from `T
 
 It *is* a candidate **semantic** change behind a stable wire, which is exactly the case rule 12 exists for: a consumer that treated "wrapper events never carry `user_prompt`" as an invariant would now see one. Before opening the PR, grep for consumers keying on that emptiness. If any exists, this needs a `changelog.d/254.breaking.md` fragment. If none does, record the negative finding **in this PRD with the grep that established it** — a milestone ticked on neither a run nor a waiver is the state rule 12 prevents.
 
-The **manual cross-version run applies regardless**, since it is a hook/daemon-adjacent change and the run is what catches a semantic break behind a stable wire. Isolate `DOT_AGENT_DECK_LOG` along with the sockets, `HOME` and state dir — a sandbox daemon otherwise appends into the real `~/.local/state/dot-agent-deck/deck.log`, and two interleaved daemons are genuinely hard to attribute after the fact.
+**Narrower than originally framed, and this is why the answer is negative.** The rescope (see above) dropped the original M1 (`emit_with_metadata`'s `user_prompt` seam — see N5) entirely: no code on this branch touches `emit_with_metadata`, and no producer now populates a field that was previously always `None`. The change that actually shipped (N2) only deletes the LEVEL confirmation path in `deliver_orchestrator_prompt`; it adds no new writer of `AgentEvent.user_prompt` anywhere. So the semantic-break question rule 12 asks about — "a consumer that treated wrapper events as always carrying `user_prompt: None`" — cannot have been broken by this PR, because nothing here changes what any producer emits on that field.
+
+**Grep for consumers keying on `user_prompt`/`last_user_prompt` emptiness (2026-08-13):**
+
+```
+$ grep -n "user_prompt" src/*.rs | grep -E "\.is_none\(\)|\.is_some\(\)"
+src/event.rs:1071:        assert!(event.user_prompt.is_none());
+src/hook.rs:974:        assert!(event.user_prompt.is_none());
+
+$ grep -n "last_user_prompt" src/*.rs | grep -E "\.is_none\(\)|\.is_some\(\)"
+(no output)
+
+$ grep -rn "user_prompt" tests/*.rs | grep -E "\.is_none\(\)|\.is_some\(\)"
+tests/e2e_codex_delegate.rs:347:                && event.user_prompt.is_some()
+```
+
+**None of the three hits is a consumer relying on wrapper-emptiness as an invariant this PR could break:**
+- `src/event.rs:1071` (`parse_event_without_user_prompt`) and `src/hook.rs:974` (`build_event_session_start`) both assert `user_prompt.is_none()` for a `SessionStart`/no-prompt hook payload that genuinely carries no prompt field — unrelated to the wrapper's stdout-classification path, and unaffected by anything in this diff (neither `event.rs` nor `hook.rs` is touched by this branch).
+- `tests/e2e_codex_delegate.rs:347` asserts `.is_some()`, i.e. it *requires* a populated `user_prompt` and documents in its own comment that "the wrapper's line classifier … always leaves it `None`" — the exact invariant rule 12 asks about, stated as a precondition of what the test proves (a Codex `Thinking` event with `user_prompt.is_some()` can only have come from the native hook path, never the wrapper). This PR does not touch `emit_with_metadata` or `classify_line`/`classify_line_with`, so the wrapper still always emits `user_prompt: None` and this test's precondition still holds.
+
+**Negative finding: no consumer is broken.** No `changelog.d/254.breaking.md` fragment is needed. The manual cross-version run (below) still applies regardless, per rule 12's own text, since this is a hook/daemon-adjacent change.
+
+The **manual cross-version run applies regardless**, since it is a hook/daemon-adjacent change and the run is what catches a semantic break behind a stable wire. Isolate `DOT_AGENT_DECK_LOG` along with the sockets, `HOME` and state dir — a sandbox daemon otherwise appends into the real `~/.local/state/dot-agent-deck/deck.log`, and two interleaved daemons are genuinely hard to attribute after the fact. **Not performed by this task — the orchestrator's to authorise and sequence.**
 
 ## Risks and Mitigations
 
