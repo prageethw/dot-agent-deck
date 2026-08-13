@@ -121,6 +121,68 @@ This is **direction 2** from the issue (*"a submit-shaped event distinct from `T
 - [ ] **M2.0 — observe the real event stream first.** Capture a real Codex session's JSON events around a genuine submit, and answer the two questions in the Finding above: does `turn.started` fire on submit and *only* on submit, and does it or a neighbouring `item.started` carry the prompt text? **Nothing is implemented before this is answered** — implementing on grep evidence is how LEVEL got adopted in the first place, and the whole point of this PRD is not to repeat that.
 
   This needs a **real-agent run** (CI has no Codex credentials), so it is CLAUDE.md rule 5 carve-out (a) and requires an explicit orchestrator authorisation naming the tests. Record the captured events **in this PRD** — the observation is the deliverable, and a finding that lives only in a worker's context is one interruption from being lost.
+
+  #### M2.0 finding (2026-08-13): `turn.started` is real, but it lives on a channel the wrapper never taps
+
+  **Bottom line: this is a "no", and it disqualifies the whole M2 plan as currently scoped — not because `turn.started` behaves badly, but because it is invisible to the process the deck actually spawns.**
+
+  **What the deck spawns.** `wrap_launch_command("codex", &AgentType::Codex)` rewrites the launch to `dot-agent-deck wrap -- codex` — the **bare interactive TUI**, no `exec`, no `--json`. Grepped `src/agent_pty.rs`, `src/issue_dispatch*.rs` and all of `src/` for any construction of `exec`/`--json` alongside a Codex invocation: **no hits**. The wrapper tees that interactive process's raw stdout — the same stdout the user watches render live in the pane.
+
+  **Question 1 answer — inside the channel where `turn.started` exists (`codex exec --json`), it is well-behaved:**
+  - Fires exactly once per genuine submit, immediately (before the model responds), never spuriously.
+  - `codex exec` cannot be invoked without a prompt at all, so there is no "boot with nothing submitted" case to test inside this channel — invocation *is* submission.
+  - Resuming a prior thread and submitting a new prompt (`codex exec resume <id> --json "…"`) re-emits exactly one `turn.started` per submitted prompt, keyed to the **same** `thread_id` — no separate "resume" event type, no spurious extra `turn.started`.
+  - A tool call **within** an existing turn (a shell command) does **not** re-fire `turn.started` — it fires `item.started`/`item.completed` for the `command_execution` item instead, once each. Confirmed with a real run (below).
+
+  **But — the interactive TUI the wrapper actually tees emits ZERO JSON, ever, under any condition tested:**
+  - Fresh boot, 12s idle, nothing submitted: raw PTY capture, 15.9KB of output, `grep -oE '"type":"[a-zA-Z._]+"' ` → **0 matches**. Pure ANSI (`cursor`, `SGR`, alt-screen) redraw bytes, confirmed by `strings`.
+  - A tmux-driven session, booted to the composer, given a genuine sentinel-bearing prompt (`SENTINEL-254-EVENTSTREAM-PROBE-G`), and watched through a full real response cycle (native `SessionStart`/`UserPromptSubmit` hook banners rendered, then `PONG`): raw log grew from 25,616 → 50,028 bytes; `grep -c '"type":'` → **0** across the entire capture.
+  - So `turn.started` cannot be "LEVEL in better clothing" (falsely firing on boot) — it never fires **at all**, in either direction, on this channel. It is not unfalsifiable; it is **absent**.
+  - Conclusion: the `CODEX` `RuleSet`'s `error_markers`/`idle_markers` (`"type":"error"`, `"type":"turn.completed"`) and `classify_codex_line`'s `serde_json` parse path (`src/wrap.rs:229-243`) were authored against `codex exec --json`'s output shape, but that is **not the shape of what the wrapper ever tees**. Against the actual spawned process they are dead code — the substring/JSON checks simply never match, and every line falls through to the generic non-blank-line `Working` classification (which is why the *existing* Working/Idle-via-process-exit behaviour still works today: it doesn't depend on these markers ever firing).
+
+  **Question 2 answer — no, and it's moot given Q1, but recorded for completeness:** even in the channel where `turn.started` exists, it carries **no fields at all** beyond the type discriminator — `{"type":"turn.started"}`, nothing else. `item.completed` for an `agent_message` item carries `item.text`, but that is the **agent's own reply**, never the submitted prompt. The literal sentinel string (`SENTINEL-254-EVENTSTREAM-PROBE-*`) was grepped for across all four `codex exec --json` captures below and found in **zero** of them.
+
+  **Timing** (process start → event, `codex exec --json`, wall-clock via `date +%s%N` around each stdout line):
+  ```
+  +495ms  {"type":"thread.started","thread_id":"019ff92a-733b-7951-bc00-b0c75ce35a6c"}
+  +594ms  {"type":"turn.started"}
+  +5488ms {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"PONG"}}
+  +5614ms {"type":"turn.completed","usage":{...}}
+  ```
+  `turn.started` lands ~99ms after `thread.started` and well before the model's own response (~5s later) — genuinely tied to submission, not a boot artifact, *in the channel where it exists*. Irrelevant to the wrapper, which never sees this channel.
+
+  **Raw JSON shapes captured** (`codex exec --json`, real runs, `codex-cli 0.147.0`):
+
+  Genuine submit, no tool call:
+  ```
+  {"type":"thread.started","thread_id":"019ff924-819d-7162-9528-05c4e41b5123"}
+  {"type":"turn.started"}
+  {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"PONG"}}
+  {"type":"turn.completed","usage":{"input_tokens":12731,"cached_input_tokens":6912,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":0}}
+  ```
+  Genuine submit that includes a tool call (`ls -la`) — note `item.started`/`item.completed` bracket the tool item, `turn.started` fires only once:
+  ```
+  {"type":"thread.started","thread_id":"019ff924-e158-7bd0-8c7a-87870dc1a19a"}
+  {"type":"turn.started"}
+  {"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc 'ls -la'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+  {"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc 'ls -la'","aggregated_output":"total 40\n…","exit_code":0,"status":"completed"}}
+  {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"DONE"}}
+  {"type":"turn.completed","usage":{"input_tokens":26895,"cached_input_tokens":19968,"cache_write_input_tokens":0,"output_tokens":164,"reasoning_output_tokens":55}}
+  ```
+  Resumed thread (`codex exec resume <thread_id> --json "…"`) — same `thread_id`, one `turn.started`, no distinct resume marker:
+  ```
+  {"type":"thread.started","thread_id":"019ff924-819d-7162-9528-05c4e41b5123"}
+  {"type":"turn.started"}
+  {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"RESUMED"}}
+  {"type":"turn.completed","usage":{"input_tokens":26790,"cached_input_tokens":18944,"cache_write_input_tokens":0,"output_tokens":13,"reasoning_output_tokens":0}}
+  ```
+
+  **Cases probed for Q1:** fresh boot / no submit (interactive TUI, PTY capture, 12s idle — 0 JSON) · genuine submit (interactive TUI via tmux with a real sentinel prompt and a full response cycle — 0 JSON; also `codex exec --json`, 4 separate runs — JSON present, well-behaved) · resumed session with a new prompt (`codex exec resume <id> --json` — JSON present, same shape, same `thread_id`) · tool call inside an existing turn (`codex exec --json` with a shell command — confirmed `item.started`/`item.completed` only, no extra `turn.started`). **Not probed:** resuming the *interactive* TUI with no new submit (moot — the interactive channel already shows zero JSON under every other condition, so there is nothing left to disprove there).
+
+  **Aside, flagged as an observation and not a recommendation:** while capturing the tmux genuine-submit run, Codex's **native** `UserPromptSubmit` hook fired and rendered in the pane (`codex_hooks_manage.rs`'s `CODEX_HOOK_EVENTS` already installs it, and `hook.rs:357`/`hook.rs:428` already extract real `user_prompt` text from that hook's stdin payload — confirmed by the existing test `build_event_user_prompt_submit_extracts_prompt`). That is a **second, independent, already-wired path** that appears to carry real submitted-prompt text for Codex specifically, separate from the wrapper's stdout-classification path this PRD scopes M2 around. Whether that native-hook path is reliable enough to serve as the seed-confirmation TEXT signal (e.g. whether hook trust/install lands in time for the very first seed prompt, which is the case this PRD cares about) is unverified — flagging it for the orchestrator to weigh, not deciding it here.
+
+  **Recommendation (orchestrator's call per the PRD, not mine to decide):** M2 as scoped — recognise `turn.started` off the wrapper's teed stdout — is not implementable; the event does not reach that channel under any condition. Direction 1 (echo-matching rendered TUI text) or Direction 3 (viewport differencing), the PRD's two listed fallbacks, are the remaining candidates, unless the native-hook aside above turns out to be usable, which would need its own verification pass before being treated as a candidate.
+
 - [ ] The `CODEX` `RuleSet` recognises whichever event M2.0 establishes, and emits it carrying the prompt where available.
 - [ ] **The falsifiability test is the deliverable, not a nicety:** a scenario where the write is genuinely lost, in which the signal returns **false** and the delivery is correctly reported unconfirmed. A test that only shows the happy path confirming does not close this issue — that is precisely what LEVEL already does.
 - [ ] A real-Codex run showing confirmation in milliseconds rather than at the 60 s deadline, with no stray CR.
