@@ -6,7 +6,22 @@
 
 **Status** *(updated 2026-08-11, PR #215)*: **Phase 1 complete** — shipped via the carved-out PRD [fork#192](https://github.com/prageethw/dot-agent-deck/issues/192) (PR #193, merged `7426b25`), **released in v0.37.0**. **Phase 2 complete** — M2.3's display half (the OWNER column in `format_list_human`) and M2.4 (the `DOT_AGENT_DECK_WORKTREE_OWNER` identity supply, threaded through both the interactive and issue-dispatch spawn paths, PERSISTED across session-restore via a new `OrchestrationSnapshot.owner` field, plus the `PROTOCOL_VERSION`-unchanged decision) both landed on this branch. **Phase 3 (M3.0) complete** — `worktree list --mine`, filtering on the supplied identity, fails loudly on an absent or `orchestration:unknown` identity, and now matches correctly across a tab close/reopen too. **Phase 4 (M4.0) complete** — docs and changelog fragment below.
 
-**Fork-only**, and intended to stay so. Confirmed mechanically against `upstream/main`: `src/worktree_reclaim.rs` **does not exist** there and `worktree_slug` has **0** occurrences. The ownership half is built entirely on fork-only code, so per `docs/develop/upstream-contribution-policy.md` this is not an offer-later case.
+**Fork-only** — but *(corrected 2026-08-13, fork [#266](https://github.com/prageethw/dot-agent-deck/issues/266))* **not for the reason this document gave.** The original basis was: *"Confirmed mechanically against `upstream/main`: `src/worktree_reclaim.rs` **does not exist** there and `worktree_slug` has **0** occurrences."* **That test no longer holds.** Verified against `upstream/main` @ `3496e7ab`: the file **does** exist upstream — the reclaim half landed via upstream PR [#427](https://github.com/vfarcic/dot-agent-deck/pull/427).
+
+The conclusion survives on a different basis. Re-verified on the same commit, upstream took the *reclaim* half and **none** of the *ownership* half:
+
+| Primitive this PRD builds on | On `upstream/main` |
+|---|---|
+| `mark_worktree_owned` | absent |
+| `owner_of` | absent |
+| `sanitize_marker_creator` | absent |
+| `DOT_AGENT_DECK_WORKTREE_OWNER` | absent |
+
+So this stays fork-only because the **mechanism** is absent upstream, not because the **file** is.
+
+**And "intended to stay so" is now the wrong default.** The ownership half is a coherent, self-contained addition to a file upstream already maintains — a far more offerable change than when this was written against an empty-file baseline. CLAUDE.md rule 19's upstream-first default should be re-applied here deliberately rather than inherited from a finding that has stopped being true. Tracked as fork #266.
+
+*A justification that has silently expired is worse than none: the next reader re-runs the documented check, sees it fail, and cannot tell whether the answer changed or only the test did.*
 
 **Related**: fork [#192](https://github.com/prageethw/dot-agent-deck/issues/192) (Phase 1 carved out and **shipped** — names as instance identity, released in v0.37.0) · fork [#201](https://github.com/prageethw/dot-agent-deck/issues/201) (the residual #192 left open: uniqueness is advisory against a form-open snapshot) · fork #144 (the ownership marker and its containment check — the foundation) · fork #122 (per-orchestration worktree creation, and the hardened path validation reused here) · PRD #422 (`worktree list` / `reclaim`) · PRD #140 (per-tab routing identity; its `display_title` contract changes here) · PRD #120 (issue-dispatch, which already provisions its own worktrees) · PRD #220 (the upstream cousin; its M1.1 naming question is settled differently here) · fork #74 (the motivating collision) · PRD #421 (the provenance precedent, applied to a case it did not cover)
 
