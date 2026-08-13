@@ -2729,4 +2729,176 @@ mod tests {
              {out:?}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Issue #232 round 3: `list_linked_worktrees`' `Err` path embeds RAW
+    // `git worktree list` stderr (this function, a few lines above), which
+    // `examine_worktrees` and `run_reclaim` both propagate unchanged via
+    // `?`. `src/main.rs`'s `worktree list` and `worktree reclaim` CLI
+    // wrappers are the only two places that ever print that `Err` to a
+    // terminal, and each now routes it through
+    // [`sanitize_for_terminal_display`] before printing. Neither wrapper
+    // function is reachable from a unit test (both are private free
+    // functions in `main.rs` that print via `eprintln!` rather than
+    // returning a string), so -- following `format_disagreement_warning`'s
+    // precedent just above, whose own catalog entry notes it does not
+    // assert the CLI's stderr text either, only the formatter it calls --
+    // these tests pin the exact composition `main.rs` now uses:
+    // `sanitize_for_terminal_display(&e)` applied to the library's raw
+    // `Err` string.
+    //
+    // A real `git worktree list` failure whose stderr echoes attacker
+    // content is reproduced by standing a fake `git` in front of
+    // `list_linked_worktrees`' `Command::new("git")` call (the same
+    // `PathEnvGuard`/`GH_PATH_ENV_LOCK` mocking `worktree_reclaim_021`
+    // already uses for `gh`) that fails `worktree list` with a stderr
+    // carrying the same hostile mix [`hostile_path_component`] uses.
+    // -------------------------------------------------------------------
+
+    /// A synthetic `git worktree list` failure message embedding every char
+    /// in [`HOSTILE_CONTROLS`] and [`HOSTILE_BIDI`] between printable text,
+    /// standing in for a real `git worktree list` stderr that echoes back
+    /// hostile repository/worktree path content.
+    fn hostile_git_worktree_list_stderr() -> String {
+        let mut s =
+            String::from("fatal: worktree administrative files are corrupt at path-café-日本語");
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            s.push(*c);
+        }
+        s.push_str("-tail");
+        s
+    }
+
+    /// Writes a fake `git` executable into `bindir` that fails ONLY a
+    /// `worktree list ...` invocation, with `stderr` set to
+    /// `hostile_stderr` and exit code 1; any other argv exits 1 with no
+    /// output, since `examine_worktrees`/`run_reclaim` return via `?` on
+    /// the very first `git` call and never reach a second one on this
+    /// path.
+    #[cfg(unix)]
+    fn write_fake_git_failing_worktree_list(bindir: &Path, hostile_stderr: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = list ]; then\n  printf '%s' '{hostile_stderr}' >&2\n  exit 1\nfi\nexit 1\n"
+        );
+        let git_path = bindir.join("git");
+        std::fs::write(&git_path, script).expect("must write fake git script");
+        std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755))
+            .expect("must make fake git script executable");
+    }
+
+    /// Scenario: `worktree list`'s enumeration fails because `git worktree
+    /// list` itself fails, with a stderr that echoes hostile
+    /// repository/worktree path content (the substantive sink at
+    /// `src/main.rs`'s `run_worktree_list_cli`). `examine_worktrees` must
+    /// still propagate that stderr RAW in its `Err` -- sanitization is not
+    /// this library function's job -- but `sanitize_for_terminal_display`
+    /// applied to it, exactly as `main.rs` now does before printing, must
+    /// carry no raw hostile char and the escaped spelling of each instead,
+    /// while the surrounding printable text survives unchanged.
+    #[test]
+    #[cfg(unix)]
+    fn examine_worktrees_raw_error_is_sanitized_by_the_list_cli_sink() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let hostile_stderr = hostile_git_worktree_list_stderr();
+        write_fake_git_failing_worktree_list(&bindir, &hostile_stderr);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let repo_dir = scratch.path().join("wherever");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let err = examine_worktrees(&repo_dir)
+            .expect_err("the mocked git worktree list failure must propagate as Err");
+        assert!(
+            err.contains(&hostile_stderr),
+            "examine_worktrees must propagate the raw git stderr unchanged -- sanitizing is the \
+             CLI print sink's job, not the library's; got {err:?}"
+        );
+
+        let sanitized = sanitize_for_terminal_display(&err);
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            assert!(
+                !sanitized.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in what \
+                 `worktree list`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                sanitized.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) in what \
+                 `worktree list`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+        }
+        assert!(
+            sanitized.contains("path-café-日本語"),
+            "printable text surrounding the hostile content must survive unchanged, got \
+             {sanitized:?}"
+        );
+    }
+
+    /// Scenario: `worktree reclaim`'s enumeration fails the same way (the
+    /// substantive sink at `src/main.rs`'s `run_worktree_reclaim_cli`) --
+    /// `run_reclaim` calls `examine_worktrees` first and propagates its
+    /// `Err` via `?` unchanged, reaching a SEPARATE print site
+    /// (`"worktree reclaim: ..."` vs. `worktree list`'s `"worktree list:
+    /// ..."`) that needs its own sanitizing call, not a shared one -- this
+    /// pins that the `reclaim` sink is independently fixed, not merely
+    /// inherited from `list`'s fix.
+    #[test]
+    #[cfg(unix)]
+    fn run_reclaim_raw_error_is_sanitized_by_the_reclaim_cli_sink() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let hostile_stderr = hostile_git_worktree_list_stderr();
+        write_fake_git_failing_worktree_list(&bindir, &hostile_stderr);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let repo_dir = scratch.path().join("wherever");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let err = match run_reclaim(&repo_dir, false) {
+            Err(e) => e,
+            // `ReclaimOutcome` derives no `Debug`, so this cannot print what it
+            // got -- the arm is unreachable anyway, since the mocked `git`
+            // fails every invocation.
+            Ok(_) => panic!("the mocked git worktree list failure must propagate as Err"),
+        };
+        assert!(
+            err.contains(&hostile_stderr),
+            "run_reclaim must propagate the raw git stderr unchanged -- sanitizing is the CLI \
+             print sink's job, not the library's; got {err:?}"
+        );
+
+        let sanitized = sanitize_for_terminal_display(&err);
+        for c in HOSTILE_CONTROLS.iter().chain(HOSTILE_BIDI.iter()) {
+            assert!(
+                !sanitized.contains(*c),
+                "raw hostile char {c:?} (U+{:04X}) must not appear verbatim in what `worktree \
+                 reclaim`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+            let escaped: String = c.escape_default().collect();
+            assert!(
+                sanitized.contains(&escaped),
+                "expected the escaped spelling {escaped:?} for {c:?} (U+{:04X}) in what \
+                 `worktree reclaim`'s sink prints, got {sanitized:?}",
+                *c as u32
+            );
+        }
+        assert!(
+            sanitized.contains("path-café-日本語"),
+            "printable text surrounding the hostile content must survive unchanged, got \
+             {sanitized:?}"
+        );
+    }
 }

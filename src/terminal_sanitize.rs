@@ -25,8 +25,10 @@
 //! escaping (issue #232 round 2, gap 4) also escapes a literal backslash, so
 //! two distinct inputs never render identically: without that, a real LF and
 //! the two printable bytes `\` + `n` both rendered as the two-char sequence
-//! `\n`, and a real ESC collided with the two printable bytes `\` + `e`
-//! against `escape_default`'s `\u{...}` spelling. This guarantee stops at
+//! `\n`. More generally, `\\` is reserved for a literal backslash, and every
+//! hostile char's `escape_default` spelling begins with a single backslash
+//! followed by a non-backslash character — so escaping `\` itself keeps the
+//! codeword stream uniquely decodable for valid UTF-8. This guarantee stops at
 //! the UTF-8 boundary, though: [`sanitize_path_for_terminal_display`] goes
 //! through `Path::to_string_lossy()`, which collapses every invalid UTF-8
 //! byte sequence to `U+FFFD` before this module ever sees it, so two

@@ -1971,14 +1971,17 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("worktree list: failed to resolve current directory: {e}");
+            eprintln!(
+                "worktree list: failed to resolve current directory: {}",
+                sanitize_for_terminal_display(&e.to_string())
+            );
             return ExitCode::FAILURE;
         }
     };
     let mut reports = match examine_worktrees(&cwd) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("worktree list: {e}");
+            eprintln!("worktree list: {}", sanitize_for_terminal_display(&e));
             return ExitCode::FAILURE;
         }
     };
@@ -2067,12 +2070,16 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
 /// worktree; only a failure to enumerate worktrees at all (e.g. not a git
 /// repo) is reported as failure.
 fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
     use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("worktree reclaim: failed to resolve current directory: {e}");
+            eprintln!(
+                "worktree reclaim: failed to resolve current directory: {}",
+                sanitize_for_terminal_display(&e.to_string())
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -2082,7 +2089,7 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("worktree reclaim: {e}");
+            eprintln!("worktree reclaim: {}", sanitize_for_terminal_display(&e));
             ExitCode::FAILURE
         }
     }
