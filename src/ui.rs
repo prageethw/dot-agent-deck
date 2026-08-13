@@ -1969,6 +1969,25 @@ struct PromptDelivery {
     expected_agent_id: Option<String>,
     expected_session_id: Option<String>,
     delivery_id: String,
+    /// Fork #256 M1 round 2 (reviewer/auditor, closing the round-1 rename):
+    /// has THIS pane's current delivery cycle LANDED (`Applied`/`Queued` —
+    /// bytes reached the PTY) but not yet been reclaimed/finalized? This is
+    /// now the ONE "landed" bit both delivery paths read through
+    /// [`delivery_phase`] — the orchestrator path sets it alongside its own
+    /// [`UiState::orchestration_awaiting_confirmation`] insert (same call
+    /// site, same instant), and the mode-seed path sets it directly, since
+    /// [`PromptDelivery`] is already populated by both paths (`capture_
+    /// prompt_delivery`) and already cleared unconditionally, for both
+    /// paths, by [`reset_delivery_cycle`] — round 1's mistake was adding a
+    /// SECOND pane-keyed store (`seed_prompt_landed`) beside this one
+    /// instead of using it. `orchestration_awaiting_confirmation` keeps
+    /// existing and keeps being inserted/removed exactly as before — it
+    /// carries confirmation-retry-specific data (`since`, baselines,
+    /// `retried`) this field does not replace — but its PRESENCE is no
+    /// longer what [`delivery_phase`] consults for orchestrator "landed"
+    /// status; this field is, and the two are provably in lockstep because
+    /// they are written and cleared at the same two code sites.
+    landed: bool,
 }
 
 /// Issue #424 round 2: replaces the bare `std::time::Instant` round 1 stored
@@ -2114,12 +2133,12 @@ enum DeliveryPhase {
 /// a `PendingSeedPrompt` element is unconditionally queued for as long as
 /// `process_pending_seed_prompts`'s `retain_mut` is visiting it — there is
 /// no separate "is a seed queued for this pane" question the way the
-/// orchestrator path has one. `landed` reads `orchestration_awaiting_
-/// confirmation` (tab-keyed) or [`UiState::seed_prompt_landed`] (pane-keyed)
-/// respectively — see that field's doc for why the two paths keep separate,
-/// differently-keyed storage rather than sharing one map. Pure and
-/// side-effect-free so every call site asks the SAME question the SAME way,
-/// rather than each re-deriving its own boolean spelling of it.
+/// orchestrator path has one. `landed` reads [`PromptDelivery::landed`] —
+/// the ONE pane-keyed store both paths write (fork #256 M1 round 2; see
+/// that field's doc for why round 1's separate `seed_prompt_landed` was a
+/// regression, not the migration). Pure and side-effect-free so every call
+/// site asks the SAME question the SAME way, rather than each re-deriving
+/// its own boolean spelling of it.
 fn delivery_phase(queued: bool, landed: bool) -> DeliveryPhase {
     match (queued, landed) {
         (true, false) => DeliveryPhase::Armed,
@@ -2137,13 +2156,15 @@ fn delivery_phase(queued: bool, landed: bool) -> DeliveryPhase {
 ///
 /// `tab_id` is `Some` for an orchestration-tab cycle and `None` for a
 /// mode-seed cycle (fork #256 M1) — mode-seed prompts are not scoped to a
-/// tab at all (see [`UiState::seed_prompt_landed`]), so there is no tab id
-/// to pass. The pane-keyed maps (`send_retry_backoff`, `prompt_delivery`)
-/// are cleared unconditionally, since audit F6 (on
-/// [`UiState::send_retry_backoff`]) already established both paths share
-/// them by pane id; the tab-keyed maps are cleared only when `tab_id` is
-/// `Some`, and [`UiState::seed_prompt_landed`] only when it is `None` — the
-/// two paths' own per-cycle markers, never both at once for a single call.
+/// tab at all, so there is no tab id to pass. The pane-keyed maps
+/// (`send_retry_backoff`, `prompt_delivery`) are cleared unconditionally,
+/// since audit F6 (on [`UiState::send_retry_backoff`]) already established
+/// both paths share them by pane id — and, fork #256 M1 round 2,
+/// `prompt_delivery`'s removal is what clears [`PromptDelivery::landed`]
+/// for BOTH paths now, since "landed" moved into that field instead of a
+/// separate pane-keyed store. The tab-keyed maps are cleared only when
+/// `tab_id` is `Some` — a mode-seed cycle has none of its own left to clear
+/// here.
 ///
 /// Deliberately does NOT touch `orchestrator_prompt` itself, nor
 /// `orchestration_prompted` / `orchestration_remit_abandoned`: those carry
@@ -2155,14 +2176,9 @@ fn delivery_phase(queued: bool, landed: bool) -> DeliveryPhase {
 fn reset_delivery_cycle(ui: &mut UiState, tab_id: Option<TabId>, start_pane_id: &str) {
     ui.send_retry_backoff.remove(start_pane_id);
     ui.prompt_delivery.remove(start_pane_id);
-    match tab_id {
-        Some(tab_id) => {
-            ui.orchestration_ready_since.remove(&tab_id);
-            ui.orchestration_awaiting_confirmation.remove(&tab_id);
-        }
-        None => {
-            ui.seed_prompt_landed.remove(start_pane_id);
-        }
+    if let Some(tab_id) = tab_id {
+        ui.orchestration_ready_since.remove(&tab_id);
+        ui.orchestration_awaiting_confirmation.remove(&tab_id);
     }
 }
 
@@ -2640,6 +2656,13 @@ struct UiState {
     /// confirmation, abandonment, or deadline (round 2: a deadline reached
     /// with an entry present finalizes as delivered-unconfirmed, not
     /// abandoned — see `orchestration/seed/005`).
+    ///
+    /// Fork #256 M1 round 2: inserted/removed at the exact same two sites as
+    /// before, and still the confirmation-retry mechanism's own store — but
+    /// [`delivery_phase`]'s orchestrator "landed" question no longer reads
+    /// this map's presence directly; it reads [`PromptDelivery::landed`],
+    /// which is set/cleared alongside this one. See that field's doc for
+    /// why the two are one fact represented in lockstep, not two.
     orchestration_awaiting_confirmation: HashMap<TabId, AwaitingConfirmation>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
@@ -2665,8 +2688,8 @@ struct UiState {
     /// exists today — the audit checked every current producer — so this is
     /// a constraint to notice, not a live bug. A future change that lets a
     /// pane carry two concurrent automatic-prompt cycles must key this (and
-    /// [`UiState::prompt_delivery`] and [`UiState::seed_prompt_landed`]) by
-    /// `(pane_id, cycle kind)`, not pane id alone.
+    /// [`UiState::prompt_delivery`]) by `(pane_id, cycle kind)`, not pane id
+    /// alone.
     send_retry_backoff: HashMap<String, SendRetryState>,
     /// PRD #20 R20-003/R20-004: per-pane captured delivery identity for automatic
     /// prompts. Populated at ENQUEUE (and lazily at first delivery as a fallback)
@@ -2675,54 +2698,25 @@ struct UiState {
     ///
     /// Audit F6: shares [`UiState::send_retry_backoff`]'s pane-id-only
     /// keyspace and the same bounded collision window — see that field's doc.
+    ///
+    /// Fork #256 M1 round 2: also carries [`PromptDelivery::landed`] — the
+    /// ONE store of "landed" both the orchestrator and mode-seed delivery
+    /// paths read through [`delivery_phase`], replacing round 1's separate
+    /// pane-keyed `seed_prompt_landed: HashSet<String>` (a rename of the
+    /// THIRD open-coded "landed" spelling fork #256 exists to delete, not a
+    /// migration of it — reviewer and auditor both caught this the same
+    /// day). This map was already populated and cleared by both paths for
+    /// identity/backoff purposes, so folding "landed" in here adds no new
+    /// pane-keyed collection — it is genuinely the same store, not two
+    /// stores behind one classifier. Mode-seed pane id is authoritative
+    /// here (a plain dashboard-card `seed_prompt` has no orchestration tab
+    /// in play at all), so this stays keyed by pane id rather than
+    /// bridging to [`TabId`] — see [`PromptDelivery::landed`] for how the
+    /// orchestrator path's own tab-keyed
+    /// `orchestration_awaiting_confirmation` (unchanged, still holding its
+    /// confirmation-retry-specific data) stays in lockstep with this field
+    /// without either being a translation of the other.
     prompt_delivery: HashMap<String, PromptDelivery>,
-    /// Fork #256 M1 (renamed from fork #197 M2's original field — the THIRD
-    /// open-coded "landed" spelling fork #256 exists to delete; see that
-    /// PRD): pane ids whose mode `seed_prompt` write has LANDED
-    /// (`Applied`/`Queued` — bytes reached the PTY) but has no independent
-    /// submit confirmation, now read through the SAME [`DeliveryPhase`]
-    /// enum and [`delivery_phase`] classifier the orchestrator path uses —
-    /// `delivery_phase(true, landed)`, where `true` is literal: a
-    /// `PendingSeedPrompt` element is unconditionally "queued" for as long
-    /// as `process_pending_seed_prompts`'s `retain_mut` is visiting it, so
-    /// membership in THIS set is the only thing that varies. The mode-seed
-    /// path still has no LEVEL/TEXT confirmation check (fork #256 M2,
-    /// blocked on fork #254) — so while a pane is in this set no further
-    /// write is attempted for it at all; it is retained, silently, until
-    /// `AUTOMATIC_PROMPT_DEADLINE` reclaims it via [`reset_delivery_cycle`].
-    /// Before fork #197 M2, `Applied`/`Queued` was instead treated as
-    /// terminal delivery and the seed dropped in the same frame the write
-    /// landed — issue #424's own finding #2.
-    ///
-    /// Fork #256 M1's keyspace decision, stated here per that PRD's M1
-    /// requirement: unlike `orchestration_awaiting_confirmation` (keyed by
-    /// [`TabId`]), this stays keyed by PANE id, and pane id is
-    /// authoritative for the mode-seed path specifically. A mode
-    /// `seed_prompt` is not scoped to an orchestration tab at all — a
-    /// plain single-agent dashboard card can carry one, with no tab in
-    /// play — so there is no tab id to key this by, and bridging pane id
-    /// to a tab id here would be a mapping layer: a fourth representation
-    /// wearing a disguise, the exact thing fork #256 exists to avoid
-    /// adding. [`reset_delivery_cycle`] takes `tab_id: Option<TabId>`
-    /// precisely so it can clear this map (alongside the pane-keyed maps
-    /// it already shared with the orchestrator path, per audit F6 below)
-    /// for a tab-less cycle, with no translation between the two keyspaces.
-    ///
-    /// Audit F13 (still holds post-migration): inserted in exactly one
-    /// place (the successful-write arm) and removed in exactly one place
-    /// (`reset_delivery_cycle`'s `None` arm, invoked once per reclaimed
-    /// pane after the `AUTOMATIC_PROMPT_DEADLINE` branch), keyed by pane id
-    /// alone. Safe today because both enqueue sites mint a fresh, monotonic
-    /// `new_id` for the `PendingSeedPrompt`, and `retain_mut` is the only
-    /// other mutation of `pending_seed_prompts`. Two things would break it,
-    /// neither reachable now: a future path enqueueing a second seed for a
-    /// pane id already in this set (the stale entry makes the new seed's
-    /// write report `true` on the very first poll and it is never actually
-    /// written — silently), and `PANE_COUNTER` resetting on daemon restart
-    /// while a TUI outlives it, colliding a freshly-minted pane id with a
-    /// stale marker's. See [`UiState::send_retry_backoff`]'s audit F6 note
-    /// for the adjacent pane-id-only keyspace this shares.
-    seed_prompt_landed: HashSet<String>,
     /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
@@ -2897,7 +2891,6 @@ impl UiState {
             pending_seed_prompts: Vec::new(),
             send_retry_backoff: HashMap::new(),
             prompt_delivery: HashMap::new(),
-            seed_prompt_landed: HashSet::new(),
             // next_delivery_seq removed (PRD #20 finding #3): delivery ids are now
             // minted globally unique via `mint_delivery_id`.
             scheduled_tasks: Vec::new(),
@@ -3850,19 +3843,20 @@ fn process_pending_seed_prompts(
     let mut feedback: Option<String> = None;
     let mut prompts = std::mem::take(&mut ui.pending_seed_prompts);
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
+    // Fork #256 M1 round 2: "landed" is no longer a separate map taken
+    // alongside this one — it lives as `PromptDelivery::landed` on the
+    // entries `deliveries` already holds, so there is nothing extra to
+    // take here. See that field's doc for why folding it in here (rather
+    // than round 1's separate `seed_prompt_landed` HashSet) is what makes
+    // this the SAME store the orchestrator path reads through
+    // [`delivery_phase`], not a second one beside it.
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
-    // Fork #256 M1 (closes #182 fully): take `seed_prompt_landed` out too —
-    // see [`UiState::seed_prompt_landed`] for what it tracks, why it is a
-    // marker only (not a full awaiting-confirmation cycle — that is M2,
-    // blocked on fork #254), and why it stays pane-keyed rather than
-    // sharing `orchestration_awaiting_confirmation`'s tab keyspace.
-    let mut landed = std::mem::take(&mut ui.seed_prompt_landed);
     // Fork #256 M1: panes reclaimed this pass (deadline hit). `reset_
     // delivery_cycle` mutates `ui` fields directly, but `send_retry_backoff`/
-    // `prompt_delivery`/`seed_prompt_landed` are all on loan to the local
-    // `backoff`/`deliveries`/`landed` bindings above for the duration of
-    // `retain_mut` below — so the reclaim calls are deferred to after those
-    // bindings are restored to `ui`, rather than reaching for `ui` mid-loop.
+    // `prompt_delivery` are on loan to the local `backoff`/`deliveries`
+    // bindings above for the duration of `retain_mut` below — so the
+    // reclaim calls are deferred to after those bindings are restored to
+    // `ui`, rather than reaching for `ui` mid-loop.
     let mut reclaimed: Vec<String> = Vec::new();
     prompts.retain_mut(|sp| {
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
@@ -3875,12 +3869,12 @@ fn process_pending_seed_prompts(
         // below) eventually terminates: nothing else reclaims it.
         if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
             // F8 (reviewer, MINOR): a landed write already succeeded — bytes
-            // reached the PTY (`Applied`/`Queued`, see the `landed.insert`
+            // reached the PTY (`Applied`/`Queued`, see the `.landed = true`
             // below) — this branch is only reclaiming the tracking entry
             // because the mode-seed path has no confirmation check yet (fork
             // #256 M2, blocked on fork #254). Logging "abandoning" here would
             // say the opposite of what happened on the happy path, every time.
-            if landed.contains(&sp.pane_id) {
+            if deliveries.get(&sp.pane_id).is_some_and(|d| d.landed) {
                 tracing::info!(
                     pane_id = %sp.pane_id,
                     "seed prompt: delivery landed; reclaiming unconfirmed tracking entry"
@@ -3901,11 +3895,12 @@ fn process_pending_seed_prompts(
         // as delivered (the #182 bug this closes) and never resubmitted
         // (which would risk the #194-shaped duplicate-submission bug M2
         // exists to solve properly). Fork #256 M1: this reads through the
-        // SAME [`DeliveryPhase`] classifier the orchestrator path uses — see
-        // [`UiState::seed_prompt_landed`] for why `queued` is hardcoded
-        // `true` rather than derived per-pane the way the orchestrator's
-        // `orchestrator_prompt.is_some()` is.
-        match delivery_phase(true, landed.contains(&sp.pane_id)) {
+        // SAME [`DeliveryPhase`] classifier the orchestrator path uses,
+        // against the SAME store ([`PromptDelivery::landed`]) the
+        // orchestrator path's own landed check reads — see that field's doc
+        // for why `queued` is hardcoded `true` rather than derived per-pane
+        // the way the orchestrator's `orchestrator_prompt.is_some()` is.
+        match delivery_phase(true, deliveries.get(&sp.pane_id).is_some_and(|d| d.landed)) {
             DeliveryPhase::Landed => return true,
             DeliveryPhase::Armed | DeliveryPhase::Idle | DeliveryPhase::Finalized => {}
         }
@@ -3952,6 +3947,7 @@ fn process_pending_seed_prompts(
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
+                    landed: false,
                 }
             });
             let expected_agent_id = delivery.expected_agent_id.clone();
@@ -3977,7 +3973,9 @@ fn process_pending_seed_prompts(
                          (mode-seed path has no confirmation check yet — fork #256 M2, \
                          blocked on fork #254)"
                     );
-                    landed.insert(sp.pane_id.clone());
+                    if let Some(entry) = deliveries.get_mut(&sp.pane_id) {
+                        entry.landed = true;
+                    }
                     return true;
                 }
                 // Explicit non-delivery: retain for retry, back off, surface
@@ -4004,13 +4002,12 @@ fn process_pending_seed_prompts(
     ui.pending_seed_prompts = prompts;
     ui.send_retry_backoff = backoff;
     ui.prompt_delivery = deliveries;
-    ui.seed_prompt_landed = landed;
     // Fork #256 M1: now that the loaned maps are back on `ui`, run the same
     // per-cycle reset the orchestrator path uses (`reset_delivery_cycle`,
     // `tab_id: None` — a mode-seed cycle has no tab) for every pane reclaimed
-    // above. Removes exactly what the inline `backoff.remove`/`deliveries.
-    // remove`/`landed.remove` triple used to remove by hand, now via the
-    // shared helper instead of a second copy of the same three lines.
+    // above. `prompt_delivery.remove()` inside it clears `landed` along with
+    // the rest of the entry, now via the shared helper instead of a second
+    // copy of the same clear by hand.
     for pane_id in reclaimed {
         reset_delivery_cycle(ui, None, &pane_id);
     }
@@ -4061,6 +4058,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
             delivery_id: mint_delivery_id(pane_id),
+            landed: false,
         },
     );
 }
@@ -4187,14 +4185,17 @@ fn deliver_orchestrator_prompt(
         .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
     {
         // Issue #424 round 2 (`orchestration/seed/005`): a write that
-        // genuinely LANDED (an `orchestration_awaiting_confirmation` entry
-        // exists) must not be reported as loss just because a submit was
-        // never independently confirmed — bytes reached the PTY, which is
-        // exactly what `main` reported as success for a single delivery. Only
-        // a tab with NO landed write at all (no entry) is genuinely abandoned.
+        // genuinely LANDED (a `PromptDelivery::landed` entry exists — fork
+        // #256 M1 round 2, the same store the mode-seed path reads) must
+        // not be reported as loss just because a submit was never
+        // independently confirmed — bytes reached the PTY, which is exactly
+        // what `main` reported as success for a single delivery. Only a
+        // tab with NO landed write at all is genuinely abandoned.
         match delivery_phase(
             orchestrator_prompt.is_some(),
-            ui.orchestration_awaiting_confirmation.contains_key(&tab_id),
+            ui.prompt_delivery
+                .get(start_pane_id.as_str())
+                .is_some_and(|d| d.landed),
         ) {
             DeliveryPhase::Landed => {
                 tracing::warn!(
@@ -4524,6 +4525,17 @@ fn deliver_orchestrator_prompt(
                     retried: awaiting.is_some(),
                 },
             );
+            // Fork #256 M1 round 2: set the ONE shared "landed" bit
+            // ([`PromptDelivery::landed`]) at the same instant as the insert
+            // above, so `delivery_phase`'s two orchestrator call sites and
+            // the mode-seed path all read the same fact. `prompt_delivery`
+            // is guaranteed present here (captured lazily above, or at spawn
+            // time) — see [`PromptDelivery::landed`] for why this stays in
+            // lockstep with `orchestration_awaiting_confirmation` without
+            // being a translation of it.
+            if let Some(entry) = ui.prompt_delivery.get_mut(start_pane_id.as_str()) {
+                entry.landed = true;
+            }
             schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
         }
         // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
@@ -12772,7 +12784,9 @@ pub fn run_tui(
                     // (history-only) phase depends on exactly that.
                     let no_delivery_pending = match delivery_phase(
                         orchestrator_prompt.is_some(),
-                        ui.orchestration_awaiting_confirmation.contains_key(id),
+                        ui.prompt_delivery
+                            .get(start_pane_id.as_str())
+                            .is_some_and(|d| d.landed),
                     ) {
                         DeliveryPhase::Armed => false,
                         DeliveryPhase::Idle | DeliveryPhase::Landed | DeliveryPhase::Finalized => {
