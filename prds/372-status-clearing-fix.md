@@ -1,6 +1,6 @@
 # PRD #372: Fix stale "Needs Input" status after a permission prompt is answered
 
-**Status**: Implementation complete — PR pending
+**Status**: **Complete** — merged 2026-08-04 as [PR #11](https://github.com/prageethw/dot-agent-deck/pull/11) (`30ce3c1`), first released in **v0.35.8**. *(Status corrected 2026-08-12: this line read "PR pending" for eight days after the PR had merged.)*
 **Priority**: Medium
 **Created**: 2026-08-04
 **GitHub Issue**: [#372](https://github.com/vfarcic/dot-agent-deck/issues/372) (closed upstream as not-planned; this fork continues the work independently)
