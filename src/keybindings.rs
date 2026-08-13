@@ -162,13 +162,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         description: "Toggle orchestration split",
     },
     ActionSpec {
-        action: Action::ToggleOrchestrationLock,
-        section: Section::Global,
-        name: "toggle_orchestration_lock",
-        default: "Ctrl+e",
-        description: "Toggle orchestration command-entry lock",
-    },
-    ActionSpec {
         action: Action::Jump1,
         section: Section::Global,
         name: "jump_1",
