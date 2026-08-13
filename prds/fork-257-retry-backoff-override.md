@@ -4,7 +4,17 @@
 
 **Priority**: Medium
 
-**Status**: Planning
+**Status** *(2026-08-13)*: **M1 and M2 complete, reviewed and mutation-proven.** M3 (offer upstream) is in flight as a separate branch.
+
+**M1 — the override seam.** `send_retry_base()` extracted as a directly-callable accessor with the `cfg(any(test, debug_assertions))` pair, clamped to `SEND_RETRY_BACKOFF_CAP`, warn-once. The extraction and that ceiling were **decisions taken mid-flight**, not the PRD's original wording — see the Decision subsection under M1. A shared un-gated `SEND_RETRY_BASE_MS` keeps the release floor and the test fallback from drifting.
+
+**M2 — the proof.** `orchestration/seed/017` asserts the clamp **against the accessor**, mutation-verified (mutating `SEND_RETRY_BASE_MAX` went RED on exactly that one test, run `31666931880`, then GREEN on revert). `/018` proves the retry fires deterministically once the floor is lowered. `orchestration/seed/015` is now a **positive** proof: a PTY relay suppresses the original write's CR — with byte counters proving exactly one byte differs between what was read and what was forwarded — so the retry's own bare CR is the sole possible cause of the single observed submission. Verified across five local real-agent runs including a mutation check.
+
+**The standalone-CR-is-a-no-op risk is retired for Claude.** fork#197 recorded it as accepted-but-unverified; the retry's bare CR reliably submits the composer's already-typed text.
+
+**`orchestration/seed/016` (Codex) is unchanged and still carries only the weaker "no duplication observed" claim.** The relay technique bypasses `dot-agent-deck wrap`, and Codex then never receives the seed at all — investigated across three real runs and filed as fork [#280](https://github.com/prageethw/dot-agent-deck/issues/280) with a concrete next attempt. Recorded rather than papered over, per this PRD's own rule that a partial proof honestly described beats a full one claimed and absent.
+
+**Two findings this work produced, both filed:** fork [#284](https://github.com/prageethw/dot-agent-deck/issues/284) — the relay fixture has no regression net, and two real bugs in it (signal-handler re-entrancy, an unbounded final `waitpid`) were invisible to `fmt`, `clippy` and CI, surfacing only under manual signalling. And the observation that a test asserting against the constant a mutation would move is no test at all, caught twice in this PRD's own line of work.
 
 **Parent**: [fork #197](https://github.com/prageethw/dot-agent-deck/issues/197) — the seed/prompt delivery state machine, merged as PR [#219](https://github.com/prageethw/dot-agent-deck/pull/219). This PRD carries the M4 verification gap that PR deliberately deferred.
 
