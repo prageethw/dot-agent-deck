@@ -1539,7 +1539,9 @@ fn worktree_reclaim_010_worktree_created_by_the_deck_reads_as_owned() {
         .expect("the deck's creation path must create the worktree");
     assert_eq!(
         outcome,
-        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created,
+        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created {
+            marker_warning: None
+        },
         "fixture precondition: the worktree must have been genuinely CREATED here — an \
          already-claimed directory is somebody else's and is never marked"
     );

@@ -446,15 +446,18 @@ enum WorktreeCmd {
     },
     /// Remove every merged, clean worktree the deck can PROVE it created and
     /// which holds no gitignored content; list the rest for confirmation. A
-    /// worktree the deck can prove it created (a bare `git worktree add` it
-    /// ran itself), with no gitignored content, is removed by a bare
-    /// `reclaim`, no `--yes` needed. One the deck cannot prove it created,
-    /// OR one that still holds gitignored content (e.g. `target/`, `.env`),
-    /// is instead reported as reclaimable-pending-confirmation and left
-    /// alone unless `--yes` is passed — and once passed, `--yes` removes it
-    /// regardless of provenance or ignored content, exactly like a
-    /// deck-created one; the flag is the user vouching for what the pending
-    /// report already showed them, not a request for the deck to trust more.
+    /// worktree the deck can prove it created AND successfully marked (a
+    /// bare `git worktree add` it ran itself, with its ownership marker
+    /// written), with no gitignored content, is removed by a bare
+    /// `reclaim`, no `--yes` needed. One the deck cannot prove it both
+    /// created and marked — including one it created but whose marker write
+    /// failed, which is reported as a warning at creation time — OR one that
+    /// still holds gitignored content (e.g. `target/`, `.env`), is instead
+    /// reported as reclaimable-pending-confirmation and left alone unless
+    /// `--yes` is passed — and once passed, `--yes` removes it regardless of
+    /// provenance or ignored content, exactly like a deck-created one; the
+    /// flag is the user vouching for what the pending report already showed
+    /// them, not a request for the deck to trust more.
     /// A dirty worktree, an open/closed-unmerged PR, or an unresolvable PR
     /// state always keeps, `--yes` or not. Never deletes the branch.
     Reclaim {

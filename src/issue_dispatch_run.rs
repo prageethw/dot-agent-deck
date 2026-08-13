@@ -529,7 +529,16 @@ async fn dispatch_one_issue(
     )
     .await?
     {
-        WorktreeCreation::Created => {}
+        WorktreeCreation::Created { marker_warning } => {
+            notify_marker_warning_if_any(
+                notifier,
+                task_name,
+                &cfg.repo,
+                issue,
+                &paths.worktree_dir,
+                marker_warning,
+            );
+        }
         // `reuse_existing_branch: true` above means `BranchExists` is never
         // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
         // which is exactly what keeps the vacated slot reclaimable. `TimedOut`
@@ -1191,9 +1200,20 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// ([`create_worktree_sync`]) confirmed the half-created directory was
 /// actually removed, so the caller can tell the user either "try again" or
 /// give them the exact manual command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeCreation {
-    Created,
+    /// `marker_warning` is `Some(error)` when `git worktree add` itself
+    /// succeeded but the best-effort `dot-agent-deck-owner` write
+    /// ([`mark_worktree_owned_best_effort`]) failed (issue #164) — the raw,
+    /// unsanitized `mark_worktree_owned` error. Creation is still reported
+    /// as `Created`, never as a failure: the worktree is fully usable, and
+    /// the only consequence is that a later `reclaim` will land it on `Ask`
+    /// instead of `Remove` until `--yes` is passed. Carrying the warning
+    /// here (rather than only logging it, as before) is what lets a caller
+    /// tell the user about it — see [`crate::worktree_reclaim::format_marker_warning`].
+    Created {
+        marker_warning: Option<String>,
+    },
     /// The worktree DIRECTORY is already there — a concurrent fire claimed it in
     /// the benign TOCTOU window described below. Callers surface this as a skip
     /// rather than a failure.
@@ -1578,12 +1598,15 @@ pub async fn create_worktree(
             // dispatch that really did create it writes its own marker from
             // its own `Created` arm, so nothing is lost.)
             //
-            // Best-effort by construction: `write_marker_best_effort` warns
-            // and returns rather than failing the creation. A missing marker
-            // costs one `--yes` confirmation later, which is the fail-safe
-            // direction; a failed dispatch is not.
-            crate::worktree_owner::write_marker_best_effort(worktree_dir, branch, creator).await;
-            Ok(WorktreeCreation::Created)
+            // Best-effort by construction: `write_marker_best_effort` never
+            // fails the creation on a marker-write failure — issue #164: it
+            // now RETURNS the warning instead of only logging it, so this
+            // caller can surface it via `WorktreeCreation::Created`'s
+            // `marker_warning` field.
+            let marker_warning =
+                crate::worktree_owner::write_marker_best_effort(worktree_dir, branch, creator)
+                    .await;
+            Ok(WorktreeCreation::Created { marker_warning })
         }
         // Concurrent claim (TOCTOU): the dir is present now though we arrived
         // believing it absent — treat as already-claimed. A real failure leaves
@@ -1610,14 +1633,54 @@ pub async fn create_worktree(
 /// `creator` (issue #425) names the task or orchestration responsible for
 /// this worktree — forwarded verbatim to `mark_worktree_owned`, which
 /// sanitises it before writing.
-fn mark_worktree_owned_best_effort(worktree_dir: &Path, creator: &str) {
-    if let Err(e) = crate::worktree_reclaim::mark_worktree_owned(worktree_dir, creator) {
-        tracing::warn!(
-            worktree = %worktree_dir.display(),
-            error = %e,
-            "issue-dispatch: could not write ownership marker; this worktree will require \
-             `reclaim --yes` instead of a bare `reclaim` later"
-        );
+///
+/// Issue #164: the shared seam both [`create_worktree`] and
+/// [`create_worktree_sync`] call, immediately after a successful
+/// `git worktree add`. Still logs at WARN as before, but now also RETURNS
+/// the raw (unsanitized) error on failure — `None` on success — so the
+/// caller can carry it into [`WorktreeCreation::Created`]'s
+/// `marker_warning` instead of it being visible only in the daemon's own
+/// tracing output.
+fn mark_worktree_owned_best_effort(worktree_dir: &Path, creator: &str) -> Option<String> {
+    match crate::worktree_reclaim::mark_worktree_owned(worktree_dir, creator) {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                error = %e,
+                "issue-dispatch: could not write ownership marker; this worktree will require \
+                 `reclaim --yes` instead of a bare `reclaim` later"
+            );
+            Some(e)
+        }
+    }
+}
+
+/// Issue #164: surface a [`WorktreeCreation::Created`] marker-write warning
+/// through the [`Notifier`] seam, if there is one — called only from
+/// [`dispatch_one_issue`], the scheduled-dispatch caller of the async
+/// [`create_worktree`]. Extracted into its own function so the notify
+/// decision is unit-testable without driving the rest of the dispatch flow
+/// (`gh` calls, spawn, claim). A `None` warning is a silent no-op: dispatch
+/// proceeds and still reports `IssueDispatched` exactly as before this
+/// change — this only adds a distinguishable notification alongside it,
+/// never gates it.
+fn notify_marker_warning_if_any(
+    notifier: &dyn Notifier,
+    task_name: &str,
+    repo: &str,
+    issue: u64,
+    worktree_dir: &Path,
+    marker_warning: Option<String>,
+) {
+    if let Some(error) = marker_warning {
+        notifier.notify(NotifyEvent::IssueWorktreeMarkerWarning {
+            task: task_name.to_string(),
+            repo: repo.to_string(),
+            issue,
+            worktree: worktree_dir.display().to_string(),
+            error,
+        });
     }
 }
 
@@ -1652,8 +1715,8 @@ pub(crate) fn create_worktree_sync(
     );
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
-            mark_worktree_owned_best_effort(worktree_dir, creator);
-            WorktreeCreation::Created
+            let marker_warning = mark_worktree_owned_best_effort(worktree_dir, creator);
+            WorktreeCreation::Created { marker_warning }
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
         // Fork #122/#123 re-audit (P2): the add registered `worktree_dir`
@@ -2814,7 +2877,12 @@ exit 0
         )
         .await
         .expect("create_worktree must succeed against a real git repo");
-        assert_eq!(outcome, WorktreeCreation::Created);
+        assert_eq!(
+            outcome,
+            WorktreeCreation::Created {
+                marker_warning: None
+            }
+        );
 
         let git_dir_out = std::process::Command::new("git")
             .current_dir(&worktree_dir)
@@ -2966,7 +3034,9 @@ exit 0
             let (name, worktree_dir, branch, outcome) = fire.await.expect("dispatch task");
             assert_eq!(
                 outcome,
-                Ok(WorktreeCreation::Created),
+                Ok(WorktreeCreation::Created {
+                    marker_warning: None
+                }),
                 "dispatch '{name}' must get its worktree despite a concurrent add's \
                  half-created entry; `Err(… commondir …)` is issue #541 itself, and \
                  `Ok(BranchExists)`/`… already exists` is a retry that failed to \
@@ -3089,7 +3159,9 @@ exit 0
             .expect("the creating task must not panic");
         assert_eq!(
             outcome,
-            Ok(WorktreeCreation::Created),
+            Ok(WorktreeCreation::Created {
+                marker_warning: None
+            }),
             "once the lock is released the worktree must be created normally"
         );
     }
@@ -3122,7 +3194,9 @@ exit 0
                 Creator::dispatch("claimed")
             )
             .await,
-            Ok(WorktreeCreation::Created),
+            Ok(WorktreeCreation::Created {
+                marker_warning: None
+            }),
             "precondition: the first dispatch claims the name"
         );
 
@@ -3204,7 +3278,9 @@ exit 0
                 Creator::dispatch("marked"),
             )
             .await,
-            Ok(WorktreeCreation::Created)
+            Ok(WorktreeCreation::Created {
+                marker_warning: None
+            })
         );
 
         let marker = crate::worktree_owner::marker_path(&worktree_dir)
@@ -3307,6 +3383,176 @@ exit 0
             "a worktree the deck did not create must never be marked as deck-owned — \
              the marker gates an unattended `git worktree remove`; found one at {}",
             marker.display()
+        );
+    }
+
+    /// Scenario: issue #164. `mark_worktree_owned_best_effort` is the single
+    /// seam both the async [`create_worktree`] above and the sync
+    /// `create_worktree_sync` (the TUI's twin) call right after `git
+    /// worktree add` succeeds, so a test against it covers the shared logic
+    /// behind both creation paths' `WorktreeCreation::Created` result. A
+    /// failed marker write must no longer be silently swallowed into only a
+    /// `tracing::warn!` — it must come back as `Some(error)` so a caller can
+    /// carry it into a user-visible warning.
+    ///
+    /// Deterministic without chmod/timing/a full disk (per the scoping
+    /// review): mark a real worktree successfully once, then replace the
+    /// marker file with a directory of the same name — `std::fs::write`
+    /// then reliably fails with an `Is a directory` style error.
+    #[tokio::test]
+    async fn mark_worktree_owned_best_effort_surfaces_a_failed_write() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let worktree_dir = clone_dir.join(".worktrees").join("issue-164");
+        let outcome = create_worktree(
+            &clone_dir,
+            &worktree_dir,
+            "agent/issue-164",
+            true,
+            Creator::issue_dispatch("test-creator", 164),
+        )
+        .await
+        .expect("create_worktree must succeed against a real git repo");
+        assert_eq!(
+            outcome,
+            WorktreeCreation::Created {
+                marker_warning: None
+            },
+            "a normal successful mark must carry no warning"
+        );
+
+        let git_dir_out = std::process::Command::new("git")
+            .current_dir(&worktree_dir)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .expect("git rev-parse --git-dir must spawn");
+        assert!(git_dir_out.status.success());
+        let git_dir_raw = String::from_utf8_lossy(&git_dir_out.stdout)
+            .trim()
+            .to_string();
+        let git_dir = if Path::new(&git_dir_raw).is_absolute() {
+            PathBuf::from(git_dir_raw)
+        } else {
+            worktree_dir.join(git_dir_raw)
+        };
+        let marker_path = git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME);
+        std::fs::remove_file(&marker_path)
+            .expect("the marker file must exist after a successful mark");
+        std::fs::create_dir(&marker_path)
+            .expect("must be able to replace the marker file with a directory");
+
+        let warning = mark_worktree_owned_best_effort(&worktree_dir, "second-creator");
+        assert!(
+            warning.is_some(),
+            "a directory occupying the marker path must make the write fail and be reported, \
+             not swallowed"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "the worktree itself must survive a marker-write failure — creation stays \
+             best-effort"
+        );
+    }
+
+    /// Scenario: issue #164. `notify_marker_warning_if_any` — the small seam
+    /// `dispatch_one_issue` calls right after a `WorktreeCreation::Created`
+    /// result — must emit a distinguishable `NotifyEvent` when there is a
+    /// warning to report, carrying the raw (unsanitized) path and error:
+    /// sanitizing for terminal display is the render sink's job
+    /// (`format_marker_warning`, called from `StderrNotifier`), not this
+    /// seam's.
+    #[test]
+    fn notify_marker_warning_if_any_notifies_on_write_failure() {
+        #[derive(Default)]
+        struct RecordingNotifier {
+            events: std::sync::Mutex<Vec<NotifyEvent>>,
+        }
+        impl Notifier for RecordingNotifier {
+            fn notify(&self, event: NotifyEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let notifier = RecordingNotifier::default();
+        notify_marker_warning_if_any(
+            &notifier,
+            "my-task",
+            "org/repo",
+            42,
+            Path::new("/tmp/wt-164"),
+            Some("disk full".to_string()),
+        );
+
+        let events = notifier.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one event must be notified");
+        match &events[0] {
+            NotifyEvent::IssueWorktreeMarkerWarning {
+                task,
+                repo,
+                issue,
+                worktree,
+                error,
+            } => {
+                assert_eq!(task, "my-task");
+                assert_eq!(repo, "org/repo");
+                assert_eq!(*issue, 42);
+                assert_eq!(worktree, "/tmp/wt-164");
+                assert_eq!(error, "disk full");
+            }
+            other => panic!("expected IssueWorktreeMarkerWarning, got {other:?}"),
+        }
+    }
+
+    /// The counterpart to the above: no warning to report means no event —
+    /// the common case (the marker write almost always succeeds) must not
+    /// spam the notifier on every dispatch.
+    #[test]
+    fn notify_marker_warning_if_any_silent_on_success() {
+        #[derive(Default)]
+        struct RecordingNotifier {
+            events: std::sync::Mutex<Vec<NotifyEvent>>,
+        }
+        impl Notifier for RecordingNotifier {
+            fn notify(&self, event: NotifyEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let notifier = RecordingNotifier::default();
+        notify_marker_warning_if_any(
+            &notifier,
+            "my-task",
+            "org/repo",
+            42,
+            Path::new("/tmp/wt"),
+            None,
+        );
+
+        assert!(
+            notifier.events.lock().unwrap().is_empty(),
+            "a None marker_warning must not notify anything"
         );
     }
 
