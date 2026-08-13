@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: M1.0, M1.1 and M1.2 are all complete (see the note under M1.2 below for how the cross-version manual test ran and what it found). M2.0 (offer upstream) not yet started.
+**Status**: **Merged into the fork** — [PR #193](https://github.com/prageethw/dot-agent-deck/pull/193) (`0c648355`), first released in **v0.37.2**. M1.0–M1.2 complete. **M2.0 (offer upstream) remains open** and is genuinely blocked on a person, not on us: it is offered as [upstream PR #539](https://github.com/vfarcic/dot-agent-deck/pull/539), which is open and awaiting maintainer review. *(Status clarified 2026-08-14: the previous line did not say the fork work had merged and released, so the PRD read as unlanded when only its upstream half was outstanding.)*
 
 **Parent**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166) — this PRD carves out its parked **Phase 1** (M1.0/M1.1/M1.2). Sibling of [fork #175](https://github.com/prageethw/dot-agent-deck/issues/175), which carved out provisioning.
 
