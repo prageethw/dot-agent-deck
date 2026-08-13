@@ -75,16 +75,19 @@ The resolution logic itself lives in `build_version_resolve.rs` at the repo root
 
 Step 2 has a fork-specific failure mode that is **worse than the placeholder fall-through above, because it does not degrade to an obviously-wrong number and emits no `cargo:warning`**. `git describe --tags --abbrev=0` considers only tags **reachable from `HEAD`**. The sync procedure ([`fork-sync-workflow.md`](fork-sync-workflow.md)) rebases `fork-only` onto `upstream/main` and then hard-resets `main` to it — which rewrites the commits the fork's release tags point at. The tags keep pointing at the pre-rebase commits, those commits stop being ancestors of `main`, and `describe` walks straight past them to the newest tag it can still reach: **upstream's**.
 
-Measured on `origin/main` (`66077b2`) 2026-08-12 — every fork release tag is unreachable:
+Measured on `origin/main` (`5ffe2351`) 2026-08-13:
 
 | Fork tag | Commit | Ancestor of `origin/main`? |
 |---|---|---|
+| `v0.37.2` | `66077b2a` | **yes** |
 | `v0.37.1` | `f057ba65` | no |
 | `v0.37.0` | `a6de0062` | no |
 | `v0.36.1` | `7233a55a` | no |
 | `v0.36.0` | `f4e6e4a3` | no |
 
-`git describe --tags --abbrev=0` there returns `v0.35.10` — an upstream tag, two minors below the fork's actual latest release. So **a local build of post-sync `main` reports a real, plausible, wrong version**, and every consumer of it (the upgrade nudge, `remote add` pre-flight, the PRD #161 negotiation, the version inventory in [`upgrading-a-running-deck.md`](upgrading-a-running-deck.md)) inherits it. Nothing warns, because step 2 succeeded — it just answered from the wrong lineage.
+Every fork release tag cut **before the most recent sync** is unreachable — the four `no` rows are exactly the pattern the mechanism above predicts. The newest tag, `v0.37.2`, is not a contradiction of that: it was cut *after* the most recent sync, on a commit that is still an ancestor of `main` today, so it stays reachable **only until the next sync rewrites that commit too**. The accurate statement is that every fork release tag cut before the most recent sync is unreachable, while the newest one — cut after it — stays reachable until the following sync orphans it in turn.
+
+`git describe --tags --abbrev=0` on `origin/main` currently returns **`v0.37.2`**, correctly, because `v0.37.2` is (for now) the newest reachable tag. That correctness is a snapshot, not a property: the next sync orphans `v0.37.2` exactly as the previous one orphaned `v0.37.1`, and `describe` will walk straight past it to whatever upstream tag is newest and reachable — **a local build of post-sync `main` reports a real, plausible, wrong version**, and every consumer of it (the upgrade nudge, `remote add` pre-flight, the PRD #161 negotiation, the version inventory in [`upgrading-a-running-deck.md`](upgrading-a-running-deck.md)) inherits it. Nothing warns, because step 2 succeeded — it just answered from the wrong lineage. Re-measure rather than trust either the table or the `describe` output above at face value; both drift with the next sync.
 
 Three consequences worth knowing:
 
