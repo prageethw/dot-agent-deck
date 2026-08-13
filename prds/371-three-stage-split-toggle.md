@@ -1,6 +1,6 @@
 # PRD #371: Three-stage `Ctrl+l` pane-split toggle (Default / Narrow / Hidden)
 
-**Status**: Implementation complete — PR pending
+**Status**: **Complete** — merged 2026-08-04 as [PR #10](https://github.com/prageethw/dot-agent-deck/pull/10) (`80e8431`), first released in **v0.35.8**. *(Status corrected 2026-08-12: this line read "PR pending" for eight days after the PR had merged.)*
 **Priority**: Medium
 **Created**: 2026-08-04
 **GitHub Issue**: [#371](https://github.com/vfarcic/dot-agent-deck/issues/371) (closed upstream as not-planned; this fork continues the work independently)
