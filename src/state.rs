@@ -4964,24 +4964,27 @@ mod tests {
         );
     }
 
-    /// #174 round 2: the round trip a unit test on `resolve_orchestration_name`
-    /// alone cannot see. `tab.rs:808` stamps an orchestration's IDENTITY by
-    /// calling `resolve_orchestration_name` unconditionally on the raw config
-    /// name; `lookup_orchestration_role` matches against whatever
-    /// `load_project_config`'s normalization loop wrote into `orch.name`. The
-    /// two must agree for a whitespace-only `name = "   "` exactly as they do
-    /// for an empty one, or the `orch.name == orchestration_name` match
-    /// misses and a role's `prompt_template`/`clear` config silently stops
-    /// resolving.
+    /// #174 round 3: pins that `tab.rs:808`'s identity-stamping call to
+    /// `resolve_orchestration_name` and `load_project_config`'s
+    /// normalization loop stay in agreement — a round trip a unit test on
+    /// `resolve_orchestration_name` alone cannot see, because both sides
+    /// now call the same single guard rather than each deciding "is this
+    /// name blank" independently. `name = "   "` is used here specifically
+    /// because it is a real, present name under the current (non-trimming)
+    /// guard: both the TUI's stamped identity and the daemon's freshly
+    /// loaded config keep it as `"   "` unchanged, so the lookup must hit.
     ///
-    /// Before this fix, fixing only `resolve_orchestration_name`'s inner
-    /// guard (`is_empty()` -> `trim().is_empty()`) without also removing
-    /// `load_project_config`'s outer `is_empty()` pre-check would have
-    /// passed a unit test on `resolve_orchestration_name` in isolation while
-    /// failing exactly this: the stamped identity would resolve to the
-    /// basename, but `load_project_config` would still normalize `"   "` to
-    /// itself (outer guard still blocking the call), so this lookup would go
-    /// from `Some` to `None`.
+    /// This test fails the moment anyone reintroduces a second guard that
+    /// desyncs the two call sites — e.g. adding `.trim()` back to only one
+    /// of them — which is exactly the regression class round 1 shipped:
+    /// fixing `resolve_orchestration_name`'s guard alone would have passed
+    /// a unit test on that function in isolation while `load_project_config`
+    /// kept blocking the call behind its own separate `is_empty()`
+    /// pre-check, silently desyncing the stamped identity from the loaded
+    /// config. See `resolve_orchestration_name`'s doc comment for why
+    /// whitespace-only names are not normalized: doing so would change
+    /// `TabMembership::Orchestration.name`'s meaning across the
+    /// TUI↔daemon wire (CLAUDE.md rule 12).
     #[test]
     fn lookup_orchestration_role_matches_the_identity_the_tui_stamps_for_a_whitespace_only_name() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -226,11 +226,21 @@ fn default_clear() -> bool {
 
 /// Resolve an orchestration name with the cwd-basename fallback that
 /// the TUI applies when constructing `TabMembership::Orchestration` and
-/// when labelling the `Tab::Orchestration` record. Empty / whitespace
-/// config names — produced by `#[serde(default)]` on `OrchestrationConfig::name`
-/// or by the user not writing a `name = ...` line — resolve to the
-/// basename of `dir`; falls back to the path's `display()` form when the
-/// dir has no basename (e.g. `/`).
+/// when labelling the `Tab::Orchestration` record. An empty config name —
+/// produced by `#[serde(default)]` on `OrchestrationConfig::name` or by
+/// the user not writing a `name = ...` line — resolves to the basename
+/// of `dir`; falls back to the path's `display()` form when the dir has
+/// no basename (e.g. `/`).
+///
+/// A whitespace-only name (e.g. `"   "`) is treated as a real, present
+/// name and returned unchanged — deliberately, not an oversight. This
+/// value crosses the TUI↔daemon wire as `TabMembership::Orchestration.name`,
+/// so normalizing whitespace here would change that field's meaning while
+/// its shape stays identical (CLAUDE.md rule 12's "semantic break behind a
+/// stable wire"). #174's whitespace-only case is real but has no known
+/// occurrence; fixing it would require a compatibility shim or a
+/// `changelog.d/*.breaking.md` plus a version bump, which the defect does
+/// not warrant.
 ///
 /// Centralized so the TUI's tab construction site, the TUI's hydration
 /// site, and the daemon's `handle_delegate` lookup all agree on the
@@ -241,7 +251,7 @@ fn default_clear() -> bool {
 /// misses — silently dropping per-role `prompt_template` wrapping
 /// (round-10 reviewer #1).
 pub fn resolve_orchestration_name(config_name: &str, dir: &Path) -> String {
-    if !config_name.trim().is_empty() {
+    if !config_name.is_empty() {
         return config_name.to_string();
     }
     dir.file_name()
@@ -786,12 +796,12 @@ watch = true
         assert!(result.is_err());
     }
 
-    /// #174: an empty name and a whitespace-only name must both resolve
-    /// to the same cwd-basename fallback — a `.trim().is_empty()` guard
-    /// treats them identically, unlike the pre-fix `.is_empty()` guard
-    /// which returned `"   "` unchanged as if it were a meaningful name.
+    /// #174: an empty name resolves to the cwd-basename fallback. A
+    /// whitespace-only name is deliberately NOT treated as blank — see
+    /// `resolve_orchestration_name`'s doc comment — so it is not covered
+    /// here.
     #[test]
-    fn resolve_orchestration_name_treats_blank_and_whitespace_as_unnamed() {
+    fn resolve_orchestration_name_treats_empty_as_unnamed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let expected = dir
             .path()
@@ -801,8 +811,6 @@ watch = true
             .to_string();
 
         assert_eq!(resolve_orchestration_name("", dir.path()), expected);
-        assert_eq!(resolve_orchestration_name("   ", dir.path()), expected);
-        assert_eq!(resolve_orchestration_name("\t\n", dir.path()), expected);
     }
 
     #[test]
