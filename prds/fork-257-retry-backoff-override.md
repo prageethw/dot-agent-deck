@@ -108,7 +108,7 @@ The fix has two parts:
 
 ### M2 — the proof
 
-- [ ] `orchestration/seed/017` — unit: the override is honoured, clamped at both ends, and warns once. Must be mutation-checked: changing the clamp bound has to fail it.
+- [x] `orchestration/seed/017` — unit: the override is honoured, clamped at both ends, and warns once. Mutation-checked: the upper-bound clamp is asserted directly against `send_retry_base()` (not only through `send_retry_delay`, whose trailing `.min(SEND_RETRY_BACKOFF_CAP)` made a broken or removed clamp indistinguishable from a correct one — reviewer P1), and changing `SEND_RETRY_BASE_MAX` was confirmed on CI to fail the test before being reverted.
 - [ ] `orchestration/seed/018` — L1: with the floor lowered, a landed-but-unconfirmed write **deterministically** produces a second write whose payload is the empty string. This is the assertion that currently cannot be made.
 - [ ] `orchestration/seed/015` (real-agent) asserts **positively** that a retry fired, rather than `submissions.len() == 1`.
 - [ ] A scenario in which the original CR is suppressed, so the retry's CR is the **only** possible source of the submission. If this proves infeasible on a real harness, record why in this PRD rather than quietly dropping it — the risk it retires is a real one.

@@ -36182,31 +36182,86 @@ mod tests {
         );
     }
 
+    /// Reviewer P2 (fork#257): serializes `orchestration/seed/017` and
+    /// `orchestration/seed/018`, the two tests that mutate the
+    /// process-global `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, against EACH
+    /// OTHER. Each test previously declared its own function-local `static
+    /// Mutex` (mirroring `spawn_readiness_buffer_parses_env_override_
+    /// default_and_invalid`, whose var is different and so needs no
+    /// sharing) — two distinct mutexes guarding one process-global var let
+    /// parallel unit-test threads interleave their set/read/restore
+    /// sequences, so `017` could observe `018`'s override (or vice versa)
+    /// instead of the value each test itself set. Mirrors the split
+    /// lock/guard idiom `CONFIG_GEN_STATE_ENV_LOCK` / `ConfigGenStateEnvGuard`
+    /// already use in `src/config.rs` for the same job over a different var.
+    static SEND_RETRY_BASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard for `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`: captures
+    /// whatever value is in effect when constructed and restores exactly
+    /// that value on drop — including on unwind, so a test that panics
+    /// mid-assertion cannot leave the variable set for its neighbour.
+    /// Callers must hold `SEND_RETRY_BASE_ENV_LOCK` for this guard's entire
+    /// lifetime; the guard itself only captures/restores — callers make
+    /// their own `std::env::set_var` calls under the held lock.
+    struct SendRetryBaseEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl SendRetryBaseEnvGuard {
+        const VAR: &'static str = "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS";
+
+        fn capture() -> Self {
+            Self {
+                prev: std::env::var(Self::VAR).ok(),
+            }
+        }
+    }
+
+    impl Drop for SendRetryBaseEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold SEND_RETRY_BASE_ENV_LOCK for this guard's
+            // entire lifetime, serializing access to the process-global var.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(Self::VAR, v),
+                    None => std::env::remove_var(Self::VAR),
+                }
+            }
+        }
+    }
+
     /// Scenario: with `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS` unset,
     /// `send_retry_delay` returns today's fixed 500ms floor unchanged. Set to
     /// a valid low value, the floor honors it exactly — including zero, a
     /// legitimate "retry as soon as the grace period allows" value — and the
     /// exponential doubling shape (`BASE << (attempts-1)`) survives on the
     /// lowered base. Set to a non-numeric string, it falls back to the fixed
-    /// floor rather than panicking. Set to an absurdly large value (past
-    /// `AUTOMATIC_PROMPT_DEADLINE`), the result still lands on a sane,
-    /// backoff-capped schedule rather than an effectively-disabled wait.
-    /// PRD fork#257 M1/M2: mirrors `confirmation_grace_period()`'s existing
-    /// override idiom (`src/ui.rs:2239-2270`) line for line. Expected RED:
-    /// `send_retry_delay` does not read this env var at all today, so every
-    /// overridden assertion below observes the unchanged 500ms floor.
+    /// floor rather than panicking. Set to an absurdly large value, the
+    /// override's own ceiling clamp is asserted directly against
+    /// `send_retry_base()` (reviewer P1, fork#257) — not only through
+    /// `send_retry_delay`, whose trailing `.min(SEND_RETRY_BACKOFF_CAP)`
+    /// reapplies the same 2s ceiling downstream and so cannot tell a broken
+    /// clamp from a correct one — while the `send_retry_delay` assertion is
+    /// kept alongside it as the sane-schedule pin. PRD fork#257 M1/M2:
+    /// mirrors `confirmation_grace_period()`'s existing override idiom
+    /// (`src/ui.rs:2239-2270`) line for line. Expected RED (original round):
+    /// `send_retry_delay` did not read this env var at all, so every
+    /// overridden assertion observed the unchanged 500ms floor.
     #[spec("orchestration/seed/017")]
     #[test]
     fn orchestration_seed_017_send_retry_delay_honors_test_base_override() {
-        // Serialize against any other test reading this process-global env
-        // var — mirrors `spawn_readiness_buffer_parses_env_override_default_
-        // and_invalid`'s idiom, the sibling override this test is modeled on.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        const VAR: &str = "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS";
-        let prev = std::env::var(VAR).ok();
+        // Reviewer P2: shared module-level lock (not a function-local one)
+        // serializes this test against `orchestration/seed/018`, the other
+        // test mutating the same process-global var; the guard restores the
+        // pre-test value on drop, including on unwind.
+        let _lock = SEND_RETRY_BASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = SendRetryBaseEnvGuard::capture();
+        const VAR: &str = SendRetryBaseEnvGuard::VAR;
 
-        // SAFETY: lock held for the duration; restored below.
+        // SAFETY: lock held for the duration; `_restore`'s Drop restores the
+        // captured pre-test value.
         unsafe {
             std::env::remove_var(VAR);
         }
@@ -36290,13 +36345,25 @@ mod tests {
              backoff-capped schedule, not an effectively-disabled wait"
         );
 
-        // SAFETY: same lock; restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(VAR, v),
-                None => std::env::remove_var(VAR),
-            }
-        }
+        // Reviewer P1: the assertion above cannot, by itself, tell a broken
+        // ceiling clamp from a correct one — `send_retry_delay`'s trailing
+        // `.min(SEND_RETRY_BACKOFF_CAP)` reapplies the same 2s ceiling to
+        // ANY base at or above it, so a `send_retry_base()` that returned
+        // the raw 120s override unclamped would produce an identical
+        // `send_retry_delay(1)` result to a correctly clamped one. Assert
+        // the clamp directly against `send_retry_base()`, where nothing
+        // caps the result afterwards — this is what makes a broken or
+        // removed clamp (e.g. raising `SEND_RETRY_BASE_MAX`, or dropping the
+        // `.clamp(...)` call) actually fail this test.
+        assert_eq!(
+            send_retry_base(),
+            SEND_RETRY_BASE_MAX,
+            "an out-of-range override must clamp to SEND_RETRY_BASE_MAX at \
+             the accessor itself — asserting only through send_retry_delay \
+             cannot distinguish a correct clamp from a broken or missing \
+             one, since SEND_RETRY_BACKOFF_CAP reapplies the same ceiling \
+             downstream regardless"
+        );
     }
 
     /// Scenario: drive `deliver_orchestrator_prompt` across two frames with
@@ -36317,15 +36384,22 @@ mod tests {
     #[spec("orchestration/seed/018")]
     #[test]
     fn orchestration_seed_018_retry_fires_deterministically_once_floor_is_lowered() {
-        // Serialize against any other test reading these process-global env
-        // vars, mirroring `orchestration/seed/017`'s idiom.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reviewer P2: the SAME shared module-level lock `orchestration/
+        // seed/017` uses — the two tests mutate the same process-global
+        // `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, so a second, unrelated
+        // function-local mutex here would not serialize against seed/017 at
+        // all. `GRACE_VAR` has no sibling test touching it, so it keeps a
+        // plain manual restore below rather than a guard.
+        let _lock = SEND_RETRY_BASE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore_base = SendRetryBaseEnvGuard::capture();
         const GRACE_VAR: &str = "DOT_AGENT_DECK_TEST_CONFIRMATION_GRACE_PERIOD_MS";
-        const BASE_VAR: &str = "DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS";
+        const BASE_VAR: &str = SendRetryBaseEnvGuard::VAR;
         let prev_grace = std::env::var(GRACE_VAR).ok();
-        let prev_base = std::env::var(BASE_VAR).ok();
-        // SAFETY: lock held for the duration; restored below.
+        // SAFETY: lock held for the duration; `_restore_base`'s Drop
+        // restores BASE_VAR (even on unwind). GRACE_VAR is restored
+        // manually below.
         unsafe {
             std::env::set_var(GRACE_VAR, "10");
             std::env::set_var(BASE_VAR, "10");
@@ -36388,17 +36462,14 @@ mod tests {
             &mut prompt,
         );
 
-        // SAFETY: same lock; restore now, before any assertion below might
-        // panic (the lock guard's own drop during unwind would restore the
-        // lock, but not these env vars).
+        // SAFETY: same lock. GRACE_VAR is restored manually here, before any
+        // assertion below might panic; BASE_VAR is restored automatically by
+        // `_restore_base`'s Drop, including on unwind, so it needs no manual
+        // restore here.
         unsafe {
             match prev_grace {
                 Some(v) => std::env::set_var(GRACE_VAR, v),
                 None => std::env::remove_var(GRACE_VAR),
-            }
-            match prev_base {
-                Some(v) => std::env::set_var(BASE_VAR, v),
-                None => std::env::remove_var(BASE_VAR),
             }
         }
 
