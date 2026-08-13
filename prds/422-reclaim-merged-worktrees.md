@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status**: Not started
+**Status**: **Complete** — merged 2026-08-08 as [PR #131](https://github.com/prageethw/dot-agent-deck/pull/131) (`1090d6f`), first released in **v0.36.0**; upstream issue [#422](https://github.com/vfarcic/dot-agent-deck/issues/422) is closed. *(Status corrected 2026-08-12: this line still read "Not started" four days after the work had shipped — the most misleading of the four stale statuses, since it invited someone to start work that was already done.)*
 
 ## Problem Statement
 
