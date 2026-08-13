@@ -654,6 +654,45 @@ fn count_orchestrators(daemon: &common::DaemonProc) -> usize {
         .count()
 }
 
+/// Canonicalise `worktree_dir` exactly as production's
+/// `canonicalize_identity_path` does (best-effort — falls back to the given
+/// path on error — which is safe here because by the point every call site
+/// reaches this the worktree genuinely exists on disk), then assert that a
+/// recorded `gh issue comment` call names BOTH halves of the round-3 identity
+/// anchor: that canonical path AND `branch` (CLAUDE.md rule 23). Asserting
+/// the branch alone would let a regression that omits the path — or
+/// substitutes a DIFFERENT canonical worktree path alongside a correct
+/// branch — pass undetected; the branch is a genuinely stable component, not
+/// a substitute for the two-field identity. `decoration` fills the
+/// site-specific tail of the failure message — pass a full clause such as
+/// `"decorate it with the claiming task name"` / `"decorate it with the
+/// orchestration name"`.
+fn assert_claim_names_worktree_identity(
+    stub: &GhStub,
+    worktree_dir: &Path,
+    branch: &str,
+    decoration: &str,
+) {
+    let canonical_path =
+        std::fs::canonicalize(worktree_dir).unwrap_or_else(|_| worktree_dir.to_path_buf());
+    let canonical_path = canonical_path.to_string_lossy().into_owned();
+    let named_identity = common::wait_until(Duration::from_secs(3), || {
+        stub.gh_calls().iter().any(|l| {
+            l.contains("issue")
+                && l.contains("comment")
+                && l.contains(&canonical_path)
+                && l.contains(branch)
+        })
+    });
+    assert!(
+        named_identity,
+        "the claim comment must name BOTH halves of the round-3 identity anchor — the canonical \
+         worktree path ({canonical_path:?}) and the branch ({branch:?}, CLAUDE.md rule 23) — not \
+         merely {decoration}; observed gh calls:\n{}",
+        stub.gh_calls().join("\n")
+    );
+}
+
 /// Whether the clone's `git worktree list` still references `worktree`.
 fn git_worktree_listed(clone: &Path, worktree: &Path) -> bool {
     let out = std::process::Command::new("git")
@@ -1541,12 +1580,12 @@ const FAILING_ORCH_TOML: &str = "[[orchestrations]]\nname = \"dispatch-orch\"\n\
 /// card present, as in `scheduler/dispatch/022`), the stub `gh` log must show
 /// an `issue edit ... --add-label in-progress` invocation for the issue AND
 /// an `issue comment` invocation whose body names the claiming task
-/// (the task name as DECORATION on round 3's worktree-path-plus-branch
-/// identity — this is the genuinely single-agent claim path PRD #421
-/// originally covered here, kept distinct from the orchestration-named claim
-/// `scheduler/dispatch/021` exists to pin) — and, because `in-progress`
-/// pre-existed, the add-label call must have actually SUCCEEDED, not merely
-/// been attempted.
+/// (the task name as DECORATION on round 3's two-field worktree-path-plus-branch
+/// identity, asserted in full — this is the genuinely single-agent claim path
+/// PRD #421 originally covered here, kept distinct from the
+/// orchestration-named claim `scheduler/dispatch/021` exists to pin) — and,
+/// because `in-progress` pre-existed, the add-label call must have actually
+/// SUCCEEDED, not merely been attempted.
 #[spec("scheduler/dispatch/010")]
 #[test]
 fn dispatch_010_success_writes_label_and_claim_comment() {
@@ -1603,24 +1642,19 @@ fn dispatch_010_success_writes_label_and_claim_comment() {
     // PRD fork#235 round 3: the identity itself is the dispatched worktree's
     // absolute path plus its branch (`agent/issue-<n>`, CLAUDE.md rule 23),
     // not `issue-dispatch:<task>#<issue>@…` — the task name above is
-    // DECORATION, not the compared identity string. Assert on the branch —
-    // a canonicalisation-stable component unique to this issue's dispatch —
-    // rather than `paths.worktree_dir`: that path is built lexically
-    // (`derive_issue_paths` performs no canonicalisation) while the identity
-    // rendered into the comment is physically resolved (`canonicalize_identity_path`,
-    // PRD fork#235 round 3), so the two diverge whenever the workspace root is
-    // reached through a symlink (fork#243).
-    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls()
-            .iter()
-            .any(|l| l.contains("issue") && l.contains("comment") && l.contains(&paths.branch))
-    });
-    assert!(
-        named_worktree_identity,
-        "the claim comment must name the round-3 identity anchor's branch ({:?}, CLAUDE.md \
-         rule 23) — not merely decorate it with the task name; observed gh calls:\n{}",
-        paths.branch,
-        stub.gh_calls().join("\n")
+    // DECORATION, not the compared identity string. `derive_issue_paths`
+    // builds `paths.worktree_dir` lexically, while the identity rendered
+    // into the comment is physically resolved
+    // (`canonicalize_identity_path`), so this canonicalises the same way
+    // production does before comparing (fork#243) — and asserts BOTH halves
+    // of the identity, not the branch alone: a regression that serialises
+    // the correct branch but omits the path, or pairs the branch with a
+    // DIFFERENT canonical path, must still fail here.
+    assert_claim_names_worktree_identity(
+        &stub,
+        &paths.worktree_dir,
+        &paths.branch,
+        "decorate it with the claiming task name",
     );
 
     // The fixture pre-seeded `in-progress`, so the add-label call must have
@@ -2224,16 +2258,16 @@ fn dispatch_020_claim_succeeds_when_label_does_not_preexist() {
 /// `.dot-agent-deck.toml` opens an ORCHESTRATION tab (`ORCH_TOML`'s
 /// `dispatch-orch`). Assert the posted claim comment names the
 /// ORCHESTRATION's own typed name (`dispatch-orch`) as DECORATION, and
-/// separately anchors on the round-3 identity's branch (`agent/issue-<n>`,
-/// CLAUDE.md rule 23) — regardless of which spawn kind fired it. Anchors on
-/// the branch rather than the dispatched worktree's absolute path
-/// (fork#243): the path rendered into the comment is physically resolved
-/// (`canonicalize_identity_path`), while `derive_issue_paths` builds a
-/// lexical path with no canonicalisation, so the two would silently diverge
-/// whenever the workspace root is reached through a symlink — the branch has
-/// no such dependency and is just as unique to this dispatch — what differs
-/// between an orchestration dispatch and a single-agent one
-/// (`scheduler/dispatch/010`) is only which name is rendered as decoration.
+/// separately anchors on the COMPLETE round-3 identity — the dispatched
+/// worktree's canonical absolute path AND its branch (`agent/issue-<n>`,
+/// CLAUDE.md rule 23) — regardless of which spawn kind fired it. The test
+/// canonicalises `derive_issue_paths`' lexically-built path itself before
+/// comparing (fork#243): the identity rendered into the comment is
+/// physically resolved (`canonicalize_identity_path`), so a raw lexical
+/// comparison would falsely diverge whenever the workspace root is reached
+/// through a symlink. What differs between an orchestration dispatch and a
+/// single-agent one (`scheduler/dispatch/010`) is only which name is
+/// rendered as decoration.
 #[spec("scheduler/dispatch/021")]
 #[test]
 fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
@@ -2271,24 +2305,19 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
 
     // PRD fork#235 round 3: the identity itself is the dispatched worktree's
     // absolute path plus its branch (CLAUDE.md rule 23) regardless of spawn
-    // kind — `dispatch-orch` above is decoration only. Assert on the branch —
-    // a canonicalisation-stable component unique to this issue's dispatch —
-    // rather than `paths.worktree_dir`: that path is built lexically
-    // (`derive_issue_paths` performs no canonicalisation) while the identity
-    // rendered into the comment is physically resolved (`canonicalize_identity_path`,
-    // PRD fork#235 round 3), so the two diverge whenever the workspace root is
-    // reached through a symlink (fork#243).
-    let named_worktree_identity = common::wait_until(Duration::from_secs(3), || {
-        stub.gh_calls()
-            .iter()
-            .any(|l| l.contains("issue") && l.contains("comment") && l.contains(&paths.branch))
-    });
-    assert!(
-        named_worktree_identity,
-        "the claim comment must name the round-3 identity anchor's branch ({:?}, CLAUDE.md \
-         rule 23) — not merely decorate it with the orchestration name; observed gh calls:\n{}",
-        paths.branch,
-        stub.gh_calls().join("\n")
+    // kind — `dispatch-orch` above is decoration only. `derive_issue_paths`
+    // builds `paths.worktree_dir` lexically, while the identity rendered
+    // into the comment is physically resolved (`canonicalize_identity_path`),
+    // so this canonicalises the same way production does before comparing
+    // (fork#243) — and asserts BOTH halves of the identity, not the branch
+    // alone: a regression that serialises the correct branch but omits the
+    // path, or pairs the branch with a DIFFERENT canonical path, must still
+    // fail here.
+    assert_claim_names_worktree_identity(
+        &stub,
+        &paths.worktree_dir,
+        &paths.branch,
+        "decorate it with the orchestration name",
     );
 
     let named_orchestration = stub
@@ -2302,9 +2331,10 @@ fn dispatch_021_orchestration_dispatch_names_the_orchestration_in_the_claim() {
          task exclusively; fork#235 M1/M2 derives the claimant's decoration from the bound \
          spawn handle's `SpawnKind` instead. This does NOT assert the scheduled task's name \
          (`claim-task-021`) is absent from the comment: `derive_issue_paths` keys the clone \
-         directory on the task name for every `SpawnKind`, so the worktree path asserted above \
-         legitimately contains `claim-task-021` as a path segment — asserting its absence would \
-         contradict the path assertion; observed gh calls:\n{}",
+         directory on the task name for every `SpawnKind`, so the canonical worktree path \
+         asserted above (via `assert_claim_names_worktree_identity`) legitimately contains \
+         `claim-task-021` as a path segment — asserting its absence would contradict that path \
+         assertion; observed gh calls:\n{}",
         stub.gh_calls().join("\n")
     );
 }
