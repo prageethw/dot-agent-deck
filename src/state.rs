@@ -5971,6 +5971,53 @@ mod tests {
         );
     }
 
+    /// Issue #262's trusted counterpart to the detector above. When the pane
+    /// carries no untagged mark at all, `None => !pane_status_untagged`
+    /// resolves to `true`, so a tagged `ToolStart` DOES clear a
+    /// `WaitingForInput` left by no marker — PRD #372's "no marker means no
+    /// permission prompt was pending, so a tool starting must be the human's
+    /// reply" heuristic, operating on a status the gate already trusts. Only
+    /// the untagged half of this arm is pinned above; a mutation that always
+    /// resolved the arm to `false` (`None => false`) would regress this
+    /// heuristic while still passing every other test in this module.
+    #[test]
+    fn a_tagged_tool_start_with_no_marker_clears_a_trusted_waiting_status() {
+        let mut state = pane_with_tagged_session();
+
+        // A tagged plain `WaitingForInput` — an identified producer, so it
+        // clears any marker and leaves the pane trusted.
+        let mut tagged_waiting =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::WaitingForInput);
+        tagged_waiting.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_waiting);
+        assert!(
+            !state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "precondition: a tagged WaitingForInput must leave the pane trusted"
+        );
+
+        // The pane's real agent starts a tool. With no marker at all and a
+        // trusted status, this must be read as the human's reply taking
+        // effect, not a guess.
+        let mut tagged_tool =
+            untagged_event(&format!("pane-{UNTAGGED_PANE}"), EventType::ToolStart);
+        tagged_tool.agent_id = Some(UNTAGGED_AGENT_ID.to_string());
+        state.apply_event(tagged_tool);
+
+        let session = state
+            .sessions
+            .get(&format!("pane-{UNTAGGED_PANE}"))
+            .expect("the pane's session");
+        assert_eq!(
+            session.status,
+            SessionStatus::Working,
+            "a trusted WaitingForInput with no marker must clear on ToolStart"
+        );
+        assert!(
+            !state.untagged_status_panes.contains(UNTAGGED_PANE),
+            "the pane must remain trusted after the clear"
+        );
+    }
+
     /// The counterpart: `ToolEnd` genuinely overwrites `WaitingForInput` (with
     /// `Thinking`), so it does assert, and a tagged one legitimately clears the
     /// mark. Pins the asymmetry so neither arm is "simplified" into the other.
