@@ -101,6 +101,10 @@
     gh pr view <n> --repo prageethw/dot-agent-deck --json closingIssuesReferences \
       --jq '[.closingIssuesReferences[].number]'
     ```
+
+    **Two refinements, both learned by getting them wrong while writing this paragraph.** First: **describing the trap in a PR body re-triggers it** — quoting the bad example *"this does not close &lt;issue&gt;"* with a real number in it links the issue you are using as the example. Write illustrative examples with a placeholder and **no numeral**. Second: **HTML-escaping the `#` does not help.** `&#35;256` renders as `#256`, and the parser works on the rendered text, so the link is created anyway — verified directly on PR #265, which kept reporting the reference until the numeral was removed altogether.
+
+    Note also that the check above is the *only* reliable signal: a body edit does clear a link, but only once the rendered text genuinely no longer matches — so re-run it after editing rather than assuming the edit worked.
 9. **Ask the Experimental-Flag Question When Starting a User-Facing PRD; Gate at the Seam**: When starting a PRD that introduces a new user-visible surface (pane, field, command, tab, footer, keybinding), ask the user whether that surface should ship behind the `experimental` feature flag (PRD #139). If **yes**:
    - Add **one** per-feature wrapper function in `src/features.rs` — e.g. `pub fn show_<feature>() -> bool { experimental_enabled() }` — and gate **only at the user-visible seam** (render and input-binding). Do **not** scatter `experimental_enabled()` checks through implementation code, and never branch business logic / daemon protocols / hook handling on the flag — it is a *presentation* switch (M3.2). Every call site reads `if features::show_<feature>() { … }` so `grep show_<feature>` finds them all for a mechanical removal at graduation.
    - Note the flag in the **PRD itself**, in the **changelog fragment** (`dot-ai-changelog-fragment`), and in the **docs** (`docs/develop/experimental-flag.md` lists the flag and how to enable it).
