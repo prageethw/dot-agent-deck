@@ -2568,6 +2568,18 @@ struct UiState {
     /// later write succeeds (which clears this flag, re-arming the warning for
     /// any subsequent new failure).
     session_snapshot_write_failed: bool,
+    /// Fork issue #318 auditor A2: `(cwd, orchestration name)` pairs that
+    /// have already contributed a warning to `session_warnings` via the
+    /// per-frame `surface_one_orchestration` producer. That producer's
+    /// idempotency guard only suppresses a repeat once a pane is
+    /// registered, and both of its failure exits return before that
+    /// happens — so without this latch a recurring or re-broadcast
+    /// surface against a broken local config pushes one warning per
+    /// occurrence, unbounded, for the life of the session. Not cleared on
+    /// a later success, so a config that breaks differently after a first
+    /// warning won't re-warn — accepted per the auditor's "cheapest
+    /// sufficient fix" framing rather than tracking per-message text.
+    warned_orchestration_surface_configs: HashSet<(String, String)>,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
@@ -2942,6 +2954,7 @@ impl UiState {
             split_stage: SplitStage::Default,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
+            warned_orchestration_surface_configs: HashSet::new(),
             selection: None,
             focused_pane_rect: None,
             side_pane_rects: Vec::new(),
@@ -3500,7 +3513,7 @@ pub fn resolve_orch_config_for_hydration(
     )
 }
 
-/// Fork issues #318 + #320: the three ways a hydration/live-surfacing call
+/// Fork issues #318 + #320: the four ways a hydration/live-surfacing call
 /// site's local-config lookup can come out, replacing the `(config_present,
 /// local_found)` boolean pair `hydration_drift_warning` used to take. That
 /// pair was flagged on PR #315 as a tautology at its call site — both
@@ -3513,15 +3526,58 @@ enum LocalConfigState {
     /// #111 remote-reconnect case — stay silent.
     Absent,
     /// The local `.dot-agent-deck.toml` exists but failed to parse (fork
-    /// issue #320). `path` is the `ProjectConfigError::Parse` `Display`
-    /// text, which already names both the file path and the underlying
-    /// `toml::de::Error` — exactly the two things the warning needs to
-    /// name, for free.
-    Unparseable { path: String },
+    /// issue #320). `reason` is the underlying `toml::de::Error`'s own
+    /// position line ("TOML parse error at line N, column M"), not the
+    /// full multi-line `Display` — see `toml_parse_reason` for why.
+    Unparseable { reason: String },
+    /// The local `.dot-agent-deck.toml` exists but could not be read — a
+    /// permission error, `EISDIR`, a broken symlink, or similar (fork
+    /// issue #318 reviewer F3 / auditor A3). Distinct from `Absent`: the
+    /// file is genuinely there, just not readable, so collapsing it into
+    /// the silent PRD #111 remote-reconnect case would misreport the
+    /// exact bug class #318/#320 exist to fix, for a different error
+    /// variant. `reason` is the underlying `std::io::Error`'s `Display`.
+    Unreadable { reason: String },
     /// The local `.dot-agent-deck.toml` parsed. `found` is whether it
     /// lists an orchestration by this name — `false` is the rename/removal
     /// drift case (fork issue #314).
     Present { found: bool },
+}
+
+/// Fork issue #318 reviewer F2: `toml::de::Error`'s `Display` embeds the
+/// raw offending source line and the full caret diagram (see
+/// `toml::de::Error`'s doc example), which can push a rendered warning
+/// well past the status bar's usable width before the actionable part —
+/// where to look — ever appears. Its first line, when the parser had a
+/// span to report against, is `"TOML parse error at line N, column M"`;
+/// stripping the `"TOML parse error at "` restatement (the message
+/// already says "could not be parsed" — the same redundancy this fix
+/// removed from the old message's `"Failed to parse "`) leaves just
+/// `"line N, column M"`, which is what actually fits ahead of the status
+/// bar's truncation point. Falls back to the bare `message()` line for
+/// the rare case with no span (a serde-level error the parser couldn't
+/// localize).
+fn toml_parse_reason(source: &toml::de::Error) -> String {
+    let first_line = source.to_string();
+    let first_line = first_line.lines().next().unwrap_or_default();
+    first_line
+        .strip_prefix("TOML parse error at ")
+        .unwrap_or(first_line)
+        .to_string()
+}
+
+/// Shared by [`hydration_drift_warning`]'s `Unparseable` arm and the
+/// mode-bucket loop (fork issue #318 reviewer F1) — the wording doesn't
+/// reference an orchestration/mode name, so both call sites share it
+/// rather than drifting apart.
+fn unparseable_config_warning(reason: &str, cwd: &str) -> String {
+    format!("Warning: local .dot-agent-deck.toml could not be parsed: {reason} ({cwd})")
+}
+
+/// Shared by [`hydration_drift_warning`]'s `Unreadable` arm and the
+/// mode-bucket loop, mirroring [`unparseable_config_warning`].
+fn unreadable_config_warning(reason: &str, cwd: &str) -> String {
+    format!("Warning: local .dot-agent-deck.toml could not be read: {reason} ({cwd})")
 }
 
 /// Fork issue #314 (enum shape: #318/#320): decide whether the
@@ -3554,9 +3610,12 @@ fn hydration_drift_warning(state: LocalConfigState, name: &str, cwd: &str) -> Op
         // substring below ("local .dot-agent-deck.toml could not be
         // parsed") is what `hydration/002` and `live_005`'s sibling case
         // assert on.
-        LocalConfigState::Unparseable { path } => Some(format!(
-            "Warning: local .dot-agent-deck.toml could not be parsed: {path}"
-        )),
+        LocalConfigState::Unparseable { reason } => Some(unparseable_config_warning(&reason, cwd)),
+        // Fork issue #318 reviewer F3 / auditor A3: a present-but-unreadable
+        // file used to collapse into `Absent` and stay silent — the exact
+        // bug class #318/#320 exist to fix, surviving for a different
+        // `ProjectConfigError` variant. Give it its own warning instead.
+        LocalConfigState::Unreadable { reason } => Some(unreadable_config_warning(&reason, cwd)),
     }
 }
 
@@ -4930,30 +4989,51 @@ fn surface_one_orchestration(
         Ok(Some(_)) => LocalConfigState::Present {
             found: local.is_some(),
         },
-        Err(e @ crate::project_config::ProjectConfigError::Parse { .. }) => {
+        Err(crate::project_config::ProjectConfigError::Parse { source, .. }) => {
             tracing::warn!(
                 cwd = %surface.cwd,
                 orchestration = %surface.name,
-                error = %e,
+                error = %source,
                 "live orchestration surface: local project config failed to parse"
             );
             LocalConfigState::Unparseable {
-                path: e.to_string(),
+                reason: toml_parse_reason(source),
             }
         }
-        Err(e) => {
-            tracing::error!(
+        // Fork issue #318 reviewer F3 / auditor A3: a present-but-unreadable
+        // config used to collapse into `Absent` here too — give it its own
+        // state instead of reporting a file that demonstrably exists as one
+        // that doesn't.
+        Err(crate::project_config::ProjectConfigError::Io { source, .. }) => {
+            tracing::warn!(
                 cwd = %surface.cwd,
                 orchestration = %surface.name,
-                error = %e,
-                "live orchestration surface: failed to load local project config; using synthesised config"
+                error = %source,
+                "live orchestration surface: local project config exists but could not be read"
             );
-            LocalConfigState::Absent
+            LocalConfigState::Unreadable {
+                reason: source.to_string(),
+            }
         }
     };
     if let Some(msg) = hydration_drift_warning(local_config_state, &surface.name, &surface.cwd) {
-        ui.session_warnings.push(msg.clone());
-        ui.status_message = Some((msg, std::time::Instant::now()));
+        ui.status_message = Some((msg.clone(), std::time::Instant::now()));
+        // Fork issue #318 auditor A2: this producer runs from the per-frame
+        // surface-drain loop, not the once-per-startup hydration loop above
+        // (whose pushes are naturally bounded by bucket count) — and both of
+        // this function's failure exits below return without registering a
+        // pane, so `already_built` (the idempotency guard above) can never
+        // suppress a repeat. Latch the accumulating `Vec` on (cwd, name) so
+        // a recurring or re-broadcast surface can't grow it unbounded, per
+        // the precedent at `session_snapshot_write_failed` below.
+        // `status_message` stays unconditional so an in-session recurrence
+        // is still visible; only the exit-time `Vec` needs bounding.
+        if ui
+            .warned_orchestration_surface_configs
+            .insert((surface.cwd.clone(), surface.name.clone()))
+        {
+            ui.session_warnings.push(msg);
+        }
     }
     let orch_config = resolve_orch_config_for_hydration(local, &bucket);
 
@@ -11573,51 +11653,70 @@ pub fn run_tui(
                 }
             }
         }
+        // Fork issue #318 F1/F3: the cache needs to keep the
+        // parse-vs-unreadable distinction alive for callers (mode loop
+        // included) rather than collapsing both into one opaque `String` —
+        // and needs a `Clone` error type in the first place, since
+        // `ProjectConfigError::Io`'s `std::io::Error` isn't `Clone`.
+        #[derive(Clone)]
+        enum ConfigLookupFailure {
+            Unparseable(String),
+            Unreadable(String),
+        }
         // Cache cwd → project config lookup so it happens once per distinct
         // cwd regardless of how many buckets share it. Fork issue #320: the
-        // cache carries `Err(String)` for an unparseable file rather than
-        // collapsing it into `Ok(None)` alongside a genuinely absent one —
-        // `lookup_config` used to map BOTH to `None`, which is what made an
-        // unparseable local edit silent. The `String` is the
-        // `ProjectConfigError::Parse` `Display` text (see
-        // `LocalConfigState::Unparseable`'s doc comment for why that's
-        // sufficient on its own).
+        // cache carries `Err(ConfigLookupFailure)` for an unusable file
+        // rather than collapsing it into `Ok(None)` alongside a genuinely
+        // absent one — `lookup_config` used to map every failure to `None`,
+        // which is what made an unparseable local edit silent.
         let mut config_cache: std::collections::HashMap<
             String,
-            Result<Option<crate::project_config::ProjectConfig>, String>,
+            Result<Option<crate::project_config::ProjectConfig>, ConfigLookupFailure>,
         > = std::collections::HashMap::new();
-        let lookup_config =
-            |cache: &mut std::collections::HashMap<
-                String,
-                Result<Option<crate::project_config::ProjectConfig>, String>,
-            >,
-             cwd: &str|
-             -> Result<Option<crate::project_config::ProjectConfig>, String> {
-                if let Some(cached) = cache.get(cwd) {
-                    return cached.clone();
+        let lookup_config = |cache: &mut std::collections::HashMap<
+            String,
+            Result<Option<crate::project_config::ProjectConfig>, ConfigLookupFailure>,
+        >,
+                             cwd: &str|
+         -> Result<
+            Option<crate::project_config::ProjectConfig>,
+            ConfigLookupFailure,
+        > {
+            if let Some(cached) = cache.get(cwd) {
+                return cached.clone();
+            }
+            let loaded = match load_project_config(std::path::Path::new(cwd)) {
+                Ok(opt) => Ok(opt),
+                Err(crate::project_config::ProjectConfigError::Parse { source, .. }) => {
+                    // Fork issue #318 reviewer D2: match the live-surfacing
+                    // site's `warn!` level for the identical condition —
+                    // this used to log `error!` here and `warn!` there for
+                    // the same fact.
+                    tracing::warn!(
+                        cwd = %cwd,
+                        error = %source,
+                        "hydration: local project config failed to parse"
+                    );
+                    Err(ConfigLookupFailure::Unparseable(toml_parse_reason(&source)))
                 }
-                let loaded = match load_project_config(std::path::Path::new(cwd)) {
-                    Ok(opt) => Ok(opt),
-                    Err(e @ crate::project_config::ProjectConfigError::Parse { .. }) => {
-                        tracing::error!(
-                            cwd = %cwd,
-                            error = %e,
-                            "hydration: local project config failed to parse"
-                        );
-                        Err(e.to_string())
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            cwd = %cwd,
-                            error = %e,
-                            "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
-                        );
-                        Ok(None)
-                    }
-                };
-                cache.insert(cwd.to_string(), loaded.clone());
-                loaded
+                // Fork issue #318 reviewer F3 / auditor A3: a
+                // present-but-unreadable config used to collapse into
+                // `Ok(None)` here — reporting a file that demonstrably
+                // exists as absent, and (since the loop below also logs
+                // an `info!` "absent" line) producing two contradictory
+                // log lines for one event.
+                Err(crate::project_config::ProjectConfigError::Io { source, .. }) => {
+                    tracing::warn!(
+                        cwd = %cwd,
+                        error = %source,
+                        "hydration: local project config exists but could not be read"
+                    );
+                    Err(ConfigLookupFailure::Unreadable(source.to_string()))
+                }
             };
+            cache.insert(cwd.to_string(), loaded.clone());
+            loaded
+        };
 
         // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane dims for
         // hydration mode-tab rebuilds. Side panes spawn fresh from the
@@ -11627,20 +11726,63 @@ pub fn run_tui(
         // is active, but spawning at the right size avoids the 24×80 hiccup.
         let hydration_frame_area = terminal.get_frame().area();
         for bucket in &partition.mode_buckets {
-            // Mode tabs don't distinguish Absent/Unparseable/drift — an
-            // unusable local config just means no mode config for this
-            // bucket, same as before #320.
-            let cfg = lookup_config(&mut config_cache, &bucket.cwd).ok().flatten();
+            let cfg_result = lookup_config(&mut config_cache, &bucket.cwd);
+            let cfg: Option<crate::project_config::ProjectConfig> =
+                cfg_result.as_ref().ok().cloned().flatten();
             let mode_config = cfg
                 .as_ref()
                 .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
+            // Fork issue #318 reviewer F1: this used to be
+            // `.ok().flatten()`, collapsing Absent/Unparseable/Unreadable/
+            // drift into one silent "no mode config" outcome and blaming
+            // the drift branch's own log line for all four. Match the real
+            // outcome instead — mode tabs still have no synthesis fallback
+            // (unlike orchestrations), so every branch here still drops
+            // the pane to the dashboard; what changes is whether the log
+            // and the user are told the truth about why.
             let Some(mode_config) = mode_config else {
-                tracing::error!(
-                    cwd = %bucket.cwd,
-                    mode = %bucket.mode_name,
-                    agent_pane_id = %bucket.agent_pane_id,
-                    "hydration: hydrated agent claims mode that is not in project config; dropping to dashboard"
-                );
+                match &cfg_result {
+                    Ok(None) => {
+                        tracing::info!(
+                            cwd = %bucket.cwd,
+                            mode = %bucket.mode_name,
+                            agent_pane_id = %bucket.agent_pane_id,
+                            "hydration: local .dot-agent-deck.toml absent — dropping mode pane to dashboard (remote daemon path)"
+                        );
+                    }
+                    Ok(Some(_)) => {
+                        tracing::error!(
+                            cwd = %bucket.cwd,
+                            mode = %bucket.mode_name,
+                            agent_pane_id = %bucket.agent_pane_id,
+                            "hydration: hydrated agent claims mode that is not in project config; dropping to dashboard"
+                        );
+                    }
+                    Err(ConfigLookupFailure::Unparseable(reason)) => {
+                        tracing::warn!(
+                            cwd = %bucket.cwd,
+                            mode = %bucket.mode_name,
+                            agent_pane_id = %bucket.agent_pane_id,
+                            error = %reason,
+                            "hydration: dropping mode pane to dashboard (local .dot-agent-deck.toml could not be parsed)"
+                        );
+                        let msg = unparseable_config_warning(reason, &bucket.cwd);
+                        ui.session_warnings.push(msg.clone());
+                        ui.status_message = Some((msg, std::time::Instant::now()));
+                    }
+                    Err(ConfigLookupFailure::Unreadable(reason)) => {
+                        tracing::warn!(
+                            cwd = %bucket.cwd,
+                            mode = %bucket.mode_name,
+                            agent_pane_id = %bucket.agent_pane_id,
+                            error = %reason,
+                            "hydration: dropping mode pane to dashboard (local .dot-agent-deck.toml exists but could not be read)"
+                        );
+                        let msg = unreadable_config_warning(reason, &bucket.cwd);
+                        ui.session_warnings.push(msg.clone());
+                        ui.status_message = Some((msg, std::time::Instant::now()));
+                    }
+                }
                 continue;
             };
             let total_side_count = (mode_config.panes.len() + mode_config.reactive_panes) as u16;
@@ -11691,18 +11833,26 @@ pub fn run_tui(
             // `LocalConfigState`'s doc comment for why a bare bool pair
             // can't represent "unparseable" at all.
             let local_config_state = match cfg_result {
-                Err(path) => LocalConfigState::Unparseable { path },
+                Err(ConfigLookupFailure::Unparseable(reason)) => {
+                    LocalConfigState::Unparseable { reason }
+                }
+                Err(ConfigLookupFailure::Unreadable(reason)) => {
+                    LocalConfigState::Unreadable { reason }
+                }
                 Ok(None) => LocalConfigState::Absent,
                 Ok(Some(_)) => LocalConfigState::Present {
                     found: local_orch_config.is_some(),
                 },
             };
             // PRD #111 auditor nit / fork issue #320: distinguish the
-            // three "synthesise" cases so operators can tell whether the
+            // four "synthesise" cases so operators can tell whether the
             // file is genuinely absent (legitimate remote reconnect),
-            // present but unparseable (a broken local edit), or present
-            // but missing this orchestration (config drift). `Absent` logs
-            // at info (expected, PRD #111); the other two log at warn.
+            // present but unparseable or unreadable (a broken local edit
+            // or filesystem issue — fork issue #318 reviewer F3 / auditor
+            // A3), or present but missing this orchestration (config
+            // drift). `Absent` logs at info (expected, PRD #111); the
+            // other three log at warn (reviewer D2: same fact, same
+            // severity, so the same level everywhere it's logged).
             match &local_config_state {
                 LocalConfigState::Present { found: true } => {}
                 LocalConfigState::Absent => {
@@ -11713,13 +11863,22 @@ pub fn run_tui(
                         "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
                     );
                 }
-                LocalConfigState::Unparseable { path } => {
+                LocalConfigState::Unparseable { reason } => {
                     tracing::warn!(
                         cwd = %bucket.cwd,
                         orchestration = %bucket.orchestration_name,
                         role_count = bucket.role_slots.len(),
-                        error = %path,
+                        error = %reason,
                         "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml could not be parsed)"
+                    );
+                }
+                LocalConfigState::Unreadable { reason } => {
+                    tracing::warn!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_count = bucket.role_slots.len(),
+                        error = %reason,
+                        "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml exists but could not be read)"
                     );
                 }
                 LocalConfigState::Present { found: false } => {
@@ -22700,11 +22859,12 @@ mod tests {
     }
 
     /// Fork issues #314/#318/#320: `hydration_drift_warning`'s truth table
-    /// over `LocalConfigState`'s three outcomes. Only `Present { found:
-    /// false }` (a rename/removal drifted out from under a live tab) and
-    /// `Unparseable` (a broken local edit) should warn; `Absent` (the PRD
-    /// #111 remote-reconnect case) and `Present { found: true }` must both
-    /// stay silent.
+    /// over `LocalConfigState`'s four outcomes. `Present { found: false }`
+    /// (a rename/removal drifted out from under a live tab), `Unparseable`
+    /// (a broken local edit) and `Unreadable` (fork issue #318 reviewer F3
+    /// / auditor A3 — present but unreadable, e.g. a permission error)
+    /// should warn; `Absent` (the PRD #111 remote-reconnect case) and
+    /// `Present { found: true }` must both stay silent.
     #[test]
     fn hydration_drift_warning_truth_table() {
         // Present, orchestration not found -> warns, names both the
@@ -22740,27 +22900,75 @@ mod tests {
             "orchestration found in local config must stay silent"
         );
 
-        // Unparseable (fork issue #320) -> warns, names the local config
-        // file and carries the parse-error text (both folded into `path`
-        // by the `ProjectConfigError::Parse` `Display` impl) around the
-        // contract substring the e2e test asserts on.
+        // Unparseable (fork issue #320) -> warns, contract substring
+        // leading, and — fork issue #318 reviewer F2 — the toml error's
+        // own position ("line N, column M") lands close enough to the
+        // front that it clears an 80-column terminal's usable width
+        // (`status bar width` minus the 10-cell mode-chip band = 70
+        // cells), unlike the old message whose actionable half only
+        // arrived past column 144.
         let parse_warning = hydration_drift_warning(
             LocalConfigState::Unparseable {
-                path: "Failed to parse /Users/x/project/.dot-agent-deck.toml: TOML parse error"
-                    .into(),
+                reason: "line 5, column 1".into(),
             },
             "demo-orch",
             "/Users/x/project",
         )
         .unwrap();
         assert!(
-            parse_warning.contains("local .dot-agent-deck.toml could not be parsed"),
-            "warning must carry the exact contract substring, got: {parse_warning:?}"
+            parse_warning.starts_with(
+                "Warning: local .dot-agent-deck.toml could not be parsed: line 5, column 1"
+            ),
+            "warning must carry the exact contract substring leading, followed directly by \
+             the parse position (no restated 'Failed to parse' and no absolute path ahead of \
+             it), got: {parse_warning:?}"
+        );
+        let visible_at_80_cols = &parse_warning[..parse_warning.len().min(70)];
+        assert!(
+            visible_at_80_cols.contains("line 5"),
+            "the parse error's line number must survive within the first 70 visible cells \
+             (an 80-column terminal minus the 10-cell mode-chip band), got prefix: \
+             {visible_at_80_cols:?}"
+        );
+
+        // Unreadable (fork issue #318 reviewer F3 / auditor A3) -> warns
+        // too, with wording distinct from Unparseable so a permission
+        // error isn't reported as a syntax error.
+        let unreadable_warning = hydration_drift_warning(
+            LocalConfigState::Unreadable {
+                reason: "Permission denied (os error 13)".into(),
+            },
+            "demo-orch",
+            "/Users/x/project",
+        )
+        .unwrap();
+        assert!(
+            unreadable_warning.starts_with(
+                "Warning: local .dot-agent-deck.toml could not be read: Permission denied"
+            ),
+            "warning must carry the read-failure contract substring leading, got: \
+             {unreadable_warning:?}"
+        );
+    }
+
+    /// Fork issue #318 reviewer F2: pins `toml_parse_reason`'s stripping of
+    /// the redundant `"TOML parse error at "` restatement, and its fallback
+    /// to the bare message when the parser had no span to localize.
+    #[test]
+    fn toml_parse_reason_strips_redundant_prefix() {
+        // Same shape as `hydration_002`'s fixture (auditor-confirmed genuine
+        // parse failure): an unterminated basic string.
+        let with_span =
+            toml::from_str::<crate::project_config::ProjectConfig>("name = \"demo-orch")
+                .unwrap_err();
+        let reason = toml_parse_reason(&with_span);
+        assert!(
+            !reason.starts_with("TOML parse error at "),
+            "the redundant restatement must be stripped, got: {reason:?}"
         );
         assert!(
-            parse_warning.contains("/Users/x/project/.dot-agent-deck.toml")
-                && parse_warning.contains("TOML parse error"),
-            "warning must name both the file path and the parse error, got: {parse_warning:?}"
+            reason.starts_with("line "),
+            "a located error's reason should lead with its position, got: {reason:?}"
         );
     }
 
