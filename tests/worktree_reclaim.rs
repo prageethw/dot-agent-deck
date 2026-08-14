@@ -61,7 +61,25 @@ mod test_temp;
 /// A missing fixture file (no PR for this branch) still prints `[]`, same as
 /// real `gh pr list` — that is a correctly-resolved "no PR" answer, not a
 /// wrong-invocation error, and must not look like one.
+///
+/// PRD fork#298: also handles `gh api user --jq .login`, mirroring
+/// `tests/issue_claim.rs`'s own stub byte-for-byte (same branch, same
+/// `$GHSTUB_DIR/login` file, same `stub-user` fallback) — the seam a
+/// `WorktreeOwner::Human` resolution reuses from `issue_claim.rs`'s
+/// `resolve_gh_login`/`gh_current_login_argv` (the PRD's own words: "reusing
+/// issue_claim's resolution shape"), so a caller with no ownership marker
+/// resolves a login without ever depending on this machine's real `gh`
+/// session or shelling out for real.
 const GH_STUB_SCRIPT: &str = r#"#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "user" ]; then
+    if [ -f "$GHSTUB_DIR/login" ]; then
+        cat "$GHSTUB_DIR/login"
+    else
+        printf 'stub-user\n'
+    fi
+    exit 0
+fi
+
 all_args="$*"
 group="$1"
 sub="$2"
@@ -413,6 +431,17 @@ impl Fixture {
         .expect("write owner marker with creator");
     }
 
+    /// Set what the stub `gh api user --jq .login` reports from here on —
+    /// standing in for "whoever `gh` is currently authenticated as", the
+    /// same seam `tests/issue_claim.rs`'s `Fixture::set_login` already
+    /// establishes for `issue claim`'s own human-identity resolution (PRD
+    /// fork#298: a worktree with no ownership marker is expected to reuse
+    /// that exact resolution shape). Never a real `gh` session, never this
+    /// machine's actual login.
+    fn set_login(&self, login: &str) {
+        std::fs::write(self.ghstub.join("login"), format!("{login}\n")).expect("write login");
+    }
+
     /// The scratch tempdir's own root -- for fixtures that need to place a
     /// file OUTSIDE the repo/worktree tree, such as the forged admin dir
     /// below.
@@ -553,6 +582,53 @@ fn combined(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// Run `worktree list --json` and return the parsed document's `worktrees`
+/// array. Panics with the raw output on failure or malformed JSON, so a
+/// failure here is diagnosable without rerunning by hand. PRD fork#298: the
+/// `owner_kind` field these tests look for does not exist in
+/// `WorktreeReport` yet, so reading it back through `serde_json::Value`
+/// (rather than a Rust struct field) is deliberate — a missing key
+/// deserializes to `None` and fails the ASSERTION that follows, not the
+/// build, which is what a RED phase needs.
+fn list_json(fx: &Fixture) -> Vec<serde_json::Value> {
+    let out = fx.run(&["worktree", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "`worktree list --json` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON ({e}); got:\n{stdout}"));
+    doc.get("worktrees")
+        .and_then(|w| w.as_array())
+        .unwrap_or_else(|| {
+            panic!("the JSON document must carry a `worktrees` array; got:\n{stdout}")
+        })
+        .clone()
+}
+
+/// Find the entry in `entries` whose `path` contains `needle` — worktree
+/// paths are absolute tempdir paths, so a substring match on the fixture's
+/// own directory name is enough to identify the row without needing the
+/// full path.
+fn find_entry<'a>(entries: &'a [serde_json::Value], needle: &str) -> &'a serde_json::Value {
+    entries
+        .iter()
+        .find(|e| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.contains(needle))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the JSON document must include a worktree matching {needle:?}; got \
+                 entries:\n{entries:#?}"
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1648,5 +1724,262 @@ fn worktree_reclaim_035_mine_fails_loudly_when_owner_env_empty() {
         !combined(&control_out).contains("wt-someones"),
         "must never fall through to listing the fixture's worktree; got:\n{}",
         combined(&control_out)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD fork#298 — WorktreeOwner: a three-state owner (Agent / Human / Unknown),
+// not a marker-existence bool. `Ownership`/`decide` stay untouched (the PRD's
+// own constraint); these tests pin the NEW `owner_kind` field the JSON
+// document must carry, read back via `serde_json::Value` rather than a Rust
+// struct field so a field that does not exist yet fails the assertion below,
+// not the build.
+// ---------------------------------------------------------------------------
+
+/// Scenario: A worktree marked owned via the fork #166 marker format,
+/// carrying an explicit `created-by: orchestration:foo` identity, is
+/// examined by `worktree list --json`. PRD fork#298 M1.0 introduces a
+/// three-state `WorktreeOwner` and PRD M2.0 surfaces its kind alongside the
+/// existing `owner` string; a deck-created worktree must positively resolve
+/// `owner_kind: "agent"`, not merely carry an owner string with no kind
+/// attached.
+#[spec("worktree/reclaim/037")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_037_agent_owned_reports_the_agent() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-agent-owner", "feat/agent-owner");
+    fx.set_pr_state("feat/agent-owner", "OPEN");
+    fx.mark_owned_with_creator(&wt, "orchestration:foo");
+
+    let entries = list_json(&fx);
+    let entry = find_entry(&entries, "wt-agent-owner");
+
+    assert_eq!(
+        entry.get("owner_kind").and_then(|v| v.as_str()),
+        Some("agent"),
+        "a deck-created worktree whose marker carries `created-by: orchestration:foo` must \
+         resolve `owner_kind: \"agent\"` (PRD fork#298 M1.0's `WorktreeOwner::Agent`) -- this \
+         field does not exist in `WorktreeReport` today; got entry:\n{entry}"
+    );
+    assert_eq!(
+        entry.get("owner").and_then(|v| v.as_str()),
+        Some("orchestration:foo"),
+        "the agent row's existing `owner` string must still carry the exact marker identity, \
+         unchanged from today's behaviour; got entry:\n{entry}"
+    );
+}
+
+/// Scenario: An UNMARKED worktree — a hand-made `git worktree add`,
+/// CLAUDE.md rule 1's dominant real path — is examined by `worktree list
+/// --json` with the stub `gh api user` reporting login `"alice"`. PRD
+/// fork#298 M1.0 says a worktree with no marker resolves
+/// `WorktreeOwner::Human`, not `Unknown`; this must show up as
+/// `owner_kind: "human"` with a populated `owner` naming the resolved
+/// login, while `owned` stays `false` — the second half is what keeps the
+/// safety property (`039`) honest: reporting a human owner must never look
+/// like proof of deck-creation.
+#[spec("worktree/reclaim/038")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_038_human_owned_reports_a_human_not_owned_true() {
+    let fx = Fixture::new();
+    let _wt = fx.add_worktree_with_commit("wt-human-owner", "feat/human-owner");
+    fx.set_pr_state("feat/human-owner", "OPEN");
+    fx.set_login("alice");
+    // Deliberately NOT marked -- no call to `mark_owned`/`mark_owned_with_creator`.
+
+    let entries = list_json(&fx);
+    let entry = find_entry(&entries, "wt-human-owner");
+
+    assert_eq!(
+        entry.get("owner_kind").and_then(|v| v.as_str()),
+        Some("human"),
+        "an unmarked, hand-made worktree must resolve `owner_kind: \"human\"` (PRD fork#298 \
+         M1.0's `WorktreeOwner::Human`), not silently fall through as unknown -- this field \
+         does not exist in `WorktreeReport` today; got entry:\n{entry}"
+    );
+    assert!(
+        entry
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .is_some_and(|o| o.contains("alice")),
+        "the human row's `owner` string must name the resolved login (\"alice\", from the \
+         stubbed `gh api user --jq .login`) -- got entry:\n{entry}"
+    );
+    assert_eq!(
+        entry.get("owned").and_then(|v| v.as_bool()),
+        Some(false),
+        "a human-owned worktree must NOT be reported `owned: true` -- `owned` answers a \
+         DIFFERENT question (may a bare `reclaim` remove this with no prompt?) than \
+         `owner_kind` does (who does this belong to?); conflating them would let a \
+         human-created worktree be silently removed by a bare `reclaim`, reopening fork #144's \
+         P1; got entry:\n{entry}"
+    );
+}
+
+/// Scenario: THE SAFETY PIN. A MERGED, clean, human-owned (unmarked,
+/// hand-made) worktree must still resolve `Verdict::Ask` under a bare
+/// `reclaim` (no `--yes`), never `Verdict::Remove` — fork #144's P1 (a
+/// worktree the deck did not create being silently deleted), which fork
+/// #166 explicitly refused to reopen, reopens for real if `owned` (removal
+/// authority) is ever derived from PRD fork#298's NEW `WorktreeOwner::Human`
+/// reporting instead of staying keyed strictly on the existing
+/// marker-presence `Ownership` bit. Pins both halves in one test: `reclaim`
+/// (no `--yes`) must leave the worktree directory in place, AND the SAME
+/// row in `worktree list --json` must carry `verdict: "ask"` together with
+/// a POSITIVELY resolved `owner_kind: "human"` (not merely an absent
+/// owner) and `owned: false` — so a future change that starts deriving
+/// removability from `WorktreeOwner` fails this test loudly instead of
+/// silently reopening fork #144's P1.
+#[spec("worktree/reclaim/039")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_039_human_owned_merged_clean_is_still_asked_never_removed() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-human-safety", "feat/human-safety");
+    fx.set_pr_state("feat/human-safety", "MERGED");
+    fx.set_login("carol");
+    // Deliberately NOT marked -- hand-made, rule 1's dominant real path.
+
+    // The removal half: no `--yes`, the worktree must survive.
+    let reclaim_out = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        wt.exists(),
+        "a human-owned worktree must never be removed by a bare `reclaim` -- {} is gone; this \
+         is fork #144's P1 reopened; out={}",
+        wt.display(),
+        combined(&reclaim_out)
+    );
+
+    // The reporting half: `owner_kind` must positively say `human`, in the
+    // SAME row that also carries `verdict: "ask"` -- proving the two
+    // questions (who owns this? / may a bare reclaim remove it?) are
+    // resolved independently rather than one bit doing double duty.
+    let entries = list_json(&fx);
+    let entry = find_entry(&entries, "wt-human-safety");
+
+    assert_eq!(
+        entry.get("verdict").and_then(|v| v.as_str()),
+        Some("ask"),
+        "a merged, clean, human-owned worktree's verdict must be \"ask\", never \"remove\"; got \
+         entry:\n{entry}"
+    );
+    assert_eq!(
+        entry.get("owner_kind").and_then(|v| v.as_str()),
+        Some("human"),
+        "the SAME row must positively resolve `owner_kind: \"human\"` -- this field does not \
+         exist in `WorktreeReport` today; a merely-absent owner is not proof the safety \
+         property will hold once `WorktreeOwner` exists; got entry:\n{entry}"
+    );
+    assert_eq!(
+        entry.get("owned").and_then(|v| v.as_bool()),
+        Some(false),
+        "reporting a human owner must never flip `owned` to true -- that field alone decides \
+         bare-`reclaim` removal authority, and widening it is exactly how fork #144's P1 would \
+         reopen; got entry:\n{entry}"
+    );
+}
+
+/// Scenario: One repo with two worktrees examined together by a single
+/// `worktree list --json` call — one deck-created and marked `created-by:
+/// orchestration:doc-carrier`, one hand-made and unmarked with the stub `gh
+/// api user` reporting login `"dana"`. `WorktreeReport.owner:
+/// Option<String>` has carried a per-row identity string since fork #166
+/// and is only OMITTED from JSON via `skip_serializing_if =
+/// "Option::is_none"` when `None` — which is why the document read as "no
+/// owner string anywhere" even though the field already existed. PRD
+/// fork#298 M2.0 adds `owner_kind` beside it; this pins that BOTH rows
+/// carry a non-empty `owner` string AND a positively-resolved `owner_kind`
+/// in the same document, not merely that the document is well-formed.
+#[spec("worktree/reclaim/040")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_040_json_document_carries_owner_and_kind_for_both_rows() {
+    let fx = Fixture::new();
+    let wt_agent = fx.add_worktree_with_commit("wt-doc-agent", "feat/doc-agent");
+    fx.set_pr_state("feat/doc-agent", "OPEN");
+    fx.mark_owned_with_creator(&wt_agent, "orchestration:doc-carrier");
+
+    let _wt_human = fx.add_worktree_with_commit("wt-doc-human", "feat/doc-human");
+    fx.set_pr_state("feat/doc-human", "OPEN");
+    fx.set_login("dana");
+    // Deliberately NOT marked.
+
+    let entries = list_json(&fx);
+    let agent_entry = find_entry(&entries, "wt-doc-agent");
+    let human_entry = find_entry(&entries, "wt-doc-human");
+
+    assert_eq!(
+        agent_entry.get("owner_kind").and_then(|v| v.as_str()),
+        Some("agent"),
+        "the agent row must carry `owner_kind: \"agent\"` -- this field does not exist in \
+         `WorktreeReport` today; got entry:\n{agent_entry}"
+    );
+    assert_eq!(
+        agent_entry.get("owner").and_then(|v| v.as_str()),
+        Some("orchestration:doc-carrier"),
+        "the agent row's `owner` must carry the exact marker identity; got entry:\n{agent_entry}"
+    );
+
+    assert_eq!(
+        human_entry.get("owner_kind").and_then(|v| v.as_str()),
+        Some("human"),
+        "the human row must carry `owner_kind: \"human\"` -- this field does not exist in \
+         `WorktreeReport` today; got entry:\n{human_entry}"
+    );
+    assert!(
+        human_entry
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .is_some_and(|o| o.contains("dana")),
+        "the human row's `owner` must name the resolved login (\"dana\"); got \
+         entry:\n{human_entry}"
+    );
+}
+
+/// Scenario: A pre-fork#166 LEGACY marker — the bare `"deck\n"` content
+/// `mark_worktree_owned` wrote before identity tracking existed, with no
+/// `created-by:` line — resolves `owned: true` (unchanged: the deck still
+/// proved it created this worktree) with `owner` absent/`None` (unchanged:
+/// there is no identity to report). Fork issue #231 names this exact state
+/// as the still-silent mirror of #221's disagreement warning. PRD fork#298
+/// M1.0 closes it: this must resolve `owner_kind: "unknown"`, never
+/// `"agent"` (there is no identity to attribute it to -- claiming one would
+/// be a fabrication) and never `"human"` (the marker DOES prove deck
+/// creation, so reporting it as human-owned would understate what is
+/// actually known and, per the safety property `039` pins, risk being read
+/// as non-removable when it in fact still is).
+#[spec("worktree/reclaim/041")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_041_legacy_marker_resolves_unknown_not_human_or_agent() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-legacy-marker", "feat/legacy-marker");
+    fx.set_pr_state("feat/legacy-marker", "OPEN");
+    fx.mark_owned(&wt); // bare "deck\n" -- no `created-by:` line.
+
+    let entries = list_json(&fx);
+    let entry = find_entry(&entries, "wt-legacy-marker");
+
+    assert_eq!(
+        entry.get("owned").and_then(|v| v.as_bool()),
+        Some(true),
+        "a legacy marker still proves deck-creation -- `owned` must remain true, unchanged by \
+         PRD fork#298; got entry:\n{entry}"
+    );
+    assert_eq!(
+        entry.get("owner").and_then(|v| v.as_str()),
+        None,
+        "a legacy marker carries no `created-by:` line -- `owner` must remain absent/`None`, \
+         unchanged; got entry:\n{entry}"
+    );
+    assert_eq!(
+        entry.get("owner_kind").and_then(|v| v.as_str()),
+        Some("unknown"),
+        "a legacy marker must resolve `owner_kind: \"unknown\"` -- not \"agent\" (no identity \
+         to attribute it to) and not \"human\" (the marker DOES prove deck creation) -- this \
+         field does not exist in `WorktreeReport` today; fork issue #231's still-silent mirror \
+         case must resolve to something stated, never a blank; got entry:\n{entry}"
     );
 }
