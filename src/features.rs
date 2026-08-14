@@ -154,6 +154,22 @@ pub fn init_and_watch(project_dir: &std::path::Path) {
             if resolved.experimental { "ON" } else { "OFF" },
             path.display()
         );
+        // Fork issue #303: when the ancestor walk in `features_config_path()`
+        // found no `.dot-agent-deck.toml` anywhere above the process cwd, the
+        // flag silently defaults to OFF with no other signal that anything
+        // went looking. Only diagnose this when no explicit override is in
+        // play — an operator-supplied `DOT_AGENT_DECK_FEATURES_CONFIG` that
+        // points at a missing file is a different problem.
+        if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_err() && !path.is_file() {
+            tracing::warn!(
+                "no {} found in {} or any ancestor directory; experimental \
+                 flags default to OFF",
+                crate::project_config::CONFIG_FILE_NAME,
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .display()
+            );
+        }
         spawn_watcher(path);
     });
 }
