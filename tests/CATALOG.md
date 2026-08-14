@@ -3215,7 +3215,7 @@ without depending on the config struct API.
 ##### orchestration/lock/008 — On a real locked orchestration tab the orchestrator's own input still reaches its PTY while a worker's does not, and `Ctrl+d`,`Ctrl+e` reverses that.
 - **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
 - **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
-- **Asserts:** a sentinel typed into the focused orchestrator pane echoes on the grid even though the deck is LOCKED by default; after jumping to the non-orchestrator `worker` role, a second sentinel does NOT appear within 2s; after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a third sentinel typed into the still-focused worker pane echoes normally.
+- **Asserts:** a sentinel typed into the focused orchestrator pane echoes on the grid even though the deck is LOCKED by default; after jumping to the non-orchestrator `worker` role, a second sentinel does NOT appear within 2s; the dropped keystroke's status message reads the corrected `Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here` hint (issue #302 defect 2 — the old wording stopped one keypress short, naming only `Ctrl+d then Ctrl+e to unlock`); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a third sentinel typed into the still-focused worker pane echoes normally.
 - **Does not assert:** what a real agent does with the forwarded bytes (`orchestration/lock/012`); the `WaitingForInput` carve-out (`orchestration/lock/011`).
 - **Platform coverage:** mac+linux.
 
@@ -3259,6 +3259,20 @@ without depending on the config struct API.
 - **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Same `DOT_AGENT_DECK_FEATURES_CONFIG`-pointed-at-a-missing-path mechanism as `orchestration/lock/015`.
 - **Asserts:** `Ctrl+d` into command mode then `Ctrl+e` produces the deck's `Pane entry: unlocked` report. `Ctrl+e`'s binding resolution is unconditional (fork #346's graduation), so it still resolves with no config present.
 - **Does not assert:** the forwarding gate itself (`orchestration/lock/015`); the caret-echo proof that `0x05` reaches a focused pane's PTY in `PaneInput` mode (`orchestration/lock/009`, unaffected by this flag either way since the orchestrator pane is never gated).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/015 — A bracketed paste aimed at a locked worker pane is dropped exactly like an ordinary keystroke, and the drop leaves no side effects behind (issue #302 defect 1).
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** a bracketed paste (`\x1b[200~…\x1b[201~`) aimed at the focused non-orchestrator worker pane does NOT reach its PTY while LOCKED — `Event::Paste` previously called `embedded.write_raw_bytes` directly, bypassing `gate_pane_input_key` entirely. Two ordering details a careless fix gets wrong are pinned separately: after building real scrollback in the worker pane, re-locking, and scrolling back via the mouse wheel (the one scroll door that survives a `PaneInput` re-entry), a further dropped paste does NOT yank the view back to live output (`reset_scrollback` must not fire on a drop); and, in one burst, a dropped paste immediately followed by an unlock-and-forward of an Enter-bearing keystroke reaches the grid in under 100ms, proving the drop left no `last_pane_keystroke_at` stamp to trip the 150ms `SUBMIT_DEBOUNCE`.
+- **Does not assert:** what a real agent does with a delivered paste (no real-agent variant exists for paste, unlike `orchestration/lock/012`'s keystroke coverage); the `WaitingForInput` carve-out for a paste (not requested by issue #302).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/016 — A persistent LOCKED/UNLOCKED chip renders immediately right of the mode chip on the bottom bar in both lock states, and `Ctrl+e` is documented in the help overlay (issue #302 defect 3).
+- **Layer:** L2 PTY-attached — NOT the L1 widget snapshot originally requested. No existing `_to_buffer` seam threads Orchestration-tab-and-lock context into `render_bottom_bar` (every current seam builds a bare `UiState` with no such parameter, and `UiState`/`render_bottom_bar` are private to `src/ui.rs`); adding that parameter is itself the production change this test exists to drive, which is out of a tester's reach. Consequently this pins TEXT CONTENT only — it cannot verify the task's styling requirement (reversed+bold locked vs dim unlocked), which remains open for an L1 snapshot once the seam exists.
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** in `PaneInput` on a real orchestration tab, the text immediately following the ` TYPING ` mode chip on the bottom bar reads ` LOCKED ` while the command-entry lock is engaged (the default); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, the same position reads ` UNLOCKED ` — both states are asserted, not just the locked default, so an indicator that only ever renders one state cannot pass. The `?` help overlay documents `Ctrl+e`.
+- **Does not assert:** cell styling (reversed+bold / dim) — text-only via `snapshot_grid()`; `bottom_bar_rows`' height-budget accounting for the new chip (left for a follow-up L1 test once the render seam exists).
 - **Platform coverage:** mac+linux.
 
 #### orchestration/focus
