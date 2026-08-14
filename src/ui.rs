@@ -4913,6 +4913,55 @@ fn process_pending_orchestration_surfaces(
     surface_one_orchestration(state, embedded, tab_manager, surface, ui);
 }
 
+/// PRD 236: surface every daemon-kept dispatched worktree queued by the event
+/// subscriber into [`AppState::pending_kept_worktrees`] — a worktree the
+/// close-time cleanup left in place (dirty, a status probe that itself
+/// failed, or a removal that itself failed) rather than removing. Drains the
+/// WHOLE queue every frame (unlike [`process_pending_orchestration_surfaces`],
+/// each entry here is just a string push into `ui.session_warnings` — no
+/// bounded daemon round-trip, so there is no per-frame cost to cap).
+fn process_pending_kept_worktrees(state: &SharedState, ui: &mut UiState) {
+    // S2: cheap READ-lock peek, mirroring `process_pending_orchestration_surfaces`
+    // four lines up (PRD 236 review N1) — the steady-state idle cost is one
+    // read lock + is_empty, not the exclusive write lock the drain needs,
+    // taken every frame just to find the queue empty and contending with the
+    // event subscriber's own writes into this same state.
+    if state.blocking_read().pending_kept_worktrees.is_empty() {
+        return;
+    }
+    let notices = {
+        let mut st = state.blocking_write();
+        if st.pending_kept_worktrees.is_empty() {
+            return; // a concurrent path drained it between the peek and here
+        }
+        std::mem::take(&mut st.pending_kept_worktrees)
+    };
+    let now = std::time::Instant::now();
+    for notice in notices {
+        let reason = match notice.reason {
+            crate::event::KeptReason::Dirty => {
+                "it has uncommitted or untracked changes".to_string()
+            }
+            crate::event::KeptReason::ProbeError => {
+                "its status could not be checked (kept fail-safe)".to_string()
+            }
+            crate::event::KeptReason::RemovalFailed => match &notice.error {
+                Some(error) => format!("removing it failed: {error}"),
+                None => "removing it failed".to_string(),
+            },
+        };
+        let message = format!("Worktree kept at {}: {reason}", notice.path);
+        // PRD 236 review (item 3): visibility is the entire justification for
+        // keeping instead of force-removing — the ONLY prior reader of
+        // `session_warnings` is an `eprintln!` loop after `ratatui::restore()`
+        // (i.e. on quit), so without this the notice never reaches the user
+        // at the moment it actually happens. `status_message` is immediate;
+        // `session_warnings` still carries it through to exit.
+        ui.status_message = Some((message.clone(), now));
+        ui.session_warnings.push(message);
+    }
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -12682,6 +12731,9 @@ pub fn run_tui(
         // mid-session (issue dispatch). Done before the snapshot clone + tab
         // derivation below so a freshly-surfaced tab paints this same frame.
         process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager, &mut ui);
+        // PRD 236: surface any dispatched worktree the daemon kept on tab
+        // close instead of removing, naming where it survives.
+        process_pending_kept_worktrees(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -20760,7 +20812,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::event::{AgentEvent, AgentType, EventType, KeptReason, WorktreeKeptNotice};
     use crate::orchestrator_context::build_orchestrator_context;
     use crate::project_config::OrchestrationRoleConfig;
     use chrono::{Duration, Utc};
@@ -27683,6 +27735,52 @@ mod tests {
         // Reset immediately so a later test on this worker thread never
         // observes a leaked non-Default stage from this one.
         ACTIVE_SPLIT_STAGE.with(|c| c.set(SplitStage::Default));
+    }
+
+    /// Scenario: Queue a `WorktreeKeptNotice` (as the event subscriber does on
+    /// a daemon `BroadcastMsg::WorktreeKept`) directly into `AppState`, then
+    /// call `process_pending_kept_worktrees` — the render-loop step that
+    /// drains it — and check what lands in `ui.session_warnings`. Pins that
+    /// the delivered message names the retained worktree's path, not just
+    /// that "a worktree was kept" somewhere.
+    #[spec("dispatch/close/002")]
+    #[test]
+    fn dispatch_close_002_kept_worktree_notice_names_the_retained_path() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let mut ui = default_ui();
+
+        // Nothing queued yet: draining must be a no-op, not a panic on an
+        // empty queue.
+        process_pending_kept_worktrees(&state, &mut ui);
+        assert!(
+            ui.session_warnings.is_empty(),
+            "an empty pending-kept-worktrees queue must not push a warning; got {:?}",
+            ui.session_warnings
+        );
+
+        let kept_path = "/workspace/acme-widgets/.worktrees/issue-42";
+        state
+            .blocking_write()
+            .queue_kept_worktree(WorktreeKeptNotice {
+                path: kept_path.to_string(),
+                reason: KeptReason::Dirty,
+                error: None,
+            });
+
+        process_pending_kept_worktrees(&state, &mut ui);
+
+        assert!(
+            ui.session_warnings.iter().any(|w| w.contains(kept_path)),
+            "a kept-worktree notice must reach the user naming the retained \
+             path ({kept_path}) — a message that only says \"a worktree was \
+             kept\" without saying where is not the milestone; got {:?}",
+            ui.session_warnings
+        );
+        assert!(
+            state.blocking_read().pending_kept_worktrees.is_empty(),
+            "process_pending_kept_worktrees must drain the queue it reads, \
+             not leave the notice to be delivered again next frame"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -828,6 +828,77 @@ pub enum BroadcastMsg {
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
     #[serde(rename = "orchestration_surface")]
     OrchestrationSurface(OrchestrationSurface),
+    /// PRD 236: a dispatched worktree the daemon KEPT on tab close instead of
+    /// removing (uncommitted work, or a status probe that itself failed) — see
+    /// [`crate::issue_dispatch_run::RemoveOutcome`]. The close handler runs
+    /// detached from the close response (`daemon_protocol.rs`), and the pane
+    /// that triggered it may already be gone by the time the outcome is known,
+    /// so this is a deck-level broadcast rather than a reply riding the close
+    /// response itself — every attached TUI gets it, not just the one that
+    /// closed the tab.
+    ///
+    /// Adding this variant changes the `KIND_EVENT` payload schema the same way
+    /// [`BroadcastMsg::OrchestrationSurface`] did, so it too bumps
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
+    #[serde(rename = "worktree_kept")]
+    WorktreeKept(WorktreeKeptNotice),
+}
+
+/// PRD 236: payload for [`BroadcastMsg::WorktreeKept`] — a dispatched worktree
+/// the daemon left on disk instead of removing on tab close, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeKeptNotice {
+    /// Absolute path of the retained worktree, exactly as recorded in the
+    /// daemon's [`crate::issue_dispatch_run::WorktreeRegistry`]. Named
+    /// explicitly rather than only logged server-side, so the user knows where
+    /// to go recover the work.
+    pub path: String,
+    /// Why the worktree was kept rather than removed.
+    pub reason: KeptReason,
+    /// The error text `git worktree remove` failed with — set exactly when
+    /// `reason == KeptReason::RemovalFailed`, `None` otherwise. A separate
+    /// field rather than a payload on the `RemovalFailed` variant itself
+    /// (PRD 236 review): `#[serde(other)]`'s forward-compat catch-all (on
+    /// [`KeptReason::ProbeError`]) is only valid on an externally-tagged enum
+    /// whose variants are ALL unit — `serde_derive` rejects the combination
+    /// otherwise — so keeping every `KeptReason` variant field-less is what
+    /// lets the catch-all exist at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Why [`remove_worktree`](crate::issue_dispatch_run::remove_worktree) left a
+/// worktree in place instead of removing it — either
+/// [`RemovalPolicy::KeepIfDirty`](crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty)
+/// chose not to attempt removal, or removal was attempted and failed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeptReason {
+    /// `git status --porcelain` reported uncommitted or untracked changes.
+    Dirty,
+    /// `git worktree remove` itself was attempted and failed (non-zero exit
+    /// or spawn error) — the error text rides [`WorktreeKeptNotice::error`],
+    /// not this variant, so `KeptReason` can stay field-less (see that
+    /// field's doc for why). Previously this outcome was reported as
+    /// [`crate::issue_dispatch_run::RemoveOutcome::Removed`] and never
+    /// reached the wire at all (PRD 236 review, reproduced against a locked
+    /// worktree on git 2.55.0).
+    RemovalFailed,
+    /// The `git status --porcelain` probe itself failed (not a valid worktree,
+    /// `git` missing, etc.) — kept fail-safe: unknown is treated as dirty
+    /// rather than assumed clean.
+    ///
+    /// PRD 236 review: also the forward-compat catch-all (matches
+    /// `AgentType::None` / `EventType::Unknown`'s retrofit) for any future
+    /// wire variant this build doesn't recognize — the conservative,
+    /// already-fail-safe outcome, so an unrecognized reason never fails the
+    /// whole `WorktreeKeptNotice` decode. Deserialize-only in practice.
+    /// `#[serde(other)]` must be the LAST variant (serde_derive requirement),
+    /// which is also why it sits below `RemovalFailed` rather than in the
+    /// declaration order the wire's `PROTOCOL_VERSION 7 → 8` bump introduced
+    /// them.
+    #[serde(other)]
+    ProbeError,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,
@@ -919,6 +990,7 @@ pub struct WorkDoneSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[test]
     fn parse_full_event() {
@@ -1473,6 +1545,60 @@ mod tests {
         assert!(s.roles[0].is_start_role);
         assert_eq!(s.roles[1].pane_id, "sched-github-issues-0-r1");
         assert_eq!(s.roles[1].role_index, 1);
+    }
+
+    /// Scenario: Build a `BroadcastMsg::WorktreeKept` carrying a `Dirty`
+    /// reason and no error text, serialize it to JSON, check the wire tag
+    /// and shape (including that the absent `error` is omitted, not sent as
+    /// `null`), then deserialize it back and confirm every field survives.
+    /// Repeats the check for a `RemovalFailed` reason carrying the `error`
+    /// field, since that's the one case where it's populated.
+    #[spec("worktree/reclaim/047")]
+    #[test]
+    fn reclaim_047_worktree_kept_broadcast_round_trips() {
+        let msg = BroadcastMsg::WorktreeKept(WorktreeKeptNotice {
+            path: "/work/github-issues/.worktrees/issue-7".into(),
+            reason: KeptReason::Dirty,
+            error: None,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "worktree_kept");
+        assert_eq!(v["path"], "/work/github-issues/.worktrees/issue-7");
+        assert_eq!(v["reason"], "dirty");
+        assert!(
+            v.as_object().unwrap().get("error").is_none(),
+            "a None error must be omitted from the wire payload, not sent as null"
+        );
+
+        let back: BroadcastMsg = serde_json::from_str(&json).unwrap();
+        let BroadcastMsg::WorktreeKept(notice) = back else {
+            panic!("expected a BroadcastMsg::WorktreeKept");
+        };
+        assert_eq!(notice.path, "/work/github-issues/.worktrees/issue-7");
+        assert_eq!(notice.reason, KeptReason::Dirty);
+        assert_eq!(notice.error, None);
+
+        // `RemovalFailed` is the one reason that populates `error` -- round-trip it too.
+        let msg = BroadcastMsg::WorktreeKept(WorktreeKeptNotice {
+            path: "/work/github-issues/.worktrees/issue-9".into(),
+            reason: KeptReason::RemovalFailed,
+            error: Some("git worktree remove failed (exit 128)".into()),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["reason"], "removal_failed");
+        assert_eq!(v["error"], "git worktree remove failed (exit 128)");
+
+        let back: BroadcastMsg = serde_json::from_str(&json).unwrap();
+        let BroadcastMsg::WorktreeKept(notice) = back else {
+            panic!("expected a BroadcastMsg::WorktreeKept");
+        };
+        assert_eq!(notice.reason, KeptReason::RemovalFailed);
+        assert_eq!(
+            notice.error,
+            Some("git worktree remove failed (exit 128)".to_string())
+        );
     }
 
     // PRD #201 M1.2 (test-plan row 3): pin the lifecycle-state → EventType

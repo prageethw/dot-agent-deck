@@ -257,7 +257,16 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// recording byte-identical `created-by:` ownership markers, the exact
 /// fork #74 condition this PRD exists to prevent (fork#192 audit F2). See
 /// `changelog.d/192.breaking.md` for the corrected mixed-version write-up.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// PRD 236 bumped 7 → 8: the `KIND_EVENT` payload
+/// ([`crate::event::BroadcastMsg`]) gained a new
+/// [`crate::event::BroadcastMsg::WorktreeKept`] variant (a new `kind` tag) so
+/// the daemon can tell an attached TUI that a dispatched worktree was kept
+/// rather than removed on tab close, and where. Same class of change as
+/// PRD #120's `OrchestrationSurface` bump above: an older client receiving
+/// the new tag would fail to deserialize the frame, so this is a
+/// non-forward-compatible payload-schema change, not an additive field.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -1584,11 +1593,12 @@ async fn handle_connection(
                     // preserved) and drop the registry entry. The child is already
                     // reaped, so the worktree is no longer a live cwd. No-op for
                     // ordinary agents and for earlier sibling-role closes.
-                    // PRD #220: the removal POLICY travels with the registry
-                    // entry, because this handler serves both producers and sees
-                    // only a path — issue-dispatch needs the force removal its
-                    // slot-reclaim model depends on, while a PRD #220 dispatch
-                    // sibling must keep uncommitted work. See `RemovalPolicy`.
+                    // PRD #220 / PRD 236: the removal POLICY travels with the
+                    // registry entry, because this handler serves both
+                    // producers and sees only a path. Both now record
+                    // `KeepIfDirty` (PRD 236 unified the policy — see
+                    // `RemovalPolicy`'s doc comment), so this call can come
+                    // back `Kept` for either producer.
                     //
                     // Cleanup runs DETACHED, and the close is answered without
                     // waiting for it. The agent is already stopped by this point,
@@ -1601,9 +1611,25 @@ async fn handle_connection(
                     // retained the pane "for retry", and the user saw a card that
                     // would not go away even though its agent was gone
                     // (`dispatch/close/001`).
+                    //
+                    // PRD 236: because cleanup is detached, the pane that
+                    // triggered it may already be gone by the time the outcome
+                    // is known — a pane-scoped reply would reach nobody. So a
+                    // `Kept` OR `RemoveFailed` outcome is broadcast deck-wide
+                    // (`event_tx`, the same channel `OrchestrationSurface`
+                    // uses) rather than riding the close response, and every
+                    // attached TUI — not just the one that closed the tab —
+                    // learns where the work survives. `RemoveFailed` rides
+                    // the same `WorktreeKept` broadcast, folded into
+                    // `KeptReason::RemovalFailed`, because to the user both
+                    // outcomes look identical: the tree is still on disk and
+                    // the slot is still claimed (PRD 236 review — a failed
+                    // removal used to be reported as `Removed`, so nothing
+                    // was ever sent and nothing ever retried it).
                     if let Some(worktree) = dispatched_worktree {
                         let registry = registry.clone();
                         let worktree_registry = worktree_registry.clone();
+                        let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             if !crate::issue_dispatch_run::worktree_still_in_use(
                                 &registry.agent_records(),
@@ -1612,12 +1638,40 @@ async fn handle_connection(
                                 &worktree_registry,
                                 &worktree,
                             ) {
-                                crate::issue_dispatch_run::remove_worktree(
+                                let outcome = crate::issue_dispatch_run::remove_worktree(
                                     &worktree,
                                     &entry.clone_dir,
                                     entry.policy,
                                 )
                                 .await;
+                                // PRD 236 review: a failed removal must reach
+                                // the user exactly like a `Kept` does — the
+                                // tab-close response has already gone out
+                                // (cleanup is detached, see above), and the
+                                // registry entry is already dropped, so a
+                                // failed removal that only logs and returns
+                                // `Removed` leaves the tree on disk with no
+                                // client-visible trace and nothing to retry.
+                                let reason_and_error = match outcome {
+                                    crate::issue_dispatch_run::RemoveOutcome::Kept(reason) => {
+                                        Some((reason, None))
+                                    }
+                                    crate::issue_dispatch_run::RemoveOutcome::RemoveFailed(
+                                        error,
+                                    ) => {
+                                        Some((crate::event::KeptReason::RemovalFailed, Some(error)))
+                                    }
+                                    crate::issue_dispatch_run::RemoveOutcome::Removed => None,
+                                };
+                                if let Some((reason, error)) = reason_and_error {
+                                    let _ = event_tx.send(BroadcastMsg::WorktreeKept(
+                                        crate::event::WorktreeKeptNotice {
+                                            path: worktree.to_string_lossy().to_string(),
+                                            reason,
+                                            error,
+                                        },
+                                    ));
+                                }
                             }
                         });
                     }

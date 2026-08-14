@@ -951,6 +951,48 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the agent or human kinds (covered by `037`/`038`); `--mine`'s handling of a legacy-marked worktree (unaffected — `is_mine` reads `owned`/`owner`, neither of which changes here).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/042 — `remove_worktree` returns an outcome distinguishing WHY a tree was kept, instead of the `()` it used to return, which discarded the reason entirely (PRD 236 M1.1, GREEN).
+- **Layer:** pure-data unit (`tokio::test`, `dot_agent_deck::issue_dispatch_run::remove_worktree` called directly against a real local git clone + worktree, no CLI subprocess, no `gh`).
+- **Agent:** none.
+- **Asserts:** a dirty tree under `RemovalPolicy::KeepIfDirty` survives the call; AND the call's own return value equals `RemoveOutcome::Kept(KeptReason::Dirty)` exactly (not merely "not `()`"), since the production function now returns a typed outcome and the daemon's close handler has something specific to hand back to the TUI.
+- **Does not assert:** the removed-clean and probe-error branches (covered by `043`); the detached-spawn boundary (covered by `044`); the `RemoveFailed` branch (removal itself failing — not exercised by these local-fixture tests, since the fixtures always produce a git worktree `git worktree remove` can actually remove).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/043 — `remove_worktree`'s outcome also distinguishes "removed" (clean tree) from "kept, unknown" (the `git status` probe itself failed) — not just "kept, dirty" (PRD 236 M1.1, GREEN).
+- **Layer:** pure-data unit (as `042`), one clean worktree removed by the call and one non-git directory that makes the internal `git status --porcelain` probe fail outright.
+- **Agent:** none.
+- **Asserts:** a CLEAN tree under `KeepIfDirty` is actually removed from disk, and the call's return value equals `RemoveOutcome::Removed` exactly; a worktree path whose status probe errors is left in place — the fail-safe — and its return value equals `RemoveOutcome::Kept(KeptReason::ProbeError)` exactly.
+- **Does not assert:** the kept-because-dirty branch (covered by `042`); the detached-spawn boundary (covered by `044`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/044 — The close path's detached `tokio::spawn` (mirroring `daemon_protocol.rs`'s shape) has a typed outcome to propagate: joining a task built the same way `remove_worktree(...).await` ends on now yields `RemoveOutcome::Kept(KeptReason::Dirty)`, not the `()` it used to (PRD 236 M1.1, GREEN).
+- **Layer:** pure-data unit (as `042`), a `tokio::spawn` mirroring the close handler's bare `remove_worktree(...).await` shape, joined via its own `JoinHandle`.
+- **Agent:** none.
+- **Asserts:** the dirty tree survives the detached task; the joined result equals `RemoveOutcome::Kept(KeptReason::Dirty)` exactly.
+- **Does not assert:** the daemon's real socket/attach-response wiring, or that `daemon_protocol.rs` itself actually broadcasts the outcome (out of reach for a pure-data unit test — this test only mirrors the spawn shape); the removed/kept-unknown branches (covered by `042`/`043`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/045 — The #120 issue-dispatch producer (`run_issue_dispatch`) records `RemovalPolicy::KeepIfDirty` for its per-issue worktree, like PRD #220's own dispatch does — the policies unified, no longer `RemovalPolicy::Force` — proven both as the recorded enum and as actual close-time survival (PRD 236 M2, GREEN).
+- **Layer:** pure-data unit — the real `run_issue_dispatch` called in-process (no daemon, no attach socket) against a local git clone/origin and a minimal stub `gh` on `PATH`, with `cat` as the dispatched agent (`detach_delivery = true`, so this returns promptly rather than paying the ~30s readiness-wait cost `dispatch.rs`'s own e2e-gated spawn test documents).
+- **Agent:** one real `cat` PTY as the dispatched single agent (alive on stdin, no LLM tokens) — required because `record_worktree`'s call site sits after a real spawn in `dispatch_one_issue`.
+- **Asserts:** after a successful dispatch of issue #7, the `WorktreeRegistry` holds an entry for its worktree; dirtying that worktree and calling the real `remove_worktree` under the entry's OWN recorded policy leaves the directory in place (the previous, pre-unification `Force` policy would instead have destroyed it); the recorded policy equals `RemovalPolicy::KeepIfDirty`.
+- **Does not assert:** the claim/label/comment writes `dispatch_one_issue` makes afterward (best-effort, irrelevant to the policy recorded); the daemon-hosted end-to-end flow (covered by the `scheduler/dispatch/*` e2e family).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/046 — THE REGRESSION GUARD. A kept, dirty #120 worktree must still read as "already claimed" to `dispatch_decision` (the exact safety property the shipped code used to cite as its reason for forcing), AND the slot must not be a permanent dead end: the `worktree reclaim` path must see it, and once the operator resolves the dirtiness and its PR merges, must be able to remove it and free the slot (PRD 236, GREEN — M2 has unified the policy).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`) for the reclaim-path half, plus a direct pure call into `dot_agent_deck::issue_dispatch::dispatch_decision` for the idempotency half — one fixture, two assertions that must BOTH hold.
+- **Agent:** none.
+- **Asserts:** `dispatch_decision(true, false, false)` is `Skip` (a present worktree is always already-claimed, regardless of which policy created/kept it); a dirty, deck-marked, #120-style worktree is visible to `worktree list --json` (`owned: true`); after the operator cleans the dirty content and the PR merges, a bare `worktree reclaim` genuinely removes it, freeing the slot for a future fire.
+- **Does not assert:** that reclaim can remove a STILL-dirty tree (it never can, by `003`'s own regression guard — recovery requires resolving the dirtiness first, same as any other kept worktree).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/047 — `BroadcastMsg::WorktreeKept` round-trips through the exact `KIND_EVENT` wire the daemon forwards, tagged `worktree_kept` so it's distinguishable from `event`/`orchestration_surface` (the reason `PROTOCOL_VERSION` bumped), and `WorktreeKeptNotice.error` (populated for `KeptReason::RemovalFailed`, the field the error text rides on since `KeptReason` itself must stay field-less for its `#[serde(other)]` catch-all to compile) survives the round trip too (PRD 236 review — the wire path had no test on this branch until now).
+- **Layer:** pure-data unit (`src/event.rs`'s own `#[cfg(test)] mod tests`), serializing/deserializing `BroadcastMsg` directly via `serde_json` — no daemon, no socket, mirrors `orchestration_surface_broadcast_round_trips` immediately above it in the same file.
+- **Agent:** none.
+- **Asserts:** a `WorktreeKept(WorktreeKeptNotice { reason: KeptReason::Dirty, error: None })` serializes with `"kind":"worktree_kept"` and the expected `path`/`reason` fields, omits `error` from the wire entirely (`skip_serializing_if`) rather than sending `null`, and deserializes back to an equal value; a second message with `reason: KeptReason::RemovalFailed, error: Some(..)` also round-trips, including the error string.
+- **Does not assert:** that the daemon's close handler (`daemon_protocol.rs`) actually sends this broadcast, or that `apply_broadcast`/`queue_kept_worktree` (`reconnect.rs`/`state.rs`) route it into `AppState` — those remain covered only by `dispatch/close/002`'s last-hop test and by reading the source, not by an automated test on this branch.
+- **Platform coverage:** mac+linux.
+
 #### issue/claim
 
 Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's WORKTREE — its absolute path plus its git branch (CLAUDE.md rule 23) — never a `DOT_AGENT_DECK_PANE_ID` value (round 2, dropped: those ids recycle across a daemon restart, fork #160/#163/#166) and never the worktree ownership marker (round 1, dropped: the marker is almost never present under CLAUDE.md rule 1's mandated hand-made `git worktree add`). Both the path and the branch are derivable straight from `git`, so no marker is required at all — the marker, when present, supplies human-readable DECORATION only and is never part of the compared identity. A human claiming outside any worktree still resolves as `human:<login>@<host>` — that half is unchanged since round 1. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 3's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still pane-id-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
@@ -3282,6 +3324,14 @@ without depending on the config struct API.
 - **Why it exists:** a user reported closing a dispatched agent leaving its card behind. It reproduced THREE independent defects, and the failure message distinguishes the first two by whether the daemon still holds the agent: (a) a daemon-spawned card has no local pane until focused, so `close_pane` returned `Pane <id> not found`, the PRD #92 F4 policy preserved the card, and the agent kept running; (b) with that fixed, the daemon still awaited the worktree cleanup before answering, blowing the TUI's 5s `CTRL_W_STOP_TIMEOUT`; (c) with BOTH fixed and a real agent behind a non-inferable command, the close removed only the session its card was built from and left the pane's *other* session rendering as a ghost card badged `No agent` — the symptom as reported. Reverting any one fix alone turns this test red (verified).
 - **Does not assert:** the worktree's own removal (`KeepIfDirty` leaves a dirty one in place by design); the orchestration close path, where the last role's close is the cleanup trigger.
 - **Platform coverage:** mac+linux.
+
+##### dispatch/close/002 — A dispatched worktree the daemon kept on tab close (instead of removing it) reaches the user naming WHERE it survives, not just that something was kept (PRD 236).
+- **Layer:** L1 (`process_pending_kept_worktrees` — the render-loop drain step — called directly against a `SharedState`/`UiState` pair; no PTY, no TestBackend render, no daemon).
+- **Agent:** none.
+- **Asserts:** with the pending-kept-worktrees queue empty, draining is a no-op (no spurious warning); after queuing a `WorktreeKeptNotice` the way the event subscriber does on a daemon `BroadcastMsg::WorktreeKept` (PRD 236 M1.1's typed `RemoveOutcome::Kept` reaching the wire), draining pushes a message into `ui.session_warnings` that contains the retained worktree's own path; and the queue is left empty afterward, so the same notice cannot be delivered twice.
+- **Why it exists:** PRD 236 unifies the two dispatch producers on `RemovalPolicy::KeepIfDirty` (`worktree/reclaim/045`/`046`), so a dispatched worktree with uncommitted work now survives Ctrl+W instead of being force-removed. That is only a real recovery path if the user can find the worktree afterward — a message saying only "a worktree was kept" with no path is exactly as useless as no message at all, since the daemon's own worktree-registry layout is not something a user is expected to know.
+- **Does not assert:** the daemon-side broadcast plumbing itself (`BroadcastMsg::WorktreeKept` construction, the `event_tx.send` in `daemon_protocol.rs`'s close handler, or the `apply_broadcast`/`queue_kept_worktree` hop that gets a notice from the wire into this queue) — those have no PTY/daemon harness in this fast-tier file; nor the exact rendered wording of `ui.session_warnings`'s eventual flush (unchanged, pre-existing `eprintln!` behavior).
+- **Platform coverage:** mac+linux+windows.
 
 #### orchestration/route
 
