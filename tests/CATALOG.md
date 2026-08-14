@@ -1969,7 +1969,7 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the resolver's own selection logic in isolation (`orchestration/focus/*` suite); any other layout mode.
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/012 — An ACTIVE non-orchestration tab (this feature doesn't touch it) still carries the UNDERLINED | BOLD active cue, no REVERSED, and no absolute foreground color (issue #306).
+##### tabs/orchestration/015 — An ACTIVE non-orchestration tab (this feature doesn't touch it) still carries the UNDERLINED | BOLD active cue, no REVERSED, and no absolute foreground color (issue #306).
 - **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
 - **Agent:** none (synthetic; no `orchestration_statuses` entry, no panes/PTYs).
 - **Asserts:** a single active Dashboard tab with `orchestration_statuses = [None]` renders `UNDERLINED | BOLD` as its active cue, contains no `REVERSED`, and carries `Color::Reset` (no absolute foreground color) — proving the new active cue applies uniformly to tabs PRD #333's status-tint feature does not touch.
@@ -3883,6 +3883,14 @@ without depending on the config struct API.
 - **Asserts:** running both forcing entry points this fix touched — `terminate_child_with_grace_and_wait_forcing_group_backstop` (test-only) and `terminate_child_with_grace_and_detached_reap_forcing_group_backstop` (the one that ships, called from `issue_dispatch_run.rs`'s worktree-timeout escalation) — against independent instances of the stand-in (20ms grace) each produces a call log with zero `try_wait` calls (the forcing path must not poll — polling is exactly what reaps early) and exactly two `kill` calls (phase 1's SIGTERM, then phase 3's forcing SIGKILL), both occurring strictly before the single `wait` call that performs the actual reap; the detached half's `wait` runs on a background thread (fork #136), so that half polls the log for the reap to land before asserting.
 - **Does not assert:** the real pid-recycling race itself (not deterministically forceable — see the headline); the non-forcing `terminate_child_with_grace_and_wait` (unaffected by this fix, still covered by `009`); the detached variant's own bounded-return *latency* property (that's `011`'s job — this test pins the detached variant's reap *ordering*, not how quickly it returns); a real `killpg` call or process group (the stand-in's `process_id()` returns `None`, routing every signal through the `ChildKiller::kill` fallback so this test needs no OS process, and no pid recycling is exercised at all); signal identity — with `process_id() -> None` both SIGTERM and SIGKILL collapse into the same unqualified `kill` call, so "two kill calls" proves two signal *attempts*, not confirmed SIGTERM-then-SIGKILL identity (`009`/`010` pin that against real processes).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `009`-`012`).
+#### orchestration/hydration
+
+##### orchestration/hydration/001 — Renaming an orchestration in the local `.dot-agent-deck.toml` while its tab is live surfaces an on-screen drift warning naming the orchestration when the TUI reattaches to the still-running daemon (fork issue #314 / upstream #554).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness; a second real client attaches to the first client's still-running daemon, matching `session/live/006`'s reattach shape).
+- **Agent:** none (`cat` stand-in roles; no LLM tokens).
+- **Asserts:** with an Orchestration tab opened live against the `orch-deck` fixture's `demo-orch` orchestration, rewriting that project's `.dot-agent-deck.toml` on disk to rename the orchestration (the file still parses — this is config drift, not the legitimate `cfg.is_none()` remote-reconnect case `session/live/006`/PRD #111 covers) and then launching a fresh TUI client against the SAME daemon renders an in-session status-line warning naming the orchestration (`demo-orch`) once hydration rebuilds the tab from the daemon's synthesised config.
+- **Does not assert:** the exact wording of the warning beyond the required substring; the legitimate silent `cfg.is_none()` remote-reconnect path (`session/live/006`); the snapshot-restore path's equivalent drift warning (that path already warns — this entry is the daemon-hydration path's counterpart); which config (local vs synthesized) wins the rebuild (unchanged either way).
+- **Platform coverage:** mac+linux.
 ### Session restore
 
 #### session/restore
