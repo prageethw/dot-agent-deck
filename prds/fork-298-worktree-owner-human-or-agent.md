@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status** *(2026-08-14)*: **M1/M2/M4 in flight.** M3 deliberately excluded — see Scope.
+**Status** *(corrected 2026-08-14)*: **Merged, with one known gap.** M1, M2 and M4 landed as [PR #298](https://github.com/prageethw/dot-agent-deck/pull/298), merged 2026-08-14T00:38:48Z as `cc9595d3`; on `main`, not yet in a release tag. `changelog.d/298.feature.md` present. **M2.1's `--mine`-for-a-human half did not ship** — see "What did NOT land, and why criterion 4 is only half" below; `owner_filter` still reads only `DOT_AGENT_DECK_WORKTREE_OWNER` and `is_mine`'s `owned &&` conjunct still excludes every `Human`-owned row, so a human caller still cannot use `--mine`. Tracked as a follow-up, not yet its own issue. M3 deliberately excluded — see Scope.
 
 **Parent**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166) (worktree ownership surface, PR [#215](https://github.com/prageethw/dot-agent-deck/pull/215), released v0.37.0) · **Blocked-on for the creation half**: [fork #175](https://github.com/prageethw/dot-agent-deck/issues/175) (delegate provisions the worktree, PRD-only today)
 
