@@ -29,7 +29,8 @@ expression: text
         │  Enter              Focus selected pane             j / Down        Select next                     │         
         │  Ctrl+w             Close selected pane (confirms)  k / Up          Select previous                 │         
         │  Ctrl+l             Cycle sidebar split stage       l / Right / Enter   Enter directory             │         
-        │  Ctrl+m / m         Show / hide agent badges        h / Left / Bksp     Go up one level             │         
+        │  Ctrl+m / m         Show / hide agent badges        h / Left / Bksp     Go up one level             │
+        │  Ctrl+e             Toggle command-entry lock                                                       │
         │  /                  Filter sessions                 Space           Confirm current directory       │         
         │  Esc                Clear filter                    /               Filter (case-insensitive)       │         
         │  r                  Rename session                  Esc             Clear filter (twice = close)    │         

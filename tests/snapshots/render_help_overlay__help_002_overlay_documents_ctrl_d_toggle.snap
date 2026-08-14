@@ -37,7 +37,8 @@ expression: buf
    │  enter              focus selected pane             j / down        select next                     │    
    │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
    │  ctrl+l             cycle sidebar split stage       l / right / enter   enter directory             │    
-   │  ctrl+m / m         show / hide agent badges        h / left / bksp     go up one level             │    
+   │  ctrl+m / m         show / hide agent badges        h / left / bksp     go up one level             │
+   │  ctrl+e             toggle command-entry lock                                                       │
    │  /                  filter sessions                 space           confirm current directory       │    
    │  esc                clear filter                    /               filter (case-insensitive)       │    
    │  r                  rename session                  esc             clear filter (twice = close)    │    
