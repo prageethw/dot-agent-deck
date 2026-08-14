@@ -2946,6 +2946,184 @@ exit 0
         );
     }
 
+    // --- fork issue #282: the attach race ---
+
+    /// Scenario: fork issue #282. Two concurrent callers of
+    /// `create_worktree_sync`, both attaching to the SAME already-existing
+    /// branch at the SAME target path, race across many trials — a single
+    /// trial proves nothing, since the issue measured this at only ~8% for
+    /// one 2-way race. Asserts, for every trial, that at most one caller
+    /// reports `Created`, that `git worktree list` shows the target path
+    /// exactly once, and that `.git/worktrees/` holds exactly one admin
+    /// entry for it. `create_worktree_sync` holds no lock around the attach
+    /// path today, so on at least some trials git itself lets both callers
+    /// win, producing two `Created` results and two admin entries for one
+    /// on-disk path.
+    #[spec("worktree/create/001")]
+    #[test]
+    fn create_001_concurrent_attach_never_double_creates() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        /// Count `.git/worktrees/<name>/gitdir` admin entries whose target
+        /// resolves to `worktree_dir`'s own `.git` — the exact
+        /// admin-directory duplication the issue measured (two entries
+        /// registered for one on-disk path).
+        fn count_admin_entries_for(clone_dir: &Path, worktree_dir: &Path) -> usize {
+            let worktrees_dir = clone_dir.join(".git").join("worktrees");
+            let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+                return 0;
+            };
+            let target = worktree_dir.join(".git");
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter(|e| {
+                    std::fs::read_to_string(e.path().join("gitdir"))
+                        .map(|s| Path::new(s.trim()) == target)
+                        .unwrap_or(false)
+                })
+                .count()
+        }
+
+        /// Count `git worktree list --porcelain` rows naming `worktree_dir`
+        /// — the second, independent symptom the issue measured (the path
+        /// shown twice by `git worktree list`).
+        fn count_worktree_list_entries(clone_dir: &Path, worktree_dir: &Path) -> usize {
+            let out = std::process::Command::new("git")
+                .current_dir(clone_dir)
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .expect("git worktree list must spawn");
+            assert!(
+                out.status.success(),
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let wanted = worktree_dir.to_string_lossy().into_owned();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.strip_prefix("worktree ") == Some(wanted.as_str()))
+                .count()
+        }
+
+        const TRIALS: usize = 60;
+
+        let ws = tempfile::tempdir().unwrap();
+        // Canonicalize the scratch root up front (before any worktree_dir is
+        // derived from it) — `worktree_dir` never exists at the point it is
+        // computed, so it cannot be canonicalized itself, and a symlinked
+        // temp root (e.g. macOS `/tmp` -> `/private/tmp`) would otherwise
+        // make git's own reported paths mismatch the ones this test computed.
+        let ws_root = ws.path().canonicalize().unwrap();
+        let clone_dir = ws_root.join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let mut branches = Vec::with_capacity(TRIALS);
+        let mut worktree_dirs = Vec::with_capacity(TRIALS);
+        for i in 0..TRIALS {
+            let branch = format!("race-{i}");
+            git(&clone_dir, &["branch", &branch]);
+            branches.push(branch);
+            worktree_dirs.push(ws_root.join(format!("wt-{i}")));
+        }
+
+        let barriers: Vec<std::sync::Barrier> =
+            (0..TRIALS).map(|_| std::sync::Barrier::new(2)).collect();
+
+        // Every trial's pair races concurrently with every other trial's
+        // pair too (not sequentially) — deliberate, since this mirrors how
+        // real concurrent orchestrations hit the shared repository, and
+        // keeps the whole test's wall-clock close to a single `git worktree
+        // add`'s rather than TRIALS times that.
+        let results: Vec<[Result<WorktreeCreation, String>; 2]> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(TRIALS);
+            for i in 0..TRIALS {
+                let clone_dir = &clone_dir;
+                let branch = &branches[i];
+                let worktree_dir = &worktree_dirs[i];
+                let barrier = &barriers[i];
+                let h_a = s.spawn(move || {
+                    barrier.wait();
+                    create_worktree_sync(clone_dir, worktree_dir, branch, "racer-a")
+                });
+                let h_b = s.spawn(move || {
+                    barrier.wait();
+                    create_worktree_sync(clone_dir, worktree_dir, branch, "racer-b")
+                });
+                handles.push((h_a, h_b));
+            }
+            handles
+                .into_iter()
+                .map(|(a, b)| [a.join().unwrap(), b.join().unwrap()])
+                .collect()
+        });
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut double_created = 0usize;
+        let mut duplicate_admin = 0usize;
+        let mut duplicate_listed = 0usize;
+
+        for (i, pair) in results.iter().enumerate() {
+            let created_count = pair
+                .iter()
+                .filter(|r| matches!(r, Ok(WorktreeCreation::Created { .. })))
+                .count();
+            if created_count != 1 {
+                double_created += 1;
+                failures.push(format!(
+                    "trial {i}: expected exactly one Created, got a={:?} b={:?}",
+                    pair[0], pair[1]
+                ));
+            }
+
+            let admin_count = count_admin_entries_for(&clone_dir, &worktree_dirs[i]);
+            if admin_count != 1 {
+                duplicate_admin += 1;
+                failures.push(format!(
+                    "trial {i}: expected exactly one .git/worktrees admin entry for {:?}, found {admin_count}",
+                    worktree_dirs[i]
+                ));
+            }
+
+            let listed_count = count_worktree_list_entries(&clone_dir, &worktree_dirs[i]);
+            if listed_count != 1 {
+                duplicate_listed += 1;
+                failures.push(format!(
+                    "trial {i}: expected `git worktree list` to show {:?} exactly once, found {listed_count}",
+                    worktree_dirs[i]
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "fork issue #282: create_worktree_sync holds no lock around the attach path -- \
+             {double_created}/{TRIALS} trials produced more than one `Created`, \
+             {duplicate_admin}/{TRIALS} trials left more than one `.git/worktrees` admin entry, \
+             {duplicate_listed}/{TRIALS} trials showed the path more than once in `git worktree \
+             list`. Failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
     // --- .worktrees/ git-status hygiene via .git/info/exclude ---
 
     // PRD #120 — provisioning keeps `.worktrees/` out of the clone's `git status`
