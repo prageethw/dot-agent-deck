@@ -16,14 +16,19 @@ There are two ways to turn it on. **The environment variable wins over the file*
 
 **1. Config file (`.dot-agent-deck.toml`)**
 
-Add a `[features]` table to the `.dot-agent-deck.toml` in the directory where you launch the deck:
+Add a `[features]` table to your project's `.dot-agent-deck.toml`:
 
 ```toml
 [features]
 experimental = true
 ```
 
-Editing this file while the deck is running takes effect live — within a couple of seconds, no restart needed. Set it back to `false` (or remove the table) to hide the experimental surfaces again.
+**Which file is that, exactly?** At startup the deck walks up from its own working directory and uses the first `.dot-agent-deck.toml` it finds — so launching from a subdirectory of the project picks up the project root's file, not a non-existent one beside you. `DOT_AGENT_DECK_FEATURES_CONFIG` overrides the search entirely and is what the tests use.
+
+Two consequences worth knowing, because both are silent:
+
+- **A deck launched outside the project tree still resolves the flag OFF.** There is nothing to walk up to from, say, `$HOME`, so every experimental surface stays hidden however the project config reads. That is fork issue [#303](https://github.com/prageethw/dot-agent-deck/issues/303), which remains open for the structural fix — the flag is process-global while the deck is a multi-project tool, so no single directory is the right answer. Until then, launch the deck from inside the project, or set `DOT_AGENT_DECK_FEATURES_CONFIG`.
+- **The walk runs once, at startup, and the resolved path is then fixed.** Editing *that* file while the deck is running takes effect live — within a couple of seconds, no restart needed, and setting it back to `false` (or removing the table) hides the experimental surfaces again. But *creating* a config the walk did not find will not be picked up until the deck restarts, because the watcher polls the path resolved at startup rather than repeating the search.
 
 **2. Environment variable (`DOT_AGENT_DECK_EXPERIMENTAL`)**
 
@@ -44,7 +49,7 @@ The value is case-insensitive: `1` or `true` enables the flag; any other value (
 | `DOT_AGENT_DECK_EXPERIMENTAL=1` (or `true`) | env | On — wins over the file |
 | `DOT_AGENT_DECK_EXPERIMENTAL=0` (or `false`/other) | env | Off — wins over the file |
 
-Both the TUI and the background daemon read the flag independently from the same `.dot-agent-deck.toml`, so the two stay consistent — the file is the contract. On startup each process logs a single line — `experimental flag: ON` or `experimental flag: OFF` — when file logging is enabled (`DOT_AGENT_DECK_LOG`).
+Both the TUI and the background daemon read the flag independently from the same `.dot-agent-deck.toml`, so the two stay consistent — the file is the contract. The detached daemon inherits the TUI's working directory, so both run the same walk and land on the same file. On startup each process logs a single line naming the resolved value **and the path it came from** — `experimental flag: ON (config path: …)` — plus a warning when the walk found no config anywhere up the tree and the flags are defaulting to OFF. Both surface only when file logging is enabled (`DOT_AGENT_DECK_LOG`). The path is in that line precisely so a wrong-file mismatch is diagnosable without resorting to `lsof` on a running deck.
 
 > **One flag for everything.** There is exactly one experimental toggle. If two unrelated experimental surfaces are in flight at once, they are shown or hidden together — there are no per-feature toggles.
 
