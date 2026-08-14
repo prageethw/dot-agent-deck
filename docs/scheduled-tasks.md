@@ -301,9 +301,9 @@ Two things this deliberately does **not** do, so nobody infers a behavior that i
 - It does not triage your whole backlog — only the issues a fire actually dispatches ever get labeled or see the instruction.
 - Recording a priority does not currently affect dispatch order. `max_per_run` still takes issues in the order `gh` returns them; nothing sorts by `priority-*` yet.
 
-### Cleanup: closing a tab removes its worktree
+### Cleanup: closing a tab tries to remove its worktree
 
-Dispatched tabs/cards persist until **you** close them — you stay in control of review, further iteration, or discarding the work. **Closing a dispatched tab/card removes its worktree** (`git worktree remove`) so the slot is freed for a future run; the **clone is preserved** (only the per-issue worktree goes away). Until you close it, the worktree keeps "claiming" its issue, so subsequent fires skip it.
+Dispatched tabs/cards persist until **you** close them — you stay in control of review, further iteration, or discarding the work. **Closing a dispatched tab/card attempts to remove its worktree** (`git worktree remove`); the **clone is preserved** (only the per-issue worktree ever goes away). A **clean** worktree — no uncommitted or untracked changes — is removed and its slot is freed immediately. A **dirty** worktree, or one whose status couldn't be checked, is left in place instead of discarding the work, and you're notified where it's sitting; the slot stays claimed (subsequent fires still skip that issue) until you resolve the worktree's contents and run `worktree reclaim` yourself. Until the worktree is actually removed — by the close, or by a later reclaim — it keeps "claiming" its issue.
 
 > **Requirements & caveats**
 >
