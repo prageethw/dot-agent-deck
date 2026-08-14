@@ -561,7 +561,7 @@ If your project vendors the `/worktree-prd` skill (from [dot-ai](https://github.
 
 ### Listing worktrees by owner
 
-`dot-agent-deck worktree list` shows every linked worktree with its resolved PR state, cleanliness, and gate verdict, including an OWNER column naming which orchestration created it (a dash when the worktree predates this feature, or was not created by the deck).
+`dot-agent-deck worktree list` shows every linked worktree with its resolved PR state, cleanliness, and gate verdict, including an OWNER column naming who owns it: the marker's recorded identity for a deck-created worktree, or `human:<login>@<host>` for one you created by hand (e.g. a plain `git worktree add`). A dash appears only when ownership could not be resolved at all — a legacy marker that predates this feature and names nobody, `gh` unavailable, or the worktree's own git metadata directory could not be verified; `worktree list --json`'s `owner_kind` and `owner_reason` fields tell those cases apart.
 
 Run with `--mine` from inside an orchestration pane, it lists only the worktrees *that orchestration* created — useful for an autonomous agent that needs to enumerate its own work without seeing every other orchestration's worktrees too:
 

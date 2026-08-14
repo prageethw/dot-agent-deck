@@ -1019,6 +1019,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the CLI's stderr text as printed through `run_worktree_list_cli` itself (only the `format_disagreement_warning` function it calls). The divergent `owned=false` + `owner=Some(..)` state is produced by a race between two independent `owned_git_dir` resolutions (`ownership_of` and `owner_of` each spawning their own `git rev-parse`s), so it cannot be staged deterministically through the real-binary `Fixture` that `001`–`007`/`009`/`010` use — constructing `WorktreeReport` values directly is the only deterministic seam.
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/037 — A worktree marked owned via the fork #166 marker format, carrying `created-by: orchestration:foo`, resolves `owner_kind: "agent"` in the `worktree list --json` document, alongside the existing `owner` string (PRD fork#298 M1.0's `WorktreeOwner::Agent`).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), reading the JSON row back via `serde_json::Value` rather than a `WorktreeReport` struct field — `owner_kind` does not exist in the struct yet, so a missing key fails the assertion, not the build.
+- **Agent:** none.
+- **Asserts:** the examined worktree's JSON entry carries `owner_kind: "agent"` and `owner: "orchestration:foo"` (unchanged from today).
+- **Does not assert:** the human or unknown kinds (covered by `038`/`041`); the human-table OWNER column (covered by `030`); removal authority (covered by `039`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/038 — An UNMARKED, hand-made worktree (CLAUDE.md rule 1's dominant real path) resolves `owner_kind: "human"` with a populated `owner` naming the resolved login, and `owned: false` (PRD fork#298 M1.0's `WorktreeOwner::Human`).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with the stub `gh` extended to answer `gh api user --jq .login` from `$GHSTUB_DIR/login` via the new `Fixture::set_login` (mirroring `tests/issue_claim.rs`'s own stub byte-for-byte) — the seam a `WorktreeOwner::Human` resolution is expected to reuse from `issue_claim.rs`'s `resolve_gh_login`/`gh_current_login_argv`.
+- **Agent:** none.
+- **Asserts:** the examined worktree's JSON entry carries `owner_kind: "human"`; `owner` contains the stubbed login (`"alice"`); `owned` is `false` — the last is the safety-property half: reporting a human owner must never look like proof of deck-creation.
+- **Does not assert:** removal authority under `reclaim` (covered by `039`, the safety pin); the agent or unknown kinds (covered by `037`/`041`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/039 — THE SAFETY PIN. A MERGED, clean, human-owned (unmarked) worktree still resolves `Verdict::Ask`, never `Verdict::Remove`, under a bare `reclaim` (no `--yes`) — reopening fork #144's P1 if removal authority is ever derived from the NEW `WorktreeOwner::Human` reporting instead of staying keyed strictly on the existing marker-presence `Ownership` bit, which fork #166 explicitly refused to let happen.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), combining a real `worktree reclaim` invocation (checking the worktree directory survives on disk) with a `worktree list --json` call on the same fixture (checking the JSON row).
+- **Agent:** none.
+- **Asserts:** after a bare `reclaim`, the worktree directory still exists; the SAME row in `worktree list --json` carries `verdict: "ask"`, `owner_kind: "human"` (a positive resolution, not merely an absent owner), and `owned: false` — all three together, in one row, so a future change that starts deriving removability from `WorktreeOwner` fails this test loudly.
+- **Does not assert:** the `--yes` removal path itself (covered by `011`, a foreign worktree — the mechanism is identical since `owned` stays keyed on the marker); the human-owner reporting fields in isolation (covered by `038`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/040 — A single `worktree list --json` document examining two worktrees (one deck-created and marked, one hand-made and unmarked) carries `owner_kind` AND a populated `owner` for BOTH rows (PRD fork#298 M2.0) — `owner: Option<String>` has carried a per-row identity string since fork #166 and is only omitted from JSON via `skip_serializing_if = "Option::is_none"` when `None`, which is why the document previously read as carrying no owner string anywhere even though the field already existed.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), one fixture repo with two linked worktrees examined in a single `worktree list --json` call.
+- **Agent:** none.
+- **Asserts:** the agent row carries `owner_kind: "agent"` and `owner: "orchestration:doc-carrier"`; the human row carries `owner_kind: "human"` and an `owner` containing the stubbed login (`"dana"`) — in the same JSON document.
+- **Does not assert:** the legacy/unknown kind (covered by `041`); the human-table OWNER column (covered by `030`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/041 — A pre-fork#166 LEGACY marker (the bare `"deck\n"` content `mark_worktree_owned` wrote before identity tracking existed, no `created-by:` line) resolves `owner_kind: "unknown"` — never `"agent"` (no identity to attribute it to) and never `"human"` (the marker DOES prove deck creation) — while `owned` stays `true` and `owner` stays absent, both unchanged (fork issue #231's still-silent mirror of #221's disagreement warning, now resolved to something stated rather than a blank).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), the worktree marked via the existing `Fixture::mark_owned` (bare `"deck\n"`, no creator).
+- **Agent:** none.
+- **Asserts:** `owned: true` and `owner` absent/`None`, both unchanged from today's behaviour; `owner_kind: "unknown"` in the same row.
+- **Does not assert:** the agent or human kinds (covered by `037`/`038`); `--mine`'s handling of a legacy-marked worktree (unaffected — `is_mine` reads `owned`/`owner`, neither of which changes here).
+- **Platform coverage:** mac+linux.
+
 #### issue/claim
 
 Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's WORKTREE — its absolute path plus its git branch (CLAUDE.md rule 23) — never a `DOT_AGENT_DECK_PANE_ID` value (round 2, dropped: those ids recycle across a daemon restart, fork #160/#163/#166) and never the worktree ownership marker (round 1, dropped: the marker is almost never present under CLAUDE.md rule 1's mandated hand-made `git worktree add`). Both the path and the branch are derivable straight from `git`, so no marker is required at all — the marker, when present, supplies human-readable DECORATION only and is never part of the compared identity. A human claiming outside any worktree still resolves as `human:<login>@<host>` — that half is unchanged since round 1. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 3's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still pane-id-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
