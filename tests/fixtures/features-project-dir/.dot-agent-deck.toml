@@ -1,0 +1,11 @@
+# Fixture for the L2 real-binary proof of fork issue #303
+# (features/config/001): the harness launches the deck from a
+# subdirectory INSIDE this fixture root (via `with_launch_subdir`), never
+# from the root itself, while THIS file carries `[features] experimental =
+# true`. Pins that the experimental flag resolves against the project
+# directory (where this file lives), not the process's own, nested,
+# working directory. No modes/orchestrations — an otherwise-empty
+# dashboard so the rendered `experimental: on` footer is the only thing
+# under test.
+[features]
+experimental = true
