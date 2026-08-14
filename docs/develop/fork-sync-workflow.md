@@ -52,6 +52,26 @@ git reset --hard fork-only
 git push --force origin main   # force-with-lease won't help here: we didn't fetch origin, so its tracking ref for main may be stale
 ```
 
+### On a conflict over a fork feature, the fork wins
+
+**CLAUDE.md rule 24.** When a conflict touches a deliberate fork divergence, resolve it in the fork's favour. The fork's behaviour is authoritative; upstream's does not win merely by being the incoming side of a rebase. Every **PERMANENT** row in the stack table below is in this category, as is any fork feature upstream has not merged. If upstream later implements the same surface *differently*, that is still a fork feature — keep ours and note the divergence.
+
+**Three cases look identical at a conflict marker and resolve in opposite directions, so classify before resolving:**
+
+| Situation | Resolution | Why |
+|---|---|---|
+| Fork feature vs upstream change | **Fork wins** | Deliberate divergence upstream never had |
+| Upstream landed our own offered work | **Upstream wins; drop the fork commit** | Supersession, not a clash — the healthy end of an offer |
+| Upstream fixed a real bug in code the fork also touches | **Take both** | Not a feature clash; picking either whole loses something |
+
+The middle row is the one that looks most like a betrayal of this rule and is not. `55021c3` (PRD #333) is the worked precedent: upstream merged its own version as PR #356 after requesting behaviour changes, so upstream's had evolved past the fork's; taking upstream's whole reduced the commit to empty and `--empty=drop` removed it. `ab71a28` (PRD #336) went the same way, and `14bf83c` was skipped automatically with `warning: skipped previously applied commit`. **Defending a fork commit upstream has already absorbed** re-introduces a diff the fork no longer needs and pays rebase tax on it forever.
+
+**Why this needs a written rule rather than judgement: the failure is silent.** Resolving toward upstream deletes a fork feature with nothing going red — upstream has no test for a feature it never had, so the fork's own tests are the only net, and for a presentation-only divergence like the `worker-deck` TUI title (`b33cec2`) a snapshot may simply be regenerated to match the wrong side. `git rebase` compounds it by presenting the fork's commit as *incoming*, which makes "take upstream" feel like the conservative choice when it is the destructive one.
+
+**Verify before resetting `main`.** The rebase finishing cleanly is not evidence the features survived it. Walk the PERMANENT rows in the stack table below and confirm each is still present, and run the diff-and-restore procedure in [`fork-config-backups.md`](fork-config-backups.md) for the config half (`devbox.json`, `.dot-agent-deck.toml`). `main` is reset to `fork-only` at the last step precisely so there is a window to check first — use it.
+
+**A resolution is not a place to redesign.** If honouring the fork's side looks wrong — the feature is obsolete, upstream's approach is better — raise it with the maintainer and handle it as its own change. A sync PR should read as "upstream's changes, plus the fork's features intact"; anything else in it is a defect, and a rebase is the worst possible place to review a design decision.
+
 ### A sync PR gets no CI automatically — dispatch it by hand
 
 **This is the one class of PR that cannot self-trigger CI, and it is the class where CI matters most**, because a sync PR carries an entire upstream rebase and every conflict resolution in it.
