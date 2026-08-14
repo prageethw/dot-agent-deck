@@ -27,6 +27,14 @@ use spec::spec;
 /// `"demo-orch"` would pass before the fix exists and not be a real RED.
 const DRIFT_WARNING_NEEDLE: &str = "orchestration 'demo-orch' not found in local config";
 
+/// Substring the fix for fork issue #320 must carry: names the local config
+/// file and states it failed to parse — the `LocalConfigState::Unparseable`
+/// branch, distinct from both `Absent` (silent, PRD #111) and the
+/// `DRIFT_WARNING_NEEDLE` "found == false" case above. Deliberately includes
+/// the filename so a needle of just "parse" or "invalid" could not pass by
+/// coincidentally matching some unrelated error string.
+const PARSE_WARNING_NEEDLE: &str = "local .dot-agent-deck.toml could not be parsed";
+
 /// Scenario: Open a live Orchestration tab against the `orch-deck` fixture's
 /// `demo-orch` orchestration in one TUI client, then rewrite that project's
 /// `.dot-agent-deck.toml` on disk to rename the orchestration — the file
@@ -98,6 +106,78 @@ command = "cat"
          must render an on-screen drift warning naming the orchestration -- \
          expected the substring {DRIFT_WARNING_NEEDLE:?} on the rendered \
          grid within 10s, got:\n{}",
+        reattached.snapshot_grid()
+    );
+}
+
+/// Scenario: Open a live Orchestration tab against the `orch-deck` fixture's
+/// `demo-orch` orchestration in one TUI client, then CORRUPT that project's
+/// `.dot-agent-deck.toml` on disk with a syntax error (an unterminated
+/// string) so it no longer parses at all — distinct from `hydration_001`'s
+/// rename, which keeps the file valid. The file is not deleted, so the
+/// legitimate silent `Absent` / PRD #111 remote-reconnect case stays
+/// untouched. A second, fresh TUI client then attaches to the SAME
+/// still-running daemon and must render an in-session status-line warning
+/// naming the local config file as unparseable once hydration's
+/// `lookup_config` closure runs against it (fork issue #320: this was RED
+/// when written, because `lookup_config` mapped `Err(ProjectConfigError::Parse)`
+/// to `None`, taking the branch reserved for an absent file, so the broken
+/// edit was silent; closed by `6ef0269`, which introduces `LocalConfigState`).
+#[spec("orchestration/hydration/002")]
+#[test]
+fn hydration_002_unparseable_config_warns_on_reattach() {
+    let deck = TuiDeck::builder().launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    // Open the fixture's single orchestration live -- identical setup to
+    // `hydration_001`.
+    deck.send_bytes(b"\x0e");
+    deck.send_bytes(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_bytes(b"\x1b[C");
+    deck.send_bytes(b"\r");
+    deck.send_bytes(b"\r");
+    deck.wait_for_absence("New Agent");
+
+    let attach_socket = deck.attach_socket_path().to_string_lossy().into_owned();
+    let hook_socket = deck.hook_socket_path().to_string_lossy().into_owned();
+
+    // Corrupt the fixture's config on disk while the daemon still has a live
+    // pane recorded under `demo-orch` -- an unterminated string makes this
+    // invalid TOML, so `toml::from_str` fails and `load_project_config`
+    // returns `Err(ProjectConfigError::Parse)`. This is NOT the `Absent`
+    // case (the file still exists) and NOT `hydration_001`'s drift case (the
+    // file doesn't parse at all, so there's no `orchestrations` list to miss
+    // from).
+    let corrupted_toml = r#"# Rewritten by orchestration/hydration/002 to corrupt the file's syntax
+# out from under the still-live daemon pane -- the Unparseable condition
+# under test. The unterminated string below is what breaks the parse.
+[[orchestrations]]
+name = "demo-orch
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+"#;
+    std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), corrupted_toml)
+        .expect("corrupt .dot-agent-deck.toml with a syntax error");
+
+    // Reattach a FRESH TUI client to the SAME daemon, exactly as
+    // `hydration_001` does.
+    let reattached = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_ATTACH_SOCKET", attach_socket)
+        .with_env("DOT_AGENT_DECK_SOCKET", hook_socket)
+        .without_success_recording()
+        .launch_with_fixture("minimal");
+
+    assert!(
+        reattached.wait_for_grid_string_within(PARSE_WARNING_NEEDLE, Duration::from_secs(10)),
+        "reattaching to a daemon whose live orchestration pane's local \
+         .dot-agent-deck.toml has been corrupted into invalid TOML (still \
+         present, just unparseable) must render an on-screen warning naming \
+         the local config file -- expected the substring \
+         {PARSE_WARNING_NEEDLE:?} on the rendered grid within 10s, got:\n{}",
         reattached.snapshot_grid()
     );
 }
