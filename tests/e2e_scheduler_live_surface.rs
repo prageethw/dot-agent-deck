@@ -14,20 +14,24 @@
 //! fires are triggered with the existing `RunNow` control message over the
 //! deck's attach socket (no real LLM, no real-time cron wait).
 //!
-//! `live/001`-`live/004` are GREEN today, and have been since the fixes below
+//! `live/001`-`live/005` are GREEN today, and have been since the fixes below
 //! landed — with ONE exception: `78f92b6` widened the retire predicate and made
 //! `/004` RED again for the window it was on the tree, until `8f579dd` reverted
 //! it (see `/004`'s own note below). Outside that window they have been green,
-//! so do NOT read any of them as known-failing. A failure in `/001`-`/004` is a
-//! real regression at the live-surfacing / supersession seam (issue #284: an
-//! earlier stale `RED today:` note here caused exactly that misclassification,
-//! so an investigation stopped looking at a genuine break).
+//! so do NOT read any of them as known-failing. A failure in `/001`-`/005` is a
+//! real regression at the live-surfacing / supersession / local-config-drift
+//! seam (issue #284: an earlier stale `RED today:` note here caused exactly
+//! that misclassification, so an investigation stopped looking at a genuine
+//! break).
 //!
-//! `live/005` (fork issues #318/#320) is a DIFFERENT bug and is RED as
-//! written, by design — see its own doc comment. Do not fold it into the
-//! "all green" statement above when it eventually flips; update this note
-//! alongside its fix instead of leaving a stale claim for the next reader
-//! (that is exactly what issue #284 was about).
+//! `live/005` (fork issues #318/#320) pins the local-config-drift warning at
+//! the daemon-surfacing call site (`surface_one_orchestration`) — see its own
+//! doc comment for the full mechanism. It was RED as written, by design, until
+//! `6ef0269` landed `LocalConfigState` and folded it into the "all green"
+//! statement above, along with `orchestration/hydration/002`. This note is
+//! itself the thing issue #284 is about: update it alongside the next fix
+//! that touches this file, rather than leaving a claim here for the next
+//! reader to trust past its expiry.
 //!
 //! What each one pins, and the fix it guards:
 //!   - `live/001`: a fire with a NON-hook command (`cat`) paints a card on the
@@ -55,6 +59,14 @@
 //!     hook superseding the placeholder. Was RED; closed by `ccadbbc`, which
 //!     captures the retired session's `display_name` (keyed by the stable pane
 //!     id) and seeds the replacement session with it. Shipped green in v0.35.0.
+//!   - `live/005`: a daemon-surfaced orchestration whose local
+//!     `.dot-agent-deck.toml` no longer lists it by the time the
+//!     ALREADY-ATTACHED TUI live-surfaces it renders the same on-screen drift
+//!     warning `orchestration/hydration/001` pins for the reconnect path. Was
+//!     RED — `surface_one_orchestration` mapped the renamed-out case through
+//!     `.ok().flatten()` and logged nothing. Closed by `6ef0269`, which
+//!     introduces `LocalConfigState` and routes both call sites through the
+//!     same drift-warning helper.
 
 mod common;
 
@@ -530,9 +542,9 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
 /// needs no such rendezvous (nothing races there; the file is already
 /// rewritten by the time a fresh client attaches). Pins that the SAME
 /// on-screen drift warning `orchestration/hydration/001` asserts also appears
-/// for THIS path once the config no longer lists the orchestration — today
-/// `surface_one_orchestration` uses `.ok().flatten()` and logs nothing at
-/// all, so this must currently time out RED.
+/// for THIS path once the config no longer lists the orchestration — this was
+/// RED when written, because `surface_one_orchestration` used `.ok().flatten()`
+/// and logged nothing at all; closed by `6ef0269`.
 #[spec("scheduler/live/005")]
 #[test]
 fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
@@ -541,6 +553,25 @@ fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
     std::fs::create_dir_all(&work).expect("create work dir");
     let config_path = work.join(".dot-agent-deck.toml");
 
+    // This is the ONLY `mkfifo` in the test suite -- there is no prior art
+    // elsewhere to compare against if this ever needs debugging. The whole
+    // rendezvous depends on `load_project_config` reading the config via
+    // `std::fs::read_to_string`, whose `open()` on a FIFO blocks until a
+    // writer appears -- that blocking is what lets the two writes below hand
+    // two different bodies to two different readers in a fixed order with no
+    // millisecond race. That same blocking-on-FIFO behaviour is filed as a
+    // bug in a sibling loader, fork issue #310 ("`load_features_file` stats
+    // then opens, so a regular file swapped for a FIFO blocks deck startup
+    // indefinitely"); the obvious fix there is to refuse non-regular config
+    // files before opening them. If that hardening is ever applied to
+    // `load_project_config` too, this test breaks -- as a mysterious hang,
+    // not a clean assertion failure, since the daemon/TUI reader would then
+    // never open the FIFO at all. If `live_005` starts hanging or timing out
+    // here for no visible reason, check whether `load_project_config` grew a
+    // not-a-regular-file guard, and if so replace this FIFO-as-config
+    // technique with a regular config file plus a SEPARATE synchronization
+    // primitive (e.g. a FIFO used only as a signal, never as the config
+    // itself).
     let mkfifo_status = std::process::Command::new("mkfifo")
         .arg(&config_path)
         .status()
@@ -654,8 +685,9 @@ fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
 
     // The pin: the SAME drift message `orchestration/hydration/001` pins for
     // the reconnect-hydration path must also appear here, for the
-    // mid-session daemon-surfacing path. Today `surface_one_orchestration`
-    // logs nothing at all for this case, so this must time out RED.
+    // mid-session daemon-surfacing path. This was RED when written —
+    // `surface_one_orchestration` logged nothing at all for this case;
+    // closed by `6ef0269`.
     assert!(
         deck.wait_for_grid_string_within(SCHEDULER_LIVE_DRIFT_NEEDLE, Duration::from_secs(10)),
         "a daemon-surfaced orchestration whose local .dot-agent-deck.toml no \

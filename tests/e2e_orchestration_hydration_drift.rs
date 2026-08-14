@@ -119,9 +119,10 @@ command = "cat"
 /// untouched. A second, fresh TUI client then attaches to the SAME
 /// still-running daemon and must render an in-session status-line warning
 /// naming the local config file as unparseable once hydration's
-/// `lookup_config` closure runs against it (fork issue #320: today it maps
-/// `Err(ProjectConfigError::Parse)` to `None`, taking the branch reserved for
-/// an absent file, so the broken edit is currently silent).
+/// `lookup_config` closure runs against it (fork issue #320: this was RED
+/// when written, because `lookup_config` mapped `Err(ProjectConfigError::Parse)`
+/// to `None`, taking the branch reserved for an absent file, so the broken
+/// edit was silent; closed by `6ef0269`, which introduces `LocalConfigState`).
 #[spec("orchestration/hydration/002")]
 #[test]
 fn hydration_002_unparseable_config_warns_on_reattach() {
