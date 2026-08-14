@@ -1615,11 +1615,17 @@ async fn handle_connection(
                     // PRD 236: because cleanup is detached, the pane that
                     // triggered it may already be gone by the time the outcome
                     // is known — a pane-scoped reply would reach nobody. So a
-                    // `Kept` outcome is broadcast deck-wide (`event_tx`, the
-                    // same channel `OrchestrationSurface` uses) rather than
-                    // riding the close response, and every attached TUI —
-                    // not just the one that closed the tab — learns where the
-                    // work survives.
+                    // `Kept` OR `RemoveFailed` outcome is broadcast deck-wide
+                    // (`event_tx`, the same channel `OrchestrationSurface`
+                    // uses) rather than riding the close response, and every
+                    // attached TUI — not just the one that closed the tab —
+                    // learns where the work survives. `RemoveFailed` rides
+                    // the same `WorktreeKept` broadcast, folded into
+                    // `KeptReason::RemovalFailed`, because to the user both
+                    // outcomes look identical: the tree is still on disk and
+                    // the slot is still claimed (PRD 236 review — a failed
+                    // removal used to be reported as `Removed`, so nothing
+                    // was ever sent and nothing ever retried it).
                     if let Some(worktree) = dispatched_worktree {
                         let registry = registry.clone();
                         let worktree_registry = worktree_registry.clone();
@@ -1638,13 +1644,31 @@ async fn handle_connection(
                                     entry.policy,
                                 )
                                 .await;
-                                if let crate::issue_dispatch_run::RemoveOutcome::Kept(reason) =
-                                    outcome
-                                {
+                                // PRD 236 review: a failed removal must reach
+                                // the user exactly like a `Kept` does — the
+                                // tab-close response has already gone out
+                                // (cleanup is detached, see above), and the
+                                // registry entry is already dropped, so a
+                                // failed removal that only logs and returns
+                                // `Removed` leaves the tree on disk with no
+                                // client-visible trace and nothing to retry.
+                                let reason_and_error = match outcome {
+                                    crate::issue_dispatch_run::RemoveOutcome::Kept(reason) => {
+                                        Some((reason, None))
+                                    }
+                                    crate::issue_dispatch_run::RemoveOutcome::RemoveFailed(
+                                        error,
+                                    ) => {
+                                        Some((crate::event::KeptReason::RemovalFailed, Some(error)))
+                                    }
+                                    crate::issue_dispatch_run::RemoveOutcome::Removed => None,
+                                };
+                                if let Some((reason, error)) = reason_and_error {
                                     let _ = event_tx.send(BroadcastMsg::WorktreeKept(
                                         crate::event::WorktreeKeptNotice {
                                             path: worktree.to_string_lossy().to_string(),
                                             reason,
+                                            error,
                                         },
                                     ));
                                 }

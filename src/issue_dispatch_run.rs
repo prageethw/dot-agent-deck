@@ -129,10 +129,14 @@ pub struct WorktreeEntry {
 /// path and still skips (correctly — the issue genuinely is claimed), and the
 /// operator gets a recoverable worktree instead of `Force` silently discarding
 /// whatever the agent had done. [`RemovalPolicy::Force`] remains for the ONE
-/// case that still needs it: `dispatch.rs`'s spawn-failure rollback, where the
-/// worktree is seconds old and the agent never ran, so there is no work to
-/// protect and a leftover dir/branch would wedge the name for every later
-/// dispatch.
+/// case that still needs it: `dispatch.rs`'s spawn-failure rollback, where —
+/// for a single-role dispatch — no agent has been handed the worktree yet,
+/// so there is no work to protect and a leftover dir/branch would wedge the
+/// name for every later dispatch. (That single-role framing does not extend
+/// to a multi-role orchestration, where an earlier role can already be a
+/// live PTY child rooted in the worktree by the time a later role's spawn
+/// fails and triggers this rollback — PRD 236 review; tracked for a
+/// follow-up rather than changed here.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalPolicy {
     /// Remove unconditionally (`--force`), discarding uncommitted changes.
@@ -205,24 +209,37 @@ pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bo
 
 /// What [`remove_worktree`] actually did — the typed replacement for the `()`
 /// it used to return. A caller (the daemon's tab-close handler) needs this to
-/// tell "removed" from "kept", and — when kept — WHY, without re-probing the
-/// filesystem itself; see [`crate::event::WorktreeKeptNotice`], which carries
-/// the `Kept` reason across the wire to an attached TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// tell "removed" from "kept" from "removal failed", and — when kept or
+/// failed — WHY, without re-probing the filesystem itself; see
+/// [`crate::event::WorktreeKeptNotice`], which carries the reason across the
+/// wire to an attached TUI. `#[must_use]` is the mechanical guard against the
+/// exact defect this type exists to fix: a discarded outcome silently
+/// reporting success (PRD 236 review).
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoveOutcome {
-    /// The worktree was removed (or a best-effort removal was attempted; `git
-    /// worktree remove` failing here is logged, not surfaced, matching the
-    /// function's existing best-effort contract for that branch).
+    /// The worktree was removed.
     Removed,
     /// The worktree was left in place. Carries why — see
     /// [`crate::event::KeptReason`].
     Kept(crate::event::KeptReason),
+    /// `git worktree remove` itself failed (non-zero exit or spawn error) —
+    /// carries the error so the caller can surface it. Previously folded
+    /// into [`RemoveOutcome::Removed`] (the failure was logged, not
+    /// returned), which meant a failed removal reported success: nothing
+    /// broadcast (only `Kept` was), the registry entry was already dropped
+    /// so nothing retried, the tree stayed on disk, and every later
+    /// `dispatch_decision` filesystem check skipped that issue forever with
+    /// no client-visible trace (PRD 236 review, reproduced against a locked
+    /// worktree on git 2.55.0).
+    RemoveFailed(String),
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
-/// <worktree>`), PRESERVING the clone. Best-effort: a non-zero exit (already
-/// removed, locked) or a spawn error is logged, not fatal — the tab is already
-/// gone.
+/// <worktree>`), PRESERVING the clone. Never fatal to the caller — a non-zero
+/// exit (already removed, locked) or a spawn error is logged AND reported back
+/// as [`RemoveOutcome::RemoveFailed`], so the tab-close path never panics or
+/// blocks on it, but the caller can no longer mistake the failure for success.
 ///
 /// `policy` decides what happens when the worktree still holds uncommitted work
 /// — see [`RemovalPolicy`] for why the two producers used to need opposite
@@ -237,7 +254,7 @@ pub async fn remove_worktree(
 ) -> RemoveOutcome {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
-        let status = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await;
+        let status = probe_worktree_dirty(&worktree).await;
         match status {
             Ok(output) if !output.trim().is_empty() => {
                 tracing::warn!(
@@ -265,17 +282,22 @@ pub async fn remove_worktree(
     }
     let res = run_status("git", &args).await;
     match res {
-        Ok(()) => tracing::info!(
-            worktree = %worktree_dir.display(),
-            "issue-dispatch: removed worktree on tab close (clone preserved)"
-        ),
-        Err(e) => tracing::warn!(
-            worktree = %worktree_dir.display(),
-            error = %e,
-            "issue-dispatch: worktree cleanup on close failed"
-        ),
+        Ok(()) => {
+            tracing::info!(
+                worktree = %worktree_dir.display(),
+                "issue-dispatch: removed worktree on tab close (clone preserved)"
+            );
+            RemoveOutcome::Removed
+        }
+        Err(e) => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                error = %e,
+                "issue-dispatch: worktree cleanup on close failed"
+            );
+            RemoveOutcome::RemoveFailed(e)
+        }
     }
-    RemoveOutcome::Removed
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,6 +1830,54 @@ async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String
         return Err(format!(
             "`{program} {}` failed ({}): {}",
             args.join(" "),
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`remove_worktree`]'s `KeepIfDirty` dirty-probe (`git status --porcelain`
+/// against the worktree). Deliberately its OWN function rather than a call
+/// into the shared [`run_capture_args`]: that function is also used by `gh`
+/// network calls (via [`run_capture`]) that legitimately need more room than
+/// a local, no-network `git status`, so bounding it there would risk cutting
+/// off a slow-but-working `gh` call. This probe, by contrast, runs against a
+/// worktree an agent may have left in a stuck state — a held `index.lock`, a
+/// stalled filesystem — and the close-time cleanup that calls it is
+/// detached, so an unbounded wait here pins that task for the daemon's
+/// lifetime with the tree kept and, before PRD 236's blocking-1 fix, no
+/// notice ever reaching the user (PRD 236 review, item 5). Bounded with the
+/// same [`WORKTREE_CLEANUP_TIMEOUT`] `attempt_worktree_cleanup` uses for its
+/// own `git worktree remove --force`, and hardened the same way
+/// [`run_status`] is (stdin closed, no credential-prompt env) since — unlike
+/// `run_capture_args`'s other direct `git` use (`remote get-url origin`
+/// against a clone we just provisioned) — this runs against a worktree
+/// outside our control. A timeout is treated exactly like any other probe
+/// failure: the caller's `Err` arm already keeps the tree fail-safe and
+/// reports [`crate::event::KeptReason::ProbeError`].
+async fn probe_worktree_dirty(worktree: &str) -> Result<String, String> {
+    let output = tokio::time::timeout(
+        WORKTREE_CLEANUP_TIMEOUT,
+        tokio::process::Command::new("git")
+            .args(["-C", worktree, "status", "--porcelain"])
+            .stdin(Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "`git -C {worktree} status --porcelain` timed out after {WORKTREE_CLEANUP_TIMEOUT:?}"
+        )
+    })?
+    .map_err(|e| format!("failed to run `git`: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`git -C {worktree} status --porcelain` failed ({}): {}",
             output.status,
             stderr.trim()
         ));

@@ -2025,8 +2025,6 @@ async fn worktree_reclaim_042_remove_worktree_returns_a_kept_outcome_not_unit() 
     std::fs::write(worktree_dir.join("scratch.txt"), "never committed\n")
         .expect("write untracked file");
 
-    // The `()` binding IS the point of this test -- see the assertion below.
-    #[allow(clippy::let_unit_value)]
     let outcome = dot_agent_deck::issue_dispatch_run::remove_worktree(
         &worktree_dir,
         &clone_dir,
@@ -2039,15 +2037,13 @@ async fn worktree_reclaim_042_remove_worktree_returns_a_kept_outcome_not_unit() 
         "a dirty tree under KeepIfDirty must survive -- {} is gone",
         worktree_dir.display()
     );
-    assert_ne!(
-        std::any::type_name_of_val(&outcome),
-        "()",
+    assert_eq!(
+        outcome,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Kept(
+            dot_agent_deck::event::KeptReason::Dirty
+        ),
         "remove_worktree must return a typed outcome distinguishing WHY the tree was kept \
-         (dirty vs. an unresolvable status probe) -- today it returns `()`, so the daemon's \
-         detached close-time task (`daemon_protocol.rs`) has nothing typed to propagate to the \
-         TUI even once it stops discarding the result; got outcome type \
-         {:?}",
-        std::any::type_name_of_val(&outcome)
+         (dirty vs. an unresolvable status probe), not just any non-unit type; got {outcome:?}"
     );
 }
 
@@ -2079,8 +2075,6 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
             "main",
         ],
     );
-    // The `()` binding IS the point of this test -- see the assertion below.
-    #[allow(clippy::let_unit_value)]
     let removed_outcome = dot_agent_deck::issue_dispatch_run::remove_worktree(
         &clean_wt,
         &clone_dir,
@@ -2092,12 +2086,12 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
         "a clean tree under KeepIfDirty must actually be removed -- {} still exists",
         clean_wt.display()
     );
-    assert_ne!(
-        std::any::type_name_of_val(&removed_outcome),
-        "()",
-        "the removed-clean-tree branch must return a typed outcome too, not just the \
-         kept/dirty branch -- today both return the same `()`, so a caller has no way to tell \
-         \"removed\" from \"kept\" without re-probing the filesystem itself"
+    assert_eq!(
+        removed_outcome,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Removed,
+        "the removed-clean-tree branch must return `RemoveOutcome::Removed`, distinguishable \
+         from the kept/dirty branch -- a caller must be able to tell \"removed\" from \"kept\" \
+         without re-probing the filesystem itself; got {removed_outcome:?}"
     );
 
     // A `git status --porcelain` probe that genuinely fails: not a valid git
@@ -2105,8 +2099,6 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
     // than assumed clean.
     let bogus_wt = scratch.path().join("not-a-worktree");
     std::fs::create_dir_all(&bogus_wt).expect("create a plain, non-git directory");
-    // The `()` binding IS the point of this test -- see the assertion below.
-    #[allow(clippy::let_unit_value)]
     let unknown_outcome = dot_agent_deck::issue_dispatch_run::remove_worktree(
         &bogus_wt,
         &clone_dir,
@@ -2118,12 +2110,13 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
         "when the status probe itself fails, the fail-safe must keep the tree -- {} is gone",
         bogus_wt.display()
     );
-    assert_ne!(
-        std::any::type_name_of_val(&unknown_outcome),
-        "()",
-        "the probe-error branch must ALSO return a typed outcome distinguishing \"kept because \
-         unknown\" from \"kept because dirty\" -- collapsing both into the same `()` (or even \
-         the same enum variant) loses information a future operator needs"
+    assert_eq!(
+        unknown_outcome,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Kept(
+            dot_agent_deck::event::KeptReason::ProbeError
+        ),
+        "the probe-error branch must return `Kept(ProbeError)`, distinguishing \"kept because \
+         unknown\" from \"kept because dirty\" -- got {unknown_outcome:?}"
     );
 }
 
@@ -2172,8 +2165,6 @@ async fn worktree_reclaim_044_close_path_detached_spawn_propagates_nothing() {
         )
         .await
     });
-    // The `()` binding IS the point of this test -- see the assertion below.
-    #[allow(clippy::let_unit_value)]
     let joined = handle
         .await
         .expect("the detached cleanup task must not panic");
@@ -2183,13 +2174,14 @@ async fn worktree_reclaim_044_close_path_detached_spawn_propagates_nothing() {
         "the dirty tree must survive the detached close-time task -- {} is gone",
         worktree_dir.display()
     );
-    assert_ne!(
-        std::any::type_name_of_val(&joined),
-        "()",
-        "the close path's detached task must have something typed to propagate once it stops \
-         discarding its result -- joining the SAME spawn shape `daemon_protocol.rs` uses today \
-         yields `()`, which is why the close handler currently has nothing to hand back to an \
-         attached TUI even if it started awaiting its own spawn"
+    assert_eq!(
+        joined,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Kept(
+            dot_agent_deck::event::KeptReason::Dirty
+        ),
+        "the close path's detached task must have something typed to propagate -- joining the \
+         SAME spawn shape `daemon_protocol.rs` uses must yield `Kept(Dirty)`, not an opaque \
+         non-unit type; got {joined:?}"
     );
 }
 
@@ -2315,7 +2307,7 @@ async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
     // the policy it actually recorded.
     std::fs::write(paths.worktree_dir.join("scratch.txt"), "never committed\n")
         .expect("write untracked file into the dispatched worktree");
-    dot_agent_deck::issue_dispatch_run::remove_worktree(
+    let _ = dot_agent_deck::issue_dispatch_run::remove_worktree(
         &paths.worktree_dir,
         &entry.clone_dir,
         entry.policy,

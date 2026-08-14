@@ -4837,28 +4837,50 @@ fn process_pending_orchestration_surfaces(
 
 /// PRD 236: surface every daemon-kept dispatched worktree queued by the event
 /// subscriber into [`AppState::pending_kept_worktrees`] — a worktree the
-/// close-time cleanup left in place (dirty, or a status probe that itself
-/// failed) rather than removing. Drains the WHOLE queue every frame (unlike
-/// [`process_pending_orchestration_surfaces`], each entry here is just a
-/// string push into `ui.session_warnings` — no bounded daemon round-trip, so
-/// there is no per-frame cost to cap).
+/// close-time cleanup left in place (dirty, a status probe that itself
+/// failed, or a removal that itself failed) rather than removing. Drains the
+/// WHOLE queue every frame (unlike [`process_pending_orchestration_surfaces`],
+/// each entry here is just a string push into `ui.session_warnings` — no
+/// bounded daemon round-trip, so there is no per-frame cost to cap).
 fn process_pending_kept_worktrees(state: &SharedState, ui: &mut UiState) {
+    // S2: cheap READ-lock peek, mirroring `process_pending_orchestration_surfaces`
+    // four lines up (PRD 236 review N1) — the steady-state idle cost is one
+    // read lock + is_empty, not the exclusive write lock the drain needs,
+    // taken every frame just to find the queue empty and contending with the
+    // event subscriber's own writes into this same state.
+    if state.blocking_read().pending_kept_worktrees.is_empty() {
+        return;
+    }
     let notices = {
         let mut st = state.blocking_write();
         if st.pending_kept_worktrees.is_empty() {
-            return;
+            return; // a concurrent path drained it between the peek and here
         }
         std::mem::take(&mut st.pending_kept_worktrees)
     };
+    let now = std::time::Instant::now();
     for notice in notices {
         let reason = match notice.reason {
-            crate::event::KeptReason::Dirty => "it has uncommitted or untracked changes",
-            crate::event::KeptReason::ProbeError => {
-                "its status could not be checked (kept fail-safe)"
+            crate::event::KeptReason::Dirty => {
+                "it has uncommitted or untracked changes".to_string()
             }
+            crate::event::KeptReason::ProbeError => {
+                "its status could not be checked (kept fail-safe)".to_string()
+            }
+            crate::event::KeptReason::RemovalFailed => match &notice.error {
+                Some(error) => format!("removing it failed: {error}"),
+                None => "removing it failed".to_string(),
+            },
         };
-        ui.session_warnings
-            .push(format!("Worktree kept at {}: {reason}", notice.path));
+        let message = format!("Worktree kept at {}: {reason}", notice.path);
+        // PRD 236 review (item 3): visibility is the entire justification for
+        // keeping instead of force-removing — the ONLY prior reader of
+        // `session_warnings` is an `eprintln!` loop after `ratatui::restore()`
+        // (i.e. on quit), so without this the notice never reaches the user
+        // at the moment it actually happens. `status_message` is immediate;
+        // `session_warnings` still carries it through to exit.
+        ui.status_message = Some((message.clone(), now));
+        ui.session_warnings.push(message);
     }
 }
 
@@ -27436,6 +27458,7 @@ mod tests {
             .queue_kept_worktree(WorktreeKeptNotice {
                 path: kept_path.to_string(),
                 reason: KeptReason::Dirty,
+                error: None,
             });
 
         process_pending_kept_worktrees(&state, &mut ui);
