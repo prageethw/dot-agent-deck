@@ -3545,8 +3545,6 @@ without depending on the config struct API.
 - **Does not assert:** the pure liveness-toggle mechanism in isolation (covered generally by `prompt/pane-input/007`'s identical `emit_target` technique at spawn time); #424's own internal retry/backoff bookkeeping (out of scope by design, per the task's decoupling requirement); a genuinely dropped/lost re-assertion attempt distinct from a merely-deferred one (not constructible without the coder's implementation to compare against).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`002`).
 
-### Orchestration hydration
-
 #### orchestration/hydration
 
 ##### orchestration/hydration/001 — Renaming an orchestration in the local `.dot-agent-deck.toml` while its tab is live surfaces an on-screen drift warning naming the orchestration when the TUI reattaches to the still-running daemon (fork issue #314 / upstream #554).

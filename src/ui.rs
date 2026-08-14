@@ -3508,13 +3508,17 @@ pub fn resolve_orch_config_for_hydration(
 /// contract is unit-testable without standing up a hydration fixture.
 ///
 /// `config_present` is `true` when the local `.dot-agent-deck.toml`
-/// loaded successfully (`cfg.is_some()` at the call site); `local_found`
+/// loaded successfully (`cfg.is_some()` at the call site) — `lookup_config`
+/// collapses BOTH an absent file and an unparseable one to `None`, so
+/// `config_present == false` covers both, not only "absent". `local_found`
 /// is `true` when that config lists an orchestration by this name. Only
 /// `config_present && !local_found` — the file parses but no longer
 /// lists the orchestration, i.e. a rename/removal drifted out from under
-/// a live tab — is a warning. `!config_present` is the legitimate
-/// PRD #111 remote-reconnect case and must stay silent regardless of
-/// `local_found`.
+/// a live tab — is a warning. `!config_present` covers the legitimate
+/// PRD #111 remote-reconnect case (file genuinely absent) as well as an
+/// unparseable local file, and must stay silent regardless of
+/// `local_found` in both cases; warning on the parse-error case is
+/// tracked separately by fork issue #320.
 fn hydration_drift_warning(
     config_present: bool,
     local_found: bool,
@@ -3522,9 +3526,16 @@ fn hydration_drift_warning(
     cwd: &str,
 ) -> Option<String> {
     if config_present && !local_found {
+        // Fork issue #314 reviewer F1: the status bar is one unwrapped row,
+        // so the actionable clause has to come before the cwd — otherwise
+        // truncation eats the part that tells the user what happened and
+        // leaves only the least useful part (the path) visible. The
+        // contract substring below ("orchestration '<name>' not found in
+        // local config") must stay verbatim and leading — it's what
+        // `hydration/001` asserts on.
         Some(format!(
-            "Warning: orchestration '{name}' not found in local config for {cwd}; \
-             rebuilt this tab from the live daemon's roles instead of your project config"
+            "Warning: orchestration '{name}' not found in local config; \
+             rebuilt this tab from the live daemon, not your project config ({cwd})"
         ))
     } else {
         None
@@ -11593,6 +11604,24 @@ pub fn run_tui(
                     .find(|o| o.name == bucket.orchestration_name)
                     .cloned()
             });
+            // Fork issue #314 reviewer F2: computed here, above the
+            // `if local_orch_config.is_none()` block below, so BOTH
+            // parameters stay live. Computed inside that block (as
+            // before), the call site itself statically fixes both —
+            // `cfg.is_some()` is always true inside its `else`, and
+            // `local_found` was a hardcoded `false` — so
+            // `hydration_drift_warning` could never return `None` in
+            // production regardless of what its body does; a unit test on
+            // the pure function can't see that, since it can't observe its
+            // caller. Hoisting makes this call site the single decision
+            // point instead of restating the decision the `if` below
+            // already made.
+            let drift_warning = hydration_drift_warning(
+                cfg.is_some(),
+                local_orch_config.is_some(),
+                &bucket.orchestration_name,
+                &bucket.cwd,
+            );
             // PRD #111: when the local project config file can't be
             // resolved (laptop TUI reconnecting to a VM daemon whose
             // `bucket.cwd` doesn't exist locally) or the local file
@@ -11633,12 +11662,31 @@ pub fn run_tui(
                     // path uses: the exit-time session warning and the
                     // in-session status line (the latter is what a
                     // still-attached user actually sees).
-                    if let Some(msg) = hydration_drift_warning(
-                        cfg.is_some(),
-                        false,
-                        &bucket.orchestration_name,
-                        &bucket.cwd,
-                    ) {
+                    //
+                    // Reviewer F4: when several orchestrations drift in
+                    // the same hydration pass, this loop overwrites
+                    // `ui.status_message` on every iteration, so only the
+                    // LAST drifted orchestration's warning is visible
+                    // in-session; every one of them is still preserved in
+                    // `ui.session_warnings` and reaches the user at exit.
+                    // Deliberate, matching the precedent already set by
+                    // the single-slot-status / multi-item-warnings split
+                    // used elsewhere in this function (e.g. the
+                    // snapshot-restore loop below) rather than an
+                    // oversight here.
+                    //
+                    // The 15s `STATUS_MESSAGE_TTL` clock starts at the
+                    // `Instant::now()` below, before the (mutually
+                    // exclusive, but still later-running) snapshot-restore
+                    // block and the first draw. A restore slow enough to
+                    // eat 15s could in principle expire the message before
+                    // it is ever rendered. Documenting rather than fixing:
+                    // a restore taking anywhere near 15s would itself be
+                    // the user-visible problem, and deferring this
+                    // timestamp would mean threading it through the
+                    // hydration/restore split for a case that has never
+                    // been observed.
+                    if let Some(msg) = drift_warning {
                         ui.session_warnings.push(msg.clone());
                         ui.status_message = Some((msg, std::time::Instant::now()));
                     }
@@ -22580,8 +22628,9 @@ mod tests {
     /// Fork issue #314: `hydration_drift_warning`'s truth table. Only the
     /// "config parses but no longer lists this orchestration" case (a
     /// rename/removal drifted out from under a live tab) should warn;
-    /// the PRD #111 remote-reconnect case (`config_present = false`)
-    /// and the found case must both stay silent.
+    /// `config_present = false` (the PRD #111 remote-reconnect case OR an
+    /// unparseable local file — fork issue #320) and the found case must
+    /// both stay silent.
     #[test]
     fn hydration_drift_warning_truth_table() {
         // config present, orchestration not found -> warns, names both
@@ -22593,8 +22642,10 @@ mod tests {
             "warning must carry the exact contract substring, got: {warning:?}"
         );
 
-        // config absent (legitimate remote reconnect, PRD #111) -> silent
-        // regardless of local_found.
+        // config_present=false — covers both the legitimate remote
+        // reconnect (PRD #111, file genuinely absent) and an unparseable
+        // local file (fork issue #320 tracks warning on that case
+        // separately) -> silent regardless of local_found.
         assert_eq!(
             hydration_drift_warning(false, false, "demo-orch", "/remote/proj"),
             None,
@@ -22603,7 +22654,7 @@ mod tests {
         assert_eq!(
             hydration_drift_warning(false, true, "demo-orch", "/remote/proj"),
             None,
-            "config_present=false must stay silent even if local_found were true"
+            "config_present=false (absent or unparseable) must stay silent even if local_found were true"
         );
 
         // config present, orchestration found -> silent (not the drift
