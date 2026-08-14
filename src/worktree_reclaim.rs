@@ -39,7 +39,20 @@ use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_
 
 /// Version of the `--json` document shape. Bump on a field removal or a
 /// meaning change; additive fields don't need a bump.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped to 2 by PRD fork#298 (review F1 / audit, and issue #230's own
+/// suggested direction): `owner` is an EXISTING field whose meaning changed,
+/// not merely a sibling that gained a field. Before, `owner` was `Some` only
+/// for a deck-created worktree whose marker held a readable `created-by:`
+/// line — proof-backed, marker-only. After, it is also
+/// `Some("human:<login>@<host>")` for a worktree with no marker at all
+/// (`owned: false`), so a consumer doing `.worktrees[] | select(.owner !=
+/// null)` to enumerate deck-created worktrees now gets every hand-made
+/// worktree on the machine too, with no version signal that anything
+/// changed. `warnings` and `owner_kind`, added in the same PRD, are additive
+/// and need no bump on their own; `owner`'s meaning change is what forces
+/// this one.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
 /// in the worktree's OWN git metadata dir (`<repo>/.git/worktrees/<name>/`,
@@ -119,9 +132,21 @@ pub enum WorktreeOwner {
 }
 
 impl WorktreeOwner {
+    /// PRD fork#298 (review F9): all three accessors below are `pub`, not
+    /// `pub(crate)` or private, to match this enum's own `pub` visibility.
+    /// Before this fix, `WorktreeOwner` was `pub` in a library crate while
+    /// `kind()` and `identity_string()` were private and `resolve_worktree_owner`
+    /// (the only constructor reachable from outside this module) was also
+    /// private -- an external consumer of `dot_agent_deck::worktree_reclaim`
+    /// could name the type and match on it but never obtain one or read
+    /// anything useful from it, a visibility the module did not actually
+    /// keep. Made genuinely usable rather than narrowed to `pub(crate)`,
+    /// consistent with the PRD's own framing: reporting gains a three-state
+    /// owner, not a three-state owner gains reporting.
+    ///
     /// The `owner_kind` value serialized into [`WorktreeReport`] —
     /// `"agent"` / `"human"` / `"unknown"`.
-    fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             WorktreeOwner::Agent { .. } => "agent",
             WorktreeOwner::Human { .. } => "human",
@@ -134,11 +159,25 @@ impl WorktreeOwner {
     /// report" meaning. A `Human` renders as `human:<login>@<host>`,
     /// matching `issue_dispatch::Identity::Human`'s own `Display` exactly,
     /// so the two subsystems render an identity the same way.
-    fn identity_string(&self) -> Option<String> {
+    pub fn identity_string(&self) -> Option<String> {
         match self {
             WorktreeOwner::Agent { identity } => Some(identity.clone()),
             WorktreeOwner::Human { login, host } => Some(format!("human:{login}@{host}")),
             WorktreeOwner::Unknown { .. } => None,
+        }
+    }
+
+    /// The stated reason `owner` is absent, for `Unknown` only -- `None` for
+    /// `Agent`/`Human`, which need no explaining. Surfaces the discriminator
+    /// the three `*_UNKNOWN_REASON` constants already compute at
+    /// construction (review F3 / audit F2): before this accessor existed,
+    /// `reason` was written three times and read zero times, so the PRD's
+    /// "`Unknown` with a stated reason, never a silent blank" was not
+    /// delivered on any surface -- see [`WorktreeReport::owner_reason`].
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            WorktreeOwner::Unknown { reason } => Some(reason),
+            WorktreeOwner::Agent { .. } | WorktreeOwner::Human { .. } => None,
         }
     }
 }
@@ -177,17 +216,17 @@ fn resolve_worktree_owner(
         Some(git_dir) => {
             let marker_path = git_dir.join(OWNER_MARKER_FILENAME);
             if marker_path.is_file() {
-                // Reuses `owner_of` (which itself reuses `read_marker_owner`
-                // -- no second parser) rather than reading the marker again
-                // here directly: a THIRD independent `owned_git_dir`
-                // resolution per worktree, on top of `ownership_of`'s and
-                // this function's own above, but it keeps exactly one
-                // function responsible for "what does this worktree's
-                // marker say", matching this module's existing tolerance
-                // for redundant independent resolutions over a shared,
-                // stateful one (see `owner_of`'s own doc on why
-                // `ownership_of` and `owner_of` already do this).
-                match owner_of(repo_dir, worktree_path) {
+                // Reads the marker directly via `read_marker_owner` rather
+                // than going through `owner_of` (review F2 / audit F3):
+                // `owner_of` would re-resolve `owned_git_dir` a THIRD
+                // independent time per worktree -- on top of `ownership_of`'s
+                // and this function's own above -- widening the fork #166 P2
+                // flip window from four `git rev-parse` spawns to six. The
+                // git-dir above is already containment-checked, so the exact
+                // directory that passed containment is the directory
+                // `read_marker_owner` reads from -- no weaker than routing
+                // through `owner_of`, and strictly narrower.
+                match read_marker_owner(&marker_path) {
                     Some(identity) => WorktreeOwner::Agent { identity },
                     None => WorktreeOwner::Unknown {
                         reason: LEGACY_MARKER_UNKNOWN_REASON,
@@ -328,6 +367,16 @@ pub struct WorktreeReport {
     /// #231) — omitted from JSON entirely rather than serialized as `null`,
     /// mirroring `reason` above, so an older client reading this document
     /// still round-trips cleanly.
+    ///
+    /// PRD fork#298 (audit Focus 4 / F4): this is a display string spanning
+    /// TWO namespaces (a marker's free-form `created-by:` value, or a
+    /// synthesised `human:<login>@<host>`) and is NOT authenticated — anyone
+    /// with write access to a worktree's admin dir can plant a marker
+    /// reading `created-by: human:alice@laptop`, producing `owner:
+    /// "human:alice@laptop"` alongside `owner_kind: "agent"`. `owner_kind`
+    /// is the only field a consumer may branch on; nothing in this crate
+    /// prefix-matches `owner` today, and the point of this note is to keep
+    /// it that way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// The three-state owner's kind (PRD fork#298 M2.0) — `"agent"` /
@@ -338,6 +387,19 @@ pub struct WorktreeReport {
     /// (`owned` above), so a `Human`-owned worktree can never become
     /// removable by a bare `reclaim`.
     pub owner_kind: String,
+    /// Why `owner_kind` is `"unknown"` (review F3 / audit F2) — `None` for
+    /// `Agent`/`Human`, which need no explaining. Additive (same
+    /// justification as `owner_kind`; no `SCHEMA_VERSION` bump needed for
+    /// this field alone). Before this field existed, [`WorktreeOwner::Unknown`]'s
+    /// `reason` was computed at construction and discarded by every
+    /// consumer, so three genuinely distinct causes — a benign legacy
+    /// marker, `gh` absent/unauthenticated, and an unverifiable (possibly
+    /// forged, per `worktree/reclaim/014`) git-dir — all rendered
+    /// identically as `owner_kind: "unknown"` with nothing to tell them
+    /// apart. This is the PRD's own stated M1.0 property ("`Unknown` with a
+    /// stated reason, never a silent blank") actually reaching a surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_reason: Option<String>,
     /// The worktree's real, byte-exact path (issue #144 finding 4) — never
     /// serialized; `path` above (`to_string_lossy`) is what the JSON document
     /// and the human report show. [`run_reclaim`] passes THIS to
@@ -359,10 +421,23 @@ pub struct WorktreeReport {
 /// disagreement into indistinguishable-from-"nothing found", which is worse
 /// than surfacing it. Callers use this to warn on stderr before filtering,
 /// never to change what gets filtered.
+///
+/// PRD fork#298 (review F11 / audit F1): `owned=false && owner.is_some()` is
+/// no longer sufficient evidence of a disagreement on its own. Before, every
+/// non-`None` `owner` came from a marker, so the predicate really did mean
+/// "a marker names this owner, yet the independent authority check says
+/// foreign". Now `owner` can also be a `Human` resolution
+/// (`WorktreeOwner::Human`) for an ordinary, working-as-designed hand-made
+/// worktree -- CLAUDE.md rule 1's dominant real path, and every such row is
+/// `owned: false` by construction -- which is the MAJORITY of worktrees in
+/// this repo, not an anomaly. Restricted to `owner_kind == "agent"` (the
+/// only kind a marker can produce) so this stays what its name says: a
+/// genuine disagreement between two resolutions of the same marker-backed
+/// claim, never a human row's ordinary, unmarked state.
 pub fn owner_disagreements<'a>(reports: &'a [WorktreeReport], owner: &str) -> Vec<&'a Path> {
     reports
         .iter()
-        .filter(|r| !r.owned && r.owner.as_deref() == Some(owner))
+        .filter(|r| !r.owned && r.owner_kind == "agent" && r.owner.as_deref() == Some(owner))
         .map(|r| r.real_path.as_path())
         .collect()
 }
@@ -409,23 +484,34 @@ pub fn format_disagreement_warning(path: &Path, owner: &str) -> String {
 }
 
 /// Formats the fork issue #231 warning for a row `--mine` excludes because
-/// it is `owned: true` but carries no marker identity (`owner: None`) — most
-/// often a legacy pre-fork#166 marker (the bare `"deck\n"` content with no
-/// `created-by:` line, `owner_kind: "unknown"` as of PRD fork#298). Distinct
-/// from [`format_disagreement_warning`]'s #221 case: there `owned` and
-/// `owner` actively disagree; here `owned` is true and `owner` is simply
-/// absent, so nothing here signals forgery or a race, only that this row
-/// cannot be matched to any specific caller. Deliberately NOT also printed
-/// to stderr per-row (unlike the #221 warning above) — issue #231's own doc
-/// notes a blanket per-row stderr warning here would fire on every legacy
-/// worktree, every time, for a state that is working as designed; the
-/// `--json` document is where a consumer can decide, without a human
-/// terminal being spammed. `path` is display-only, sanitized the same way.
+/// it is `owned: true` but carries no marker identity (`owner: None`,
+/// `owner_kind: "unknown"`). Distinct from [`format_disagreement_warning`]'s
+/// #221 case: there `owned` and `owner` actively disagree; here `owned` is
+/// true and `owner` is simply absent, so nothing here signals forgery or a
+/// race, only that this row cannot be matched to any specific caller.
+///
+/// PRD fork#298 (review F3 / audit F2): this used to name a single likely
+/// cause here ("often a legacy pre-fork#166 marker"), but `owner_kind:
+/// "unknown"` with `owned: true` collapses several distinct states —
+/// including a marker deliberately grown past `MARKER_READ_MAX_BYTES` or
+/// written as invalid UTF-8, both plantable by the same admin-dir writer
+/// that can plant a genuine legacy marker — and asserting one of them as the
+/// likely cause is a confident wrong answer for the others. The `--json`
+/// document's `owner_reason` field (added in the same PRD) carries the
+/// actual resolved reason for a consumer that wants to distinguish them;
+/// this stderr line stays deliberately non-committal.
+///
+/// Deliberately NOT also printed to stderr per-row (unlike the #221 warning
+/// above) — issue #231's own doc notes a blanket per-row stderr warning here
+/// would fire on every legacy worktree, every time, for a state that is
+/// working as designed; the `--json` document is where a consumer can
+/// decide, without a human terminal being spammed. `path` is display-only,
+/// sanitized the same way.
 pub fn format_excluded_unknown_owner_warning(path: &Path) -> String {
     format!(
         "worktree list --mine: {path} is deck-owned (owned: true) but carries no identifiable \
-         marker owner (often a legacy pre-fork#166 marker, owner_kind: \"unknown\") -- excluding \
-         it from --mine rather than guessing whether it is yours",
+         marker owner (owner_kind: \"unknown\" -- see the --json document's owner_reason for \
+         why) -- excluding it from --mine rather than guessing whether it is yours",
         path = sanitize_path_for_terminal_display(path)
     )
 }
@@ -438,11 +524,13 @@ pub struct WorktreeListDocument {
     /// Machine-readable warnings a `--mine --json` consumer would otherwise
     /// never see (fork issues #230, #231) — additive, so `SCHEMA_VERSION`
     /// does not need a bump (per this file's own doc: "additive fields don't
-    /// need a bump"). Empty for a plain `worktree list --json` with no
-    /// `--mine` filtering: nothing has been excluded from the document, so
-    /// there is nothing to warn about. Reporting-only, exactly like
-    /// `owner_kind` — never changes which rows `--mine` retains.
-    #[serde(default)]
+    /// need a bump"). Carries no `skip_serializing_if`, so EVERY `worktree
+    /// list --json` document now carries a `"warnings":[]` key, including a
+    /// plain non-`--mine` run where nothing has been excluded and there is
+    /// nothing to warn about — a consumer can read the key unconditionally
+    /// rather than treating its absence as meaningful. Reporting-only,
+    /// exactly like `owner_kind` — never changes which rows `--mine`
+    /// retains.
     pub warnings: Vec<String>,
 }
 
@@ -825,19 +913,34 @@ fn read_marker_owner(marker_path: &Path) -> Option<String> {
 /// marker happens to read back a matching identity is excluded rather
 /// than reported as mine.
 ///
-/// [`examine_worktrees`] calls this immediately after [`ownership_of`], with
-/// no I/O of any kind — no `gh` call, no other filesystem work — in between,
-/// specifically so the two independent [`owned_git_dir`] resolutions they
-/// each perform sit back-to-back rather than spanning the seconds-wide `gh`
-/// network call that used to separate them (reviewer F5). That is a
-/// narrowed window, not a closed one: each [`owned_git_dir`] call spawns two
-/// `git rev-parse` subprocesses ([`resolve_git_dir`] and
-/// [`resolve_common_dir`]), so the two back-to-back calls here span **four**
-/// spawns, not two, and the window is wide enough that the auditor measured
-/// a hostile flipper winning it 54 of 120 times (45%). Collapsing them into
-/// one evaluation would need `owner_of`'s public signature to change to
-/// accept an already-resolved git-dir, which would also change what
-/// `worktree/reclaim/017`–`022` call — out of scope for this round.
+/// PRD fork#298 (review F2 / audit F3): [`examine_worktrees`] no longer
+/// calls this function at all, directly or indirectly. It calls
+/// [`resolve_worktree_owner`], which -- once its OWN [`owned_git_dir`]
+/// resolution has containment-checked the git-dir -- reads the marker via
+/// [`read_marker_owner`] directly rather than routing back through this
+/// function, so a THIRD independent [`owned_git_dir`] resolution is not
+/// spent per marked worktree. What [`examine_worktrees`] actually gets is
+/// [`ownership_of`]'s resolution immediately followed by
+/// [`resolve_worktree_owner`]'s own, with no I/O of any kind — no `gh` call,
+/// no other filesystem work — in between, for a MARKED worktree: each
+/// [`owned_git_dir`] call spawns two `git rev-parse` subprocesses
+/// ([`resolve_git_dir`] and [`resolve_common_dir`]), so those two
+/// back-to-back calls span **four** spawns, not two, restoring the original
+/// window the auditor measured a hostile flipper winning 54 of 120 times
+/// (45%) — not narrowing it further, but not widening it either. The `gh api
+/// user` call [`resolve_worktree_owner`] may make sits in the
+/// mutually-exclusive NO-marker branch, so the original fork #166 P2 worst
+/// case — a seconds-wide network round trip landing between the two
+/// resolutions — is not reintroduced by any of this.
+///
+/// This function remains available as a direct, single-worktree marker
+/// lookup for callers that have not already containment-checked a git-dir of
+/// their own — its own test suite, and `ui.rs`'s marker-content assertions.
+/// `#[cfg(test)]` because, as of the [`resolve_worktree_owner`] fix above,
+/// those two test call sites are its only remaining callers; a production
+/// build with no test callers left it as a genuine dead-code warning under
+/// `-D warnings`.
+#[cfg(test)]
 pub(crate) fn owner_of(repo_dir: &Path, worktree_path: &Path) -> Option<String> {
     let git_dir = owned_git_dir(repo_dir, worktree_path)?;
     read_marker_owner(&git_dir.join(OWNER_MARKER_FILENAME))
@@ -1162,14 +1265,16 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 ///
 /// PR state is resolved against each candidate's OWN path (`wt.path`), never
 /// `repo_dir` (the caller's cwd), consistently with `check_cleanliness(&wt.path)`
-/// and `ownership_of(repo_dir, &wt.path)` / `owner_of(repo_dir, &wt.path)`:
-/// every per-worktree property is read from the worktree it describes
-/// (`repo_dir` is still threaded into both — not as the thing being
-/// described, but as the enumerating repo whose common dir the worktree's
-/// admin dir must sit under; see `owned_git_dir`'s doc comment). `owner_of`
-/// is called immediately after `ownership_of`, with no other work — no `gh`
-/// call, no other I/O — in between; see `owner_of`'s doc comment for why
-/// that ordering matters (reviewer F5). One concrete case this affects:
+/// and `ownership_of(repo_dir, &wt.path)` / `resolve_worktree_owner(repo_dir,
+/// &wt.path, ..)`: every per-worktree property is read from the worktree it
+/// describes (`repo_dir` is still threaded into both — not as the thing
+/// being described, but as the enumerating repo whose common dir the
+/// worktree's admin dir must sit under; see `owned_git_dir`'s doc comment).
+/// `resolve_worktree_owner` is called immediately after `ownership_of` (PRD
+/// fork#298 review F2 / audit F3 — `owner_of` is NOT the function in this
+/// sequence any more; see its own doc comment for why, and for the real
+/// spawn count and which branch may still make a `gh` call). One concrete
+/// case this affects:
 /// `remote.<name>.url` is a list-accumulating git config variable, and `git
 /// remote get-url` (called by [`derive_repo_slug`]) returns only the first
 /// value, so a worktree-scoped `origin` set via `extensions.worktreeConfig`
@@ -1215,6 +1320,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         let resolved_owner = resolve_worktree_owner(repo_dir, &wt.path, &mut human_owner_cache);
         let owner = resolved_owner.identity_string();
         let owner_kind = resolved_owner.kind().to_string();
+        let owner_reason = resolved_owner.reason().map(str::to_string);
         let pr_state = match &wt.branch {
             Some(branch) => resolve_pr_state(&wt.path, branch),
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
@@ -1240,6 +1346,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             verdict: verdict.label().to_string(),
             owner,
             owner_kind,
+            owner_reason,
             real_path,
         });
     }
@@ -1598,6 +1705,7 @@ mod tests {
             // as the comment above, updated only so this pre-existing test
             // keeps compiling.
             owner_kind: "unknown".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -1605,7 +1713,7 @@ mod tests {
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["schema_version"], 2);
         assert!(json.contains("wt-a"));
     }
 
@@ -2389,6 +2497,7 @@ mod tests {
                 owned: true,
                 owner: Some("orchestration:owner-x".to_string()),
                 owner_kind: "agent".to_string(),
+                owner_reason: None,
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
@@ -2401,6 +2510,7 @@ mod tests {
                 owned: true,
                 owner: None,
                 owner_kind: "unknown".to_string(),
+                owner_reason: None,
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
@@ -2469,6 +2579,7 @@ mod tests {
             owned: false,
             owner: Some("orch-x".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
@@ -2481,6 +2592,7 @@ mod tests {
             owned: true,
             owner: Some("orch-x".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2493,6 +2605,7 @@ mod tests {
             owned: true,
             owner: Some("orch-y".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2511,6 +2624,7 @@ mod tests {
             owned: false,
             owner: Some("orch-y".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
@@ -2523,6 +2637,7 @@ mod tests {
             owned: false,
             owner: None,
             owner_kind: "human".to_string(),
+            owner_reason: None,
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
@@ -2698,6 +2813,7 @@ mod tests {
             owned: true,
             owner: Some("test-owner".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -2741,6 +2857,7 @@ mod tests {
             owned: false,
             owner: None,
             owner_kind: "human".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "ask".to_string(),
             reason: Some(
@@ -2787,6 +2904,7 @@ mod tests {
             owned: true,
             owner: Some("test-owner".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -2830,6 +2948,7 @@ mod tests {
             owned: true,
             owner: Some("test-owner".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
@@ -2880,6 +2999,7 @@ mod tests {
             owned: true,
             owner: Some("test-owner".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
@@ -3017,6 +3137,7 @@ mod tests {
             owned: true,
             owner: Some("test-owner".to_string()),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
@@ -3064,6 +3185,7 @@ mod tests {
             owned: false,
             owner: None,
             owner_kind: "unknown".to_string(),
+            owner_reason: None,
             pr_state: "unresolvable".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason),
@@ -3133,6 +3255,7 @@ mod tests {
             owned: true,
             owner: Some(owner),
             owner_kind: "agent".to_string(),
+            owner_reason: None,
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
