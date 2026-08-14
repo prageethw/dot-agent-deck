@@ -467,10 +467,11 @@ async fn apply_broadcast(state: &SharedState, msg: BroadcastMsg) {
         BroadcastMsg::OrchestrationSurface(surface) => {
             state.write().await.queue_orchestration_surface(surface)
         }
-        // Issue #717: a close left a dispatched worktree on disk. Queue it
-        // for the render loop for the same reason as the surface above — the
-        // status line is `UiState`, which this task cannot touch.
-        BroadcastMsg::WorktreeKept(kept) => state.write().await.queue_worktree_kept(kept),
+        // Issue #717 / PRD 236: a dispatched worktree the daemon kept on tab
+        // close. Queue it for the render loop the same way as the surface
+        // above — the subscriber task can't touch `ui.session_warnings`
+        // either, that's render-loop-local state.
+        BroadcastMsg::WorktreeKept(notice) => state.write().await.queue_kept_worktree(notice),
     }
 }
 

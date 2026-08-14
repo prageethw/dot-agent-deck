@@ -795,6 +795,30 @@ impl EventSubscription {
                                 }
                             }
                         }
+                        // PRD 236 review: sanitize the kept-worktree path at
+                        // the same wire boundary `OrchestrationSurface` is
+                        // validated at, above — it crosses the wire
+                        // unvalidated and, per `process_pending_kept_worktrees`
+                        // (`ui.rs`), is `eprintln!`'d straight to the
+                        // terminal after `ratatui::restore()` with no other
+                        // sanitization on that path.
+                        Ok(BroadcastMsg::WorktreeKept(notice)) => {
+                            return Ok(Some(BroadcastMsg::WorktreeKept(
+                                crate::event::WorktreeKeptNotice {
+                                    path:
+                                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                                            Path::new(&notice.path),
+                                        ),
+                                    reason: notice.reason,
+                                    // Same terminal-display hazard as `path` above
+                                    // (raw `git` stderr, ultimately from the
+                                    // worktree/filesystem) — sanitize it too.
+                                    error: notice.error.as_deref().map(
+                                        crate::terminal_sanitize::sanitize_for_terminal_display,
+                                    ),
+                                },
+                            )));
+                        }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {
                             return Err(io::Error::new(
