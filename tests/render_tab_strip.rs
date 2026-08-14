@@ -226,10 +226,9 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
 /// ordinary tab, not `Color::DarkGray` (PRD #333 defect B, unchanged), and
 /// that an INACTIVE orchestration tab with a non-idle (`Error`) aggregate
 /// status still colors its label text as today, with neither `REVERSED` nor
-/// `BOLD` (regression guard, unchanged). RED today: the active branch still
-/// applies `Modifier::REVERSED | Modifier::BOLD` with no status `fg` tint at
-/// all, so it carries neither the expected Red `fg` nor `UNDERLINED`, and
-/// still carries `REVERSED`.
+/// `BOLD` nor `UNDERLINED` — pinning the active cue from both sides, so an
+/// inactive tab can never become indistinguishable from an active one
+/// (reviewer finding F3 on PR #307/issue #306).
 #[spec("tabs/orchestration/010")]
 #[test]
 fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
@@ -288,9 +287,11 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
          same base label color as an ordinary tab, not DarkGray"
     );
 
-    // Case 3 (no regression): an INACTIVE orchestration tab with a non-idle
-    // (Error) aggregate status still colors its label text, exactly as
-    // today, with neither REVERSED nor BOLD.
+    // Case 3 (no regression, and F3: pin the inactive side of the active
+    // cue): an INACTIVE orchestration tab with a non-idle (Error) aggregate
+    // status still colors its label text, exactly as today, with neither
+    // REVERSED nor BOLD nor UNDERLINED — so the UNDERLINED cue that marks a
+    // tab active (case 1) cannot leak onto an inactive one.
     let err_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
@@ -306,8 +307,10 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
     let inactive_modifier = tab_label_modifier(&err_buf, "squad");
     assert!(
         !inactive_modifier.contains(Modifier::REVERSED)
-            && !inactive_modifier.contains(Modifier::BOLD),
-        "an inactive orchestration tab must carry neither REVERSED nor BOLD, got {inactive_modifier:?}"
+            && !inactive_modifier.contains(Modifier::BOLD)
+            && !inactive_modifier.contains(Modifier::UNDERLINED),
+        "an inactive orchestration tab must carry neither REVERSED nor BOLD nor UNDERLINED, got \
+         {inactive_modifier:?}"
     );
 }
 
