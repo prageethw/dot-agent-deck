@@ -3929,7 +3929,7 @@ exit 0
         } else {
             worktree_dir.join(git_dir_raw)
         };
-        let marker_path = git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME);
+        let marker_path = git_dir.join(crate::worktree_owner::OWNER_MARKER_FILENAME);
         std::fs::remove_file(&marker_path)
             .expect("the marker file must exist after a successful mark");
         std::fs::create_dir(&marker_path)

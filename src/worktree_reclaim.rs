@@ -1740,6 +1740,8 @@ mod tests {
             verdict: "ask".to_string(),
             reason: Some("reclaimable".to_string()),
             owner: None,
+            owner_kind: "unknown".to_string(),
+            owner_reason: None,
         }
     }
 
