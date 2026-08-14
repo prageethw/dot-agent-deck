@@ -828,6 +828,47 @@ pub enum BroadcastMsg {
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
     #[serde(rename = "orchestration_surface")]
     OrchestrationSurface(OrchestrationSurface),
+    /// PRD #236: a dispatched worktree the daemon KEPT on tab close instead of
+    /// removing (uncommitted work, or a status probe that itself failed) — see
+    /// [`crate::issue_dispatch_run::RemoveOutcome`]. The close handler runs
+    /// detached from the close response (`daemon_protocol.rs`), and the pane
+    /// that triggered it may already be gone by the time the outcome is known,
+    /// so this is a deck-level broadcast rather than a reply riding the close
+    /// response itself — every attached TUI gets it, not just the one that
+    /// closed the tab.
+    ///
+    /// Adding this variant changes the `KIND_EVENT` payload schema the same way
+    /// [`BroadcastMsg::OrchestrationSurface`] did, so it too bumps
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
+    #[serde(rename = "worktree_kept")]
+    WorktreeKept(WorktreeKeptNotice),
+}
+
+/// PRD #236: payload for [`BroadcastMsg::WorktreeKept`] — a dispatched worktree
+/// the daemon left on disk instead of removing on tab close, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeKeptNotice {
+    /// Absolute path of the retained worktree, exactly as recorded in the
+    /// daemon's [`crate::issue_dispatch_run::WorktreeRegistry`]. Named
+    /// explicitly rather than only logged server-side, so the user knows where
+    /// to go recover the work.
+    pub path: String,
+    /// Why the worktree was kept rather than removed.
+    pub reason: KeptReason,
+}
+
+/// Why [`remove_worktree`](crate::issue_dispatch_run::remove_worktree) left a
+/// worktree in place under [`RemovalPolicy::KeepIfDirty`](crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty)
+/// instead of removing it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeptReason {
+    /// `git status --porcelain` reported uncommitted or untracked changes.
+    Dirty,
+    /// The `git status --porcelain` probe itself failed (not a valid worktree,
+    /// `git` missing, etc.) — kept fail-safe: unknown is treated as dirty
+    /// rather than assumed clean.
+    ProbeError,
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,

@@ -116,19 +116,23 @@ pub struct WorktreeEntry {
 /// Whether a recorded worktree may be removed while it still holds
 /// uncommitted work.
 ///
-/// The two producers want opposite things, and both are right for their case:
-///
-/// * [`RemovalPolicy::Force`] — PRD #120 issue-dispatch. The worktree lives
-///   inside a daemon-owned `gh repo clone`, never a human checkout, and the
-///   reuse-the-vacated-slot model *depends* on the directory actually going
-///   away: `dispatch_decision` treats a present worktree as "issue already
-///   claimed", so a worktree left behind skips that issue on every later fire,
-///   permanently. Forcing is what keeps the slot reclaimable.
-/// * [`RemovalPolicy::KeepIfDirty`] — PRD #220 dispatch. The name is chosen by
-///   an LLM and the tree is a sibling of the user's own checkout, so Ctrl+W
-///   reads as "close this view", not "destroy uncommitted work". A leaked
-///   worktree costs disk; a force-removed one costs work, and that asymmetry
-///   decides it.
+/// PRD 236: both producers now record [`RemovalPolicy::KeepIfDirty`]. The
+/// split used to argue that PRD #120 issue-dispatch NEEDED `Force`, because
+/// `dispatch_decision` treats a present worktree as "issue already claimed" —
+/// a worktree left behind would skip that issue on every later fire,
+/// permanently. That argument was about *visibility*, not about removal: a
+/// kept worktree is only a dead end if nothing can ever see it or reclaim it
+/// again. `worktree/reclaim/046` pins that it is not — `worktree list --json`
+/// reports a kept, deck-marked `#120` worktree as `owned: true`, and once its
+/// dirtiness is resolved and its PR merges, a bare `worktree reclaim` frees the
+/// slot. So keeping is safe for #120 too: `dispatch_decision` still sees the
+/// path and still skips (correctly — the issue genuinely is claimed), and the
+/// operator gets a recoverable worktree instead of `Force` silently discarding
+/// whatever the agent had done. [`RemovalPolicy::Force`] remains for the ONE
+/// case that still needs it: `dispatch.rs`'s spawn-failure rollback, where the
+/// worktree is seconds old and the agent never ran, so there is no work to
+/// protect and a leftover dir/branch would wedge the name for every later
+/// dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalPolicy {
     /// Remove unconditionally (`--force`), discarding uncommitted changes.
@@ -199,18 +203,38 @@ pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bo
         .any(|r| worktree_of_record(r).as_deref() == Some(worktree_dir))
 }
 
+/// What [`remove_worktree`] actually did — the typed replacement for the `()`
+/// it used to return. A caller (the daemon's tab-close handler) needs this to
+/// tell "removed" from "kept", and — when kept — WHY, without re-probing the
+/// filesystem itself; see [`crate::event::WorktreeKeptNotice`], which carries
+/// the `Kept` reason across the wire to an attached TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// The worktree was removed (or a best-effort removal was attempted; `git
+    /// worktree remove` failing here is logged, not surfaced, matching the
+    /// function's existing best-effort contract for that branch).
+    Removed,
+    /// The worktree was left in place. Carries why — see
+    /// [`crate::event::KeptReason`].
+    Kept(crate::event::KeptReason),
+}
+
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
 /// <worktree>`), PRESERVING the clone. Best-effort: a non-zero exit (already
 /// removed, locked) or a spawn error is logged, not fatal — the tab is already
 /// gone.
 ///
 /// `policy` decides what happens when the worktree still holds uncommitted work
-/// — see [`RemovalPolicy`] for why the two producers need opposite answers.
-/// Under [`RemovalPolicy::KeepIfDirty`] a dirty tree (or a status probe that
-/// fails, so dirtiness is unknown) is left in place and logged; under
-/// [`RemovalPolicy::Force`] the tree is removed regardless, which is what keeps
-/// PRD #120's vacated slot reclaimable.
-pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: RemovalPolicy) {
+/// — see [`RemovalPolicy`] for why the two producers used to need opposite
+/// answers. Under [`RemovalPolicy::KeepIfDirty`] a dirty tree (or a status
+/// probe that fails, so dirtiness is unknown) is left in place, logged, and
+/// reported back as [`RemoveOutcome::Kept`]; under [`RemovalPolicy::Force`] the
+/// tree is removed regardless.
+pub async fn remove_worktree(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) -> RemoveOutcome {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
         let status = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await;
@@ -220,7 +244,7 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: Remo
                     worktree = %worktree_dir.display(),
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
-                return;
+                return RemoveOutcome::Kept(crate::event::KeptReason::Dirty);
             }
             Ok(_) => {}
             Err(e) => {
@@ -229,7 +253,7 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: Remo
                     error = %e,
                     "dispatch: could not check worktree status; leaving in place"
                 );
-                return;
+                return RemoveOutcome::Kept(crate::event::KeptReason::ProbeError);
             }
         }
     }
@@ -251,6 +275,7 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: Remo
             "issue-dispatch: worktree cleanup on close failed"
         ),
     }
+    RemoveOutcome::Removed
 }
 
 // ---------------------------------------------------------------------------
@@ -535,15 +560,18 @@ async fn dispatch_one_issue(
     // from a fast client) well before it returns, so recording after the spawn
     // would race a prompt close. The close watcher matches the agent to this
     // worktree by its record's cwd, not by an agent id we don't have yet.
-    // `RemovalPolicy::Force`: this worktree lives inside a daemon-owned clone,
-    // and the reuse-the-vacated-slot model depends on the directory actually
-    // going away on tab close — a tree left behind makes `dispatch_decision`
-    // skip the issue on every later fire. See [`RemovalPolicy`].
+    // PRD 236: `RemovalPolicy::KeepIfDirty`, not `Force` — a dirty worktree now
+    // survives tab close instead of being destroyed. `dispatch_decision` still
+    // sees the kept path and still skips the issue on every later fire (that
+    // part of the old reasoning was correct and unchanged); what changes is
+    // that the slot is no longer a silent dead end — `worktree list --json`
+    // reports it (`owned: true`) and a bare `worktree reclaim` frees it once
+    // the dirtiness is resolved and the PR merges. See [`RemovalPolicy`].
     record_worktree(
         worktrees,
         &paths.worktree_dir,
         clone_dir,
-        RemovalPolicy::Force,
+        RemovalPolicy::KeepIfDirty,
     );
 
     // M2.3 — spawn one agent into the worktree, delivering the substituted

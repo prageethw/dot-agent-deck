@@ -3318,6 +3318,14 @@ without depending on the config struct API.
 - **Does not assert:** the worktree's own removal (`KeepIfDirty` leaves a dirty one in place by design); the orchestration close path, where the last role's close is the cleanup trigger.
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close/002 — A dispatched worktree the daemon kept on tab close (instead of removing it) reaches the user naming WHERE it survives, not just that something was kept (PRD 236).
+- **Layer:** L1 (`process_pending_kept_worktrees` — the render-loop drain step — called directly against a `SharedState`/`UiState` pair; no PTY, no TestBackend render, no daemon).
+- **Agent:** none.
+- **Asserts:** with the pending-kept-worktrees queue empty, draining is a no-op (no spurious warning); after queuing a `WorktreeKeptNotice` the way the event subscriber does on a daemon `BroadcastMsg::WorktreeKept` (PRD 236 M1.1's typed `RemoveOutcome::Kept` reaching the wire), draining pushes a message into `ui.session_warnings` that contains the retained worktree's own path; and the queue is left empty afterward, so the same notice cannot be delivered twice.
+- **Why it exists:** PRD 236 unifies the two dispatch producers on `RemovalPolicy::KeepIfDirty` (`worktree/reclaim/045`/`046`), so a dispatched worktree with uncommitted work now survives Ctrl+W instead of being force-removed. That is only a real recovery path if the user can find the worktree afterward — a message saying only "a worktree was kept" with no path is exactly as useless as no message at all, since the daemon's own worktree-registry layout is not something a user is expected to know.
+- **Does not assert:** the daemon-side broadcast plumbing itself (`BroadcastMsg::WorktreeKept` construction, the `event_tx.send` in `daemon_protocol.rs`'s close handler, or the `apply_broadcast`/`queue_kept_worktree` hop that gets a notice from the wire into this queue) — those have no PTY/daemon harness in this fast-tier file; nor the exact rendered wording of `ui.session_warnings`'s eventual flush (unchanged, pre-existing `eprintln!` behavior).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
