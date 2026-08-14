@@ -1,6 +1,6 @@
 # PRD #91: Hook freshness check on TUI startup
 
-**Status**: Planning
+**Status**: In progress — one of the two reframed items has shipped. *(Status corrected 2026-08-14: this line read "Planning" after the 2026-06-14 reframe narrowed the PRD to two remaining items, and one of those two had since shipped. Reframed item 2 — "warn instead of clobber a corrupt `settings.json`", the PRD's own stated "one genuine, if small, data-loss risk" — is **done**: `load_settings_or_refuse` (`src/hooks_manage.rs:70-91`) backs a malformed `settings.json` up to `<path>.bak`, leaves the original bytes untouched, and returns `Err` so every install caller skips the write instead of collapsing the user's settings to `{}`; `auto_install` (`src/hooks_manage.rs:554-582`) consumes it correctly, logging and returning without writing on `Err`. Landed in `fafdd35d` — a commit about hook rule identification by command suffix, which mentions this PRD nowhere, first released `v0.37.2`. Reframed item 1 — "notify-on-change" — is **not shipped**: `auto_install()` still returns `()` and every outcome is `tracing`-only; nothing routes an install/refusal outcome into `ui.session_warnings`. That makes the refusal from item 2 safe but still invisible to the user, which is worth more now than when the reframe was written. Issue #91 stays open.)*
 **Priority**: Medium
 **Created**: 2026-05-17
 **GitHub Issue**: [#91](https://github.com/vfarcic/dot-agent-deck/issues/91)
