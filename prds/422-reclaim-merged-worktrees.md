@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status**: **Complete** — merged 2026-08-08 as [PR #131](https://github.com/prageethw/dot-agent-deck/pull/131) (`1090d6f`), first released in **v0.36.0**; upstream issue [#422](https://github.com/vfarcic/dot-agent-deck/issues/422) is closed. *(Status corrected 2026-08-12: this line still read "Not started" four days after the work had shipped — the most misleading of the four stale statuses, since it invited someone to start work that was already done.)*
+**Status** *(corrected 2026-08-14)*: **Merged, with two milestones genuinely open.** PR [#131](https://github.com/prageethw/dot-agent-deck/pull/131) (original merge commit `1090d6f`, superseded by a later fork-sync rebase; the equivalent commit on `main` today is `99badf3c`, confirmed by `git merge-base --is-ancestor`) merged 2026-08-08, first released in **v0.36.0**; upstream issue [#422](https://github.com/vfarcic/dot-agent-deck/issues/422) is closed. M1, M2.0, M2.1 and M2.3 are done and verified in source. **M2.2 shipped only its non-interactive half**: named paths and a copy-ready `--yes` command exist, but `Mode::CloseConfirm`/`CloseConfirmState` were never reused, and no interactive reclaim surface exists in `src/ui.rs`. **M3.0 has not shipped**: `git grep -i 'worktree reclaim\|worktree-reclaim' CLAUDE.md` returns nothing, and the orchestrator's post-merge protocol is not wired to the command — CLAUDE.md rule 1 still names the manual `git worktree remove` command rather than this PRD's CLI verb. *(This line previously read "Complete" and this file sat archived in `prds/done/`; both were wrong on the evidence above — reopened and moved back to `prds/` on 2026-08-14 after a reviewer re-derived the milestone evidence and found the two gaps described here. Before that, the line had read "Not started" for four days after the work had shipped, corrected 2026-08-12.)*
 
 ## Problem Statement
 
@@ -101,7 +101,7 @@ So a **third gate: ownership.** Remove without asking only what the deck can pro
 
 ## Milestones
 
-*(Checkboxes below corrected 2026-08-14: all nine were still unchecked despite the Status line above having read Complete since 2026-08-12. Verified against `origin/main`: `decide()` and `Ownership::{Ours,Foreign}` exist at `src/worktree_reclaim.rs:308,265`; `WorktreeCmd::List`/`Reclaim` are wired in `src/main.rs:1453-1454`; the JSON document carries `schema_version` (`src/worktree_reclaim.rs:522`); the feature's changelog entry is already consumed into `CHANGELOG.md` under the `worktree list`/`worktree reclaim` heading.)*
+*(Checkboxes below corrected 2026-08-14: all nine were still unchecked despite the Status line above having read Complete since 2026-08-12. Verified against `origin/main`: `decide()` exists at `src/worktree_reclaim.rs:308` and `Ownership::{Ours,Foreign}` at `src/worktree_reclaim.rs:92–94`; `WorktreeCmd::List`/`Reclaim` are wired in `src/main.rs:1453-1454`; the JSON document carries `schema_version` (`src/worktree_reclaim.rs:522`); the feature's changelog entry is already consumed into `CHANGELOG.md` under the `worktree list`/`worktree reclaim` heading. A second correction later the same day reopened M2.2 and M3.0 — see the Status line above — after a reviewer found this first pass had ticked both on evidence that does not hold.)*
 
 ### Phase 1: The gate
 
@@ -113,13 +113,13 @@ So a **third gate: ownership.** Remove without asking only what the deck can pro
 
 - [x] **M2.0** — Enumerate worktrees and resolve each one's PR state via `gh` and cleanliness via `git status --porcelain`. — Done, `src/worktree_reclaim.rs`.
 - [x] **M2.1** — The CLI verb: listing (human table + versioned JSON) and removal, with removal explicit rather than implicit. — Done: `WorktreeCmd::List`/`Reclaim`, `src/main.rs:1453-1454`.
-- [x] **M2.2** — The ask surface: named paths, keep-by-default, bound to the captured set, and a copy-ready command when non-interactive. Reuse `Mode::CloseConfirm`/`CloseConfirmState` rather than adding a parallel confirmation path. — Done, shipped with the CLI verb.
+- [ ] **M2.2** — The ask surface: named paths, keep-by-default, bound to the captured set, and a copy-ready command when non-interactive. Reuse `Mode::CloseConfirm`/`CloseConfirmState` rather than adding a parallel confirmation path. — Half-done: the non-interactive half shipped (named paths, keep-by-default, a copy-ready `--yes` command). The `Mode::CloseConfirm`/`CloseConfirmState` reuse did not ship — `git grep -c 'CloseConfirm' src/worktree_reclaim.rs` returns 0, and `git grep -n 'CloseConfirm' src/` finds it only in `src/ui.rs`'s pre-existing close-pane flow; `run_worktree_reclaim_cli` (`src/main.rs`) reads no stdin and prompts for nothing, and there is no interactive reclaim surface in `src/ui.rs`.
 - [x] **M2.3** — Tests for the command surface, including the kept-with-reason output and the ask's default-to-keep behaviour. — Done, `tests/worktree_reclaim.rs`.
 
 ### Phase 3: Ship
 
-- [x] **M3.0** — Wire into the orchestrator's post-merge protocol; repoint the existing prose rule at the command. — Done; CLAUDE.md rule 1 references worktree cleanup via this command.
-- [x] **M3.1** — Docs and changelog fragment; PR, review, merge, close #422. — Done: merged as `1090d6f` via [PR #131](https://github.com/prageethw/dot-agent-deck/pull/131), first released in `v0.36.0`; changelog entry consumed into `CHANGELOG.md`.
+- [ ] **M3.0** — Wire into the orchestrator's post-merge protocol; repoint the existing prose rule at the command. — Not done: `git grep -i 'worktree reclaim\|worktree-reclaim' origin/main -- CLAUDE.md` returns nothing, and CLAUDE.md rule 1 still names the manual `git worktree remove` command, not this PRD's CLI verb. No hit in `.dot-agent-deck.toml`, `docs/`, or `.claude/` either, so the orchestrator's post-merge protocol has not been repointed at it.
+- [x] **M3.1** — Docs and changelog fragment; PR, review, merge, close #422. — Done: merged as [PR #131](https://github.com/prageethw/dot-agent-deck/pull/131) (original merge commit `1090d6f`, superseded by a later fork-sync rebase; the equivalent commit on `main` today is `99badf3c`, confirmed by `git merge-base --is-ancestor`), first released in `v0.36.0`; changelog entry consumed into `CHANGELOG.md`.
 
 ## Key Files
 
