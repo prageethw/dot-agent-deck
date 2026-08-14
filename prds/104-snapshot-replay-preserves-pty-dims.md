@@ -1,6 +1,6 @@
 # PRD #104: Snapshot replay preserves PTY dimensions so reattach doesn't scramble scrollback
 
-**Status**: Defined; ready to implement
+**Status**: **Complete** — merged as `f83623d1710e5437f107bdbbdb4a5a79cb89a08d` (`fix(prd-104): snapshot replay initializes vt100 parser at daemon PTY dims`) via https://github.com/vfarcic/dot-agent-deck/pull/130, first released in **v0.27.1**. *(Status corrected 2026-08-14: this line read "Defined; ready to implement" for some time after the change had shipped. Corroborated by `changelog.d/104.bugfix.md` and `hydrate_from_daemon` reading daemon-supplied PTY dims on `origin/main`.)*
 **Priority**: Medium
 **Created**: 2026-05-22
 **GitHub Issue**: [#104](https://github.com/vfarcic/dot-agent-deck/issues/104)

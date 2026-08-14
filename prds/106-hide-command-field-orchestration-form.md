@@ -1,6 +1,6 @@
 # PRD #106: Hide command field in new-pane form when orchestration is selected
 
-**Status**: Open  
+**Status**: **Complete** — merged as `467aeee84728982a737afe914ce5ac1af2054d2e` (`feat(ui): hide Command field in new-pane form when orchestration mode is selected`) via https://github.com/vfarcic/dot-agent-deck/pull/121, first released in **v0.27.0**. *(Status corrected 2026-08-14: this line read "Open" for some time after the change had shipped. Corroborated by `NewPaneFormState::command_visible()` and the `tab_skips_hidden_command_field_with_orchestration` test on `origin/main`.)*
 **Priority**: Low  
 **Created**: 2026-05-24  
 **GitHub Issue**: [#106](https://github.com/vfarcic/dot-agent-deck/issues/106)

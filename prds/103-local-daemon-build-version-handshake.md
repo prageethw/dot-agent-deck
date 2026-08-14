@@ -1,6 +1,6 @@
 # PRD #103: Local daemon build-version handshake + `daemon stop` CLI
 
-**Status**: Planning
+**Status**: **Complete** — merged as `4779c7f9c9d99906d19b2cc3c9066ade539928c7` (`feat(prd-103): build-version handshake + daemon stop/restart`) via https://github.com/vfarcic/dot-agent-deck/pull/117, first released in **v0.26.0**. *(Status corrected 2026-08-14: this line read "Planning" for some time after the change had shipped. Corroborated by `changelog.d/103.bugfix.md` and by `build_version`/`DaemonCmd::Stop`/`peer_pid` existing on `origin/main`, none of which the milestone checkboxes below were ever updated to reflect — those are left as-is per this reconciliation task's scope.)*
 **Priority**: High
 **Created**: 2026-05-22
 **GitHub Issue**: [#103](https://github.com/vfarcic/dot-agent-deck/issues/103)

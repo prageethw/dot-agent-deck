@@ -1,6 +1,6 @@
 # PRD #79: OpenCode plugin auto-install must refresh every existing layout
 
-**Status**: Not started
+**Status**: **Complete** — merged as `16a0b946fdcbd7b2835460eb76f4588942ac9615` (`fix(prd-79): fan out OpenCode plugin install across every existing layout`) via https://github.com/vfarcic/dot-agent-deck/pull/189, first released in **v0.32.0**. *(Status corrected 2026-08-14: this line read "Not started" for some time after the change had shipped. Corroborated by `changelog.d/79.bugfix.md` and by `auto_install_to`/`auto_install_writes_to_both_existing_roots` existing in `src/opencode_manage.rs` on `origin/main`, which the milestone checkboxes below were never updated to reflect.)*
 **Priority**: Medium
 **Created**: 2026-05-09
 

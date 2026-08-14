@@ -1,6 +1,6 @@
 # PRD #51: Enhance Documentation with Screenshots
 
-**Status**: Draft
+**Status**: **Complete** — merged as `78ea7d27874bf45d65fb1e49d1db10e94ab5b17c` (`docs(prd-51): enhance docs with screenshots and accuracy fixes`) via https://github.com/vfarcic/dot-agent-deck/pull/70, first released in **v0.24.2**. *(Status corrected 2026-08-14: this line read "Draft" for some time after the change had shipped. Corroborated by the "Documentation" entry in `CHANGELOG.md` describing the shipped screenshots and accuracy fixes, which the milestone checkboxes below were never updated to reflect.)*
 **Priority**: Medium
 **Created**: 2026-04-06
 
