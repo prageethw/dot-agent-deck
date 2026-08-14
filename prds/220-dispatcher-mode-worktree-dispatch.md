@@ -1,6 +1,6 @@
 # PRD #220: Dispatcher mode + worktree dispatch — one-step, agent-callable isolated line of work
 
-**Status**: Planning
+**Status**: **Phases 1, 3 and 5 landed; Phase 2 (return-edge routing) deliberately deferred; Phase 4 partial** (M4.0 and part of M4.2 still open). Merged via https://github.com/vfarcic/dot-agent-deck/pull/232 (`feat: PRD #220 — dispatch CLI verb + dispatcher mode`, merge commit `7616d2f537b7ffc0657e508f52ca971fc5710627`); the dispatcher mode graduated out of the `experimental` flag in `9248e932d40493304676cd1655b19e970677b8e2`, first released in **v0.35.9**. Corroborated by `changelog.d/220.feature.md`. *(Status corrected 2026-08-14: this line still read "Planning" long after most of the PRD had shipped. The milestone checkboxes below already record this accurately per-item — M2.0/M2.1/M4.0/M4.2/M5.1 unchecked, everything else checked — this correction only fixes the top-level Status line to match them.)*
 **Priority**: Medium
 **Created**: 2026-07-19
 **GitHub Issue**: [#220](https://github.com/vfarcic/dot-agent-deck/issues/220)

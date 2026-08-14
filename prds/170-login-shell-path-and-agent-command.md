@@ -1,6 +1,6 @@
 # PRD #170: Spawned panes inherit login-shell PATH + configurable agent command
 
-**Status**: In Progress
+**Status**: **Complete** — merged as `c1ef33da9b50a6380f915e82e3a20d1bffc1237d` (`feat(prd-170): login-shell PATH parity + configurable agent command`, https://github.com/vfarcic/dot-agent-deck/pull/171) with a follow-up fix `8e399021a9a4e24595dd2654cd8b55d558fb0e23` (https://github.com/vfarcic/dot-agent-deck/pull/179), first released in **v0.31.1**. *(Status corrected 2026-08-14: this line read "In Progress" for some time after the change had shipped. Corroborated by `changelog.d/170.feature.md` on `origin/main`, which the M3.1 checkbox below was never updated to reflect.)*
 **Priority**: High
 **Created**: 2026-06-16
 **GitHub Issue**: [#170](https://github.com/vfarcic/dot-agent-deck/issues/170)
