@@ -951,6 +951,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the agent or human kinds (covered by `037`/`038`); `--mine`'s handling of a legacy-marked worktree (unaffected — `is_mine` reads `owned`/`owner`, neither of which changes here).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/042 — `remove_worktree` must return an outcome distinguishing WHY a tree was kept, instead of today's `()`, which discards the reason entirely (PRD 236 M1.1, RED).
+- **Layer:** pure-data unit (`tokio::test`, `dot_agent_deck::issue_dispatch_run::remove_worktree` called directly against a real local git clone + worktree, no CLI subprocess, no `gh`).
+- **Agent:** none.
+- **Asserts:** a dirty tree under `RemovalPolicy::KeepIfDirty` survives the call (already true today); AND the call's own return value is NOT `()` (checked via `std::any::type_name_of_val`), since the production function returns `()` and the daemon's close handler therefore has nothing typed to hand back to the TUI even once it stops discarding the result.
+- **Does not assert:** the removed-clean and probe-error branches (covered by `043`); the detached-spawn boundary (covered by `044`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/043 — `remove_worktree`'s outcome must also distinguish "removed" (clean tree) from "kept, unknown" (the `git status` probe itself failed) — not just "kept, dirty" — and today's `()` return collapses all three (PRD 236 M1.1, RED).
+- **Layer:** pure-data unit (as `042`), one clean worktree removed by the call and one non-git directory that makes the internal `git status --porcelain` probe fail outright.
+- **Agent:** none.
+- **Asserts:** a CLEAN tree under `KeepIfDirty` is actually removed from disk (already true today), and the call's return value is not `()`; a worktree path whose status probe errors is left in place — the fail-safe (already true today) — and its return value is ALSO not `()`.
+- **Does not assert:** the kept-because-dirty branch (covered by `042`); the detached-spawn boundary (covered by `044`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/044 — The close path's detached `tokio::spawn` (`daemon_protocol.rs`'s exact shape) has nothing to propagate: joining a task built the identical way `remove_worktree(...).await` ends on yields `()`, so there is no outcome for the TUI to ever see even once the daemon stops discarding it (PRD 236 M1.1, RED).
+- **Layer:** pure-data unit (as `042`), a `tokio::spawn` mirroring `daemon_protocol.rs`'s close handler byte-for-byte (an async block ending on a bare `remove_worktree(...).await`), joined via its own `JoinHandle`.
+- **Agent:** none.
+- **Asserts:** the dirty tree survives the detached task; the joined result is not `()`.
+- **Does not assert:** the daemon's real socket/attach-response wiring (out of reach for a pure-data unit test); the removed/kept-unknown branches (covered by `042`/`043`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/045 — The #120 issue-dispatch producer (`run_issue_dispatch`) must record `RemovalPolicy::KeepIfDirty` for its per-issue worktree, like PRD #220's own dispatch does, instead of today's `RemovalPolicy::Force` — proven both as the recorded enum and as actual close-time survival (PRD 236 M2, RED).
+- **Layer:** pure-data unit — the real `run_issue_dispatch` called in-process (no daemon, no attach socket) against a local git clone/origin and a minimal stub `gh` on `PATH`, with `cat` as the dispatched agent (`detach_delivery = true`, so this returns promptly rather than paying the ~30s readiness-wait cost `dispatch.rs`'s own e2e-gated spawn test documents).
+- **Agent:** one real `cat` PTY as the dispatched single agent (alive on stdin, no LLM tokens) — required because `record_worktree`'s call site sits after a real spawn in `dispatch_one_issue`.
+- **Asserts:** after a successful dispatch of issue #7, the `WorktreeRegistry` holds an entry for its worktree; dirtying that worktree and calling the real `remove_worktree` under the entry's OWN recorded policy leaves the directory in place (today's `Force` policy would instead destroy it); the recorded policy equals `RemovalPolicy::KeepIfDirty`.
+- **Does not assert:** the claim/label/comment writes `dispatch_one_issue` makes afterward (best-effort, irrelevant to the policy recorded); the daemon-hosted end-to-end flow (covered by the `scheduler/dispatch/*` e2e family).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/046 — THE REGRESSION GUARD. A kept, dirty #120 worktree must still read as "already claimed" to `dispatch_decision` (the exact safety property the shipped code cites as its reason for forcing), AND the slot must not be a permanent dead end: the `worktree reclaim` path must see it, and once the operator resolves the dirtiness and its PR merges, must be able to remove it and free the slot (PRD 236, RED once M2 unifies the policy).
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`) for the reclaim-path half, plus a direct pure call into `dot_agent_deck::issue_dispatch::dispatch_decision` for the idempotency half — one fixture, two assertions that must BOTH hold.
+- **Agent:** none.
+- **Asserts:** `dispatch_decision(true, false, false)` is `Skip` (a present worktree is always already-claimed, regardless of which policy created/kept it); a dirty, deck-marked, #120-style worktree is visible to `worktree list --json` (`owned: true`); after the operator cleans the dirty content and the PR merges, a bare `worktree reclaim` genuinely removes it, freeing the slot for a future fire.
+- **Does not assert:** that reclaim can remove a STILL-dirty tree (it never can, by `003`'s own regression guard — recovery requires resolving the dirtiness first, same as any other kept worktree).
+- **Platform coverage:** mac+linux.
+
 #### issue/claim
 
 Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's WORKTREE — its absolute path plus its git branch (CLAUDE.md rule 23) — never a `DOT_AGENT_DECK_PANE_ID` value (round 2, dropped: those ids recycle across a daemon restart, fork #160/#163/#166) and never the worktree ownership marker (round 1, dropped: the marker is almost never present under CLAUDE.md rule 1's mandated hand-made `git worktree add`). Both the path and the branch are derivable straight from `git`, so no marker is required at all — the marker, when present, supplies human-readable DECORATION only and is never part of the compared identity. A human claiming outside any worktree still resolves as `human:<login>@<host>` — that half is unchanged since round 1. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 3's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still pane-id-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
