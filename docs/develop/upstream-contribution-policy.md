@@ -9,7 +9,7 @@ Ask one question about every change: **would upstream want this?**
 - **No — it is a preference.** It stays forked, permanently. Badge removal and the "worker-deck" rename, the role→model assignments, the devbox wrapper commands, the Telegram/Slack removal, the fork's release-CI skips, this fork's CLAUDE.md rules and PRD documents, `cleanup.sh`'s fork-specific evolution. This is the fork's identity. Upstream would reject it and should.
 - **Yes — it is an improvement that merely happens to have been written here.** It goes upstream. A bugfix, a test-determinism fix, a genuine feature, a correction to an upstream doc.
 
-If the honest answer is "yes, but not yet" — that is a "yes" with an unscheduled second step, and the second step is the one that historically does not happen. See the backlog below for what that cost.
+If the honest answer is "yes, but not yet" — that is a "yes" with an unscheduled second step, and the second step is the one that historically does not happen. See the backlog below for what that cost. Under the fork-first ordering this document now prescribes, "not yet" is the *expected* state between merging here and offering upstream, which is exactly why that gap has to be closed by a tracked issue rather than by intention.
 
 ## Why the second category must not linger here
 
@@ -17,13 +17,21 @@ If the honest answer is "yes, but not yet" — that is a "yes" with an unschedul
 
 It also costs real, duplicated work when the offer comes late. `55021c3` (PRD #333, tab status colours) was **dropped entirely** in the 2026-08-09 sync: upstream merged its own version as PR #356 only after the maintainer requested behaviour changes, so upstream's version had evolved past the fork's. The resolution was to take upstream's version whole and discard the fork's diff. That work was done twice because it was offered late rather than early.
 
-## The default for new work is upstream-first
+## The default for new work is fork-first, offer-after
 
-For anything that is **not** a preference divergence: branch from `upstream/main`, open the PR upstream, merge, and let it arrive here through the normal sync.
+*(Changed 2026-08-14 by maintainer decision. This section previously mandated upstream-first — branch from `upstream/main`, open the PR upstream, and let the fix arrive here by sync. That is withdrawn: it delayed this fork's own users for a benefit they never receive. The **decision test** above is unchanged; only the **ordering** flipped. CLAUDE.md rule 19 carries the same change and is the authority.)*
 
-**Do not** default to fork-first-then-offer. That pattern is what created the backlog — "offer later" depends on someone remembering, nothing enforces it, and it did not happen fourteen times. It also maximises the window in which upstream's version and the fork's can drift apart, which is exactly the PRD #333 failure above.
+For anything that is **not** a preference divergence:
 
-Fork-first remains correct when the change genuinely needs the fork's environment to be developed or validated — but the PR upstream is then opened as soon as it works, not "eventually".
+1. Fix it here, on a fork branch, against `origin/main`.
+2. Review it, merge it, ship it. This fork's users have the fix at this point, and nothing further is required for them.
+3. **Then** open the upstream PR from the merged work, and file the offer issue that tracks it.
+
+**This fork is never blocked on an upstream decision.** Not on a review, not on requested changes, not on a merge. An open upstream PR is a gift already given — it is not a dependency and never belongs in a status report as blocking work.
+
+**The risk moves; it does not disappear.** Under this ordering the *offer* is the step that silently does not happen — which is precisely what built the backlog below. "Offer later" depending on someone remembering is what failed before, so it must be tracked rather than remembered: **file the upstream-offer issue at merge time**, naming what to port, the matching upstream issue, and anything that makes the port non-trivial. [prageethw/dot-agent-deck#322](https://github.com/prageethw/dot-agent-deck/issues/322) is the pattern to copy. A merge that owed an offer issue and did not produce one is a defect, not a judgement call — the next session will not know the offer was ever owed.
+
+Offering promptly still matters for the reason the PRD #333 failure above shows: the longer the gap, the more upstream's version and the fork's can drift apart. "After merge" means the same day, not "eventually".
 
 ## Purifying `fork-only` is a byproduct, not a project
 
@@ -45,16 +53,20 @@ A hand-run purification pass would do by hand what the sync does for free, and w
 
 ## Write access is permission to merge, not to skip review
 
-As of 2026-08-09 this fork's maintainer has **write** access on `vfarcic/dot-agent-deck` (`vfarcic` remains `admin`). That removes the friction that caused the backlog — but only if the default above actually changes. Write access with an unchanged fork-first habit just produces a backlog you *could* merge and still do not.
+As of 2026-08-09 this fork's maintainer has **write** access on `vfarcic/dot-agent-deck` (`vfarcic` remains `admin`). That removes the friction that caused the backlog — but write access only helps if the offer gets *made*. It is the tracked offer issue, not the access, that closes the gap.
 
-Keep the review discipline. Upstream's Greptile genuinely works — it is **not** credit-limited the way this fork's is (CLAUDE.md rule 8) — and upstream review has been substantive: on PR #419 the maintainer verified the change locally against the full e2e tier, identified three specific defects, and filed two follow-up issues (#434, #435) rather than waving it through. That is a better gate than the fork currently has. Open the PR, let the review run, then merge.
+Keep the review discipline. Upstream's Greptile genuinely works — it is **not** credit-limited the way this fork's is (CLAUDE.md rule 8) — and upstream review has been substantive: on PR #419 the maintainer verified the change locally against the full e2e tier, identified three specific defects, and filed two follow-up issues (#434, #435) rather than waving it through. That is a better gate than the fork currently has. Open the PR and let the review run; merge it when it is approved.
+
+**That review runs on upstream's clock, and an open upstream PR costs this fork nothing.** PR [#506](https://github.com/vfarcic/dot-agent-deck/pull/506) is the worked example: the fork's own fix for the same defect merged here as PR #240 on 2026-08-11 and shipped to this fork's users immediately, while the upstream PR sat green under a standing `CHANGES_REQUESTED` for days with every requested item already addressed. Nothing on this side waited. Do not chase an open upstream PR, do not re-ping the maintainer on a schedule, and do not report "the upstream PR has not merged" as unfinished work.
 
 ## Order of operations
 
-1. **Finish the open upstream queue before extending it.** Adding to a stalled queue just moves the pile.
-2. **Decide the closed PRs.** Re-offer or explicitly abandon — limbo is the worst state.
-3. **Then drain the backlog** in themed batches, splitting the two MIXED commits as you reach them.
-4. **Re-verify before offering.** The classification below is hand-maintained and hand-maintained classifications drift. Confirm a commit still applies to current `upstream/main` before spending a PR on it.
+This ordering governs **draining the historical backlog** below. It does **not** govern new work, and nothing in it may delay a fork fix or a fresh offer — see the fork-first default above.
+
+1. **A stalled upstream queue never blocks new work.** *(Corrected 2026-08-14; this previously read "Finish the open upstream queue before extending it.")* Open upstream PRs are waiting on someone else's click, so treating them as a queue to drain first would hand upstream a veto over this fork's pace — exactly what the fork-first default exists to prevent. Fix here, merge here, offer, move on, however many offers are already open.
+2. **Decide the closed PRs.** Re-offer or explicitly abandon — limbo is the worst state. These are the ones that genuinely need a decision, because nobody else will make it.
+3. **Drain the backlog** in themed batches, splitting the two MIXED commits as you reach them. This is opportunistic work, not a phase that blocks anything.
+4. **Re-verify before offering.** The classification below is hand-maintained and hand-maintained classifications drift. Confirm a commit still applies to current `upstream/main` before spending a PR on it — and per CLAUDE.md rule 20, search upstream **PRs** as well as issues, `--state all`, since an offer already made is invisible from `upstream/main`.
 
 ## The backlog — upstream-worthy, never offered
 
@@ -84,18 +96,23 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 
 **These are not backlog and must not be re-offered.** They are open PRs on `vfarcic/dot-agent-deck`, green and mergeable, waiting on the maintainer's approving review — the fork's maintainer is the author and cannot self-approve, and the `main-protected` ruleset has no bypass actors. Nothing here needs work; it needs someone else's click.
 
-| Upstream PR | Commit | Opened | What |
+*(Table re-verified against GitHub 2026-08-14. #390, #419 and #427 had all **merged** and were still listed here as awaiting review — the exact drift the "Keep it current" note below warns about, in the direction that makes the queue look more stalled than it is. Four genuinely-open PRs were missing. Re-verify with `gh pr list --repo vfarcic/dot-agent-deck --state open --author prageethw` rather than trusting this table.)*
+
+| Upstream PR | Opened | Review state | What |
 |---|---|---|---|
-| [#390](https://github.com/vfarcic/dot-agent-deck/pull/390) | — | 2026-08-06 | A pane reads Idle while its agent's shell command is still running (upstream #386) |
-| [#419](https://github.com/vfarcic/dot-agent-deck/pull/419) | — | 2026-08-08 | Bound `get-seed`'s socket read/write so a wedged daemon cannot hang forever |
-| [#427](https://github.com/vfarcic/dot-agent-deck/pull/427) | — | 2026-08-08 | Reclaim merged worktrees behind a PR-state + clean + ownership gate |
-| [#471](https://github.com/vfarcic/dot-agent-deck/pull/471) | `c0cd1c8` | 2026-08-09 | Claim dispatched issues and triage them on dispatch (upstream #421) |
+| [#471](https://github.com/vfarcic/dot-agent-deck/pull/471) | 2026-08-09 | `CHANGES_REQUESTED` | Claim dispatched issues and triage them on dispatch (upstream #421) |
+| [#506](https://github.com/vfarcic/dot-agent-deck/pull/506) | 2026-08-11 | `CHANGES_REQUESTED` | Identify Claude Code hook rules by command, not by the binary's name (upstream #516, #517). **All three requested items were addressed and pushed 2026-08-13; all 10 checks green.** The fork's own fix merged here as PR #240 on 2026-08-11. |
+| [#520](https://github.com/vfarcic/dot-agent-deck/pull/520) | 2026-08-12 | `REVIEW_REQUIRED` | Resolve the deck's command name from `current_exe()` rather than the crate literal (fork #253) |
+| [#539](https://github.com/vfarcic/dot-agent-deck/pull/539) | 2026-08-13 | `REVIEW_REQUIRED` | Suggest and enforce unique orchestration names on the new-orchestration form (fork #192) |
+| [#556](https://github.com/vfarcic/dot-agent-deck/pull/556) | 2026-08-14 | `REVIEW_REQUIRED` | De-duplicate two PRD files and repoint their references |
+
+A `CHANGES_REQUESTED` row is **not** automatically outstanding work — check whether the requested items have already been pushed, as on #506, where the standing review is the only thing left and the author has already responded. Re-review happens on the maintainer's clock.
 
 **Why this table exists.** On 2026-08-10 an orchestration asked to offer PRD #421 upstream searched both trackers' *issues*, correctly found upstream #421 open and unimplemented on `upstream/main`, and planned the entire port — which #471 had already delivered the day before. Nothing in this repository recorded that the offer had been made, so the only way to discover it was to query GitHub for PRs. That absence is what made the near-duplicate possible; this table is the fix, and CLAUDE.md rule 20 now requires a `gh pr list --state all` search over both trackers as well as the issue search.
 
 **Keep it current.** Add a row the moment a PR is opened upstream, not when it merges — the whole point is that the record exists during the window when the work is invisible from `upstream/main`. Delete the row when it merges; the next rebase deletes the commit.
 
-**A stalled queue is a reason not to extend it.** Four PRs sitting here at once is the state the "Order of operations" section below is about: adding a fifth just moves the pile.
+**A stalled queue is NOT a reason to withhold the next offer.** *(Corrected 2026-08-14; this previously read "A stalled queue is a reason not to extend it… adding a fifth just moves the pile.")* Several PRs sitting here at once is normal and costs this fork nothing — each is already-finished work parked on someone else's clock. Withholding a new offer until the queue drains would make upstream's review latency set this fork's contribution rate, which is the veto the fork-first default exists to remove. Open the fifth. The rows below are a record, not a debt.
 
 ## Offered upstream but closed without merging
 
