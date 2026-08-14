@@ -3124,11 +3124,11 @@ without depending on the config struct API.
 - **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `orchestration/lock/008`/`011` carry the CI-visible coverage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 
-##### orchestration/lock/014 — With the `experimental` flag OFF (the default), the command-entry lock surface is absent entirely.
+##### orchestration/lock/014 — On a DEFAULT install, with no `DOT_AGENT_DECK_EXPERIMENTAL` anywhere, the command-entry lock is engaged from the start.
 - **Layer:** L2 (PTY end-to-end).
-- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Deliberately launched WITHOUT `DOT_AGENT_DECK_EXPERIMENTAL`, unlike every other test in the file.
-- **Asserts:** on a real orchestration tab a keystroke typed at the focused non-orchestrator worker reaches its PTY with no unlock chord at all; the `Pane locked` message never appears; and `Ctrl+e` sent in command mode is not claimed, so no `Pane entry:` report is produced. This is the other side of the PRD #393 gate — a regression that shipped the lock unconditionally fails here rather than reaching every user silently.
-- **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
+- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Deliberately launched WITHOUT `DOT_AGENT_DECK_EXPERIMENTAL`, same as every other test in the file now that the lock is unconditional.
+- **Asserts:** on a real orchestration tab a keystroke typed at the focused non-orchestrator worker does NOT reach its PTY and the deck reports `Pane locked`; after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a further keystroke aimed at the still-focused worker pane does reach its PTY. This pins the lock as live by default now that it has graduated out of the experimental flag (issue #302) rather than merely present when opted in.
+- **Does not assert:** that the focus steering is gated too (no automatic focus movement is asserted here, covered by `orchestration/focus/007`).
 - **Platform coverage:** mac+linux.
 
 #### orchestration/focus
@@ -3175,10 +3175,10 @@ without depending on the config struct API.
 - **Does not assert:** the mechanism used to reach that outcome — only that every Orchestration tab's edge state is reset on the transition.
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/focus/007 — The experimental command-entry-lock surface's whole focus contract on the real binary.
+##### orchestration/focus/007 — The command-entry-lock surface's whole focus contract on the real binary.
 - **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness), asserted purely on the rendered grid via the expanded-pane header `┌<role>`, which only the currently focused role ever draws.
 - **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: `orchestrator` + `alpha` + `beta`, all `printf`+`sleep` stubs). Three roles are required: the "manual focus sticks" half needs a role OTHER than the one going `WaitingForInput`, since where the focused and waiting role are the same pane a genuine stick is indistinguishable from `auto_focus_waiting_pane`'s own same-pane no-op. `WaitingForInput` is injected over the hook socket exactly as `orchestration/lock/011` does.
-- **Asserts:** (1) with the experimental command-entry-lock surface enabled, a freshly opened tab starts LOCKED and shows the orchestrator's expanded box; (2) injecting `WaitingForInput` for `alpha` visibly steers focus onto ITS box; (3) injecting `Thinking` visibly returns focus to the orchestrator — the all-clear edge; (4) `Ctrl+d`,`Ctrl+e` surfaces `Pane entry: unlocked`; (5) manually jumping to `beta` and then injecting a fresh `WaitingForInput`/`Thinking` pair for `alpha` moves focus NOWHERE — `beta`'s box survives both events, and a sentinel typed at the end appears inside `beta`'s own box, proving it still holds live PTY focus rather than merely still being drawn.
+- **Asserts:** (1) a freshly opened tab starts LOCKED by default and shows the orchestrator's expanded box; (2) injecting `WaitingForInput` for `alpha` visibly steers focus onto ITS box; (3) injecting `Thinking` visibly returns focus to the orchestrator — the all-clear edge; (4) `Ctrl+d`,`Ctrl+e` surfaces `Pane entry: unlocked`; (5) manually jumping to `beta` and then injecting a fresh `WaitingForInput`/`Thinking` pair for `alpha` moves focus NOWHERE — `beta`'s box survives both events, and a sentinel typed at the end appears inside `beta`'s own box, proving it still holds live PTY focus rather than merely still being drawn.
 - **Does not assert:** the `TabManager`-level contract in isolation (`orchestration/focus/001`-`006`); the keystroke gate (`orchestration/lock/*`).
 - **Platform coverage:** mac+linux (unix-only: the injector writes to a Unix-domain hook socket).
 
@@ -3187,13 +3187,6 @@ without depending on the config struct API.
 - **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
 - **Asserts:** with a real `TabManager`-opened 3-role Orchestration tab (`orchestrator` < `alpha` < `beta`), `beta` (higher role order) goes `WaitingForInput` and steals focus with no input pending, as `orchestration/focus/001` pins; `alpha` (LOWER role order than `beta`) then ALSO goes `WaitingForInput` on a frame where `input_pending` is true (modeling a keystroke still queued for `beta`) — the steal to `alpha` must be deferred, returning `None` and leaving focus on `beta`, not yanked away from the pane the queued keystroke is aimed at; once `input_pending` clears on a later frame, the deferred steer to `alpha` must still fire, proving the guard DEFERS the move rather than dropping it, mirroring `TabManager::auto_focus_all_clear`'s existing "no one-shot latch" contract. Drives `TabManager::auto_focus_locked(pane_status, input_pending)`, the seam that folds both `auto_focus_waiting_pane` and `auto_focus_all_clear` behind ONE shared `input_pending` guard mirroring the real per-frame call site's shape.
 - **Does not assert:** the real `src/ui.rs` per-frame call site actually computing `input_pending` from `crossterm::event::poll` or applying the result via `pane.focus_pane` (out of L1 `TabManager` reach — it would need a PTY-attached L2 test, and an L2 test was evaluated and rejected: the underlying terminal race is not economically reproducible there, since it requires a keystroke to be sitting in the terminal's input queue on the exact frame a lower-order pane transitions to `WaitingForInput`); the deck-global lock gate itself (`ui.command_entry_locked`, covered by `orchestration/focus/005`/`006`); the multi-waiter ordering contract, covered exhaustively by `orchestration/focus/001`/`004`.
-- **Platform coverage:** mac+linux+windows.
-
-##### orchestration/focus/009 — Turning the `experimental` flag OFF mid-session clears the waiting-episode latch, so re-enabling it replays no stale all-clear edge.
-- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`/`008`).
-- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
-- **Asserts:** with the flag on and the deck locked, `alpha` goes `WaitingForInput`, latching the episode and stealing focus; the flag then flips OFF (the watcher re-reads `.dot-agent-deck.toml` roughly every 2s, so this is reachable without a restart) and `alpha` resolves unobserved; on the first frame after the flag returns, no focus move may be produced. A latch left standing while the flag was off would read there as a stale `true` -> `false` all-clear and yank focus to the orchestrator for an episode already dealt with. Mirrors `orchestration/focus/006`, which pins the same contract for the `Ctrl+E` unlock — the flag is simply a second way to stop observing.
-- **Does not assert:** the real `src/ui.rs` per-frame call site (out of L1 `TabManager` reach, as `orchestration/focus/008` records); the gating of the keystroke path or the `Ctrl+E` binding (`orchestration/lock/014`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout

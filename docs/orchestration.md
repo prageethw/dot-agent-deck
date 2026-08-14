@@ -93,7 +93,7 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 | `Left` / `Right` (or `h` / `l`) | Cycle to previous / next tab |
 | `1`–`9` | Jump to role card N and focus its pane |
 | `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
-| `Ctrl+e` | **Experimental, off by default** — toggle the command-entry lock, i.e. whether you can type directly into a worker pane (see below) |
+| `Ctrl+e` | Toggle the command-entry lock, i.e. whether you can type directly into a worker pane (see below) |
 
 These work from anywhere, including while typing in a role pane:
 
@@ -107,13 +107,9 @@ The tab bar carries the same signal one level up: a **background** orchestration
 
 In the default `Stacked` pane layout, only the focused role's pane is drawn — switching roles swaps which pane is visible, but every other role's agent keeps running underneath, and the sidebar is what tells you it's still busy or idle. Toggle to `Tiled` (`Ctrl+t`) to see every role's pane at once.
 
-### Typing into a worker is locked by default (experimental)
+### Typing into a worker is locked by default
 
-> **Experimental — this section describes a surface that is off unless you turn it on.**
->
-> The command-entry lock, and the focus steering that comes with it, are gated behind the `experimental` feature flag while the behaviour is evaluated in real use. With the flag off — the default — typing into a worker pane works exactly as it always has, `Ctrl+e` is not claimed, and the deck never moves focus on its own. To try it, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file).
-
-You talk to the orchestrator; the orchestrator talks to the workers. With the flag on, an orchestration tab makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. The orchestrator's own pane is never locked, and Dashboard and mode tabs are not affected at all.
+You talk to the orchestrator; the orchestrator talks to the workers. An orchestration tab makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. The orchestrator's own pane is never locked, and Dashboard and mode tabs are not affected at all.
 
 The reason is that an orchestration is one workflow with a single coordinator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
 

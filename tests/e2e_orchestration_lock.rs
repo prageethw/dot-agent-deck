@@ -2,17 +2,10 @@
 
 //! L2 end-to-end coverage for the command-entry lock on Orchestration tabs.
 //!
-//! **Every deck here launches with `DOT_AGENT_DECK_EXPERIMENTAL=1`.** The lock
-//! is gated behind the experimental flag (`features::show_command_entry_lock`,
-//! CLAUDE.md #9) while it is evaluated in real use, so without the env var
-//! these decks would observe the un-gated pre-lock behaviour and every
-//! assertion below would be testing the wrong thing. `orchestration/lock/014`
-//! is the deliberate exception — it launches WITHOUT the flag and pins that
-//! flag-off behaviour, so the gate stays covered from both sides.
-//!
-//! With the flag on: a keystroke typed while a non-orchestrator role pane is focused
-//! must not reach that pane's PTY; the orchestrator pane's own input is never
-//! gated; `Ctrl+d` then `Ctrl+e` toggles the lock; a pane reporting
+//! The lock is on by default — no env var is involved in this file. A
+//! keystroke typed while a non-orchestrator role pane is focused must not
+//! reach that pane's PTY; the orchestrator pane's own input is never gated;
+//! `Ctrl+d` then `Ctrl+e` toggles the lock; a pane reporting
 //! `WaitingForInput` is not gated at all; and the always-available
 //! `Ctrl+`-chords (resolved before the PTY-forward fallback the lock gates)
 //! keep working regardless of lock state or which pane is focused.
@@ -76,7 +69,6 @@ fn lock_008_forwarding_gated_by_lock_state() {
     const WORKER_UNLOCKED_SENTINEL: &str = "LOCK008_WORKER_UNLOCKED_c83e";
 
     let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -135,7 +127,6 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
     const WORKER_UNLOCKED_SENTINEL: &str = "LOCK009_WORKER_UNLOCKED_7be2";
 
     let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -232,7 +223,6 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
 #[test]
 fn lock_010_global_chord_unaffected_by_lock_state() {
     let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -371,7 +361,6 @@ fn lock_011_waiting_carve_out_on_real_panes() {
     const WORKER_RELOCKED_SENTINEL: &str = "LOCK011_RELOCKED_e814";
 
     let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -500,7 +489,6 @@ fn lock_012_real_agent_gated_by_lock_state() {
     skip_unless!(common::check_claude_available());
 
     let deck = TuiDeck::builder()
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .with_imported_claude_credentials()
         // The worker's cwd is the deck's own workdir (the copied
@@ -575,22 +563,22 @@ fn lock_012_real_agent_gated_by_lock_state() {
     );
 }
 
-/// Scenario: With the `experimental` flag OFF — the default — the whole
-/// command-entry lock surface is absent. On a real Orchestration tab
-/// (`orch-deck` fixture, two `cat` stub roles), focus the non-orchestrator
-/// worker and type: the keystrokes must reach its PTY immediately, with no
-/// unlock and no `Pane locked` message. Then send `Ctrl+e` in command mode and
-/// confirm the deck does not claim it — no `Pane entry:` report appears.
+/// Scenario: On a DEFAULT install — no `DOT_AGENT_DECK_EXPERIMENTAL` anywhere
+/// — the command-entry lock is engaged from the start. On a real
+/// Orchestration tab (`orch-deck` fixture, two `cat` stub roles), focus the
+/// non-orchestrator worker and type: the keystroke must NOT reach its PTY and
+/// the deck must report `Pane locked`. Then `Ctrl+d`, `Ctrl+e`, `Ctrl+d` to
+/// unlock and confirm a keystroke now reaches the worker's PTY — proving the
+/// lock is live by default rather than merely present.
 #[spec("orchestration/lock/014")]
 #[test]
-fn lock_014_flag_off_leaves_worker_input_ungated() {
-    const WORKER_SENTINEL: &str = "LOCK014_WORKER_UNGATED_5b7d";
+fn lock_014_default_install_gates_worker_input() {
+    const WORKER_LOCKED_SENTINEL: &str = "LOCK014_WORKER_LOCKED_5b7d";
+    const WORKER_UNLOCKED_SENTINEL: &str = "LOCK014_WORKER_UNLOCKED_a1e9";
 
     // Deliberately NO `.with_env("DOT_AGENT_DECK_EXPERIMENTAL", …)`: this test
-    // exists to pin what a DEFAULT install sees while PRD #393 is gated. Every
-    // other test in this file opts the flag ON; this is the other side of that
-    // gate, so a regression that shipped the lock unconditionally fails here
-    // rather than silently reaching every user.
+    // exists to pin what a DEFAULT install sees now that the lock is
+    // unconditional. No env var anywhere in this file changes that.
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
@@ -601,27 +589,31 @@ fn lock_014_flag_off_leaves_worker_input_ungated() {
 
     focus_worker_role(&deck);
 
-    // The keystroke must reach the worker's PTY with no unlock chord at all.
-    deck.send_keys(format!("{WORKER_SENTINEL}\r").as_bytes());
-    deck.wait_for_string(WORKER_SENTINEL);
-
-    // And the lock's own status message must never have appeared.
+    // Locked by default: the keystroke must NOT reach the worker's PTY.
+    deck.send_keys(format!("{WORKER_LOCKED_SENTINEL}\r").as_bytes());
+    let leaked = deck.wait_for_grid_string_within(WORKER_LOCKED_SENTINEL, Duration::from_secs(2));
     assert!(
-        !deck.snapshot_grid().contains("Pane locked"),
-        "the deck reported the command-entry lock while the experimental flag \
-         was off — the surface must be entirely absent by default.\nGrid:\n{}",
+        !leaked,
+        "a keystroke typed into the non-orchestrator worker pane reached its \
+         PTY on a default install — expected the command-entry lock to drop \
+         it before Action::ForwardToPane.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        deck.snapshot_grid().contains("Pane locked"),
+        "the deck did not report the command-entry lock on a default \
+         install.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
-    // Ctrl+e must not be claimed either: in command mode it should toggle
-    // nothing, so no `Pane entry:` report can appear.
+    // Ctrl+e only resolves in command mode: Ctrl+d into command mode, Ctrl+e
+    // to unlock, then Ctrl+d back into PaneInput so the sentinel below
+    // actually reaches the worker pane's PTY.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
-    deck.send_bytes(b"\x05"); // Ctrl+e -> not claimed while the flag is off
-    let claimed = deck.wait_for_grid_string_within("Pane entry:", Duration::from_secs(2));
-    assert!(
-        !claimed,
-        "Ctrl+e toggled the command-entry lock while the experimental flag was \
-         off — the binding must not be claimed at all.\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
+    deck.send_bytes(b"\x05"); // Ctrl+e == 0x05 -> unlock
+    deck.send_bytes(b"\x04"); // Ctrl+d -> back to PaneInput
+
+    // Unlocked: typing into the still-focused worker pane must now forward.
+    deck.send_keys(format!("{WORKER_UNLOCKED_SENTINEL}\r").as_bytes());
+    deck.wait_for_string(WORKER_UNLOCKED_SENTINEL);
 }
