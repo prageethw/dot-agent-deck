@@ -826,14 +826,28 @@ fn lock_015_paste_gated_by_lock_state() {
     // enabled (true for the `cat` stub here) regardless of UiMode, so this is
     // the one scroll door that does not itself re-enter PaneInput and reset
     // what this is about to prove.
+    //
+    // Polled in batches rather than one blind 60-notch burst then a single
+    // check: 60 back-to-back synthetic SGR mouse sequences is, like the bulk
+    // send above, a volume nothing else in this suite fires at once, and a
+    // fixed count plus one fire-and-forget wait cannot tell "not enough
+    // notches yet" apart from "an event got lost" from "still catching up".
+    // Each iteration sends another batch — cheap and safe well under the
+    // 10,000-line scrollback cap (`PANE_SCROLLBACK_LINES`) — so intermittent
+    // event loss self-heals instead of wedging the assertion, matching the
+    // retry-not-just-wait shape `send_keys_until_grid_string_within` already
+    // uses elsewhere in this harness.
     let (col, row) = deck.wait_for_in_grid(SCROLL_BOTTOM_MARKER);
-    deck.scroll_n(col, row, false, 60); // false == wheel-up, 60 notches
+    let scrolled_to_top = common::wait_until(Duration::from_secs(10), || {
+        deck.scroll_n(col, row, false, 20); // false == wheel-up, 20 notches
+        deck.wait_for_grid_string_within(SCROLL_TOP_MARKER, Duration::from_millis(200))
+    });
     assert!(
-        deck.wait_for_grid_string_within(SCROLL_TOP_MARKER, Duration::from_secs(2)),
-        "scrolling the focused worker pane's own view back 60 wheel notches \
-         never surfaced the marker typed as the very first of 120+ lines — \
-         the scrollback precondition for the next assertion was never \
-         actually established.\nGrid:\n{}",
+        scrolled_to_top,
+        "scrolling the focused worker pane's own view back via the wheel \
+         never surfaced the marker typed as the very first of 120+ lines \
+         within 10s of polled scrolling — the scrollback precondition for \
+         the next assertion was never actually established.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
