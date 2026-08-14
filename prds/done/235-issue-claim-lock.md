@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: In progress — M1–M4 implemented and green at `375285d`, then **re-scoped after review**. Reviewer and auditor both returned blocking verdicts on the marker-based identity (see "Identity, round 2"). Round-2 fixes in flight.
+**Status**: **Complete.** *(Status corrected 2026-08-14: this line read "Round-2 fixes in flight" for two days after the PR had merged — the identity design in fact went through five rounds, and the FINAL (round 5) design below is what shipped.)* Merged 2026-08-12 as `f91e7b22` via [PR #236](https://github.com/prageethw/dot-agent-deck/pull/236), first released in **v0.37.2**. `src/issue_claim.rs` exists on `main`; `changelog.d/235.feature.md` present. M5's close-out obligation is independently corroborated: CLAUDE.md rules 14 and 23 are already rewritten around `worker-agent-deck issue claim`, as M5 required.
 
 ## Threat model — read this before the design
 
