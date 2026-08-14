@@ -2382,6 +2382,9 @@ fn worktree_reclaim_046_kept_120_tree_stays_claimed_but_is_reclaimable() {
          reclaim` must actually remove the kept tree and free the slot -- otherwise \"kept, not \
          force-removed\" is a dead end with no way back; out={}",
         combined(&reclaimed)
+    );
+}
+
 // --- fork issue #325 M2: the shallow shared repository ---
 
 /// Scenario: fork issue #325 M2. `.git/shallow` lives in the common dir, so
@@ -2445,12 +2448,17 @@ fn guard_001_shallow_repo_is_detected_and_reported() {
             .expect("run dot-agent-deck worktree list")
     };
 
-    // Shallow scenario: `git clone --depth 1` from the seed repo.
+    // Shallow scenario: `git clone --depth 1` from the seed repo. `--no-local`
+    // is required here -- measured directly in CI: git silently IGNORES
+    // `--depth` for a same-filesystem local-path clone unless the local
+    // optimization is disabled, so without it the clone comes back with full
+    // history and this fixture's own precondition assertion below fails.
     let shallow_repo = scratch.path().join("shallow");
     git(
         scratch.path(),
         &[
             "clone",
+            "--no-local",
             "--depth",
             "1",
             &seed.to_string_lossy(),
@@ -2509,5 +2517,6 @@ fn guard_001_shallow_repo_is_detected_and_reported() {
     .to_lowercase();
     assert!(
         !combined.contains("shallow"),
-        "a normal, full-history repo must pass silently, got: {combined:?}"    );
+        "a normal, full-history repo must pass silently, got: {combined:?}"
+    );
 }

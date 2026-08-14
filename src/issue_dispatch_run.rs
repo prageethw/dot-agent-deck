@@ -3020,12 +3020,16 @@ exit 0
         const TRIALS: usize = 60;
 
         let ws = tempfile::tempdir().unwrap();
-        // Canonicalize the scratch root up front (before any worktree_dir is
-        // derived from it) — `worktree_dir` never exists at the point it is
-        // computed, so it cannot be canonicalized itself, and a symlinked
-        // temp root (e.g. macOS `/tmp` -> `/private/tmp`) would otherwise
-        // make git's own reported paths mismatch the ones this test computed.
-        let ws_root = ws.path().canonicalize().unwrap();
+        // Deliberately NOT canonicalized: on Windows, `Path::canonicalize`
+        // produces a `\\?\`-prefixed extended-length path, and `git worktree
+        // add` against such a path fails outright ("could not create leading
+        // directories ...: Invalid argument") — measured directly in CI. The
+        // paths this test passes to `create_worktree_sync` and the ones read
+        // back from `git worktree list` / `.git/worktrees/*/gitdir` are
+        // always derived from this SAME `ws_root`, so lexical equality holds
+        // without canonicalizing, matching how `create_worktree_records_creator_identity`
+        // above already compares paths.
+        let ws_root = ws.path().to_path_buf();
         let clone_dir = ws_root.join("clone");
         std::fs::create_dir_all(&clone_dir).unwrap();
         git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
