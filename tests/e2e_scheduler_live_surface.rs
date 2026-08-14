@@ -14,14 +14,20 @@
 //! fires are triggered with the existing `RunNow` control message over the
 //! deck's attach socket (no real LLM, no real-time cron wait).
 //!
-//! All four tests here are GREEN today, and have been since the fixes below
+//! `live/001`-`live/004` are GREEN today, and have been since the fixes below
 //! landed — with ONE exception: `78f92b6` widened the retire predicate and made
 //! `/004` RED again for the window it was on the tree, until `8f579dd` reverted
 //! it (see `/004`'s own note below). Outside that window they have been green,
-//! so do NOT read any of them as known-failing. A failure in this file is a real
-//! regression at the live-surfacing / supersession seam (issue #284: an earlier
-//! stale `RED today:` note here caused exactly that misclassification, so an
-//! investigation stopped looking at a genuine break).
+//! so do NOT read any of them as known-failing. A failure in `/001`-`/004` is a
+//! real regression at the live-surfacing / supersession seam (issue #284: an
+//! earlier stale `RED today:` note here caused exactly that misclassification,
+//! so an investigation stopped looking at a genuine break).
+//!
+//! `live/005` (fork issues #318/#320) is a DIFFERENT bug and is RED as
+//! written, by design — see its own doc comment. Do not fold it into the
+//! "all green" statement above when it eventually flips; update this note
+//! alongside its fix instead of leaving a stale claim for the next reader
+//! (that is exactly what issue #284 was about).
 //!
 //! What each one pins, and the fix it guards:
 //!   - `live/001`: a fire with a NON-hook command (`cat`) paints a card on the
@@ -81,6 +87,42 @@ fn run_now(deck: &TuiDeck, name: &str) {
         },
     )
     .unwrap_or_else(|e| panic!("RunNow {name} over the attach socket failed: {e}"));
+}
+
+/// Same on-screen drift substring `orchestration/hydration/001` pins for the
+/// reconnect-hydration call site. `scheduler/live/005` drives fork issue
+/// #318's OTHER call site (`surface_one_orchestration`, via
+/// `pending_orchestration_surfaces`) and is meant to end up sharing the same
+/// drift-warning helper once the fix lands, so this deliberately reuses the
+/// identical text rather than inventing a second spelling of one message —
+/// the coder must make both call sites produce this exact substring.
+const SCHEDULER_LIVE_DRIFT_NEEDLE: &str = "orchestration 'demo-orch' not found in local config";
+
+/// Write `content` to `path` (expected to be a FIFO / named pipe) on a
+/// background thread, bounded by a generous timeout. `open()` on a FIFO
+/// blocks until a reader and a writer pair up, so calling this from the main
+/// test thread would deadlock until the intended reader (the daemon's
+/// `decide_target`, or the attached TUI's `surface_one_orchestration`)
+/// actually performs its read — which this test cannot otherwise observe.
+/// The timeout exists only so a wrong synchronization assumption fails fast
+/// with a clear message instead of relying on nextest's blunt 3x60s kill
+/// window. `what` names which reader this write is meant to unblock, for the
+/// panic message.
+fn write_fifo_rendezvous(path: &std::path::Path, content: &'static str, what: &str) {
+    let owned_path = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::fs::write(&owned_path, content);
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("failed to write the FIFO for {what}: {e}"),
+        Err(_) => panic!(
+            "timed out after 20s waiting to write the FIFO {path:?} for {what} -- no reader \
+             opened it for reading in time"
+        ),
+    }
 }
 
 /// Scenario: Launch the deck attached to a daemon that has one enabled schedule
@@ -461,6 +503,167 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
         !grid.contains("9f8e7d6c-5b"),
         "after supersession the card TITLE must NOT revert to the session-id hash \
          ('… · 9f8e7d6c-5b…') — it should keep the schedule name.\nGrid:\n{grid}"
+    );
+
+    drop(scratch);
+}
+
+/// Scenario: Launch the deck attached to a daemon with one enabled schedule
+/// (`orchdrift`) whose target directory defines a two-role `[[orchestrations]]`
+/// entry named `demo-orch`, then fire it via `RunNow` while its local
+/// `.dot-agent-deck.toml` is a NAMED PIPE under this test's control. A FIFO's
+/// `open()` blocks until a reader and a writer pair up, which lets this test
+/// hand the daemon's spawn-time config read (inside `decide_target`, which
+/// decides the orchestration to spawn) and the ALREADY-ATTACHED TUI's later
+/// live-surfacing config read (inside `surface_one_orchestration`, once it
+/// drains the queued `OrchestrationSurface` broadcast) two DELIBERATELY
+/// DIFFERENT bodies, deterministically — whichever side reaches its `open()`
+/// call first simply waits for the other, so there is no millisecond race to
+/// win. The first body lists "demo-orch" (so the spawn succeeds and names the
+/// orchestration "demo-orch"); the second no longer does (renamed to
+/// "demo-orch-renamed", mirroring `orchestration/hydration/002`'s corruption
+/// and `orchestration/hydration/001`'s original rename) — the drift condition
+/// fork issue #318 is about. This drives #318's live-surfacing call site
+/// specifically, `surface_one_orchestration` via
+/// `pending_orchestration_surfaces` — NOT `orchestration/hydration/001`'s
+/// reconnect-hydration path, which is a different call site entirely and
+/// needs no such rendezvous (nothing races there; the file is already
+/// rewritten by the time a fresh client attaches). Pins that the SAME
+/// on-screen drift warning `orchestration/hydration/001` asserts also appears
+/// for THIS path once the config no longer lists the orchestration — today
+/// `surface_one_orchestration` uses `.ok().flatten()` and logs nothing at
+/// all, so this must currently time out RED.
+#[spec("scheduler/live/005")]
+#[test]
+fn live_005_daemon_surfaced_orchestration_config_drift_warns() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let work = scratch.path().join("orchdrift");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    let config_path = work.join(".dot-agent-deck.toml");
+
+    let mkfifo_status = std::process::Command::new("mkfifo")
+        .arg(&config_path)
+        .status()
+        .expect("mkfifo must be on PATH in the e2e environment");
+    assert!(
+        mkfifo_status.success(),
+        "mkfifo {config_path:?} failed with status {mkfifo_status:?}"
+    );
+
+    let sched_path = scratch.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        single_task_toml(
+            "orchdrift",
+            &work.to_string_lossy(),
+            "cat",
+            "ORCHDRIFTPROMPT",
+        ),
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // Fire the schedule on a BACKGROUND thread: the daemon's spawn path opens
+    // `config_path` for reading (inside `decide_target`) before it can do
+    // anything else, and that call blocks until rendezvous #1 below is
+    // provided -- calling `RunNow` on this (the main) thread would deadlock
+    // against our own writes.
+    let attach_socket = deck.attach_socket_path().to_path_buf();
+    let fire = std::thread::spawn(move || {
+        common::attach_request_on(
+            &attach_socket,
+            &dot_agent_deck::daemon_protocol::AttachRequest::RunNow {
+                name: "orchdrift".to_string(),
+            },
+        )
+    });
+
+    // Rendezvous #1: the config `decide_target` reads to decide WHAT to
+    // spawn. Must list "demo-orch" with two `cat` roles, or there is no
+    // orchestration to surface at all.
+    const MATCHING_TOML: &str = "[[orchestrations]]\n\
+         name = \"demo-orch\"\n\
+         \n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"cat\"\n\
+         start = true\n\
+         \n\
+         [[orchestrations.roles]]\n\
+         name = \"worker\"\n\
+         command = \"cat\"\n";
+    write_fifo_rendezvous(
+        &config_path,
+        MATCHING_TOML,
+        "decide_target's spawn-time config read",
+    );
+
+    // The daemon registers a role pane only once `spawn_one` returns for it,
+    // which can only happen AFTER `decide_target`'s read (above) has fully
+    // returned and its reader fd closed -- so observing the orchestrator
+    // pane here is a hard causal guarantee, not a race, that the FIFO is
+    // free again for a second writer to pair with a DIFFERENT reader.
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "orchestrator",
+            true,
+            Duration::from_secs(10),
+        ),
+        "the daemon must spawn the orchestrator role (precondition) before the \
+         live-surfacing broadcast can fire"
+    );
+
+    // Rendezvous #2: the config the ATTACHED TUI's `surface_one_orchestration`
+    // reads once it drains the queued `OrchestrationSurface` broadcast. No
+    // longer lists "demo-orch" -- the drift condition under test, identical
+    // in shape to `orchestration/hydration/001`'s rename.
+    const RENAMED_TOML: &str = "[[orchestrations]]\n\
+         name = \"demo-orch-renamed\"\n\
+         \n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"cat\"\n\
+         start = true\n\
+         \n\
+         [[orchestrations.roles]]\n\
+         name = \"worker\"\n\
+         command = \"cat\"\n";
+    write_fifo_rendezvous(
+        &config_path,
+        RENAMED_TOML,
+        "surface_one_orchestration's live-surfacing config read",
+    );
+
+    // Replace the FIFO with a stable regular file carrying the same content
+    // so nothing later in this test (or its teardown) can block forever on a
+    // third read nobody will answer.
+    std::fs::remove_file(&config_path).expect("remove the fifo");
+    std::fs::write(&config_path, RENAMED_TOML).expect("replace the fifo with a regular file");
+
+    // The RunNow socket call may or may not have completed by now (it awaits
+    // the full delivery wait after the two rendezvous above) -- its own
+    // success/failure is not this test's pin; the drift warning assertion
+    // below is the authoritative observation, made independently on the
+    // deck's own rendered grid.
+    let _ = fire.join();
+
+    // The pin: the SAME drift message `orchestration/hydration/001` pins for
+    // the reconnect-hydration path must also appear here, for the
+    // mid-session daemon-surfacing path. Today `surface_one_orchestration`
+    // logs nothing at all for this case, so this must time out RED.
+    assert!(
+        deck.wait_for_grid_string_within(SCHEDULER_LIVE_DRIFT_NEEDLE, Duration::from_secs(10)),
+        "a daemon-surfaced orchestration whose local .dot-agent-deck.toml no \
+         longer lists it (renamed out from under it between spawn and \
+         surfacing) must render an on-screen drift warning naming the \
+         orchestration -- expected the substring {SCHEDULER_LIVE_DRIFT_NEEDLE:?} \
+         on the rendered grid within 10s, got:\n{}",
+        deck.snapshot_grid()
     );
 
     drop(scratch);

@@ -3554,6 +3554,13 @@ without depending on the config struct API.
 - **Does not assert:** the exact wording of the warning beyond the required substring; the legitimate silent `cfg.is_none()` remote-reconnect path (`session/live/006`); the snapshot-restore path's equivalent drift warning (that path already warns — this entry is the daemon-hydration path's counterpart); which config (local vs synthesized) wins the rebuild (unchanged either way).
 - **Platform coverage:** mac+linux.
 
+##### orchestration/hydration/002 — Corrupting the local `.dot-agent-deck.toml` into invalid TOML while an orchestration's tab is live surfaces an on-screen warning naming the config file when the TUI reattaches to the still-running daemon (fork issue #320).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness; same reattach shape as `orchestration/hydration/001`).
+- **Agent:** none (`cat` stand-in roles; no LLM tokens).
+- **Asserts:** with an Orchestration tab opened live against the `orch-deck` fixture's `demo-orch` orchestration, rewriting that project's `.dot-agent-deck.toml` on disk with a syntax error (an unterminated string — the file still exists, it just no longer parses, distinct from both the legitimate silent `Absent` case and `001`'s "parses but doesn't list it" drift) and then launching a fresh TUI client against the SAME daemon renders an in-session status-line warning naming the local config file as unparseable. Pins the `LocalConfigState::Unparseable` branch of the `lookup_config` closure in `run_tui` (`src/ui.rs`), which today maps `Err(ProjectConfigError::Parse)` to `None` and takes the branch reserved for an absent file — silently.
+- **Does not assert:** the exact wording of the warning beyond the required substring; the legitimate silent `Absent` remote-reconnect path; `001`'s "parses but doesn't list the orchestration" drift case (a different `LocalConfigState` branch); the live-surfacing call site's equivalent case (covered by `scheduler/live/005`).
+- **Platform coverage:** mac+linux.
+
 ### Session restore
 
 #### session/restore
@@ -5033,6 +5040,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** after the placeholder surfaces with the friendly title `morning-digest` and the real hook supersedes it (the "No agent" placeholder becomes a live ClaudeCode card), the card TITLE STILL shows `morning-digest` (matching a reconnect) and has NOT reverted to the session-id hash form (`… · 9f8e7d6c-5b…`).
 - **Does not assert:** the surfacing path itself (covered by `scheduler/live/001`); focus survival (covered by `scheduler/live/002`); the no-hook title case (covered by `scheduler/live/003`); the title after a reconnect (which already masks the bug via startup hydration); the card's status badge / body layout.
 - **Platform coverage:** mac+linux.
+
+##### scheduler/live/005 — A daemon-surfaced orchestration whose local `.dot-agent-deck.toml` no longer lists it by the time the ALREADY-ATTACHED TUI processes the live-surfacing broadcast renders an on-screen drift warning naming the orchestration (fork issue #318).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`; fired with `RunNow`. The target directory's `.dot-agent-deck.toml` is a named pipe (`mkfifo`) so the test can hand the daemon's spawn-time `decide_target` read and the attached TUI's later `surface_one_orchestration` read two deliberately different bodies with no timing race (a FIFO `open()` blocks until a reader/writer pair up).
+- **Agent:** none (two `cat`-command roles — orchestrator + worker — no hooks).
+- **Asserts:** firing a schedule whose target directory defines a two-role `[[orchestrations]]` entry named `demo-orch` spawns and registers the orchestrator role (precondition, confirms the daemon's config read already saw "demo-orch"); with the local config then rewritten (via the second FIFO rendezvous) to no longer list `demo-orch` before the attached TUI's `surface_one_orchestration` reads it, the SAME on-screen substring `orchestration/hydration/001` pins (`orchestration 'demo-orch' not found in local config`) appears on the rendered grid.
+- **Does not assert:** the reconnect-hydration call site (covered by `orchestration/hydration/001`/`002`, a different call site entirely — nothing races there); the exact wording of the warning beyond the required substring; the unparseable-config case for this call site (only the "parses but doesn't list it" case is constructed here, matching what a FIFO rendezvous can deterministically drive); the card's status badge / body layout.
+- **Platform coverage:** mac+linux (`mkfifo` / POSIX named pipes; the L2 tier is already Unix-only per CLAUDE.md rule 2).
 
 
 ### Experimental feature flag (PRD #139)
