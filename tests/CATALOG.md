@@ -1867,10 +1867,10 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the aggregate-priority resolver as a standalone pure-function unit test (PRD #333 M1, may land separately); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/010 — An ACTIVE orchestration tab carries no status tint, and an inactive Idle orchestration tab renders with no grey (PRD #333).
+##### tabs/orchestration/010 — An ACTIVE orchestration tab renders its status tint as ordinary foreground text, cued as active via UNDERLINED | BOLD instead of REVERSED, and an inactive Idle orchestration tab renders with no grey (PRD #333; issue #306 reverses the earlier no-tint-on-active carve-out).
 - **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
 - **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
-- **Asserts:** an orchestration tab made the ACTIVE tab with a non-idle (`Error`) pane renders with NO status `fg` tint at all — its `fg` and modifiers must match an active non-orchestration (Dashboard) tab exactly (`REVERSED | BOLD`, no absolute color), since stacking a status `fg` on `Modifier::REVERSED` would invert the color into a background at display time (defect A). Also asserts an INACTIVE orchestration tab whose aggregate status is `Idle` renders with the same base label color as an ordinary tab, not `Color::DarkGray` (defect B), and that an INACTIVE orchestration tab with a non-idle (`Error`) aggregate status still colors its label text with neither `REVERSED` nor `BOLD` (regression guard, unchanged from before).
+- **Asserts:** an orchestration tab made the ACTIVE tab with a non-idle (`Error`) pane renders its status `fg` tint (Red) as ordinary foreground text, cued as active via `UNDERLINED | BOLD` with no `REVERSED` — since stacking a status `fg` on `Modifier::REVERSED` would invert the color into a background at display time (issue #306, reversing PRD #333 defect A's no-tint carve-out). Also asserts an INACTIVE orchestration tab whose aggregate status is `Idle` renders with the same base label color as an ordinary tab, not `Color::DarkGray` (defect B, unchanged), and that an INACTIVE orchestration tab with a non-idle (`Error`) aggregate status still colors its label text with neither `REVERSED` nor `BOLD` nor `UNDERLINED` — pinning the `UNDERLINED` active cue from both sides so an inactive tab can never become indistinguishable from an active one (reviewer finding F3 on PR #307).
 - **Does not assert:** the aggregate-priority resolver (covered by `tabs/orchestration/009`); per-pane sidebar status rendering (covered by `focus/orchestration/002`); pane-column geometry (covered by `orchestration/layout/002`/`004`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1879,6 +1879,20 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Agent:** none (synthetic `SessionStatus` map, no panes/PTYs).
 - **Asserts:** with the higher-order `coder` role manually focused and the lower-order `orchestrator` role marked `WaitingForInput`, applying the resolver's result through `focus_pane` and reading focus back off the SAME pane controller — the value the render loop actually feeds `compute_frame_layout` — shows the auto-focused `orchestrator` role reclaiming the full `PaneLayout::Stacked` pane-column height while the manually-focused-but-superseded `coder` role cedes its slot to zero height.
 - **Does not assert:** the resolver's own selection logic in isolation (`tabs/orchestration/013` and the `orchestration/focus/*` suite); any other layout mode.
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/012 — An ACTIVE non-orchestration tab (this feature doesn't touch it) still carries the UNDERLINED | BOLD active cue, no REVERSED, and no absolute foreground color (issue #306).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic; no `orchestration_statuses` entry, no panes/PTYs).
+- **Asserts:** a single active Dashboard tab with `orchestration_statuses = [None]` renders `UNDERLINED | BOLD` as its active cue, contains no `REVERSED`, and carries `Color::Reset` (no absolute foreground color) — proving the new active cue applies uniformly to tabs PRD #333's status-tint feature does not touch.
+- **Does not assert:** any status-tinted tab (covered by `tabs/orchestration/009`/`010`); the Idle fall-through on an active orchestration tab (covered by `tabs/orchestration/014`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/orchestration/014 — An ACTIVE orchestration tab whose aggregate status resolves to Idle falls through to the base label color (no grey), while still carrying the UNDERLINED | BOLD active cue (issue #306, extending PRD #333 defect B to the active tab).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** an orchestration tab made the ACTIVE tab with an all-`Idle` aggregate renders its label with the same base/unstyled foreground color as an ordinary tab (not `Color::DarkGray`), while still carrying `UNDERLINED | BOLD` and no `REVERSED` as its active cue.
+- **Does not assert:** the non-Idle active-tint case (covered by `tabs/orchestration/010`); the inactive Idle case (also covered by `tabs/orchestration/010`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### tabs/orchestration/024 — `Ctrl+l` must forward to a focused orchestration role pane's PTY, not be claimed as the split-cycle action, while the deck is in `PaneInput` mode (PRD #387 Defect 1 / M1b — the reported bug, in a real pane).
