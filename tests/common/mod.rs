@@ -161,6 +161,7 @@ pub struct TuiDeckBuilder {
     claude_trust_paths: Vec<String>,
     claude_trust_workdir: bool,
     suppress_success_recording: bool,
+    launch_subdir: Option<String>,
 }
 
 impl TuiDeckBuilder {
@@ -302,6 +303,18 @@ impl TuiDeckBuilder {
     /// would make the last drop nondeterministically overwrite the primary cast.
     pub fn without_success_recording(mut self) -> Self {
         self.suppress_success_recording = true;
+        self
+    }
+
+    /// Launch the binary with its process cwd set to `subdir` (created if
+    /// needed) *inside* the copied fixture root, instead of the fixture root
+    /// itself. Fork issue #303: `.dot-agent-deck.toml` still lives at the
+    /// fixture root — this exercises a deck launched from somewhere other
+    /// than its project directory, which is exactly the case
+    /// `features_config_path()` resolved wrong (against the process cwd
+    /// rather than the project directory).
+    pub fn with_launch_subdir(mut self, subdir: impl Into<String>) -> Self {
+        self.launch_subdir = Some(subdir.into());
         self
     }
 
@@ -448,6 +461,7 @@ impl TuiDeck {
             claude_trust_paths: Vec::new(),
             claude_trust_workdir: false,
             suppress_success_recording: false,
+            launch_subdir: None,
         }
     }
 
@@ -618,9 +632,22 @@ impl TuiDeck {
         // test. The `env!()` evaluates at compile time so the harness
         // always launches whatever the current test build produced
         // (debug vs. release matches the test's profile).
+        // Fork issue #303: some tests launch the binary from a subdirectory
+        // of the fixture root rather than the root itself, to prove config
+        // resolution finds the project directory rather than the process's
+        // own (possibly nested) cwd.
+        let launch_cwd = match &builder.launch_subdir {
+            Some(subdir) => {
+                let dir = work.join(subdir);
+                std::fs::create_dir_all(&dir).expect("create launch subdir");
+                dir
+            }
+            None => work.clone(),
+        };
+
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
-        cmd.cwd(&work);
+        cmd.cwd(&launch_cwd);
         // PRD #89: the `--continue` flag was removed — auto-restore is now the
         // default. A staged saved session (pointed at by `DOT_AGENT_DECK_SESSION`
         // below) is restored unconditionally on launch when the daemon is empty,

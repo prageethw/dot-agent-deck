@@ -74,3 +74,26 @@ fn gating_003_env_var_toggles_footer_e2e() {
         off.snapshot_grid()
     );
 }
+
+/// Scenario: Launch the deck from a subdirectory *inside* the
+/// `features-project-dir` fixture root rather than the root itself, with
+/// `DOT_AGENT_DECK_EXPERIMENTAL` unset. That fixture's `.dot-agent-deck.toml`
+/// carries `[features] experimental = true`. The rendered grid must show the
+/// `experimental: on` footer once the dashboard is up — proving the flag
+/// resolver finds the PROJECT directory's config rather than one relative to
+/// the process's own, nested, working directory.
+#[spec("orchestration/features/001")]
+#[test]
+fn features_001_flag_resolves_from_project_dir_not_nested_launch_cwd() {
+    // Fork issue #303: `features_config_path()` resolves the feature-flag
+    // config against the process's OWN cwd, while every other config read in
+    // the deck resolves against the project directory it was handed. Here the
+    // process cwd (`nested/launch/dir`) has no `.dot-agent-deck.toml` of its
+    // own, so today the flag resolves to the default (OFF) and the wait
+    // below times out. RED today.
+    let deck = TuiDeck::builder()
+        .with_launch_subdir("nested/launch/dir")
+        .launch_with_fixture("features-project-dir");
+    deck.wait_for_string("No active sessions");
+    deck.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
+}
