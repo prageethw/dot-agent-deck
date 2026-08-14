@@ -3500,45 +3500,63 @@ pub fn resolve_orch_config_for_hydration(
     )
 }
 
-/// Fork issue #314: decide whether the hydration-drift branch beside
-/// [`resolve_orch_config_for_hydration`] should surface a user-visible
-/// warning. Extracted as a pure helper — same rationale as
-/// `resolve_orch_config_for_hydration` itself (reviewer S1) — so the
-/// "warn only on drift, stay silent on legitimate remote reconnect"
-/// contract is unit-testable without standing up a hydration fixture.
-///
-/// `config_present` is `true` when the local `.dot-agent-deck.toml`
-/// loaded successfully (`cfg.is_some()` at the call site) — `lookup_config`
-/// collapses BOTH an absent file and an unparseable one to `None`, so
-/// `config_present == false` covers both, not only "absent". `local_found`
-/// is `true` when that config lists an orchestration by this name. Only
-/// `config_present && !local_found` — the file parses but no longer
-/// lists the orchestration, i.e. a rename/removal drifted out from under
-/// a live tab — is a warning. `!config_present` covers the legitimate
-/// PRD #111 remote-reconnect case (file genuinely absent) as well as an
-/// unparseable local file, and must stay silent regardless of
-/// `local_found` in both cases; warning on the parse-error case is
-/// tracked separately by fork issue #320.
-fn hydration_drift_warning(
-    config_present: bool,
-    local_found: bool,
-    name: &str,
-    cwd: &str,
-) -> Option<String> {
-    if config_present && !local_found {
-        // Fork issue #314 reviewer F1: the status bar is one unwrapped row,
-        // so the actionable clause has to come before the cwd — otherwise
-        // truncation eats the part that tells the user what happened and
-        // leaves only the least useful part (the path) visible. The
-        // contract substring below ("orchestration '<name>' not found in
-        // local config") must stay verbatim and leading — it's what
-        // `hydration/001` asserts on.
-        Some(format!(
-            "Warning: orchestration '{name}' not found in local config; \
-             rebuilt this tab from the live daemon, not your project config ({cwd})"
-        ))
-    } else {
-        None
+/// Fork issues #318 + #320: the three ways a hydration/live-surfacing call
+/// site's local-config lookup can come out, replacing the `(config_present,
+/// local_found)` boolean pair `hydration_drift_warning` used to take. That
+/// pair was flagged on PR #315 as a tautology at its call site — both
+/// booleans were statically fixed by the enclosing `if`/`else` branches — so
+/// it ruled out the illegal `local_found == true` while `config_present ==
+/// false` state only by convention, not by the type. This enum makes it
+/// unrepresentable instead.
+enum LocalConfigState {
+    /// The local `.dot-agent-deck.toml` does not exist. The legitimate PRD
+    /// #111 remote-reconnect case — stay silent.
+    Absent,
+    /// The local `.dot-agent-deck.toml` exists but failed to parse (fork
+    /// issue #320). `path` is the `ProjectConfigError::Parse` `Display`
+    /// text, which already names both the file path and the underlying
+    /// `toml::de::Error` — exactly the two things the warning needs to
+    /// name, for free.
+    Unparseable { path: String },
+    /// The local `.dot-agent-deck.toml` parsed. `found` is whether it
+    /// lists an orchestration by this name — `false` is the rename/removal
+    /// drift case (fork issue #314).
+    Present { found: bool },
+}
+
+/// Fork issue #314 (enum shape: #318/#320): decide whether the
+/// hydration-drift branch beside [`resolve_orch_config_for_hydration`]
+/// should surface a user-visible warning. Extracted as a pure helper — same
+/// rationale as `resolve_orch_config_for_hydration` itself (reviewer S1) —
+/// so the "warn only on drift or an unparseable file, stay silent on
+/// legitimate remote reconnect" contract is unit-testable without standing
+/// up a hydration fixture.
+fn hydration_drift_warning(state: LocalConfigState, name: &str, cwd: &str) -> Option<String> {
+    match state {
+        LocalConfigState::Absent => None,
+        LocalConfigState::Present { found: true } => None,
+        LocalConfigState::Present { found: false } => {
+            // Fork issue #314 reviewer F1: the status bar is one unwrapped
+            // row, so the actionable clause has to come before the cwd —
+            // otherwise truncation eats the part that tells the user what
+            // happened and leaves only the least useful part (the path)
+            // visible. The contract substring below ("orchestration '<name>'
+            // not found in local config") must stay verbatim and leading —
+            // it's what `hydration/001` and `live_005` assert on.
+            Some(format!(
+                "Warning: orchestration '{name}' not found in local config; \
+                 rebuilt this tab from the live daemon, not your project config ({cwd})"
+            ))
+        }
+        // Fork issue #320: distinct from the drift case above — the file
+        // itself is broken, not merely missing this orchestration, so name
+        // what's broken rather than the drift phrasing. The contract
+        // substring below ("local .dot-agent-deck.toml could not be
+        // parsed") is what `hydration/002` and `live_005`'s sibling case
+        // assert on.
+        LocalConfigState::Unparseable { path } => Some(format!(
+            "Warning: local .dot-agent-deck.toml could not be parsed: {path}"
+        )),
     }
 }
 
@@ -4794,6 +4812,7 @@ fn process_pending_orchestration_surfaces(
     state: &SharedState,
     pane: &Arc<dyn PaneController>,
     tab_manager: &mut TabManager,
+    ui: &mut UiState,
 ) {
     // S2: cheap READ-lock peek. The steady-state idle cost is one read lock +
     // is_empty — not the exclusive write lock the drain needs, taken every frame
@@ -4832,7 +4851,7 @@ fn process_pending_orchestration_surfaces(
         }
         st.pending_orchestration_surfaces.remove(0)
     };
-    surface_one_orchestration(state, embedded, tab_manager, surface);
+    surface_one_orchestration(state, embedded, tab_manager, surface, ui);
 }
 
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
@@ -4843,6 +4862,7 @@ fn surface_one_orchestration(
     embedded: &EmbeddedPaneController,
     tab_manager: &mut TabManager,
     surface: OrchestrationSurface,
+    ui: &mut UiState,
 ) {
     // Idempotency: skip if an existing tab already owns any of this surface's
     // role panes (a duplicate broadcast, or reconnect-hydration that beat us to
@@ -4889,14 +4909,52 @@ fn surface_one_orchestration(
             })
             .collect(),
     };
-    let local = load_project_config(Path::new(&surface.cwd))
-        .ok()
-        .flatten()
-        .and_then(|c| {
-            c.orchestrations
-                .into_iter()
-                .find(|o| o.name == surface.name)
-        });
+    // Fork issue #318: `.ok().flatten()` used to collapse ALL THREE
+    // `LocalConfigState` outcomes (absent, unparseable, present-but-drifted)
+    // with no log at all — worse than the reconnect-hydration path was
+    // before fork issue #314. Resolve through the same states that loop
+    // uses instead, so the mid-session daemon-surfacing path (issue
+    // dispatch, scheduled runs) warns on drift/unparseable exactly like a
+    // reconnect does.
+    let cfg_result = load_project_config(Path::new(&surface.cwd));
+    let local = match &cfg_result {
+        Ok(Some(c)) => c
+            .orchestrations
+            .iter()
+            .find(|o| o.name == surface.name)
+            .cloned(),
+        Ok(None) | Err(_) => None,
+    };
+    let local_config_state = match &cfg_result {
+        Ok(None) => LocalConfigState::Absent,
+        Ok(Some(_)) => LocalConfigState::Present {
+            found: local.is_some(),
+        },
+        Err(e @ crate::project_config::ProjectConfigError::Parse { .. }) => {
+            tracing::warn!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                error = %e,
+                "live orchestration surface: local project config failed to parse"
+            );
+            LocalConfigState::Unparseable {
+                path: e.to_string(),
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                error = %e,
+                "live orchestration surface: failed to load local project config; using synthesised config"
+            );
+            LocalConfigState::Absent
+        }
+    };
+    if let Some(msg) = hydration_drift_warning(local_config_state, &surface.name, &surface.cwd) {
+        ui.session_warnings.push(msg.clone());
+        ui.status_message = Some((msg, std::time::Instant::now()));
+    }
     let orch_config = resolve_orch_config_for_hydration(local, &bucket);
 
     // Attach each role's live daemon PTY (by its DOT_AGENT_DECK_PANE_ID) and
@@ -11515,35 +11573,51 @@ pub fn run_tui(
                 }
             }
         }
-        // Cache cwd → project config so the lookup happens once per
-        // distinct cwd regardless of how many buckets share it.
+        // Cache cwd → project config lookup so it happens once per distinct
+        // cwd regardless of how many buckets share it. Fork issue #320: the
+        // cache carries `Err(String)` for an unparseable file rather than
+        // collapsing it into `Ok(None)` alongside a genuinely absent one —
+        // `lookup_config` used to map BOTH to `None`, which is what made an
+        // unparseable local edit silent. The `String` is the
+        // `ProjectConfigError::Parse` `Display` text (see
+        // `LocalConfigState::Unparseable`'s doc comment for why that's
+        // sufficient on its own).
         let mut config_cache: std::collections::HashMap<
             String,
-            Option<crate::project_config::ProjectConfig>,
+            Result<Option<crate::project_config::ProjectConfig>, String>,
         > = std::collections::HashMap::new();
-        let lookup_config = |cache: &mut std::collections::HashMap<
-            String,
-            Option<crate::project_config::ProjectConfig>,
-        >,
-                             cwd: &str|
-         -> Option<crate::project_config::ProjectConfig> {
-            if let Some(cached) = cache.get(cwd) {
-                return cached.clone();
-            }
-            let loaded = match load_project_config(std::path::Path::new(cwd)) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    tracing::error!(
-                        cwd = %cwd,
-                        error = %e,
-                        "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
-                    );
-                    None
+        let lookup_config =
+            |cache: &mut std::collections::HashMap<
+                String,
+                Result<Option<crate::project_config::ProjectConfig>, String>,
+            >,
+             cwd: &str|
+             -> Result<Option<crate::project_config::ProjectConfig>, String> {
+                if let Some(cached) = cache.get(cwd) {
+                    return cached.clone();
                 }
+                let loaded = match load_project_config(std::path::Path::new(cwd)) {
+                    Ok(opt) => Ok(opt),
+                    Err(e @ crate::project_config::ProjectConfigError::Parse { .. }) => {
+                        tracing::error!(
+                            cwd = %cwd,
+                            error = %e,
+                            "hydration: local project config failed to parse"
+                        );
+                        Err(e.to_string())
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            cwd = %cwd,
+                            error = %e,
+                            "hydration: failed to load project config; dropping mode/orchestration tabs to dashboard"
+                        );
+                        Ok(None)
+                    }
+                };
+                cache.insert(cwd.to_string(), loaded.clone());
+                loaded
             };
-            cache.insert(cwd.to_string(), loaded.clone());
-            loaded
-        };
 
         // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane dims for
         // hydration mode-tab rebuilds. Side panes spawn fresh from the
@@ -11553,7 +11627,10 @@ pub fn run_tui(
         // is active, but spawning at the right size avoids the 24×80 hiccup.
         let hydration_frame_area = terminal.get_frame().area();
         for bucket in &partition.mode_buckets {
-            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            // Mode tabs don't distinguish Absent/Unparseable/drift — an
+            // unusable local config just means no mode config for this
+            // bucket, same as before #320.
+            let cfg = lookup_config(&mut config_cache, &bucket.cwd).ok().flatten();
             let mode_config = cfg
                 .as_ref()
                 .and_then(|c| c.modes.iter().find(|m| m.name == bucket.mode_name).cloned());
@@ -11597,100 +11674,97 @@ pub fn run_tui(
         // hiding their work).
         let mut first_orchestration_tab_index: Option<usize> = None;
         for bucket in &partition.orchestration_buckets {
-            let cfg = lookup_config(&mut config_cache, &bucket.cwd);
+            let cfg_result = lookup_config(&mut config_cache, &bucket.cwd);
+            let cfg: Option<crate::project_config::ProjectConfig> =
+                cfg_result.as_ref().ok().cloned().flatten();
             let local_orch_config = cfg.as_ref().and_then(|c| {
                 c.orchestrations
                     .iter()
                     .find(|o| o.name == bucket.orchestration_name)
                     .cloned()
             });
-            // Fork issue #314 reviewer F2: computed here, above the
-            // `if local_orch_config.is_none()` block below, so BOTH
-            // parameters stay live. Computed inside that block (as
-            // before), the call site itself statically fixes both —
-            // `cfg.is_some()` is always true inside its `else`, and
-            // `local_found` was a hardcoded `false` — so
-            // `hydration_drift_warning` could never return `None` in
-            // production regardless of what its body does; a unit test on
-            // the pure function can't see that, since it can't observe its
-            // caller. Hoisting makes this call site the single decision
-            // point instead of restating the decision the `if` below
-            // already made.
-            let drift_warning = hydration_drift_warning(
-                cfg.is_some(),
-                local_orch_config.is_some(),
-                &bucket.orchestration_name,
-                &bucket.cwd,
-            );
-            // PRD #111: when the local project config file can't be
-            // resolved (laptop TUI reconnecting to a VM daemon whose
-            // `bucket.cwd` doesn't exist locally) or the local file
-            // doesn't carry an orchestration with this name (drift),
-            // synthesise a minimal `OrchestrationConfig` from the
-            // daemon-supplied bucket metadata. The synthesised config
-            // is structurally correct (same name, same role count,
-            // same role names, same start role) — only display-only
-            // enrichment fields (description, prompt_template) are
-            // missing. Without this fallback, every remote-reconnect
-            // user would see their orchestration panes dumped into the
-            // dashboard.
-            if local_orch_config.is_none() {
-                // PRD #111 auditor nit: distinguish the two
-                // "synthesise" cases so operators can tell whether
-                // the file is genuinely absent (legitimate remote
-                // reconnect — `cfg.is_none()`) or present but
-                // missing this orchestration (config drift —
-                // `cfg.is_some()`). Same level (info) for both;
-                // distinct messages so log search picks them apart.
-                if cfg.is_none() {
+            // Fork issue #314 reviewer F2 (state shape: #318/#320):
+            // computed here, above the tracing/warning block below, so the
+            // full three-way state stays live for both the log-level
+            // decision and `hydration_drift_warning` instead of the call
+            // site restating a decision an inner `if` already made — see
+            // `LocalConfigState`'s doc comment for why a bare bool pair
+            // can't represent "unparseable" at all.
+            let local_config_state = match cfg_result {
+                Err(path) => LocalConfigState::Unparseable { path },
+                Ok(None) => LocalConfigState::Absent,
+                Ok(Some(_)) => LocalConfigState::Present {
+                    found: local_orch_config.is_some(),
+                },
+            };
+            // PRD #111 auditor nit / fork issue #320: distinguish the
+            // three "synthesise" cases so operators can tell whether the
+            // file is genuinely absent (legitimate remote reconnect),
+            // present but unparseable (a broken local edit), or present
+            // but missing this orchestration (config drift). `Absent` logs
+            // at info (expected, PRD #111); the other two log at warn.
+            match &local_config_state {
+                LocalConfigState::Present { found: true } => {}
+                LocalConfigState::Absent => {
                     tracing::info!(
                         cwd = %bucket.cwd,
                         orchestration = %bucket.orchestration_name,
                         role_count = bucket.role_slots.len(),
                         "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
                     );
-                } else {
+                }
+                LocalConfigState::Unparseable { path } => {
+                    tracing::warn!(
+                        cwd = %bucket.cwd,
+                        orchestration = %bucket.orchestration_name,
+                        role_count = bucket.role_slots.len(),
+                        error = %path,
+                        "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml could not be parsed)"
+                    );
+                }
+                LocalConfigState::Present { found: false } => {
                     tracing::warn!(
                         cwd = %bucket.cwd,
                         orchestration = %bucket.orchestration_name,
                         role_count = bucket.role_slots.len(),
                         "hydration: rebuilding orchestration tab from synthesised config (local config exists but does not list this orchestration — config drift or stale)"
                     );
-                    // Fork issue #314: unlike the snapshot-restore path,
-                    // this branch used to be silent to the user (log
-                    // only). Surface it on both surfaces the restore
-                    // path uses: the exit-time session warning and the
-                    // in-session status line (the latter is what a
-                    // still-attached user actually sees).
-                    //
-                    // Reviewer F4: when several orchestrations drift in
-                    // the same hydration pass, this loop overwrites
-                    // `ui.status_message` on every iteration, so only the
-                    // LAST drifted orchestration's warning is visible
-                    // in-session; every one of them is still preserved in
-                    // `ui.session_warnings` and reaches the user at exit.
-                    // Deliberate, matching the precedent already set by
-                    // the single-slot-status / multi-item-warnings split
-                    // used elsewhere in this function (e.g. the
-                    // snapshot-restore loop below) rather than an
-                    // oversight here.
-                    //
-                    // The 15s `STATUS_MESSAGE_TTL` clock starts at the
-                    // `Instant::now()` below, before the (mutually
-                    // exclusive, but still later-running) snapshot-restore
-                    // block and the first draw. A restore slow enough to
-                    // eat 15s could in principle expire the message before
-                    // it is ever rendered. Documenting rather than fixing:
-                    // a restore taking anywhere near 15s would itself be
-                    // the user-visible problem, and deferring this
-                    // timestamp would mean threading it through the
-                    // hydration/restore split for a case that has never
-                    // been observed.
-                    if let Some(msg) = drift_warning {
-                        ui.session_warnings.push(msg.clone());
-                        ui.status_message = Some((msg, std::time::Instant::now()));
-                    }
                 }
+            }
+            // Fork issue #314 (originally): unlike the snapshot-restore
+            // path, the drift and unparseable branches used to be silent
+            // to the user (log only). Surface them on both surfaces the
+            // restore path uses: the exit-time session warning and the
+            // in-session status line (the latter is what a still-attached
+            // user actually sees). `Absent` stays silent — that's the
+            // legitimate PRD #111 remote-reconnect case, and
+            // `hydration_drift_warning` returns `None` for it.
+            //
+            // Reviewer F4: when several orchestrations drift in the same
+            // hydration pass, this loop overwrites `ui.status_message` on
+            // every iteration, so only the LAST drifted orchestration's
+            // warning is visible in-session; every one of them is still
+            // preserved in `ui.session_warnings` and reaches the user at
+            // exit. Deliberate, matching the precedent already set by the
+            // single-slot-status / multi-item-warnings split used
+            // elsewhere in this function (e.g. the snapshot-restore loop
+            // below) rather than an oversight here.
+            //
+            // The 15s `STATUS_MESSAGE_TTL` clock starts at the
+            // `Instant::now()` below, before the (mutually exclusive, but
+            // still later-running) snapshot-restore block and the first
+            // draw. A restore slow enough to eat 15s could in principle
+            // expire the message before it is ever rendered. Documenting
+            // rather than fixing: a restore taking anywhere near 15s would
+            // itself be the user-visible problem, and deferring this
+            // timestamp would mean threading it through the
+            // hydration/restore split for a case that has never been
+            // observed.
+            if let Some(msg) =
+                hydration_drift_warning(local_config_state, &bucket.orchestration_name, &bucket.cwd)
+            {
+                ui.session_warnings.push(msg.clone());
+                ui.status_message = Some((msg, std::time::Instant::now()));
             }
             let orch_config = resolve_orch_config_for_hydration(local_orch_config, bucket);
             // Build a Vec<Option<String>> of length config.roles.len()
@@ -12448,7 +12522,7 @@ pub fn run_tui(
         // PRD #120: build live tabs for any orchestrations the daemon spawned
         // mid-session (issue dispatch). Done before the snapshot clone + tab
         // derivation below so a freshly-surfaced tab paints this same frame.
-        process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager);
+        process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -22625,44 +22699,68 @@ mod tests {
         assert_eq!(synthesised.roles[1].name, "reviewer");
     }
 
-    /// Fork issue #314: `hydration_drift_warning`'s truth table. Only the
-    /// "config parses but no longer lists this orchestration" case (a
-    /// rename/removal drifted out from under a live tab) should warn;
-    /// `config_present = false` (the PRD #111 remote-reconnect case OR an
-    /// unparseable local file — fork issue #320) and the found case must
-    /// both stay silent.
+    /// Fork issues #314/#318/#320: `hydration_drift_warning`'s truth table
+    /// over `LocalConfigState`'s three outcomes. Only `Present { found:
+    /// false }` (a rename/removal drifted out from under a live tab) and
+    /// `Unparseable` (a broken local edit) should warn; `Absent` (the PRD
+    /// #111 remote-reconnect case) and `Present { found: true }` must both
+    /// stay silent.
     #[test]
     fn hydration_drift_warning_truth_table() {
-        // config present, orchestration not found -> warns, names both
-        // the orchestration and the substring the e2e test asserts on.
-        let warning =
-            hydration_drift_warning(true, false, "demo-orch", "/Users/x/project").unwrap();
+        // Present, orchestration not found -> warns, names both the
+        // orchestration and the substring the e2e tests assert on.
+        let warning = hydration_drift_warning(
+            LocalConfigState::Present { found: false },
+            "demo-orch",
+            "/Users/x/project",
+        )
+        .unwrap();
         assert!(
             warning.contains("orchestration 'demo-orch' not found in local config"),
             "warning must carry the exact contract substring, got: {warning:?}"
         );
 
-        // config_present=false — covers both the legitimate remote
-        // reconnect (PRD #111, file genuinely absent) and an unparseable
-        // local file (fork issue #320 tracks warning on that case
-        // separately) -> silent regardless of local_found.
+        // Absent — the legitimate remote reconnect (PRD #111, file
+        // genuinely absent) -> silent.
         assert_eq!(
-            hydration_drift_warning(false, false, "demo-orch", "/remote/proj"),
+            hydration_drift_warning(LocalConfigState::Absent, "demo-orch", "/remote/proj"),
             None,
             "remote reconnect with no local config file must stay silent"
         );
-        assert_eq!(
-            hydration_drift_warning(false, true, "demo-orch", "/remote/proj"),
-            None,
-            "config_present=false (absent or unparseable) must stay silent even if local_found were true"
-        );
 
-        // config present, orchestration found -> silent (not the drift
-        // branch at all).
+        // Present, orchestration found -> silent (not the drift branch at
+        // all).
         assert_eq!(
-            hydration_drift_warning(true, true, "demo-orch", "/Users/x/project"),
+            hydration_drift_warning(
+                LocalConfigState::Present { found: true },
+                "demo-orch",
+                "/Users/x/project"
+            ),
             None,
             "orchestration found in local config must stay silent"
+        );
+
+        // Unparseable (fork issue #320) -> warns, names the local config
+        // file and carries the parse-error text (both folded into `path`
+        // by the `ProjectConfigError::Parse` `Display` impl) around the
+        // contract substring the e2e test asserts on.
+        let parse_warning = hydration_drift_warning(
+            LocalConfigState::Unparseable {
+                path: "Failed to parse /Users/x/project/.dot-agent-deck.toml: TOML parse error"
+                    .into(),
+            },
+            "demo-orch",
+            "/Users/x/project",
+        )
+        .unwrap();
+        assert!(
+            parse_warning.contains("local .dot-agent-deck.toml could not be parsed"),
+            "warning must carry the exact contract substring, got: {parse_warning:?}"
+        );
+        assert!(
+            parse_warning.contains("/Users/x/project/.dot-agent-deck.toml")
+                && parse_warning.contains("TOML parse error"),
+            "warning must name both the file path and the parse error, got: {parse_warning:?}"
         );
     }
 
