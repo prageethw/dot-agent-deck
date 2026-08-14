@@ -119,9 +119,32 @@ Reporting gains a three-state owner for every worktree. Removal authority stays 
 
 ## Success Criteria
 
-1. A deck-created worktree reports `Agent{identity}` matching its marker.
-2. A hand-made worktree reports `Human{login,host}` — not `Unknown`, and **not** `owned: true`.
-3. A merged, clean, human-owned worktree is still `Ask`, never `Remove`, under a bare `reclaim`.
-4. `worktree list --json` carries owner and kind on every row; `--mine` answers rather than refusing for both caller kinds.
-5. Ownership survives restart/reload, and a restored `OrchestrationSnapshot.owner` agrees with the marker.
-6. Running `worker-agent-deck worktree list` on this repo names an owner for every worktree instead of an empty column.
+**Status against PR #298 as merged** *(annotated 2026-08-14, before merge — do not read this PRD as complete)*:
+
+| # | Criterion | Landed? |
+|---|---|---|
+| 1 | A deck-created worktree reports `Agent{identity}` matching its marker. | **Yes** — `worktree/reclaim/037` |
+| 2 | A hand-made worktree reports `Human{login,host}` — not `Unknown`, and **not** `owned: true`. | **Yes** — `worktree/reclaim/038` |
+| 3 | A merged, clean, human-owned worktree is still `Ask`, never `Remove`, under a bare `reclaim`. | **Yes** — `worktree/reclaim/039`, and independently traced by both the reviewer and the auditor |
+| 4 | `worktree list --json` carries owner and kind on every row; `--mine` answers rather than refusing for both caller kinds. | **Half.** The `--json` half landed (`worktree/reclaim/040`). **`--mine` still refuses for a human caller** — see below |
+| 5 | Ownership survives restart/reload, and a restored `OrchestrationSnapshot.owner` agrees with the marker. | **Partly** — the marker is a file in the worktree's git dir and is inherently durable, but the snapshot-agreement half is not separately asserted |
+| 6 | Running `worker-agent-deck worktree list` on this repo names an owner for every worktree instead of an empty column. | **Yes** for the OWNER column, which `format_list_human` already emitted from `r.owner` and which now populates with no display-side change |
+
+### What did NOT land, and why criterion 4 is only half
+
+**M2.1's `--mine`-for-a-human half is not implemented.** Two independent blockers, both in code this PR deliberately did not touch:
+
+1. `owner_filter` is derived **solely** from `DOT_AGENT_DECK_WORKTREE_OWNER` (`src/main.rs`). A human at a terminal has no such variable, so `worktree list --mine` exits `FAILURE` before `examine_worktrees` is ever called — the new human resolution is never consulted for the filter.
+2. Even if it were, `is_mine` is `report.owned && report.owner == Some(owner)`. A `Human` worktree is unmarked, so `owned` is `false`, so **no human row can satisfy `is_mine` by construction.**
+
+Closing that gap means changing `is_mine`'s `owned &&` conjunct — a **fail-closed guard PR #215 added deliberately** after its own reviewer F4 / auditor L1 round. That is not a detail to fold into a review-fix commit; it needs its own round with its own review. Tracked as a follow-up.
+
+**M3 (fork#175) was never in scope** — see Scope above. So *"creating a worktree records ownership"* remains true only for deck-created worktrees; a hand-made one now **reports** a resolved human owner but **records** nothing.
+
+### Known follow-ups at merge
+
+- `--mine` for a human caller (criterion 4's second half).
+- Structured warning objects rather than prose strings — issue #230's own suggested direction; this PR ships prose.
+- Tests for the two untested `Unknown` branches (unresolvable git-dir; `gh` login unresolved). The second is the security-relevant one: it currently renders identically to the adversarial forged-`.git` case.
+- The pre-existing stub-`gh` harness duplication between `tests/worktree_reclaim.rs` and `tests/issue_claim.rs`, which tips SonarCloud's new-code duplication gate by **18 lines against a 17.94-line threshold**. Production code has zero duplicated lines; the five new tests appear in no duplication block.
+- No bounded wait on any subprocess in `worktree_reclaim.rs` — pre-existing and module-wide, not introduced here.
