@@ -724,9 +724,10 @@ mod tests {
         view.install(listing(vec![record("7", "pane-7")]), now);
 
         view.apply(&BroadcastMsg::WorktreeKept(
-            dot_agent_deck::issue_dispatch_run::KeptWorktree {
+            dot_agent_deck::event::WorktreeKeptNotice {
                 path: "/tmp/wt".into(),
-                confirmed_dirty: true,
+                reason: dot_agent_deck::event::KeptReason::Dirty,
+                error: None,
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::WorktreeKept));
