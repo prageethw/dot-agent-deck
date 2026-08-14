@@ -5935,7 +5935,7 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
 /// * `a–z` — the same rule after upcasing, giving 0x01..=0x1a.
 /// * `2`–`8` — xterm's digit aliases: NUL, ESC, FS, GS, RS, US, DEL. `4`–`7` are
 ///   also the *only* form crossterm's legacy parser produces for `0x1c..=0x1f`
-///   (`crossterm-0.28.1/src/event/sys/unix/parse.rs:110-113`), so they matter in
+///   (`crossterm-0.29.0/src/event/sys/unix/parse.rs:110-113`), so they matter in
 ///   legacy mode too, not just under M2.
 /// * `?` → DEL and `/` → US — xterm's two punctuation aliases that the caret
 ///   rule cannot produce (`?` masks to 0x1f, `/` to 0x0f).
@@ -5954,15 +5954,15 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
 ///    through the REAL decoder — it puts a PTY on fd 0 so crossterm's
 ///    `pub(crate)` `parse_event` runs on genuine terminal input — and so fails
 ///    the moment the encoder stops being the decoder's inverse. It needs the
-///    process to itself (crossterm 0.28's raw-mode flag and its lazily-built
+///    process to itself (crossterm 0.29's raw-mode flag and its lazily-built
 ///    event reader are PROCESS-global), so it runs under `cargo test-fast` /
 ///    `cargo nextest` and skips under a plain `cargo test`.
-/// 2. `Cargo.toml` pins the direct dependency to `=0.28.1`, so the decoder
+/// 2. `Cargo.toml` pins the direct dependency to `=0.29.0`, so the decoder
 ///    cannot change without a deliberate edit to that line.
 ///
 /// The hand-read decoder tables stay recorded here because they are the *why*
 /// behind the rules above, and because (1) proves agreement without explaining
-/// it. Read out of `crossterm-0.28.1/src/event/sys/unix/parse.rs`; legacy single
+/// it. Read out of `crossterm-0.29.0/src/event/sys/unix/parse.rs`; legacy single
 /// bytes, in `parse_event`'s match order (earlier arms shadow later ones):
 ///
 /// * `:35-91` — `0x1b` opens an escape sequence; alone, with no further input
@@ -5991,7 +5991,7 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
 /// that reading, exhaustively over all 128 ASCII characters, with no PTY needed;
 /// `keyevent_ctrl_c0_matches_crossterm_decoder` pins the reading itself against
 /// the shipped decoder. What none of them can do is keep the LINE REFERENCES
-/// above accurate: relaxing the `=0.28.1` pin in `Cargo.toml` means re-checking
+/// above accurate: relaxing the `=0.29.0` pin in `Cargo.toml` means re-checking
 /// every one of them by hand, even when the round-trip test stays green.
 fn ctrl_c0_byte(c: char) -> Option<u8> {
     match c {
@@ -31921,7 +31921,7 @@ mod tests {
     /// # Only sound when the test owns the process
     ///
     /// Every piece of state this probe touches is PROCESS-global, not per-test:
-    /// fd 0, crossterm 0.28's raw-mode flag, and crossterm's lazily-built event
+    /// fd 0, crossterm 0.29's raw-mode flag, and crossterm's lazily-built event
     /// reader (cached in a process-wide `Mutex<Option<...>>`). A concurrent
     /// stdin/event user in the same process could consume the queued event
     /// between this probe's `poll` and its `read`, at which point `event::read`

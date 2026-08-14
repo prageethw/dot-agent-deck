@@ -21,16 +21,21 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui = "0.30"
-# PRD #227: EXACT pin. `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder
+# PRD #227: EXACT pin. `ui::ctrl_c0_byte` documents crossterm 0.29.0's decoder
 # behavior down to `src/event/sys/unix/parse.rs` line numbers, because the deck's
 # Ctrl+<char> → C0 encoder has to be that decoder's exact inverse. Changing this
 # line is therefore a decoder change: re-verify those `parse.rs` references by
 # hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
 # `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
 # encoder/decoder mismatch under `cargo test-fast`, but not a stale line
-# reference.) NOTE: ratatui 0.30 pulls crossterm 0.29 in via `ratatui-crossterm`;
-# the two coexist because 0.28/0.29 are semver-incompatible, and this pin binds
-# only OUR direct dependency — the one `src/ui.rs` reads events from.
+# reference.) NOTE: ratatui 0.30 also pulls crossterm in via `ratatui-crossterm`,
+# which offers crossterm 0.28 and 0.29 as mutually-exclusive optional
+# dependencies (renamed packages `crossterm_0_28`/`crossterm_0_29`) and
+# defaults to 0.29 — the same version this pin now names, so cargo unifies
+# both into the single `crossterm 0.29.0` entry in `Cargo.lock`. This pin still
+# binds OUR direct dependency — the one `src/ui.rs` reads events from —
+# explicitly, rather than relying on `ratatui-crossterm`'s default feature to
+# stay in sync.
 crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
 toml = "1.0"
