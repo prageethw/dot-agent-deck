@@ -2202,3 +2202,403 @@ fn worktree_reclaim_041_legacy_marker_resolves_unknown_not_human_or_agent() {
          case must resolve to something stated, never a blank; got entry:\n{entry}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PRD 236 M1.1 / M2 -- the kept-tree signal and the #120 policy unification.
+//
+// `042`-`044` call `dot_agent_deck::issue_dispatch_run::remove_worktree`
+// directly against real local git fixtures (a "pure-data unit" tier distinct
+// from this file's dominant real-binary-subprocess shape above) -- no CLI
+// subprocess, no `gh`. `045` drives the real `run_issue_dispatch` in-process
+// with a `cat` stand-in agent. `046` combines a real-binary reclaim-CLI
+// fixture with a direct pure call into `dispatch_decision`.
+// ---------------------------------------------------------------------------
+
+/// Scenario: Build a real local git clone plus a dispatched-style worktree, dirty it with an untracked file, and call `remove_worktree` under `KeepIfDirty`. Pins that the function must return a typed outcome distinguishing WHY the tree was kept, instead of today's `()`, which discards the reason entirely.
+#[spec("worktree/reclaim/042")]
+#[tokio::test]
+#[cfg(unix)]
+async fn worktree_reclaim_042_remove_worktree_returns_a_kept_outcome_not_unit() {
+    let scratch = test_temp::tempdir().expect("scratch tempdir");
+    let clone_dir = scratch.path().join("clone");
+    std::fs::create_dir_all(&clone_dir).expect("create clone dir");
+    git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+    git(&clone_dir, &["config", "user.email", "test@example.com"]);
+    git(&clone_dir, &["config", "user.name", "Test"]);
+    std::fs::write(clone_dir.join("README.md"), "seed\n").expect("write seed file");
+    git(&clone_dir, &["add", "README.md"]);
+    git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+    let worktree_dir = scratch.path().join("wt-outcome-dirty");
+    git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/issue-1",
+            &worktree_dir.to_string_lossy(),
+            "main",
+        ],
+    );
+    std::fs::write(worktree_dir.join("scratch.txt"), "never committed\n")
+        .expect("write untracked file");
+
+    let outcome = dot_agent_deck::issue_dispatch_run::remove_worktree(
+        &worktree_dir,
+        &clone_dir,
+        dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+    )
+    .await;
+
+    assert!(
+        worktree_dir.exists(),
+        "a dirty tree under KeepIfDirty must survive -- {} is gone",
+        worktree_dir.display()
+    );
+    assert_eq!(
+        outcome,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Kept(
+            dot_agent_deck::event::KeptReason::Dirty
+        ),
+        "remove_worktree must return a typed outcome distinguishing WHY the tree was kept \
+         (dirty vs. an unresolvable status probe), not just any non-unit type; got {outcome:?}"
+    );
+}
+
+/// Scenario: Call `remove_worktree` under `KeepIfDirty` twice more -- once against a CLEAN tree (must be removed) and once against a path whose `git status` probe genuinely fails (must be kept, fail-safe). Pins that BOTH branches must also return a distinguishable typed outcome, not today's shared `()`.
+#[spec("worktree/reclaim/043")]
+#[tokio::test]
+#[cfg(unix)]
+async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_error() {
+    let scratch = test_temp::tempdir().expect("scratch tempdir");
+    let clone_dir = scratch.path().join("clone");
+    std::fs::create_dir_all(&clone_dir).expect("create clone dir");
+    git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+    git(&clone_dir, &["config", "user.email", "test@example.com"]);
+    git(&clone_dir, &["config", "user.name", "Test"]);
+    std::fs::write(clone_dir.join("README.md"), "seed\n").expect("write seed file");
+    git(&clone_dir, &["add", "README.md"]);
+    git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+    // Clean tree -- must be removed.
+    let clean_wt = scratch.path().join("wt-outcome-clean");
+    git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/issue-2",
+            &clean_wt.to_string_lossy(),
+            "main",
+        ],
+    );
+    let removed_outcome = dot_agent_deck::issue_dispatch_run::remove_worktree(
+        &clean_wt,
+        &clone_dir,
+        dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+    )
+    .await;
+    assert!(
+        !clean_wt.exists(),
+        "a clean tree under KeepIfDirty must actually be removed -- {} still exists",
+        clean_wt.display()
+    );
+    assert_eq!(
+        removed_outcome,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Removed,
+        "the removed-clean-tree branch must return `RemoveOutcome::Removed`, distinguishable \
+         from the kept/dirty branch -- a caller must be able to tell \"removed\" from \"kept\" \
+         without re-probing the filesystem itself; got {removed_outcome:?}"
+    );
+
+    // A `git status --porcelain` probe that genuinely fails: not a valid git
+    // worktree (or repo) at all -- the fail-safe must keep it, unknown rather
+    // than assumed clean.
+    let bogus_wt = scratch.path().join("not-a-worktree");
+    std::fs::create_dir_all(&bogus_wt).expect("create a plain, non-git directory");
+    let unknown_outcome = dot_agent_deck::issue_dispatch_run::remove_worktree(
+        &bogus_wt,
+        &clone_dir,
+        dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+    )
+    .await;
+    assert!(
+        bogus_wt.exists(),
+        "when the status probe itself fails, the fail-safe must keep the tree -- {} is gone",
+        bogus_wt.display()
+    );
+    assert_eq!(
+        unknown_outcome,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Kept(
+            dot_agent_deck::event::KeptReason::ProbeError
+        ),
+        "the probe-error branch must return `Kept(ProbeError)`, distinguishing \"kept because \
+         unknown\" from \"kept because dirty\" -- got {unknown_outcome:?}"
+    );
+}
+
+/// Scenario: Mirror `daemon_protocol.rs`'s exact detached-task shape -- a plain `tokio::spawn(async move { remove_worktree(...).await })` with the task's own `JoinHandle` the only thing available afterward -- and check whether anything meaningful crosses that boundary. Pins that the close path currently has nothing to propagate: joining a task built the identical way yields `()`, so there is no outcome for an attached TUI to ever see even once the daemon stops discarding it.
+#[spec("worktree/reclaim/044")]
+#[tokio::test]
+#[cfg(unix)]
+async fn worktree_reclaim_044_close_path_detached_spawn_propagates_nothing() {
+    let scratch = test_temp::tempdir().expect("scratch tempdir");
+    let clone_dir = scratch.path().join("clone");
+    std::fs::create_dir_all(&clone_dir).expect("create clone dir");
+    git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+    git(&clone_dir, &["config", "user.email", "test@example.com"]);
+    git(&clone_dir, &["config", "user.name", "Test"]);
+    std::fs::write(clone_dir.join("README.md"), "seed\n").expect("write seed file");
+    git(&clone_dir, &["add", "README.md"]);
+    git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+    let worktree_dir = scratch.path().join("wt-propagation");
+    git(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/issue-3",
+            &worktree_dir.to_string_lossy(),
+            "main",
+        ],
+    );
+    std::fs::write(worktree_dir.join("scratch.txt"), "never committed\n")
+        .expect("write untracked file");
+
+    // Exactly `daemon_protocol.rs`'s shape (~line 1607): a plain `tokio::spawn`
+    // whose async block ends on the bare `remove_worktree(...).await` call --
+    // nothing is sent anywhere from inside it. This test's `JoinHandle` is the
+    // ONLY window into the task's result, mirroring what the close handler
+    // could observe if it ever awaited its own spawn (it does not today).
+    let wt_for_task = worktree_dir.clone();
+    let clone_for_task = clone_dir.clone();
+    let handle = tokio::spawn(async move {
+        dot_agent_deck::issue_dispatch_run::remove_worktree(
+            &wt_for_task,
+            &clone_for_task,
+            dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        )
+        .await
+    });
+    let joined = handle
+        .await
+        .expect("the detached cleanup task must not panic");
+
+    assert!(
+        worktree_dir.exists(),
+        "the dirty tree must survive the detached close-time task -- {} is gone",
+        worktree_dir.display()
+    );
+    assert_eq!(
+        joined,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Kept(
+            dot_agent_deck::event::KeptReason::Dirty
+        ),
+        "the close path's detached task must have something typed to propagate -- joining the \
+         SAME spawn shape `daemon_protocol.rs` uses must yield `Kept(Dirty)`, not an opaque \
+         non-unit type; got {joined:?}"
+    );
+}
+
+/// Minimal offline `gh` stand-in for the single in-process `run_issue_dispatch` call in `worktree_reclaim_045` below. Deliberately permissive on argv shape -- this test asserts on the RECORDED REMOVAL POLICY, not on `gh` invocation correctness, which `tests/e2e_issue_dispatch.rs`'s own stricter stub already covers.
+const ISSUE_DISPATCH_UNIT_GH_STUB: &str = r#"#!/bin/sh
+group="$1"
+sub="$2"
+shift 2 2>/dev/null || true
+
+if [ "$group" = "api" ] && [ "$sub" = "user" ]; then
+    printf 'stub-user\n'
+    exit 0
+fi
+
+if [ "$group" = "issue" ] && [ "$sub" = "list" ]; then
+    printf '[{"number":7}]\n'
+    exit 0
+fi
+
+if [ "$group" = "pr" ] && [ "$sub" = "list" ]; then
+    printf '[]\n'
+    exit 0
+fi
+
+# label create / issue edit / issue comment: accept unconditionally.
+exit 0
+"#;
+
+/// Scenario: Drive the real `run_issue_dispatch` (PRD #120's own entry point) end to end, in-process, against a local git fixture and a stub `gh` -- no daemon, no attach socket, `cat` as the dispatched stand-in agent -- then read back the `RemovalPolicy` it recorded for the freshly dispatched worktree. Pins that the #120 producer must record `KeepIfDirty` like PRD #220's own dispatch does, and proves it in terms of actual close-time survival: dirtying the worktree and running the SAME `remove_worktree` the tab-close handler runs, under the policy actually recorded, must leave it on disk.
+#[spec("worktree/reclaim/045")]
+#[tokio::test]
+#[cfg(unix)]
+async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
+    let scratch = test_temp::tempdir().expect("scratch tempdir");
+    let workspace = scratch.path().to_path_buf();
+    let task_name = "prd236-unit";
+
+    let clone_dir = workspace.join(dot_agent_deck::issue_dispatch::sanitize_clone_segment(
+        task_name,
+    ));
+    std::fs::create_dir_all(&clone_dir).expect("create clone dir");
+    git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+    git(&clone_dir, &["config", "user.email", "test@example.com"]);
+    git(&clone_dir, &["config", "user.name", "Test"]);
+    std::fs::write(clone_dir.join("README.md"), "seed\n").expect("write seed file");
+    git(&clone_dir, &["add", "README.md"]);
+    git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+    // A local, non-github origin: `origin_matches_repo` accepts any origin it
+    // cannot attribute to a specific GitHub repo, so `provision_repo` treats
+    // this clone as already-provisioned and its best-effort fetch/pull
+    // refresh (allowed to fail) never needs real network access.
+    let origin_stand_in = scratch.path().join("remote.git");
+    git(
+        &clone_dir,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &origin_stand_in.to_string_lossy(),
+        ],
+    );
+
+    let bindir = scratch.path().join("bin");
+    std::fs::create_dir_all(&bindir).expect("create bindir");
+    let gh = bindir.join("gh");
+    std::fs::write(&gh, ISSUE_DISPATCH_UNIT_GH_STUB).expect("write gh stub");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod gh stub");
+    }
+
+    let prior_path = std::env::var("PATH").unwrap_or_default();
+    // SAFETY: `cargo nextest` runs one process per test function, so
+    // mutating this process's PATH cannot race a sibling test; restored
+    // below regardless of how the call completes.
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+    }
+
+    let registry = std::sync::Arc::new(dot_agent_deck::agent_pty::AgentPtyRegistry::new());
+    let worktrees = dot_agent_deck::issue_dispatch_run::new_worktree_registry();
+    let cfg = dot_agent_deck::config::IssueDispatchConfig {
+        repo: "acme/widgets".to_string(),
+        max_per_run: 3,
+        label: None,
+        query: None,
+        triage: false,
+    };
+
+    dot_agent_deck::issue_dispatch_run::run_issue_dispatch(
+        task_name,
+        &workspace.to_string_lossy(),
+        "do the thing for issue {{issue_number}}",
+        &cfg,
+        Some("cat".to_string()),
+        &registry,
+        &worktrees,
+        &dot_agent_deck::scheduler::StderrNotifier,
+        None,
+    )
+    .await;
+
+    // SAFETY: see the comment on the previous unsafe block.
+    unsafe {
+        std::env::set_var("PATH", prior_path);
+    }
+
+    let paths = dot_agent_deck::issue_dispatch::derive_issue_paths(&workspace, task_name, 7);
+    let entry = dot_agent_deck::issue_dispatch_run::take_worktree(&worktrees, &paths.worktree_dir)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a recorded worktree entry at {} after a successful #120 dispatch -- \
+                 the dispatch may not have reached `record_worktree` at all; check the gh stub \
+                 output and that `cat` spawned",
+                paths.worktree_dir.display()
+            )
+        });
+
+    // Prove it in terms of actual close-time survival, not merely the stored
+    // enum: dirty this worktree exactly as an agent mid-work would leave it,
+    // then run the SAME `remove_worktree` the tab-close handler runs, under
+    // the policy it actually recorded.
+    std::fs::write(paths.worktree_dir.join("scratch.txt"), "never committed\n")
+        .expect("write untracked file into the dispatched worktree");
+    let _ = dot_agent_deck::issue_dispatch_run::remove_worktree(
+        &paths.worktree_dir,
+        &entry.clone_dir,
+        entry.policy,
+    )
+    .await;
+    assert!(
+        paths.worktree_dir.exists(),
+        "a dirty #120 worktree closed under its recorded policy must survive -- {} is gone \
+         (today's RemovalPolicy::Force destroys it instead)",
+        paths.worktree_dir.display()
+    );
+
+    assert_eq!(
+        entry.policy,
+        dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        "the #120 issue-dispatch producer must record KeepIfDirty, exactly like PRD #220's own \
+         dispatch does, so a dirty #120 worktree survives tab close instead of the `--force` \
+         removal that destroys uncommitted work -- got {:?}",
+        entry.policy
+    );
+}
+
+/// Scenario: THE REGRESSION GUARD. Build a dirty, deck-marked, #120-style worktree and check two things at once: `dispatch_decision` still treats its mere presence as "already claimed" (the exact safety property the shipped code cites as its reason for force-removing today), and the `worktree reclaim` CLI actually sees it and -- once its dirtiness is resolved and its PR merges -- can remove it and free the slot. This is what makes keeping (instead of force-removing) a dirty #120 tree safe rather than a permanent invisible block; it is the entire reason PRD 236's policy change is allowed to happen at all.
+#[spec("worktree/reclaim/046")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_046_kept_120_tree_stays_claimed_but_is_reclaimable() {
+    // Half 1 -- the regression this whole PRD is conditioned on: a present
+    // worktree must read as "already claimed" to `dispatch_decision`
+    // regardless of which policy created or kept it. No fixture needed --
+    // this is `dispatch_decision`'s own contract.
+    assert_eq!(
+        dot_agent_deck::issue_dispatch::dispatch_decision(true, false, false),
+        dot_agent_deck::issue_dispatch::DispatchDecision::Skip,
+        "a present #120 worktree must still read as already-claimed to dispatch_decision -- if \
+         this ever flips to Dispatch, #120 would re-dispatch the SAME issue into the SAME \
+         worktree path on every later fire, which is exactly the hazard the shipped code's \
+         `RemovalPolicy::Force` cites as its reason for existing"
+    );
+
+    // Half 2 -- the slot must not be a permanent dead end: the reclaim CLI
+    // must SEE this kept worktree, and once an operator resolves the
+    // dirtiness and the issue's PR merges, must be able to remove it and
+    // free the slot back up.
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-issue-7", "agent/issue-7");
+    fx.mark_owned_with_creator(&wt, "issue-dispatch:nightly#7");
+    // Dirty, exactly as `RemovalPolicy::KeepIfDirty` would leave a #120
+    // worktree instead of force-removing it.
+    std::fs::write(wt.join("scratch.txt"), "never committed\n").expect("write untracked");
+
+    let entries = list_json(&fx);
+    let entry = find_entry(&entries, "wt-issue-7");
+    assert_eq!(
+        entry.get("owned").and_then(|v| v.as_bool()),
+        Some(true),
+        "the kept #120 worktree must be visible to the reclaim CLI, not merely logged \
+         server-side and forgotten; got entry:\n{entry}"
+    );
+
+    // Resolve the dirtiness (as an operator recovering the slot would) and
+    // mark the PR merged, then prove the slot is genuinely freeable -- a
+    // bare `reclaim` (no `--yes`), since this worktree is deck-marked and
+    // carries no gitignored content.
+    std::fs::remove_file(wt.join("scratch.txt")).expect("clean up the untracked file");
+    fx.set_pr_state("agent/issue-7", "MERGED");
+    let reclaimed = fx.run(&["worktree", "reclaim"]);
+    assert!(
+        !wt.exists(),
+        "once the operator cleans the dirty content and the issue's PR merges, `worktree \
+         reclaim` must actually remove the kept tree and free the slot -- otherwise \"kept, not \
+         force-removed\" is a dead end with no way back; out={}",
+        combined(&reclaimed)
+    );
+}
