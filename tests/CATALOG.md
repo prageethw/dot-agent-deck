@@ -3545,6 +3545,17 @@ without depending on the config struct API.
 - **Does not assert:** the pure liveness-toggle mechanism in isolation (covered generally by `prompt/pane-input/007`'s identical `emit_target` technique at spawn time); #424's own internal retry/backoff bookkeeping (out of scope by design, per the task's decoupling requirement); a genuinely dropped/lost re-assertion attempt distinct from a merely-deferred one (not constructible without the coder's implementation to compare against).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`002`).
 
+### Orchestration hydration
+
+#### orchestration/hydration
+
+##### orchestration/hydration/001 — Renaming an orchestration in the local `.dot-agent-deck.toml` while its tab is live surfaces an on-screen drift warning naming the orchestration when the TUI reattaches to the still-running daemon (fork issue #314 / upstream #554).
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness; a second real client attaches to the first client's still-running daemon, matching `session/live/006`'s reattach shape).
+- **Agent:** none (`cat` stand-in roles; no LLM tokens).
+- **Asserts:** with an Orchestration tab opened live against the `orch-deck` fixture's `demo-orch` orchestration, rewriting that project's `.dot-agent-deck.toml` on disk to rename the orchestration (the file still parses — this is config drift, not the legitimate `cfg.is_none()` remote-reconnect case `session/live/006`/PRD #111 covers) and then launching a fresh TUI client against the SAME daemon renders an in-session status-line warning naming the orchestration (`demo-orch`) once hydration rebuilds the tab from the daemon's synthesised config.
+- **Does not assert:** the exact wording of the warning beyond the required substring; the legitimate silent `cfg.is_none()` remote-reconnect path (`session/live/006`); the snapshot-restore path's equivalent drift warning (that path already warns — this entry is the daemon-hydration path's counterpart); which config (local vs synthesized) wins the rebuild (unchanged either way).
+- **Platform coverage:** mac+linux.
+
 ### Session restore
 
 #### session/restore
