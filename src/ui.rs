@@ -1058,6 +1058,17 @@ struct NewPaneFormState {
     /// filesystem). Empty (the `new` default) means "nothing known live" — the
     /// suggestion starts at `-orchestrator-1` and nothing is ever refused.
     live_orchestration_names: Vec<String>,
+    /// Whether the user has edited the Name field by hand since the form
+    /// opened — set by the two text-edit key arms in
+    /// `handle_new_pane_form_key` (`FormField::Name` only), never by the
+    /// basename pre-fill `transition_after_dir_pick` applies. While `false`,
+    /// [`Self::suggest_name_if_orchestration_selected`] is free to overwrite
+    /// `name` with the generated suggestion; once `true`, that fn leaves the
+    /// field alone — a generated default may replace a generated default,
+    /// never a human edit. Guards re-clicking the selected chip, arrowing
+    /// between orchestrations, and arrowing off and back onto one, all of
+    /// which land on the same call.
+    name_touched: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,6 +1164,9 @@ impl NewPaneFormState {
             // known live, so the suggestion starts at `-orchestrator-1` and
             // nothing is ever refused.
             live_orchestration_names: Vec::new(),
+            // A freshly opened form has no human edit yet — the basename
+            // pre-fill below is not one.
+            name_touched: false,
         }
     }
 
@@ -1211,24 +1225,51 @@ impl NewPaneFormState {
     /// the selection LANDS on an orchestration — called from every path that
     /// can change `selection_index` (arrow keys, click). A no-op when the
     /// current selection isn't an orchestration (a plain mode/card/authoring
-    /// option keeps whatever the user already typed).
+    /// option keeps whatever the user already typed), and a no-op once
+    /// [`Self::name_touched`] is set — a generated default may replace a
+    /// generated default, never a human edit. Without this guard, re-clicking
+    /// the already-selected chip, arrowing between two orchestrations, or
+    /// arrowing off one and back all silently clobber whatever the user typed.
     fn suggest_name_if_orchestration_selected(&mut self) {
+        if self.name_touched {
+            return;
+        }
         if self.selected_orchestration().is_some() {
             self.name = self.suggest_orchestration_name();
         }
     }
 
-    /// Whether the typed Name matches a name a live orchestration already
+    /// The title this submission will ACTUALLY take: the typed Name when it
+    /// is non-empty, otherwise the canonical fallback
+    /// `open_orchestration_tab` applies
+    /// ([`crate::project_config::resolve_orchestration_name`],
+    /// `src/tab.rs:846-849`). `None` when no orchestration is selected — a
+    /// plain mode/card/authoring option carries no identity uniqueness
+    /// constraint. [`Self::name_collision`] must compare THIS and not the raw
+    /// field — an empty field is not "no title", it is the canonical title,
+    /// and comparing `""` against the live titles can never match because
+    /// `live_orchestration_cwds_and_titles` filters empties out
+    /// (`src/ui.rs:944`). Uses `is_empty()`, mirroring `src/tab.rs:846`'s
+    /// predicate byte for byte — trimming here would let a whitespace-only
+    /// name resolve differently in the guard than in the tab.
+    fn resolved_title(&self) -> Option<String> {
+        let orch = self.selected_orchestration()?;
+        Some(if self.name.is_empty() {
+            crate::project_config::resolve_orchestration_name(&orch.name, &self.dir)
+        } else {
+            self.name.clone()
+        })
+    }
+
+    /// Whether the title this submission will actually take (see
+    /// [`Self::resolved_title`]) matches a name a live orchestration already
     /// holds. Only meaningful when an orchestration is selected — a plain
     /// mode/card/authoring option carries no identity uniqueness constraint.
     /// Drives the blocking refusal at submit and the `[Submit]`-button-gone
     /// render on the guard seam.
     fn name_collision(&self) -> bool {
-        self.selected_orchestration().is_some()
-            && self
-                .live_orchestration_names
-                .iter()
-                .any(|l| l == &self.name)
+        self.resolved_title()
+            .is_some_and(|t| self.live_orchestration_names.iter().any(|l| l == &t))
     }
 
     /// PRD #140 M4.0: whether the form should render
@@ -1301,6 +1342,9 @@ impl NewPaneFormState {
             // The locked schedule form can't select an orchestration either,
             // so there is never a name to suggest or collide.
             live_orchestration_names: Vec::new(),
+            // The Name field is hidden and fixed to `SCHEDULE_MODE_NAME` on
+            // this form, so there is nothing to touch.
+            name_touched: false,
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -6633,7 +6677,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         },
         KeyCode::Backspace if matches!(form.focused, FormField::Name | FormField::Command) => {
             let field = match form.focused {
-                FormField::Name => &mut form.name,
+                FormField::Name => {
+                    // A human edit — the suggestion must never overwrite it.
+                    form.name_touched = true;
+                    &mut form.name
+                }
                 FormField::Command => &mut form.command,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
@@ -6641,7 +6689,11 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         }
         KeyCode::Char(c) if matches!(form.focused, FormField::Name | FormField::Command) => {
             let field = match form.focused {
-                FormField::Name => &mut form.name,
+                FormField::Name => {
+                    // A human edit — the suggestion must never overwrite it.
+                    form.name_touched = true;
+                    &mut form.name
+                }
                 FormField::Command => &mut form.command,
                 FormField::Mode | FormField::Agent => unreachable!(),
             };
@@ -27984,13 +28036,22 @@ mod tests {
              suggest N=2, skipping the taken slot"
         );
 
-        // Simulate a stale/resubmitted taken name still sitting in the field
-        // (e.g. the user typed over the suggestion with a value someone
-        // else's live orchestration already holds).
-        ui.new_pane_form.as_mut().unwrap().name = "myproj-orchestrator-1".to_string();
-
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+
+        // Simulate a stale/resubmitted taken name still sitting in the field
+        // (e.g. the user typed over the suggestion with a value someone
+        // else's live orchestration already holds) — reached through the
+        // real key handler, not by direct field assignment, so the test pins
+        // the user-facing path rather than a shortcut around it.
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0.."myproj-orchestrator-2".len() {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "myproj-orchestrator-1".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+
         let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
 
         assert!(
@@ -28001,6 +28062,170 @@ mod tests {
             ui.mode,
             UiMode::NewPaneForm,
             "a refused submit must keep the form open, not close it"
+        );
+    }
+
+    /// Scenario: Select the form's orchestration, type a custom name over the
+    /// suggestion character by character through the real key handler, then
+    /// dispatch `Action::FormSelectMode` at the SAME index — re-clicking the
+    /// already-selected chip. The typed name must survive; the suggestion
+    /// must not silently overwrite it (Finding A, the reported case). Then
+    /// arrow off the orchestration onto a mode and back onto it — a genuine
+    /// selection CHANGE — and assert the name still survives: a guard keyed
+    /// only on "did the selection index change" would catch the first case
+    /// and miss this one, and pinning it stops that weaker fix from being
+    /// substituted later.
+    #[spec("orchestration/identity/004")]
+    #[test]
+    fn identity_004_reselecting_or_arrowing_never_clobbers_a_typed_name() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![make_mode("chat")],
+            vec![make_orchestration("review")],
+        ));
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // "No mode" -> chat
+        handle_new_pane_form_key(right, &mut ui); // chat -> the orchestration
+        let orchestration_idx = ui.new_pane_form.as_ref().unwrap().selection_index;
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+
+        // Type a custom name over the suggestion, one keystroke at a time
+        // through the real handler — the exact arm Finding A's fix hooks.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        for c in "my-custom-name".chars() {
+            handle_new_pane_form_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "my-custom-name",
+            "the typed name should be in place before the clobber is attempted"
+        );
+
+        // Return focus to Mode so the click/arrow actions below act on the
+        // cycler, mirroring how the real form gets there (Tab/BackTab).
+        ui.new_pane_form.as_mut().unwrap().focused = FormField::Mode;
+
+        // Case 1 (Finding A, the reported case): re-click the
+        // ALREADY-selected chip via the real `Action::FormSelectMode`
+        // dispatch.
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let _ = dispatch_action(
+            Action::FormSelectMode(orchestration_idx),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "my-custom-name",
+            "re-clicking the already-selected chip must not clobber a typed name"
+        );
+
+        // Case 2: arrow off the orchestration onto a mode and back — a
+        // genuine selection change, which an `idx != selection_index` guard
+        // would miss.
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        handle_new_pane_form_key(left, &mut ui); // orchestration -> chat mode
+        handle_new_pane_form_key(right, &mut ui); // chat mode -> orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "my-custom-name",
+            "arrowing off the orchestration and back must not clobber a typed name"
+        );
+    }
+
+    /// Scenario: With a live orchestration already holding the canonical
+    /// title `tdd-cycle` (an earlier spawn that left the Name field empty,
+    /// so its title fell back to the config name), open the form, select the
+    /// orchestration, and clear the Name field to empty through real
+    /// `KeyCode::Backspace` events. Submitting must be REFUSED — an empty
+    /// field is not "no title", it resolves to the same canonical
+    /// `tdd-cycle` and would produce a second, indistinguishable tab. Also
+    /// render the form through the dedicated collision seam and assert
+    /// `[Submit]` is gone from the action row — the refusal's most
+    /// user-visible behaviour, pinned by nothing until now.
+    #[spec("orchestration/identity/005")]
+    #[test]
+    fn identity_005_an_empty_name_is_checked_against_its_resolved_title() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(
+            NewPaneFormState::new(
+                PathBuf::from("/tmp/myproj"),
+                "myproj".to_string(),
+                String::new(),
+                vec![],
+                vec![make_orchestration("review")],
+            )
+            .with_live_orchestration_names(vec!["review".to_string()]),
+        );
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        handle_new_pane_form_key(right, &mut ui); // select the orchestration
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+
+        // Clear the field through real Backspace events, not by assigning
+        // `form.name` — the point is that the path a user walks reaches
+        // this state.
+        let suggested_len = ui.new_pane_form.as_ref().unwrap().name.len();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        for _ in 0..suggested_len {
+            handle_new_pane_form_key(backspace, &mut ui);
+        }
+        assert_eq!(ui.new_pane_form.as_ref().unwrap().name, "");
+
+        assert!(
+            ui.new_pane_form.as_ref().unwrap().name_collision(),
+            "an empty Name field resolves to the canonical config name \
+             `review`, which a live orchestration already holds — the guard \
+             must catch it"
+        );
+
+        let result = handle_new_pane_form_key(enter, &mut ui); // attempted submit
+        assert!(
+            !matches!(result, Action::SpawnPane(_)),
+            "submitting an empty name that resolves to a taken title must be \
+             refused, got {result:?}"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::NewPaneForm,
+            "a refused submit must keep the form open, not close it"
+        );
+
+        // The refusal's most user-visible behaviour is that [Submit]
+        // disappears from the action row entirely (rather than being
+        // dimmed) — pin that through the dedicated render seam. The seam's
+        // fixture orchestration is named `tdd-cycle` (not `review`, this
+        // test's own fixture), so the live name passed here matches THAT.
+        let buf =
+            render_new_pane_orchestration_name_collision_to_buffer("", &["tdd-cycle"], 100, 28);
+        let rendered = buffer_to_string(&buf);
+        assert!(
+            !rendered.contains("[Submit]"),
+            "an empty Name that resolves to a taken title must drop [Submit] \
+             from the action row, got:\n{rendered}"
         );
     }
 

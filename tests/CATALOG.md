@@ -2274,6 +2274,20 @@ without depending on the config struct API.
 - **Does not assert:** the exact refusal UI copy/rendering; what N is counted over across multiple cwds (scoped global-over-live); a real-binary/PTY-attached end-to-end pass (no L2 test accompanies this port).
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/004 — Re-clicking the already-selected orchestration chip, or arrowing off it and back, must not clobber a Name the user has typed over the suggestion (Greptile P1; the suggestion must only ever replace a generated default, never a human edit).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path plus a real `dispatch_action(Action::FormSelectMode(...))` dispatch against a `CapturingPaneController`/`TabManager`; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form with one plain mode and one orchestration, after selecting the orchestration and typing `"my-custom-name"` over the suggestion one keystroke at a time through the real key handler, dispatching `Action::FormSelectMode` at the SAME (already-selected) index leaves `form.name == "my-custom-name"` unchanged; a subsequent arrow-away-to-a-mode-and-back sequence (a genuine selection change, which a `idx != selection_index` guard would not catch) also leaves the name unchanged.
+- **Does not assert:** the click-to-`Action::FormSelectMode` routing itself (covered elsewhere); rendering of the Name field's literal text.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/identity/005 — An empty Name field is checked against the RESOLVED title it will actually submit (the canonical config name), not the raw empty string — clearing the field can no longer silently bypass the collision guard.
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` path for the state transition, plus the `render_new_pane_orchestration_name_collision_to_buffer` seam for the render assertion; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form with one orchestration and `with_live_orchestration_names(vec!["review".into()])`, after selecting the orchestration and clearing the Name field to empty via real `KeyCode::Backspace` events, `form.name_collision()` is `true` and submitting via `handle_new_pane_form_key` does NOT yield `Action::SpawnPane` (`ui.mode` stays `UiMode::NewPaneForm`); separately, rendering the dedicated collision seam with an empty typed name against a live title matching the seam's fixture orchestration name confirms `[Submit]` is absent from the action row (dropped, not dimmed).
+- **Does not assert:** the daemon-side authoritative check deferred to a follow-up issue (form-time uniqueness stays advisory); a real-binary/PTY-attached end-to-end pass.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
