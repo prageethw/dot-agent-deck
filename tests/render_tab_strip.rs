@@ -326,9 +326,9 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
 /// uniformly to tabs this feature (issue #306) doesn't touch. RED today: the
 /// active style is still `Modifier::REVERSED | Modifier::BOLD` with no
 /// `UNDERLINED`.
-#[spec("tabs/orchestration/012")]
+#[spec("tabs/orchestration/015")]
 #[test]
-fn orchestration_012_active_non_orchestration_tab_underlined_no_reversed() {
+fn orchestration_015_active_non_orchestration_tab_underlined_no_reversed() {
     let buf = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
     let modifier = tab_label_modifier(&buf, "Dashboard");
     assert!(
