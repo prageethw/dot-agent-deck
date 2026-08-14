@@ -1244,17 +1244,26 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
 }
 
 /// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
-/// flag — the file in the current working directory, so the TUI and daemon
-/// (launched in the same dir) read the same source of truth.
-/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override so tests never
-/// touch the real cwd.
+/// flag. Walks up from the process cwd to the nearest ancestor directory
+/// containing `crate::project_config::CONFIG_FILE_NAME`, so a deck launched
+/// from a subdirectory of the project still finds the project's own config
+/// (fork issue #303) rather than the process's own cwd. When no ancestor
+/// contains the file, falls back to the cwd-joined path — `load_features_file`
+/// treats a missing file as `Features::default()` (OFF).
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override, checked first,
+/// so tests never touch the real cwd.
 pub fn features_config_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
         return PathBuf::from(p);
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(crate::project_config::CONFIG_FILE_NAME)
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(crate::project_config::CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    cwd.join(crate::project_config::CONFIG_FILE_NAME)
 }
 
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
