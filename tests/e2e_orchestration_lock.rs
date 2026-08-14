@@ -788,12 +788,28 @@ fn lock_015_paste_gated_by_lock_state() {
     // Enough numbered filler lines to push the top marker well off-screen at
     // scrollback == 0, whatever the worker pane's actual height turns out to
     // be at 120x40.
+    //
+    // Sent as ONE bracketed paste, not raw `send_keys`: unwrapped, crossterm
+    // parses each of the 122 `\r`s here as its own KeyEvent, and every
+    // Enter-bearing `Action::ForwardToPane` pays `submit_debounce_duration`'s
+    // up-to-150ms synchronous sleep (PRD #76 M2.20, `src/ui.rs`) when it
+    // lands under `SUBMIT_DEBOUNCE` of the previous forward — which a burst
+    // this dense always does. ~122 * 150ms is >18s of the deck's single
+    // event/render thread blocked in `std::thread::sleep`, on top of
+    // everything else this test still has to do, well past what a 30s
+    // `wait_for_string` budget survives on a loaded CI runner. A bracketed
+    // paste is a single `Event::Paste` delivered in one `write_raw_bytes`
+    // call with no per-line debounce, exactly like `unlocked_paste` above —
+    // and this is genuinely scrollback content the worker pane must render,
+    // not a paste-drop assertion, so wrapping it changes nothing this part
+    // of the test is trying to prove.
     let mut bulk = format!("{SCROLL_TOP_MARKER}\r");
     for i in 0..120 {
         bulk.push_str(&format!("filler-{i:03}\r"));
     }
     bulk.push_str(&format!("{SCROLL_BOTTOM_MARKER}\r"));
-    deck.send_keys(bulk.as_bytes());
+    let bracketed_bulk = format!("\x1b[200~{bulk}\x1b[201~");
+    deck.send_keys(bracketed_bulk.as_bytes());
     deck.wait_for_string(SCROLL_BOTTOM_MARKER);
 
     // Re-lock. The final Ctrl+d back into PaneInput is itself a fresh mode
@@ -961,7 +977,15 @@ fn lock_016_persistent_chip_and_help_entry() {
         deck.snapshot_grid()
     );
 
-    // `?` (Help) resolves globally, including from PaneInput.
+    // `?` (Help) resolves only from `UiMode::Normal` (`dispatch_normal_mode_key`,
+    // `src/ui.rs`) — `global_action()`'s always-resolves-from-any-mode table
+    // (Dashboard/ToggleLayout/ToggleOrchestrationSplit/ToggleOrchestrationLock/
+    // NewPane/ClosePane/Ctrl+PageUp/PageDown) has no entry for it, so from
+    // `PaneInput` a bare `?` falls through to `handle_pane_input_key` and is
+    // forwarded to the focused pane like any other character instead of
+    // opening the overlay. `Ctrl+d` first, matching every other command-mode
+    // chord this test already sends.
+    deck.send_bytes(b"\x04");
     deck.send_bytes(b"?");
     deck.wait_for_string("Press ? or Esc to close");
     assert!(
