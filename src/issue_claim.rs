@@ -256,7 +256,11 @@ fn resolve_assignee_login(identity: &Identity) -> Option<String> {
     }
 }
 
-fn resolve_gh_login() -> Result<String, String> {
+/// `pub(crate)`, not private: PRD fork#298 M1.0's `worktree_reclaim::resolve_human_owner`
+/// reuses this rather than duplicating the `gh api user` capture logic, so
+/// the two subsystems' "no marker → resolve a human caller" paths share one
+/// implementation instead of two that could silently drift apart.
+pub(crate) fn resolve_gh_login() -> Result<String, String> {
     let out = run_gh_capture(&gh_current_login_argv())?;
     let login = out.trim();
     if login.is_empty() {
