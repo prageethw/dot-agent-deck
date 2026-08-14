@@ -3500,6 +3500,37 @@ pub fn resolve_orch_config_for_hydration(
     )
 }
 
+/// Fork issue #314: decide whether the hydration-drift branch beside
+/// [`resolve_orch_config_for_hydration`] should surface a user-visible
+/// warning. Extracted as a pure helper — same rationale as
+/// `resolve_orch_config_for_hydration` itself (reviewer S1) — so the
+/// "warn only on drift, stay silent on legitimate remote reconnect"
+/// contract is unit-testable without standing up a hydration fixture.
+///
+/// `config_present` is `true` when the local `.dot-agent-deck.toml`
+/// loaded successfully (`cfg.is_some()` at the call site); `local_found`
+/// is `true` when that config lists an orchestration by this name. Only
+/// `config_present && !local_found` — the file parses but no longer
+/// lists the orchestration, i.e. a rename/removal drifted out from under
+/// a live tab — is a warning. `!config_present` is the legitimate
+/// PRD #111 remote-reconnect case and must stay silent regardless of
+/// `local_found`.
+fn hydration_drift_warning(
+    config_present: bool,
+    local_found: bool,
+    name: &str,
+    cwd: &str,
+) -> Option<String> {
+    if config_present && !local_found {
+        Some(format!(
+            "Warning: orchestration '{name}' not found in local config for {cwd}; \
+             rebuilt this tab from the live daemon's roles instead of your project config"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Diagnostic info for a hydrated pane the partition couldn't bucket
 /// cleanly. Surfaced via `HydrationPartition.rejections` so the caller
 /// can emit `tracing::error!` at the hydration site and the partition
@@ -11590,12 +11621,27 @@ pub fn run_tui(
                         "hydration: rebuilding orchestration tab from synthesised config (local .dot-agent-deck.toml absent — remote daemon path)"
                     );
                 } else {
-                    tracing::info!(
+                    tracing::warn!(
                         cwd = %bucket.cwd,
                         orchestration = %bucket.orchestration_name,
                         role_count = bucket.role_slots.len(),
                         "hydration: rebuilding orchestration tab from synthesised config (local config exists but does not list this orchestration — config drift or stale)"
                     );
+                    // Fork issue #314: unlike the snapshot-restore path,
+                    // this branch used to be silent to the user (log
+                    // only). Surface it on both surfaces the restore
+                    // path uses: the exit-time session warning and the
+                    // in-session status line (the latter is what a
+                    // still-attached user actually sees).
+                    if let Some(msg) = hydration_drift_warning(
+                        cfg.is_some(),
+                        false,
+                        &bucket.orchestration_name,
+                        &bucket.cwd,
+                    ) {
+                        ui.session_warnings.push(msg.clone());
+                        ui.status_message = Some((msg, std::time::Instant::now()));
+                    }
                 }
             }
             let orch_config = resolve_orch_config_for_hydration(local_orch_config, bucket);
@@ -22529,6 +22575,44 @@ mod tests {
         assert_eq!(synthesised.roles[0].name, "orchestrator");
         assert!(synthesised.roles[0].start);
         assert_eq!(synthesised.roles[1].name, "reviewer");
+    }
+
+    /// Fork issue #314: `hydration_drift_warning`'s truth table. Only the
+    /// "config parses but no longer lists this orchestration" case (a
+    /// rename/removal drifted out from under a live tab) should warn;
+    /// the PRD #111 remote-reconnect case (`config_present = false`)
+    /// and the found case must both stay silent.
+    #[test]
+    fn hydration_drift_warning_truth_table() {
+        // config present, orchestration not found -> warns, names both
+        // the orchestration and the substring the e2e test asserts on.
+        let warning =
+            hydration_drift_warning(true, false, "demo-orch", "/Users/x/project").unwrap();
+        assert!(
+            warning.contains("orchestration 'demo-orch' not found in local config"),
+            "warning must carry the exact contract substring, got: {warning:?}"
+        );
+
+        // config absent (legitimate remote reconnect, PRD #111) -> silent
+        // regardless of local_found.
+        assert_eq!(
+            hydration_drift_warning(false, false, "demo-orch", "/remote/proj"),
+            None,
+            "remote reconnect with no local config file must stay silent"
+        );
+        assert_eq!(
+            hydration_drift_warning(false, true, "demo-orch", "/remote/proj"),
+            None,
+            "config_present=false must stay silent even if local_found were true"
+        );
+
+        // config present, orchestration found -> silent (not the drift
+        // branch at all).
+        assert_eq!(
+            hydration_drift_warning(true, true, "demo-orch", "/Users/x/project"),
+            None,
+            "orchestration found in local config must stay silent"
+        );
     }
 
     #[test]
