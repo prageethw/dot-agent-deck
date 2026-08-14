@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Not started
+**Status**: In progress — Phase 1 partial, Phase 2 complete. *(Status corrected 2026-08-14: this line read "Not started" after most of the work had already shipped, under other issue numbers, which is why a #236-keyed search never found it. Reclamation shipped under upstream issue https://github.com/vfarcic/dot-agent-deck/issues/422 and fork issues https://github.com/prageethw/dot-agent-deck/issues/144, https://github.com/prageethw/dot-agent-deck/issues/166, https://github.com/prageethw/dot-agent-deck/issues/298 (**#422 is an upstream issue, not a fork one** — `prageethw/dot-agent-deck#422` does not exist); removal gating shipped under PRD #220. **M1.0 partially shipped**: `RemovalPolicy::{Force,KeepIfDirty}` (`src/issue_dispatch_run.rs:133`) and `remove_worktree` (`:213`) gate on `git status --porcelain`, landed `8c47c950`, first released `v0.35.9` — but the gate is not applied to the production #120 issue-dispatch producer, which still records `RemovalPolicy::Force` (`:542-547`) and still pushes `--force` (`:240`); closing a #120 dispatched tab still destroys uncommitted work. **M2.0 shipped** (`aed0ef96`, first released `v0.35.10`): `dot-agent-deck worktree list [--json] [--mine]` (`src/main.rs:1453`). **M2.1 shipped**: `dot-agent-deck worktree reclaim [--yes]` (`src/main.rs:1454`), landed `aed0ef96`/`99badf3c`, first released `v0.35.10`/`v0.37.2`. **M2.2 shipped, in a shape closer to a distributed form of the PRD's first alternative than its stated "second" one**: ownership is derived from an on-disk marker file (`mark_worktree_owned`, `src/worktree_reclaim.rs:1025`) written into the git-dir and presence-checked by `ownership_of` (`:824-829`) — that is still new persisted state, just per-worktree rather than centrally registered, not the stateless path/branch-naming derivation the PRD's option 2 described. Hardened by `b67e827e` and `2f444f84`, both first released `v0.37.2`; `cc9595d3` is on `main`, not yet in a release tag. **M1.1 still outstanding**: a kept dirty tree is announced only by `tracing::warn!` at `src/issue_dispatch_run.rs:221` — the PRD explicitly rules a log-only signal insufficient. M1.2 and M3.0 are thin (see the Milestones section for what remains). **One success criterion was consciously inverted, not merely missed**: the PRD asks for one removal policy covering #120 and #220; what shipped is per-producer — `src/issue_dispatch_run.rs:121-127` documents that #120 issue-dispatch still force-removes a dirty tree, deliberately, because a present worktree there means "already claimed" and removing it is what keeps the slot reclaimable. Whoever picks this PRD back up must decide whether that split is the accepted end state or a residual gap; the Solution Overview's "one policy" framing is now inaccurate to what shipped. Issue #236 stays open.)*
 
 ## Problem Statement
 
@@ -57,19 +57,19 @@ One policy governs every worktree-creating feature — #120 today, #220 next, #1
 
 ### Phase 1: Stop the data loss
 
-- [ ] **M1.0** — Gate removal on a clean tree (drop `--force` or pre-check `git status --porcelain`), preserving the known-empty spawn-failure rollback as an explicit exception.
+- [ ] **M1.0** — Gate removal on a clean tree (drop `--force` or pre-check `git status --porcelain`), preserving the known-empty spawn-failure rollback as an explicit exception. — Partial (`8c47c950`, first released `v0.35.9`): `RemovalPolicy::{Force,KeepIfDirty}` and `remove_worktree` (`src/issue_dispatch_run.rs:133`, `:213`) gate on `git status --porcelain`, but the production #120 issue-dispatch producer is not gated — it still records `RemovalPolicy::Force` (`:542-547`) and `remove_worktree` still pushes `--force` for that policy (`:240`), so closing a #120 dispatched tab still destroys uncommitted work.
 - [ ] **M1.1** — Surface the kept-tree outcome to the user (`worktree kept at <path>: uncommitted changes`), not to the log only.
-- [ ] **M1.2** — Tests for all three paths: dirty → kept, clean → removed, spawn failure → removed.
+- [ ] **M1.2** — Tests for all three paths: dirty → kept, clean → removed, spawn failure → removed. — Partial: the `reclaim`-verb side is well covered (`worktree/reclaim/003` etc.); the tab-close triad itself has no dedicated assertion.
 
 ### Phase 2: Reclamation
 
-- [ ] **M2.0** — Decide the reclamation shape (see Open Questions) and make kept/orphaned worktrees *discoverable* — the user can find out what exists without running git by hand.
-- [ ] **M2.1** — Make them *prunable* in one step, with the same clean/dirty gate applied (a prune must not become a new force-remove).
-- [ ] **M2.2** — Address restart orphaning, either by persisting the registry or by deriving ownership from the path/branch convention.
+- [x] **M2.0** — Decide the reclamation shape (see Open Questions) and make kept/orphaned worktrees *discoverable* — the user can find out what exists without running git by hand. — Done (`aed0ef96`, first released `v0.35.10`): `dot-agent-deck worktree list [--json] [--mine]` (`src/main.rs:1453`).
+- [x] **M2.1** — Make them *prunable* in one step, with the same clean/dirty gate applied (a prune must not become a new force-remove). — Done (`aed0ef96`/`99badf3c`, first released `v0.35.10`/`v0.37.2`): `dot-agent-deck worktree reclaim [--yes]` (`src/main.rs:1454`), deliberately without `--force`.
+- [x] **M2.2** — Address restart orphaning, either by persisting the registry or by deriving ownership from the path/branch convention. — Done, in a shape closer to a distributed form of the first option than the stated "second" one: an on-disk ownership marker file (`mark_worktree_owned`, `src/worktree_reclaim.rs:1025`) written into the git-dir and presence-checked by `ownership_of` (`:824-829`) — still new persisted state, per-worktree rather than centrally registered, not the stateless path/branch derivation option 2 described. Hardened by `b67e827e` and `2f444f84`, both first released `v0.37.2`; `cc9595d3` is on `main`, not yet in a release tag.
 
 ### Phase 3: Ship
 
-- [ ] **M3.0** — Docs: the removal policy, how to prune, and a correction of any copy implying tab close always cleans up.
+- [ ] **M3.0** — Docs: the removal policy, how to prune, and a correction of any copy implying tab close always cleans up. — Thin: pure documentation, no code path or design decision outstanding.
 - [ ] **M3.1** — Changelog fragment; cross-version check per CLAUDE.md rule 12 (this touches the daemon and the attach `StopAgent` handler); PR, review, merge, close #236.
 
 ## Key Files
