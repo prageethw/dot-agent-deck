@@ -2079,8 +2079,8 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
     use dot_agent_deck::worktree_reclaim::{
         WorktreeListDocument, examine_worktrees, format_disagreement_warning,
-        format_list_error_for_cli, format_list_human, is_mine, owner_disagreements,
-        sanitize_marker_creator,
+        format_excluded_unknown_owner_warning, format_list_error_for_cli, format_list_human,
+        is_mine, owner_disagreements, sanitize_marker_creator,
     };
 
     let owner_filter = if mine {
@@ -2156,14 +2156,36 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Fork issues #230 / #231: everything a `--json` consumer would
+    // otherwise only learn from a stderr line it never reads (or never
+    // learn at all, for #231's mirror case) -- attached to the document
+    // below via `with_warnings`, reporting-only, never changing which rows
+    // `is_mine` retains.
+    let mut json_warnings: Vec<String> = Vec::new();
     if let Some(owner) = &owner_filter {
-        // Issue #221: before filtering, name any row where the marker names
-        // this owner but the independent `owned` resolution disagrees --
-        // otherwise that disagreement becomes indistinguishable from
-        // "nothing found" once the retain below drops the row. Stderr, so
-        // `--json` consumers see it too.
+        // Issue #221 / #230: before filtering, name any row where the marker
+        // names this owner but the independent `owned` resolution disagrees
+        // -- otherwise that disagreement becomes indistinguishable from
+        // "nothing found" once the retain below drops the row. Stderr for a
+        // human, AND collected here so a `--json` consumer (which reads
+        // stdout only) sees it too.
         for path in owner_disagreements(&reports, owner) {
-            eprintln!("{}", format_disagreement_warning(path, owner));
+            let warning = format_disagreement_warning(path, owner);
+            eprintln!("{warning}");
+            json_warnings.push(warning);
+        }
+
+        // Issue #231: the mirror case -- `owned: true` but `owner: None`
+        // (most often a legacy pre-fork#166 marker, `owner_kind: "unknown"`
+        // as of PRD fork#298) -- is unconditionally excluded by the retain
+        // below regardless of which owner was filtered on, since it can
+        // never match ANY `owner` string. Represented in the JSON document
+        // rather than dropped silently; deliberately NOT also printed to
+        // stderr (see `format_excluded_unknown_owner_warning`'s own doc --
+        // issue #231 itself warns that a blanket per-row stderr warning here
+        // would fire on every legacy worktree, every time).
+        for report in reports.iter().filter(|r| r.owned && r.owner.is_none()) {
+            json_warnings.push(format_excluded_unknown_owner_warning(&report.real_path));
         }
 
         // PR #215 fixup (reviewer F4 / auditor L1 item 3): `owned` must be a
@@ -2180,7 +2202,8 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     }
 
     if json {
-        match serde_json::to_string(&WorktreeListDocument::new(reports)) {
+        let doc = WorktreeListDocument::new(reports).with_warnings(json_warnings);
+        match serde_json::to_string(&doc) {
             Ok(j) => {
                 println!("{j}");
                 ExitCode::SUCCESS
