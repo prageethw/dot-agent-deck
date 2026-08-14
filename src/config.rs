@@ -1067,6 +1067,65 @@ impl Drop for ConfigGenStateEnvGuard {
     }
 }
 
+/// Serializes cwd/env mutation only among the tests IN THIS MODULE that take
+/// this specific lock — process cwd and/or `DOT_AGENT_DECK_FEATURES_CONFIG`
+/// are both process-global (fork issue #303). It does NOT serialize against
+/// other tests elsewhere in the crate that separately mutate the process
+/// cwd (e.g. `schedule_cli.rs`'s own function-local cwd mutex) — two
+/// independent mutexes do not exclude each other. That gap is harmless
+/// today only because `cargo nextest` runs each test in its own process, so
+/// no two tests' cwd mutations can interleave regardless of which lock (if
+/// any) they hold; it would not be safe under a same-process test runner.
+/// Any test that wants to observe a specific resolved value from
+/// `features_config_path()` must hold this lock for the duration of its
+/// cwd/env fiddling.
+#[cfg(test)]
+static FEATURES_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only RAII guard: snapshots the process cwd and
+/// `DOT_AGENT_DECK_FEATURES_CONFIG`, clears the env var so a value leaking in
+/// from the outer test-runner environment can't mask the defect under test,
+/// and restores BOTH on drop — even if the test panics. Callers must hold
+/// `FEATURES_CONFIG_TEST_LOCK` for the guard's lifetime.
+#[cfg(test)]
+struct FeaturesConfigCwdEnvGuard {
+    prev_cwd: PathBuf,
+    prev_override: Option<String>,
+}
+
+#[cfg(test)]
+impl FeaturesConfigCwdEnvGuard {
+    fn new() -> Self {
+        let prev_cwd = std::env::current_dir().expect("read process cwd");
+        let prev_override = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").ok();
+        // SAFETY: callers hold FEATURES_CONFIG_TEST_LOCK for the duration of
+        // this guard, which serializes env-var access.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_FEATURES_CONFIG");
+        }
+        Self {
+            prev_cwd,
+            prev_override,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FeaturesConfigCwdEnvGuard {
+    fn drop(&mut self) {
+        // Best-effort: if this fails the process cwd is left wherever the
+        // test last set it, but there is nothing more corrective to do here.
+        let _ = std::env::set_current_dir(&self.prev_cwd);
+        // SAFETY: see FeaturesConfigCwdEnvGuard::new.
+        unsafe {
+            match self.prev_override.take() {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_FEATURES_CONFIG", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_FEATURES_CONFIG"),
+            }
+        }
+    }
+}
+
 /// Home directory used to anchor config/state/cache paths. Delegates to
 /// [`crate::platform::paths::home_dir`] (PRD #42 M1): `$HOME` (fallback `/`) on
 /// Unix, `%USERPROFILE%` on Windows.
@@ -1131,17 +1190,26 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
 }
 
 /// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
-/// flag — the file in the current working directory, so the TUI and daemon
-/// (launched in the same dir) read the same source of truth.
-/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override so tests never
-/// touch the real cwd.
+/// flag. Walks up from the process cwd to the nearest ancestor directory
+/// containing `crate::project_config::CONFIG_FILE_NAME`, so a deck launched
+/// from a subdirectory of the project still finds the project's own config
+/// (fork issue #303) rather than the process's own cwd. When no ancestor
+/// contains the file, falls back to the cwd-joined path — `load_features_file`
+/// treats a missing file as `Features::default()` (OFF).
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override, checked first,
+/// so tests never touch the real cwd.
 pub fn features_config_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
         return PathBuf::from(p);
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(crate::project_config::CONFIG_FILE_NAME)
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(crate::project_config::CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    cwd.join(crate::project_config::CONFIG_FILE_NAME)
 }
 
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
@@ -2443,5 +2511,82 @@ label = "-rf"
                 None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
             }
         }
+    }
+
+    // Fork issue #303: `features_config_path()` resolved the feature-flag
+    // config against the process's OWN cwd, while every other config read in
+    // the deck resolves against the explicit project directory. This pins
+    // the corrected contract: launched from a process cwd nested several
+    // levels below the project root, the resolver must still find the
+    // PROJECT's `.dot-agent-deck.toml` — not join the process cwd directly —
+    // and `DOT_AGENT_DECK_FEATURES_CONFIG` must keep overriding both.
+    #[test]
+    fn features_config_path_resolves_against_project_dir_not_process_cwd() {
+        let _lock = FEATURES_CONFIG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = FeaturesConfigCwdEnvGuard::new();
+
+        // Isolated fixture: this repo's own `.dot-agent-deck.toml` sets
+        // `[features] experimental = true` too, so a bug that accidentally
+        // read the real repo config here would pass for the wrong reason.
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        let project_config = project_root.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&project_config, "[features]\nexperimental = true\n").unwrap();
+
+        // A process cwd nested three levels below the project root —
+        // deliberately not the project directory itself.
+        let nested_cwd = project_root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+
+        std::env::set_current_dir(&nested_cwd).expect("chdir into nested fixture dir");
+        let resolved = features_config_path();
+
+        assert_eq!(
+            resolved,
+            project_config,
+            "features_config_path() must resolve to the project directory's \
+             .dot-agent-deck.toml ({}) even when the process cwd is nested \
+             elsewhere under the project ({}); got {}",
+            project_config.display(),
+            nested_cwd.display(),
+            resolved.display()
+        );
+
+        // The resolved value for a project whose config carries
+        // `experimental = true` must be `true` from the nested cwd too —
+        // the assertion that fails today, since today's resolver returns
+        // <nested_cwd>/.dot-agent-deck.toml, which does not exist, and a
+        // missing file resolves to the default (OFF).
+        let loaded = load_features_file(&resolved, crate::features::Features::default());
+        let resolved_flag = resolve_features(loaded);
+        assert!(
+            resolved_flag.experimental,
+            "expected experimental=true from the project's \
+             .dot-agent-deck.toml when the process cwd is nested elsewhere \
+             in the project; got false (resolved path: {})",
+            resolved.display()
+        );
+
+        // DOT_AGENT_DECK_FEATURES_CONFIG must still win over both the
+        // process cwd and the project-directory resolution — existing
+        // behavior this fix must not regress.
+        let override_target = project_root.join("override-features.toml");
+        std::fs::write(&override_target, "[features]\nexperimental = false\n").unwrap();
+        // SAFETY: FEATURES_CONFIG_TEST_LOCK is held for the guard's (and
+        // hence this test's) lifetime.
+        unsafe {
+            std::env::set_var(
+                "DOT_AGENT_DECK_FEATURES_CONFIG",
+                override_target.to_str().unwrap(),
+            );
+        }
+        let resolved_with_override = features_config_path();
+        assert_eq!(
+            resolved_with_override, override_target,
+            "DOT_AGENT_DECK_FEATURES_CONFIG must still win over the \
+             project-directory resolution"
+        );
     }
 }
