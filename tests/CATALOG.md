@@ -5046,11 +5046,9 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the real file-watcher / debounce mechanics (the synthetic event stands in for the watcher's apply step); env-override precedence; partial/invalid-TOML reload handling (unit-covered).
 - **Platform coverage:** mac+linux+windows.
 
-### Feature-flag config path resolution (fork issue #303)
+#### features/config
 
-#### orchestration/features
-
-##### orchestration/features/001 — The experimental flag resolves against the PROJECT directory's `.dot-agent-deck.toml`, not the process's own (nested) launch cwd.
+##### features/config/001 — The experimental flag resolves against the PROJECT directory's `.dot-agent-deck.toml`, not the process's own (nested) launch cwd (fork issue #303).
 - **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). Fixture `features-project-dir` carries `[features] experimental = true` at its root; the harness launches the binary from `nested/launch/dir` INSIDE that root (`with_launch_subdir`), not the root itself. `DOT_AGENT_DECK_EXPERIMENTAL` is left unset so only the file-resolution path is under test.
 - **Agent:** none (no modes/orchestrations; empty dashboard).
 - **Asserts:** once the dashboard is up (`No active sessions`), the rendered grid shows the `experimental: on` footer — proving `features_config_path()` found the project root's config rather than resolving (or failing to resolve) one relative to the process's own nested cwd.

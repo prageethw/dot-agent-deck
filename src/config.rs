@@ -1128,11 +1128,18 @@ impl Drop for ConfigGenStateEnvGuard {
     }
 }
 
-/// Serializes tests that mutate the process cwd and/or
-/// `DOT_AGENT_DECK_FEATURES_CONFIG` — both process-global (fork issue #303).
-/// Rust runs unit tests in parallel, so any test that wants to observe a
-/// specific resolved value from `features_config_path()` must hold this lock
-/// for the duration of its cwd/env fiddling.
+/// Serializes cwd/env mutation only among the tests IN THIS MODULE that take
+/// this specific lock — process cwd and/or `DOT_AGENT_DECK_FEATURES_CONFIG`
+/// are both process-global (fork issue #303). It does NOT serialize against
+/// other tests elsewhere in the crate that separately mutate the process
+/// cwd (e.g. `schedule_cli.rs`'s own function-local cwd mutex) — two
+/// independent mutexes do not exclude each other. That gap is harmless
+/// today only because `cargo nextest` runs each test in its own process, so
+/// no two tests' cwd mutations can interleave regardless of which lock (if
+/// any) they hold; it would not be safe under a same-process test runner.
+/// Any test that wants to observe a specific resolved value from
+/// `features_config_path()` must hold this lock for the duration of its
+/// cwd/env fiddling.
 #[cfg(test)]
 static FEATURES_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

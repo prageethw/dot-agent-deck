@@ -1,5 +1,5 @@
 # Fixture for the L2 real-binary proof of fork issue #303
-# (orchestration/features/001): the harness launches the deck from a
+# (features/config/001): the harness launches the deck from a
 # subdirectory INSIDE this fixture root (via `with_launch_subdir`), never
 # from the root itself, while THIS file carries `[features] experimental =
 # true`. Pins that the experimental flag resolves against the project

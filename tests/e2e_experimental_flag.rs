@@ -82,9 +82,9 @@ fn gating_003_env_var_toggles_footer_e2e() {
 /// `experimental: on` footer once the dashboard is up — proving the flag
 /// resolver finds the PROJECT directory's config rather than one relative to
 /// the process's own, nested, working directory.
-#[spec("orchestration/features/001")]
+#[spec("features/config/001")]
 #[test]
-fn features_001_flag_resolves_from_project_dir_not_nested_launch_cwd() {
+fn config_001_flag_resolves_from_project_dir_not_nested_launch_cwd() {
     // Fork issue #303: `features_config_path()` resolves the feature-flag
     // config against the process's OWN cwd, while every other config read in
     // the deck resolves against the project directory it was handed. Here the
