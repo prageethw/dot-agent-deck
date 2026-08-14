@@ -14031,7 +14031,9 @@ fn render_tab_strip(
     // decoration, so it stays dim.
     let base_style = text_primary();
     let divider_style = text_dim();
-    let active_style = Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(Color::Reset)
+        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
 
     let mut headers = Vec::with_capacity(fitted_labels.len());
     let mut closes = Vec::new();
@@ -16394,10 +16396,10 @@ fn mode_chip_bar_split(mode: UiMode, width: u16) -> (u16, u16) {
 /// PRD #341 M2 — draw the mode chip at `area`'s left edge and return the rect
 /// left for the bar's own content (same row, same right edge).
 ///
-/// Styled `Modifier::REVERSED | BOLD` with no colour at all — the same
-/// terminal-relative trick the active tab uses (`render_tab_strip`), so the chip
-/// inverts against whatever background the user's theme provides and reads on
-/// light and dark terminals alike without an absolute RGB value (PRD #13).
+/// Styled `Modifier::REVERSED | BOLD` with no colour at all — a
+/// terminal-relative trick, so the chip inverts against whatever background
+/// the user's theme provides and reads on light and dark terminals alike
+/// without an absolute RGB value (PRD #13).
 fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
     let (band, rest) = mode_chip_bar_split(mode, area.width);
     if band == 0 {
