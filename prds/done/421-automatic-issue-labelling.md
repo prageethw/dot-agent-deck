@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status**: **Shipped, with one obligation unaccounted for.** Merged 2026-08-09 as [PR #154](https://github.com/prageethw/dot-agent-deck/pull/154) (`c0cd1c8`), first released in **v0.36.1**. Review and merge are done; **M3.1's rule 12 cross-version interop run has no record of having been performed** — see M3.1. Upstream issue [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) remains open. *(Status corrected 2026-08-12: this line read "Phase 3 outstanding on the cross-version run, review and merge" for three days after the merge, which understated what had shipped and overstated what was still pending.)*
+**Status**: **Complete.** *(Status corrected 2026-08-14: the 2026-08-12 correction fixed M3.1's checkbox and body but left this line claiming "M3.1's rule 12 cross-version interop run has no record of having been performed" — stale the moment it was written, since the same commit added M3.1's own paragraph recording that the run *was* performed on 2026-08-09 and copying its evidence in-repo per CLAUDE.md rule 13.)* Merged 2026-08-09 as [PR #154](https://github.com/prageethw/dot-agent-deck/pull/154) (`c0cd1c8`), first released in **v0.36.1**. All milestones M1.0–M3.1 done, including the cross-version interop run — see M3.1 for the full record. Upstream issue [#421](https://github.com/vfarcic/dot-agent-deck/issues/421) remains open — that is the upstream tracker, not this fork's own completion.
 
 ## Problem Statement
 

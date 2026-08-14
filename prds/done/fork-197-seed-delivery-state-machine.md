@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: **RESUMED and awaiting re-review**, 2026-08-12/13. The park below is retained as the historical record; this line supersedes it. All four milestones are implemented, the parked blocker is resolved, and every item in *Work remaining* has been executed. PR #219 (draft) is at HEAD `c128823c`, `MERGEABLE`, fast tier **3090 run / 3076 passed / 14 failed**.
+**Status**: **Complete.** *(Status corrected 2026-08-14: this line read "RESUMED and awaiting re-review … PR #219 (draft)" for two days after the PR had merged.)* All four milestones landed. Merged 2026-08-12T23:04:44Z via [PR #219](https://github.com/prageethw/dot-agent-deck/pull/219) (original merge commit `7f925e8a`, superseded by a later fork-sync rebase; the equivalent commit on `main` today is `619d0f60`, confirmed by `git merge-base --is-ancestor`); on `main`, not yet in a release tag. `changelog.d/197.bugfix.md` is present and unconsumed. The park below is retained as the historical record.
 
 **Read the 14 before reading anything into them.** `main` itself is red at `66077b2a` and this branch inherits its failing set **byte-identically** — ten `keybindings::tests::*`, `mode_scroll_002`, `remap_003`, `state::tests::a_tagged_frame_…`, `ui::tests::orchestration_011_…`, plus a red `semgrep` (4 findings under `--error`). Tracked as [#255](https://github.com/prageethw/dot-agent-deck/issues/255) and deliberately **not** fixed here. This PR therefore cannot show a green board; the achievable bar is "the same 14 as `main`, and no more", which is what it meets.
 
