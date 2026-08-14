@@ -52,8 +52,10 @@ use crate::terminal_widget::TerminalWidget;
 // no absolute `Color::Rgb(..)` is painted on text or contrast-critical
 // surfaces. Backgrounds are left as the terminal default (`Color::Reset`),
 // primary text uses the terminal's default foreground, secondary/muted text
-// dims that same foreground (rather than hardcoding a gray), and selection /
-// active-tab highlights invert in place via `Modifier::REVERSED`. Semantic
+// dims that same foreground (rather than hardcoding a gray), and selection
+// highlights invert in place via `Modifier::REVERSED`; the active tab is
+// instead cued with `Modifier::UNDERLINED | Modifier::BOLD` so a stacked
+// status `fg` tint stays legible (issue #306). Semantic
 // accent/status colors stay as named ANSI (Cyan/Yellow/Red/Green/Blue/
 // Magenta), which terminal themes already remap.
 
@@ -14139,9 +14141,10 @@ struct TabStripRects {
 
 /// PRD #333: `orchestration_statuses[i]` carries tab `i`'s pane statuses
 /// (`Some` for an Orchestration tab, `None` for every tab this feature
-/// doesn't touch) so an *inactive* tab's label can render in
-/// `palette::status_color()` of the highest-priority status among them. The
-/// active tab, and any tab whose aggregate resolves to Idle, render in the
+/// doesn't touch) so a tab's label can render in `palette::status_color()` of
+/// the highest-priority status among them — issue #306 extends this to the
+/// active tab too, since its `UNDERLINED` cue no longer fights a stacked `fg`
+/// tint. Any tab whose aggregate resolves to Idle still renders in the
 /// ordinary tab style — see the carve-out comment in the loop.
 fn render_tab_strip(
     frame: &mut Frame,
@@ -14159,12 +14162,16 @@ fn render_tab_strip(
     let fitted_labels = fit_tab_labels(labels, area.width);
 
     // Inactive tab labels render at full contrast (readable text); the active
-    // tab inverts the terminal's own fg/bg in place (Modifier::REVERSED) for a
-    // self-contained, single-frame highlight that needs no absolute color. The
-    // `│` divider between tabs is decoration, so it stays dim.
+    // tab is cued with Modifier::UNDERLINED | Modifier::BOLD, a terminal-
+    // relative highlight that adds no absolute color and — unlike the
+    // REVERSED it replaces (issue #306) — doesn't invert a stacked status
+    // `fg` tint into the label's background. The `│` divider between tabs is
+    // decoration, so it stays dim.
     let base_style = text_primary();
     let divider_style = text_dim();
-    let active_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(Color::Reset)
+        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
 
     let mut headers = Vec::with_capacity(fitted_labels.len());
     let mut closes = Vec::new();
@@ -14183,20 +14190,22 @@ fn render_tab_strip(
         };
         // PRD #333: an orchestration tab's label takes the color of the single
         // highest-priority status among its panes instead of the base label
-        // color, so color means "something here needs attention". Two
-        // carve-outs (maintainer review on PR #356) keep the label readable:
-        //   - the ACTIVE tab is never tinted. Its highlight is `REVERSED`,
-        //     which swaps fg/bg, so an absolute fg would become the label's
-        //     *background* and draw the text in the terminal's background
-        //     color. It renders exactly like an active non-orchestration tab.
+        // color, so color means "something here needs attention". One
+        // carve-out keeps the label readable:
         //   - an aggregate that resolves to Idle (including `Unknown`, which
         //     `status_color` aliases to it) falls through to the base style
         //     rather than painting `STATUS_IDLE` (a grey) onto read-critical
         //     text — the low-contrast-on-light pattern PRD #13 removed from
         //     `ui.rs`. An idle tab simply looks like an ordinary tab.
+        // Issue #306: the ACTIVE tab used to be excluded here too, on the
+        // reasoning that its `REVERSED` highlight would invert an absolute fg
+        // into the label's background. Now that the active cue is
+        // `UNDERLINED | BOLD` instead of `REVERSED`, a stacked status `fg`
+        // tint renders as ordinary foreground text, so the active tab takes
+        // the same tint an inactive one gets.
         // Tabs this feature doesn't touch (`None`) are untouched.
         let style = match orchestration_statuses.get(i).copied().flatten() {
-            Some(statuses) if i != active_index => {
+            Some(statuses) => {
                 let color = palette::status_color(&palette::highest_priority_status(statuses));
                 if color == palette::STATUS_IDLE {
                     style
@@ -14798,8 +14807,8 @@ fn render_frame(
         // affordance; Mode and Orchestration tabs do. Pass the per-tab
         // closeable mask to the tab-strip renderer, and record the clickable
         // header / [×] rects for the mouse hit-test. PRD #13: the strip is
-        // terminal-relative — the active tab is cued with Modifier::REVERSED,
-        // not an absolute background tint.
+        // terminal-relative — the active tab is cued with Modifier::UNDERLINED
+        // | Modifier::BOLD, not an absolute background tint.
         let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
         let orchestration_statuses: Vec<Option<&[SessionStatus]>> = tab_bar
             .orchestration_statuses
@@ -16514,10 +16523,10 @@ fn mode_chip_bar_split(mode: UiMode, width: u16) -> (u16, u16) {
 /// PRD #341 M2 — draw the mode chip at `area`'s left edge and return the rect
 /// left for the bar's own content (same row, same right edge).
 ///
-/// Styled `Modifier::REVERSED | BOLD` with no colour at all — the same
-/// terminal-relative trick the active tab uses (`render_tab_strip`), so the chip
-/// inverts against whatever background the user's theme provides and reads on
-/// light and dark terminals alike without an absolute RGB value (PRD #13).
+/// Styled `Modifier::REVERSED | BOLD` with no colour at all — a
+/// terminal-relative trick, so the chip inverts against whatever background
+/// the user's theme provides and reads on light and dark terminals alike
+/// without an absolute RGB value (PRD #13).
 fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
     let (band, rest) = mode_chip_bar_split(mode, area.width);
     if band == 0 {
