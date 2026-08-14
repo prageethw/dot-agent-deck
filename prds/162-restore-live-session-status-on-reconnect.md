@@ -1,6 +1,6 @@
 # PRD #162: Restore live session status on daemon reconnect
 
-**Status**: In Progress — implementation, tests, review, and e2e gate complete; changelog + PR/merge pending (M4.2–M4.3)
+**Status**: **Complete.** *(Status corrected 2026-08-14: this line read "changelog + PR/merge pending" for some time after the work had actually shipped. M4.2's changelog fragment landed as `6ee4d5d7` (demo-reel link added in `fb1eb36a`); merged as PR #186 (`dc915486`); a follow-up reconciliation commit `119e5791` references this PRD after a later merge.)*
 **Priority**: High
 **Created**: 2026-06-14
 **GitHub Issue**: [#162](https://github.com/vfarcic/dot-agent-deck/issues/162)
@@ -104,8 +104,8 @@ When more than one historical session maps to the same agent (e.g. a `/clear` re
 ### Phase 4: Docs and release
 
 - [x] **M4.1** — Docs: note in the daemon/reconnect documentation that a reconnected dashboard restores live status (not just the list of agents). Keep it dual-render (Docusaurus + GitHub) per repo convention. — Done (d789667; `docs/session-management.md` "Resuming Sessions").
-- [ ] **M4.2** — Changelog fragment (`dot-ai-changelog-fragment`) on the first push to the PR.
-- [ ] **M4.3** — PR, Greptile review, audit, merge, close.
+- [x] **M4.2** — Changelog fragment (`dot-ai-changelog-fragment`) on the first push to the PR. — Done (`6ee4d5d7`; demo-reel link added in `fb1eb36a`).
+- [x] **M4.3** — PR, Greptile review, audit, merge, close. — Done: merged as PR #186 (`dc915486`).
 
 ## Key Files
 

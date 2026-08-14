@@ -1,6 +1,6 @@
 # PRD #93: Always-external daemon (unify local and remote architecture)
 
-**Status**: In Progress (Phases 1-3 complete; Phase 4 in flight)
+**Status**: **Complete.** *(Status corrected 2026-08-14: this line read "Phase 4 in flight" for some time after the work had actually shipped. Merged as `48b9180d` "PRD #93: always-external daemon (unify local and remote architecture) (#102)"; M4.3's changelog fragment landed as `913b5b22`; the success-criterion grep — `grep -r "PaneBackend::Pty\|ControllerMode::LocalDeck" src/ tests/` — returns zero matches on `main`.)*
 **Priority**: Medium
 **Created**: 2026-05-17
 **GitHub Issue**: [#93](https://github.com/vfarcic/dot-agent-deck/issues/93)
@@ -86,8 +86,8 @@ Concretely:
 
 - [x] **M4.1** — Update `docs/installation.md` and `docs/getting-started.mdx` to describe the daemon lifecycle in a "How it runs" subsection. *90c8139.*
 - [x] **M4.2** — Reconsider PRD #76 M2.18 (quit/detach dialog). *90c8139 — collapsed to single Detach confirmation; `via_daemon` field deleted along with its mode-dependent branching.*
-- [ ] **M4.3** — Changelog fragment via `dot-ai-changelog-fragment`. Focus on user-visible behavior change (daemon now persistent across deck restarts; agents survive).
-- [ ] **M4.4** — PR, review, audit, merge, release.
+- [x] **M4.3** — Changelog fragment via `dot-ai-changelog-fragment`. Focus on user-visible behavior change (daemon now persistent across deck restarts; agents survive). — Done (`913b5b22`).
+- [x] **M4.4** — PR, review, audit, merge, release. — Done: merged as `48b9180d` (PR #102).
 
 ## Implementation notes (out-of-PRD work that landed alongside)
 
