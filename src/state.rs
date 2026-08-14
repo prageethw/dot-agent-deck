@@ -8,8 +8,9 @@ use tracing::warn;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateResponse,
+    DelegateSignal, EventType, LiveTarget, OrchestrationSurface, WorkDoneSignal,
+    WorktreeKeptNotice, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -23,6 +24,11 @@ const MAX_RECENT_EVENTS: usize = 50;
 /// to build). Sized well above any realistic concurrent-dispatch burst (a fire's
 /// `max_per_run` issue dispatches is single/low-double digits).
 const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
+/// PRD 236: cap on [`AppState::pending_kept_worktrees`], mirroring
+/// `MAX_PENDING_ORCHESTRATION_SURFACES` above for the same reason — a daemon
+/// producing kept-worktree notices faster than the render loop drains them
+/// can't grow the Vec unbounded.
+const MAX_PENDING_KEPT_WORKTREES: usize = 64;
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
 /// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
@@ -546,6 +552,16 @@ pub struct AppState {
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
     pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    /// PRD 236: a dispatched worktree the daemon kept on tab close (dirty, or a
+    /// status probe that itself failed) rather than removing, queued for the
+    /// render loop the same way [`Self::pending_orchestration_surfaces`] is —
+    /// the daemon publishes a [`BroadcastMsg::WorktreeKept`]; the event
+    /// subscriber records it here because it has no access to
+    /// `ui.session_warnings` (render-loop-local state), and the render loop
+    /// drains it into that Vec so the user learns where the work survives.
+    /// Bounded by `MAX_PENDING_KEPT_WORKTREES` so a flood can't grow it
+    /// unbounded.
+    pub pending_kept_worktrees: Vec<WorktreeKeptNotice>,
     /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
     /// (the "generation") currently bound to each pane, keyed by `pane_id`.
     /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
@@ -1674,6 +1690,8 @@ async fn wait_for_worker_event(
                 }
             }
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // PRD 236: not a hook event either — keep waiting.
+            Ok(Ok(BroadcastMsg::WorktreeKept(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
                 warn!(
                     pane_id = %pane_id,
@@ -2190,6 +2208,8 @@ pub(crate) async fn wait_for_session_start(
             }
             // PRD #120: not a hook event — keep waiting for the SessionStart.
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // PRD 236: not a hook event either — keep waiting.
+            Ok(Ok(BroadcastMsg::WorktreeKept(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
                 return SessionStartWait::unready(launcher_handoff);
@@ -3331,6 +3351,24 @@ impl AppState {
             );
         }
         self.pending_orchestration_surfaces.push(surface);
+    }
+
+    /// PRD 236: record a daemon-kept dispatched worktree for the render loop
+    /// to surface into `ui.session_warnings`. Called from the event
+    /// subscriber, which receives the [`BroadcastMsg::WorktreeKept`] but
+    /// cannot touch `ui.session_warnings` (render-loop-local state).
+    pub fn queue_kept_worktree(&mut self, notice: WorktreeKeptNotice) {
+        // Mirrors `queue_orchestration_surface`'s cap-and-drop-oldest policy —
+        // see [`MAX_PENDING_KEPT_WORKTREES`].
+        if self.pending_kept_worktrees.len() >= MAX_PENDING_KEPT_WORKTREES {
+            let dropped = self.pending_kept_worktrees.remove(0);
+            tracing::warn!(
+                worktree = %dropped.path,
+                cap = MAX_PENDING_KEPT_WORKTREES,
+                "queue_kept_worktree: pending queue at cap; dropping oldest notice"
+            );
+        }
+        self.pending_kept_worktrees.push(notice);
     }
 
     /// Create a placeholder session for a newly created pane so it always

@@ -423,15 +423,25 @@ pub async fn handle_dispatch(
             },
         },
         Err(e) => {
-            // `Force` on the rollback path, unlike the tab-close path: we created
-            // this worktree seconds ago and the agent never started, so there is
-            // no user work to protect — and it MUST actually go, or the leftover
-            // dir and branch wedge this name for every later dispatch.
-            remove_worktree(&paths.worktree_dir, &clone_dir, RemovalPolicy::Force).await;
-            // Also delete the branch: `git worktree remove` never deletes it,
-            // but on this rollback path the agent never ran so there is no
-            // committed work to protect — leaving the branch would wedge this
-            // name for every later dispatch.
+            // `Force` on the rollback path, unlike the tab-close path: for a
+            // SINGLE-role dispatch no agent has been handed this worktree
+            // yet, so there is no user work to protect and it MUST actually
+            // go, or the leftover dir and branch wedge this name for every
+            // later dispatch. That is NOT true for a multi-role
+            // orchestration, though (PRD 236 review) — `spawn()`'s
+            // orchestration branch spawns roles in a loop with `?`
+            // (`spawn.rs:536`), so a later role's spawn failure still
+            // leaves EARLIER roles as live PTY children already rooted in
+            // this worktree, and this call force-removes it out from under
+            // them. Left as-is rather than guarded with
+            // `worktree_still_in_use` here — that would be a behaviour
+            // change, out of scope for this fix — but flagged for a
+            // follow-up issue.
+            let _ = remove_worktree(&paths.worktree_dir, &clone_dir, RemovalPolicy::Force).await;
+            // Also delete the branch: `git worktree remove` never deletes
+            // it. Same multi-role caveat as above — a still-live sibling
+            // role may hold committed work whose only record is this
+            // branch.
             let branch_cleanup_failed = run_status(
                 "git",
                 &[
@@ -582,7 +592,7 @@ mod tests {
         );
 
         // Tab close: the worktree goes away, the branch does not.
-        remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
         assert!(!paths.worktree_dir.exists(), "worktree dir should be gone");
         assert!(
             branch_exists(&repo, &paths.branch),
@@ -622,7 +632,7 @@ mod tests {
         )
         .await
         .unwrap();
-        remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
         std::process::Command::new("git")
             .args(["branch", "-D", &paths.branch])
             .current_dir(&repo)
@@ -666,7 +676,7 @@ mod tests {
         .unwrap();
         std::fs::write(paths.worktree_dir.join("uncommitted.txt"), "work").unwrap();
 
-        remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
 
         assert!(
             paths.worktree_dir.exists(),
@@ -674,12 +684,15 @@ mod tests {
         );
     }
 
-    /// `Force` (PRD #120 issue-dispatch): the directory MUST go even when dirty,
-    /// because `dispatch_decision` reads a surviving worktree as "issue already
-    /// claimed" and would skip that issue on every later fire, permanently.
-    /// This is the exact regression that dropping `--force` introduced.
+    /// `Force`: the directory MUST go even when dirty. PRD 236 unified both
+    /// dispatch producers onto `KeepIfDirty` — `#120` issue-dispatch no
+    /// longer force-removes (see [`RemovalPolicy`]'s doc comment) — so this
+    /// is now a direct policy check, independent of either producer, rather
+    /// than the issue-dispatch-specific regression guard it used to be. The
+    /// one caller left depending on `Force` is `dispatch.rs`'s own
+    /// spawn-failure rollback.
     #[tokio::test]
-    async fn force_removes_a_dirty_worktree_so_the_slot_is_reclaimable() {
+    async fn force_removes_a_dirty_worktree_regardless_of_uncommitted_work() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
@@ -689,11 +702,12 @@ mod tests {
             .unwrap();
         std::fs::write(worktree_dir.join("uncommitted.txt"), "wip").unwrap();
 
-        remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force).await;
+        let _ = remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force).await;
 
         assert!(
             !worktree_dir.exists(),
-            "issue-dispatch must force-remove so the vacated slot is reclaimable"
+            "RemovalPolicy::Force must remove a dirty worktree unconditionally -- the policy \
+             `dispatch.rs`'s spawn-failure rollback depends on"
         );
     }
 
