@@ -23,8 +23,8 @@ mod test_temp;
 use std::sync::Mutex;
 
 use dot_agent_deck::config::{
-    EXPERIMENTAL_ENV, features_config_path, load_features_file, parse_features, resolve_features,
-    resolve_project_dir,
+    EXPERIMENTAL_ENV, features_config_path, features_config_path_for_display, load_features_file,
+    parse_features, resolve_features, resolve_project_dir,
 };
 use dot_agent_deck::features::{self, Features};
 
@@ -248,7 +248,7 @@ fn reload_apply_path_updates_shared_features() {
 // (and an operator who really does want one specific file) never depend on
 // any directory at all.
 #[test]
-fn features_config_path_honors_override() {
+fn features_config_path_for_display_honors_override() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // RAII guard: restores the prior value on drop even if the assertion
     // panics, so the override never leaks to other tests that read
@@ -258,9 +258,9 @@ fn features_config_path_honors_override() {
         Some("/tmp/explicit/.dot-agent-deck.toml"),
     );
     assert_eq!(
-        features_config_path(std::path::Path::new("/some/project")),
+        features_config_path_for_display(),
         std::path::PathBuf::from("/tmp/explicit/.dot-agent-deck.toml"),
-        "the explicit-path override wins over the project directory"
+        "the explicit-path override wins over the process cwd"
     );
 }
 

@@ -28082,6 +28082,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             zoomed: false,
+            orchestration_id: None,
         };
 
         let dashboard = Tab::Dashboard {

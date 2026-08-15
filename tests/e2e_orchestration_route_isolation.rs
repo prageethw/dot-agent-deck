@@ -64,7 +64,6 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
-use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::SendResult;
 use dot_agent_deck::state::work_done_file_name;
 use spec::spec;

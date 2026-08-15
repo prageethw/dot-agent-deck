@@ -14114,7 +14114,6 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
     }
 
-
     // ---------------------------------------------------------------------
     // Issue #581 — one wedged agent's reap must not starve its siblings of
     // their phase-3 SIGKILL.

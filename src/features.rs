@@ -121,22 +121,56 @@ static INIT: Once = Once::new();
 /// that points at a missing file is a different problem. Returns `None` when
 /// a config was found (or an override is set), so callers can stay silent in
 /// the common case.
-fn missing_config_warning(path: &std::path::Path, project_dir: &std::path::Path) -> Option<String> {
+///
+/// Reviewer F5: this can also fire when something DOES exist at the
+/// resolved path — a non-regular file of that name, or an ancestor whose
+/// `stat` failed (`is_file()` reads `EACCES` the same as absent) — so the
+/// wording says what was actually determined (no *readable regular file*
+/// found) rather than asserting outright absence. `no {CONFIG_FILE_NAME}
+/// found` stays intact as the opening clause (verbatim, unchanged) because
+/// `e2e_features_status.rs`'s `startup_warning_001`/`002`/`003` pin that
+/// exact substring on stderr — this only applies when `declined_any` is
+/// `false`; that test's fixture never declines anything.
+///
+/// Reviewer L-2 (round 2): when one or more ancestors WERE declined
+/// (`declined_any` is `true`), the plain "no {CONFIG_FILE_NAME} found in
+/// {project_dir}" wording is actively false — a config *was* found, one line
+/// above, and was declined rather than absent — and it names `project_dir`,
+/// which can be a different directory from the one the resolution actually
+/// froze at (the coda names the real one). In that case this swaps to a
+/// clause that doesn't claim absence and doesn't name a directory the
+/// decline lines above already covered.
+fn missing_config_warning(
+    path: &std::path::Path,
+    project_dir: &std::path::Path,
+    declined_any: bool,
+) -> Option<String> {
     if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok() || path.is_file() {
         return None;
     }
-    Some(format!(
-        "no {} found in {} or any ancestor directory; experimental flags default to OFF",
-        crate::project_config::CONFIG_FILE_NAME,
-        // SECURITY (issue #303 M1): `project_dir` is attacker-influenceable —
-        // any directory the process was launched from — and this warning is
-        // printed raw to the terminal ahead of the alt-screen switch
-        // (`main.rs::run_tui_session`). Sanitize it the same way
-        // `worktree_reclaim.rs`/`daemon_client.rs`/`keybindings.rs` sanitize
-        // other operator-facing paths, or an embedded CR+ESC[2K can erase
-        // this very warning and forge a reassuring line in its place.
-        crate::terminal_sanitize::sanitize_path_for_terminal_display(project_dir)
-    ))
+    let opening = if declined_any {
+        format!(
+            "no usable {} (one or more candidates were declined, above)",
+            crate::project_config::CONFIG_FILE_NAME
+        )
+    } else {
+        format!(
+            "no {} found in {} or any ancestor directory (or one exists there \
+             but is not a readable regular file — indistinguishable from \
+             absent here)",
+            crate::project_config::CONFIG_FILE_NAME,
+            // SECURITY (issue #303 M1): `project_dir` is attacker-influenceable —
+            // any directory the process was launched from — and this
+            // warning is printed raw to the terminal ahead of the
+            // alt-screen switch (`main.rs::run_tui_session`). Sanitize it
+            // the same way `worktree_reclaim.rs`/`daemon_client.rs`/
+            // `keybindings.rs` sanitize other operator-facing paths, or an
+            // embedded CR+ESC[2K can erase this very warning and forge a
+            // reassuring line in its place.
+            crate::terminal_sanitize::sanitize_path_for_terminal_display(project_dir)
+        )
+    };
+    Some(format!("{opening}; experimental flags default to OFF"))
 }
 
 /// Initialize the process-global `Features` from the `[features]` table of
@@ -154,17 +188,70 @@ fn missing_config_warning(path: &std::path::Path, project_dir: &std::path::Path)
 /// config read takes the directory it was handed
 /// ([`crate::project_config::load_project_config`]).
 ///
-/// Returns the fork issue #303 diagnosability message (see
-/// [`missing_config_warning`]) the FIRST time this is called, so a caller
-/// with a user-visible seam (the TUI's startup path, before it enters the
-/// alternate screen) can surface it without needing `DOT_AGENT_DECK_LOG` or a
-/// restart. Returns `None` on a config found (or an override set), and also
-/// on any call after the first — `init_and_watch` is only ever called once
-/// per process in production, so this is not a real limitation.
-pub fn init_and_watch(project_dir: &std::path::Path) -> Option<String> {
-    let mut warning = None;
+/// Returns every diagnosability message produced by this call (fork issue
+/// #309's declined-ancestor warnings, then either fork issue #303's
+/// [`missing_config_warning`] plus a trailing coda naming the frozen
+/// resolution path (reviewer F4), or — when no ancestor was trustworthy at
+/// all (round 2, auditor M-1r) — one message saying so instead) the FIRST
+/// time this is called, so a caller with a user-visible seam (the TUI's
+/// startup path, before it enters the alternate screen) can surface them
+/// without needing `DOT_AGENT_DECK_LOG` or a restart. Every message here is
+/// also `tracing::warn!`-logged as it is produced, so `DOT_AGENT_DECK_LOG`
+/// still captures them even for a caller (the daemon) that discards the
+/// returned `Vec`. Returns empty when a config was cleanly found (or an
+/// override is set), and also on any call after the first —
+/// `init_and_watch` is only ever called once per process in production, so
+/// this is not a real limitation.
+///
+/// Reviewer F4: resolution happens exactly once, here, inside
+/// `INIT.call_once` — [`spawn_watcher`] re-reads the SAME resolved `path` on
+/// every tick but the ancestor walk itself never repeats. So "I'll fix this
+/// by creating/moving a config" has no effect until the process restarts
+/// unless the operator creates it at exactly the path named in the coda.
+///
+/// Round 2 (auditor M-1r / reviewer L-1): the ancestor walk can now report
+/// that NO ancestor was trustworthy at all
+/// (`features_config_path_with_diagnostics` returning `None`) rather than
+/// always naming a path. When that happens this installs
+/// [`Features::default`] (still honoring an env override, which does not
+/// depend on any file), logs and returns a warning saying so, and —
+/// deliberately — does **not** call [`spawn_watcher`]: there is no
+/// directory left that the walk has any basis to trust, so nothing here
+/// should be handed to a thread that polls it for the rest of the
+/// process's life.
+pub fn init_and_watch(project_dir: &std::path::Path) -> Vec<String> {
+    let mut warnings = Vec::new();
     INIT.call_once(|| {
-        let path = crate::config::features_config_path(project_dir);
+        let (path, declined) = crate::config::features_config_path_with_diagnostics(project_dir);
+        let declined_any = !declined.is_empty();
+        warnings.extend(declined);
+        let Some(path) = path else {
+            let resolved = crate::config::resolve_features(Features::default());
+            install(resolved);
+            tracing::info!(
+                "experimental flag: {} (no trustworthy features-config location)",
+                if resolved.experimental { "ON" } else { "OFF" }
+            );
+            // Deliberately NOT the literal "experimental flags default to
+            // OFF" tail `missing_config_warning`'s declined_any == false
+            // branch ends with (pinned verbatim by
+            // `startup_warning_001`/`002`/`003`): this branch is otherwise
+            // unreachable from those tests (`path` is always `Some` in
+            // their fixtures), but a shared tail would let a future
+            // regression that misroutes into this branch instead still
+            // satisfy `startup_warning_002`/`003`'s `!contains(...)` check
+            // by accident, silently losing their independent second net.
+            let message = "no ancestor directory could be trusted as a \
+                 features-config location — every candidate was either \
+                 world-writable or its safety could not be determined; \
+                 experimental features stay disabled (unless overridden by \
+                 DOT_AGENT_DECK_EXPERIMENTAL) and no config watcher was \
+                 started for this run (fork issue #309)"
+                .to_string();
+            tracing::warn!("{message}");
+            warnings.push(message);
+            return;
+        };
         let resolved = crate::config::resolve_features(crate::config::load_features_file(
             &path,
             Features::default(),
@@ -180,13 +267,23 @@ pub fn init_and_watch(project_dir: &std::path::Path) -> Option<String> {
             if resolved.experimental { "ON" } else { "OFF" },
             path.display()
         );
-        if let Some(message) = missing_config_warning(&path, project_dir) {
+        if let Some(message) = missing_config_warning(&path, project_dir, declined_any) {
             tracing::warn!("{message}");
-            warning = Some(message);
+            warnings.push(message);
+        }
+        if !warnings.is_empty() {
+            let coda = format!(
+                "this resolution is frozen for the rest of this run at {} \
+                 (fork issue #309 F4) — a config created or moved after \
+                 startup has no effect until the deck is restarted",
+                crate::terminal_sanitize::sanitize_path_for_terminal_display(&path)
+            );
+            tracing::warn!("{coda}");
+            warnings.push(coda);
         }
         spawn_watcher(path);
     });
-    warning
+    warnings
 }
 
 /// Periodic re-read watcher (OQ1). The deck has no existing config-reload

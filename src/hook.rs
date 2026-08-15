@@ -914,7 +914,7 @@ fn request_from_socket_at_detailed(
 ///
 /// Every variant folds into [`SocketReply::NoReply`] at the boundary, so this
 /// changes no caller's behavior; it exists so a failure names itself instead
-/// of collapsing four distinct causes into one `None`. Issue #564: a
+/// of collapsing multiple distinct causes into one `None`. Issue #564: a
 /// `get-seed` that silently degrades to PTY injection looks identical to one
 /// that never had a daemon to talk to, which is exactly the ambiguity that
 /// made a macOS-only flake take two occurrences and a log excavation to place.
