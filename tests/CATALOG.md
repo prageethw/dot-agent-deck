@@ -3257,8 +3257,8 @@ without depending on the config struct API.
 ##### orchestration/lock/016 — With NO project config discoverable anywhere (fork #346), `Ctrl+e` from command mode on a real Orchestration tab is still claimed as `Action::ToggleOrchestrationLock` — the mirror of `orchestration/lock/009`'s command-mode proof, with no flag involved at all.
 - **Layer:** L2 (PTY end-to-end).
 - **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Same `DOT_AGENT_DECK_FEATURES_CONFIG`-pointed-at-a-missing-path mechanism as `orchestration/lock/015`.
-- **Asserts:** `Ctrl+d` into command mode then `Ctrl+e` produces the deck's `Pane entry: unlocked` report. `Ctrl+e`'s binding resolution is unconditional (fork #346's graduation), so it still resolves with no config present.
-- **Does not assert:** the forwarding gate itself (`orchestration/lock/015`); the caret-echo proof that `0x05` reaches a focused pane's PTY in `PaneInput` mode (`orchestration/lock/009`, unaffected by this flag either way since the orchestrator pane is never gated).
+- **Asserts:** `Ctrl+d` into command mode then `Ctrl+e` produces the deck's `Pane entry: unlocked` report. `Ctrl+e`'s binding resolution is unconditional (fork #346's graduation), so it still resolves with no config present. Also reads the persistent LOCKED/UNLOCKED chip immediately right of the mode chip before and after the toggle, confirming `lock_context_for_tab`'s render path is likewise unconditional with no project config present anywhere — the no-config coverage `orchestration/lock/018` does not itself provide.
+- **Does not assert:** the forwarding gate itself (`orchestration/lock/015`); the caret-echo proof that `0x05` reaches a focused pane's PTY in `PaneInput` mode (`orchestration/lock/009`, unaffected by this flag either way since the orchestrator pane is never gated); cell styling of the chip (text-only via `snapshot_grid()`, same limitation as `orchestration/lock/018`).
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/lock/017 — A bracketed paste aimed at a locked worker pane is dropped exactly like an ordinary keystroke, and the drop leaves no side effects behind (issue #302 defect 1).
@@ -3273,6 +3273,13 @@ without depending on the config struct API.
 - **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
 - **Asserts:** in `PaneInput` on a real orchestration tab, the text immediately following the ` TYPING ` mode chip on the bottom bar reads ` LOCKED ` while the command-entry lock is engaged (the default); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, the same position reads ` UNLOCKED ` — both states are asserted, not just the locked default, so an indicator that only ever renders one state cannot pass. The `?` help overlay documents `Ctrl+e`.
 - **Does not assert:** cell styling (reversed+bold / dim) — text-only via `snapshot_grid()`; `bottom_bar_rows`' height-budget accounting for the new chip (left for a follow-up L1 test once the render seam exists).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/019 — At 80 columns the dropped-keystroke unlock hint is fully visible, not truncated by the right-aligned `[Command Mode Ctrl+D]` button (issue #302 review finding F2).
+- **Layer:** L2 PTY-attached — NOT the L1 widget snapshot originally requested. No existing `_to_buffer` seam threads an arbitrary status message into `render_bottom_bar`'s `PaneInput` arm (every current seam builds a bare `UiState` with `status_message` left at its default `None`, and `UiState::new`/`status_message` are private to `src/ui.rs`); adding that seam is itself a production-code change, out of a tester's reach — the same reasoning `orchestration/lock/018` already records for the LOCKED/UNLOCKED chip. Drives the real running binary at 80x40 instead, through the same dropped-keystroke path `orchestration/lock/008` pins at 120x40.
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** at 80 columns, after a dropped keystroke at the locked worker pane, the full corrected hint (`Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here`, 49 chars) appears as a contiguous string in the grid — not overwritten by the right-aligned `[Command Mode Ctrl+D]` button (21 chars) sharing the same row. The chip band widened 9→17 and the message 42→49 chars in this PR, moving the collision threshold from 72 to 87 columns, so 80 columns (previously safe) now truncates the message's tail (`type here`).
+- **Does not assert:** any width other than 80; a fix's exact shape (shortened message vs. clipped `Paragraph`) — either satisfies this assertion.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/focus

@@ -694,7 +694,11 @@ fn lock_015_gate_holds_with_no_project_config_present() {
 /// rather than leaving it unclaimed for the global keybinding resolver to
 /// fall through to the PTY. `Ctrl+e`'s binding resolution is unconditional
 /// (fork #346), so it still resolves with no config present — the mirror of
-/// `orchestration/lock/009`'s proof, with no flag involved at all.
+/// `orchestration/lock/009`'s proof, with no flag involved at all. Also reads
+/// the persistent LOCKED/UNLOCKED chip immediately right of the mode chip
+/// before and after the toggle, proving `lock_context_for_tab`'s render path
+/// is likewise unconditional and not still routed through a discoverable
+/// config or the (now-removed) flag.
 #[spec("orchestration/lock/016")]
 #[test]
 fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
@@ -709,6 +713,16 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent");
 
+    let locked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
+    assert!(
+        locked_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with(" LOCKED ")),
+        "the persistent lock chip did not read ` LOCKED ` with no project \
+         config present anywhere. Observed tail: {locked_tail:?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock
 
@@ -720,12 +734,23 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
          #346).\nGrid:\n{}",
         deck.snapshot_grid()
     );
+
+    let unlocked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
+    assert!(
+        unlocked_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with(" UNLOCKED ")),
+        "the persistent lock chip did not read ` UNLOCKED ` after Ctrl+e with \
+         no project config present anywhere. Observed tail: \
+         {unlocked_tail:?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
 }
 
 /// Scenario: Open a real orchestration tab (default LOCKED), focus the
 /// non-orchestrator "worker" role, and send a bracketed paste at it — confirm
 /// it is dropped exactly like an ordinary keystroke (issue #302 defect 1:
-/// `Event::Paste` currently calls `embedded.write_raw_bytes` directly,
+/// `Event::Paste` previously called `embedded.write_raw_bytes` directly,
 /// bypassing `gate_pane_input_key` entirely). Build real scrollback in the
 /// worker pane, re-lock, scroll back via the mouse wheel (the one scroll door
 /// that survives a `PaneInput` re-entry, since keyboard PageUp/PageDown is
@@ -986,7 +1011,7 @@ fn lock_017_paste_gated_by_lock_state() {
 /// Poll the rendered grid for the persistent mode chip (` TYPING `, the
 /// `PaneInput` label) and return whatever text immediately follows it on that
 /// row — `None` if the chip itself never appears within `timeout`. Used by
-/// `lock_018` to read the (not-yet-existing) lock chip's text without racing
+/// `lock_018` to read the lock chip's text without racing
 /// the frame that draws the bottom bar.
 fn wait_for_chip_tail(deck: &TuiDeck, timeout: Duration) -> Option<String> {
     common::wait_until(timeout, || {
@@ -1005,9 +1030,9 @@ fn wait_for_chip_tail(deck: &TuiDeck, timeout: Duration) -> Option<String> {
 /// mode chip on the bottom bar — confirm the cells immediately to its right
 /// read ` LOCKED `. Unlock (`Ctrl+d`, `Ctrl+e`, `Ctrl+d`) and confirm the same
 /// position now reads ` UNLOCKED ` — both states must render, not just the
-/// locked default (issue #302 defect 3: today NEITHER renders at all, so a
-/// working lock and an inert one are indistinguishable on screen, which is
-/// how #303 went unnoticed). Then open the `?` help overlay and confirm
+/// locked default (issue #302 defect 3: previously NEITHER rendered at all,
+/// so a working lock and an inert one were indistinguishable on screen,
+/// which is how #303 went unnoticed). Then open the `?` help overlay and confirm
 /// `Ctrl+e` is documented there.
 ///
 /// Written as L2 (not the L1 widget snapshot the task named) because no
@@ -1045,8 +1070,8 @@ fn lock_018_persistent_chip_and_help_entry() {
             .is_some_and(|tail| tail.starts_with(" LOCKED ")),
         "immediately right of the ` TYPING ` mode chip, the bottom bar must \
          read ` LOCKED ` while the command-entry lock is engaged (the \
-         default) — no such chip exists yet, so a working lock and an inert \
-         one are indistinguishable on screen. Observed tail: {locked_tail:?}\n\
+         default) — without this chip a working lock and an inert one are \
+         indistinguishable on screen. Observed tail: {locked_tail:?}\n\
          Grid:\n{}",
         deck.snapshot_grid()
     );
@@ -1084,7 +1109,71 @@ fn lock_018_persistent_chip_and_help_entry() {
     assert!(
         deck.snapshot_grid().contains("Ctrl+e"),
         "the help overlay must document Ctrl+e (ToggleOrchestrationLock) — it \
-         does not appear anywhere in today's overlay.\nGrid:\n{}",
+         does not appear anywhere in the overlay.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: At 80 columns — the single most common terminal width — open a
+/// real orchestration tab (default LOCKED), focus the non-orchestrator
+/// "worker" role, and send a dropped keystroke to surface the corrected
+/// unlock hint. Confirm the FULL hint text (`Pane locked — Ctrl+d, Ctrl+e,
+/// Ctrl+d to type here`) is visible as a contiguous string in the grid, not
+/// truncated by the right-aligned `[Command Mode Ctrl+D]` button drawn into
+/// the same row.
+///
+/// Written as L2, not the L1 widget snapshot the task originally named:
+/// every existing `_to_buffer` seam that exercises `render_bottom_bar`'s
+/// `PaneInput` arm (`render_button_bar_for_mode_to_buffer` and siblings)
+/// builds a bare `UiState` with `status_message` left at its default `None`,
+/// and `UiState::new`/its `status_message` field are private to `src/ui.rs`
+/// — no seam threads an arbitrary status message into the rendered bar.
+/// Adding one is itself a production-code change (a new seam plus whatever
+/// it exposes), which is out of a tester's reach — the same reasoning
+/// `orchestration/lock/018` already recorded in this file for the LOCKED/
+/// UNLOCKED chip. This drives the real running binary instead, through the
+/// same dropped-keystroke path `orchestration/lock/008` already pins at
+/// 120x40 (where the collision does not occur).
+#[spec("orchestration/lock/019")]
+#[test]
+fn lock_019_hint_visible_at_80_columns() {
+    const WORKER_SENTINEL: &str = "LOCK019_WORKER_1c8e";
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(80, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+
+    focus_worker_role(&deck);
+
+    // Locked: a keystroke aimed at the worker pane must NOT reach its PTY,
+    // and the drop must surface the unlock hint (orchestration/lock/008).
+    deck.send_keys(format!("{WORKER_SENTINEL}\r").as_bytes());
+    let leaked = deck.wait_for_grid_string_within(WORKER_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "a keystroke typed into the non-orchestrator worker pane reached its \
+         PTY while the command-entry lock was engaged (the default state) at \
+         80 columns.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    assert!(
+        deck.wait_for_grid_string_within(
+            "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here",
+            Duration::from_secs(2),
+        ),
+        "at 80 columns the dropped-keystroke status message was not visible \
+         as a contiguous string — issue #302 defect 2's corrected hint (`Pane \
+         locked — Ctrl+d, Ctrl+e, Ctrl+d to type here`, 49 chars) is drawn \
+         into the same row as the right-aligned `[Command Mode Ctrl+D]` \
+         button (21 chars); below 87 columns the button (drawn second) wins \
+         the overlapping cells and the tail of the message — `type here` — is \
+         overwritten. `orchestration/lock/008` pins the same message at \
+         120x40, where the two do not overlap.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
