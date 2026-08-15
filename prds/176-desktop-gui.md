@@ -138,7 +138,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 - [ ] **M5.1** — Opt-in packaging: a separate build target/artifact, excluded from the default release, labeled preview/opt-in.
 - [ ] **M5.2** — Tests: `protocol`-crate and core bridge/handshake (Rust); lightweight web component/e2e for chrome + one terminal round-trip; daemon event-emission coverage.
 - [ ] **M5.3** — Docs: developer build/run + toolchain doc under `docs/develop/` (linked from `CONTRIBUTING.md`); user doc once past spike quality; changelog fragment via `dot-ai-changelog-fragment`.
-- [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
+- [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (delegated `reviewer` + `auditor` pass) settled per CLAUDE.md rule 8.
 
 ## Risks & Mitigations
 
