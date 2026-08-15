@@ -6,28 +6,91 @@ CHANGELOG_DIR="changelog.d"
 CHANGELOG_FILE="CHANGELOG.md"
 DATE=$(date +%Y-%m-%d)
 
-# Collect entries by type.
-# Supports both Keep-a-Changelog names (added, changed, fixed, removed)
-# and semantic fragment names (feature, breaking, bugfix, doc, misc).
+# Collect entries by type. The five recognized suffixes are the semantic
+# fragment names declared in pyproject.toml's [[tool.towncrier.type]] table
+# (feature, bugfix, breaking, doc, misc) — see the vocabulary check below.
 declare -A TYPE_HEADERS=(
-  [added]="Added"
   [feature]="Added"
-  [changed]="Changed"
   [breaking]="Changed"
-  [fixed]="Fixed"
   [bugfix]="Fixed"
-  [removed]="Removed"
   [doc]="Documentation"
   [misc]="Miscellaneous"
 )
 
 # Ordered list of types to scan — earlier entries appear first in the changelog.
-TYPES=(breaking added feature changed fixed bugfix removed doc misc)
+# `breaking` is deliberately first so Breaking Changes leads the release notes;
+# this order is independent of pyproject.toml's declaration order (see below).
+TYPES=(breaking feature bugfix doc misc)
+
+# pyproject.toml is the single declared source of the valid type vocabulary
+# (docs/develop/versioning.md, R5) even though this script — not towncrier
+# itself — is what actually assembles the changelog (C5, deliberate: towncrier
+# is never invoked). Read only the SET of `directory = "..."` values from its
+# [[tool.towncrier.type]] blocks; pyproject.toml's own TYPES order and its
+# `name` fields (Features/Bug Fixes/…) are NOT authoritative here — taking
+# either would silently reorder or re-title every future changelog.
+PYPROJECT_TOML="pyproject.toml"
+pyproject_types=()
+while IFS= read -r t; do
+  [[ -n "$t" ]] && pyproject_types+=("$t")
+done < <(awk '
+  /^\[\[tool\.towncrier\.type\]\]/ { in_block=1; next }
+  /^\[/ { in_block=0 }
+  in_block && /^[[:space:]]*directory[[:space:]]*=/ {
+    line=$0
+    sub(/^[[:space:]]*directory[[:space:]]*=[[:space:]]*/, "", line)
+    gsub(/["'"'"']/, "", line)
+    gsub(/[[:space:]]+$/, "", line)
+    print line
+  }
+' "$PYPROJECT_TOML" 2>/dev/null)
+
+if [ ${#pyproject_types[@]} -eq 0 ]; then
+  echo "ERROR: could not parse any [[tool.towncrier.type]] directory entries from $PYPROJECT_TOML" >&2
+  echo "A silently empty vocabulary would turn the unknown-suffix check below into a no-op that accepts everything — refusing to proceed instead." >&2
+  exit 1
+fi
+
+# Assert the script's TYPES and pyproject.toml's declared types are the same
+# set, so the two vocabularies can never silently diverge again (PRD fork#340,
+# C4: pyproject.toml, this script and analyze.sh disagreeing let a fragment
+# type pass here and hard-fail the release later).
+missing_in_script=()
+for t in "${pyproject_types[@]}"; do
+  found=false
+  for s in "${TYPES[@]}"; do
+    [[ "$s" == "$t" ]] && { found=true; break; }
+  done
+  $found || missing_in_script+=("$t")
+done
+
+extra_in_script=()
+for s in "${TYPES[@]}"; do
+  found=false
+  for t in "${pyproject_types[@]}"; do
+    [[ "$t" == "$s" ]] && { found=true; break; }
+  done
+  $found || extra_in_script+=("$s")
+done
+
+if [ ${#missing_in_script[@]} -gt 0 ] || [ ${#extra_in_script[@]} -gt 0 ]; then
+  echo "ERROR: changelog type vocabulary mismatch between $PYPROJECT_TOML and $0" >&2
+  if [ ${#missing_in_script[@]} -gt 0 ]; then
+    echo "  pyproject.toml declares a type this script has no TYPES/TYPE_HEADERS entry for:" >&2
+    printf '    %s\n' "${missing_in_script[@]}" >&2
+  fi
+  if [ ${#extra_in_script[@]} -gt 0 ]; then
+    echo "  this script recognizes a type pyproject.toml does not declare:" >&2
+    printf '    %s\n' "${extra_in_script[@]}" >&2
+  fi
+  echo "Keep TYPES/TYPE_HEADERS in $0 and [[tool.towncrier.type]] in $PYPROJECT_TOML in sync." >&2
+  exit 1
+fi
 
 # Fail loudly if changelog.d/ contains fragments with unrecognized suffixes,
 # rather than silently skipping them. (v0.24.3 shipped with `*.fix.md` fragments
-# that were ignored because only `*.bugfix.md`/`*.fixed.md` are recognized,
-# leaving the GitHub release body and CHANGELOG.md empty for that version.)
+# that were ignored because only `*.bugfix.md` is recognized, leaving the
+# GitHub release body and CHANGELOG.md empty for that version.)
 #
 # LOCKSTEP: this validation `find` and the collection `find` further down MUST
 # scan the same tree. Both are recursive — no `-maxdepth` on either — so every
@@ -79,7 +142,8 @@ for type in "${TYPES[@]}"; do
 
   if [ ${#fragments[@]} -gt 0 ]; then
     header="${TYPE_HEADERS[$type]}"
-    # Deduplicate headers (e.g. added & feature both map to "Added")
+    # Deduplicate headers (each of the five types maps to a distinct header
+    # today, but this stays defensive against a future TYPE_HEADERS collision)
     if [[ ! " ${seen_headers[*]:-} " =~ " ${header} " ]]; then
       section+="### ${header}"$'\n\n'
       seen_headers+=("$header")
