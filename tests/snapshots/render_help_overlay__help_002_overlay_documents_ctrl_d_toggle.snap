@@ -38,15 +38,15 @@ expression: buf
    │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
    │  ctrl+l             cycle sidebar split stage       l / right / enter   enter directory             │    
    │  ctrl+m / m         show / hide agent badges        h / left / bksp     go up one level             │    
-   │  /                  filter sessions                 space           confirm current directory       │    
-   │  esc                clear filter                    /               filter (case-insensitive)       │    
-   │  r                  rename session                  esc             clear filter (twice = close)    │    
-   │  g                  generate .dot-agent-deck.toml   q               cancel                          │    
-   │  y / n              approve / deny permission                                                       │    
-   │  s                  scheduled tasks manager         session                                         │    
-   │  pageup / pagedown  scroll focused pane                                                             │    
-   │  ?                  toggle this help                panes auto-saved continuously.                  │    
-   │                                                     restored automatically on launch.               │    
+   │  ctrl+e             toggle command-entry lock       space           confirm current directory       │    
+   │  /                  filter sessions                 /               filter (case-insensitive)       │    
+   │  esc                clear filter                    esc             clear filter (twice = close)    │    
+   │  r                  rename session                  q               cancel                          │    
+   │  g                  generate .dot-agent-deck.toml                                                   │    
+   │  y / n              approve / deny permission       session                                         │    
+   │  s                  scheduled tasks manager                                                         │    
+   │  pageup / pagedown  scroll focused pane             panes auto-saved continuously.                  │    
+   │  ?                  toggle this help                restored automatically on launch.               │    
    │  [close]                                                                                            │    
    │  press ? or esc to close                                                                            │    
    └─────────────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -30,15 +30,15 @@ expression: text
         │  Ctrl+w             Close selected pane (confirms)  k / Up          Select previous                 │         
         │  Ctrl+l             Cycle sidebar split stage       l / Right / Enter   Enter directory             │         
         │  Ctrl+m / m         Show / hide agent badges        h / Left / Bksp     Go up one level             │         
-        │  /                  Filter sessions                 Space           Confirm current directory       │         
-        │  Esc                Clear filter                    /               Filter (case-insensitive)       │         
-        │  r                  Rename session                  Esc             Clear filter (twice = close)    │         
-        │  g                  Generate .dot-agent-deck.toml   q               Cancel                          │         
-        │  y / n              Approve / deny permission                                                       │         
-        │  s                  Scheduled Tasks manager         Session                                         │         
-        │  PageUp / PageDown  Scroll focused pane                                                             │         
-        │  F1                 Toggle this help                Panes auto-saved continuously.                  │         
-        │                                                     Restored automatically on launch.               │         
+        │  Ctrl+e             Toggle command-entry lock       Space           Confirm current directory       │         
+        │  /                  Filter sessions                 /               Filter (case-insensitive)       │         
+        │  Esc                Clear filter                    Esc             Clear filter (twice = close)    │         
+        │  r                  Rename session                  q               Cancel                          │         
+        │  g                  Generate .dot-agent-deck.toml                                                   │         
+        │  y / n              Approve / deny permission       Session                                         │         
+        │  s                  Scheduled Tasks manager                                                         │         
+        │  PageUp / PageDown  Scroll focused pane             Panes auto-saved continuously.                  │         
+        │  F1                 Toggle this help                Restored automatically on launch.               │         
         │  [Close]                                                                                            │         
         │  Press ? or Esc to close                                                                            │         
         └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
