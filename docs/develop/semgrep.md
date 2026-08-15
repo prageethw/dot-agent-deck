@@ -12,7 +12,7 @@ The job runs `semgrep scan --config p/rust --config p/github-actions --config p/
 
 This is safe on this repo specifically: `main` has no branch protection and nothing `needs:` the `semgrep` job (verified across all workflow files), so a failing scan colours the board without gating a merge or the direct pushes `release.yml`/`docs-publish.yml` make to `main`. The `upload-sarif` step carries `if: always()`, so findings still reach GitHub code scanning when the scan step exits non-zero.
 
-**A green `semgrep` check before this change meant "the scan ran", not "the scan found nothing".** That distinction is now recorded in CLAUDE.md rule 8 alongside the same failure mode in Greptile, the `e2e:` job, and SonarQube's `SONAR_TOKEN` gate — every automated check in this repo has its own way of being silently empty, and the check's colour alone never proves which one you're looking at.
+**A green `semgrep` check before this change meant "the scan ran", not "the scan found nothing".** That distinction is now recorded in CLAUDE.md rule 8 alongside the same failure mode in the `e2e:` job and SonarQube's `SONAR_TOKEN` gate — every automated check in this repo has its own way of being silently empty, and the check's colour alone never proves which one you're looking at.
 
 ## The four `--exclude-rule` flags
 
