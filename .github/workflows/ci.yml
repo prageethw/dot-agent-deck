@@ -129,7 +129,15 @@ jobs:
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
+      # PRD fork#340 (E1): `fetch-depth: 0`, not the default depth-1 checkout
+      # every other job here uses. `work-type-check` below resolves `git
+      # merge-base HEAD origin/main`, and on a `pull_request` event a depth-1
+      # checkout has no `origin/main` ref at all — `list-tests` never ran in
+      # CI, so this has never mattered before. A full clone is what makes
+      # that ref resolvable.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.1
@@ -225,6 +233,15 @@ jobs:
       # orphaned: linkage-check was failing on main and no gate noticed, because
       # it only ever ran when somebody invoked it by hand.
       - run: cargo xtask linkage-check
+      # PRD fork#340 M3 — R0 only (E2: kept in `build`, which has no path
+      # filter and is skipped only for Renovate's devbox/flake-only PRs,
+      # which are exempt anyway). `--self-test` runs immediately before the
+      # real invocation, mirroring `scripts/check-symlinks.sh --self-test`
+      # (`build-windows` below) — the same binary is shown rejecting a
+      # genuinely violating case seconds before it passes on the real diff,
+      # so a green result here is never the vacuous kind (E3).
+      - run: cargo xtask work-type-check --self-test
+      - run: cargo xtask work-type-check
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been

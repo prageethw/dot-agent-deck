@@ -17,6 +17,12 @@ proc-macro2 = "1"
 regex = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 xtask-docs = { path = "../docs" }
+# PRD fork#340 M3: `work-type-check --self-test` builds a scratch git repo at
+# runtime (production code, not `#[cfg(test)]`) to prove the gate genuinely
+# rejects a violating case — `tempfile` therefore has to be a real dependency
+# here, not only a dev one. Already a workspace dependency at the same "3"
+# version (root `Cargo.toml`), so this pulls no new crate into Cargo.lock.
+tempfile = "3"
 
 # `clean-e2e-tmp` needs two libc calls that have no std equivalent:
 #
@@ -34,6 +40,3 @@ xtask-docs = { path = "../docs" }
 # the harness, and non-Unix targets fall back to the age rule.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
