@@ -1138,8 +1138,8 @@ impl Drop for ConfigGenStateEnvGuard {
 /// no two tests' cwd mutations can interleave regardless of which lock (if
 /// any) they hold; it would not be safe under a same-process test runner.
 /// Any test that wants to observe a specific resolved value from
-/// `features_config_path()` must hold this lock for the duration of its
-/// cwd/env fiddling.
+/// `features_config_path_for_display()` must hold this lock for the duration
+/// of its cwd/env fiddling.
 #[cfg(test)]
 static FEATURES_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1250,36 +1250,22 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
     crate::features::Features { experimental }
 }
 
-/// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
-/// flag. Walks up from the process cwd to the nearest ancestor directory
-/// containing a *regular file* named `crate::project_config::CONFIG_FILE_NAME`
-/// (`candidate.is_file()`, not merely present — a directory or other
-/// non-regular target of that name does not count), so a deck launched
-/// from a subdirectory of the project still finds the project's own config
-/// (fork issue #303) rather than the process's own cwd. When no such
-/// ancestor exists, falls back to the nearest *safe* ancestor's joined path
-/// (see below) — `load_features_file` treats a missing file as
-/// `Features::default()` (OFF). `DOT_AGENT_DECK_FEATURES_CONFIG` is an
-/// explicit override, checked first, so tests never touch the real cwd.
+/// Display-only convenience wrapper over
+/// [`features_config_path_with_diagnostics`] for callers (currently only
+/// tests) that just want *a* path to show, not a trust decision: when the
+/// walk finds nowhere trustworthy at all, that function returns `None` and
+/// this wrapper substitutes `cwd.join(crate::project_config::CONFIG_FILE_NAME)`
+/// purely so there is something non-empty to print. See that function's own
+/// doc for the actual ancestor walk, its `DOT_AGENT_DECK_FEATURES_CONFIG`
+/// override, and its world-writable/indeterminate-ancestor trust rules
+/// (fork issue #309) — this wrapper does not reimplement any of it.
 ///
-/// This is a **display-only** wrapper over
-/// [`features_config_path_with_diagnostics`] for callers (tests, and
-/// `features status`'s path line) that just want *a* path to show, not a
-/// trust decision: when the walk finds nowhere trustworthy at all, that
-/// function returns `None` and this wrapper substitutes `cwd.join(...)`
-/// purely so there is something non-empty to print. `init_and_watch` (the
-/// only caller that actually loads or watches a file) calls the
-/// diagnostics function directly and does **not** go through this wrapper,
-/// so it correctly does nothing on `None` rather than reading or polling
-/// the substituted path.
-///
-/// An ancestor directory that is world-writable — or whose safety could not
-/// be determined at all — is declined rather than trusted (fork issue
-/// #309): the walk is otherwise unbounded, so a deck launched anywhere
-/// under a shared directory like `/tmp` would adopt a config another user
-/// planted there. The search continues to the next ancestor up rather than
-/// aborting, with a warning naming the declined path.
-pub fn features_config_path() -> PathBuf {
+/// Neither real caller goes through this wrapper: `init_and_watch` (the
+/// only caller that actually loads or watches a file) and `features
+/// status` (fork issue #303) both call
+/// [`features_config_path_with_diagnostics`] directly, so neither one risks
+/// reading or polling the substituted display path.
+pub fn features_config_path_for_display() -> PathBuf {
     let (path, _) = features_config_path_with_diagnostics();
     path.unwrap_or_else(|| {
         std::env::current_dir()
@@ -1288,7 +1274,7 @@ pub fn features_config_path() -> PathBuf {
     })
 }
 
-/// [`features_config_path`]'s real logic, returning one diagnostic message
+/// [`features_config_path_for_display`]'s real logic, returning one diagnostic message
 /// per declined ancestor whose candidate file actually existed there —
 /// nothing is emitted for an ancestor that was merely untrusted but held no
 /// config (reviewer minor 1: warning on every `/tmp`-launched deck when
@@ -1304,7 +1290,7 @@ pub fn features_config_path() -> PathBuf {
 /// so there is no path left to hand back that is not itself a live
 /// instance of the thing this function exists to reject. Callers that load
 /// or watch a file (`init_and_watch`) must treat `None` as "install the
-/// default and start no watcher"; only [`features_config_path`]'s
+/// default and start no watcher"; only [`features_config_path_for_display`]'s
 /// display-only wrapper substitutes a path for it, and only for printing.
 ///
 /// The walk classifies each ancestor with [`classify_dir_safety`], which
@@ -1427,7 +1413,12 @@ where
 ///   writability could not be determined is not a place the resolver has
 ///   any basis to trust, so it must not become the directory the watcher
 ///   polls for the rest of the process's life (auditor M-1r, scenario B).
+// `WorldWritable` and `Unknown` are only constructed on Unix (see
+// `classify_dir_safety` below); the non-Unix arm always returns `Safe`, so
+// `-D dead-code` flags both variants there. Remove this once #383 lands a
+// Windows ACL check that can construct them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum DirSafety {
     /// Confirmed not world-writable. May supply a candidate or serve as a
     /// fallback.
@@ -2968,12 +2959,12 @@ label = "-rf"
         std::fs::create_dir_all(&nested_cwd).unwrap();
 
         std::env::set_current_dir(&nested_cwd).expect("chdir into nested fixture dir");
-        let resolved = features_config_path();
+        let resolved = features_config_path_for_display();
 
         assert_eq!(
             resolved,
             project_config,
-            "features_config_path() must resolve to the project directory's \
+            "features_config_path_for_display() must resolve to the project directory's \
              .dot-agent-deck.toml ({}) even when the process cwd is nested \
              elsewhere under the project ({}); got {}",
             project_config.display(),
@@ -3009,7 +3000,7 @@ label = "-rf"
                 override_target.to_str().unwrap(),
             );
         }
-        let resolved_with_override = features_config_path();
+        let resolved_with_override = features_config_path_for_display();
         assert_eq!(
             resolved_with_override, override_target,
             "DOT_AGENT_DECK_FEATURES_CONFIG must still win over the \

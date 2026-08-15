@@ -223,10 +223,19 @@ pub fn init_and_watch() -> Vec<String> {
                 "experimental flag: {} (no trustworthy features-config location)",
                 if resolved.experimental { "ON" } else { "OFF" }
             );
+            // Deliberately NOT the literal "experimental flags default to
+            // OFF" tail `missing_config_warning`'s declined_any == false
+            // branch ends with (pinned verbatim by
+            // `startup_warning_001`/`002`/`003`): this branch is otherwise
+            // unreachable from those tests (`path` is always `Some` in
+            // their fixtures), but a shared tail would let a future
+            // regression that misroutes into this branch instead still
+            // satisfy `startup_warning_002`/`003`'s `!contains(...)` check
+            // by accident, silently losing their independent second net.
             let message = "no ancestor directory could be trusted as a \
                  features-config location — every candidate was either \
                  world-writable or its safety could not be determined; \
-                 experimental flags default to OFF (unless overridden by \
+                 experimental features stay disabled (unless overridden by \
                  DOT_AGENT_DECK_EXPERIMENTAL) and no config watcher was \
                  started for this run (fork issue #309)"
                 .to_string();

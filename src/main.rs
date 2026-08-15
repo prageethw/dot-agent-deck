@@ -1072,8 +1072,9 @@ fn main() -> ExitCode {
                             if declined.is_empty() {
                                 format!("default (no {CONFIG_FILE_NAME} found)")
                             } else {
-                                "default (all candidate .dot-agent-deck.toml files were declined)"
-                                    .to_string()
+                                format!(
+                                    "default (all candidate {CONFIG_FILE_NAME} files were declined)"
+                                )
                             }
                         }
                         FeaturesFileOutcome::NotRegular => {
