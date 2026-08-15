@@ -735,6 +735,12 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
         deck.snapshot_grid()
     );
 
+    // Back into PaneInput: the persistent chip is drawn only in that mode
+    // (`lock_context_for_tab` is scoped to `UiMode::PaneInput`, per src/ui.rs)
+    // — `wait_for_chip_tail`'s " TYPING " anchor cannot appear while still in
+    // command mode.
+    deck.send_bytes(b"\x04");
+
     let unlocked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
     assert!(
         unlocked_tail
