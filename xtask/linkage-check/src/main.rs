@@ -81,6 +81,11 @@
 //!   `origin/main`, plus per-catalog-entry prose diffs and any
 //!   `m2.allowlist` changes. The orchestrator surfaces this to the
 //!   user before delegating release.
+//! - `work-type-check` — PRD fork#340 M3 R0: derives this diff's work type
+//!   (`bug | prd | doc | chore`) from the added `changelog.d` fragment
+//!   suffix, else the branch's work-type prefix, and fails if neither
+//!   supplies one or the two disagree. `--self-test` proves the gate can
+//!   actually reject a violating case. See [`work_type`].
 //!
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
@@ -125,9 +130,6 @@ mod sidecar_staging;
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
 mod verify_pr_stream;
-// PRD fork#340 M3, RED round (tester): signatures only, every body
-// `todo!()`. Not wired into the subcommand multiplexer below — that is the
-// coder delegation that follows this one.
 mod work_type;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -639,6 +641,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
         return clean_tmp::run(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("work-type-check")) {
+        return work_type::run(&args[1..]);
     }
 
     let root = repo_root();
