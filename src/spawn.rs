@@ -2690,7 +2690,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Type an unsent user draft after a detached automatic prompt has been delivered and confirmation is retrying with submit-only probes. The next automatic attempt must send no bytes, so it does not submit the user's draft.
+    /// Scenario: Deliver a detached automatic prompt with an explicit attempt-1 write (standing in for the real caller), then type an unsent user draft while confirmation is retrying with submit-only probes. The next automatic attempt must send no bytes, so it does not submit the user's draft.
     #[spec("scheduler/dispatch/018")]
     #[tokio::test]
     async fn dispatch_018_user_input_disarms_detached_submit_probe() {
@@ -2717,6 +2717,38 @@ mod tests {
 
         let registry = Arc::new(AgentPtyRegistry::new());
         let agent_id = spawn_byte_target(&registry, PANE_ID);
+
+        // Attempt 1 is the CALLER's write in production (`deliver`, ~src/spawn.rs
+        // :1006-1007, `log_prompt_written(..., 1)`), performed and logged before
+        // `confirm_prompt_delivery` is ever spawned. The loop's own attempt
+        // counter starts its first write at attempt 2
+        // (`attempt.saturating_add(1)` at ~src/spawn.rs:1484 runs before that
+        // write), so it never again writes a non-empty payload while
+        // `MAX_PAYLOAD_SUBMISSIONS == 1` — every write the loop below makes is a
+        // probe. Do not remove this explicit write as redundant with the loop:
+        // without a real attempt-1 write standing in for the caller, `PROMPT`
+        // never physically reaches the pane and the precondition below panics.
+        let initial = registry
+            .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+            .await
+            .expect("attempt 1 guarded delivery");
+        assert_eq!(
+            initial,
+            GuardedSend::Applied,
+            "attempt 1 must never be refused before an automatic write timestamp exists"
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let after_attempt_one = registry
+            .snapshot(&agent_id)
+            .expect("attempt 1 delivery snapshot");
+        assert!(
+            after_attempt_one
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "precondition: attempt 1 must physically reach the detached pane before the user types; output={:?}",
+            String::from_utf8_lossy(&after_attempt_one)
+        );
+
         let (event_tx, event_rx) = broadcast::channel(8);
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
@@ -2733,16 +2765,6 @@ mod tests {
         ));
 
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let before_user_input = registry
-            .snapshot(&agent_id)
-            .expect("replacement payload snapshot");
-        assert!(
-            before_user_input
-                .windows(PROMPT.len())
-                .any(|window| window == PROMPT.as_bytes()),
-            "precondition: attempt 2 must have reached the byte target before the user types"
-        );
-
         type_user_draft(&registry, &agent_id, PANE_ID, USER_DRAFT).await;
         let before_probe = registry
             .snapshot(&agent_id)
