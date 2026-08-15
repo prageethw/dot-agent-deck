@@ -2156,6 +2156,21 @@ struct UiState {
     /// is likewise driven by a single global chord (`Ctrl+t`). Not
     /// persisted: every deck starts at `Default` on launch.
     split_stage: SplitStage,
+    /// Fork #339: whether session cards show the agent-type badge (the
+    /// `ClaudeCode` / `OpenCode` / `Codex` / `Pi` segment restoring
+    /// `370b6228`'s removal), toggled deck-global by `Ctrl+m` / a bare `m`
+    /// from command mode. Describes how someone is reading the deck right
+    /// now, not which tab they happened to open — same shape as
+    /// [`Self::split_stage`] and [`Self::pane_layout`] above. Not
+    /// persisted: every deck starts with the badge hidden.
+    ///
+    /// Fork #339 M6 RED skeleton: this field, its dispatch no-op arm, and the
+    /// `render_card_for_mode_to_buffer` parameter it will eventually feed all
+    /// land in this compile-only commit ahead of the M1-M5 delegation that
+    /// wires resolution, scoping, and the render conditional — the same
+    /// foundation-before-render-side shape as `Self::button_rects`.
+    #[allow(dead_code)]
+    show_agent_type_badge: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -2491,6 +2506,7 @@ impl UiState {
             pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             split_stage: SplitStage::Default,
+            show_agent_type_badge: false,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             warned_orchestration_surface_configs: HashSet::new(),
@@ -5461,6 +5477,9 @@ pub enum Action {
     /// focused Dashboard pane forwards Ctrl+L to its PTY instead). No effect
     /// on a Mode tab.
     CycleSplitStage,
+    /// Fork #339: toggle the deck-global agent-type badge on session cards
+    /// (`Ctrl+m` / a bare `m`, command mode only). Off by default.
+    ToggleAgentTypeBadge,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -9311,6 +9330,10 @@ fn dispatch_action(
                     Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
             }
         }
+        // Fork #339 M6 RED skeleton: the dispatcher's match is exhaustive, so
+        // the enum variant needs an arm to compile — this no-op stands in
+        // until the M3 delegation wires the actual flip + status message.
+        Action::ToggleAgentTypeBadge => {}
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
         //
@@ -19873,6 +19896,7 @@ pub fn render_card_to_buffer(
         UiMode::Normal,
         width,
         height,
+        false,
     )
 }
 
@@ -19896,6 +19920,12 @@ pub fn render_card_for_mode_to_buffer(
     mode: UiMode,
     width: u16,
     height: u16,
+    // fork#339 M6 RED skeleton: accepted but not yet threaded into
+    // `render_session_card` — that wiring is M4's, not this compile-only
+    // scaffold's. Underscored so the four RED tests fail on assertions
+    // (the toggle currently has no rendering effect), never on an
+    // unused-variable warning under `-D warnings`.
+    _show_agent_type_badge: bool,
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -36428,6 +36458,90 @@ mod tests {
         assert!(
             ui.command_entry_locked,
             "the second Ctrl+e toggle should RE-LOCK the deck-global lock"
+        );
+    }
+
+    /// Scenario: Dispatch `Action::ToggleAgentTypeBadge` twice against a fresh
+    /// `UiState` and confirm `ui.show_agent_type_badge` cycles
+    /// hidden -> shown -> hidden, with `ui.status_message` reporting each
+    /// transition. Also confirm `handle_normal_key` resolves a bare `m` to
+    /// the toggle action, and that the alias does not displace `Enter`'s
+    /// existing `Action::Focus` resolution (via `KbAction::FocusPane`).
+    #[spec("dashboard/agent-badge/002")]
+    #[test]
+    fn agent_badge_002_toggle_cycles_hidden_shown_hidden() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        assert!(
+            !ui.show_agent_type_badge,
+            "a fresh UiState must start with the agent-type badge hidden"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleAgentTypeBadge,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.show_agent_type_badge,
+            "the first toggle should SHOW the agent-type badge"
+        );
+        assert_eq!(
+            ui.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Agent badge: shown"),
+            "the first toggle must report the shown status message"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleAgentTypeBadge,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            !ui.show_agent_type_badge,
+            "the second toggle should HIDE the agent-type badge"
+        );
+        assert_eq!(
+            ui.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Agent badge: hidden"),
+            "the second toggle must report the hidden status message"
+        );
+
+        let kb = KeybindingConfig::default();
+        let bare_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(
+            matches!(
+                handle_normal_key(bare_m, &mut ui, 0, None, &kb),
+                Action::ToggleAgentTypeBadge
+            ),
+            "a bare `m` in command mode must resolve to the agent-badge toggle"
+        );
+
+        // The alias must not displace FocusPane's existing Enter resolution.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(
+                handle_normal_key(enter, &mut ui, 1, None, &kb),
+                Action::Focus
+            ),
+            "Enter must still resolve to Action::Focus after adding the `m` alias"
         );
     }
 

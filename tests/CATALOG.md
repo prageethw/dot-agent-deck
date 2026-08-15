@@ -411,6 +411,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/dashboard/001`); cross-tab or cross-tab-type scoping (covered by `tabs/dashboard/001`); Orchestration-tab geometry (covered by `orchestration/layout/002`).
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/agent-badge
+
+##### dashboard/agent-badge/001 — A session card shows the agent-type badge only when the deck-global toggle is on (fork #339 — restores `370b6228`'s removal behind an off-by-default toggle).
+- **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
+- **Agent:** none (a live Codex fixture rendered through `render_card_for_mode_to_buffer`, plus named ClaudeCode / OpenCode / Pi / Codex fixtures).
+- **Asserts:** with the toggle off, no card shows its agent-type label and no cell carries that agent's registry `badge_color`; with the toggle on, the card shows `<Label> · <name>` and a cell carries `badge_color` **and** `Modifier::BOLD`, repeated across all four shipped agent types. Also pins D4: a placeholder (`AgentType::None`) card shows `No agent` exactly once (its unrelated status text) even with the toggle on, never a second occurrence from a restored identity segment.
+- **Does not assert:** the toggle's keybinding resolution (`keybindings/safety/005`); the deck-global state transition itself (`dashboard/agent-badge/002`); the real binary's default-hidden render path (`dashboard/agent-badge/003`); no hints-bar test (the bar already omits `Ctrl+L`/`Ctrl+E`); no button-bar test (D7 — the feature has no button).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/002 — `Action::ToggleAgentTypeBadge` cycles the deck-global toggle hidden -> shown -> hidden, and a bare `m` resolves to the same action without displacing `Enter`'s `Focus` resolution.
+- **Layer:** L1 (in-process `dispatch_action` / `handle_normal_key`, in-crate — `handle_normal_key` is private).
+- **Agent:** none.
+- **Asserts:** a fresh `UiState` starts with the badge hidden; dispatching the toggle once shows it and sets `ui.status_message` to `"Agent badge: shown"`; dispatching again hides it and sets `"Agent badge: hidden"`; `handle_normal_key` resolves a bare `m` (no modifiers) to `Action::ToggleAgentTypeBadge`; `handle_normal_key` still resolves `Enter` to `Action::Focus`.
+- **Does not assert:** the rendered card difference (`dashboard/agent-badge/001`); the real binary's key dispatch (`dashboard/agent-badge/003`); no `keybindings/help/002` (covered free by `keybindings/help/001`'s remapped-config snapshot re-accept).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/003 — Pressing `m` toggles the agent-type badge on every card through the real binary, proving both the deck-global reach and the bare-`m` alias as the door that works everywhere.
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (synthetic Claude Code + Codex `SessionStart` hooks).
+- **Asserts:** both cards' agent-type labels are absent at rest (default hidden — the only coverage of default-hidden through the real `render_frame`, which no L1 seam reaches); pressing `m` shows `"Agent badge: shown"` in the status bar and both labels appear; pressing `m` again shows `"Agent badge: hidden"` and both labels disappear. Presses only `m`, never `\x0d` — under a legacy PTY `Ctrl+M` decodes as Enter and `FocusPane` wins first (by design).
+- **Does not assert:** the enhanced-terminal `Ctrl+M` chord path (covered by `keybindings/safety/005`'s key-mapper assertion — no PTY harness here emulates the kitty keyboard protocol); real-agent execution.
+- **Platform coverage:** mac+linux.
+
 ### Statuses
 
 #### status/transition
@@ -2632,6 +2655,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
 - **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/safety/005 — `Ctrl+M` resolves to the agent-badge toggle only in command mode; PaneInput always forwards it as the CR submit byte, never the toggle (fork #339 — the highest-severity guard in the change).
+- **Layer:** L1 (in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** `Normal` + `Ctrl+M` resolves to `Action::ToggleAgentTypeBadge`; `PaneInput` + `Ctrl+M` forwards the exact byte `0x0d` to the PTY and is never claimed as the toggle; `Filter` + `Ctrl+M` resolves to nothing; `PaneInput` + a bare `m` forwards `b'm'` as plain input; `Normal` + `Enter` is never claimed by the global command layer.
+- **Does not assert:** the bare-`m` alias in command mode (`dashboard/agent-badge/002`); the real PTY's decoding of `Ctrl+M` as `Enter` under a legacy terminal (`dashboard/agent-badge/003` presses `m`, never `\x0d`, for exactly this reason).
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/unbind

@@ -16,8 +16,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::keybindings::{Action as KbAction, KeybindingConfig, parse_binding};
 use dot_agent_deck::ui::{
-    Action as UiAction, UiMode, key_action_for_mode, render_button_bar_for_mode_to_buffer,
-    render_button_bar_with_bindings_to_buffer, render_help_overlay_with_bindings_to_buffer,
+    Action as UiAction, UiMode, global_action, key_action_for_mode,
+    render_button_bar_for_mode_to_buffer, render_button_bar_with_bindings_to_buffer,
+    render_help_overlay_with_bindings_to_buffer,
 };
 use ratatui::style::Modifier;
 use spec::spec;
@@ -216,6 +217,60 @@ fn safety_003_ctrl_w_is_forwarded_only_in_pane_input() {
             Some(UiAction::CloseSelected)
         ),
         "command-mode Ctrl+W must still resolve the close request"
+    );
+}
+
+/// Scenario: Resolve Ctrl+M through the production key mapper in three modes plus PaneInput's bare `m`. Normal mode must claim it as the agent-badge toggle, PaneInput must forward it to the PTY as the CR submit byte `0x0d` (never claim it as the toggle), Filter must claim neither, and a bare `m` in PaneInput must forward as plain input — proving the toggle can never steal a pane's submit byte.
+#[spec("keybindings/safety/005")]
+#[test]
+fn safety_005_ctrl_m_is_command_mode_only() {
+    let config = KeybindingConfig::default();
+    let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+
+    assert!(
+        matches!(
+            key_action_for_mode(&config, UiMode::Normal, &ctrl_m),
+            Some(UiAction::ToggleAgentTypeBadge)
+        ),
+        "command-mode Ctrl+M must resolve to the agent-badge toggle"
+    );
+
+    // Highest-severity guard in the whole change: if the mode scoping is
+    // ever dropped or inverted, every user on a kitty-capable terminal
+    // silently loses the ability to submit to their agent. Written so it
+    // cannot pass vacuously — it demands the exact CR byte, not merely
+    // "not the toggle".
+    match key_action_for_mode(&config, UiMode::PaneInput, &ctrl_m) {
+        Some(UiAction::ForwardToPane(bytes)) => assert_eq!(
+            bytes,
+            vec![0x0d],
+            "PaneInput Ctrl+M must reach the PTY as the CR submit byte, never \
+             be claimed as the agent-badge toggle"
+        ),
+        other => {
+            panic!("PaneInput Ctrl+M must fall through to PTY forwarding as 0x0d, got {other:?}")
+        }
+    }
+
+    assert!(
+        key_action_for_mode(&config, UiMode::Filter, &ctrl_m).is_none(),
+        "Filter mode must claim neither the toggle nor anything else for Ctrl+M"
+    );
+
+    let bare_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+    match key_action_for_mode(&config, UiMode::PaneInput, &bare_m) {
+        Some(UiAction::ForwardToPane(bytes)) => assert_eq!(
+            bytes,
+            vec![b'm'],
+            "PaneInput bare `m` must reach the PTY as plain typed input"
+        ),
+        other => panic!("PaneInput bare `m` must fall through to PTY forwarding, got {other:?}"),
+    }
+
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        global_action(&config, &enter).is_none(),
+        "Enter must never be claimed by the global command layer"
     );
 }
 
