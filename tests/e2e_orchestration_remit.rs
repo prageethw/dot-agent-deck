@@ -46,7 +46,20 @@ const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 /// pointer) and — only if the test writes the corresponding control file
 /// into the workdir — later declares history-only and then live again;
 /// meanwhile the FOREGROUND script body reads and logs every line delivered
-/// to its real stdin, however many arrive, to `orchestrator-prompt.log`.
+/// to its real stdin, however many arrive, to `orchestrator-prompt.log`, and
+/// — issue #424 — reports each one back over the hook socket as a
+/// `user_prompt`-carrying `thinking` event, the only evidence
+/// `prompt_submission_evidence` (`src/ui.rs`) accepts as CONFIRMATION that a
+/// written prompt was actually submitted rather than merely landed on the
+/// PTY. Without that confirmation every delivery against this fixture — the
+/// spawn-time seed included — is stuck permanently PROVISIONAL, so
+/// `MAX_PAYLOAD_SUBMISSIONS` (`src/prompt_delivery.rs`) fires its one
+/// automatic replacement write ~500ms later regardless of whether a real
+/// re-assertion was ever requested; `orchestration/remit/002` and `_003`
+/// pin behaviour that only starts once that spurious second write stops
+/// happening. Confirming does not touch the log: only the `read` loop's own
+/// `printf` line appends to `orchestrator-prompt.log`, so the tests' log
+/// substring counts still measure exactly what was delivered to the pane.
 ///
 /// The background/foreground split is load-bearing, not stylistic: a
 /// non-interactive POSIX shell reassigns an ASYNCHRONOUS (`&`) job's stdin to
@@ -58,11 +71,11 @@ const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 /// instead of the feature under test (caught reading PR #177's first CI run:
 /// all three tests failed at the identical precondition line with the
 /// pointer plainly visible in the failure's `Final grid` dump). The
-/// `emit_target` subshell below never reads stdin, so backgrounding IT is
-/// unaffected; the `read` loop stays in the foreground, so it keeps the
-/// real PTY stdin. Mirrors the `emit_target` helper
-/// `tests/e2e_pane_send_result.rs::pane_input_007` uses for the identical
-/// raw hook-socket `session_start` technique.
+/// `emit_target` and `confirm_submission` subshells below never read stdin,
+/// so backgrounding or forking them is unaffected; the `read` loop stays in
+/// the foreground, so it keeps the real PTY stdin. Mirrors the `emit_target`
+/// helper `tests/e2e_pane_send_result.rs::pane_input_007` uses for the
+/// identical raw hook-socket `session_start` technique.
 const ORCHESTRATOR_REMIT_SCRIPT: &str = r#"#!/bin/sh
 emit_target() {
     WRITABLE="$1" python3 - <<'PY'
@@ -91,6 +104,30 @@ s.close()
 PY
 }
 
+confirm_submission() {
+    SUBMITTED="$1" python3 - <<'PY'
+import datetime
+import json
+import os
+import socket
+
+pane = os.environ["DOT_AGENT_DECK_PANE_ID"]
+payload = {
+    "session_id": "remit-reassert-boot-session",
+    "agent_type": "codex",
+    "event_type": "thinking",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "pane_id": pane,
+    "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    "user_prompt": os.environ["SUBMITTED"],
+}
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["DOT_AGENT_DECK_SOCKET"])
+s.sendall((json.dumps(payload) + "\n").encode())
+s.close()
+PY
+}
+
 (
     emit_target live
     touch initial-live-emitted
@@ -104,7 +141,10 @@ PY
     touch relive-emitted
 ) &
 
-while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; done
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> orchestrator-prompt.log
+    confirm_submission "$line"
+done
 "#;
 
 #[cfg(unix)]
@@ -357,12 +397,19 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
         "the fixture script never emitted its history-only session_start within 5s"
     );
 
+    // Reuse the fixture's own boot session id here, unlike `_001`/`_002`'s
+    // synthetic per-call ids: a real `Compacting` hook carries the agent's
+    // own session id (its `PreCompact` originates from that agent's own
+    // process), so a differing synthetic id models an event shape that does
+    // not occur in production. `_003` is the only test in this file whose
+    // flow (history-only -> live-again) makes the resulting id-overwrite
+    // observable, which is why only this call needs the boot id.
     inject_compacting(
         &deck,
         &socket,
         &pane_id,
         &agent_id,
-        &format!("{agent_id}-remit003-session"),
+        "remit-reassert-boot-session",
     );
 
     let wrote_blindly =
