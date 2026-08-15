@@ -2282,6 +2282,7 @@ async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
         &worktrees,
         &dot_agent_deck::scheduler::StderrNotifier,
         None,
+        None,
     )
     .await;
 
