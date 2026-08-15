@@ -167,7 +167,7 @@ Reproduce the spawn decision table above in `docs/orchestration.md` so users can
 
 - [ ] **M4.1** — L2 e2e across two project directories: an `info` dispatch returns an answer and wakes the originator; a `work` dispatch produces a worktree result and wakes the originator; a not-found dispatch escalates to the human and releases the originator. L1/behavior coverage for resolution and the decision table.
 - [ ] **M4.2** — User docs: cross-project dispatch section in `docs/orchestration.md` (command, `info|work`, peer-map config, decision table, escalation); correct the stale concurrent-orchestration warning; changelog fragment via `dot-ai-changelog-fragment`.
-- [ ] **M4.3** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
+- [ ] **M4.3** — Pre-PR gate: `cargo test-e2e` green; review (delegated `reviewer` + `auditor` pass) settled per CLAUDE.md rule 8.
 
 ## Risks & Mitigations
 
