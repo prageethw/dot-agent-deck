@@ -13,7 +13,7 @@ Before this PRD the repo had five surfaces carrying work-type vocabulary, three 
 | `doc` | `.doc.md` | *none — see "documentation is an area label" below* | no | `docs/` | `docs:` |
 | `chore` | `.misc.md` | `chore` | no | `chore/` | `chore:`/`ci:`/`test:`/`refactor:` |
 
-Every branch and commit prefix in this table is already in use on this repo — nothing here is invented. The `chore` GitHub label does not exist yet; creating it is optional follow-up work (M5) and is decoupled from the rest of this vocabulary, since nothing here reads GitHub labels to enforce anything.
+Every branch and commit prefix in this table is already in use on this repo — nothing here is invented. The `chore` GitHub label is ensured by `ensure_labels` (`src/issue_dispatch_run.rs`) on every issue-dispatch run, the same way the triage labels are — but that is decoupled from the rest of this vocabulary, since nothing here reads GitHub labels to enforce anything.
 
 ## Why `chore` aliases onto `.misc.md` instead of getting its own changelog suffix
 
@@ -37,6 +37,8 @@ So `chore` deliberately aliases onto the existing `.misc.md` suffix, rather than
 
 **`pyproject.toml` declares a changelog filename and issue format it never uses.** `pyproject.toml` declares `filename = "docs/CHANGELOG.md"` and a `vfarcic` `issue_format`, but towncrier itself is never invoked — `scripts/assemble-changelog.sh` is. This is harmless. Note it; do not "fix" it.
 
+**The branch-prefix exemption list is advisory, not a security boundary.** `renovate/`, `sync/` and `upstream/` branches skip `work-type-check` outright, matched on the branch *name* alone — and any PR author can rename their branch to one of those prefixes to skip the gate. The unforgeable signal would be the PR *author* (`ci.yml`'s `changes` job already reads exactly that for Renovate), which this gate deliberately does not: re-plumbing it to read the CI event payload would couple the binary to CI env and break the local-invocation property this doc's own examples rely on. Treat the exemption as a name a well-behaved contributor honors, not a barrier a hostile one cannot cross — a PR still needs an approving human review to merge either way.
+
 ## Where the authoritative type list lives
 
-The list of changelog-fragment suffixes is not restated here a fifth time. `pyproject.toml`'s `[[tool.towncrier.type]]` entries are the source of truth — `scripts/assemble-changelog.sh` reads from it — so consult that file directly rather than trusting a copy of the list in this doc, which could drift the same way the pre-fork#340 surfaces did.
+This page maps the vocabulary onto suffixes; `pyproject.toml`'s `[[tool.towncrier.type]]` entries remain the authoritative list, and `scripts/assemble-changelog.sh` now hard-fails if the two sets diverge — so if this table and that file ever disagree, that file wins and the script will say so.
