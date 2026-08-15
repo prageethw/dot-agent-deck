@@ -571,6 +571,15 @@
   Every one of the twenty-one was confirmed to fail against a deliberately broken collector before being accepted as passing, across nineteen injected single-line defects. They run in the fast tier (`cargo test-fast`), adding about a fifth of a second.
   Added `python314Packages.pyte` to `devbox.json` so a PTY capture can be replayed into a final screen locally. Rule 12's cross-version manual test asks what an *older TUI* does with a newer daemon's output, and that question is only answerable by reading the screen — but a raw `script` capture of a ratatui app is a diff-based stream of cursor moves, so stripping escape sequences from it recovers nothing, and naively tailing it recovers the last repainted region rather than the frame. Verifying #548's reverse direction needed the actual frame, which is how the daemon-synthesized delivery notice was confirmed to land on the correct pane's card as `● Error` on a v0.36.0 client that has no `apply_daemon_report_event` to guard it. `pyte` is a pure-Python VT100 emulator, so the replay is ten lines and needs no terminal. Developer tooling only — nothing links it into the shipped binary, and the automated tiers are unaffected.
 
+## [0.38.1] - 2026-08-15
+
+### Fixed
+
+  - **Orchestrator remit re-assertion after compaction works again**
+    The v0.38.0 upstream sync silently broke the mechanism that re-delivers an orchestrator's remit pointer when its pane compacts (issue 423). A hand-resolved rebase conflict replaced the re-arm eligibility check with a bare `orchestrator_prompt.is_none()`, which reads as "no delivery in flight" under the fork's old model but not under the confirmation model the same sync introduced: there, `orchestrator_prompt` stays set until the agent independently reports having submitted the text, so for any producer that does not report back, the re-arm block was permanently unreachable. The check now expresses the original intent against the new model's own `PromptDelivery::attempts` witness, and the per-cycle delivery state (`prompt_delivery`, `send_retry_backoff`, `orchestration_ready_since`) is cleared on re-arm again, so a re-armed cycle retypes the pointer instead of inheriting a stale attempt count and falling back to a submit-only probe. Upstream's confirmation model is untouched.
+    This was caught by the fork's own `e2e_orchestration_remit` tests, which is what they exist for — the tier reported it while the release went out anyway, because the e2e job runs with `continue-on-error: true` and its workflow-level conclusion cannot express failure. CLAUDE.md rule 8 now records that trap and the command that reads the real result.
+
+
 ## [0.38.0] - 2026-08-15
 
 ### Changed
