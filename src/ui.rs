@@ -3957,10 +3957,11 @@ fn process_pending_seed_prompts(
             // rides its own wire id, or the daemon's ledger would replay the
             // first `Applied` and this retry would never reach the PTY at all.
             let attempt = delivery.attempts.saturating_add(1);
-            // Issue #424 D5: after the one bounded replacement payload, later
-            // attempts probe SUBMISSION rather than typing the seed in again —
-            // same identity guards, same terminal-outcome classification, empty
-            // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
+            // Issue #424 D5 / fork #194: only the FIRST attempt writes the
+            // payload — every attempt after that probes SUBMISSION rather than
+            // typing the seed in again — same identity guards, same
+            // terminal-outcome classification, empty payload. See
+            // [`crate::prompt_delivery::attempt_writes_payload`].
             let writes_payload = attempt_writes_payload(attempt);
             let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
@@ -5020,9 +5021,9 @@ fn deliver_orchestrator_prompt(
         }
         None => (None, 0),
     };
-    // Issue #424 D5: after the one bounded replacement payload, later attempts
-    // probe SUBMISSION rather than typing the role prompt in again. See
-    // [`crate::prompt_delivery::attempt_writes_payload`].
+    // Issue #424 D5 / fork #194: only the FIRST attempt writes the payload —
+    // every attempt after that probes SUBMISSION rather than typing the role
+    // prompt in again. See [`crate::prompt_delivery::attempt_writes_payload`].
     let writes_payload = attempt_writes_payload(attempt);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a
@@ -35584,74 +35585,31 @@ mod tests {
         }
     }
 
-    /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
+    /// Scenario: Let a TUI seed reach its reporting pane, then type an unsent user draft after the automatic-write timestamp exists but before the next submit-only probe is due. The next automatic attempt must send no bytes, so it does not submit the user's draft.
     #[cfg(unix)]
     #[spec("prompt/pane-input/032")]
     #[test]
     fn pane_input_032_user_input_disarms_submit_only_probe() {
+        // Retired here: a "replacement" pane sub-scenario used to precede this
+        // one, typing an unsent draft between attempt 1 and attempt 2 and
+        // asserting attempt 2 appended no replacement payload. It exercised
+        // `write_guarded`'s non-empty-payload branch
+        // (`registry.user_typed_since_writing_payload`) on attempt 2 — the one
+        // bounded replacement payload. Fork #194 set
+        // `MAX_PAYLOAD_SUBMISSIONS = 1` (`src/prompt_delivery.rs`), so
+        // `attempt_writes_payload(2)` is now `false` and attempt 2 takes the
+        // empty-payload probe branch instead (`user_typed_since_automatic_write`)
+        // — the exact branch the retained scenario below already exercises at
+        // attempt 3. Unlike `scheduler/dispatch/018`'s retired half, this one
+        // was not vacuous (it still failed if the probe guard broke); it was a
+        // duplicate of the retained scenario, so it is removed rather than kept
+        // for appearances. Recovering a launcher that genuinely consumes
+        // attempt 1 — what would make the replacement-payload branch reachable
+        // again and give the two scenarios distinct meanings — is deferred to
+        // fork issue #343.
         const PANE_ID: &str = "user-draft-safety-pane";
         const PROMPT: &str = "automatic prompt before the user's draft";
         const USER_DRAFT: &str = "user draft deliberately left unsent";
-
-        const REPLACEMENT_PANE_ID: &str = "user-draft-before-replacement-pane";
-        const REPLACEMENT_PROMPT: &str = "automatic prompt before replacement guard";
-        const REPLACEMENT_DRAFT: &str = "draft before replacement payload";
-
-        let replacement_controller =
-            Arc::new(RegistryBackedPaneController::new(REPLACEMENT_PANE_ID));
-        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
-        let mut replacement_ui = default_ui();
-        replacement_ui
-            .pending_seed_prompts
-            .push(ready_seed_prompt(REPLACEMENT_PANE_ID, REPLACEMENT_PROMPT));
-        let replacement_snapshot =
-            ready_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
-
-        process_pending_seed_prompts(
-            &mut replacement_ui,
-            &replacement_pane,
-            &replacement_snapshot,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(75));
-        let after_initial_delivery = replacement_controller.snapshot();
-        assert!(
-            after_initial_delivery
-                .windows(REPLACEMENT_PROMPT.len())
-                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
-            "precondition: attempt 1 must reach the TUI pane before any automatic-write timestamp exists; output={:?}",
-            String::from_utf8_lossy(&after_initial_delivery)
-        );
-
-        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT);
-        let before_replacement = replacement_controller.snapshot();
-        assert!(
-            before_replacement
-                .windows(REPLACEMENT_DRAFT.len())
-                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
-            "precondition: the unsent user draft must physically reach the TUI PTY; output={:?}",
-            String::from_utf8_lossy(&before_replacement)
-        );
-        replacement_ui
-            .send_retry_backoff
-            .get_mut(REPLACEMENT_PANE_ID)
-            .expect("first write arms replacement payload")
-            .next_attempt_at = std::time::Instant::now();
-        process_pending_seed_prompts(
-            &mut replacement_ui,
-            &replacement_pane,
-            &replacement_snapshot,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(75));
-        let after_replacement = replacement_controller.snapshot();
-
-        replacement_controller.registry.shutdown_all();
-        assert_eq!(
-            after_replacement,
-            before_replacement,
-            "TUI attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
-            String::from_utf8_lossy(&before_replacement),
-            String::from_utf8_lossy(&after_replacement)
-        );
 
         let controller = Arc::new(RegistryBackedPaneController::new(PANE_ID));
         let pane: Arc<dyn PaneController> = controller.clone();
@@ -35663,7 +35621,7 @@ mod tests {
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         ui.send_retry_backoff
             .get_mut(PANE_ID)
-            .expect("first write arms replacement attempt")
+            .expect("first write arms the next probe attempt")
             .next_attempt_at = std::time::Instant::now();
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         std::thread::sleep(std::time::Duration::from_millis(75));
@@ -35686,6 +35644,82 @@ mod tests {
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
         );
+    }
+
+    /// Scenario: drive `deliver_orchestrator_prompt` through five delivery
+    /// attempts on a pane whose agent never reports the prompt submitted, using
+    /// a controlled clock so every attempt clears backoff and readiness. Assert
+    /// that only the very first recorded write carries the prompt text — every
+    /// later attempt must write an empty payload, probing submission rather
+    /// than retyping the prompt into a composer that already holds it.
+    #[spec("prompt/pane-input/033")]
+    #[test]
+    fn pane_input_033_confirmation_retry_writes_payload_exactly_once() {
+        const PANE_ID: &str = "never-confirmed-orchestrator-pane";
+        const AGENT_ID: &str = "never-confirmed-orchestrator-agent";
+        const PROMPT: &str = "Read the role prompt and begin";
+        const DELIVERY_ATTEMPTS: usize = 5;
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+
+        let mut ui = default_ui();
+        let tab_id: TabId = 30040;
+        let mut now = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        // Readiness already satisfied before the first call, so every
+        // attempt below is gated only by backoff, never by the spawn-time
+        // buffer.
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let role_panes = [PANE_ID.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        for _ in 0..DELIVERY_ATTEMPTS {
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now,
+                tab_id,
+                &role_panes,
+                0,
+                &mut role_statuses,
+                &mut role_prompt,
+            );
+            // Never confirmed, so the delivery stays armed. Clear backoff
+            // explicitly rather than waiting real wall-clock time for it —
+            // this is the same technique the surrounding retry tests use.
+            if let Some(state) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                state.next_attempt_at = now;
+            }
+            now += std::time::Duration::from_millis(1);
+        }
+
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            DELIVERY_ATTEMPTS,
+            "precondition: every iteration must clear backoff/readiness and reach a write; recorded={recorded:?}"
+        );
+        assert_eq!(
+            recorded[0].0, PROMPT,
+            "attempt 1 is the delivery and must carry the prompt payload"
+        );
+        for (index, (text, _, _)) in recorded.iter().enumerate().skip(1) {
+            assert_eq!(
+                text,
+                "",
+                "attempt {} must probe submission with an empty payload, not retype the prompt; recorded={recorded:?}",
+                index + 1
+            );
+        }
     }
 
     /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, including writes whose successful daemon response is lost, then let generations arrive or roll over during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst may let either TUI path write into a successor; a later safe attempt probes submission rather than retyping.
@@ -35758,8 +35792,10 @@ mod tests {
                  /clear can take the same prompt with no session guard at all"
             );
             assert_eq!(
-                writes[1].0, PROMPT,
-                "attempt 2 is the one bounded replacement payload"
+                writes[1].0, "",
+                "fork #194: MAX_PAYLOAD_SUBMISSIONS = 1 means there is no bounded \
+                 replacement payload any more — attempt 2 already probes \
+                 submission with an empty payload, same as every attempt after it"
             );
         }
         assert_eq!(
@@ -35781,8 +35817,8 @@ mod tests {
             assert_eq!(writes.len(), 3);
             assert_eq!(
                 writes[2].0, "",
-                "D5: by attempt 3 a payload may be sitting in the input box, so \
-                 the attempt probes submission instead of appending another copy"
+                "D5: attempt 3 probes submission too — the binding must survive \
+                 more than one retry, not just the first probe after it"
             );
             assert_eq!(
                 writes[2].1.as_deref(),
@@ -35791,7 +35827,11 @@ mod tests {
             );
             assert_ne!(
                 writes[2].2, writes[1].2,
-                "a probe's payload differs, so it needs its own ledger identity"
+                "two probes carry identical (empty) payloads, so only the wire \
+                 delivery id — minted per attempt regardless of payload content \
+                 — can tell them apart; sharing one would replay the first in \
+                 the daemon's ledger and the second retry would never reach the \
+                 PTY at all"
             );
         }
 

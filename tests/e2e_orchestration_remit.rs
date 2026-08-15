@@ -52,12 +52,15 @@ const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
 /// `prompt_submission_evidence` (`src/ui.rs`) accepts as CONFIRMATION that a
 /// written prompt was actually submitted rather than merely landed on the
 /// PTY. Without that confirmation every delivery against this fixture — the
-/// spawn-time seed included — is stuck permanently PROVISIONAL, so
-/// `MAX_PAYLOAD_SUBMISSIONS` (`src/prompt_delivery.rs`) fires its one
+/// spawn-time seed included — is stuck permanently PROVISIONAL. Before fork
+/// #194, `MAX_PAYLOAD_SUBMISSIONS` (`src/prompt_delivery.rs`) fired one
 /// automatic replacement write ~500ms later regardless of whether a real
 /// re-assertion was ever requested; `orchestration/remit/002` and `_003`
-/// pin behaviour that only starts once that spurious second write stops
-/// happening. Confirming does not touch the log: only the `read` loop's own
+/// pinned behaviour that only started once that spurious second write
+/// stopped happening. As of fork #194 the constant is 1, so attempt 2 only
+/// probes submission — no payload bytes, so no second log line — and the
+/// spurious-write wait these tests were built around no longer occurs.
+/// Confirming does not touch the log: only the `read` loop's own
 /// `printf` line appends to `orchestrator-prompt.log`, so the tests' log
 /// substring counts still measure exactly what was delivered to the pane.
 ///

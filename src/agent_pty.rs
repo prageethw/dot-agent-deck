@@ -2637,10 +2637,16 @@ pub struct AgentPtyRegistry {
     /// PRD #127 M2.2 (deliver-on-idle) + issue #424 F1: what each pane's input
     /// box is holding — the user-keystroke clock the scheduler's reuse path
     /// debounces on, and the record of what THIS daemon's guarded sends put
-    /// there. Together they answer the one question a submit-only probe and the
-    /// one bounded replacement payload have to ask before they fire — "is what
-    /// the target is holding still OUR payload, or has the user typed since?" —
-    /// out of clocks the daemon owns rather than ones a producer can assert.
+    /// there. Together they answer the one question a submit-only probe has to
+    /// ask before it fires — "is what the target is holding still OUR payload,
+    /// or has the user typed since?" — out of clocks the daemon owns rather
+    /// than ones a producer can assert. As of fork #194
+    /// (`crate::prompt_delivery::MAX_PAYLOAD_SUBMISSIONS` = 1) every attempt
+    /// past the first is a probe, so the equivalent question for a bounded
+    /// replacement payload ([`Self::user_typed_since_writing_payload`]) no
+    /// longer arises in practice — kept for the follow-up in
+    /// `docs/develop/fork-sync-workflow.md` that recovers a launcher-consumed
+    /// first write by evidence rather than attempt count.
     ///
     /// An `Arc` because every agent's [`PaneWriter`] holds the same state: that
     /// is what makes the user-input stamp atomic with respect to writer handoff
@@ -4377,7 +4383,7 @@ impl AgentPtyRegistry {
     /// question any of the existing guards answer. Identity, generation, writer
     /// serialization and the deadline all establish WHICH PANE the delivery may
     /// touch; none of them says anything about what the pane's input editor is
-    /// currently holding. Attempts 3 and later write an EMPTY payload plus a
+    /// currently holding. Attempt 2 and later write an EMPTY payload plus a
     /// submit CR ([`crate::prompt_delivery::attempt_writes_payload`]), whose
     /// entire effect is "submit whatever is in the box". That is exactly right
     /// while the box still holds the payload we wrote and wrong the moment it
@@ -4497,10 +4503,12 @@ impl AgentPtyRegistry {
     /// payload record is no longer protecting a retry and must not refuse an
     /// unrelated future delivery of the same bytes.
     ///
-    /// Called once per PAYLOAD WRITE the caller made, not once per delivery: the
-    /// detached confirmation loop's first write and its one bounded replacement
-    /// each leave their own record. Issue #424 S2 — a call releases exactly one
-    /// record, so a concurrent delivery of the same bytes keeps its own. See
+    /// Called once per PAYLOAD WRITE the caller made, not once per delivery:
+    /// while `MAX_PAYLOAD_SUBMISSIONS` is 1 (fork #194) that is a single write
+    /// per delivery, but the method stays keyed per-write, not per-delivery, so
+    /// it is ready for #343's evidence-based recovery to make a second write
+    /// again. Issue #424 S2 — a call releases exactly one record, so a
+    /// concurrent delivery of the same bytes keeps its own. See
     /// [`Self::user_typed_since_writing_payload`] for the full lifecycle.
     pub fn note_payload_settled(&self, pane_id_env: &str, text: &str) {
         let Ok(payload) = encode_pane_payload(text) else {
