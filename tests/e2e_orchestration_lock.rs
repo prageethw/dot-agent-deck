@@ -734,16 +734,16 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
 /// back to live output. Finally, in one burst, drop a paste and immediately
 /// unlock-and-forward an Enter-bearing keystroke, timing its arrival to prove
 /// the drop left no `SUBMIT_DEBOUNCE` (150ms) state behind for it to trip.
-#[spec("orchestration/lock/015")]
+#[spec("orchestration/lock/017")]
 #[test]
-fn lock_015_paste_gated_by_lock_state() {
-    const LOCKED_PASTE_SENTINEL: &str = "LOCK015_LOCKED_PASTE_2f6a";
-    const UNLOCKED_PASTE_SENTINEL: &str = "LOCK015_UNLOCKED_PASTE_9d47";
-    const SCROLL_TOP_MARKER: &str = "LOCK015_SCROLL_TOP_MARKER_a91c";
-    const SCROLL_BOTTOM_MARKER: &str = "LOCK015_SCROLL_BOTTOM_c73e";
-    const REGATED_PASTE_SENTINEL: &str = "LOCK015_REGATED_PASTE_5b18";
-    const TIMING_DROP_SENTINEL: &str = "LOCK015_TIMING_DROP_7ee2";
-    const TIMING_SENTINEL: &str = "LOCK015_TIMING_e04d";
+fn lock_017_paste_gated_by_lock_state() {
+    const LOCKED_PASTE_SENTINEL: &str = "LOCK017_LOCKED_PASTE_2f6a";
+    const UNLOCKED_PASTE_SENTINEL: &str = "LOCK017_UNLOCKED_PASTE_9d47";
+    const SCROLL_TOP_MARKER: &str = "LOCK017_SCROLL_TOP_MARKER_a91c";
+    const SCROLL_BOTTOM_MARKER: &str = "LOCK017_SCROLL_BOTTOM_c73e";
+    const REGATED_PASTE_SENTINEL: &str = "LOCK017_REGATED_PASTE_5b18";
+    const TIMING_DROP_SENTINEL: &str = "LOCK017_TIMING_DROP_7ee2";
+    const TIMING_SENTINEL: &str = "LOCK017_TIMING_e04d";
 
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
@@ -907,7 +907,7 @@ fn lock_015_paste_gated_by_lock_state() {
 /// Poll the rendered grid for the persistent mode chip (` TYPING `, the
 /// `PaneInput` label) and return whatever text immediately follows it on that
 /// row — `None` if the chip itself never appears within `timeout`. Used by
-/// `lock_016` to read the (not-yet-existing) lock chip's text without racing
+/// `lock_018` to read the (not-yet-existing) lock chip's text without racing
 /// the frame that draws the bottom bar.
 fn wait_for_chip_tail(deck: &TuiDeck, timeout: Duration) -> Option<String> {
     common::wait_until(timeout, || {
@@ -942,9 +942,9 @@ fn wait_for_chip_tail(deck: &TuiDeck, timeout: Duration) -> Option<String> {
 /// genuinely pinned; it can NOT verify the task's styling requirement
 /// (reversed+bold vs dim) — `snapshot_grid()` is text-only. An L1 snapshot
 /// pinning the exact styling remains worth adding once the seam exists.
-#[spec("orchestration/lock/016")]
+#[spec("orchestration/lock/018")]
 #[test]
-fn lock_016_persistent_chip_and_help_entry() {
+fn lock_018_persistent_chip_and_help_entry() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
