@@ -67,7 +67,9 @@ fn focus_worker_role(deck: &TuiDeck) {
 
 /// Scenario: Open a real orchestration tab (default LOCKED) and confirm the
 /// focused orchestrator pane's own input is never gated, while a keystroke
-/// aimed at the non-orchestrator "worker" role does not reach its PTY. Enter
+/// aimed at the non-orchestrator "worker" role does not reach its PTY and
+/// surfaces the corrected `Ctrl+d`, `Ctrl+e`, `Ctrl+d` unlock hint (issue
+/// #302 defect 2 — the old wording stopped one keypress short). Enter
 /// command mode (`Ctrl+d`) and send `Ctrl+e` to unlock — the chord only
 /// resolves in command mode — then `Ctrl+d` back into `PaneInput` and confirm
 /// a keystroke into the still-focused worker pane now forwards and echoes.
@@ -105,6 +107,23 @@ fn lock_008_forwarding_gated_by_lock_state() {
         "a keystroke typed into the non-orchestrator worker pane reached its \
          PTY while the command-entry lock was engaged (the default state) — \
          expected it to be dropped before Action::ForwardToPane.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Issue #302 defect 2: the dropped keystroke's status message must name
+    // the FULL three-chord round trip. The old wording ("Ctrl+d then Ctrl+e
+    // to unlock") was literally true but left the reader in command mode —
+    // anyone following it exactly unlocks and then finds their typing going
+    // to the deck rather than the pane. This is the wording the upstream
+    // maintainer suggested in #445.
+    assert!(
+        deck.snapshot_grid()
+            .contains("Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here"),
+        "the dropped-keystroke status message did not carry the corrected \
+         unlock hint — expected `Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type \
+         here`, naming the full round trip back into the pane, not the old \
+         `Ctrl+d then Ctrl+e to unlock` which stops one keypress short.\n\
+         Grid:\n{}",
         deck.snapshot_grid()
     );
 
@@ -675,7 +694,11 @@ fn lock_015_gate_holds_with_no_project_config_present() {
 /// rather than leaving it unclaimed for the global keybinding resolver to
 /// fall through to the PTY. `Ctrl+e`'s binding resolution is unconditional
 /// (fork #346), so it still resolves with no config present — the mirror of
-/// `orchestration/lock/009`'s proof, with no flag involved at all.
+/// `orchestration/lock/009`'s proof, with no flag involved at all. Also reads
+/// the persistent LOCKED/UNLOCKED chip immediately right of the mode chip
+/// before and after the toggle, proving `lock_context_for_tab`'s render path
+/// is likewise unconditional and not still routed through a discoverable
+/// config or the (now-removed) flag.
 #[spec("orchestration/lock/016")]
 #[test]
 fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
@@ -690,6 +713,16 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent");
 
+    let locked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
+    assert!(
+        locked_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with(" LOCKED ")),
+        "the persistent lock chip did not read ` LOCKED ` with no project \
+         config present anywhere. Observed tail: {locked_tail:?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock
 
@@ -699,6 +732,454 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
          Action::ToggleOrchestrationLock with no project config present \
          anywhere — the deck never reported `Pane entry: unlocked` (fork \
          #346).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Back into PaneInput: the persistent chip is drawn only in that mode
+    // (`lock_context_for_tab` is scoped to `UiMode::PaneInput`, per src/ui.rs)
+    // — `wait_for_chip_tail`'s " TYPING " anchor cannot appear while still in
+    // command mode.
+    deck.send_bytes(b"\x04");
+
+    let unlocked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
+    assert!(
+        unlocked_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with(" UNLOCKED ")),
+        "the persistent lock chip did not read ` UNLOCKED ` after Ctrl+e with \
+         no project config present anywhere. Observed tail: \
+         {unlocked_tail:?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Open a real orchestration tab (default LOCKED), focus the
+/// non-orchestrator "worker" role, and send a bracketed paste at it — confirm
+/// it is dropped exactly like an ordinary keystroke (issue #302 defect 1:
+/// `Event::Paste` previously called `embedded.write_raw_bytes` directly,
+/// bypassing `gate_pane_input_key` entirely). Build real scrollback in the
+/// worker pane, re-lock, scroll back via the mouse wheel (the one scroll door
+/// that survives a `PaneInput` re-entry, since keyboard PageUp/PageDown is
+/// command-mode only and re-entering `PaneInput` itself snaps scrollback to
+/// live output), and confirm a further dropped paste does not yank the view
+/// back to live output. Finally, in one burst, drop a paste and immediately
+/// unlock-and-forward a bare Enter — with a visible marker sent only AFTER
+/// the Enter, since anything forwarded before it (even the marker itself)
+/// would debounce it unconditionally and mask the very thing being tested —
+/// proving the drop left no `SUBMIT_DEBOUNCE` (150ms) state behind for it to
+/// trip. Not by comparing its arrival time against a fixed bound (render and
+/// harness-polling latency for the whole burst can itself run past 150ms on
+/// a loaded CI runner, making any fixed bound either flaky or vacuous), but
+/// by comparing it against a plain control keystroke's round trip measured
+/// moments later on the same runner, canceling the runner's shared baseline
+/// instead of hard-coding one.
+#[spec("orchestration/lock/017")]
+#[test]
+fn lock_017_paste_gated_by_lock_state() {
+    const LOCKED_PASTE_SENTINEL: &str = "LOCK017_LOCKED_PASTE_2f6a";
+    const UNLOCKED_PASTE_SENTINEL: &str = "LOCK017_UNLOCKED_PASTE_9d47";
+    const SCROLL_TOP_MARKER: &str = "LOCK017_SCROLL_TOP_MARKER_a91c";
+    const SCROLL_BOTTOM_MARKER: &str = "LOCK017_SCROLL_BOTTOM_c73e";
+    const REGATED_PASTE_SENTINEL: &str = "LOCK017_REGATED_PASTE_5b18";
+    const TIMING_DROP_SENTINEL: &str = "LOCK017_TIMING_DROP_7ee2";
+    const TIMING_SENTINEL: &str = "LOCK017_TIMING_e04d";
+    const CONTROL_SENTINEL: &str = "LOCK017_CONTROL_b3af";
+    // Never sent to the grid; polling for it up to a timeout is this test's
+    // Decision-21-compliant substitute for a bare `std::thread::sleep`,
+    // which `cargo xtask linkage-check` forbids in e2e test bodies.
+    const NEVER_APPEARS_SENTINEL: &str = "LOCK017_NEVER_APPEARS_1a0e9c3f";
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+
+    // --- Part 1: locked, a bracketed paste at the worker must be dropped
+    // exactly like an ordinary keystroke (the orchestration/lock/008
+    // baseline), proving Event::Paste no longer bypasses gate_pane_input_key.
+    focus_worker_role(&deck);
+
+    let locked_paste = format!("\x1b[200~{LOCKED_PASTE_SENTINEL}\x1b[201~");
+    deck.send_keys(locked_paste.as_bytes());
+    let leaked = deck.wait_for_grid_string_within(LOCKED_PASTE_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "a bracketed paste aimed at the non-orchestrator worker pane reached \
+         its PTY while the command-entry lock was engaged — Event::Paste \
+         calls embedded.write_raw_bytes directly, never through \
+         gate_pane_input_key, so the lock's guarantee was keystroke-only.\n\
+         Grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // --- Part 2: build real scrollback in the worker pane, re-lock, scroll
+    // back, and prove a further dropped paste does not reset it to live
+    // output (reset_scrollback must not fire on a drop).
+
+    // Unlock so the worker can actually receive the bulk content below.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x05"); // Ctrl+e -> unlock
+    deck.send_bytes(b"\x04"); // Ctrl+d -> back to PaneInput
+
+    let unlocked_paste = format!("\x1b[200~{UNLOCKED_PASTE_SENTINEL}\x1b[201~");
+    deck.send_keys(unlocked_paste.as_bytes());
+    deck.wait_for_string(UNLOCKED_PASTE_SENTINEL);
+
+    // Enough numbered filler lines to push the top marker well off-screen at
+    // scrollback == 0, whatever the worker pane's actual height turns out to
+    // be at 120x40.
+    //
+    // Sent as ONE bracketed paste, not raw `send_keys`: unwrapped, crossterm
+    // parses each of the 122 `\r`s here as its own KeyEvent, and every
+    // Enter-bearing `Action::ForwardToPane` pays `submit_debounce_duration`'s
+    // up-to-150ms synchronous sleep (PRD #76 M2.20, `src/ui.rs`) when it
+    // lands under `SUBMIT_DEBOUNCE` of the previous forward — which a burst
+    // this dense always does. ~122 * 150ms is >18s of the deck's single
+    // event/render thread blocked in `std::thread::sleep`, on top of
+    // everything else this test still has to do, well past what a 30s
+    // `wait_for_string` budget survives on a loaded CI runner. A bracketed
+    // paste is a single `Event::Paste` delivered in one `write_raw_bytes`
+    // call with no per-line debounce, exactly like `unlocked_paste` above —
+    // and this is genuinely scrollback content the worker pane must render,
+    // not a paste-drop assertion, so wrapping it changes nothing this part
+    // of the test is trying to prove.
+    let mut bulk = format!("{SCROLL_TOP_MARKER}\r");
+    for i in 0..120 {
+        bulk.push_str(&format!("filler-{i:03}\r"));
+    }
+    bulk.push_str(&format!("{SCROLL_BOTTOM_MARKER}\r"));
+    let bracketed_bulk = format!("\x1b[200~{bulk}\x1b[201~");
+    deck.send_keys(bracketed_bulk.as_bytes());
+    deck.wait_for_string(SCROLL_BOTTOM_MARKER);
+
+    // Re-lock. The final Ctrl+d back into PaneInput is itself a fresh mode
+    // entry, which snaps scrollback to live output (mode/scroll/003) — the
+    // right starting point for what follows, since the wheel scroll below
+    // must be the ONLY thing that moves the offset off zero.
+    deck.send_bytes(b"\x04");
+    deck.send_bytes(b"\x05");
+    deck.send_bytes(b"\x04");
+
+    // Scroll the worker pane's OWN view back into its scrollback via the
+    // mouse wheel: scroll_focused_agent_pane falls through to
+    // scroll_focused_pane_scrollback whenever the child has no mouse mode
+    // enabled (true for the `cat` stub here) regardless of UiMode, so this is
+    // the one scroll door that does not itself re-enter PaneInput and reset
+    // what this is about to prove.
+    //
+    // Polled in batches rather than one blind 60-notch burst then a single
+    // check: 60 back-to-back synthetic SGR mouse sequences is, like the bulk
+    // send above, a volume nothing else in this suite fires at once, and a
+    // fixed count plus one fire-and-forget wait cannot tell "not enough
+    // notches yet" apart from "an event got lost" from "still catching up".
+    // Each iteration sends another batch — cheap and safe well under the
+    // 10,000-line scrollback cap (`PANE_SCROLLBACK_LINES`) — so intermittent
+    // event loss self-heals instead of wedging the assertion, matching the
+    // retry-not-just-wait shape `send_keys_until_grid_string_within` already
+    // uses elsewhere in this harness.
+    let (col, row) = deck.wait_for_in_grid(SCROLL_BOTTOM_MARKER);
+    let scrolled_to_top = common::wait_until(Duration::from_secs(10), || {
+        deck.scroll_n(col, row, false, 20); // false == wheel-up, 20 notches
+        deck.wait_for_grid_string_within(SCROLL_TOP_MARKER, Duration::from_millis(200))
+    });
+    assert!(
+        scrolled_to_top,
+        "scrolling the focused worker pane's own view back via the wheel \
+         never surfaced the marker typed as the very first of 120+ lines \
+         within 10s of polled scrolling — the scrollback precondition for \
+         the next assertion was never actually established.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Locked again, scrolled back: a dropped paste must not touch this
+    // pane's scrollback at all.
+    let regated_paste = format!("\x1b[200~{REGATED_PASTE_SENTINEL}\x1b[201~");
+    deck.send_keys(regated_paste.as_bytes());
+    let leaked_again =
+        deck.wait_for_grid_string_within(REGATED_PASTE_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked_again,
+        "a second bracketed paste reached the relocked worker pane's PTY.\n\
+         Grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        deck.snapshot_grid().contains(SCROLL_TOP_MARKER),
+        "the dropped paste yanked the worker pane's view back to live output \
+         — Event::Paste must not call embedded.reset_scrollback for a paste \
+         gate_pane_input_key denies, exactly as a dropped ordinary keystroke \
+         already does not.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // --- Part 3: the drop must also leave last_pane_keystroke_at untouched,
+    // so a genuinely forwarded Enter right after it is not needlessly
+    // debounced (SUBMIT_DEBOUNCE == 150ms).
+    //
+    // The visible marker text goes AFTER the tested `\r`, not before it.
+    // Every forwarded byte — including an ordinary printable character,
+    // per the unconditional restamp at src/ui.rs:10953 — updates
+    // `last_pane_keystroke_at`, and the existing unit test
+    // `enter_following_recent_keystroke_sleeps_at_least_debounce_minus_elapsed`
+    // (src/ui.rs) pins that ANY recently-forwarded keystroke debounces the
+    // Enter that follows it, regardless of what that keystroke was. Typing
+    // the marker BEFORE the `\r` would make the `\r` see its own
+    // just-typed marker text as "the recent keystroke," debouncing it
+    // UNCONDITIONALLY — passing or failing on a signal that has nothing to
+    // do with the dropped paste. Sending `\r` first, with nothing
+    // forwarded in between it and the (denied) drop but the mode-toggle
+    // keys — which are not `Action::ForwardToPane` and so never touch the
+    // timestamp — means its debounce check reflects ONLY what the drop
+    // did or did not do. The marker that follows it is free to restamp
+    // harmlessly, since by then the tested check has already run; it
+    // exists purely so this test can observe that the whole burst,
+    // `\r` included, has been processed and rendered.
+    //
+    // Concatenated into ONE write so the deck's own event processing —
+    // not this test's IPC round trips — sets the (near-zero, if buggy)
+    // gap between the drop and the `\r`: splitting this into
+    // separately-confirmed sends would let real wall-clock time pass
+    // between the (potential) stamp and the forward, which would let even
+    // a genuine regression sail under SUBMIT_DEBOUNCE's 150ms window
+    // undetected — the debounce check only ever compares against the
+    // MOST RECENT stamp, so a stale one is invisible to it by design.
+    let mut burst = format!("\x1b[200~{TIMING_DROP_SENTINEL}\x1b[201~"); // dropped, still locked
+    burst.push('\x04'); // Ctrl+d -> command mode
+    burst.push('\x05'); // Ctrl+e -> unlock
+    burst.push('\x04'); // Ctrl+d -> back to PaneInput, now unlocked
+    burst.push('\r'); // the tested keystroke: nothing forwarded before it but the drop
+    burst.push_str(TIMING_SENTINEL); // marker AFTER `\r`, so it cannot contaminate its debounce check
+
+    let timed_start = std::time::Instant::now();
+    deck.send_keys(burst.as_bytes());
+    let observed = deck.wait_for_grid_string_within(TIMING_SENTINEL, Duration::from_secs(2));
+    let timed_elapsed = timed_start.elapsed();
+    assert!(
+        observed,
+        "the timing sentinel never reached the grid at all.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // CONTROL: the same shape — a bare Enter, then a marker — sent only
+    // once SUBMIT_DEBOUNCE's 150ms window since the last genuinely
+    // forwarded byte (the timing `\r` above, which always stamps
+    // regardless of this test's outcome — src/ui.rs:10953) has
+    // unquestionably elapsed. This round trip's own latency is therefore
+    // guaranteed debounce-free and stands purely for "what does an
+    // unremarkable round trip cost right now, on this runner" — the same
+    // render + harness-polling pipeline the timed round trip above went
+    // through, measured moments later under the same load. A fixed
+    // absolute bound cannot separate that shared, load-driven baseline
+    // from a genuine 150ms debounce sleep: CI observed 433/484/678ms for
+    // this test's PRIOR form (marker BEFORE `\r`, production code
+    // confirmed not to stamp on a drop), strictly rising across three
+    // retries with no code change in between — and that form additionally
+    // had the marker-before-`\r` defect above, so part of that number was
+    // a guaranteed, unconditional debounce rather than pure baseline
+    // noise. Comparing against this control cancels the baseline either
+    // way, without needing to disentangle the two.
+    let _ = deck.wait_for_grid_string_within(NEVER_APPEARS_SENTINEL, Duration::from_millis(200));
+    let control_start = std::time::Instant::now();
+    deck.send_keys(format!("\r{CONTROL_SENTINEL}").as_bytes());
+    let control_observed =
+        deck.wait_for_grid_string_within(CONTROL_SENTINEL, Duration::from_secs(2));
+    let control_elapsed = control_start.elapsed();
+    assert!(
+        control_observed,
+        "the control sentinel never reached the grid at all.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // A genuine SUBMIT_DEBOUNCE sleep is a synchronous ~150ms added directly
+    // to the timed round trip and nowhere else, so a 100ms margin above the
+    // control leaves ample room for ordinary measurement-to-measurement
+    // jitter between two round trips a few hundred milliseconds apart,
+    // while staying well short of the 150ms signal a regression would add.
+    assert!(
+        timed_elapsed < control_elapsed + Duration::from_millis(100),
+        "the Enter-bearing keystroke sent immediately after a DROPPED paste \
+         took {timed_elapsed:?} to reach the grid, {:?} more than a plain \
+         control round trip measured moments later on this same runner \
+         ({control_elapsed:?}) — SUBMIT_DEBOUNCE is 150ms, so a gap this \
+         large above the runner's own current baseline implicates \
+         last_pane_keystroke_at having been stamped by the dropped paste. \
+         Event::Paste must not stamp it when gate_pane_input_key denies the \
+         write; only a genuinely forwarded keystroke may.\nGrid:\n{}",
+        timed_elapsed.saturating_sub(control_elapsed),
+        deck.snapshot_grid()
+    );
+}
+
+/// Poll the rendered grid for the persistent mode chip (` TYPING `, the
+/// `PaneInput` label) and return whatever text immediately follows it on that
+/// row — `None` if the chip itself never appears within `timeout`. Used by
+/// `lock_018` to read the lock chip's text without racing
+/// the frame that draws the bottom bar.
+fn wait_for_chip_tail(deck: &TuiDeck, timeout: Duration) -> Option<String> {
+    common::wait_until(timeout, || {
+        deck.snapshot_grid()
+            .lines()
+            .any(|line| line.contains(" TYPING "))
+    });
+    deck.snapshot_grid().lines().find_map(|line| {
+        line.split_once(" TYPING ")
+            .map(|(_, tail)| tail.to_string())
+    })
+}
+
+/// Scenario: Open a real orchestration tab (default LOCKED), and in
+/// `PaneInput` mode (the orchestrator role focused) locate the persistent
+/// mode chip on the bottom bar — confirm the cells immediately to its right
+/// read ` LOCKED `. Unlock (`Ctrl+d`, `Ctrl+e`, `Ctrl+d`) and confirm the same
+/// position now reads ` UNLOCKED ` — both states must render, not just the
+/// locked default (issue #302 defect 3: previously NEITHER rendered at all,
+/// so a working lock and an inert one were indistinguishable on screen,
+/// which is how #303 went unnoticed). Then open the `?` help overlay and confirm
+/// `Ctrl+e` is documented there.
+///
+/// Written as L2 (not the L1 widget snapshot the task named) because no
+/// existing `_to_buffer` seam threads Orchestration-tab-and-lock context into
+/// `render_bottom_bar` — every current seam (`render_button_bar_for_mode_to_buffer`
+/// and siblings) builds a bare `UiState` with no tab/lock parameter, and
+/// `UiState`/`render_bottom_bar` are private to `src/ui.rs`. Adding that
+/// parameter is itself the production change (a new seam plus the render
+/// logic it exercises), which is out of a tester's reach. This drives the
+/// real running binary instead, so the LOCKED/UNLOCKED text content is
+/// genuinely pinned; it can NOT verify the task's styling requirement
+/// (reversed+bold vs dim) — `snapshot_grid()` is text-only. An L1 snapshot
+/// pinning the exact styling remains worth adding once the seam exists.
+#[spec("orchestration/lock/018")]
+#[test]
+fn lock_018_persistent_chip_and_help_entry() {
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, frame settled
+
+    // Locate the persistent mode chip (" TYPING " in PaneInput) and read what
+    // immediately follows it — that is where the lock chip must sit. Polled
+    // (not a single snapshot) since this is the first read after the form
+    // closed and the frame carrying the bottom bar may not have painted yet.
+    let locked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
+    assert!(
+        locked_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with(" LOCKED ")),
+        "immediately right of the ` TYPING ` mode chip, the bottom bar must \
+         read ` LOCKED ` while the command-entry lock is engaged (the \
+         default) — without this chip a working lock and an inert one are \
+         indistinguishable on screen. Observed tail: {locked_tail:?}\n\
+         Grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Unlock: Ctrl+d into command mode, Ctrl+e to toggle, Ctrl+d back into
+    // PaneInput.
+    deck.send_bytes(b"\x04");
+    deck.send_bytes(b"\x05");
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("Pane entry: unlocked");
+
+    let unlocked_tail = wait_for_chip_tail(&deck, Duration::from_secs(2));
+    assert!(
+        unlocked_tail
+            .as_deref()
+            .is_some_and(|tail| tail.starts_with(" UNLOCKED ")),
+        "immediately right of the ` TYPING ` mode chip, the bottom bar must \
+         read ` UNLOCKED ` once the lock is toggled off — an indicator that \
+         only ever renders the locked state reproduces the exact ambiguity \
+         it exists to remove.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // `?` (Help) resolves only from `UiMode::Normal` (`dispatch_normal_mode_key`,
+    // `src/ui.rs`) — `global_action()`'s always-resolves-from-any-mode table
+    // (Dashboard/ToggleLayout/ToggleOrchestrationSplit/ToggleOrchestrationLock/
+    // NewPane/ClosePane/Ctrl+PageUp/PageDown) has no entry for it, so from
+    // `PaneInput` a bare `?` falls through to `handle_pane_input_key` and is
+    // forwarded to the focused pane like any other character instead of
+    // opening the overlay. `Ctrl+d` first, matching every other command-mode
+    // chord this test already sends.
+    deck.send_bytes(b"\x04");
+    deck.send_bytes(b"?");
+    deck.wait_for_string("Press ? or Esc to close");
+    assert!(
+        deck.snapshot_grid().contains("Ctrl+e"),
+        "the help overlay must document Ctrl+e (ToggleOrchestrationLock) — it \
+         does not appear anywhere in the overlay.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: At 80 columns — the single most common terminal width — open a
+/// real orchestration tab (default LOCKED), focus the non-orchestrator
+/// "worker" role, and send a dropped keystroke to surface the corrected
+/// unlock hint. Confirm the FULL hint text (`Pane locked — Ctrl+d, Ctrl+e,
+/// Ctrl+d to type here`) is visible as a contiguous string in the grid, not
+/// truncated by the right-aligned `[Command Mode Ctrl+D]` button drawn into
+/// the same row.
+///
+/// Written as L2, not the L1 widget snapshot the task originally named:
+/// every existing `_to_buffer` seam that exercises `render_bottom_bar`'s
+/// `PaneInput` arm (`render_button_bar_for_mode_to_buffer` and siblings)
+/// builds a bare `UiState` with `status_message` left at its default `None`,
+/// and `UiState::new`/its `status_message` field are private to `src/ui.rs`
+/// — no seam threads an arbitrary status message into the rendered bar.
+/// Adding one is itself a production-code change (a new seam plus whatever
+/// it exposes), which is out of a tester's reach — the same reasoning
+/// `orchestration/lock/018` already recorded in this file for the LOCKED/
+/// UNLOCKED chip. This drives the real running binary instead, through the
+/// same dropped-keystroke path `orchestration/lock/008` already pins at
+/// 120x40 (where the collision does not occur).
+#[spec("orchestration/lock/019")]
+#[test]
+fn lock_019_hint_visible_at_80_columns() {
+    const WORKER_SENTINEL: &str = "LOCK019_WORKER_1c8e";
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(80, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+
+    focus_worker_role(&deck);
+
+    // Locked: a keystroke aimed at the worker pane must NOT reach its PTY,
+    // and the drop must surface the unlock hint (orchestration/lock/008).
+    deck.send_keys(format!("{WORKER_SENTINEL}\r").as_bytes());
+    let leaked = deck.wait_for_grid_string_within(WORKER_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "a keystroke typed into the non-orchestrator worker pane reached its \
+         PTY while the command-entry lock was engaged (the default state) at \
+         80 columns.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    assert!(
+        deck.wait_for_grid_string_within(
+            "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here",
+            Duration::from_secs(2),
+        ),
+        "at 80 columns the dropped-keystroke status message was not visible \
+         as a contiguous string — issue #302 defect 2's corrected hint (`Pane \
+         locked — Ctrl+d, Ctrl+e, Ctrl+d to type here`, 49 chars) is drawn \
+         into the same row as the right-aligned `[Command Mode Ctrl+D]` \
+         button (21 chars); below 87 columns the button (drawn second) wins \
+         the overlapping cells and the tail of the message — `type here` — is \
+         overwritten. `orchestration/lock/008` pins the same message at \
+         120x40, where the two do not overlap.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
