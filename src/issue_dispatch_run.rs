@@ -683,7 +683,7 @@ async fn dispatch_one_issue(
     // genuinely succeeded: write the `in-progress` label, replace-to-one the
     // assignee (PRD fork#235 M2), and post a claim comment naming the
     // claiming identity. Deliberately AFTER both worktree creation and spawn
-    // succeeded (`dispatch/014`): marking any earlier would make a FAILED
+    // succeeded: marking any earlier would make a FAILED
     // dispatch leave a false claim, permanently un-dispatchable once M1.2
     // reads the label back. A `gh` failure here must not turn this
     // already-successful dispatch into a per-issue failure — the per-issue

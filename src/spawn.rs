@@ -1026,13 +1026,17 @@ async fn deliver(
         .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
         || drained_capability;
     // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
-    // recorded rather than folded into the answer above. Arming here instead
-    // would put the one replacement payload on the retry schedule's clock —
-    // ~500 ms after the write — which for `scheduler/dispatch/015` means typing
-    // it into a launcher that has not exec'd the real agent yet, and every
-    // attempt after that is a submit-only probe with nothing to submit. What the
-    // handoff licenses is accepting the successor WHEN IT ANNOUNCES ITSELF, so
-    // the payload goes in exactly when the agent is there to receive it. See
+    // recorded rather than folded into the answer above. With
+    // `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194) there is no replacement
+    // payload left to put on the retry schedule's clock: arming here means
+    // every attempt from here on is a submit-only probe with nothing to
+    // submit, so for `scheduler/dispatch/015`'s launcher-consumed case the
+    // handoff now arms blind CRs into the real agent's pane rather than
+    // recovering the lost prompt. What the handoff licenses is accepting the
+    // successor WHEN IT ANNOUNCES ITSELF; recovering the prompt itself for
+    // that successor is deferred to #343, which also has to weigh whether
+    // arming probes with nothing to submit is still the right default (see
+    // #343's blind-CR cost). See
     // [`crate::state::SessionStartWait::launcher_handoff`].
     if observed.launcher_handoff {
         registry.note_launcher_handoff(agent_id);
@@ -1252,10 +1256,12 @@ fn drain_pre_write_events(
 /// of whoever happens to own the pane string by then.
 ///
 /// Bounded by [`AUTOMATIC_PROMPT_DEADLINE`], after which the prompt is abandoned
-/// with a warn, a durable report on the pane's card, and no further write. Every
-/// retry types the prompt into the pane again, so the escalating
-/// [`unconfirmed_retry_delay`] keeps that to single digits across the whole
-/// window (see its docs).
+/// with a warn, a durable report on the pane's card, and no further write. The
+/// prompt itself is typed once, by the caller, before this loop starts; with
+/// `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194) every retry THIS loop makes is a
+/// submit-only probe, not a re-type. The escalating [`unconfirmed_retry_delay`]
+/// keeps the retry count to single digits across the whole window regardless
+/// (see its docs).
 ///
 /// `can_report_prompts` is the initial answer to "can this pane's delivery ever
 /// be confirmed" — `true` when a pre-write event came from a producer that
@@ -1314,8 +1320,12 @@ async fn confirm_prompt_delivery(
     // Issue #424 S2: ONE HOLDER PER PAYLOAD WRITE. A record is now per write
     // rather than per distinct payload, so that a delivery sharing its bytes
     // with a concurrent one cannot release the other's guard — which means this
-    // delivery must hold (and drop) as many as it wrote. The replacement
-    // payload's holder is pushed below, at the write that creates it.
+    // delivery must hold (and drop) as many as it wrote. While
+    // `MAX_PAYLOAD_SUBMISSIONS == 1` (fork #194) that is exactly the one record
+    // below; a would-be second holder, for a replacement payload write, is
+    // pushed at `guarded_submit`'s call site further down but is currently
+    // unreachable (see the `GuardedOutcome::Written if writes_payload` arm) —
+    // ready for #343 to make it live again.
     let mut payload_records = vec![PayloadRecordRelease {
         registry: &registry,
         pane_id: &pane_id,
@@ -1501,11 +1511,11 @@ async fn confirm_prompt_delivery(
         armed |= gap_capability && accepts_late_producer;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
-        // Issue #424 D5: after the one bounded replacement payload, later
-        // attempts PROBE SUBMISSION instead of typing the prompt in again — same
-        // guarded path, same writer serialization, same deadline, same
-        // partial-write classification, only an empty payload so the target
-        // receives just the delayed submit CR. See
+        // Issue #424 D5 / fork #194: only the FIRST attempt writes the payload
+        // — every attempt after that PROBES SUBMISSION instead of typing the
+        // prompt in again — same guarded path, same writer serialization, same
+        // deadline, same partial-write classification, only an empty payload so
+        // the target receives just the delayed submit CR. See
         // [`crate::prompt_delivery::attempt_writes_payload`].
         let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt);
         // Issue #424 F1 (auditor HIGH): a probe submits whatever the target is
@@ -1520,14 +1530,16 @@ async fn confirm_prompt_delivery(
         // strictly worse than stopping — so it is terminal, and the notice tells
         // the user their pane holds an automatic prompt they never submitted.
         //
-        // Issue #424 F1, replacement-payload half: the SAME stop applies to the
-        // one bounded replacement payload (attempt 2). Left unguarded it was the
-        // worse half of the finding — the probe merely submits the user's draft,
-        // whereas the replacement APPENDS our prompt to that draft and submits
-        // the pair as a single turn. The registry asks the byte-keyed question
-        // ("would this repeat what we already put in that box?"); this loop asks
-        // the same one, for the same reason it asks the probe's, so the stop is
-        // reported rather than surfacing as a bare `target went stale`.
+        // Issue #424 F1, replacement-payload half: the SAME stop applied to the
+        // one bounded replacement payload (attempt 2), which appended our
+        // prompt to the user's draft and submitted the pair as a single turn
+        // rather than merely submitting the draft as a probe does. With
+        // `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194), `writes_payload` is never
+        // true inside this loop, so the `if writes_payload` arm below —
+        // `registry.user_typed_since_writing_payload` — is currently
+        // unreachable from here. Left in place, and the reasoning kept, because
+        // #343's evidence-based recovery restores a case where this loop writes
+        // a replacement payload again.
         //
         // Issue #424 S1/S2 (both reviewers): the FIRST of the two questions
         // below is this delivery's OWN — has user input reached this pane since
@@ -1565,11 +1577,19 @@ async fn confirm_prompt_delivery(
         }
         let payload = if writes_payload { prompt.as_str() } else { "" };
         match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
+            // Currently UNREACHABLE while `MAX_PAYLOAD_SUBMISSIONS == 1` (fork
+            // #194): `attempt` is incremented above, before `writes_payload` is
+            // computed, so this loop's first write is attempt 2 and
+            // `writes_payload` is always false here. Kept, rather than removed,
+            // because #343's evidence-based recovery is expected to make this
+            // loop write a replacement payload again, at which point this arm
+            // — and the record it takes below — becomes live once more.
+            //
+            // Issue #424 S2: the replacement left a SECOND record of these
+            // bytes on the pane. Take a holder for it here, at the write
+            // that created it, so this delivery releases exactly what it
+            // wrote and leaves nothing behind to refuse a later one.
             GuardedOutcome::Written if writes_payload => {
-                // Issue #424 S2: the replacement left a SECOND record of these
-                // bytes on the pane. Take a holder for it here, at the write
-                // that created it, so this delivery releases exactly what it
-                // wrote and leaves nothing behind to refuse a later one.
                 payload_records.push(PayloadRecordRelease {
                     registry: &registry,
                     pane_id: &pane_id,
@@ -2778,27 +2798,46 @@ mod tests {
         );
     }
 
-    /// Scenario: Deliver a detached spawn prompt, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
+    /// Scenario: Deliver a detached automatic prompt with an explicit attempt-1 write (standing in for the real caller), then type an unsent user draft while confirmation is retrying with submit-only probes. The next automatic attempt must send no bytes, so it does not submit the user's draft.
     #[spec("scheduler/dispatch/018")]
     #[tokio::test]
     async fn dispatch_018_user_input_disarms_detached_submit_probe() {
+        // Retired here: the "replacement" pane sub-scenario that used to precede
+        // this one exercised `write_guarded`'s non-empty-payload branch (the
+        // `registry.user_typed_since_writing_payload` guard, ~:1533 above) on
+        // attempt 2 — the one bounded replacement payload. Fork #194 set
+        // `MAX_PAYLOAD_SUBMISSIONS = 1` (`src/prompt_delivery.rs`), so
+        // `attempt_writes_payload(2)` is now `false` and this loop never again
+        // calls `write_and_submit_guarded`/`write_guarded` with a non-empty
+        // payload past attempt 1 — that branch is unreachable from here while
+        // `MAX_PAYLOAD_SUBMISSIONS` stays 1. The retired assertion kept passing
+        // regardless (it would have passed even with
+        // `user_typed_since_writing_payload` deleted outright), so it is
+        // removed rather than kept as a vacuous pass. The guard itself stays
+        // covered independent of `MAX_PAYLOAD_SUBMISSIONS` by
+        // `dispatch_031_user_typed_since_writing_payload_guards_the_registry_directly`
+        // below, which calls it directly against the registry. Recovering a
+        // launcher that genuinely consumes attempt 1 — which is what would make
+        // this branch reachable again — is deferred to fork issue #343.
         const PANE_ID: &str = "detached-user-draft-pane";
         const PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-USER-DRAFT";
         const USER_DRAFT: &str = "detached draft deliberately left unsent";
 
-        const REPLACEMENT_PANE_ID: &str = "detached-draft-before-replacement-pane";
-        const REPLACEMENT_PROMPT: &str = "AUTOMATIC-PROMPT-BEFORE-REPLACEMENT-GUARD";
-        const REPLACEMENT_DRAFT: &str = "detached draft before replacement payload";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
 
-        let replacement_registry = Arc::new(AgentPtyRegistry::new());
-        let replacement_agent = spawn_byte_target(&replacement_registry, REPLACEMENT_PANE_ID);
-        let initial = replacement_registry
-            .write_and_submit_guarded(
-                REPLACEMENT_PANE_ID,
-                REPLACEMENT_PROMPT,
-                Some(&replacement_agent),
-                || async { true },
-            )
+        // Attempt 1 is the CALLER's write in production (`deliver`, ~src/spawn.rs
+        // :1006-1007, `log_prompt_written(..., 1)`), performed and logged before
+        // `confirm_prompt_delivery` is ever spawned. The loop's own attempt
+        // counter starts its first write at attempt 2
+        // (`attempt.saturating_add(1)` at ~src/spawn.rs:1484 runs before that
+        // write), so it never again writes a non-empty payload while
+        // `MAX_PAYLOAD_SUBMISSIONS == 1` — every write the loop below makes is a
+        // probe. Do not remove this explicit write as redundant with the loop:
+        // without a real attempt-1 write standing in for the caller, `PROMPT`
+        // never physically reaches the pane and the precondition below panics.
+        let initial = registry
+            .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
             .await
             .expect("attempt 1 guarded delivery");
         assert_eq!(
@@ -2807,68 +2846,17 @@ mod tests {
             "attempt 1 must never be refused before an automatic write timestamp exists"
         );
         tokio::time::sleep(Duration::from_millis(75)).await;
-        let after_initial_delivery = replacement_registry
-            .snapshot(&replacement_agent)
-            .expect("initial detached delivery snapshot");
+        let after_attempt_one = registry
+            .snapshot(&agent_id)
+            .expect("attempt 1 delivery snapshot");
         assert!(
-            after_initial_delivery
-                .windows(REPLACEMENT_PROMPT.len())
-                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
-            "precondition: attempt 1 must physically reach the detached pane; output={:?}",
-            String::from_utf8_lossy(&after_initial_delivery)
+            after_attempt_one
+                .windows(PROMPT.len())
+                .any(|window| window == PROMPT.as_bytes()),
+            "precondition: attempt 1 must physically reach the detached pane before the user types; output={:?}",
+            String::from_utf8_lossy(&after_attempt_one)
         );
 
-        type_user_draft(
-            &replacement_registry,
-            &replacement_agent,
-            REPLACEMENT_PANE_ID,
-            REPLACEMENT_DRAFT,
-        )
-        .await;
-        let before_replacement = replacement_registry
-            .snapshot(&replacement_agent)
-            .expect("pre-replacement detached snapshot");
-        assert!(
-            before_replacement
-                .windows(REPLACEMENT_DRAFT.len())
-                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
-            "precondition: the unsent user draft must physically reach the detached PTY; output={:?}",
-            String::from_utf8_lossy(&before_replacement)
-        );
-
-        let (replacement_tx, replacement_rx) = broadcast::channel(8);
-        let replacement_confirmation = tokio::spawn(confirm_prompt_delivery(
-            replacement_registry.clone(),
-            replacement_rx,
-            ConfirmationTask {
-                pane_id: REPLACEMENT_PANE_ID.into(),
-                agent_id: replacement_agent.clone(),
-                prompt: REPLACEMENT_PROMPT.into(),
-                delivery_id: "detached-replacement-user-draft-safety".into(),
-                generation: None,
-                can_report_prompts: true,
-                deadline: Instant::now() + Duration::from_secs(3),
-            },
-        ));
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let after_replacement = replacement_registry
-            .snapshot(&replacement_agent)
-            .expect("post-replacement detached snapshot");
-
-        replacement_confirmation.abort();
-        let _ = replacement_confirmation.await;
-        drop(replacement_tx);
-        replacement_registry.shutdown_all();
-        assert_eq!(
-            after_replacement,
-            before_replacement,
-            "detached attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
-            String::from_utf8_lossy(&before_replacement),
-            String::from_utf8_lossy(&after_replacement)
-        );
-
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent_id = spawn_byte_target(&registry, PANE_ID);
         let (event_tx, event_rx) = broadcast::channel(8);
         let confirmation = tokio::spawn(confirm_prompt_delivery(
             registry.clone(),
@@ -2885,16 +2873,6 @@ mod tests {
         ));
 
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let before_user_input = registry
-            .snapshot(&agent_id)
-            .expect("replacement payload snapshot");
-        assert!(
-            before_user_input
-                .windows(PROMPT.len())
-                .any(|window| window == PROMPT.as_bytes()),
-            "precondition: attempt 2 must have reached the byte target before the user types"
-        );
-
         type_user_draft(&registry, &agent_id, PANE_ID, USER_DRAFT).await;
         let before_probe = registry
             .snapshot(&agent_id)
@@ -2915,6 +2893,57 @@ mod tests {
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
         );
+    }
+
+    /// Scenario: Write a payload directly through the registry, confirm `user_typed_since_writing_payload` reports false with no user input recorded yet, type an unsent user draft and confirm it now reports true for that exact text, then release the delivery's record on a terminal outcome and confirm the same text reports false again. Exercised directly against the registry API rather than through the attempt-count retry loop, so the guard stays covered independent of what `MAX_PAYLOAD_SUBMISSIONS` is set to.
+    #[spec("scheduler/dispatch/031")]
+    #[tokio::test]
+    async fn dispatch_031_user_typed_since_writing_payload_guards_the_registry_directly() {
+        const PANE_ID: &str = "direct-payload-guard-pane";
+        const PROMPT: &str = "DIRECT-PAYLOAD-GUARD-PROMPT";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+
+        assert!(
+            !registry.user_typed_since_writing_payload(PANE_ID, PROMPT),
+            "precondition: nothing has been written yet, so there is nothing to repeat"
+        );
+
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .await
+                .expect("guarded payload write"),
+            GuardedSend::Applied
+        );
+        assert!(
+            !registry.user_typed_since_writing_payload(PANE_ID, PROMPT),
+            "no user input has reached the pane since the write, so the same \
+             text is not yet a repeat"
+        );
+
+        type_user_draft(
+            &registry,
+            &agent_id,
+            PANE_ID,
+            "unsent draft after the payload write",
+        )
+        .await;
+        assert!(
+            registry.user_typed_since_writing_payload(PANE_ID, PROMPT),
+            "the user typed after our write, so writing the same payload again \
+             would repeat it into their draft"
+        );
+
+        registry.note_payload_settled(PANE_ID, PROMPT);
+        assert!(
+            !registry.user_typed_since_writing_payload(PANE_ID, PROMPT),
+            "the delivery released its record on a terminal outcome, so the \
+             same text is a first write again, not a repeat"
+        );
+
+        registry.shutdown_all();
     }
 
     /// Scenario: Queue an automatic replacement behind the same writer that is forwarding an attached user's unsent draft, then release the writer without stamping the user-input clock. The queued retry must not append or submit anything before that clock stamp can run.
