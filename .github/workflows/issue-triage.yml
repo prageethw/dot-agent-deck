@@ -16,25 +16,13 @@ jobs:
     if: github.event.issue.state == 'open'
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure needs-triage label exists
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # Source of truth for the full 7-label vocabulary: ensure_labels
-          # (src/issue_dispatch.rs), which only runs at issue_dispatch fire
-          # time and is not scheduled on this repo (see fork-config-backups.md).
-          # This keeps needs-triage itself self-sufficient regardless.
-          gh label create needs-triage --repo "$REPO" \
-            --color d4c5f9 --description "Priority not yet determined." --force
-
       - name: Stamp or clear needs-triage
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
           EVENT_ACTION: ${{ github.event.action }}
+          ADDED_LABEL: ${{ github.event.label.name }}
         run: |
           set -euo pipefail
 
@@ -44,33 +32,47 @@ jobs:
           has_priority=$(jq -r 'any(.[]?; .name | startswith("priority-"))' <<<"$labels_json")
           has_size=$(jq -r 'any(.[]?; .name | startswith("size-"))' <<<"$labels_json")
           has_needs_triage=$(jq -r 'any(.[]?; .name == "needs-triage")' <<<"$labels_json")
+          is_exempt=$(jq -r 'any(.[]?; .name == "wontfix" or .name == "duplicate" or .name == "invalid" or .name == "question")' <<<"$labels_json")
 
-          # opened/reopened only ever ADD the stamp; labeled/unlabeled only
-          # ever CLEAR it — so a human who deliberately removes needs-triage
-          # by hand is never fought by this workflow re-adding it.
+          # Every handled event runs the same check, so a routine re-labelling
+          # that drops priority-*/size-* (or a still-unlabelled issue's next
+          # labeled/unlabeled event) is caught, not only the issue's original
+          # opened event. This means a human can no longer win by stripping
+          # needs-triage by hand — it is immediately re-applied if the issue
+          # is still missing a label. The escape hatch is now applying one of
+          # the exempt labels below, which is visible in the label set rather
+          # than an invisible absence.
           case "$EVENT_ACTION" in
-            opened|reopened)
+            opened|reopened|labeled|unlabeled)
               if [ "$has_priority" = "false" ] || [ "$has_size" = "false" ]; then
-                if [ "$has_needs_triage" = "false" ]; then
-                  echo "#$ISSUE_NUMBER missing priority-*/size-* — adding needs-triage"
-                  gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label needs-triage
-                else
+                if [ "$is_exempt" = "true" ]; then
+                  echo "#$ISSUE_NUMBER missing priority-*/size-* but carries an exempt label — leaving as-is"
+                elif [ "$has_needs_triage" = "true" ]; then
                   echo "needs-triage already present on #$ISSUE_NUMBER — nothing to do"
+                else
+                  echo "#$ISSUE_NUMBER missing priority-*/size-* — adding needs-triage"
+                  # Source of truth for the full 7-label vocabulary:
+                  # ensure_labels (src/issue_dispatch_run.rs), which only runs
+                  # at issue_dispatch fire time and is not scheduled on this
+                  # repo (see fork-config-backups.md). Ensured here, right
+                  # before the one call that can actually need it, so a
+                  # remove-only outcome below never pays for it.
+                  gh label create needs-triage --repo "$REPO" \
+                    --color d4c5f9 --description "Priority not yet determined." --force
+                  gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label needs-triage
                 fi
               else
-                echo "#$ISSUE_NUMBER already has priority-*/size-* — nothing to do"
-              fi
-              ;;
-            labeled|unlabeled)
-              if [ "$has_priority" = "true" ] && [ "$has_size" = "true" ]; then
-                if [ "$has_needs_triage" = "true" ]; then
+                if [ "$has_needs_triage" = "false" ]; then
+                  echo "#$ISSUE_NUMBER already has priority-*/size-* — nothing to do"
+                elif [ "$EVENT_ACTION" = "labeled" ] && [ "$ADDED_LABEL" = "needs-triage" ]; then
+                  echo "needs-triage manually re-added to fully labelled #$ISSUE_NUMBER — honoring the re-triage request"
+                else
                   echo "priority-*/size-* now both present on #$ISSUE_NUMBER — removing needs-triage"
                   gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-triage
-                else
-                  echo "priority-*/size-* both present, needs-triage absent — nothing to do"
                 fi
-              else
-                echo "#$ISSUE_NUMBER still missing priority-*/size-* — leaving needs-triage as-is"
               fi
+              ;;
+            *)
+              echo "unhandled action: $EVENT_ACTION"
               ;;
           esac
