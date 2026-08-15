@@ -6128,7 +6128,13 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 /// only — is precisely the mode where `Ctrl+E` alone does nothing. Naming just
 /// the unlock chord would instruct the user to press a chord that provably
 /// cannot work from where they are standing.
-const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
+///
+/// Issue #302 defect 2: the wording names the full three-chord round trip
+/// back into the pane, not just the unlock. `Ctrl+d`, `Ctrl+e` alone is
+/// literally true but leaves the reader in command mode — anyone following it
+/// exactly unlocks and then finds their typing going to the deck rather than
+/// the pane.
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
 
 /// Gate the PTY-forward fallback [`handle_pane_input_key`] produces against the
 /// command-entry lock. When the active tab is [`Tab::Orchestration`], the lock
@@ -14394,7 +14400,6 @@ pub fn run_tui(
                     && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
-                    embedded.reset_scrollback(&pane_id);
                     let use_bracketed = embedded
                         .get_screen(&pane_id)
                         .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
@@ -14407,13 +14412,37 @@ pub fn run_tui(
                     if use_bracketed {
                         payload.extend_from_slice(b"\x1b[201~");
                     }
-                    let _ = embedded.write_raw_bytes(&pane_id, &payload);
-                    // PRD #76 M2.20: a paste is a forwarded keystroke event
-                    // too — mark the timestamp so a following Enter
-                    // (`Action::ForwardToPane(b"\r")`) is debounced and
-                    // arrives at the agent as a standalone submit, not fused
-                    // with the paste tail.
-                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+                    // Issue #302 defect 1: a paste is just another
+                    // PTY-forwarded write, so it must clear the same
+                    // command-entry-lock gate a keystroke does rather than
+                    // calling `write_raw_bytes` directly — otherwise the
+                    // lock's guarantee is keystroke-only.
+                    let gated = gate_pane_input_key(
+                        Action::ForwardToPane(payload),
+                        &ui,
+                        &tab_manager,
+                        &*pane,
+                        &build_pane_status_for_gate(&snapshot),
+                    );
+                    if let Action::ForwardToPane(bytes) = gated {
+                        // A dropped paste must not touch the pane at all, so
+                        // both the scrollback reset and the debounce
+                        // timestamp move inside the delivered branch — a
+                        // dropped ordinary keystroke does neither.
+                        embedded.reset_scrollback(&pane_id);
+                        let _ = embedded.write_raw_bytes(&pane_id, &bytes);
+                        // PRD #76 M2.20: a paste is a forwarded keystroke event
+                        // too — mark the timestamp so a following Enter
+                        // (`Action::ForwardToPane(b"\r")`) is debounced and
+                        // arrives at the agent as a standalone submit, not fused
+                        // with the paste tail.
+                        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+                    } else {
+                        ui.status_message = Some((
+                            ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    }
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -15228,6 +15257,13 @@ fn render_frame(
         ActiveTabView::Mode { mode_name, .. } => Some(mode_name.as_str()),
     };
 
+    // Issue #302 defect 3: computed once per frame from `tab_view`, so every
+    // `render_bottom_bar` call this function makes for the Cards path
+    // (Dashboard / Orchestration, including the zero-session case) agrees on
+    // the same answer. The Mode-tab branch below never reaches these calls —
+    // it delegates to `render_mode_tab`, which always passes `None`.
+    let lock_context = lock_context_for_tab(ui, tab_view);
+
     // PRD #341 M3: reconcile the banner against the mode this frame is about to
     // draw, then read its decay state ONCE and thread that one value into every
     // pane-rendering path below. Doing it here — rather than at each
@@ -15265,6 +15301,23 @@ fn render_frame(
     // This function only reads from it; it never splits layout itself. See
     // `docs/develop/rendering-contract.md`.
     let hints_area = layout.hints;
+
+    // Issue #302 defect 3: the three Cards-path branches below (filtered to
+    // zero, genuinely zero sessions, and the populated view) each render this
+    // same hints bar with the same `lock_context` — one closure instead of
+    // repeating the call, so the render_bottom_bar call site cannot drift
+    // across the three of them.
+    let render_hints_bar = |frame: &mut Frame, ui: &mut UiState, filtered_nonempty: bool| {
+        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, filtered_nonempty);
+        render_bottom_bar(
+            frame,
+            ui,
+            hints_area,
+            has_pane_control,
+            &ctx_buttons,
+            lock_context,
+        );
+    };
 
     // Tab strip: render into the bar rect the layout pass reserved, or drop any
     // stale click rects when no strip is shown this frame.
@@ -15385,8 +15438,7 @@ fn render_frame(
         .style(text_primary())
         .centered();
         frame.render_widget(msg, vertical[1]);
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
+        render_hints_bar(frame, ui, !filtered.is_empty());
 
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -15465,8 +15517,7 @@ fn render_frame(
             vertical[2],
             active_mode_name,
         );
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
-        render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
+        render_hints_bar(frame, ui, !filtered.is_empty());
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
             ui.focused_pane_rect = render_terminal_panes(
@@ -15587,8 +15638,7 @@ fn render_frame(
     );
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
+    render_hints_bar(frame, ui, !filtered.is_empty());
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
@@ -16515,8 +16565,9 @@ fn render_mode_tab(
     }
 
     // Full-width hints bar — mode tabs show only the global buttons (no
-    // dashboard context buttons).
-    render_bottom_bar(frame, ui, hints_area, has_pane_control, &[]);
+    // dashboard context buttons). A Mode tab is never an Orchestration tab,
+    // so the lock chip never applies here (issue #302 defect 3).
+    render_bottom_bar(frame, ui, hints_area, has_pane_control, &[], None);
 
     render_overlays(frame, ui, active_mode_name);
 }
@@ -16925,7 +16976,22 @@ const CHIP_COMMAND: &str = " COMMAND ";
 /// The chip for `UiMode::PaneInput`.
 const CHIP_TYPING: &str = " TYPING ";
 
-/// The one space between the chip and the bar content, part of the band
+/// Issue #302 defect 3 — the persistent command-entry-lock indicator, drawn
+/// immediately right of the mode chip whenever an Orchestration tab supplies
+/// lock context (see [`lock_context_for_tab`]). Both states render — an
+/// indicator that only ever appears while locked reproduces the exact
+/// ambiguity it exists to remove, which is how #303 went unnoticed.
+const CHIP_LOCKED: &str = " LOCKED ";
+/// The lock chip's other state. Rendered dim rather than reversed+bold so it
+/// reads as the quieter, "nothing to see here" half of the pair.
+const CHIP_UNLOCKED: &str = " UNLOCKED ";
+
+/// The lock chip's text for a given `command_entry_locked` value.
+fn lock_chip_label(locked: bool) -> &'static str {
+    if locked { CHIP_LOCKED } else { CHIP_UNLOCKED }
+}
+
+/// The one space between the chip(s) and the bar content, part of the band
 /// [`mode_chip_bar_split`] reserves.
 const GAP_AFTER_CHIP: u16 = 1;
 
@@ -16978,30 +17044,62 @@ fn mode_chip_min_width() -> u16 {
 /// tall, so only its row 0 is indented (see [`layout_button_bar`]'s
 /// `first_row_indent`) and continuation rows get the full width back — so the
 /// buttons pay for the chip by wrapping, not by disappearing.
-fn mode_chip_bar_split(mode: UiMode, width: u16) -> (u16, u16) {
+///
+/// Issue #302 defect 3: `lock_context` — `Some(locked)` on an Orchestration
+/// tab in `UiMode::PaneInput`, `None` otherwise (see
+/// [`lock_context_for_tab`]) — folds the persistent lock chip into the SAME
+/// band. It sits flush against the mode chip with no gap between them (the
+/// lock chip's own leading space reads as that separator), so the reserved
+/// [`GAP_AFTER_CHIP`] moves to after the *last* chip instead of after the
+/// mode chip specifically. When there is not enough room for both, the mode
+/// chip wins and the lock chip is silently omitted for this frame — the same
+/// graceful-narrowing behaviour [`mode_chip_min_width`] already gives the
+/// mode chip alone.
+fn mode_chip_bar_split(mode: UiMode, width: u16, lock_context: Option<bool>) -> (u16, u16) {
     let Some(label) = mode_chip_label(mode) else {
         return (0, width);
     };
     if width < mode_chip_min_width() {
         return (0, width);
     }
-    let band = label.chars().count() as u16 + GAP_AFTER_CHIP;
+    let mode_width = label.chars().count() as u16;
+    let lock_width = match lock_context {
+        Some(locked)
+            if width
+                >= mode_width + lock_chip_label(locked).chars().count() as u16 + GAP_AFTER_CHIP =>
+        {
+            lock_chip_label(locked).chars().count() as u16
+        }
+        _ => 0,
+    };
+    let band = mode_width + lock_width + GAP_AFTER_CHIP;
     (band, width - band)
 }
 
-/// PRD #341 M2 — draw the mode chip at `area`'s left edge and return the rect
-/// left for the bar's own content (same row, same right edge).
+/// PRD #341 M2 / issue #302 defect 3 — draw the mode chip, and (when
+/// `lock_context` supplies one) the persistent lock chip immediately to its
+/// right, at `area`'s left edge; return the rect left for the bar's own
+/// content (same row, same right edge).
 ///
-/// Styled `Modifier::REVERSED | BOLD` with no colour at all — a
-/// terminal-relative trick, so the chip inverts against whatever background
-/// the user's theme provides and reads on light and dark terminals alike
-/// without an absolute RGB value (PRD #13).
-fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
-    let (band, rest) = mode_chip_bar_split(mode, area.width);
+/// The mode chip is styled `Modifier::REVERSED | BOLD` with no colour at
+/// all — a terminal-relative trick, so the chip inverts against whatever
+/// background the user's theme provides and reads on light and dark
+/// terminals alike without an absolute RGB value (PRD #13). The lock chip
+/// mirrors that styling while locked and switches to `Modifier::DIM` while
+/// unlocked, so the two states are visually distinct as well as textually
+/// distinct.
+fn render_mode_chip(
+    frame: &mut Frame,
+    mode: UiMode,
+    lock_context: Option<bool>,
+    area: Rect,
+) -> Rect {
+    let (band, rest) = mode_chip_bar_split(mode, area.width, lock_context);
     if band == 0 {
         return area;
     }
     let label = mode_chip_label(mode).expect("a non-zero chip band implies a label");
+    let mode_width = label.chars().count() as u16;
     frame.render_widget(
         Paragraph::new(Line::styled(
             label,
@@ -17010,15 +17108,68 @@ fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
         Rect {
             x: area.x,
             y: area.y,
-            width: band.saturating_sub(GAP_AFTER_CHIP),
+            width: mode_width,
             height: 1,
         },
     );
+    // `band` already tells us whether `mode_chip_bar_split` found room for the
+    // lock chip — this derives that back out rather than re-deriving the fit
+    // check, so the two can never disagree about whether it rendered.
+    let lock_width = band.saturating_sub(mode_width + GAP_AFTER_CHIP);
+    if lock_width > 0
+        && let Some(locked) = lock_context
+    {
+        let style = if locked {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(lock_chip_label(locked), style)),
+            Rect {
+                x: area.x + mode_width,
+                y: area.y,
+                width: lock_width,
+                height: 1,
+            },
+        );
+    }
     Rect {
         x: area.x.saturating_add(band),
         width: rest,
         ..area
     }
+}
+
+/// Issue #302 defect 3 — the lock context the persistent bottom-bar chip
+/// renders from: `Some(locked)` in `UiMode::PaneInput` on an Orchestration
+/// tab, `None` everywhere else (a non-Orchestration tab or a non-`PaneInput`
+/// mode). Shared by [`bottom_bar_rows`] and [`render_bottom_bar`] so the two
+/// can never derive a different answer for the same frame.
+///
+/// Scoped to `PaneInput` deliberately, not just descriptively: `PaneInput`
+/// is the ONE mode whose row count `bottom_bar_rows` already hardcodes to 1
+/// regardless of width or chip content, so the lock chip never has to
+/// interact with the wrapping button bar's `layout_button_bar` row-count
+/// math at all. Widening this to every mode (so the chip also showed next
+/// to the `COMMAND` chip) was tried and reverted — it produced a lock chip
+/// that had to travel through `UiMode::Help`'s wrapping-bar branch, a
+/// combination no prior test exercised, and CI's PTY tier failed
+/// reproducibly on `orchestration/lock/016`'s `?` (open help) step under
+/// exactly that combination. Review of `layout_button_bar` (PR #308) found
+/// no loop that could hang for any input — it is a single bounded `for` over
+/// `label_widths` with saturating arithmetic — so the CI symptom was a
+/// timeout (e.g. a `wait_for_string` never seeing the row count it expected)
+/// rather than an infinite loop; the root cause of *why* widening the chip
+/// changed that row count is still undiagnosed. `PaneInput` is also the only
+/// mode the task's own placement reasoning names ("the wide button bar is
+/// not drawn in PaneInput at all … hence the bottom bar, not the button
+/// bar").
+fn lock_context_for_tab(ui: &UiState, tab_view: &ActiveTabView) -> Option<bool> {
+    if ui.mode != UiMode::PaneInput {
+        return None;
+    }
+    matches!(tab_view, ActiveTabView::Orchestration { .. }).then_some(ui.command_entry_locked)
 }
 
 /// PRD #144 — how many rows the bottom bar will occupy this frame, so the layout
@@ -17037,6 +17188,7 @@ fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
 /// one content row always remains (Layout doesn't panic, but content vanishing
 /// is a usability bug).
 fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &ActiveTabView) -> u16 {
+    let lock_context = lock_context_for_tab(ui, tab_view);
     let rows = match ui.mode {
         UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
         _ if ui.status_message.is_some() => 1,
@@ -17052,8 +17204,12 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16, tab_view: &Activ
             // PRD #341 M2: the mode chip is part of the bar's width budget, so
             // the buttons flow around it — indenting row 0 only, exactly as
             // `render_button_bar` does. Same split, same call, same arguments: a
-            // second opinion here would mis-reserve the height.
-            let (chip_band, _) = mode_chip_bar_split(ui.mode, width);
+            // second opinion here would mis-reserve the height. Issue #302
+            // defect 3: `lock_context` must travel with it — the lock chip
+            // widens the same reserved band, so a mismatch here is exactly the
+            // silent clipping/overlap failure mode the PRD #144 contract this
+            // function exists for was written to prevent.
+            let (chip_band, _) = mode_chip_bar_split(ui.mode, width, lock_context);
             let (_, rows) = layout_button_bar(&widths, width, chip_band);
             rows.max(1)
         }
@@ -17068,6 +17224,7 @@ fn render_bottom_bar(
     area: Rect,
     has_pane_control: bool,
     extra_buttons: &[Button],
+    lock_context: Option<bool>,
 ) {
     // PRD #341 M2: the mode chip owns cell 0 of the bar wherever the bar has one
     // — the context-rich Cards path (Dashboard / Orchestration), the global-only
@@ -17079,8 +17236,8 @@ fn render_bottom_bar(
     // bar keeps the FULL rect and indents only its row 0, so a wrapped bar does
     // not pay the chip's ~10 cells on every row (see `layout_button_bar`).
     let full_area = area;
-    let (chip_band, _) = mode_chip_bar_split(ui.mode, area.width);
-    let area = render_mode_chip(frame, ui.mode, area);
+    let (chip_band, _) = mode_chip_bar_split(ui.mode, area.width, lock_context);
+    let area = render_mode_chip(frame, ui.mode, lock_context, area);
     match ui.mode {
         UiMode::Filter => {
             let line = Line::from(vec![
@@ -17137,13 +17294,33 @@ fn render_bottom_bar(
             }
             // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
             // surfaces can never disagree about which way `Ctrl+D` travels.
-            let buttons = [Button::new(
+            let button = Button::new(
                 ModeGlobals::for_mode(ui.mode).dashboard_button,
                 button_shortcut_label(&ui.keybindings, KbAction::Dashboard),
                 Action::DetachToNormal,
                 true,
-            )];
-            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area);
+            );
+            // Issue #302 review F2: the button is drawn right-aligned into the
+            // SAME row as the status message and, being drawn second, wins any
+            // overlapping cells — silently truncating the message mid-word
+            // (observed at 80 columns with the lengthened lock hint). The
+            // message is the higher-value element here: it is transient and
+            // exists specifically to tell the user something just happened, so
+            // when both cannot fit, elide the button rather than clip the
+            // message. `Ctrl+D` itself still works with no on-screen affordance
+            // for it, exactly as every other global chord does when the banner
+            // has decayed.
+            let msg_width = ui
+                .status_message
+                .as_ref()
+                .map(|(msg, _)| msg.chars().count() as u16)
+                .unwrap_or(0);
+            let button_width = button.display_label().chars().count() as u16;
+            if area.width >= msg_width.saturating_add(button_width) {
+                ui.button_rects = render_right_aligned_buttons(frame, &[button], area);
+            } else {
+                ui.button_rects.clear();
+            }
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
@@ -17911,6 +18088,14 @@ fn render_help_overlay(
                 format!("{} / m", n(KbAction::ToggleAgentTypeBadge))
             },
             "Show / hide agent badges",
+        ),
+        // Issue #302 defect 3: Ctrl+e appeared in no snapshot and was absent
+        // from this overlay, so a working command-entry lock and an inert
+        // one were indistinguishable on screen. Command-mode only, and only
+        // claimed on an Orchestration tab (see `scope_command_entry_lock`).
+        help_key_line(
+            &n(KbAction::ToggleOrchestrationLock),
+            "Toggle command-entry lock",
         ),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
@@ -19938,7 +20123,7 @@ pub fn render_button_bar_to_buffer(width: u16) -> ratatui::buffer::Buffer {
             };
             // has_pane_control = true → the richest legacy legend today;
             // after M2 this site renders the always-visible global button bar.
-            render_bottom_bar(frame, &mut ui, area, true, &[]);
+            render_bottom_bar(frame, &mut ui, area, true, &[], None);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -19972,7 +20157,7 @@ pub fn render_button_bar_with_bindings_to_buffer(
                 width,
                 height,
             };
-            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons);
+            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons, None);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -20015,7 +20200,7 @@ pub fn render_button_bar_for_mode_to_buffer(
                 width,
                 height,
             };
-            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons);
+            render_bottom_bar(frame, &mut ui, area, true, &ctx_buttons, None);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -20624,7 +20809,7 @@ pub fn render_filter_bar_to_buffer(filter_text: &str, width: u16) -> ratatui::bu
                 width,
                 height: 1,
             };
-            render_bottom_bar(frame, &mut ui, area, false, &[]);
+            render_bottom_bar(frame, &mut ui, area, false, &[], None);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -20651,7 +20836,7 @@ pub fn render_rename_bar_to_buffer(rename_text: &str, width: u16) -> ratatui::bu
                 width,
                 height: 1,
             };
-            render_bottom_bar(frame, &mut ui, area, false, &[]);
+            render_bottom_bar(frame, &mut ui, area, false, &[], None);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
