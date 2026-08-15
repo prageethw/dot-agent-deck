@@ -93,6 +93,7 @@ fn pane_004_card_title_row() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -138,6 +139,7 @@ fn card_stats_session(cwd: &str) -> SessionState {
         display_name: Some("api-svc".to_string()),
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     }
 }
 
@@ -522,6 +524,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -712,6 +715,7 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -803,6 +807,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1363,6 +1368,7 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
     }
 
@@ -1479,6 +1485,7 @@ fn palette_session(status: SessionStatus) -> SessionState {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     }
 }
 
@@ -2157,6 +2164,7 @@ fn pane_005_highlight_follows_selected_session_id() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -2239,6 +2247,7 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     });
 
     // The card list the dashboard would build for this pane.
@@ -2304,6 +2313,7 @@ fn filled_session() -> SessionState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
     }
     for (name, detail) in [
@@ -2326,6 +2336,7 @@ fn filled_session() -> SessionState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
     }
     SessionState {
@@ -2348,6 +2359,7 @@ fn filled_session() -> SessionState {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     }
 }
 

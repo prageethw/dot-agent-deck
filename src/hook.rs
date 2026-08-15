@@ -20,6 +20,12 @@ struct ClaudeCodeHookInput {
     tool_input: Option<Value>,
     tool_use_id: Option<String>,
     prompt: Option<String>,
+    // PRD fork#378: the agent's active model, posted top-level (Codex posts
+    // the same Claude-compatible stdin shape — see
+    // tests/codex_hook_ingestion.rs's schema-accurate `model` key). A NAMED
+    // field, not routed through `_extra`/`metadata` (see the constraint on
+    // that passthrough in `build_event_typed` below).
+    model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -33,6 +39,9 @@ struct OpenCodeHookInput {
     status: Option<String>,
     cwd: Option<String>,
     prompt: Option<String>,
+    // PRD fork#378: mirrors ClaudeCodeHookInput's `model` field, in case a
+    // future OpenCode payload carries one; `None` today.
+    model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -306,6 +315,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_input,
         tool_use_id,
         prompt,
+        model,
         _extra: extra,
     } = input;
 
@@ -394,6 +404,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model,
     })
 }
 
@@ -467,6 +478,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: input.model,
     })
 }
 
@@ -931,6 +943,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -951,6 +964,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -969,6 +983,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
@@ -984,6 +999,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: Some("fix the login bug".into()),
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1002,6 +1018,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: Some(long_prompt),
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1569,6 +1586,7 @@ mod tests {
             status: None,
             cwd: Some("/tmp".into()),
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();
@@ -1588,6 +1606,7 @@ mod tests {
             status: None,
             cwd: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();
@@ -1606,6 +1625,7 @@ mod tests {
             status: None,
             cwd: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         assert!(build_opencode_event(input).is_none());
@@ -1664,6 +1684,7 @@ mod tests {
                 tool_input: None,
                 tool_use_id: None,
                 prompt: None,
+                model: None,
                 _extra: extra,
             }
         };
@@ -1704,6 +1725,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         })
         .expect("SessionStart maps to an event");
@@ -1725,6 +1747,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1753,6 +1776,7 @@ mod tests {
             tool_input: None,
             prompt: None,
             status: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();
@@ -1777,6 +1801,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"command": full_cmd})),
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1801,6 +1826,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1817,6 +1843,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"command": "ls -la"})),
             tool_use_id: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1834,6 +1861,7 @@ mod tests {
             status: None,
             cwd: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();

@@ -180,6 +180,7 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -254,6 +255,7 @@ fn make_session(
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     }
 }
 
@@ -2295,6 +2297,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     });
 
     let sessions: Vec<&SessionState> = state
@@ -2552,6 +2555,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
@@ -2672,6 +2676,7 @@ fn live_011_rehydration_preserves_shell_synthetic_working() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -2719,6 +2724,7 @@ fn live_011_rehydration_preserves_shell_synthetic_working() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -3014,6 +3020,7 @@ async fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
 
     let (dir, path, listener) = {
@@ -3381,6 +3388,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(corrected_event));
 

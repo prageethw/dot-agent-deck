@@ -3162,6 +3162,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 

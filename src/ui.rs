@@ -19307,15 +19307,23 @@ fn render_session_card(
         let badge_style = Style::default()
             .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
             .add_modifier(Modifier::BOLD);
-        // The marker is appended AFTER the `<type> · <id-or-name>` so the
-        // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
-        // stays intact — only a trailing view-only annotation is added.
+        // PRD fork#378: a known active model grows the badge text to
+        // `<type> (<model>)`, still one registry-coloured, bold segment.
+        // The marker is appended AFTER the `<type>[ (<model>)] · <id-or-name>`
+        // so the `<type> ·` shape callers match on when NO model is known
+        // (e.g. `Codex ·`, `Pi · orch-01`) stays intact — only a trailing
+        // view-only annotation is added. Once a model IS known the badge
+        // reads `<type> (<model>) · …` instead, and never the bare form.
+        let badge_text = match session.model.as_deref() {
+            Some(model) => format!("{} ({model})", session.agent_type),
+            None => format!("{}", session.agent_type),
+        };
         let label_after_badge = display_name
             .map(|name| format!(" · {name} "))
             .unwrap_or_else(|| format!(" · {id_display} "));
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (format!("{}", session.agent_type), badge_style),
+            (badge_text, badge_style),
             (label_after_badge, title_bold),
         ];
         if !is_live {
@@ -23626,6 +23634,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state.apply_event(event1.clone());
 
@@ -23649,6 +23658,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state.apply_event(event2);
 
@@ -23725,6 +23735,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -23745,6 +23756,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -23781,6 +23793,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state.apply_event(event.clone());
 
@@ -24141,6 +24154,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -24655,6 +24669,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
         state
@@ -24695,6 +24710,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -24722,6 +24738,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -24750,6 +24767,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -24766,6 +24784,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         let mut ui = default_ui();
@@ -24793,6 +24812,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -24809,6 +24829,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         let mut ui = default_ui();
@@ -24838,6 +24859,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         let mut ui = default_ui();
@@ -26251,6 +26273,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -28238,6 +28261,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         }
     }
 
@@ -28440,6 +28464,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -28460,6 +28485,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         // Spacious: get all 3
@@ -28496,6 +28522,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -28523,6 +28550,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -31017,6 +31045,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         let output = build_art_output(&s);
         assert!(output.contains("Bash"));
@@ -34027,6 +34056,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
     }
 
@@ -34055,6 +34085,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
     }
 
@@ -34261,6 +34292,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
@@ -34832,6 +34864,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
 
         ui.send_retry_backoff
@@ -35323,6 +35356,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         };
         synthetic(EventType::ShellBusy, false);
@@ -35345,6 +35379,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         ui.send_retry_backoff
@@ -35594,6 +35629,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
         slow_ui
@@ -35678,6 +35714,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         assert_eq!(
@@ -35808,6 +35845,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         replacement_ui
             .send_retry_backoff
@@ -35856,6 +35894,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         assert_eq!(clear_controller.writes_for("same-agent"), 1);
@@ -35875,6 +35914,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         let clear_writes = clear_controller.writes_for("same-agent");
@@ -35927,6 +35967,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         // The lost-response shape: one wire request issued, no outcome learned,
@@ -35997,6 +36038,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         };
         let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
@@ -36267,6 +36309,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         let captured_sessions = expected_sessions.lock().unwrap().clone();

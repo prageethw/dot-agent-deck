@@ -365,6 +365,12 @@ pub struct SessionState {
     /// card permanently unrevertible, because the paired `ShellIdle` reads the
     /// marker, not the status.
     pub shell_synthetic_working: bool,
+    /// PRD fork#378: the agent's self-reported active model, mirrored from
+    /// [`AgentEvent::model`]. An event carrying `Some(m)` sets it (a later,
+    /// different `m` overwrites — the runtime-change path); an event
+    /// carrying `None` must NOT clear a previously-known model, since most
+    /// events don't carry one. `None` until the first event that does.
+    pub model: Option<String>,
 }
 
 impl SessionState {
@@ -3130,6 +3136,7 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
         agent_version: None,
         schema_version: None,
         live_target: Some(live_target),
+        model: None,
     }
 }
 
@@ -3428,6 +3435,7 @@ impl AppState {
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                model: None,
             },
         );
     }
@@ -4867,6 +4875,7 @@ impl AppState {
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                model: event.model.clone(),
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -4916,6 +4925,13 @@ impl AppState {
 
         if event.cwd.is_some() {
             session.cwd.clone_from(&event.cwd);
+        }
+
+        // PRD fork#378: a later event's model overwrites a previously-known
+        // one; `None` (most events don't carry a model) leaves it untouched
+        // rather than clearing it — mirrored on `dashboard/agent-badge/004`.
+        if event.model.is_some() {
+            session.model.clone_from(&event.model);
         }
 
         if let Some(ref prompt) = event.user_prompt {
@@ -5176,6 +5192,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -5263,6 +5280,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -5283,6 +5301,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         // Even a report naming a DIFFERENT (stale) generation with a fresher
@@ -5342,6 +5361,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
         fn launcher(session: &str, secs: i64) -> AgentEvent {
@@ -6844,6 +6864,7 @@ clear = false
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
         for no_proof in [
@@ -6904,6 +6925,7 @@ clear = false
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -7213,6 +7235,7 @@ clear = false
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -7351,6 +7374,7 @@ clear = false
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                model: None,
             },
         );
 
