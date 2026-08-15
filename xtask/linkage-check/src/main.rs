@@ -60,6 +60,10 @@
 
 mod clean_tmp;
 mod list_tests;
+// PRD fork#340 M3, RED round (tester): signatures only, every body
+// `todo!()`. Not wired into the subcommand multiplexer below — that is the
+// coder delegation that follows this one.
+mod work_type;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
