@@ -14580,8 +14580,9 @@ fn render_tab_strip(
     // click-to-switch (same width-fitting the `Tabs` widget previously used).
     let fitted_labels = fit_tab_labels(labels, area.width);
 
-    // Inactive tab labels render at full contrast (readable text); the active
-    // tab is cued with Modifier::BOLD, a terminal-relative highlight that
+    // Inactive tab labels render at base contrast by default (an idle one
+    // dims to `palette::STATUS_IDLE`, fork issue #351); the active tab is
+    // cued with Modifier::BOLD, a terminal-relative highlight that
     // adds no absolute color and — unlike the REVERSED it replaces (issue
     // #306) — doesn't invert a stacked status `fg` tint into the label's
     // background. The cue was originally `UNDERLINED | BOLD`; the underline
