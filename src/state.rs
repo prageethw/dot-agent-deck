@@ -3543,6 +3543,11 @@ impl AppState {
     /// `cwd` is the pane's own working directory (`pane_cwd_map`), which may
     /// differ per role; the orchestration IDENTITY passed in is what scopes
     /// routing, and is shared across every role of one orchestration.
+    ///
+    /// Fork #358: a pane_id later reused for a non-start role must not keep
+    /// a stale `orchestrator_pane_ids` flag from an earlier registration —
+    /// that flag wrongly excludes the pane as a delegate target. See the
+    /// `else` branch below.
     pub fn register_orchestration_role(
         &mut self,
         pane_id: &str,
@@ -3562,6 +3567,8 @@ impl AppState {
         }
         if is_start_role {
             self.orchestrator_pane_ids.insert(pane_id.to_string());
+        } else {
+            self.orchestrator_pane_ids.remove(pane_id);
         }
     }
 
@@ -6632,6 +6639,41 @@ clear = false
         assert_eq!(
             state.delegate_targets("B_orch", &["coder".to_string()]),
             vec![("coder".to_string(), "B_coder".to_string())]
+        );
+    }
+
+    /// Scenario: Register pane "19" as an orchestrator (a start role) for
+    /// orchestration `orch`, then re-register that SAME pane_id, still under
+    /// `orch`, as a plain, non-start worker role — a legitimate same-
+    /// orchestration re-register (a role change within one orchestration, a
+    /// reconnect/hydration replay), which is the only shape reachable now
+    /// that `register_orchestration_role` no longer refuses a re-register
+    /// outright. Because `register_orchestration_role` only ever INSERTS
+    /// into `orchestrator_pane_ids` when `is_start_role` is true, with no
+    /// `else` branch removing it otherwise, pane "19" must stop being
+    /// flagged as an orchestrator once it is reused for a worker role.
+    ///
+    /// Fork #358: without the `else` branch this test is RED — the pane
+    /// stays wrongly flagged, which would make `delegate_targets`'s
+    /// `!self.orchestrator_pane_ids.contains(pane_id)` filter wrongly
+    /// exclude a legitimate worker candidate reusing that pane_id.
+    #[test]
+    fn reregistering_an_orchestrator_pane_as_a_worker_drops_it_from_orchestrator_pane_ids() {
+        let mut state = AppState::default();
+        let orch = instance("orch-x");
+
+        state.register_orchestration_role("19", "orchestrator", true, orch.clone(), None);
+        assert!(
+            state.orchestrator_pane_ids.contains("19"),
+            "sanity: the start-role registration must flag the pane as an orchestrator"
+        );
+
+        state.register_orchestration_role("19", "coder", false, orch, None);
+
+        assert!(
+            !state.orchestrator_pane_ids.contains("19"),
+            "a pane_id reused for a non-start role must no longer be flagged \
+             as an orchestrator"
         );
     }
 
