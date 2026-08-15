@@ -987,6 +987,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         UiMode::Normal,
         width,
         height,
+        false,
     );
     let typing = render_card_for_mode_to_buffer(
         &session,
@@ -998,6 +999,7 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
         UiMode::PaneInput,
         width,
         height,
+        false,
     );
     let legacy = render_card_to_buffer(
         &session,

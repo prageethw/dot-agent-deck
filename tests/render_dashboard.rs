@@ -536,6 +536,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         UiMode::Normal,
         width,
         height,
+        false,
     )
 }
 
@@ -670,11 +671,13 @@ fn guard_002_no_absolute_bg_in_source() {
 /// Scenario: Render a single dashboard card for a live `AgentType::Pi` session
 /// with NO display name (so the card title falls back to the plain
 /// `<session-id>` form) into a `TestBackend` buffer, then assert the rendered
-/// card surface shows the session id but carries no agent-type badge — no
-/// `Pi` / `ClaudeCode` / `OpenCode` / `No agent` label text anywhere, and no
-/// cell in Pi's registry `badge_color`. Fork-only: the badge is removed from
-/// every card, so a Pi pane must render exactly like any other agent type
-/// once un-badged, not fall back to showing its type name.
+/// card surface shows the session id but carries no agent-type badge by
+/// default — no `Pi` / `ClaudeCode` / `OpenCode` / `No agent` label text
+/// anywhere, and no cell in Pi's registry `badge_color`. Fork-only: the
+/// badge is removed from every card by default, so a Pi pane must render
+/// exactly like any other agent type once un-badged, not fall back to
+/// showing its type name. Does not assert the toggled-on state, where the
+/// badge does render (`dashboard/agent-badge/001`).
 #[spec("dashboard/pane/007")]
 #[test]
 fn pane_007_pi_card_omits_agent_type_badge() {
@@ -755,10 +758,12 @@ fn pane_007_pi_card_omits_agent_type_badge() {
 
 /// Scenario: Render a live Codex session with no friendly display name into a
 /// color-aware card buffer. Fork-only rename/hide (never pushed upstream):
-/// the agent-type badge is removed entirely, so the card must show NO
+/// the agent-type badge is removed by default, so the card must show NO
 /// `Codex` label text and NO cell anywhere on the card in Codex's registry
 /// badge color. Repeats the check for named Claude Code / OpenCode / Pi /
-/// Codex cards, where the friendly display name must still render.
+/// Codex cards, where the friendly display name must still render. Does not
+/// assert the toggled-on state, where the badge does render
+/// (`dashboard/agent-badge/001`).
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_omits_agent_type_badge() {
@@ -871,6 +876,208 @@ fn pane_008_codex_card_omits_agent_type_badge() {
         ));
     }
     insta::assert_snapshot!("pane_008_named_agent_badges", named_badges);
+}
+
+/// Scenario: Render the same live Codex session card through
+/// `render_card_for_mode_to_buffer` with the agent-type badge toggle off and
+/// on, then repeat the on/off pair for all five shipped agent types with a
+/// friendly display name. Off must show no type label and no cell in that
+/// agent's registry `badge_color`; on must show `<Label> · <name>` and a cell
+/// carrying both `badge_color` and `Modifier::BOLD`. Also pins D4: a
+/// placeholder (`AgentType::None`) card shows no badge even when the toggle
+/// is on — only its unrelated `● No agent` status text, never a doubled
+/// occurrence from a restored identity segment.
+#[spec("dashboard/agent-badge/001")]
+#[test]
+fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "wrapped-01".to_string(),
+        agent_type: AgentType::Codex,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("codex-pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+        pending_permission_tool: None,
+        shell_synthetic_working: false,
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let codex_color = dot_agent_deck::agent_registry::spec(&AgentType::Codex).badge_color;
+
+    let off = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false,
+    );
+    let off_text = buffer_to_text(&off);
+    assert!(
+        !off_text.contains("Codex"),
+        "with the badge toggle off (the default), a Codex card must not show \
+         the `Codex` label:\n{off_text}"
+    );
+    let off_has_badge_cell = (0..off.area().height)
+        .any(|y| (0..off.area().width).any(|x| off[(x, y)].fg == codex_color));
+    assert!(
+        !off_has_badge_cell,
+        "no cell should carry Codex's registry badge color {codex_color:?} \
+         while the toggle is off:\n{}",
+        buffer_to_color_text(&off)
+    );
+
+    let on = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let on_text = buffer_to_text(&on);
+    assert!(
+        on_text.contains("Codex · wrapped-01"),
+        "with the badge toggle on, a Codex card must show the \
+         `Codex · wrapped-01` identity segment:\n{on_text}"
+    );
+    let on_has_bold_badge_cell = (0..on.area().height).any(|y| {
+        (0..on.area().width)
+            .any(|x| on[(x, y)].fg == codex_color && on[(x, y)].modifier.contains(Modifier::BOLD))
+    });
+    assert!(
+        on_has_bold_badge_cell,
+        "with the badge toggle on, a cell must carry Codex's registry badge \
+         color {codex_color:?} AND Modifier::BOLD:\n{}",
+        buffer_to_color_text(&on)
+    );
+    insta::assert_snapshot!("agent_badge_001_codex_on", buffer_to_color_text(&on));
+
+    for (agent_type, friendly_name) in [
+        (AgentType::ClaudeCode, "friendly-claude"),
+        (AgentType::OpenCode, "friendly-opencode"),
+        (AgentType::Pi, "friendly-pi"),
+        (AgentType::Codex, "friendly-codex"),
+        (AgentType::Devin, "friendly-devin"),
+    ] {
+        let mut named = session.clone();
+        named.agent_type = agent_type.clone();
+        named.display_name = Some(friendly_name.to_string());
+        let label = dot_agent_deck::agent_registry::spec(&agent_type).label;
+        let expected_color = dot_agent_deck::agent_registry::spec(&agent_type).badge_color;
+
+        let off = render_card_for_mode_to_buffer(
+            &named,
+            Some(friendly_name),
+            Some(1),
+            density,
+            0,
+            false,
+            UiMode::Normal,
+            width,
+            height,
+            false,
+        );
+        let off_text = buffer_to_text(&off);
+        assert!(
+            !off_text.contains(label),
+            "with the toggle off, a named {agent_type:?} card must not show \
+             its registry `{label}` label:\n{off_text}"
+        );
+
+        let on = render_card_for_mode_to_buffer(
+            &named,
+            Some(friendly_name),
+            Some(1),
+            density,
+            0,
+            false,
+            UiMode::Normal,
+            width,
+            height,
+            true,
+        );
+        let on_text = buffer_to_text(&on);
+        let expected_segment = format!("{label} · {friendly_name}");
+        assert!(
+            on_text.contains(&expected_segment),
+            "with the toggle on, a named {agent_type:?} card must show \
+             `{expected_segment}`:\n{on_text}"
+        );
+        let on_has_bold_badge_cell = (0..on.area().height).any(|y| {
+            (0..on.area().width).any(|x| {
+                on[(x, y)].fg == expected_color && on[(x, y)].modifier.contains(Modifier::BOLD)
+            })
+        });
+        assert!(
+            on_has_bold_badge_cell,
+            "with the toggle on, a cell on the named {agent_type:?} card must \
+             carry registry color {expected_color:?} AND Modifier::BOLD:\n{}",
+            buffer_to_color_text(&on)
+        );
+    }
+
+    // D4: a placeholder card (AgentType::None) must show no badge even when
+    // the toggle is on. `spec(&None).label` is "No agent", which already
+    // appears once as the unrelated status text — a verbatim restoration
+    // would double it via a `No agent · <pane>` identity segment, so the
+    // guard is an exact occurrence count, not a bare substring check.
+    let placeholder = SessionState {
+        session_id: String::new(),
+        agent_type: AgentType::None,
+        cwd: None,
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some("pane-x".to_string()),
+        agent_id: None,
+        display_name: None,
+        pending_permission_tool: None,
+        shell_synthetic_working: false,
+    };
+    let placeholder_on = render_card_for_mode_to_buffer(
+        &placeholder,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let placeholder_text = buffer_to_text(&placeholder_on);
+    assert_eq!(
+        placeholder_text.matches("No agent").count(),
+        1,
+        "D4: a placeholder card must show `No agent` exactly once (its status \
+         text) even with the badge toggle on — never a second, doubled \
+         occurrence from a restored identity segment:\n{placeholder_text}"
+    );
 }
 
 /// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
@@ -1221,6 +1428,7 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
         UiMode::Normal,
         width,
         height,
+        false,
     );
     let (fg, modifier) = border_style_at_mid(&buffer);
     assert_eq!(
@@ -1426,6 +1634,7 @@ fn palette_006_selection_is_visible_at_every_status() {
                     mode,
                     width,
                     height,
+                    false,
                 )
             };
             let unselected = render(false);
