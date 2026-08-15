@@ -62,21 +62,41 @@ fn tab_label_modifier(buffer: &ratatui::buffer::Buffer, label: &str) -> Modifier
     buffer[((start + 1) as u16, 0)].modifier
 }
 
-/// The foreground color of the padding space immediately preceding `label`'s
-/// first character in the rendered single-row tab strip. Mirrors
-/// `tab_label_fg`'s cell-location logic; used to assert that a tab's status
-/// tint fills the whole `" {label} "` span, not merely the label's own
-/// characters.
-fn tab_pad_fg(buffer: &ratatui::buffer::Buffer, label: &str) -> Color {
+/// Locate the **column** of the leading pad space in `label`'s own
+/// `" {label} "` span in the rendered single-row tab strip. Walks the row
+/// cell-by-cell and compares symbols directly, rather than concatenating
+/// symbols into a `String` and taking a **byte** offset into it — the `│`
+/// divider is 3 bytes but 1 cell, and `[×]`'s `×` is 2 bytes but 1 cell, so a
+/// byte offset used as an x coordinate skews right of the true column by 2
+/// for every preceding divider (fork issue #377 fix-round F1/F2: this bug
+/// previously lived inline in `tab_pad_fg` and `close_glyph_fg_after`).
+fn label_span_start_col(buffer: &ratatui::buffer::Buffer, label: &str) -> u16 {
     let area = buffer.area();
-    let row: String = (0..area.width)
+    let cells: Vec<String> = (0..area.width)
         .map(|x| buffer[(x, 0)].symbol().to_string())
         .collect();
-    let needle = format!(" {label} ");
-    let start = row
-        .find(&needle)
-        .unwrap_or_else(|| panic!("label {label:?} not found in rendered tab strip row: {row:?}"));
-    buffer[(start as u16, 0)].fg
+    let needle: Vec<String> = format!(" {label} ")
+        .chars()
+        .map(|c| c.to_string())
+        .collect();
+    (0..cells.len().saturating_sub(needle.len().saturating_sub(1)))
+        .find(|&i| cells[i..i + needle.len()] == needle[..])
+        .map(|i| i as u16)
+        .unwrap_or_else(|| {
+            panic!(
+                "label {label:?} not found in rendered tab strip row: {:?}",
+                cells.concat()
+            )
+        })
+}
+
+/// The foreground color of the padding space immediately preceding `label`'s
+/// first character in the rendered single-row tab strip. Used to assert that
+/// a tab's status tint fills the whole `" {label} "` span, not merely the
+/// label's own characters.
+fn tab_pad_fg(buffer: &ratatui::buffer::Buffer, label: &str) -> Color {
+    let start = label_span_start_col(buffer, label);
+    buffer[(start, 0)].fg
 }
 
 /// The foreground color of the `[×]` close glyph belonging to `label`'s tab —
@@ -85,18 +105,12 @@ fn tab_pad_fg(buffer: &ratatui::buffer::Buffer, label: &str) -> Color {
 /// the same status tint as the label text next to it.
 fn close_glyph_fg_after(buffer: &ratatui::buffer::Buffer, label: &str) -> Color {
     let area = buffer.area();
-    let row: String = (0..area.width)
-        .map(|x| buffer[(x, 0)].symbol().to_string())
-        .collect();
-    let needle = format!(" {label} ");
-    let start = row
-        .find(&needle)
-        .unwrap_or_else(|| panic!("label {label:?} not found in rendered tab strip row: {row:?}"));
-    ((start as u16)..area.width)
+    let start = label_span_start_col(buffer, label);
+    (start..area.width)
         .find(|&x| buffer[(x, 0)].symbol() == "×")
         .map(|x| buffer[(x, 0)].fg)
         .unwrap_or_else(|| {
-            panic!("no × close glyph found at or after label {label:?} in row: {row:?}")
+            panic!("no × close glyph found at or after label {label:?} starting at column {start}")
         })
 }
 
