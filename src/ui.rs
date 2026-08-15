@@ -17062,7 +17062,7 @@ fn mode_chip_min_width() -> u16 {
 /// buttons pay for the chip by wrapping, not by disappearing.
 ///
 /// Issue #302 defect 3: `lock_context` — `Some(locked)` on an Orchestration
-/// tab while the flag is on, `None` otherwise (see
+/// tab in `UiMode::PaneInput`, `None` otherwise (see
 /// [`lock_context_for_tab`]) — folds the persistent lock chip into the SAME
 /// band. It sits flush against the mode chip with no gap between them (the
 /// lock chip's own leading space reads as that separator), so the reserved
@@ -17170,11 +17170,17 @@ fn render_mode_chip(
 /// math at all. Widening this to every mode (so the chip also showed next
 /// to the `COMMAND` chip) was tried and reverted — it produced a lock chip
 /// that had to travel through `UiMode::Help`'s wrapping-bar branch, a
-/// combination no prior test exercised, and CI's PTY tier hung reproducibly
-/// on `orchestration/lock/016`'s `?` (open help) step under exactly that
-/// combination. `PaneInput` is also the only mode the task's own placement
-/// reasoning names ("the wide button bar is not drawn in PaneInput at all
-/// … hence the bottom bar, not the button bar").
+/// combination no prior test exercised, and CI's PTY tier failed
+/// reproducibly on `orchestration/lock/016`'s `?` (open help) step under
+/// exactly that combination. Review of `layout_button_bar` (PR #308) found
+/// no loop that could hang for any input — it is a single bounded `for` over
+/// `label_widths` with saturating arithmetic — so the CI symptom was a
+/// timeout (e.g. a `wait_for_string` never seeing the row count it expected)
+/// rather than an infinite loop; the root cause of *why* widening the chip
+/// changed that row count is still undiagnosed. `PaneInput` is also the only
+/// mode the task's own placement reasoning names ("the wide button bar is
+/// not drawn in PaneInput at all … hence the bottom bar, not the button
+/// bar").
 fn lock_context_for_tab(ui: &UiState, tab_view: &ActiveTabView) -> Option<bool> {
     if ui.mode != UiMode::PaneInput {
         return None;
@@ -17304,13 +17310,33 @@ fn render_bottom_bar(
             }
             // PRD #241 M4: same mode-aware seam the wide bar uses, so the two
             // surfaces can never disagree about which way `Ctrl+D` travels.
-            let buttons = [Button::new(
+            let button = Button::new(
                 ModeGlobals::for_mode(ui.mode).dashboard_button,
                 button_shortcut_label(&ui.keybindings, KbAction::Dashboard),
                 Action::DetachToNormal,
                 true,
-            )];
-            ui.button_rects = render_right_aligned_buttons(frame, &buttons, area);
+            );
+            // Issue #302 review F2: the button is drawn right-aligned into the
+            // SAME row as the status message and, being drawn second, wins any
+            // overlapping cells — silently truncating the message mid-word
+            // (observed at 80 columns with the lengthened lock hint). The
+            // message is the higher-value element here: it is transient and
+            // exists specifically to tell the user something just happened, so
+            // when both cannot fit, elide the button rather than clip the
+            // message. `Ctrl+D` itself still works with no on-screen affordance
+            // for it, exactly as every other global chord does when the banner
+            // has decayed.
+            let msg_width = ui
+                .status_message
+                .as_ref()
+                .map(|(msg, _)| msg.chars().count() as u16)
+                .unwrap_or(0);
+            let button_width = button.display_label().chars().count() as u16;
+            if area.width >= msg_width.saturating_add(button_width) {
+                ui.button_rects = render_right_aligned_buttons(frame, &[button], area);
+            } else {
+                ui.button_rects.clear();
+            }
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
