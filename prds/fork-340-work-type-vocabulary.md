@@ -1,10 +1,12 @@
-# PRD fork: One work-type vocabulary, derived from the diff and checked by a gate rather than a prompt
+# PRD fork#340: One work-type vocabulary, derived from the diff and checked by a gate rather than a prompt
 
-**GitHub Issue**: **not yet filed** — filing it is step 1 of the resume checklist. Rename this file to `prds/fork-<n>-work-type-vocabulary.md` once the number exists.
+**GitHub Issue**: [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)
 
 **Priority**: Medium
 
-**Status** *(2026-08-15)*: **Planned, nothing implemented.** Research and design complete and recorded here; no worktree, no branch, no issue, no code. A fresh session can start at "Resume checklist" and needs nothing from the conversation that produced this.
+**Status** *(2026-08-15)*: **In progress — M1–M5 unstarted.** Research and design complete and recorded here. Issue filed, worktree `../dot-agent-deck-worktype` created on branch `feat/340-work-type-vocabulary` from `5d2a9205`, issue claimed. Resume checklist steps 1–3 are done; execution begins at step 4 (M1 then M2, delegated to `coder`), after the orchestrator's test-plan gate.
+
+**Sibling**: [fork #339](https://github.com/prageethw/dot-agent-deck/issues/339) — the other PRD parked in `12ccb6df`, merged as PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) (`5d2a9205`). Its file was renamed to `prds/fork-339-agent-type-badge-toggle.md` on that branch, so **M4's optional rename is already done** — it is no longer the 1-of-129 `prds/` file lacking an issue number, and R4 has nothing left to fix up there.
 
 **Fork-only?** **Mixed, and the split is clean.** M1 (reconciling `assemble-changelog.sh` with `pyproject.toml`) and M3–M4 (the `xtask` gate) are **upstream-worthy** — they fix a latent release-blocker and add a general-purpose gate in shared code. M2's CLAUDE.md clause and the `docs/develop/work-types.md` vocabulary are **fork preference** (upstream's label set differs — it carries both `feature` and `enhancement`, and a live `PRD` label). Per rule 19: build and merge here, then file the upstream-offer issue at merge time for M1/M3/M4 only.
 
