@@ -331,6 +331,8 @@ The question was reconsidered once during planning, when the lock's reach was br
 
 One asymmetry worth naming: gating the *chord fix* behind a flag would be actively wrong for the same reason #387 gives — shipping a build that still swallows `Ctrl+E` by default is the exact behaviour the PRD exists to remove, and a bug fix behind an opt-in flag is not a bug fix.
 
+**A `show_command_entry_lock()` flag was nonetheless added after this PRD merged (#404), and it reintroduced the exact problem this section argued against.** Because `experimental` resolves from a `.dot-agent-deck.toml` walk up from the process cwd, and the deck is normally launched from `$HOME` as a multi-project dashboard, the flag resolved OFF in ordinary use — the lock was "completely absent in normal use", the reflex-guard this PRD's rationale section exists to justify simply did not run. Graduated back to flag-free — restoring this section's original resolution — in fork [#346](https://github.com/prageethw/dot-agent-deck/issues/346).
+
 ## Amendments owed to #373 and #374
 
 Both PRDs are marked complete and both will assert behaviour that no longer exists. Leaving them stale is how a future reader relitigates a settled decision from a document that looks authoritative. At M6:
