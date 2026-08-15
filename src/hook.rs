@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
@@ -25,6 +25,17 @@ struct ClaudeCodeHookInput {
     // tests/codex_hook_ingestion.rs's schema-accurate `model` key). A NAMED
     // field, not routed through `_extra`/`metadata` (see the constraint on
     // that passthrough in `build_event_typed` below).
+    //
+    // Reviewer/auditor round 2 (MEDIUM 4 / F3): a strict `Option<String>`
+    // failed the WHOLE decode on a non-string `model` (object, number,
+    // bool, array) — before this field existed, any shape there landed
+    // harmlessly in `_extra` and was ignored. `handle_hook` swallows a
+    // decode error silently (`Err(_) => return ExitCode::SUCCESS`), so that
+    // was a total status blackout for the agent, not just a lost model.
+    // `lenient_model` degrades an unexpected shape to `None` instead,
+    // matching `EventType`'s `#[serde(other)]` catch-all and
+    // `codex_shell_command`'s "degrades gracefully" contract.
+    #[serde(default, deserialize_with = "lenient_model")]
     model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
@@ -40,10 +51,22 @@ struct OpenCodeHookInput {
     cwd: Option<String>,
     prompt: Option<String>,
     // PRD fork#378: mirrors ClaudeCodeHookInput's `model` field, in case a
-    // future OpenCode payload carries one; `None` today.
+    // future OpenCode payload carries one; `None` today. See that field's
+    // doc comment for why this is `lenient_model` rather than a strict
+    // `Option<String>`.
+    #[serde(default, deserialize_with = "lenient_model")]
     model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
+}
+
+/// A non-string `model` (object, number, bool, array) degrades to `None`
+/// rather than failing the whole payload decode. `null` and a missing key
+/// already decode to `None` via `#[serde(default)]`; this only widens the
+/// tolerance to non-string, non-null shapes. See the field doc comments on
+/// [`ClaudeCodeHookInput::model`] / [`OpenCodeHookInput::model`].
+fn lenient_model<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {

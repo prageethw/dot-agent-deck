@@ -2257,6 +2257,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_user_prompt: Some("build the feature".into()),
         live_target: None,
         shell_synthetic_working: false,
+        model: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -2391,6 +2392,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         )),
                         live_target: None,
                         shell_synthetic_working: false,
+                        model: None,
                     }),
                 };
                 let resp = AttachResponse {
@@ -2999,6 +3001,7 @@ async fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             last_user_prompt: None,
             live_target: None,
             shell_synthetic_working: true,
+            model: None,
         }),
     };
     // The paired `ShellIdle`, shaped the way `run_shell_activity_monitor`
@@ -3292,6 +3295,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             last_user_prompt: None,
             live_target: None,
             shell_synthetic_working: false,
+            model: None,
         }),
     }));
 

@@ -19237,6 +19237,32 @@ fn card_border_glyph(is_selected: bool, mode: UiMode) -> (BorderType, Modifier) 
     (BorderType::Thick, emphasis)
 }
 
+/// PRD fork#378 reviewer/audit round 2, item 1 (user decision): the badge's
+/// model label normalization. A compact heuristic — strip a leading vendor
+/// prefix from a short, stable list, case-insensitively; everything else,
+/// including a model id matching no known prefix, passes through unchanged.
+/// Deliberately NOT a per-model lookup table: vendor prefixes are stable but
+/// model ids churn constantly, and a lookup table is exactly the "hard-coded
+/// labels" the PRD rejects.
+const MODEL_VENDOR_PREFIXES: &[&str] = &["claude-", "gpt-", "gemini-", "llama-", "mistral-"];
+
+/// Strip a leading vendor prefix from `model` (see [`MODEL_VENDOR_PREFIXES`]),
+/// case-insensitively. A model that is ONLY a vendor prefix (e.g. `"claude-"`)
+/// falls back to its raw value rather than normalizing to an empty string —
+/// every matched prefix is strictly shorter than the model it is stripped
+/// from. Every prefix is pure ASCII, so slicing at its byte length always
+/// lands on a `model` char boundary regardless of what follows.
+fn normalize_model_label(model: &str) -> &str {
+    for prefix in MODEL_VENDOR_PREFIXES {
+        if model.len() > prefix.len()
+            && model.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            return &model[prefix.len()..];
+        }
+    }
+    model
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_session_card(
     frame: &mut Frame,
@@ -19314,8 +19340,17 @@ fn render_session_card(
         // (e.g. `Codex ·`, `Pi · orch-01`) stays intact — only a trailing
         // view-only annotation is added. Once a model IS known the badge
         // reads `<type> (<model>) · …` instead, and never the bare form.
-        let badge_text = match session.model.as_deref() {
-            Some(model) => format!("{} ({model})", session.agent_type),
+        //
+        // Reviewer/audit round 2 (F4): trim and treat an empty/whitespace-only
+        // model as absent, so a producer posting `Some("")` or `Some("   ")`
+        // renders the bare `<type> · …` form rather than an empty `()`.
+        let badge_text = match session
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(model) => format!("{} ({})", session.agent_type, normalize_model_label(model)),
             None => format!("{}", session.agent_type),
         };
         let label_after_badge = display_name
