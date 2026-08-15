@@ -36,7 +36,7 @@
 //! ([`EXIT_BASE_UNRESOLVABLE`]) rather than the generic rule-violation code
 //! ([`EXIT_RULE_VIOLATION`]) — otherwise this gate is empty on day one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -381,19 +381,24 @@ pub fn run_in(args: &[String], repo_dir: &Path) -> ExitCode {
         }
     };
 
-    match derive_work_type(&fragments, &branch) {
-        Ok(derivation) => {
-            println!(
-                "work-type-check: ok ({})",
-                describe_success(&derivation, &branch, &base_sha, &fragments)
-            );
-            ExitCode::SUCCESS
-        }
+    let derivation = match derive_work_type(&fragments, &branch) {
+        Ok(derivation) => derivation,
         Err(e) => {
             eprintln!("work-type-check: {e}");
-            ExitCode::from(EXIT_RULE_VIOLATION)
+            return ExitCode::from(EXIT_RULE_VIOLATION);
         }
+    };
+
+    if let Err(e) = check_rule(&derivation, repo_dir, &base_sha, &fragments) {
+        eprintln!("work-type-check: {e}");
+        return ExitCode::from(EXIT_RULE_VIOLATION);
     }
+
+    println!(
+        "work-type-check: ok ({})",
+        describe_success(&derivation, &branch, &base_sha, &fragments)
+    );
+    ExitCode::SUCCESS
 }
 
 /// `cargo xtask work-type-check`'s entry point — [`run_in`] against the
@@ -555,7 +560,7 @@ fn describe_success(
         }
     };
     format!(
-        "work type '{}' from {supplier}, base {base_sha}, 1 rule",
+        "work type '{}' from {supplier}, base {base_sha}, 5 rules",
         derivation.work_type
     )
 }
@@ -577,154 +582,296 @@ fn run_git(args: &[&str], dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `--self-test`: build a scratch repo that genuinely violates R0 — a diff
-/// adding no changelog fragment, on a branch carrying no recognized
-/// work-type prefix — and assert the real production pipeline
-/// ([`resolve_base`] + [`collect_added_fragments`] + [`derive_work_type`])
-/// rejects it, and rejects it for that *specific* reason. Follows
-/// `scripts/check-symlinks.sh --self-test` in shape: the same code path is
-/// shown failing on a broken case immediately before it runs for real
+/// One `--self-test` case's outcome against the *production* pipeline
+/// ([`resolve_base`] + [`collect_added_fragments`] + [`derive_work_type`] +
+/// [`check_rule`]) — distinct from [`WorkTypeError`]/[`RuleCheckError`] so a
+/// case can also fail on the successful-but-wrong-reason path without
+/// forcing every case's caller to match both error enums.
+enum PipelineError {
+    Derivation(WorkTypeError),
+    Rule(RuleCheckError),
+}
+
+impl fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineError::Derivation(e) => write!(f, "{e}"),
+            PipelineError::Rule(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Run the real production pipeline against `dir`'s already-checked-out
+/// `branch`. `branch` is passed explicitly rather than read via
+/// [`current_branch`] — a `--self-test` run in CI inherits `GITHUB_HEAD_REF`/
+/// `GITHUB_REF_NAME` from the *real* PR it is running inside, and
+/// `current_branch` prefers those over the scratch repo's own checkout, so
+/// calling it here would silently test the wrong branch.
+fn run_pipeline_for_self_test(dir: &Path, branch: &str) -> Result<Derivation, PipelineError> {
+    let base_sha = resolve_base(Some("origin/main"), dir).map_err(PipelineError::Derivation)?;
+    let fragments = collect_added_fragments(dir, &base_sha)
+        .map_err(|e| PipelineError::Rule(RuleCheckError::Collection(e)))?;
+    let derivation = derive_work_type(&fragments, branch).map_err(PipelineError::Derivation)?;
+    check_rule(&derivation, dir, &base_sha, &fragments).map_err(PipelineError::Rule)?;
+    Ok(derivation)
+}
+
+/// Shared scratch-repo bootstrap for every `--self-test` case below: init,
+/// set a throwaway identity, commit `README.md`, and fake `origin/main` at
+/// that commit so [`resolve_base`] succeeds — each case's violation lives in
+/// what it commits *after* this, never in whether the repo has a resolvable
+/// base (that is E1's separately-pinned case).
+fn init_self_test_repo(dir: &Path) -> Result<(), String> {
+    run_git(&["init", "-q"], dir)?;
+    run_git(
+        &[
+            "config",
+            "user.email",
+            "work-type-self-test@example.invalid",
+        ],
+        dir,
+    )?;
+    run_git(&["config", "user.name", "work-type-check --self-test"], dir)?;
+    std::fs::write(
+        dir.join("README.md"),
+        "work-type-check self-test scratch repo\n",
+    )
+    .map_err(|e| format!("write README.md: {e}"))?;
+    run_git(&["add", "README.md"], dir)?;
+    run_git(&["commit", "-q", "-m", "base"], dir)?;
+    run_git(&["update-ref", "refs/remotes/origin/main", "HEAD"], dir)?;
+    Ok(())
+}
+
+/// `--self-test`: construct a genuinely violating case **per rule** (R0
+/// through R4) and assert the real production pipeline rejects each one for
+/// its *specific* reason — not just any `Err`. Follows
+/// `scripts/check-symlinks.sh --self-test` in shape: the same code paths are
+/// shown failing on broken cases immediately before the real invocation runs
 /// (`ci.yml:325-326`'s pattern for `work-type-check`).
 ///
-/// E5: this must not decay into `assert!(derive("").is_err())`. It checks
-/// its own preconditions before trusting the result, so it fails loudly —
-/// rather than passing vacuously — if the case it builds ever stops
+/// E5: none of these may decay into `assert!(derive("").is_err())`. Each
+/// case checks its own preconditions before trusting the result, so it fails
+/// loudly — rather than passing vacuously — if the case it builds ever stops
 /// violating.
 fn self_test() -> ExitCode {
-    let tmp = match tempfile::tempdir() {
-        Ok(tmp) => tmp,
-        Err(e) => {
-            eprintln!("work-type-check --self-test: could not create a scratch dir: {e}");
-            return ExitCode::FAILURE;
+    let cases: [fn() -> Result<String, String>; 5] = [
+        self_test_r0,
+        self_test_r1,
+        self_test_r2,
+        self_test_r3,
+        self_test_r4,
+    ];
+
+    let mut all_ok = true;
+    for case in cases {
+        match case() {
+            Ok(msg) => println!("work-type-check --self-test: ok ({msg})"),
+            Err(msg) => {
+                eprintln!("work-type-check --self-test: FAILED — {msg}");
+                all_ok = false;
+            }
         }
-    };
+    }
+
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// R0: a diff adding no changelog fragment, on a branch carrying no
+/// recognized work-type prefix, must be rejected as `NoSupplier` — the
+/// vacuity guard (E3).
+fn self_test_r0() -> Result<String, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
     let dir = tmp.path();
+    init_self_test_repo(dir)?;
 
-    let build_scratch_repo = || -> Result<(), String> {
-        run_git(&["init", "-q"], dir)?;
-        run_git(
-            &[
-                "config",
-                "user.email",
-                "work-type-self-test@example.invalid",
-            ],
-            dir,
-        )?;
-        run_git(&["config", "user.name", "work-type-check --self-test"], dir)?;
-        std::fs::write(
-            dir.join("README.md"),
-            "work-type-check self-test scratch repo\n",
-        )
-        .map_err(|e| format!("write README.md: {e}"))?;
-        run_git(&["add", "README.md"], dir)?;
-        run_git(&["commit", "-q", "-m", "base"], dir)?;
-        // Fake origin/main locally so base resolution succeeds — this
-        // self-test proves R0's derivation is rejected, not E1's already
-        // separately-pinned base-unresolvable case.
-        run_git(&["update-ref", "refs/remotes/origin/main", "HEAD"], dir)?;
-        // A branch carrying none of the four recognized work-type prefixes,
-        // with no divergence from base at all — no fragment can have been
-        // added, so tier 1 is empty by construction too.
-        run_git(&["checkout", "-q", "-b", "self-test-no-supplier"], dir)?;
-        Ok(())
-    };
-    if let Err(e) = build_scratch_repo() {
-        eprintln!("work-type-check --self-test: could not build the violating scratch repo: {e}");
-        return ExitCode::FAILURE;
-    }
+    let branch = "self-test-r0-no-supplier";
+    run_git(&["checkout", "-q", "-b", branch], dir)?;
+    // No further changes: this branch/diff supplies nothing to either tier.
 
-    let branch = "self-test-no-supplier";
-    // Fail loudly (E5) rather than trusting the scratch repo blindly: if a
-    // future edit ever gives this literal branch name a recognized prefix,
-    // the case stops violating and this must say so, not report a false ok.
     if branch_prefix_to_work_type(branch).is_some() {
-        eprintln!(
-            "work-type-check --self-test: FAILED — scratch branch {branch:?} now carries a \
-             recognized work-type prefix; this no longer builds a violating case."
-        );
-        return ExitCode::FAILURE;
+        return Err(format!(
+            "R0: scratch branch {branch:?} now carries a recognized work-type prefix; this no \
+             longer builds a violating case"
+        ));
     }
 
-    let base_sha = match resolve_base(Some("origin/main"), dir) {
-        Ok(sha) => sha,
-        Err(e) => {
-            eprintln!(
-                "work-type-check --self-test: FAILED — could not resolve the scratch repo's \
-                 own base, so this proves nothing about R0: {e}"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let fragments = match collect_added_fragments(dir, &base_sha) {
-        Ok(fragments) => fragments,
-        Err(e) => {
-            eprintln!(
-                "work-type-check --self-test: FAILED — could not read the scratch repo's own \
-                 diff: {e}"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    if !fragments.is_empty() {
-        eprintln!(
-            "work-type-check --self-test: FAILED — the scratch repo unexpectedly carries added \
-             changelog fragments ({fragments:?}); this no longer builds a violating case."
-        );
-        return ExitCode::FAILURE;
+    match run_pipeline_for_self_test(dir, branch) {
+        Err(PipelineError::Derivation(WorkTypeError::NoSupplier { .. })) => Ok(
+            "R0: a diff with no added changelog fragment and an unprefixed branch was \
+             correctly rejected as NoSupplier"
+                .to_string(),
+        ),
+        Ok(derivation) => Err(format!(
+            "R0: the violating case was accepted as {derivation:?} instead of being rejected"
+        )),
+        Err(other) => Err(format!(
+            "R0: the violating case was rejected, but not for the NoSupplier reason: {other}"
+        )),
     }
+}
 
-    match derive_work_type(&fragments, branch) {
-        Err(WorkTypeError::NoSupplier { .. }) => {
-            println!(
-                "work-type-check --self-test: ok (a diff with no added changelog fragment and \
-                 an unprefixed branch was correctly rejected as NoSupplier)"
-            );
-            ExitCode::SUCCESS
-        }
-        Ok(derivation) => {
-            eprintln!(
-                "work-type-check --self-test: FAILED — the violating case was accepted as \
-                 {derivation:?} instead of being rejected"
-            );
-            ExitCode::FAILURE
-        }
-        Err(other) => {
-            eprintln!(
-                "work-type-check --self-test: FAILED — the violating case was rejected, but \
-                 not for the NoSupplier reason: {other:?}"
-            );
-            ExitCode::FAILURE
-        }
+/// R1: a `doc`-typed diff (supplied by the `docs/` branch prefix) that adds
+/// a `#[spec(` occurrence must be rejected as `DocAddsSpecTest` — the narrow
+/// negative limb.
+fn self_test_r1() -> Result<String, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
+    let dir = tmp.path();
+    init_self_test_repo(dir)?;
+
+    let branch = "docs/999001-self-test-r1";
+    run_git(&["checkout", "-q", "-b", branch], dir)?;
+    std::fs::create_dir_all(dir.join("tests")).map_err(|e| format!("mkdir tests: {e}"))?;
+    std::fs::write(
+        dir.join("tests/self_test_r1_fixture.rs"),
+        "#[spec(\"fixture/self-test/r1\")]\nfn placeholder() {}\n",
+    )
+    .map_err(|e| format!("write tests/self_test_r1_fixture.rs: {e}"))?;
+    run_git(&["add", "tests/self_test_r1_fixture.rs"], dir)?;
+    run_git(&["commit", "-q", "-m", "r1 self-test violation"], dir)?;
+
+    match run_pipeline_for_self_test(dir, branch) {
+        Err(PipelineError::Rule(RuleCheckError::Violation(RuleViolation::DocAddsSpecTest))) => Ok(
+            "R1: a 'doc' diff adding a #[spec( occurrence was correctly rejected as \
+                DocAddsSpecTest"
+                .to_string(),
+        ),
+        Ok(derivation) => Err(format!(
+            "R1: the violating case was accepted as {derivation:?} instead of being rejected"
+        )),
+        Err(other) => Err(format!(
+            "R1: the violating case was rejected, but not for the DocAddsSpecTest reason: {other}"
+        )),
+    }
+}
+
+/// R2: a `chore`-typed diff (supplied by the `chore/` branch prefix) that
+/// adds a new CLI flag must be rejected as `ChoreAddsCliFlag` — a chore must
+/// never add user-facing surface.
+fn self_test_r2() -> Result<String, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
+    let dir = tmp.path();
+    init_self_test_repo(dir)?;
+
+    let branch = "chore/999002-self-test-r2";
+    run_git(&["checkout", "-q", "-b", branch], dir)?;
+    std::fs::create_dir_all(dir.join("src")).map_err(|e| format!("mkdir src: {e}"))?;
+    std::fs::write(
+        dir.join("src/self_test_r2_fixture.rs"),
+        "#[arg(long = \"self_test_flag\")]\npub flag: bool,\n",
+    )
+    .map_err(|e| format!("write src/self_test_r2_fixture.rs: {e}"))?;
+    run_git(&["add", "src/self_test_r2_fixture.rs"], dir)?;
+    run_git(&["commit", "-q", "-m", "r2 self-test violation"], dir)?;
+
+    match run_pipeline_for_self_test(dir, branch) {
+        Err(PipelineError::Rule(RuleCheckError::Violation(RuleViolation::ChoreAddsCliFlag))) => Ok(
+            "R2: a 'chore' diff adding a CLI flag was correctly rejected as \
+                ChoreAddsCliFlag"
+                .to_string(),
+        ),
+        Ok(derivation) => Err(format!(
+            "R2: the violating case was accepted as {derivation:?} instead of being rejected"
+        )),
+        Err(other) => Err(format!(
+            "R2: the violating case was rejected, but not for the ChoreAddsCliFlag reason: {other}"
+        )),
+    }
+}
+
+/// R3: a `bug`-typed diff (supplied by the `fix/` branch prefix) with no
+/// `#[spec]` test delta and no fragment (so no `No-Test:` escape hatch
+/// either) must be rejected as `BugMissingSpecTestDelta`.
+fn self_test_r3() -> Result<String, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
+    let dir = tmp.path();
+    init_self_test_repo(dir)?;
+
+    let branch = "fix/999003-self-test-r3";
+    run_git(&["checkout", "-q", "-b", branch], dir)?;
+    std::fs::write(
+        dir.join("README.md"),
+        "work-type-check self-test scratch repo (r3 change)\n",
+    )
+    .map_err(|e| format!("rewrite README.md: {e}"))?;
+    run_git(&["add", "README.md"], dir)?;
+    run_git(&["commit", "-q", "-m", "r3 self-test violation"], dir)?;
+
+    match run_pipeline_for_self_test(dir, branch) {
+        Err(PipelineError::Rule(RuleCheckError::Violation(
+            RuleViolation::BugMissingSpecTestDelta,
+        ))) => Ok(
+            "R3: a 'bug' diff with no #[spec] test delta and no No-Test: escape hatch was \
+             correctly rejected as BugMissingSpecTestDelta"
+                .to_string(),
+        ),
+        Ok(derivation) => Err(format!(
+            "R3: the violating case was accepted as {derivation:?} instead of being rejected"
+        )),
+        Err(other) => Err(format!(
+            "R3: the violating case was rejected, but not for the BugMissingSpecTestDelta \
+             reason: {other}"
+        )),
+    }
+}
+
+/// R4: a `.feature.md` fragment whose numeric stem has no matching `prds/`
+/// file anywhere on the filesystem must be rejected as `PrdNoMatchingFile`.
+fn self_test_r4() -> Result<String, String> {
+    let tmp = tempfile::tempdir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
+    let dir = tmp.path();
+    init_self_test_repo(dir)?;
+
+    let branch = "feat/999004-self-test-r4";
+    run_git(&["checkout", "-q", "-b", branch], dir)?;
+    std::fs::create_dir_all(dir.join("changelog.d"))
+        .map_err(|e| format!("mkdir changelog.d: {e}"))?;
+    std::fs::write(
+        dir.join("changelog.d/999004.feature.md"),
+        "Self-test fixture fragment; deliberately has no matching prds/ file.\n",
+    )
+    .map_err(|e| format!("write changelog.d/999004.feature.md: {e}"))?;
+    run_git(&["add", "changelog.d/999004.feature.md"], dir)?;
+    run_git(&["commit", "-q", "-m", "r4 self-test violation"], dir)?;
+
+    match run_pipeline_for_self_test(dir, branch) {
+        Err(PipelineError::Rule(RuleCheckError::Violation(RuleViolation::PrdNoMatchingFile {
+            ..
+        }))) => Ok(
+            "R4: a 'prd' fragment with no matching prds/ file was correctly rejected as \
+             PrdNoMatchingFile"
+                .to_string(),
+        ),
+        Ok(derivation) => Err(format!(
+            "R4: the violating case was accepted as {derivation:?} instead of being rejected"
+        )),
+        Err(other) => Err(format!(
+            "R4: the violating case was rejected, but not for the PrdNoMatchingFile reason: \
+             {other}"
+        )),
     }
 }
 
 // ---------------------------------------------------------------------------
 // M4 — rules R1-R4 (PRD fork#340). R0 above is the spine and is unaffected.
 //
-// Each rule below is a pure function over a small, directly-constructible
-// struct — the same shape as `derive_work_type` taking `&[AddedFragment]`
-// rather than reading git itself. The git-diff-to-struct extraction glue
-// (walking the actual diff to fill in these booleans) is the coder's to
-// write when R1-R4 are wired into `run_in`; it is out of this round's scope
-// and carries no test here.
-//
-// RED: every function below is `todo!()`. No wrong-but-typed stub — a stub
-// that returns a fixed `Err` would make every "must fail" case below pass
-// vacuously, which in a PRD about empty gates is the worst possible RED.
+// Each rule is a pure function over a small, directly-constructible struct —
+// the same shape as `derive_work_type` taking `&[AddedFragment]` rather than
+// reading git itself. The git-diff-to-struct extraction glue that fills in
+// these booleans from a real diff (`collect_doc_diff`, `collect_chore_diff`,
+// `collect_bug_diff`, `check_prd_fragments`, further down) is untested by
+// Tier A by design — the PRD's tester round deliberately left it unstubbed
+// so an invented signature would not need unwinding. `check_rule` wires it
+// into `run_in`'s pipeline.
 // ---------------------------------------------------------------------------
 
 /// Why R1-R4 rejected a diff. Kept as one enum (rather than one per rule)
 /// because callers that reject a whole PR want to match across rules
 /// uniformly, the same reasoning `WorkTypeError` already applies to R0.
-// M4 RED (PRD fork#340): R1-R4 are pinned by tests but not yet wired into
-// `run_in`'s pipeline — that wiring is the coder's, scoped out of this
-// round. Until then every item below is reachable only from `#[cfg(test)]`,
-// so `not(test)` dead-code would otherwise fire on the plain (non-test)
-// binary target. Same precedent as `src/platform/fsperm/mod.rs`. Remove
-// every one of these attributes when the wiring lands — a real caller
-// resolves the lint, so a leftover `allow` at that point means the coder
-// forgot to plumb it in, not that the annotation is still needed.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleViolation {
     /// R1 (`doc`): the diff added a `#[spec(` — a synthetic test, which
@@ -815,7 +962,6 @@ impl fmt::Display for RuleViolation {
 
 /// R1's inputs — booleans over the diff, decoupled from how they were
 /// computed (see the module-level note above).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocDiff {
     /// The diff touches `docs/**`, `site/**`, a root `*.md`, or `prds/**`.
@@ -830,13 +976,20 @@ pub struct DocDiff {
 /// work, so "zero diff under `src/`" was rejected. Instead: must touch one
 /// of `docs/**`/`site/**`/root `*.md`/`prds/**` (positive), and must not add
 /// a `#[spec(` or touch `tests/**` (narrow negative).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn check_r1_doc(_diff: &DocDiff) -> Result<(), RuleViolation> {
-    todo!("R1 doc rule — PRD fork#340 M4, implemented by coder")
+pub fn check_r1_doc(diff: &DocDiff) -> Result<(), RuleViolation> {
+    if diff.adds_spec_attr {
+        return Err(RuleViolation::DocAddsSpecTest);
+    }
+    if diff.touches_tests {
+        return Err(RuleViolation::DocTouchesTests);
+    }
+    if !diff.touches_doc_paths {
+        return Err(RuleViolation::DocMissingDocPaths);
+    }
+    Ok(())
 }
 
 /// R2's inputs — booleans over the diff.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChoreDiff {
     /// The diff added a new CLI flag (`#[arg(long = "`).
@@ -850,9 +1003,17 @@ pub struct ChoreDiff {
 /// R2 — refined: `test:` is 43 of the last 400 commits and a pure-chore
 /// sweep can touch all of `tests/`, so "zero diff under `tests/`" was
 /// rejected outright. Instead: must not add a new user-facing CLI surface.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn check_r2_chore(_diff: &ChoreDiff) -> Result<(), RuleViolation> {
-    todo!("R2 chore rule — PRD fork#340 M4, implemented by coder")
+pub fn check_r2_chore(diff: &ChoreDiff) -> Result<(), RuleViolation> {
+    if diff.adds_cli_flag {
+        return Err(RuleViolation::ChoreAddsCliFlag);
+    }
+    if diff.adds_command_variant {
+        return Err(RuleViolation::ChoreAddsCommandVariant);
+    }
+    if diff.adds_new_docs_page {
+        return Err(RuleViolation::ChoreAddsNewDocsPage);
+    }
+    Ok(())
 }
 
 /// Whether this diff adds or modifies (by body fingerprint) at least one
@@ -866,12 +1027,16 @@ pub fn check_r2_chore(_diff: &ChoreDiff) -> Result<(), RuleViolation> {
 /// leaves the token-stream fingerprint unchanged so it is already excluded
 /// by construction. That is the mechanism that proves R3's "whitespace
 /// does not count" claim rather than merely asserting it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn spec_test_delta(
-    _base: &BTreeMap<String, TestEntry>,
-    _head: &BTreeMap<String, TestEntry>,
+    base: &BTreeMap<String, TestEntry>,
+    head: &BTreeMap<String, TestEntry>,
 ) -> bool {
-    todo!("R3 spec-test delta — PRD fork#340 M4, implemented by coder")
+    if !crate::list_tests::compute_created(base, head).is_empty() {
+        return true;
+    }
+    crate::list_tests::compute_modified(base, head)
+        .iter()
+        .any(|row| row.body_changed)
 }
 
 /// Parse a `No-Test: <reason>` directive out of a changelog fragment's file
@@ -881,13 +1046,14 @@ pub fn spec_test_delta(
 /// `Some(reason)` when one does, where `reason` is the trimmed text after
 /// the colon — which may be empty; see [`check_r3_bug`] for what an empty
 /// reason means for the escape hatch.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn parse_no_test_directive(_fragment_body: &str) -> Option<String> {
-    todo!("R3 No-Test: directive parsing — PRD fork#340 M4, implemented by coder")
+pub fn parse_no_test_directive(fragment_body: &str) -> Option<String> {
+    fragment_body.lines().find_map(|line| {
+        line.strip_prefix("No-Test:")
+            .map(|rest| rest.trim().to_string())
+    })
 }
 
 /// R3's inputs.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BugDiff {
     /// [`spec_test_delta`]'s result for this diff.
@@ -912,9 +1078,16 @@ pub struct BugDiff {
 /// unaccountable bypass string rather than a documented exception. So
 /// `no_test_reason: Some(reason)` only satisfies R3 when `reason`, trimmed,
 /// is non-empty.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn check_r3_bug(_diff: &BugDiff) -> Result<(), RuleViolation> {
-    todo!("R3 bug rule — PRD fork#340 M4, implemented by coder")
+pub fn check_r3_bug(diff: &BugDiff) -> Result<(), RuleViolation> {
+    if diff.spec_test_delta {
+        return Ok(());
+    }
+    if let Some(reason) = &diff.no_test_reason
+        && !reason.trim().is_empty()
+    {
+        return Ok(());
+    }
+    Err(RuleViolation::BugMissingSpecTestDelta)
 }
 
 /// The fragment's stem — the portion of the filename before the first `.`,
@@ -922,9 +1095,12 @@ pub fn check_r3_bug(_diff: &BugDiff) -> Result<(), RuleViolation> {
 /// for the real historical fragment `changelog.d/clickable-hyperlinks.feature.md`
 /// (E9: a `.feature.md` with a non-numeric stem — seven historical fragments
 /// used this shape). `None` when `path`'s file name carries no `.` at all.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn fragment_stem(_path: &str) -> Option<&str> {
-    todo!("R4 fragment stem extraction — PRD fork#340 M4, implemented by coder")
+pub fn fragment_stem(path: &str) -> Option<&str> {
+    let file_name = Path::new(path).file_name()?.to_str()?;
+    if !file_name.contains('.') {
+        return None;
+    }
+    file_name.split('.').next()
 }
 
 /// Whether a `prds/` file matches fragment stem `stem` —
@@ -933,9 +1109,31 @@ pub fn fragment_stem(_path: &str) -> Option<&str> {
 /// whole point: a PRD spans many milestones and many PRs, and only the
 /// first touches the file, so requiring the file *in the diff* would fail
 /// most legitimate PRD PRs.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn matching_prds_file_exists(_prds_dir: &Path, _stem: &str) -> Result<bool, String> {
-    todo!("R4 filesystem existence check — PRD fork#340 M4, implemented by coder")
+pub fn matching_prds_file_exists(prds_dir: &Path, stem: &str) -> Result<bool, String> {
+    let prefixes = [format!("{stem}-"), format!("fork-{stem}-")];
+    if dir_has_prefixed_md_file(prds_dir, &prefixes)? {
+        return Ok(true);
+    }
+    dir_has_prefixed_md_file(&prds_dir.join("done"), &prefixes)
+}
+
+/// Whether `dir` (if it exists) directly contains a `.md` file whose name
+/// starts with one of `prefixes` — [`matching_prds_file_exists`]'s shared
+/// scan, run once against `prds/` and once against `prds/done/`.
+fn dir_has_prefixed_md_file(dir: &Path, prefixes: &[String]) -> Result<bool, String> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("read_dir entry in {}: {e}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.ends_with(".md") && prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// R4 — refined: check existence on the filesystem (via
@@ -953,13 +1151,353 @@ pub fn matching_prds_file_exists(_prds_dir: &Path, _stem: &str) -> Result<bool, 
 /// leaving it to fall out of `matching_prds_file_exists` returning `false`)
 /// makes E9's failure name itself instead of reading as an ordinary
 /// no-match.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn check_r4_prd(
-    _fragment_path: &str,
-    _stem: &str,
-    _prds_file_exists: bool,
+    fragment_path: &str,
+    stem: &str,
+    prds_file_exists: bool,
 ) -> Result<(), RuleViolation> {
-    todo!("R4 prd rule — PRD fork#340 M4, implemented by coder")
+    if stem.is_empty() || !stem.chars().all(|c| c.is_ascii_digit()) {
+        return Err(RuleViolation::PrdNonNumericStem {
+            fragment_path: fragment_path.to_string(),
+            stem: stem.to_string(),
+        });
+    }
+    if !prds_file_exists {
+        return Err(RuleViolation::PrdNoMatchingFile {
+            fragment_path: fragment_path.to_string(),
+            stem: stem.to_string(),
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The git-diff-to-struct extraction glue — untested by Tier A by design (see
+// the module-level note above `RuleViolation`). Walks the actual diff
+// between `base_sha` and `HEAD` in `repo_dir` to fill in each rule's input
+// struct, then dispatches to the matching `check_r*` function.
+// ---------------------------------------------------------------------------
+
+/// Either a rule genuinely rejected the diff, or the glue could not even
+/// compute the rule's inputs (a `git` invocation failed, a file could not be
+/// read). Kept distinct from [`RuleViolation`] so a caller — and
+/// `--self-test`'s per-rule cases — can tell "the diff is bad" apart from
+/// "something broke while checking it".
+#[derive(Debug)]
+enum RuleCheckError {
+    Violation(RuleViolation),
+    Collection(String),
+}
+
+impl From<RuleViolation> for RuleCheckError {
+    fn from(v: RuleViolation) -> Self {
+        RuleCheckError::Violation(v)
+    }
+}
+
+impl From<String> for RuleCheckError {
+    fn from(s: String) -> Self {
+        RuleCheckError::Collection(s)
+    }
+}
+
+impl fmt::Display for RuleCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuleCheckError::Violation(v) => write!(f, "{v}"),
+            RuleCheckError::Collection(s) => {
+                write!(f, "could not evaluate the rule for this diff: {s}")
+            }
+        }
+    }
+}
+
+/// Dispatch to whichever rule matches `derivation.work_type`, having walked
+/// the real diff between `base_sha` and `HEAD` in `repo_dir` to build that
+/// rule's input struct. `fragments` is R0's own already-collected added
+/// fragments, reused here rather than re-walking `changelog.d`.
+fn check_rule(
+    derivation: &Derivation,
+    repo_dir: &Path,
+    base_sha: &str,
+    fragments: &[AddedFragment],
+) -> Result<(), RuleCheckError> {
+    match derivation.work_type {
+        WorkType::Doc => {
+            let diff = collect_doc_diff(repo_dir, base_sha)?;
+            check_r1_doc(&diff)?;
+        }
+        WorkType::Chore => {
+            let diff = collect_chore_diff(repo_dir, base_sha)?;
+            check_r2_chore(&diff)?;
+        }
+        WorkType::Bug => {
+            let diff = collect_bug_diff(repo_dir, base_sha, fragments)?;
+            check_r3_bug(&diff)?;
+        }
+        WorkType::Prd => check_prd_fragments(repo_dir, fragments)?,
+    }
+    Ok(())
+}
+
+/// Every path changed (any status) between `base_sha` and `HEAD`.
+fn changed_files(repo_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .args(["diff", "--name-only", base_sha, "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git diff --name-only {base_sha} HEAD: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect())
+}
+
+/// Every path newly *added* between `base_sha` and `HEAD` — R2's "new page
+/// under docs/" must not count a file that already existed and was merely
+/// edited.
+fn added_files(repo_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .args(["diff", "--name-status", "--diff-filter=A", base_sha, "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| {
+            format!("invoke git diff --name-status --diff-filter=A {base_sha} HEAD: {e}")
+        })?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, p)| p.trim().to_string()))
+        .collect())
+}
+
+/// Every line *added* by the diff between `base_sha` and `HEAD` (a unified-
+/// diff `+` line, excluding the `+++` file header), concatenated — R1's
+/// `adds_spec_attr` and R2's `adds_cli_flag` are both "did this diff add a
+/// line matching X" checks over that text.
+fn added_diff_text(repo_dir: &Path, base_sha: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["diff", base_sha, "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git diff {base_sha} HEAD: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// R1's positive limb: `docs/**`, `site/**`, a root `*.md`, or `prds/**`.
+fn is_doc_path(path: &str) -> bool {
+    path.starts_with("docs/")
+        || path.starts_with("site/")
+        || path.starts_with("prds/")
+        || (!path.contains('/') && path.ends_with(".md"))
+}
+
+/// R1's narrow negative limb, the `tests/**` half.
+fn is_test_path(path: &str) -> bool {
+    path.starts_with("tests/")
+}
+
+fn collect_doc_diff(repo_dir: &Path, base_sha: &str) -> Result<DocDiff, String> {
+    let files = changed_files(repo_dir, base_sha)?;
+    let touches_doc_paths = files.iter().any(|p| is_doc_path(p));
+    let touches_tests = files.iter().any(|p| is_test_path(p));
+    let adds_spec_attr = added_diff_text(repo_dir, base_sha)?.contains("#[spec(");
+    Ok(DocDiff {
+        touches_doc_paths,
+        adds_spec_attr,
+        touches_tests,
+    })
+}
+
+fn collect_chore_diff(repo_dir: &Path, base_sha: &str) -> Result<ChoreDiff, String> {
+    let adds_cli_flag = added_diff_text(repo_dir, base_sha)?.contains("#[arg(long = \"");
+    let adds_command_variant = command_variant_added(repo_dir, base_sha)?;
+    let adds_new_docs_page = added_files(repo_dir, base_sha)?
+        .iter()
+        .any(|p| p.starts_with("docs/") && p.ends_with(".md"));
+    Ok(ChoreDiff {
+        adds_cli_flag,
+        adds_command_variant,
+        adds_new_docs_page,
+    })
+}
+
+/// Whether `src/main.rs`'s `enum Commands` gained a variant between
+/// `base_sha` and `HEAD`. Compares the two refs' variant name *sets* rather
+/// than scanning added diff lines for something variant-shaped, because a
+/// line-based scan cannot tell a genuinely new variant apart from an added
+/// doc comment or attribute on an existing one. A ref where `src/main.rs`
+/// does not exist (or carries no `enum Commands`) yields an empty set rather
+/// than an error — the only realistic case is a scratch repo that never had
+/// the file, not a `git` failure worth propagating.
+fn command_variant_added(repo_dir: &Path, base_sha: &str) -> Result<bool, String> {
+    let base_source = git_show_in(repo_dir, base_sha, "src/main.rs").unwrap_or_default();
+    let head_source = git_show_in(repo_dir, "HEAD", "src/main.rs").unwrap_or_default();
+    let base_variants = extract_enum_variant_names(&base_source, "Commands");
+    let head_variants = extract_enum_variant_names(&head_source, "Commands");
+    Ok(head_variants.difference(&base_variants).next().is_some())
+}
+
+/// The names of `enum <enum_name> {`'s top-level variants in `source` —
+/// e.g. `Hook`, `Hooks`, `Config`, ... for `src/main.rs`'s `enum Commands`.
+/// Depth-tracks braces rather than parsing the enum with `syn`, since this
+/// only needs variant *names*, not their field shapes.
+fn extract_enum_variant_names(source: &str, enum_name: &str) -> BTreeSet<String> {
+    let marker = format!("enum {enum_name} {{");
+    let Some(start) = source.find(&marker) else {
+        return BTreeSet::new();
+    };
+    let body = &source[start + marker.len()..];
+
+    let mut names = BTreeSet::new();
+    let mut depth = 1i32; // just inside the enum's own opening brace
+    for line in body.lines() {
+        if depth == 0 {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if depth == 1
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with('/')
+        {
+            let name: String = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                names.insert(name);
+            }
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
+fn collect_bug_diff(
+    repo_dir: &Path,
+    base_sha: &str,
+    fragments: &[AddedFragment],
+) -> Result<BugDiff, String> {
+    let base_tests = collect_spec_sources_at(repo_dir, base_sha)?;
+    let head_tests = collect_spec_sources_at(repo_dir, "HEAD")?;
+    let delta = spec_test_delta(&base_tests, &head_tests);
+
+    let no_test_reason = fragments
+        .iter()
+        .filter(|f| suffix_to_work_type(&f.suffix) == Some(WorkType::Bug))
+        .find_map(|f| {
+            let body = std::fs::read_to_string(repo_dir.join(&f.path)).ok()?;
+            parse_no_test_directive(&body)
+        });
+
+    Ok(BugDiff {
+        spec_test_delta: delta,
+        no_test_reason,
+    })
+}
+
+/// R4 only has something to check when a `feature`/`breaking` fragment was
+/// actually added — a `prd` derivation supplied purely by the branch prefix
+/// (tier 2, no fragment) has nothing on disk to validate against.
+fn check_prd_fragments(repo_dir: &Path, fragments: &[AddedFragment]) -> Result<(), RuleCheckError> {
+    let prds_dir = repo_dir.join("prds");
+    for fragment in fragments {
+        if suffix_to_work_type(&fragment.suffix) != Some(WorkType::Prd) {
+            continue;
+        }
+        let Some(stem) = fragment_stem(&fragment.path) else {
+            continue;
+        };
+        let stem = stem.to_string();
+        let exists = matching_prds_file_exists(&prds_dir, &stem)?;
+        check_r4_prd(&fragment.path, &stem, exists)?;
+    }
+    Ok(())
+}
+
+/// Repo-dir-parameterized sibling of `list_tests::collect_tests_at_ref` —
+/// duplicated rather than reused because that function (and the `git_show`/
+/// `git_ls_tree` it calls) always runs against the process's own cwd, with
+/// no `repo_dir` parameter to thread through; widening that private,
+/// well-tested function's signature was judged out of scope for glue this
+/// round's tests do not exercise. [`spec_test_delta`] itself — the part the
+/// PRD calls out by name — DOES reuse `list_tests::compute_created` /
+/// `compute_modified` rather than reimplementing the delta logic.
+fn collect_spec_sources_at(
+    repo_dir: &Path,
+    reference: &str,
+) -> Result<BTreeMap<String, TestEntry>, String> {
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for f in git_ls_tree_in(repo_dir, reference, "tests")? {
+        if !f.ends_with(".rs") || f == "tests/common/mod.rs" {
+            continue;
+        }
+        let body = git_show_in(repo_dir, reference, &f)?;
+        sources.push((f, body));
+    }
+    for f in git_ls_tree_in(repo_dir, reference, "src")? {
+        if !f.ends_with(".rs") {
+            continue;
+        }
+        let body = git_show_in(repo_dir, reference, &f)?;
+        if !body.contains("#[spec(") {
+            continue;
+        }
+        sources.push((f, body));
+    }
+    crate::list_tests::collect_tests_from_sources(&sources)
+}
+
+fn git_ls_tree_in(repo_dir: &Path, reference: &str, path: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", reference, path])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git ls-tree {reference} {path}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-tree {reference} {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect())
+}
+
+fn git_show_in(repo_dir: &Path, reference: &str, path: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["show", &format!("{reference}:{path}")])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git show {reference}:{path}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git show {reference}:{path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]
