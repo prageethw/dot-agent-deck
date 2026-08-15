@@ -74,6 +74,9 @@ pub enum Action {
     /// in command mode (see `scope_zoom`) — the default binding is a plain
     /// `z`, so off that one combination the character belongs to the agent.
     ToggleZoom,
+    /// Fork #339: toggle the deck-global agent-type badge on session cards
+    /// (`Ctrl+m` / a bare `m`, command mode only). Off by default.
+    ToggleAgentTypeBadge,
     Jump1,
     Jump2,
     Jump3,
@@ -179,6 +182,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_zoom",
         default: "Ctrl+z",
         description: "Zoom focused pane",
+    },
+    ActionSpec {
+        action: Action::ToggleAgentTypeBadge,
+        section: Section::Global,
+        name: "toggle_agent_type_badge",
+        default: "Ctrl+m",
+        description: "Toggle agent-type badge on cards",
     },
     ActionSpec {
         action: Action::Jump1,

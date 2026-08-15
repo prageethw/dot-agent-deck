@@ -72,7 +72,7 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
     );
 }
 
-/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane.
+/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane. Also asserts the overlay documents the `Ctrl+m` / `m` agent-badge toggle added in PRD #339, so the help reference does not silently drift out of sync with the button/key actually wired up.
 #[spec("dashboard/help/002")]
 #[test]
 fn help_002_overlay_documents_ctrl_d_toggle() {
@@ -86,5 +86,9 @@ fn help_002_overlay_documents_ctrl_d_toggle() {
     assert!(
         !buf.contains("command mode (dashboard)"),
         "the stale one-way Ctrl+D description must be removed\n--- rendered overlay ---\n{buf}"
+    );
+    assert!(
+        buf.contains("ctrl+m / m") && buf.contains("show / hide agent badges"),
+        "help overlay must document the agent-badge toggle (Ctrl+m / m -> Show / hide agent badges)\n--- rendered overlay ---\n{buf}"
     );
 }

@@ -189,10 +189,10 @@ pub struct AgentSpec {
     /// the readiness gate needs and used to infer, wrongly, from
     /// [`Self::hook_install`]. See [`PrePromptReadiness`].
     pub pre_prompt_readiness: PrePromptReadiness,
-    /// Per-agent badge colour. Populated now as the single source of truth even
-    /// though rendering coloured badges on cards is a later PRD #20 milestone.
-    /// A named ANSI colour only (no absolute `Color::Rgb`), matching the
-    /// palette policy (`src/palette.rs`) so terminal themes can remap it.
+    /// Per-agent badge colour, rendered on session cards when the fork #339
+    /// agent-type badge toggle (`Ctrl+m` / `m`) is on. A named ANSI colour
+    /// only (no absolute `Color::Rgb`), matching the palette policy
+    /// (`src/palette.rs`) so terminal themes can remap it.
     pub badge_color: Color,
     /// PRD #20 finding #15: this agent's OWN integration handlers, so strategy
     /// dispatch resolves from the SPEC rather than a hardcoded incumbent module
