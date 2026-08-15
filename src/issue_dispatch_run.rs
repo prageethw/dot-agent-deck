@@ -2975,6 +2975,23 @@ exit 0
             );
         }
 
+        /// Resolve `path` for comparison purposes only, falling back to
+        /// `path` unchanged if it cannot be resolved (e.g. it does not
+        /// exist). `git` reports admin-entry and `worktree list` paths
+        /// through its own realpath resolution, which diverges from the raw
+        /// `ws_root`-derived path on at least two platforms: macOS's `/var`
+        /// -> `/private/var` symlink, and Windows's `RUNNER~1` short-name
+        /// form. Comparing both sides through this same resolution makes
+        /// the comparison platform-stable without canonicalizing `ws_root`
+        /// itself, which stays raw because `Path::canonicalize` produces a
+        /// `\\?\`-prefixed path that `git worktree add` rejects outright
+        /// (see the comment on `ws_root` above) — this function is never
+        /// used for a path handed to `create_worktree_sync`, only for
+        /// comparing git's own output against it.
+        fn canonical_for_compare(path: &Path) -> PathBuf {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        }
+
         /// Count `.git/worktrees/<name>/gitdir` admin entries whose target
         /// resolves to `worktree_dir`'s own `.git` — the exact
         /// admin-directory duplication the issue measured (two entries
@@ -2984,13 +3001,13 @@ exit 0
             let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
                 return 0;
             };
-            let target = worktree_dir.join(".git");
+            let target = canonical_for_compare(&worktree_dir.join(".git"));
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir())
                 .filter(|e| {
                     std::fs::read_to_string(e.path().join("gitdir"))
-                        .map(|s| Path::new(s.trim()) == target)
+                        .map(|s| canonical_for_compare(Path::new(s.trim())) == target)
                         .unwrap_or(false)
                 })
                 .count()
@@ -3010,10 +3027,14 @@ exit 0
                 "git worktree list failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let wanted = worktree_dir.to_string_lossy().into_owned();
+            let wanted = canonical_for_compare(worktree_dir);
             String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .filter(|l| l.strip_prefix("worktree ") == Some(wanted.as_str()))
+                .filter(|l| {
+                    l.strip_prefix("worktree ")
+                        .map(|p| canonical_for_compare(Path::new(p)) == wanted)
+                        .unwrap_or(false)
+                })
                 .count()
         }
 

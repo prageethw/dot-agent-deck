@@ -1029,8 +1029,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), driving the existing `list` subcommand rather than a not-yet-existing Rust symbol so the RED stays compile-clean.
 - **Agent:** none (a `--depth 1` local clone of a real multi-commit seed repo, each with one linked worktree so `worktree list` has a row to report).
-- **Asserts:** a **fixture precondition** that the clone genuinely carries `.git/shallow`, so the test provably exercises a shallow repo; then that the shallow repo's combined stdout+stderr contains the substring "shallow" (case-insensitive) somewhere, and that the same command against the full-history seed repo does not.
-- **Does not assert:** the exact wording of the detection message, or the specific repair it names — only that shallowness is surfaced at all today it is not, for any repo.
+- **Asserts:** a **fixture precondition** that the clone genuinely carries `.git/shallow`, so the test provably exercises a shallow repo; then that the shallow repo's combined stdout+stderr contains the repair phrase "fetch --unshallow" (case-insensitive) — not a bare "shallow" substring, since both linked worktrees are deliberately named `wt-a`/`wt-b` so no fixture path, branch, or directory name can satisfy that needle by accident — and that the same command against the full-history seed repo does not contain "shallow" at all.
+- **Does not assert:** the exact wording of the detection message beyond naming the repair — only that shallowness is surfaced, and its repair named, today it is not, for any repo.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other creator-identity tests).
 #### issue/claim
 

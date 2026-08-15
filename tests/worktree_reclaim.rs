@@ -2397,7 +2397,12 @@ fn worktree_reclaim_046_kept_120_tree_stays_claimed_but_is_reclaimable() {
 /// full-history repo. Driven through the real binary against the existing
 /// `list` subcommand rather than a not-yet-existing Rust symbol, so this
 /// stays a compile-clean RED: today `worktree list` runs and succeeds
-/// either way, and never mentions shallowness at all.
+/// either way, and never mentions shallowness at all. Both linked worktrees
+/// are named `wt-a`/`wt-b` (neither substring the assertion looks for), and
+/// the shallow scenario's assertion looks for the repair command (`fetch
+/// --unshallow`) a real detector must name — not a bare `"shallow"` word —
+/// so nothing in a fixture path, branch, or directory name can satisfy it by
+/// accident; only a genuine detector can.
 #[spec("worktree/guard/001")]
 #[test]
 #[cfg(unix)]
@@ -2471,15 +2476,17 @@ fn guard_001_shallow_repo_is_detected_and_reported() {
         shallow_repo.join(".git").join("shallow").exists(),
         "fixture precondition: the clone must actually be shallow"
     );
-    let shallow_wt = scratch.path().join("shallow-wt");
+    // Named `wt-a` -- deliberately carrying no substring the assertion below
+    // could satisfy by accident (neither `shallow` nor `fetch --unshallow`).
+    let wt_a = scratch.path().join("wt-a");
     git(
         &shallow_repo,
         &[
             "worktree",
             "add",
             "-b",
-            "feat/shallow-wt",
-            &shallow_wt.to_string_lossy(),
+            "feat/wt-a",
+            &wt_a.to_string_lossy(),
         ],
     );
 
@@ -2491,21 +2498,24 @@ fn guard_001_shallow_repo_is_detected_and_reported() {
     )
     .to_lowercase();
     assert!(
-        combined.contains("shallow"),
-        "a shallow enumerating repo must be named as such (naming the repair), got: {combined:?}"
+        combined.contains("fetch --unshallow"),
+        "a shallow enumerating repo must be named as such and name its repair (`git fetch \
+         --unshallow`) -- no fixture path, branch, or directory name here can satisfy this \
+         needle by accident, so only a real detector can; got: {combined:?}"
     );
 
     // Normal scenario: the full-history seed repo itself, same shape (one
-    // linked worktree), must stay silent about shallowness.
-    let normal_wt = scratch.path().join("normal-wt");
+    // linked worktree, named `wt-b` for the same reason as `wt-a` above),
+    // must stay silent about shallowness.
+    let wt_b = scratch.path().join("wt-b");
     git(
         &seed,
         &[
             "worktree",
             "add",
             "-b",
-            "feat/normal-wt",
-            &normal_wt.to_string_lossy(),
+            "feat/wt-b",
+            &wt_b.to_string_lossy(),
         ],
     );
     let out = run_list(&seed);
