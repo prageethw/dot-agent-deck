@@ -36,9 +36,12 @@
 //! ([`EXIT_BASE_UNRESOLVABLE`]) rather than the generic rule-violation code
 //! ([`EXIT_RULE_VIOLATION`]) — otherwise this gate is empty on day one.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use crate::list_tests::TestEntry;
 
 /// Branch prefixes that skip the gate outright — Renovate PRs automerge
 /// without a human (`ci.yml:14-16`), so a gate that blocked them would get
@@ -695,9 +698,274 @@ fn self_test() -> ExitCode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M4 — rules R1-R4 (PRD fork#340). R0 above is the spine and is unaffected.
+//
+// Each rule below is a pure function over a small, directly-constructible
+// struct — the same shape as `derive_work_type` taking `&[AddedFragment]`
+// rather than reading git itself. The git-diff-to-struct extraction glue
+// (walking the actual diff to fill in these booleans) is the coder's to
+// write when R1-R4 are wired into `run_in`; it is out of this round's scope
+// and carries no test here.
+//
+// RED: every function below is `todo!()`. No wrong-but-typed stub — a stub
+// that returns a fixed `Err` would make every "must fail" case below pass
+// vacuously, which in a PRD about empty gates is the worst possible RED.
+// ---------------------------------------------------------------------------
+
+/// Why R1-R4 rejected a diff. Kept as one enum (rather than one per rule)
+/// because callers that reject a whole PR want to match across rules
+/// uniformly, the same reasoning `WorkTypeError` already applies to R0.
+// M4 RED (PRD fork#340): R1-R4 are pinned by tests but not yet wired into
+// `run_in`'s pipeline — that wiring is the coder's, scoped out of this
+// round. Until then every item below is reachable only from `#[cfg(test)]`,
+// so `not(test)` dead-code would otherwise fire on the plain (non-test)
+// binary target. Same precedent as `src/platform/fsperm/mod.rs`. Remove
+// every one of these attributes when the wiring lands — a real caller
+// resolves the lint, so a leftover `allow` at that point means the coder
+// forgot to plumb it in, not that the annotation is still needed.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleViolation {
+    /// R1 (`doc`): the diff added a `#[spec(` — a synthetic test, which
+    /// `doc` work must never ship (that is what `bug`/`prd` fragments are
+    /// for). The *narrow negative* limb of the refined rule.
+    DocAddsSpecTest,
+    /// R1 (`doc`): the diff changed something under `tests/**`. The other
+    /// half of the narrow negative limb.
+    DocTouchesTests,
+    /// R1 (`doc`): the diff touched none of `docs/**`, `site/**`, a root
+    /// `*.md`, or `prds/**` — the *positive* limb. Catches a feature shipped
+    /// as `doc`, which produces no version bump at all.
+    DocMissingDocPaths,
+    /// R2 (`chore`): the diff added a new CLI flag (`#[arg(long = "`).
+    ChoreAddsCliFlag,
+    /// R2 (`chore`): the diff added a new `Commands::` variant.
+    ChoreAddsCommandVariant,
+    /// R2 (`chore`): the diff added a *new* page under `docs/`.
+    ChoreAddsNewDocsPage,
+    /// R3 (`bug`): the diff added or modified no `#[spec]`-annotated test
+    /// (body-fingerprinted, so whitespace does not count), and no
+    /// `No-Test: <reason>` escape hatch with a non-empty reason was present
+    /// in the fragment either.
+    BugMissingSpecTestDelta,
+    /// R4 (`prd`): E9 — the fragment's stem is not numeric. M4's decision:
+    /// a numeric stem is required for `feature`/`breaking` fragments (see
+    /// [`check_r4_prd`]'s doc comment for the rationale).
+    PrdNonNumericStem { fragment_path: String, stem: String },
+    /// R4 (`prd`): no `prds/<stem>-*.md`, `prds/fork-<stem>-*.md`, or
+    /// either under `prds/done/` exists on the filesystem — checked by
+    /// existence, never by diff membership (a PRD spans many PRs, and only
+    /// the first touches the file).
+    PrdNoMatchingFile { fragment_path: String, stem: String },
+}
+
+impl fmt::Display for RuleViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuleViolation::DocAddsSpecTest => write!(
+                f,
+                "R1: a 'doc' change must not add a #[spec(...)] test — that is bug/prd work"
+            ),
+            RuleViolation::DocTouchesTests => {
+                write!(f, "R1: a 'doc' change must not touch tests/**")
+            }
+            RuleViolation::DocMissingDocPaths => write!(
+                f,
+                "R1: a 'doc' change must touch docs/**, site/**, a root *.md, or prds/**"
+            ),
+            RuleViolation::ChoreAddsCliFlag => write!(
+                f,
+                "R2: a 'chore' change must not add a new CLI flag (#[arg(long = \"...)"
+            ),
+            RuleViolation::ChoreAddsCommandVariant => write!(
+                f,
+                "R2: a 'chore' change must not add a new Commands:: variant"
+            ),
+            RuleViolation::ChoreAddsNewDocsPage => {
+                write!(
+                    f,
+                    "R2: a 'chore' change must not add a new page under docs/"
+                )
+            }
+            RuleViolation::BugMissingSpecTestDelta => write!(
+                f,
+                "R3: a 'bug' change must add or modify at least one #[spec] test, or carry a \
+                 No-Test: <reason> line in its fragment"
+            ),
+            RuleViolation::PrdNonNumericStem {
+                fragment_path,
+                stem,
+            } => write!(
+                f,
+                "R4: {fragment_path} has non-numeric stem {stem:?} — a numeric stem is \
+                 required so it can be matched against prds/<n>-*.md"
+            ),
+            RuleViolation::PrdNoMatchingFile {
+                fragment_path,
+                stem,
+            } => write!(
+                f,
+                "R4: {fragment_path} has no matching prds/{stem}-*.md, prds/fork-{stem}-*.md, \
+                 or either under prds/done/"
+            ),
+        }
+    }
+}
+
+/// R1's inputs — booleans over the diff, decoupled from how they were
+/// computed (see the module-level note above).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocDiff {
+    /// The diff touches `docs/**`, `site/**`, a root `*.md`, or `prds/**`.
+    pub touches_doc_paths: bool,
+    /// The diff added a `#[spec(` occurrence anywhere.
+    pub adds_spec_attr: bool,
+    /// The diff changed something under `tests/**`.
+    pub touches_tests: bool,
+}
+
+/// R1 — refined: rustdoc lives in `src/` and is genuinely edited as doc
+/// work, so "zero diff under `src/`" was rejected. Instead: must touch one
+/// of `docs/**`/`site/**`/root `*.md`/`prds/**` (positive), and must not add
+/// a `#[spec(` or touch `tests/**` (narrow negative).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn check_r1_doc(_diff: &DocDiff) -> Result<(), RuleViolation> {
+    todo!("R1 doc rule — PRD fork#340 M4, implemented by coder")
+}
+
+/// R2's inputs — booleans over the diff.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChoreDiff {
+    /// The diff added a new CLI flag (`#[arg(long = "`).
+    pub adds_cli_flag: bool,
+    /// The diff added a new `Commands::` variant.
+    pub adds_command_variant: bool,
+    /// The diff added a *new* page under `docs/`.
+    pub adds_new_docs_page: bool,
+}
+
+/// R2 — refined: `test:` is 43 of the last 400 commits and a pure-chore
+/// sweep can touch all of `tests/`, so "zero diff under `tests/`" was
+/// rejected outright. Instead: must not add a new user-facing CLI surface.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn check_r2_chore(_diff: &ChoreDiff) -> Result<(), RuleViolation> {
+    todo!("R2 chore rule — PRD fork#340 M4, implemented by coder")
+}
+
+/// Whether this diff adds or modifies (by body fingerprint) at least one
+/// `#[spec]`-annotated test — pure reuse of `list_tests`'s Created/Modified
+/// machinery (`compute_created`/`compute_modified`), which is exactly what
+/// the PRD calls for rather than a new mechanism.
+///
+/// A modification counts only when the fingerprinted body actually changed
+/// — `compute_modified` also flags a Scenario-only edit, which must NOT
+/// count here (prose, not a test), and a purely-whitespace body edit
+/// leaves the token-stream fingerprint unchanged so it is already excluded
+/// by construction. That is the mechanism that proves R3's "whitespace
+/// does not count" claim rather than merely asserting it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn spec_test_delta(
+    _base: &BTreeMap<String, TestEntry>,
+    _head: &BTreeMap<String, TestEntry>,
+) -> bool {
+    todo!("R3 spec-test delta — PRD fork#340 M4, implemented by coder")
+}
+
+/// Parse a `No-Test: <reason>` directive out of a changelog fragment's file
+/// content — R3's escape hatch, mirroring `m2.allowlist`'s
+/// documented-exception pattern and deliberately kept visible in the
+/// release-notes source. `None` when no line begins with `No-Test:`.
+/// `Some(reason)` when one does, where `reason` is the trimmed text after
+/// the colon — which may be empty; see [`check_r3_bug`] for what an empty
+/// reason means for the escape hatch.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_no_test_directive(_fragment_body: &str) -> Option<String> {
+    todo!("R3 No-Test: directive parsing — PRD fork#340 M4, implemented by coder")
+}
+
+/// R3's inputs.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BugDiff {
+    /// [`spec_test_delta`]'s result for this diff.
+    pub spec_test_delta: bool,
+    /// [`parse_no_test_directive`]'s result for the fragment this diff
+    /// added, if any. `None` when no fragment was added or it carries no
+    /// `No-Test:` line.
+    pub no_test_reason: Option<String>,
+}
+
+/// R3 — sharpened: "a file under `tests/` changed" is too weak (a
+/// whitespace edit to `CATALOG.md` satisfies it). Requires adding or
+/// modifying at least one `#[spec]`-annotated test, body-fingerprinted so
+/// whitespace does not count — the mechanical form of the existing
+/// `reproduce-first` skill, not a new demand.
+///
+/// **Decision (M4 tester call): an empty `No-Test:` reason does NOT count
+/// as the escape hatch.** The whole point of the directive is that it is
+/// "deliberately kept visible in the release-notes source" so a human
+/// reading the changelog can see *why* a bug shipped untested — an empty
+/// reason gives that reader nothing, and would make `No-Test:` an
+/// unaccountable bypass string rather than a documented exception. So
+/// `no_test_reason: Some(reason)` only satisfies R3 when `reason`, trimmed,
+/// is non-empty.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn check_r3_bug(_diff: &BugDiff) -> Result<(), RuleViolation> {
+    todo!("R3 bug rule — PRD fork#340 M4, implemented by coder")
+}
+
+/// The fragment's stem — the portion of the filename before the first `.`,
+/// e.g. `"341"` for `changelog.d/341.feature.md`, or `"clickable-hyperlinks"`
+/// for the real historical fragment `changelog.d/clickable-hyperlinks.feature.md`
+/// (E9: a `.feature.md` with a non-numeric stem — seven historical fragments
+/// used this shape). `None` when `path`'s file name carries no `.` at all.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fragment_stem(_path: &str) -> Option<&str> {
+    todo!("R4 fragment stem extraction — PRD fork#340 M4, implemented by coder")
+}
+
+/// Whether a `prds/` file matches fragment stem `stem` —
+/// `prds/<stem>-*.md`, `prds/fork-<stem>-*.md`, or either under
+/// `prds/done/`. Existence on the filesystem, never diff membership — R4's
+/// whole point: a PRD spans many milestones and many PRs, and only the
+/// first touches the file, so requiring the file *in the diff* would fail
+/// most legitimate PRD PRs.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn matching_prds_file_exists(_prds_dir: &Path, _stem: &str) -> Result<bool, String> {
+    todo!("R4 filesystem existence check — PRD fork#340 M4, implemented by coder")
+}
+
+/// R4 — refined: check existence on the filesystem (via
+/// [`matching_prds_file_exists`]), not membership of the diff. A
+/// `.feature.md`/`.breaking.md` fragment named `changelog.d/<stem>.*` must
+/// have a matching `prds/<stem>-*.md`, `prds/fork-<stem>-*.md`, or either
+/// under `prds/done/`.
+///
+/// **Decision (M4 tester call, E9): a numeric stem is required.** The PRD
+/// records this as free right now because `changelog.d/` carries no fragment
+/// that would need migrating, and it is the recommended direction — every
+/// `prds/` naming convention (`prds/<n>-*.md`, `prds/fork-<n>-*.md`) is
+/// keyed on the issue number, so a non-numeric stem can never be matched
+/// against one by construction; asserting that explicitly here (rather than
+/// leaving it to fall out of `matching_prds_file_exists` returning `false`)
+/// makes E9's failure name itself instead of reading as an ordinary
+/// no-match.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn check_r4_prd(
+    _fragment_path: &str,
+    _stem: &str,
+    _prds_file_exists: bool,
+) -> Result<(), RuleViolation> {
+    todo!("R4 prd rule — PRD fork#340 M4, implemented by coder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::list_tests::collect_tests_from_sources;
     use std::process::Command;
 
     /// Run `git <args>` in `dir`, panicking with git's own stderr on
@@ -891,6 +1159,341 @@ mod tests {
             "must use the distinct base-unresolvable exit code, not the generic \
              rule-violation one (E1) — so a CI log can tell them apart without \
              parsing prose"
+        );
+    }
+
+    // -- M4 R1: `doc` ----------------------------------------------------
+
+    #[test]
+    fn r1_doc_adding_a_spec_test_fails() {
+        let diff = DocDiff {
+            touches_doc_paths: true,
+            adds_spec_attr: true,
+            touches_tests: false,
+        };
+        assert_eq!(check_r1_doc(&diff), Err(RuleViolation::DocAddsSpecTest));
+    }
+
+    #[test]
+    fn r1_doc_touching_tests_fails() {
+        let diff = DocDiff {
+            touches_doc_paths: true,
+            adds_spec_attr: false,
+            touches_tests: true,
+        };
+        assert_eq!(check_r1_doc(&diff), Err(RuleViolation::DocTouchesTests));
+    }
+
+    #[test]
+    fn r1_doc_touching_only_rustdoc_in_src_plus_docs_passes() {
+        // Pins the rejection: rustdoc lives in `src/` and is genuinely
+        // edited as doc work (`xtask/linkage-check/src/main.rs:1-60` is a
+        // 60-line module doc; branch `fix/242-crossterm-doc-contract` is a
+        // live case) — this must NOT fail merely for touching `src/`.
+        let diff = DocDiff {
+            touches_doc_paths: true,
+            adds_spec_attr: false,
+            touches_tests: false,
+        };
+        assert_eq!(check_r1_doc(&diff), Ok(()));
+    }
+
+    #[test]
+    fn r1_doc_touching_no_doc_paths_fails() {
+        // The positive limb: docs/**, site/**, a root *.md, or prds/**
+        // must be touched by something.
+        let diff = DocDiff {
+            touches_doc_paths: false,
+            adds_spec_attr: false,
+            touches_tests: false,
+        };
+        assert_eq!(check_r1_doc(&diff), Err(RuleViolation::DocMissingDocPaths));
+    }
+
+    // -- M4 R2: `chore` ----------------------------------------------------
+
+    #[test]
+    fn r2_chore_touching_tests_heavily_passes() {
+        // Pins the rejection: `test:` is 43 of the last 400 commits, and
+        // the bare-`tempfile` sweep (`main.rs:74-120`) is a pure chore
+        // touching all of `tests/` — this must NOT fail merely for
+        // touching `tests/`.
+        let diff = ChoreDiff {
+            adds_cli_flag: false,
+            adds_command_variant: false,
+            adds_new_docs_page: false,
+        };
+        assert_eq!(check_r2_chore(&diff), Ok(()));
+    }
+
+    #[test]
+    fn r2_chore_adding_a_cli_flag_fails() {
+        let diff = ChoreDiff {
+            adds_cli_flag: true,
+            adds_command_variant: false,
+            adds_new_docs_page: false,
+        };
+        assert_eq!(check_r2_chore(&diff), Err(RuleViolation::ChoreAddsCliFlag));
+    }
+
+    #[test]
+    fn r2_chore_adding_a_new_command_variant_fails() {
+        let diff = ChoreDiff {
+            adds_cli_flag: false,
+            adds_command_variant: true,
+            adds_new_docs_page: false,
+        };
+        assert_eq!(
+            check_r2_chore(&diff),
+            Err(RuleViolation::ChoreAddsCommandVariant)
+        );
+    }
+
+    #[test]
+    fn r2_chore_adding_a_new_docs_page_fails() {
+        let diff = ChoreDiff {
+            adds_cli_flag: false,
+            adds_command_variant: false,
+            adds_new_docs_page: true,
+        };
+        assert_eq!(
+            check_r2_chore(&diff),
+            Err(RuleViolation::ChoreAddsNewDocsPage)
+        );
+    }
+
+    // -- M4 R3: `bug` ----------------------------------------------------
+
+    /// A one-function `#[spec]` source, for `spec_test_delta` fixtures —
+    /// following `xtask/linkage-check/tests/duplicate_catalog_id.rs`'s
+    /// pattern of synthetic sources containing `#[spec("...")]`.
+    fn spec_source(spec_id: &str, fn_name: &str, body: &str) -> String {
+        format!(
+            "#[spec(\"{spec_id}\")]\n/// Scenario: fixture only, not a real test.\nfn {fn_name}() {{\n{body}\n}}\n"
+        )
+    }
+
+    fn tests_map(sources: &[(String, String)]) -> BTreeMap<String, TestEntry> {
+        collect_tests_from_sources(sources).expect("synthetic fixture source must parse")
+    }
+
+    #[test]
+    fn spec_test_delta_is_false_when_nothing_spec_related_changed() {
+        let source = spec_source("fixture/work-type/001", "bug_001_noop", "let x = 1;");
+        let base = tests_map(&[("tests/e2e_fixture.rs".to_string(), source.clone())]);
+        let head = tests_map(&[("tests/e2e_fixture.rs".to_string(), source)]);
+        assert!(
+            !spec_test_delta(&base, &head),
+            "identical base/head must not report a spec-test delta"
+        );
+    }
+
+    #[test]
+    fn spec_test_delta_is_true_for_a_newly_added_spec_test() {
+        let base = tests_map(&[]);
+        let head = tests_map(&[(
+            "tests/e2e_fixture.rs".to_string(),
+            spec_source("fixture/work-type/002", "bug_002_added", "let x = 1;"),
+        )]);
+        assert!(
+            spec_test_delta(&base, &head),
+            "a #[spec] test added in head must count toward R3's delta"
+        );
+    }
+
+    #[test]
+    fn spec_test_delta_is_true_for_a_modified_spec_test_body() {
+        let base = tests_map(&[(
+            "tests/e2e_fixture.rs".to_string(),
+            spec_source("fixture/work-type/003", "bug_003_modified", "let x = 1;"),
+        )]);
+        let head = tests_map(&[(
+            "tests/e2e_fixture.rs".to_string(),
+            spec_source("fixture/work-type/003", "bug_003_modified", "let x = 2;"),
+        )]);
+        assert!(
+            spec_test_delta(&base, &head),
+            "a genuinely modified test body must count toward R3's delta"
+        );
+    }
+
+    #[test]
+    fn spec_test_delta_is_false_for_a_whitespace_only_body_edit() {
+        // Proves the fingerprint is real rather than a line-count check:
+        // the token stream is unaffected by reformatting, so this must NOT
+        // count — a whitespace edit to CATALOG.md is exactly the weak case
+        // R3's original "a file under tests/ changed" was rejected for.
+        let base = tests_map(&[(
+            "tests/e2e_fixture.rs".to_string(),
+            spec_source("fixture/work-type/004", "bug_004_whitespace", "let x = 1;"),
+        )]);
+        let head = tests_map(&[(
+            "tests/e2e_fixture.rs".to_string(),
+            spec_source(
+                "fixture/work-type/004",
+                "bug_004_whitespace",
+                "\n\n    let x    =    1;\n\n",
+            ),
+        )]);
+        assert!(
+            !spec_test_delta(&base, &head),
+            "a whitespace-only body edit must not count toward R3's delta"
+        );
+    }
+
+    #[test]
+    fn r3_bug_with_no_spec_delta_and_no_escape_hatch_fails() {
+        let diff = BugDiff {
+            spec_test_delta: false,
+            no_test_reason: None,
+        };
+        assert_eq!(
+            check_r3_bug(&diff),
+            Err(RuleViolation::BugMissingSpecTestDelta)
+        );
+    }
+
+    #[test]
+    fn r3_bug_with_a_spec_delta_passes() {
+        let diff = BugDiff {
+            spec_test_delta: true,
+            no_test_reason: None,
+        };
+        assert_eq!(check_r3_bug(&diff), Ok(()));
+    }
+
+    #[test]
+    fn r3_bug_with_a_no_test_reason_passes() {
+        let diff = BugDiff {
+            spec_test_delta: false,
+            no_test_reason: Some(
+                "Windows symlink materialisation cannot be exercised here".to_string(),
+            ),
+        };
+        assert_eq!(check_r3_bug(&diff), Ok(()));
+    }
+
+    #[test]
+    fn r3_bug_with_an_empty_no_test_reason_fails() {
+        // M4 tester decision: an empty reason does NOT count as the escape
+        // hatch — see `check_r3_bug`'s doc comment for the rationale. This
+        // is the test that pins that decision.
+        let diff = BugDiff {
+            spec_test_delta: false,
+            no_test_reason: Some(String::new()),
+        };
+        assert_eq!(
+            check_r3_bug(&diff),
+            Err(RuleViolation::BugMissingSpecTestDelta)
+        );
+    }
+
+    #[test]
+    fn parse_no_test_directive_finds_a_reason() {
+        let fragment = "Fixed the daemon lazy-spawn timeout.\n\nNo-Test: CI-config bug, no harness to exercise it\n";
+        assert_eq!(
+            parse_no_test_directive(fragment),
+            Some("CI-config bug, no harness to exercise it".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_no_test_directive_returns_none_when_absent() {
+        let fragment = "Fixed the daemon lazy-spawn timeout.\n";
+        assert_eq!(parse_no_test_directive(fragment), None);
+    }
+
+    #[test]
+    fn parse_no_test_directive_returns_empty_string_for_a_bare_directive() {
+        let fragment = "Fixed the daemon lazy-spawn timeout.\n\nNo-Test:\n";
+        assert_eq!(parse_no_test_directive(fragment), Some(String::new()));
+    }
+
+    // -- M4 R4: `prd` ----------------------------------------------------
+
+    #[test]
+    fn fragment_stem_reads_the_portion_before_the_first_dot() {
+        assert_eq!(fragment_stem("changelog.d/341.feature.md"), Some("341"));
+        assert_eq!(
+            fragment_stem("changelog.d/clickable-hyperlinks.feature.md"),
+            Some("clickable-hyperlinks")
+        );
+    }
+
+    #[test]
+    fn matching_prds_file_exists_true_for_plain_numbered_form() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prds_dir = tmp.path().join("prds");
+        std::fs::create_dir_all(&prds_dir).expect("mkdir prds");
+        std::fs::write(prds_dir.join("341-work-type-vocabulary.md"), "").expect("write fixture");
+        assert_eq!(matching_prds_file_exists(&prds_dir, "341"), Ok(true));
+    }
+
+    #[test]
+    fn matching_prds_file_exists_true_for_fork_prefixed_form() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prds_dir = tmp.path().join("prds");
+        std::fs::create_dir_all(&prds_dir).expect("mkdir prds");
+        std::fs::write(prds_dir.join("fork-341-work-type-vocabulary.md"), "")
+            .expect("write fixture");
+        assert_eq!(matching_prds_file_exists(&prds_dir, "341"), Ok(true));
+    }
+
+    #[test]
+    fn matching_prds_file_exists_true_under_done() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prds_dir = tmp.path().join("prds");
+        let done_dir = prds_dir.join("done");
+        std::fs::create_dir_all(&done_dir).expect("mkdir prds/done");
+        std::fs::write(done_dir.join("341-work-type-vocabulary.md"), "").expect("write fixture");
+        assert_eq!(matching_prds_file_exists(&prds_dir, "341"), Ok(true));
+    }
+
+    #[test]
+    fn matching_prds_file_exists_false_when_nothing_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prds_dir = tmp.path().join("prds");
+        std::fs::create_dir_all(&prds_dir).expect("mkdir prds");
+        std::fs::write(prds_dir.join("999-unrelated.md"), "").expect("write fixture");
+        assert_eq!(matching_prds_file_exists(&prds_dir, "341"), Ok(false));
+    }
+
+    #[test]
+    fn r4_feature_stem_with_no_matching_prds_file_fails() {
+        assert_eq!(
+            check_r4_prd("changelog.d/341.feature.md", "341", false),
+            Err(RuleViolation::PrdNoMatchingFile {
+                fragment_path: "changelog.d/341.feature.md".to_string(),
+                stem: "341".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn r4_feature_stem_with_a_matching_prds_file_passes() {
+        assert_eq!(
+            check_r4_prd("changelog.d/341.feature.md", "341", true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn r4_non_numeric_stem_fails_even_when_a_file_happens_to_match() {
+        // E9, decided: a numeric stem is required for feature/breaking
+        // fragments. Passing `prds_file_exists: true` here proves this is
+        // an independent, deliberate check — not merely a consequence of
+        // `matching_prds_file_exists` returning false for a stem it can't
+        // search for.
+        assert_eq!(
+            check_r4_prd(
+                "changelog.d/clickable-hyperlinks.feature.md",
+                "clickable-hyperlinks",
+                true,
+            ),
+            Err(RuleViolation::PrdNonNumericStem {
+                fragment_path: "changelog.d/clickable-hyperlinks.feature.md".to_string(),
+                stem: "clickable-hyperlinks".to_string(),
+            })
         );
     }
 }
