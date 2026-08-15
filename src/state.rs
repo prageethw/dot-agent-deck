@@ -3975,8 +3975,8 @@ pub(crate) async fn wait_for_prompt_submission(
                     }
                 }
             }
-            // Issue #717: neither variant is evidence about this pane.
-            // Grouped rather than wildcarded so a future variant still
+            // Issue #717 / PRD 236: neither variant is evidence about this
+            // pane. Grouped rather than wildcarded so a future variant still
             // fails this match and gets considered on its merits.
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
                 continue;

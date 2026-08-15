@@ -1587,8 +1587,8 @@ fn drain_pre_write_events(
                     return Some(reason);
                 }
             }
-            // Issue #717: neither variant is evidence about this pane.
-            // Grouped rather than wildcarded so a future variant still
+            // Issue #717 / PRD 236: neither variant is evidence about this
+            // pane. Grouped rather than wildcarded so a future variant still
             // fails this match and gets considered on its merits.
             Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_)) => {
                 continue;
