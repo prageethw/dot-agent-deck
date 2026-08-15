@@ -54,8 +54,9 @@ use crate::terminal_widget::TerminalWidget;
 // primary text uses the terminal's default foreground, secondary/muted text
 // dims that same foreground (rather than hardcoding a gray), and selection
 // highlights invert in place via `Modifier::REVERSED`; the active tab is
-// instead cued with `Modifier::UNDERLINED | Modifier::BOLD` so a stacked
-// status `fg` tint stays legible (issue #306). Semantic
+// instead cued with `Modifier::BOLD` so a stacked status `fg` tint stays
+// legible (issue #306) — originally `UNDERLINED | BOLD`, with the underline
+// dropped as a maintainer preference (fork issue #377). Semantic
 // accent/status colors stay as named ANSI (Cyan/Yellow/Red/Green/Blue/
 // Magenta), which terminal themes already remap.
 
@@ -14919,7 +14920,8 @@ struct TabStripRects {
 /// which this feature deliberately doesn't touch) so a tab's label can
 /// render in `palette::status_color()` of the highest-priority status among
 /// them — issue #306 extends this to the active tab too, since its
-/// `UNDERLINED` cue no longer fights a stacked `fg` tint. Colour is a total
+/// `BOLD` cue (originally `UNDERLINED | BOLD`, underline dropped for fork
+/// issue #377) no longer fights a stacked `fg` tint. Colour is a total
 /// function of status: every state paints, Idle included — see the
 /// `FORK-ONLY` comment in the loop for why.
 fn render_tab_strip(
@@ -14937,17 +14939,19 @@ fn render_tab_strip(
     // click-to-switch (same width-fitting the `Tabs` widget previously used).
     let fitted_labels = fit_tab_labels(labels, area.width);
 
-    // Inactive tab labels render at full contrast (readable text); the active
-    // tab is cued with Modifier::UNDERLINED | Modifier::BOLD, a terminal-
-    // relative highlight that adds no absolute color and — unlike the
-    // REVERSED it replaces (issue #306) — doesn't invert a stacked status
-    // `fg` tint into the label's background. The `│` divider between tabs is
-    // decoration, so it stays dim.
+    // Inactive tab labels render at base contrast by default (an idle one
+    // dims to `palette::STATUS_IDLE`, fork issue #351); the active tab is
+    // cued with Modifier::BOLD, a terminal-relative highlight that
+    // adds no absolute color and — unlike the REVERSED it replaces (issue
+    // #306) — doesn't invert a stacked status `fg` tint into the label's
+    // background. The cue was originally `UNDERLINED | BOLD`; the underline
+    // was dropped as a maintainer preference (fork issue #377). The `│`
+    // divider between tabs is decoration, so it stays dim.
     let base_style = text_primary();
     let divider_style = text_dim();
     let active_style = Style::default()
         .fg(Color::Reset)
-        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+        .add_modifier(Modifier::BOLD);
 
     let mut headers = Vec::with_capacity(fitted_labels.len());
     let mut closes = Vec::new();
@@ -14969,10 +14973,11 @@ fn render_tab_strip(
         // base label color, so color means "something here needs attention".
         // Issue #306: the ACTIVE tab used to be excluded here too, on the
         // reasoning that its `REVERSED` highlight would invert an absolute fg
-        // into the label's background. Now that the active cue is
-        // `UNDERLINED | BOLD` instead of `REVERSED`, a stacked status `fg`
-        // tint renders as ordinary foreground text, so the active tab takes
-        // the same tint an inactive one gets.
+        // into the label's background. Now that the active cue is `BOLD`
+        // (originally `UNDERLINED | BOLD`, underline dropped for fork issue
+        // #377) instead of `REVERSED`, a stacked status `fg` tint renders as
+        // ordinary foreground text, so the active tab takes the same tint an
+        // inactive one gets.
         // Dashboard (`None`) is untouched — see `tab_status_data`'s doc
         // comment for why.
         //
@@ -15843,8 +15848,9 @@ fn render_frame(
         // affordance; Mode and Orchestration tabs do. Pass the per-tab
         // closeable mask to the tab-strip renderer, and record the clickable
         // header / [×] rects for the mouse hit-test. PRD #13: the strip is
-        // terminal-relative — the active tab is cued with Modifier::UNDERLINED
-        // | Modifier::BOLD, not an absolute background tint.
+        // terminal-relative — the active tab is cued with Modifier::BOLD
+        // (originally `UNDERLINED | BOLD`, underline dropped for fork issue
+        // #377), not an absolute background tint.
         let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
         let tab_statuses: Vec<Option<&[SessionStatus]>> = tab_bar
             .tab_statuses
