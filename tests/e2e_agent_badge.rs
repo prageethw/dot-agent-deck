@@ -25,8 +25,12 @@ fn agent_badge_003_m_toggles_badges_on_every_card_real_binary() {
     let deck = TuiDeck::launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
+    // Session ids stay at or under the dashboard's 11-char truncation limit
+    // (`id_display` in `render_session_card`) so the full id is what
+    // `wait_for_string` looks for — a longer id would truncate before this
+    // test's badge assertions and time out for an unrelated reason.
     let claude_event = serde_json::json!({
-        "session_id": "badge-claude",
+        "session_id": "claude-bdg",
         "agent_type": "claude_code",
         "event_type": "session_start",
         "timestamp": "2026-08-15T12:00:00Z",
@@ -34,10 +38,10 @@ fn agent_badge_003_m_toggles_badges_on_every_card_real_binary() {
     });
     write_hook_line(deck.hook_socket_path(), &claude_event.to_string())
         .expect("write claude_code SessionStart hook to per-test socket");
-    deck.wait_for_string("badge-claude");
+    deck.wait_for_string("claude-bdg");
 
     let codex_event = serde_json::json!({
-        "session_id": "badge-codex",
+        "session_id": "codex-bdg",
         "agent_type": "codex",
         "event_type": "session_start",
         "timestamp": "2026-08-15T12:00:01Z",
@@ -45,7 +49,7 @@ fn agent_badge_003_m_toggles_badges_on_every_card_real_binary() {
     });
     write_hook_line(deck.hook_socket_path(), &codex_event.to_string())
         .expect("write codex SessionStart hook to per-test socket");
-    deck.wait_for_string("badge-codex");
+    deck.wait_for_string("codex-bdg");
 
     // Default hidden: this is the only coverage of default-hidden through the
     // real `render_frame` — no L1 seam reaches it.
