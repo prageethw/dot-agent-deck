@@ -5,9 +5,11 @@
 # via a raw hook-socket `session_start`, so the spawn-time remit pointer
 # delivers fast and deterministically, then tees its stdin to
 # orchestrator-prompt.log so re-delivery is observable as a second matching
-# line. The worker role is a plain `cat` stub (no LLM tokens spent) used
-# only as a non-start-role target to prove compaction re-assertion does not
-# leak onto it.
+# line, and (issue #424) reports each delivered line back over the hook
+# socket as a `user_prompt`-carrying confirmation so the delivery finalizes
+# instead of earning an automatic, unconfirmed second write. The worker role
+# is a plain `cat` stub (no LLM tokens spent) used only as a non-start-role
+# target to prove compaction re-assertion does not leak onto it.
 [[orchestrations]]
 name = "remit-reassert"
 
