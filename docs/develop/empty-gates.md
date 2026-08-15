@@ -12,7 +12,6 @@ One caveat on that, since a reviewer went looking: the `Closes` row leaves **no 
 
 | Signal | How it goes empty | What to read instead |
 |---|---|---|
-| **Greptile** | Publishes nothing at all when absent, or a `COMMENTED` review with **zero** inline comments when credit-limited. Neither produces a `Greptile Review` check-run, so the checks board is all-green with no Greptile row on it. | The **review body**. A credit-limited account carries *"prageethw has reached the 50-credit limit for trial accounts."* Absence carries nothing. |
 | **`sonarqube`** | Every scan step is gated on `if: env.SONAR_TOKEN != ''`. On a fork PR the secret is absent, so the job runs one `echo` and goes green **having analysed nothing**. | The job log — a skipped run and a clean run look identical on the board. |
 | **`semgrep`** | **Not** an empty gate: it is blocking via an explicit `--error` (`ci.yml:441`). Listed because a stale claim that it runs `--no-error` circulated in this repo's own docs — see below. | Findings still live in GitHub code scanning, not in the check. |
 | **`e2e`** | `continue-on-error: true` by design, so the **workflow** conclusion reads `success` even when the job failed outright. | The **job** conclusion and the nextest failure list. |

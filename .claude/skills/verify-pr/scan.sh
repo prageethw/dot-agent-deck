@@ -173,8 +173,9 @@ if [ "${awaiting:-0}" != "0" ] && [ "${awaiting:-unknown}" != "unknown" ]; then
   echo "APPROVE_WITH=gh api --method POST repos/{owner}/{repo}/actions/runs/<run_id>/approve"
 fi
 
-# Rule 8: the findings live ONLY in the inline review comments. A green
-# `Greptile Review` check-run is NOT the review.
+# Rule 8: a green check board is not evidence a review actually happened —
+# read the surface that carries the result. Fetch inline PR review comments
+# explicitly in case any reviewer left findings there.
 inline=$(gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --paginate --jq '.[].id' 2>/dev/null | wc -l | tr -d ' ')
 echo "INLINE_REVIEW_COMMENTS=${inline:-unknown}"
 echo "READ_INLINE_WITH=gh api repos/{owner}/{repo}/pulls/${pr}/comments --paginate"

@@ -37,8 +37,8 @@ With `CODEOWNERS` in place this normally happens on its own. The commands are fo
 
 Three rules about sequencing, each of which exists because of a specific ruleset setting:
 
-- **Request review last, not first.** `dismiss_stale_reviews_on_push: true`, so any push after an approval silently voids it. Settle CI, read Greptile's inline comments, push the fixes, resolve the threads — *then* ask for review. Requesting earlier buys a guaranteed second round trip.
-- **Resolve every review thread.** `required_review_thread_resolution: true` is what turns "read Greptile's inline comments" from a habit into something the merge button enforces — see [What is gated](#what-is-gated).
+- **Request review last, not first.** `dismiss_stale_reviews_on_push: true`, so any push after an approval silently voids it. Settle CI, resolve the delegated `reviewer`/`auditor` findings (CLAUDE.md rule 8 — no bot posts an automated review here), push the fixes, resolve the threads — *then* ask for review. Requesting earlier buys a guaranteed second round trip.
+- **Resolve every review thread.** `required_review_thread_resolution: true` is what turns "read the review comments" from a habit into something the merge button enforces — see [What is gated](#what-is-gated).
 - **The author merges after approval.** Nothing in the ruleset constrains who presses the button (`require_last_push_approval` is `false`), and the approving maintainer is under no obligation to. Reviewer-merges is a Prow/Kubernetes convention in which a *bot* merges on `/lgtm`; the GitHub-native equivalent is auto-merge, queued by the author. Auto-merge is currently disabled on this repository; enabling it would let the author queue the merge before review lands and never return to the pull request.
 
 **Never merge your own unapproved pull request.** For the owner it will succeed — the admin bypass makes it silent rather than blocked — and that silence is precisely the decay this arrangement exists to prevent. Any automated flow whose last step is a merge (`/prd-done`, `/prd-full`) must stop at "green, reviewed, approved" and hand off.
@@ -111,13 +111,13 @@ It is enabled by default deliberately. While approvals are 0 the entry is inert,
 
 One consequence to accept: with the bypass in place, CI gating on dependency pull requests rests on Renovate's own configuration (it waits for branch status before merging), not on the ruleset. Adding `required_status_checks` in step 6 does not change that, because a bypass actor bypasses those too.
 
-The `required_review_thread_resolution` rule is not a problem here in practice — Greptile posts no review and no inline comments on Renovate pull requests (verified on #426, #389 and #384). It would become one if that ever changed.
+The `required_review_thread_resolution` rule is not a problem here in practice — no bot posts a review or inline comments on Renovate pull requests (verified on #426, #389 and #384; CLAUDE.md rule 8 — no automated code reviewer runs on this fork at all). It would become one if that ever changed.
 
 ## What is gated
 
 Everything that lands on `main`, uniformly: one approving review from a maintainer, all review threads resolved, no deletion, no force-push. There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
 
-The requirement that review threads resolve before merge is doing specific work. Greptile reviews every pull request and re-reviews on each push, and its actual findings live in the inline comments rather than in the check-run or the summary — a green check has accompanied real P1 defects here before (CLAUDE.md rule 8). Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
+The requirement that review threads resolve before merge is doing specific work. No bot reviews pull requests on this fork (CLAUDE.md rule 8) — the human maintainer's review, and the delegated `reviewer`/`auditor` pass that precedes it, leave findings as inline comments rather than in a check-run or summary, and a green check board never proves those were read. Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
 
 ## Making the gate bind the owner too
 
