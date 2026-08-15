@@ -1907,6 +1907,215 @@ mod tests {
         );
     }
 
+    // -- B1: the merged-base skip -----------------------------------------
+
+    /// Scenario: builds a scratch repo where `origin/main` already includes
+    /// `HEAD` — the exact shape of a post-merge `push: [main]` run — and
+    /// asserts `run_in` treats it as nothing-to-classify rather than running
+    /// derivation and failing `NoSupplier`.
+    #[test]
+    fn run_in_skips_when_the_resolved_base_equals_head() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        git(&["commit", "-q", "--allow-empty", "-m", "init"], tmp.path());
+        // `resolve_base`'s default target is `origin/main` — fake it at
+        // HEAD so `git merge-base HEAD origin/main` resolves to HEAD itself,
+        // the same shape `fetch-depth: 0` + `push: [main]` produces.
+        git(
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            tmp.path(),
+        );
+
+        // "main" carries no work-type prefix (no '/'), so if the merged-base
+        // skip did not fire, `derive_work_type` would run against an empty
+        // fragment list and an unprefixed branch and fail as `NoSupplier` —
+        // a real derivation can never succeed on this shape. `SUCCESS` is
+        // therefore diagnostic of the skip specifically, not of some other
+        // path happening to derive a type (B1's "not a derivation").
+        let code = run_in(&[], tmp.path(), Some("main"));
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "a merged base (base == HEAD) must be treated as nothing-to-classify \
+             and skipped, not run through derivation (B1) — every merge to main \
+             would otherwise turn `push: [main]` red"
+        );
+    }
+
+    // -- B2: the branch override is actually consulted ---------------------
+
+    /// Scenario: sets `GITHUB_HEAD_REF` to an exempt branch name in the
+    /// process environment, then calls `run_in` with a non-exempt
+    /// `branch_override` against a scratch repo with no resolvable base, and
+    /// asserts the pipeline used the override rather than the environment.
+    #[test]
+    fn run_in_uses_the_branch_override_not_github_head_ref() {
+        // nextest gives each test its own process, so this env write is
+        // contained to this test and cannot bleed into another.
+        unsafe {
+            std::env::set_var("GITHUB_HEAD_REF", "renovate/anything-i-like");
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        git(&["commit", "-q", "--allow-empty", "-m", "init"], tmp.path());
+        let branch = "b2-branch-override-scratch-branch";
+        git(&["checkout", "-q", "-b", branch], tmp.path());
+
+        // No `origin/main` exists in this repo. If `run_in` read
+        // `GITHUB_HEAD_REF` instead of the override, it would take the
+        // exempt-branch skip *before* ever reaching `resolve_base` and
+        // return `SUCCESS`. The override's branch is not exempt, so the
+        // pipeline must instead reach `resolve_base`, fail to find
+        // `origin/main`, and return `EXIT_BASE_UNRESOLVABLE`.
+        let code = run_in(&[], tmp.path(), Some(branch));
+
+        unsafe {
+            std::env::remove_var("GITHUB_HEAD_REF");
+        }
+
+        assert_eq!(
+            code,
+            ExitCode::from(EXIT_BASE_UNRESOLVABLE),
+            "branch_override must be used instead of GITHUB_HEAD_REF (B2) — if \
+             the environment's exempt 'renovate/anything-i-like' had been read \
+             instead, this would have taken the exemption skip and returned \
+             SUCCESS before resolve_base ever ran"
+        );
+    }
+
+    // -- F1: non-ASCII paths are not C-quoted under -z ----------------------
+
+    /// Scenario: feeds `parse_name_status_z` the exact NUL-separated byte
+    /// shape git emits for an `A` record with a non-ASCII path, and asserts
+    /// the path comes back with no surrounding quotes or octal escapes.
+    #[test]
+    fn parse_name_status_z_handles_non_ascii_bytes_without_quoting() {
+        // Under git's default (newline-separated) --name-status this path
+        // would arrive as `"changelog.d/na\303\257ve.feature.md"` — quoted
+        // and octal-escaped (`core.quotePath`, on by default). `-z` disables
+        // that, so the raw UTF-8 bytes must come through untouched.
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice("A\0changelog.d/naïve.feature.md\0".as_bytes());
+        let paths = parse_name_status_z(&stdout);
+        assert_eq!(paths, vec!["changelog.d/naïve.feature.md".to_string()]);
+    }
+
+    /// Scenario: builds a scratch repo, adds a changelog fragment whose
+    /// filename contains a non-ASCII character, and asserts
+    /// `collect_added_fragments` still recognises it rather than silently
+    /// dropping it — the v0.24.3 "fragment silently ignored" invariant this
+    /// gate exists to protect.
+    #[test]
+    fn collect_added_fragments_recognizes_a_non_ascii_fragment_filename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("changelog.d")).expect("mkdir changelog.d");
+        git(&["commit", "-q", "--allow-empty", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(
+            tmp.path().join("changelog.d/naïve.feature.md"),
+            "Adds a naïve cache.\n",
+        )
+        .expect("write fragment");
+        git(&["add", "changelog.d/naïve.feature.md"], tmp.path());
+        git(&["commit", "-q", "-m", "add fragment"], tmp.path());
+
+        let fragments = collect_added_fragments(tmp.path(), &base_sha).expect("collect fragments");
+        assert_eq!(
+            fragments,
+            vec![AddedFragment {
+                path: "changelog.d/naïve.feature.md".to_string(),
+                suffix: "feature".to_string(),
+            }],
+            "a fragment with a non-ASCII filename must still be recognised, not \
+             silently dropped (F1)"
+        );
+    }
+
+    // -- F2: a renamed fragment counts ---------------------------------------
+
+    /// Scenario: feeds `parse_name_status_z` a rename record (three
+    /// NUL-separated fields: status, source, destination) and asserts it
+    /// resolves to the destination path alone.
+    #[test]
+    fn parse_name_status_z_resolves_a_rename_record_to_the_destination_path() {
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice(b"R100\0changelog.d/194.bugfix.md\0changelog.d/500.feature.md\0");
+        let paths = parse_name_status_z(&stdout);
+        assert_eq!(paths, vec!["changelog.d/500.feature.md".to_string()]);
+    }
+
+    /// Scenario: feeds `parse_name_status_z` a rename record immediately
+    /// followed by a plain `A` record, and asserts the second record parses
+    /// correctly — a parser that mis-split the rename's three fields would
+    /// drift the whole record stream by one field for everything after it.
+    #[test]
+    fn parse_name_status_z_does_not_desync_after_a_rename_record() {
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice(b"R100\0changelog.d/194.bugfix.md\0changelog.d/500.feature.md\0");
+        stdout.extend_from_slice(b"A\0changelog.d/501.doc.md\0");
+        let paths = parse_name_status_z(&stdout);
+        assert_eq!(
+            paths,
+            vec![
+                "changelog.d/500.feature.md".to_string(),
+                "changelog.d/501.doc.md".to_string(),
+            ]
+        );
+    }
+
+    /// Scenario: builds a scratch repo, commits a fragment, then `git mv`s
+    /// it to a new stem/suffix in a second commit, and asserts
+    /// `collect_added_fragments` sees the fragment at its destination path —
+    /// `--diff-filter=A` alone would miss it, since git reports the rename
+    /// as `R100`, not `A`.
+    #[test]
+    fn collect_added_fragments_counts_a_fragment_introduced_by_rename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(tmp.path().join("changelog.d/194.bugfix.md"), "orig\n")
+            .expect("write fragment");
+        git(&["add", "changelog.d/194.bugfix.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        git(
+            &[
+                "mv",
+                "changelog.d/194.bugfix.md",
+                "changelog.d/500.feature.md",
+            ],
+            tmp.path(),
+        );
+        git(
+            &["commit", "-q", "-m", "rename fragment suffix"],
+            tmp.path(),
+        );
+
+        let fragments = collect_added_fragments(tmp.path(), &base_sha).expect("collect fragments");
+        assert_eq!(
+            fragments,
+            vec![AddedFragment {
+                path: "changelog.d/500.feature.md".to_string(),
+                suffix: "feature".to_string(),
+            }],
+            "F2: a fragment introduced via git mv must be seen at its \
+             destination path — --diff-filter=AR resolving R rows is what \
+             makes this visible"
+        );
+    }
+
     // -- M4 R1: `doc` ----------------------------------------------------
 
     #[test]
@@ -1960,6 +2169,72 @@ mod tests {
             touches_tests: false,
         };
         assert_eq!(check_r1_doc(&diff), Err(RuleViolation::DocMissingDocPaths));
+    }
+
+    // -- S5: tests/**/*.md is doc work, not test-touching -------------------
+
+    /// Scenario: builds a scratch repo, then a second commit that only
+    /// rewords `docs/x.md` and `tests/CATALOG.md`, and asserts R1 passes —
+    /// `tests/CATALOG.md` is prose documentation of the test suite, not test
+    /// code, so it must not trip `DocTouchesTests`.
+    #[test]
+    fn r1_doc_diff_touching_only_catalog_md_under_tests_passes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("docs")).expect("mkdir docs");
+        std::fs::create_dir_all(tmp.path().join("tests")).expect("mkdir tests");
+        std::fs::write(tmp.path().join("docs/x.md"), "# x\n").expect("write doc");
+        std::fs::write(tmp.path().join("tests/CATALOG.md"), "# catalog\n").expect("write catalog");
+        git(&["add", "docs/x.md", "tests/CATALOG.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(tmp.path().join("docs/x.md"), "# x\nmore\n").expect("edit doc");
+        std::fs::write(tmp.path().join("tests/CATALOG.md"), "# catalog\nmore\n")
+            .expect("edit catalog");
+        git(
+            &["commit", "-aq", "-m", "reword docs and catalog"],
+            tmp.path(),
+        );
+
+        let diff = collect_doc_diff(tmp.path(), &base_sha).expect("collect_doc_diff");
+        assert_eq!(
+            check_r1_doc(&diff),
+            Ok(()),
+            "a CATALOG.md-only tests/ edit must not trip DocTouchesTests (S5)"
+        );
+    }
+
+    /// Scenario: the same shape as above, but the second commit adds a real
+    /// `.rs` file under `tests/` instead — asserts R1 still fails as
+    /// `DocTouchesTests`, so a fix that made `is_test_path` always false
+    /// would not satisfy the passing test above vacuously.
+    #[test]
+    fn r1_doc_diff_touching_a_rust_test_file_still_fails_as_doc_touches_tests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::create_dir_all(tmp.path().join("docs")).expect("mkdir docs");
+        std::fs::write(tmp.path().join("docs/x.md"), "# x\n").expect("write doc");
+        git(&["add", "docs/x.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::create_dir_all(tmp.path().join("tests")).expect("mkdir tests");
+        std::fs::write(tmp.path().join("docs/x.md"), "# x\nmore\n").expect("edit doc");
+        std::fs::write(tmp.path().join("tests/foo.rs"), "#[test]\nfn f() {}\n")
+            .expect("write test file");
+        git(&["add", "docs/x.md", "tests/foo.rs"], tmp.path());
+        git(
+            &["commit", "-q", "-m", "edit doc and add test file"],
+            tmp.path(),
+        );
+
+        let diff = collect_doc_diff(tmp.path(), &base_sha).expect("collect_doc_diff");
+        assert_eq!(check_r1_doc(&diff), Err(RuleViolation::DocTouchesTests));
     }
 
     // -- M4 R2: `chore` ----------------------------------------------------
@@ -2018,6 +2293,85 @@ mod tests {
         assert_eq!(
             check_r2_chore(&diff),
             Err(RuleViolation::ChoreAddsNewDocsPage)
+        );
+    }
+
+    // -- B3: added_diff_text is restricted to .rs sources --------------------
+
+    /// Scenario: commits a Markdown file whose prose quotes both
+    /// `#[spec(` and `#[arg(long = "`, and asserts `added_diff_text` does
+    /// not surface either — a doc PR that quotes the attribute syntax (as
+    /// CLAUDE.md, CONTRIBUTING.md and this PRD's own file all do) must not
+    /// be rejected as `DocAddsSpecTest`/`ChoreAddsCliFlag`.
+    #[test]
+    fn added_diff_text_ignores_markdown_lines_quoting_spec_or_arg_long() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::write(tmp.path().join("README.md"), "base\n").expect("write base file");
+        git(&["add", "README.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::write(
+            tmp.path().join("CLAUDE.md"),
+            "Every `#[spec(\"...\")]` test needs a Scenario comment, and every \
+             `#[arg(long = \"foo\")]` flag needs a docs update.\n",
+        )
+        .expect("write doc file");
+        git(&["add", "CLAUDE.md"], tmp.path());
+        git(
+            &["commit", "-q", "-m", "doc quoting spec and arg-long"],
+            tmp.path(),
+        );
+
+        let text = added_diff_text(tmp.path(), &base_sha).expect("added_diff_text");
+        assert!(
+            !text.contains("#[spec("),
+            "B3: a Markdown line merely quoting #[spec( must not be counted"
+        );
+        assert!(
+            !text.contains("#[arg(long = \""),
+            "B3: a Markdown line merely quoting #[arg(long = \" must not be counted"
+        );
+    }
+
+    /// Scenario: the other direction B3 protects — commits a `.rs` file that
+    /// genuinely adds both attributes, and asserts `added_diff_text` still
+    /// surfaces them, so a fix that made the search ignore `.rs` files too
+    /// (always false) would not satisfy the test above vacuously.
+    #[test]
+    fn added_diff_text_still_sees_spec_and_arg_long_added_in_rust_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        git(&["init", "-q"], tmp.path());
+        git(&["config", "user.email", "test@example.com"], tmp.path());
+        git(&["config", "user.name", "test"], tmp.path());
+        std::fs::write(tmp.path().join("README.md"), "base\n").expect("write base file");
+        git(&["add", "README.md"], tmp.path());
+        git(&["commit", "-q", "-m", "base"], tmp.path());
+        let base_sha = current_head_sha(tmp.path()).expect("base sha");
+
+        std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir src");
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            "#[spec(\"fixture/b3\")]\nfn f() {}\n\n#[arg(long = \"foo\")]\npub flag: bool,\n",
+        )
+        .expect("write rust source");
+        git(&["add", "src/lib.rs"], tmp.path());
+        git(
+            &["commit", "-q", "-m", "add spec test and cli flag"],
+            tmp.path(),
+        );
+
+        let text = added_diff_text(tmp.path(), &base_sha).expect("added_diff_text");
+        assert!(
+            text.contains("#[spec("),
+            "a genuine .rs addition of #[spec( must still be visible to R1"
+        );
+        assert!(
+            text.contains("#[arg(long = \""),
+            "a genuine .rs addition of #[arg(long = \" must still be visible to R2"
         );
     }
 
@@ -2253,6 +2607,44 @@ mod tests {
                 fragment_path: "changelog.d/clickable-hyperlinks.feature.md".to_string(),
                 stem: "clickable-hyperlinks".to_string(),
             })
+        );
+    }
+
+    // -- N1: RULE_COUNT feeds both the success line and the case array -----
+
+    /// Scenario: mirrors `self_test`'s own `[fn() -> Result<String, String>;
+    /// RULE_COUNT]` case-array literal and asserts its length equals
+    /// `RULE_COUNT` — a case added to (or removed from) that array without
+    /// bumping `RULE_COUNT` (or vice versa) fails to compile here, the same
+    /// structural guarantee `r1_doc_touching_only_rustdoc_in_src_plus_docs_passes`
+    /// (S6) already relies on.
+    #[test]
+    fn self_test_case_array_length_matches_rule_count() {
+        let cases: [fn() -> Result<String, String>; RULE_COUNT] = [
+            self_test_r0,
+            self_test_r1,
+            self_test_r2,
+            self_test_r3,
+            self_test_r4,
+        ];
+        assert_eq!(cases.len(), RULE_COUNT);
+    }
+
+    /// Scenario: calls `describe_success` directly and asserts its "N rules"
+    /// text is derived from `RULE_COUNT` rather than a separate hardcoded
+    /// literal — the two-literals-for-one-fact shape N1 was written to
+    /// close.
+    #[test]
+    fn describe_success_names_the_rule_count_from_the_shared_constant() {
+        let derivation = Derivation {
+            work_type: WorkType::Doc,
+            supplier: Supplier::BranchPrefix,
+        };
+        let msg = describe_success(&derivation, "docs/123-thing", "abc123", &[]);
+        assert!(
+            msg.contains(&format!("{RULE_COUNT} rules")),
+            "describe_success must derive its rule count from RULE_COUNT, not a \
+             separate hardcoded literal (N1): got {msg:?}"
         );
     }
 }
