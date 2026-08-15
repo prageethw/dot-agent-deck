@@ -3462,3 +3462,99 @@ fn live_014_transport_drop_mid_session_is_also_recovered_by_reconnect_rehydratio
         ReconnectTeardown::Dropped,
     ));
 }
+
+/// Scenario: PRD fork#378 reviewer/auditor round 2 (HIGH 1 / F8): a session
+/// with a known model is snapshotted via `live_snapshot()`, crosses the wire
+/// as JSON, and is restored via `seed_hydrated_session()` on a fresh
+/// `AppState` standing in for a reconnecting TUI. The rehydrated card's
+/// `model` must still be `Some(..)` AND the card must still render it —
+/// today `SessionSnapshot` carries no `model` field at all, so a reconnect
+/// silently drops it, and because Claude Code posts `model` only on
+/// `SessionStart`, the badge stays degraded for the rest of the session.
+/// `live_target` and `shell_synthetic_working` are in this same struct for
+/// exactly this reason (fork issue #21, PRD #20 blocker-4); this follows
+/// their round-trip precedent (`session/live/010`, `session/live/011`).
+#[spec("session/live/015")]
+#[test]
+fn live_015_rehydration_preserves_model() {
+    let mut daemon = AppState::default();
+    daemon.register_pane("pane-model".to_string());
+    daemon.apply_event(AgentEvent {
+        session_id: "sess-model".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-model".to_string()),
+        agent_id: Some("agent-model".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: Some("Opus".to_string()),
+    });
+    assert_eq!(
+        daemon.sessions["sess-model"].model.as_deref(),
+        Some("Opus"),
+        "precondition: the daemon-side session carries the model"
+    );
+
+    // --- reconnect: the daemon's snapshot crosses the wire and seeds the TUI --
+    let snapshot = daemon.sessions["sess-model"].live_snapshot();
+    let json = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+    let snapshot: SessionSnapshot = serde_json::from_str(&json).expect("the snapshot deserializes");
+
+    let mut tui = AppState::default();
+    tui.register_pane("pane-model".to_string());
+    tui.seed_hydrated_session(
+        "pane-model".to_string(),
+        None,
+        Some(AgentType::ClaudeCode),
+        Some("agent-model".to_string()),
+        Some(&snapshot),
+    );
+
+    let rehydrated = tui
+        .sessions
+        .values()
+        .find(|session| session.pane_id.as_deref() == Some("pane-model"))
+        .expect("rehydration creates one card for the pane");
+    assert_eq!(
+        rehydrated.model.as_deref(),
+        Some("Opus"),
+        "a reconnected card must retain the model it had before the \
+         detach — SessionSnapshot must carry a model field"
+    );
+
+    // The model must also still RENDER, not just survive in state.
+    let width: u16 = 80;
+    let density = dot_agent_deck::ui::CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = dot_agent_deck::ui::render_card_for_mode_to_buffer(
+        rehydrated,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        dot_agent_deck::ui::UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text: String = (0..buffer.area().height)
+        .map(|y| {
+            (0..buffer.area().width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("ClaudeCode (Opus)"),
+        "the rehydrated card must still render its model:\n{text}"
+    );
+}

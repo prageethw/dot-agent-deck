@@ -1027,6 +1027,57 @@ mod tests {
         assert!(prompt.ends_with('…'));
     }
 
+    /// Scenario: PRD fork#378 reviewer/auditor round 2 (MEDIUM 4 / F3): a
+    /// hook payload whose `model` key is a JSON object, a number, or a bool
+    /// — instead of a string — must not fail the whole decode. Before the
+    /// `model` field existed, any JSON shape there landed harmlessly in
+    /// `#[serde(flatten)] _extra` and was ignored; now it is a strictly
+    /// typed `Option<String>`, so `serde_json::from_str::<ClaudeCodeHookInput>`
+    /// errors on the whole payload, and `handle_hook` silently swallows that
+    /// error (`Err(_) => return ExitCode::SUCCESS`) with no diagnostic —
+    /// a total, silent status blackout for that agent, not just a lost
+    /// model. This is realistic: this repo's own `src/devin_hooks_manage.rs`
+    /// writes `"agent": {"model": "opus"}` (a nested shape), and OpenCode
+    /// addresses models as provider+model pairs. A non-string model must
+    /// instead degrade to `model: None` while every other field — including
+    /// `session_id`, the event type, and the tool name — survives intact.
+    /// `null` already works today (`Option` absorbs it) and must keep
+    /// working.
+    #[spec("protocol/agent-model/002")]
+    #[test]
+    fn agent_model_002_non_string_model_does_not_drop_the_event() {
+        for (label, model_json) in [
+            ("object", r#"{"provider":"anthropic","id":"opus"}"#),
+            ("number", "4"),
+            ("bool", "true"),
+            ("array", r#"["opus"]"#),
+        ] {
+            let payload = format!(
+                r#"{{"session_id":"test-123","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{{"file_path":"/src/main.rs"}},"model":{model_json}}}"#
+            );
+            let hook_input: ClaudeCodeHookInput =
+                serde_json::from_str(&payload).unwrap_or_else(|e| {
+                    panic!("a non-string ({label}) model must not fail the whole decode: {e}")
+                });
+            assert!(
+                hook_input.model.is_none(),
+                "a non-string ({label}) model must degrade to None, not a decode error"
+            );
+            let event = build_event(hook_input)
+                .expect("the rest of the event must survive a non-string model");
+            assert_eq!(event.session_id, "test-123");
+            assert_eq!(event.event_type, EventType::ToolStart);
+            assert_eq!(event.tool_name.as_deref(), Some("Read"));
+            assert!(event.model.is_none());
+        }
+
+        // `null` already works and must keep working.
+        let payload = r#"{"session_id":"test-123","hook_event_name":"SessionStart","model":null}"#;
+        let hook_input: ClaudeCodeHookInput =
+            serde_json::from_str(payload).expect("a null model must decode fine");
+        assert!(hook_input.model.is_none());
+    }
+
     #[test]
     fn send_to_missing_socket_returns_none() {
         // With no daemon running, send should silently fail

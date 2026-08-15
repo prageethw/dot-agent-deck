@@ -896,6 +896,13 @@ fn pane_008_codex_card_omits_agent_type_badge() {
 /// toggle is on, in the same registry `badge_color` + `Modifier::BOLD` cell,
 /// and shows neither the label nor the model when the toggle is off; a
 /// session with no model keeps the bare `<Label> · <name>` form.
+/// Reviewer/auditor round 2 additionally pins: model-label normalization
+/// strips a known vendor prefix (`claude-`, `gpt-`, `gemini-`, `llama-`,
+/// `mistral-`) case-insensitively and passes an unrecognized id through
+/// unchanged, with a value that is ONLY a vendor prefix falling back to its
+/// raw form rather than collapsing to empty; and an empty or
+/// whitespace-only model renders the bare `<Label> · <name>` form, never an
+/// empty `()` or a whitespace-padded one.
 #[spec("dashboard/agent-badge/001")]
 #[test]
 fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
@@ -1051,6 +1058,89 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         buffer_to_color_text(&on_model)
     );
 
+    // PRD fork#378 reviewer/auditor round 2, item 1: model-label
+    // normalization. A compact heuristic — strip a leading vendor prefix
+    // from a short, stable list, everything else passes through unchanged.
+    // No per-model lookup table, since vendor prefixes are stable but model
+    // ids churn constantly.
+    let rendered_badge_with = |agent_type: AgentType, model: &str| -> String {
+        let mut s = session.clone();
+        s.agent_type = agent_type;
+        s.model = Some(model.to_string());
+        let buf = render_card_for_mode_to_buffer(
+            &s,
+            None,
+            Some(1),
+            density,
+            0,
+            false,
+            UiMode::Normal,
+            width,
+            height,
+            true,
+        );
+        buffer_to_text(&buf)
+    };
+
+    let text = rendered_badge_with(AgentType::ClaudeCode, "claude-sonnet-5");
+    assert!(
+        text.contains("ClaudeCode (sonnet-5)"),
+        "a `claude-` vendor prefix must be stripped from the displayed \
+         model:\n{text}"
+    );
+    assert!(
+        !text.contains("claude-sonnet-5"),
+        "the raw, unstripped model id must not also appear:\n{text}"
+    );
+
+    let text = rendered_badge_with(AgentType::Codex, "gpt-5.1-codex-mini");
+    assert!(
+        text.contains("Codex (5.1-codex-mini)"),
+        "a `gpt-` vendor prefix must be stripped from the displayed \
+         model:\n{text}"
+    );
+
+    let text = rendered_badge_with(AgentType::Pi, "unknown-model-x");
+    assert!(
+        text.contains("Pi (unknown-model-x)"),
+        "a model id matching no known vendor prefix must pass through \
+         unchanged:\n{text}"
+    );
+
+    let text = rendered_badge_with(AgentType::ClaudeCode, "CLAUDE-Opus-4");
+    assert!(
+        text.contains("ClaudeCode (Opus-4)"),
+        "vendor-prefix matching must be case-insensitive:\n{text}"
+    );
+
+    let text = rendered_badge_with(AgentType::ClaudeCode, "claude-");
+    assert!(
+        text.contains("ClaudeCode (claude-)"),
+        "a model that is ONLY a vendor prefix must fall back to its raw \
+         value rather than normalizing to empty:\n{text}"
+    );
+    assert!(
+        !text.contains("ClaudeCode ()"),
+        "a bare vendor-prefix model must never render an empty `()`:\n{text}"
+    );
+
+    // PRD fork#378 reviewer/auditor round 2, item 2 (F4): an empty or
+    // whitespace-only model must render the bare `<Label> · <name>` form,
+    // never an empty `()` or a whitespace-padded one.
+    for empty_model in ["", "   "] {
+        let text = rendered_badge_with(AgentType::ClaudeCode, empty_model);
+        assert!(
+            text.contains("ClaudeCode · wrapped-01"),
+            "an empty/whitespace model {empty_model:?} must render the bare \
+             `ClaudeCode · wrapped-01` form:\n{text}"
+        );
+        assert!(
+            !text.contains('('),
+            "an empty/whitespace model {empty_model:?} must never render a \
+             bracket:\n{text}"
+        );
+    }
+
     for (agent_type, friendly_name) in [
         (AgentType::ClaudeCode, "friendly-claude"),
         (AgentType::OpenCode, "friendly-opencode"),
@@ -1176,6 +1266,64 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
 #[spec("dashboard/agent-badge/004")]
 #[test]
 fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
+    // PRD fork#378 reviewer/auditor round 2 (LOW 7 / Q4): SonarCloud's
+    // `new_duplicated_lines_density` finding traced to this test's three
+    // near-identical 15-field `AgentEvent` literals and 10-argument render
+    // calls. Two local builders — mirroring `tests/rehydration.rs::live_011`'s
+    // `hook_event`/`rollover_event`/`shell_event` pattern — factor out
+    // everything this scenario holds fixed, leaving only what varies
+    // (event type, elapsed offset, model) at each call site.
+
+    /// A `runtime-01` / `pane-badge-model` `AgentEvent`, varying only the
+    /// event type, the elapsed offset from `started`, and the model.
+    fn event(
+        started: chrono::DateTime<chrono::Utc>,
+        offset_secs: i64,
+        event_type: EventType,
+        tool_name: Option<&str>,
+        model: Option<&str>,
+    ) -> AgentEvent {
+        AgentEvent {
+            session_id: "runtime-01".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: tool_name.map(str::to_string),
+            tool_detail: None,
+            cwd: None,
+            timestamp: started + chrono::Duration::seconds(offset_secs),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("pane-badge-model".to_string()),
+            agent_id: Some("agent-badge-model".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: model.map(str::to_string),
+        }
+    }
+
+    /// Render a session's card with the badge toggle on, at this scenario's
+    /// fixed density/width/height.
+    fn render(
+        session: &SessionState,
+        density: CardDensityKind,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        render_card_for_mode_to_buffer(
+            session,
+            None,
+            Some(1),
+            density,
+            0,
+            false,
+            UiMode::Normal,
+            width,
+            height,
+            true,
+        )
+    }
+
     let mut state = AppState::default();
     state.register_pane("pane-badge-model".to_string());
     let started = chrono::Utc::now();
@@ -1185,23 +1333,13 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     let height = density.rendered_height();
     let claude_color = dot_agent_deck::agent_registry::spec(&AgentType::ClaudeCode).badge_color;
 
-    state.apply_event(AgentEvent {
-        session_id: "runtime-01".to_string(),
-        agent_type: AgentType::ClaudeCode,
-        event_type: EventType::SessionStart,
-        tool_name: None,
-        tool_detail: None,
-        cwd: None,
-        timestamp: started,
-        user_prompt: None,
-        metadata: HashMap::new(),
-        pane_id: Some("pane-badge-model".to_string()),
-        agent_id: Some("agent-badge-model".to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-        model: Some("Opus".to_string()),
-    });
+    state.apply_event(event(
+        started,
+        0,
+        EventType::SessionStart,
+        None,
+        Some("Opus"),
+    ));
     let session = state
         .sessions
         .get("runtime-01")
@@ -1212,18 +1350,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
         Some("Opus"),
         "a SessionStart carrying model:Some(\"Opus\") must set SessionState.model"
     );
-    let buffer = render_card_for_mode_to_buffer(
-        &session,
-        None,
-        Some(1),
-        density,
-        0,
-        false,
-        UiMode::Normal,
-        width,
-        height,
-        true,
-    );
+    let buffer = render(&session, density, width, height);
     let text = buffer_to_text(&buffer);
     assert!(
         text.contains("ClaudeCode (Opus) · runtime-01"),
@@ -1231,23 +1358,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
 
     // A later event with a DIFFERENT model overwrites it.
-    state.apply_event(AgentEvent {
-        session_id: "runtime-01".to_string(),
-        agent_type: AgentType::ClaudeCode,
-        event_type: EventType::Thinking,
-        tool_name: None,
-        tool_detail: None,
-        cwd: None,
-        timestamp: started + chrono::Duration::seconds(1),
-        user_prompt: None,
-        metadata: HashMap::new(),
-        pane_id: Some("pane-badge-model".to_string()),
-        agent_id: Some("agent-badge-model".to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-        model: Some("Haiku".to_string()),
-    });
+    state.apply_event(event(started, 1, EventType::Thinking, None, Some("Haiku")));
     let session = state
         .sessions
         .get("runtime-01")
@@ -1258,18 +1369,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
         Some("Haiku"),
         "a later event carrying a DIFFERENT model must overwrite the known model"
     );
-    let buffer = render_card_for_mode_to_buffer(
-        &session,
-        None,
-        Some(1),
-        density,
-        0,
-        false,
-        UiMode::Normal,
-        width,
-        height,
-        true,
-    );
+    let buffer = render(&session, density, width, height);
     let text = buffer_to_text(&buffer);
     assert!(
         text.contains("ClaudeCode (Haiku) · runtime-01"),
@@ -1281,23 +1381,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
 
     // A later event carrying NO model must NOT clear the previously-known one.
-    state.apply_event(AgentEvent {
-        session_id: "runtime-01".to_string(),
-        agent_type: AgentType::ClaudeCode,
-        event_type: EventType::ToolStart,
-        tool_name: Some("Read".to_string()),
-        tool_detail: None,
-        cwd: None,
-        timestamp: started + chrono::Duration::seconds(2),
-        user_prompt: None,
-        metadata: HashMap::new(),
-        pane_id: Some("pane-badge-model".to_string()),
-        agent_id: Some("agent-badge-model".to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-        model: None,
-    });
+    state.apply_event(event(started, 2, EventType::ToolStart, Some("Read"), None));
     let session = state
         .sessions
         .get("runtime-01")
@@ -1308,18 +1392,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
         Some("Haiku"),
         "an event carrying no model must NOT clear a previously-known model"
     );
-    let buffer = render_card_for_mode_to_buffer(
-        &session,
-        None,
-        Some(1),
-        density,
-        0,
-        false,
-        UiMode::Normal,
-        width,
-        height,
-        true,
-    );
+    let buffer = render(&session, density, width, height);
     let text = buffer_to_text(&buffer);
     assert!(
         text.contains("ClaudeCode (Haiku) · runtime-01"),
@@ -1336,6 +1409,149 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
         "the badge cell must carry ClaudeCode's registry badge color \
          {claude_color:?} AND Modifier::BOLD:\n{}",
         buffer_to_color_text(&buffer)
+    );
+}
+
+/// Scenario: PRD fork#378 reviewer/auditor round 2 (MEDIUM 3 / F1 + F2):
+/// apply a `SessionStart` `AgentEvent` whose model is a 300-character
+/// multi-byte (CJK) string followed by a distinctive tail marker, through
+/// the real `AppState::apply_event` seam, then render the card with the
+/// badge toggle on. The badge is the only free-text producer field in
+/// `build_event_typed` with no clamp, and it sits BEFORE the `· <id>`
+/// identity segment in `truncate_styled_segments`'s left-to-right budget —
+/// so today an unbounded model consumes the whole title and pushes the
+/// identity off entirely. The raw tail marker must not survive to the
+/// render (a bounded model was truncated), and the identity segment must
+/// still be visible. The 300 chars are all 3-byte UTF-8 characters, so any
+/// truncation implemented as a byte-index slice rather than a char-boundary
+/// one panics this test rather than merely failing an assertion.
+#[spec("dashboard/agent-badge/005")]
+#[test]
+fn agent_badge_005_long_model_is_bounded_and_identity_survives() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-long".to_string());
+    let started = chrono::Utc::now();
+
+    let long_model = format!("{}TAIL-MARKER-ZZZZ", "日".repeat(100));
+    state.apply_event(AgentEvent {
+        session_id: "long-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-long".to_string()),
+        agent_id: Some("agent-badge-long".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: Some(long_model),
+    });
+    let session = state
+        .sessions
+        .get("long-id-01")
+        .expect("the session exists after SessionStart")
+        .clone();
+
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+
+    assert!(
+        !text.contains("TAIL-MARKER-ZZZZ"),
+        "an unbounded model must be truncated to a sane display cap — the \
+         raw tail of a 300-char model must not survive to the render:\n{text}"
+    );
+    assert!(
+        text.contains("· long-id-01"),
+        "the card's own identity segment must survive a long model, not be \
+         pushed off the title budget by an unbounded badge segment:\n{text}"
+    );
+}
+
+/// Scenario: PRD fork#378 reviewer/auditor round 2 (LOW / F5): apply a
+/// `SessionStart` `AgentEvent` whose model embeds a Unicode `Cf` format
+/// character (U+202E RIGHT-TO-LEFT OVERRIDE) through the real
+/// `AppState::apply_event` seam, then render the card with the badge
+/// toggle on. `src/terminal_sanitize.rs` exists for exactly this class —
+/// the auditor confirmed ANSI/control (`Cc`) bytes are already filtered by
+/// ratatui at two layers, so this does NOT re-test that; `Cf` chars pass
+/// both ratatui filters unchanged and can visually reorder or conceal the
+/// rest of the title row.
+#[spec("dashboard/agent-badge/006")]
+#[test]
+fn agent_badge_006_model_with_format_chars_is_sanitized() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-cf".to_string());
+    let started = chrono::Utc::now();
+
+    let hostile_model = "Sonnet\u{202e}-evil";
+    state.apply_event(AgentEvent {
+        session_id: "cf-id-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-cf".to_string()),
+        agent_id: Some("agent-badge-cf".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: Some(hostile_model.to_string()),
+    });
+    let session = state
+        .sessions
+        .get("cf-id-01")
+        .expect("the session exists after SessionStart")
+        .clone();
+
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+
+    assert!(
+        !text.contains('\u{202e}'),
+        "a Cf format char (U+202E RIGHT-TO-LEFT OVERRIDE) in the model must \
+         not reach the rendered title unsanitized:\n{text}"
+    );
+    let sanitized = dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display(hostile_model);
+    assert!(
+        text.contains(&sanitized),
+        "the model must be routed through the repo's terminal sanitizer \
+         (src/terminal_sanitize.rs) before rendering:\n{text}"
     );
 }
 
