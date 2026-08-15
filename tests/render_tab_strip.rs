@@ -189,10 +189,10 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
          label Green — Working outranks Thinking"
     );
 
-    // Non-orchestration tabs are unaffected: a `None` entry must render with
-    // the SAME base label color as any other unaffected tab in the same row,
-    // never a status color, even though "demo" here also happens to carry no
-    // status data.
+    // A tab entry with no status data (the Dashboard case, now that Mode
+    // tabs also carry status data via `Some(..)`) is unaffected: a `None`
+    // entry must render with the SAME base label color as any other
+    // unaffected tab in the same row, never a status color.
     let buf = render_tab_bar_to_buffer(
         &["Dashboard", "demo"],
         &[false, false],
@@ -203,8 +203,8 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
     assert_eq!(
         tab_label_fg(&buf, "Dashboard"),
         tab_label_fg(&buf, "demo"),
-        "a non-orchestration tab (None) must render with the same base label color as any \
-         other unaffected tab, not a status color"
+        "a tab with no status data (the Dashboard case) must render with the same base label \
+         color as any other unaffected tab, not a status color"
     );
 }
 
@@ -303,33 +303,32 @@ fn orchestration_010_active_status_tint_underlined_and_idle_coloured() {
 }
 
 /// Scenario: Render the tab strip with only the Dashboard tab, active, and no
-/// orchestration status data (`orchestration_statuses = [None]`) — assert its
+/// status data (`tab_statuses = [None]`) — assert its
 /// label carries `UNDERLINED | BOLD` as the active cue, contains no
 /// `REVERSED`, and carries no absolute foreground color (`Color::Reset`, the
 /// same as an ordinary unstyled tab) — proving the active cue applies
 /// uniformly to the Dashboard tab, which carries no status data (fork issue
 /// #351 narrows this from "tabs this feature doesn't touch" now that Mode
 /// tabs also carry status data via `tab_status_data`; the Dashboard remains
-/// the deliberate scope boundary). RED today: the active style is still
-/// `Modifier::REVERSED | Modifier::BOLD` with no `UNDERLINED`.
+/// the deliberate scope boundary).
 #[spec("tabs/orchestration/012")]
 #[test]
-fn orchestration_012_active_non_orchestration_tab_underlined_no_reversed() {
+fn orchestration_012_active_dashboard_tab_underlined_no_reversed() {
     let buf = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
     let modifier = tab_label_modifier(&buf, "Dashboard");
     assert!(
         modifier.contains(Modifier::UNDERLINED) && modifier.contains(Modifier::BOLD),
-        "an ACTIVE non-orchestration tab must carry UNDERLINED | BOLD as its active cue, got \
+        "an ACTIVE Dashboard tab must carry UNDERLINED | BOLD as its active cue, got \
          {modifier:?}"
     );
     assert!(
         !modifier.contains(Modifier::REVERSED),
-        "an ACTIVE non-orchestration tab must NOT carry REVERSED, got {modifier:?}"
+        "an ACTIVE Dashboard tab must NOT carry REVERSED, got {modifier:?}"
     );
     assert_eq!(
         tab_label_fg(&buf, "Dashboard"),
         Color::Reset,
-        "an ACTIVE non-orchestration tab must carry no absolute foreground color"
+        "an ACTIVE Dashboard tab must carry no absolute foreground color"
     );
 }
 
@@ -377,9 +376,11 @@ fn orchestration_014_active_idle_coloured_underlined() {
 /// ordinary foreground text, still cued active via `UNDERLINED | BOLD` with
 /// no `REVERSED`. This is a regression guard, GREEN from the start: the
 /// render half (`render_tab_strip`) already colors any tab whose
-/// `orchestration_statuses` slot is `Some(..)` regardless of tab kind — the
-/// defect is one level up, in the inline builder that currently maps every
-/// Mode tab to `None` before it ever reaches this renderer.
+/// `tab_statuses` slot is `Some(..)` regardless of tab kind, exercised here
+/// directly via `render_tab_bar_to_buffer`. That `tab_status_data` actually
+/// produces `Some(&[Working])` for a live Mode tab is `tabs/label/001`'s
+/// concern; that `run_tui`'s call site wires the two together is covered by
+/// no test.
 #[spec("tabs/label/002")]
 #[test]
 fn label_002_active_tab_with_status_data_renders_status_color_underlined() {

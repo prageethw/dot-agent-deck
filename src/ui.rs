@@ -15096,8 +15096,10 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
 /// - `Tab::Orchestration` → `Some(<statuses of the role panes present in
 ///   `pane_status`>)`, unchanged from before this function existed.
 /// - `Tab::Mode` → `Some(vec![status])` when its `agent_pane_id` is live,
-///   `Some(vec![])` when it isn't yet (resolves to `Idle`, which falls
-///   through to the base style — correct, not a bug).
+///   `Some(vec![])` when the pane isn't live yet, which
+///   `highest_priority_status` resolves to `Idle` and which therefore paints
+///   `STATUS_IDLE` like any other idle tab (intended; see the `FORK-ONLY`
+///   note in `render_tab_strip`).
 /// - `Tab::Dashboard` → `None`. Deliberate: it isn't a worker, and
 ///   aggregating every session on the deck would leave it near-permanently
 ///   tinted, destroying the "colour means something needs attention" signal.
@@ -23409,13 +23411,13 @@ mod tests {
     /// variants — a `Mode` tab whose agent pane is live, a `Mode` tab whose
     /// agent pane isn't live yet, an `Orchestration` tab with two role
     /// panes, and the `Dashboard` — and confirm `tab_status_data` keys each
-    /// one positionally: a `Mode` tab's own pane status (fork issue #351;
-    /// the inline builder in `run_tui` currently maps every non-Orchestration
-    /// tab, Mode included, to `None`, which is the defect this pins), an
+    /// one positionally: a `Mode` tab's own pane status (fork issue #351), an
     /// `Orchestration` tab's role statuses (unchanged), and `None` for the
-    /// Dashboard (the deliberate scope boundary). The Mode and Orchestration
-    /// panes carry deliberately distinct statuses so a wrong lookup key
-    /// can't accidentally produce a passing result.
+    /// Dashboard (the deliberate scope boundary). This exercises
+    /// `tab_status_data` directly; that `run_tui`'s call site actually wires
+    /// its output through to the renderer is covered by no test. The Mode
+    /// and Orchestration panes carry deliberately distinct statuses so a
+    /// wrong lookup key can't accidentally produce a passing result.
     #[spec("tabs/label/001")]
     #[test]
     fn label_001_tab_status_data_keys_mode_tab_by_its_own_agent_pane() {

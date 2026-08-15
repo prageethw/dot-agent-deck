@@ -28,7 +28,7 @@ Scope decisions, confirmed with the user during PRD creation:
 - **Orchestration tabs only.** Single-pane/mode tabs already show their own status directly and don't need an aggregate signal.
 - **Renders as the tab label's text color** (not a dot/icon prefix, not a border/underline) — consistent with how deck cards already color their status badge text.
 - **The active tab is never tinted** (added during maintainer review — see the Work Log). It renders exactly like an active non-orchestration tab: `REVERSED | BOLD` with no absolute foreground. Reverse video swaps fg/bg, so a status foreground there would become the label's *background* and draw the text in the terminal's background color.
-- **An aggregate that resolves to Idle is not painted grey.** `STATUS_IDLE` is a grey, and PRD #13 removed exactly that pattern from read-critical text in `ui.rs` (it reserves faintness for purely-decorative, non-read elements such as borders). A tab label is text, so the idle case falls through to the base style instead.
+- **An aggregate that resolves to Idle is not painted grey.** `STATUS_IDLE` is a grey, and PRD #13 removed exactly that pattern from read-critical text in `ui.rs` (it reserves faintness for purely-decorative, non-read elements such as borders). A tab label is text, so the idle case falls through to the base style instead. *(reversed 2026-08-15 — see Work Log)*
 
 ## Decisions
 
