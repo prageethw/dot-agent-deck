@@ -245,10 +245,10 @@ struct TabBarInfo {
     show: bool,
     labels: Vec<String>,
     active_index: usize,
-    /// PRD #333: per-tab pane statuses, aligned with `labels` — `Some` for an
-    /// Orchestration tab (used to color its label), `None` for every other
-    /// tab.
-    orchestration_statuses: Vec<Option<Vec<SessionStatus>>>,
+    /// PRD #333 / fork issue #351: per-tab pane statuses, aligned with
+    /// `labels` — `Some` for an Orchestration or Mode tab (used to color its
+    /// label), `None` for the Dashboard.
+    tab_statuses: Vec<Option<Vec<SessionStatus>>>,
 }
 
 struct DirPickerState {
@@ -13249,30 +13249,19 @@ pub fn run_tui(
                 },
             })
             .collect();
-        // PRD #333: join each Orchestration tab's role panes to their live
+        // PRD #333 / fork issue #351: join each tab's pane(s) to their live
         // status through the SAME `state.sessions[*].status` source the deck
         // cards and embedded-pane borders read (`build_pane_status`), so the
-        // tab label's aggregate color agrees with what's actually on screen.
-        // Non-orchestration tabs get `None` — this feature doesn't touch them.
+        // tab label's color agrees with what's actually on screen. Dashboard
+        // gets `None` — see `tab_status_data`'s doc comment for why.
         let pane_status_for_tabs: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
-        let tab_bar_orchestration_statuses: Vec<Option<Vec<SessionStatus>>> = tab_manager
-            .tabs()
-            .iter()
-            .map(|tab| match tab {
-                Tab::Orchestration { role_pane_ids, .. } => Some(
-                    role_pane_ids
-                        .iter()
-                        .filter_map(|pid| pane_status_for_tabs.get(pid.as_str()).cloned())
-                        .collect(),
-                ),
-                _ => None,
-            })
-            .collect();
+        let tab_bar_statuses: Vec<Option<Vec<SessionStatus>>> =
+            tab_status_data(tab_manager.tabs(), &pane_status_for_tabs);
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
             active_index: tab_manager.active_index(),
-            orchestration_statuses: tab_bar_orchestration_statuses,
+            tab_statuses: tab_bar_statuses,
         };
         // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
         // compute → resize → render, all against the SAME live frame area.
@@ -14561,20 +14550,21 @@ struct TabStripRects {
     closes: Vec<(usize, Rect)>,
 }
 
-/// PRD #333: `orchestration_statuses[i]` carries tab `i`'s pane statuses
-/// (`Some` for an Orchestration tab, `None` for every tab this feature
-/// doesn't touch) so a tab's label can render in `palette::status_color()` of
-/// the highest-priority status among them — issue #306 extends this to the
-/// active tab too, since its `UNDERLINED` cue no longer fights a stacked `fg`
-/// tint. Any tab whose aggregate resolves to Idle still renders in the
-/// ordinary tab style — see the carve-out comment in the loop.
+/// PRD #333 / fork issue #351: `tab_statuses[i]` carries tab `i`'s pane
+/// statuses (`Some` for an Orchestration or Mode tab, `None` for Dashboard,
+/// which this feature deliberately doesn't touch) so a tab's label can
+/// render in `palette::status_color()` of the highest-priority status among
+/// them — issue #306 extends this to the active tab too, since its
+/// `UNDERLINED` cue no longer fights a stacked `fg` tint. Colour is a total
+/// function of status: every state paints, Idle included — see the
+/// `FORK-ONLY` comment in the loop for why.
 fn render_tab_strip(
     frame: &mut Frame,
     area: Rect,
     labels: &[String],
     closeable: &[bool],
     active_index: usize,
-    orchestration_statuses: &[Option<&[SessionStatus]>],
+    tab_statuses: &[Option<&[SessionStatus]>],
 ) -> TabStripRects {
     // PRD #13: the tab-bar row is left unpainted so the terminal's own
     // background shows through (no absolute `tab_bar_bg` fill).
@@ -14610,31 +14600,35 @@ fn render_tab_strip(
         } else {
             base_style
         };
-        // PRD #333: an orchestration tab's label takes the color of the single
-        // highest-priority status among its panes instead of the base label
-        // color, so color means "something here needs attention". One
-        // carve-out keeps the label readable:
-        //   - an aggregate that resolves to Idle (including `Unknown`, which
-        //     `status_color` aliases to it) falls through to the base style
-        //     rather than painting `STATUS_IDLE` (a grey) onto read-critical
-        //     text — the low-contrast-on-light pattern PRD #13 removed from
-        //     `ui.rs`. An idle tab simply looks like an ordinary tab.
+        // PRD #333 / fork issue #351: a tab's label takes the color of the
+        // single highest-priority status among its pane(s) instead of the
+        // base label color, so color means "something here needs attention".
         // Issue #306: the ACTIVE tab used to be excluded here too, on the
         // reasoning that its `REVERSED` highlight would invert an absolute fg
         // into the label's background. Now that the active cue is
         // `UNDERLINED | BOLD` instead of `REVERSED`, a stacked status `fg`
         // tint renders as ordinary foreground text, so the active tab takes
         // the same tint an inactive one gets.
-        // Tabs this feature doesn't touch (`None`) are untouched.
-        let style = match orchestration_statuses.get(i).copied().flatten() {
-            Some(statuses) => {
-                let color = palette::status_color(&palette::highest_priority_status(statuses));
-                if color == palette::STATUS_IDLE {
-                    style
-                } else {
-                    style.fg(color)
-                }
-            }
+        // Dashboard (`None`) is untouched — see `tab_status_data`'s doc
+        // comment for why.
+        //
+        // FORK-ONLY, maintainer decision 2026-08-15: an aggregate that
+        // resolves to Idle now paints `palette::STATUS_IDLE` like every
+        // other status, rather than falling through to the base style. This
+        // reverses two prior decisions that deliberately carved Idle out —
+        // PRD #333's original design ("An aggregate that resolves to Idle is
+        // not painted grey") and, before that, upstream's maintainer on
+        // review of upstream PR #356 as an explicit contrast fix. The
+        // accepted cost: `STATUS_IDLE` is an absolute `DarkGray`, so an idle
+        // tab label is low-contrast on a dark terminal — the pattern PRD #13
+        // generally bans on read-critical text — accepted here so a tab's
+        // colour always equals its worker's status colour with no
+        // exceptions, matching the idle status badge on the deck cards. A
+        // future upstream sync must not silently restore the carve-out.
+        let style = match tab_statuses.get(i).copied().flatten() {
+            Some(statuses) => style.fg(palette::status_color(&palette::highest_priority_status(
+                statuses,
+            ))),
             _ => style,
         };
 
@@ -15089,6 +15083,56 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
         .collect()
 }
 
+/// Builds `TabBarInfo`'s per-tab status data (fork issue #351): one entry per
+/// tab, positionally, joined through the same `pane_status` map
+/// (`build_pane_status`) that colors deck cards and pane borders, so a tab's
+/// colour can never disagree with what's already on screen.
+///
+/// - `Tab::Orchestration` → `Some(<statuses of the role panes present in
+///   `pane_status`>)`, unchanged from before this function existed.
+/// - `Tab::Mode` → `Some(vec![status])` when its `agent_pane_id` is live,
+///   `Some(vec![])` when the pane isn't live yet, which
+///   `highest_priority_status` resolves to `Idle` and which therefore paints
+///   `STATUS_IDLE` like any other idle tab (intended; see the `FORK-ONLY`
+///   note in `render_tab_strip`).
+/// - `Tab::Dashboard` → `None`. Deliberate: it isn't a worker, and
+///   aggregating every session on the deck would leave it near-permanently
+///   tinted, destroying the "colour means something needs attention" signal.
+///
+/// FORK-ONLY (fork issue #351): upstream's PRD #333 scoped tab colouring to
+/// orchestration tabs on the reasoning that "single-pane/mode tabs already
+/// show their own status". This fork completes it to the scope the
+/// originating issue actually asked for — upstream issue
+/// https://github.com/vfarcic/dot-agent-deck/issues/333 is titled "feature:
+/// multitabs show colors to show status ? working, idle or need input?",
+/// plural, not orchestration-only. Upstream has no test for a feature it
+/// never had, so a bad merge resolution that drops the `Tab::Mode` arm fails
+/// **silently** — a Mode tab quietly loses its status colour with nothing
+/// going red.
+pub(crate) fn tab_status_data(
+    tabs: &[Tab],
+    pane_status: &HashMap<&str, SessionStatus>,
+) -> Vec<Option<Vec<SessionStatus>>> {
+    tabs.iter()
+        .map(|tab| match tab {
+            Tab::Orchestration { role_pane_ids, .. } => Some(
+                role_pane_ids
+                    .iter()
+                    .filter_map(|pid| pane_status.get(pid.as_str()).cloned())
+                    .collect(),
+            ),
+            Tab::Mode { agent_pane_id, .. } => Some(
+                pane_status
+                    .get(agent_pane_id.as_str())
+                    .cloned()
+                    .into_iter()
+                    .collect(),
+            ),
+            Tab::Dashboard { .. } => None,
+        })
+        .collect()
+}
+
 /// The same `pane_id -> SessionStatus` join as [`build_pane_status`], but
 /// **fail-closed on ambiguity**: a `pane_id` claimed by more than one session
 /// is OMITTED from the result entirely, whatever those sessions' statuses say.
@@ -15232,8 +15276,8 @@ fn render_frame(
         // terminal-relative — the active tab is cued with Modifier::UNDERLINED
         // | Modifier::BOLD, not an absolute background tint.
         let closeable: Vec<bool> = (0..tab_bar.labels.len()).map(|i| i != 0).collect();
-        let orchestration_statuses: Vec<Option<&[SessionStatus]>> = tab_bar
-            .orchestration_statuses
+        let tab_statuses: Vec<Option<&[SessionStatus]>> = tab_bar
+            .tab_statuses
             .iter()
             .map(|statuses| statuses.as_deref())
             .collect();
@@ -15243,7 +15287,7 @@ fn render_frame(
             &tab_bar.labels,
             &closeable,
             tab_bar.active_index,
-            &orchestration_statuses,
+            &tab_statuses,
         );
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
@@ -20619,14 +20663,14 @@ pub fn render_rename_bar_to_buffer(rename_text: &str, width: u16) -> ratatui::bu
 /// rendered cells (e.g. the presence of a `[×]` close glyph on Mode /
 /// Orchestration tabs and its absence on the Dashboard tab) without a PTY.
 /// `closeable[i]` marks whether tab `i` carries a close affordance.
-/// `orchestration_statuses[i]` is `Some(pane statuses)` for an orchestration
-/// tab (PRD #333) or `None` for a tab this feature doesn't touch.
+/// `tab_statuses[i]` is `Some(pane statuses)` for an Orchestration or Mode
+/// tab (PRD #333 / fork issue #351) or `None` for the Dashboard.
 pub fn render_tab_bar_to_buffer(
     labels: &[&str],
     closeable: &[bool],
     active_index: usize,
     width: u16,
-    orchestration_statuses: &[Option<&[SessionStatus]>],
+    tab_statuses: &[Option<&[SessionStatus]>],
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -20642,14 +20686,7 @@ pub fn render_tab_bar_to_buffer(
                 width,
                 height: 1,
             };
-            render_tab_strip(
-                frame,
-                area,
-                &owned,
-                closeable,
-                active_index,
-                orchestration_statuses,
-            );
+            render_tab_strip(frame, area, &owned, closeable, active_index, tab_statuses);
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -21199,7 +21236,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into(), "Mode".into()],
             active_index: 0,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
         // A 1-row bottom bar (this fixture exercises the split math, not the
@@ -21265,7 +21302,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into(), "demo".into()],
             active_index: 1,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
         let layout = compute_frame_layout(
             frame_area,
@@ -21348,7 +21385,7 @@ mod tests {
             show: true,
             labels: vec!["seven-roles".into()],
             active_index: 0,
-            orchestration_statuses: vec![Some(vec![])],
+            tab_statuses: vec![Some(vec![])],
         };
 
         let mut expanded_rect: Option<Rect> = None;
@@ -23183,6 +23220,156 @@ mod tests {
         );
     }
 
+    /// Scenario: build a `TabManager`-independent `&[Tab]` covering all four
+    /// variants — a `Mode` tab whose agent pane is live, a `Mode` tab whose
+    /// agent pane isn't live yet, an `Orchestration` tab with two role
+    /// panes, and the `Dashboard` — and confirm `tab_status_data` keys each
+    /// one positionally: a `Mode` tab's own pane status (fork issue #351), an
+    /// `Orchestration` tab's role statuses (unchanged), and `None` for the
+    /// Dashboard (the deliberate scope boundary). This exercises
+    /// `tab_status_data` directly; that `run_tui`'s call site actually wires
+    /// its output through to the renderer is covered by no test. The Mode
+    /// and Orchestration panes carry deliberately distinct statuses so a
+    /// wrong lookup key can't accidentally produce a passing result.
+    #[spec("tabs/label/001")]
+    #[test]
+    fn label_001_tab_status_data_keys_mode_tab_by_its_own_agent_pane() {
+        use SessionStatus::*;
+
+        struct NoopPC;
+        impl crate::pane::PaneController for NoopPC {
+            fn create_pane(
+                &self,
+                _cmd: Option<&str>,
+                _cwd: Option<&str>,
+            ) -> Result<String, crate::pane::PaneError> {
+                Ok(String::new())
+            }
+            fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn rename_pane(
+                &self,
+                _id: &str,
+                name: &str,
+            ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+                Ok(crate::pane::RenameOutcome::applied(name))
+            }
+            fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+                Ok(Vec::new())
+            }
+            fn resize_pane(
+                &self,
+                _id: &str,
+                _direction: crate::pane::PaneDirection,
+                _amount: u16,
+            ) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        fn mk_role(name: &str, start: bool) -> crate::project_config::OrchestrationRoleConfig {
+            crate::project_config::OrchestrationRoleConfig {
+                name: name.to_string(),
+                command: String::new(),
+                start,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }
+        }
+
+        fn mk_mode_tab(id: TabId, agent_pane_id: &str) -> Tab {
+            Tab::Mode {
+                id,
+                name: format!("mode-{id}"),
+                agent_pane_id: agent_pane_id.to_string(),
+                mode_manager: Box::new(crate::mode_manager::ModeManager::new(Arc::new(NoopPC))),
+                last_routed_timestamp: HashMap::new(),
+                cwd: "/work".to_string(),
+                focused_pane_id: None,
+            }
+        }
+
+        // A Mode tab whose agent pane is live and Working.
+        let mode_live = mk_mode_tab(1, "pane-mode-live");
+        // A Mode tab whose agent pane hasn't spawned yet — no entry in
+        // `pane_status` at all.
+        let mode_cold = mk_mode_tab(2, "pane-mode-cold");
+
+        let orch_config = OrchestrationConfig {
+            name: "squad".to_string(),
+            roles: vec![mk_role("orch", true), mk_role("coder", false)],
+        };
+        let orchestration = Tab::Orchestration {
+            id: 3,
+            name: "squad".to_string(),
+            role_pane_ids: vec!["pane-orch".to_string(), "pane-coder".to_string()],
+            role_statuses: vec![OrchestrationRoleStatus::Waiting; 2],
+            cwd: "/work".to_string(),
+            focused_role_pane_id: None,
+            start_role_index: 0,
+            orchestrator_prompt: None,
+            config: orch_config,
+            status: OrchestrationStatus::WaitingForOrchestrator,
+            had_waiting_pane: false,
+            all_clear_pending: false,
+        };
+
+        let dashboard = Tab::Dashboard {
+            selected_session_id: None,
+        };
+
+        let tabs = vec![mode_live, mode_cold, orchestration, dashboard];
+
+        let mut pane_status: HashMap<&str, SessionStatus> = HashMap::new();
+        pane_status.insert("pane-mode-live", Working);
+        pane_status.insert("pane-orch", Error);
+        pane_status.insert("pane-coder", Idle);
+        // "pane-mode-cold" deliberately absent: the pane isn't live yet.
+
+        let result = tab_status_data(&tabs, &pane_status);
+
+        assert_eq!(result.len(), 4, "one entry per tab, positionally");
+        assert_eq!(
+            result[0],
+            Some(vec![Working]),
+            "a Mode tab must yield its own agent pane's status, not None"
+        );
+        assert_eq!(
+            result[1],
+            Some(vec![]),
+            "a Mode tab whose agent pane isn't live yet must still yield Some(empty), not None"
+        );
+        assert_eq!(
+            result[2],
+            Some(vec![Error, Idle]),
+            "an Orchestration tab's role statuses are unchanged by the Mode extraction"
+        );
+        assert_eq!(
+            result[3], None,
+            "the Dashboard tab carries no status data — the deliberate scope boundary"
+        );
+    }
+
     #[test]
     fn test_render_empty_state() {
         let backend = TestBackend::new(80, 24);
@@ -23202,7 +23389,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
-                    orchestration_statuses: vec![],
+                    tab_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -23292,7 +23479,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
-                    orchestration_statuses: vec![],
+                    tab_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -23433,7 +23620,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
-                    orchestration_statuses: vec![],
+                    tab_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -23784,7 +23971,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
-                    orchestration_statuses: vec![],
+                    tab_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -23877,7 +24064,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
-                    orchestration_statuses: vec![],
+                    tab_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -23945,7 +24132,7 @@ mod tests {
                     show: false,
                     labels: vec!["Dashboard".into()],
                     active_index: 0,
-                    orchestration_statuses: vec![],
+                    tab_statuses: vec![],
                 };
                 let layout = compute_frame_layout(
                     frame.area(),
@@ -26140,7 +26327,7 @@ mod tests {
             show: true,
             labels: vec!["orch".into()],
             active_index: 0,
-            orchestration_statuses: vec![Some(vec![])],
+            tab_statuses: vec![Some(vec![])],
         };
 
         let backend = TestBackend::new(100, 40);
@@ -26999,7 +27186,7 @@ mod tests {
             show: true,
             labels: vec!["Orchestration".into()],
             active_index: 0,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
 
         // Simulates the dispatch + render-sync (setting the thread-local
@@ -27117,7 +27304,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into()],
             active_index: 0,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
 
         let layout_for = |stage: SplitStage| {
@@ -27356,7 +27543,7 @@ mod tests {
             show: true,
             labels: vec!["Orchestration".into()],
             active_index: 0,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
         let panes_width_for = |stage: SplitStage| {
             ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
@@ -27623,7 +27810,7 @@ mod tests {
             show: true,
             labels: vec!["Orchestration".into()],
             active_index: 1,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
         let dash_pane_ids = vec!["p0".to_string(), "p1".to_string()];
         let dash_view = ActiveTabView::Dashboard {
@@ -27633,7 +27820,7 @@ mod tests {
             show: true,
             labels: vec!["Dashboard".into()],
             active_index: 0,
-            orchestration_statuses: vec![],
+            tab_statuses: vec![],
         };
         let orch_widths = || {
             let layout = compute_frame_layout(
