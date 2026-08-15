@@ -56,7 +56,11 @@ The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a
 
 ### `Ctrl+E` locks command entry to the orchestrator pane
 
-On an **orchestration tab**, typing into a worker pane is locked by default. Your keystrokes reach the orchestrator's pane exactly as before; aim them at a worker role and they are dropped rather than delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D` to reach command mode, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`; the same chord locks it again. `Ctrl+E` leaves you in command mode, so press `Ctrl+D` once more to return to the pane and type.
+On an **orchestration tab**, typing into a worker pane is locked by default. Your keystrokes reach the orchestrator's pane exactly as before; aim them at a worker role and they are dropped rather than delivered, and the bottom bar says `Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here`. That message names all three keypresses, because all three are needed: `Ctrl+D` reaches command mode, `Ctrl+E` unlocks and the deck reports `Pane entry: unlocked`, and `Ctrl+E` leaves you *in* command mode — so a third press of `Ctrl+D` returns you to the pane to type. The same chord locks it again.
+
+**Pastes are gated too.** A bracketed paste into a locked worker pane is dropped exactly as typed keystrokes are, rather than being delivered — so unlocking is required before pasting, not just before typing.
+
+While you are typing into a worker pane, a persistent **` LOCKED `** or **` UNLOCKED `** chip sits in the bottom bar beside the mode chips, so the current state is visible without having to trigger the message.
 
 **This is not a read-only mode, and it does not apply anywhere else.** Dashboard and mode tabs are untouched, nothing is disabled, and every pane still shows live output and scrolls normally. On an orchestration tab the lock costs one deliberate `Ctrl+D`, `Ctrl+E` before you can type at a worker — and that pause is the point. Why it is worth a pause, and why the default has to be locked for it to mean anything, is covered in [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
 

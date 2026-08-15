@@ -13,7 +13,6 @@ expression: buf
                                                                                                               
                                                                                                               
                                                                                                               
-                                                                                                              
    ┌ help ───────────────────────────────────────────────────────────────────────────────────────────────┐    
    │  global (works from any pane)                       mode tab (in-tab navigation)                    │    
    │                                                                                                     │    
@@ -39,14 +38,15 @@ expression: buf
    │  ctrl+l             cycle sidebar split stage       l / right / enter   enter directory             │    
    │  ctrl+z             zoom focused pane               h / left / bksp     go up one level             │    
    │  ctrl+m / m         show / hide agent badges        space           confirm current directory       │    
-   │  /                  filter sessions                 /               filter (case-insensitive)       │    
-   │  esc                clear filter                    esc             clear filter (twice = close)    │    
-   │  r                  rename session                  q               cancel                          │    
-   │  g                  generate .dot-agent-deck.toml                                                   │    
-   │  y / n              approve / deny permission       session                                         │    
-   │  s                  scheduled tasks manager                                                         │    
-   │  pageup / pagedown  scroll focused pane             panes auto-saved continuously.                  │    
-   │  ?                  toggle this help                restored automatically on launch.               │    
+   │  ctrl+e             toggle command-entry lock       /               filter (case-insensitive)       │    
+   │  /                  filter sessions                 esc             clear filter (twice = close)    │    
+   │  esc                clear filter                    q               cancel                          │    
+   │  r                  rename session                                                                  │    
+   │  g                  generate .dot-agent-deck.toml   session                                         │    
+   │  y / n              approve / deny permission                                                       │    
+   │  s                  scheduled tasks manager         panes auto-saved continuously.                  │    
+   │  pageup / pagedown  scroll focused pane             restored automatically on launch.               │    
+   │  ?                  toggle this help                                                                │    
    │  [close]                                                                                            │    
    │  press ? or esc to close                                                                            │    
    └─────────────────────────────────────────────────────────────────────────────────────────────────────┘    
