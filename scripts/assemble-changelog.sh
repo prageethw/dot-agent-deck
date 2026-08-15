@@ -6,14 +6,16 @@ CHANGELOG_DIR="changelog.d"
 CHANGELOG_FILE="CHANGELOG.md"
 DATE=$(date +%Y-%m-%d)
 
-# Map a fragment type to the changelog heading it is filed under.
-# Supports both Keep-a-Changelog names (added, changed, fixed, removed)
-# and semantic fragment names (feature, breaking, bugfix, doc, misc).
+# Map a fragment type to the changelog heading it is filed under. The five
+# recognized types are the semantic fragment names declared in
+# pyproject.toml's [[tool.towncrier.type]] table (feature, bugfix, breaking,
+# doc, misc) — see the vocabulary check below, which asserts this script and
+# pyproject.toml never silently diverge.
 #
-# A `case` rather than the `declare -A TYPE_HEADERS` this used to be. `declare
-# -A` is bash 4, and macOS ships /bin/bash 3.2.57, where it is not merely
-# ignored: the assignment degrades to an ordinary *indexed* array assignment,
-# so `[added]` is evaluated as an ARITHMETIC subscript, `added` is read as an
+# A `case` rather than a `declare -A TYPE_HEADERS`. `declare -A` is bash 4,
+# and macOS ships /bin/bash 3.2.57, where it is not merely ignored: the
+# assignment degrades to an ordinary *indexed* array assignment, so
+# `[feature]` is evaluated as an ARITHMETIC subscript, `feature` is read as an
 # unset variable, and `set -u` killed the script on that line before it did
 # anything at all (issue #593). The release job runs on ubuntu-latest, so this
 # never bit a release — it bit the first maintainer to run the assembler
@@ -27,12 +29,11 @@ DATE=$(date +%Y-%m-%d)
 # property is deliberately preserved.
 type_header() {
   case "$1" in
-    added|feature)    echo "Added" ;;
-    changed|breaking) echo "Changed" ;;
-    fixed|bugfix)     echo "Fixed" ;;
-    removed)          echo "Removed" ;;
-    doc)              echo "Documentation" ;;
-    misc)             echo "Miscellaneous" ;;
+    feature)  echo "Added" ;;
+    breaking) echo "Changed" ;;
+    bugfix)   echo "Fixed" ;;
+    doc)      echo "Documentation" ;;
+    misc)     echo "Miscellaneous" ;;
     *)
       echo "ERROR: no changelog heading is mapped for fragment type '$1'." >&2
       echo "Add a matching arm to type_header() for its entry in TYPES." >&2
@@ -41,14 +42,81 @@ type_header() {
   esac
 }
 
-# Ordered list of types to scan — earlier entries appear first in the changelog.
-# LOCKSTEP with type_header() above.
-TYPES=(breaking added feature changed fixed bugfix removed doc misc)
+# Ordered list of types to scan — earlier entries appear first in the
+# changelog. `breaking` is deliberately first so Breaking Changes leads the
+# release notes; this order is independent of pyproject.toml's declaration
+# order (see below). LOCKSTEP with type_header() above.
+TYPES=(breaking feature bugfix doc misc)
+
+# pyproject.toml is the single declared source of the valid type vocabulary
+# (docs/develop/versioning.md, R5) even though this script — not towncrier
+# itself — is what actually assembles the changelog (C5, deliberate: towncrier
+# is never invoked). Read only the SET of `directory = "..."` values from its
+# [[tool.towncrier.type]] blocks; pyproject.toml's own TYPES order and its
+# `name` fields (Features/Bug Fixes/…) are NOT authoritative here — taking
+# either would silently reorder or re-title every future changelog.
+PYPROJECT_TOML="pyproject.toml"
+pyproject_types=()
+while IFS= read -r t; do
+  [[ -n "$t" ]] && pyproject_types+=("$t")
+done < <(awk '
+  /^\[\[tool\.towncrier\.type\]\]/ { in_block=1; next }
+  /^\[/ { in_block=0 }
+  in_block && /^[[:space:]]*directory[[:space:]]*=/ {
+    line=$0
+    sub(/^[[:space:]]*directory[[:space:]]*=[[:space:]]*/, "", line)
+    gsub(/["'"'"']/, "", line)
+    gsub(/[[:space:]]+$/, "", line)
+    print line
+  }
+' "$PYPROJECT_TOML" 2>/dev/null)
+
+if [ ${#pyproject_types[@]} -eq 0 ]; then
+  echo "ERROR: could not parse any [[tool.towncrier.type]] directory entries from $PYPROJECT_TOML" >&2
+  echo "A silently empty vocabulary would turn the unknown-suffix check below into a no-op that accepts everything — refusing to proceed instead." >&2
+  exit 1
+fi
+
+# Assert the script's TYPES and pyproject.toml's declared types are the same
+# set, so the two vocabularies can never silently diverge again (PRD fork#340,
+# C4: pyproject.toml, this script and analyze.sh disagreeing let a fragment
+# type pass here and hard-fail the release later).
+missing_in_script=()
+for t in "${pyproject_types[@]}"; do
+  found=false
+  for s in "${TYPES[@]}"; do
+    [[ "$s" == "$t" ]] && { found=true; break; }
+  done
+  $found || missing_in_script+=("$t")
+done
+
+extra_in_script=()
+for s in "${TYPES[@]}"; do
+  found=false
+  for t in "${pyproject_types[@]}"; do
+    [[ "$t" == "$s" ]] && { found=true; break; }
+  done
+  $found || extra_in_script+=("$s")
+done
+
+if [ ${#missing_in_script[@]} -gt 0 ] || [ ${#extra_in_script[@]} -gt 0 ]; then
+  echo "ERROR: changelog type vocabulary mismatch between $PYPROJECT_TOML and $0" >&2
+  if [ ${#missing_in_script[@]} -gt 0 ]; then
+    echo "  pyproject.toml declares a type this script has no TYPES/type_header() entry for:" >&2
+    printf '    %s\n' "${missing_in_script[@]}" >&2
+  fi
+  if [ ${#extra_in_script[@]} -gt 0 ]; then
+    echo "  this script recognizes a type pyproject.toml does not declare:" >&2
+    printf '    %s\n' "${extra_in_script[@]}" >&2
+  fi
+  echo "Keep TYPES/type_header() in $0 and [[tool.towncrier.type]] in $PYPROJECT_TOML in sync." >&2
+  exit 1
+fi
 
 # Fail loudly if changelog.d/ contains fragments with unrecognized suffixes,
 # rather than silently skipping them. (v0.24.3 shipped with `*.fix.md` fragments
-# that were ignored because only `*.bugfix.md`/`*.fixed.md` are recognized,
-# leaving the GitHub release body and CHANGELOG.md empty for that version.)
+# that were ignored because only `*.bugfix.md` is recognized, leaving the
+# GitHub release body and CHANGELOG.md empty for that version.)
 #
 # LOCKSTEP: this validation `find` and the collection `find` further down MUST
 # scan the same tree. Both are recursive — no `-maxdepth` on either — so every
@@ -100,7 +168,8 @@ for type in "${TYPES[@]}"; do
 
   if [ ${#fragments[@]} -gt 0 ]; then
     header="$(type_header "$type")"
-    # Deduplicate headers (e.g. added & feature both map to "Added")
+    # Deduplicate headers (each of the five types maps to a distinct header
+    # today, but this stays defensive against a future type_header() collision)
     if [[ ! " ${seen_headers[*]:-} " =~ " ${header} " ]]; then
       section+="### ${header}"$'\n\n'
       seen_headers+=("$header")
