@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status** *(2026-08-15)*: **In progress — M1–M8 unstarted.** Research and design complete and recorded here. Issue filed, worktree `../dot-agent-deck-agent-badge` created on branch `feat/339-agent-type-badge-toggle` from `12ccb6df`, issue claimed. Execution begins at "Resume checklist" step 4 (the tester RED round); steps 1–3 are done.
+**Status** *(2026-08-15)*: **In progress — M1–M8 complete and green.** Draft PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) open on branch `feat/339-agent-type-badge-toggle`. Execution is at "Resume checklist" step 7: `reviewer` and `auditor` have both run, and their findings are being resolved (this round). Step 8 (`release` → `/prd-done`) and step 9 (**file the upstream-offer issue at merge time**, per rule 19 — reframed for upstream, where the badge is currently unconditional) remain and must not be dropped before merge.
 
 **Branch prefix — one deliberate deviation from the resume checklist below.** Step 2 prescribes `fix/<n>-…`. This branch is `feat/339-…` instead, because [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)'s tier-2 supplier maps `fix/` → `bug` while this change ships a `.feature.md` fragment (M8), so `work-type-check`'s R0 would fail on tier disagreement the moment that gate lands. `feat/` is the correct prefix for a `prd`-type change.
 

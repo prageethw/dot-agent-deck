@@ -2157,7 +2157,7 @@ struct UiState {
     /// persisted: every deck starts at `Default` on launch.
     split_stage: SplitStage,
     /// Fork #339: whether session cards show the agent-type badge (the
-    /// `ClaudeCode` / `OpenCode` / `Codex` / `Pi` segment restoring
+    /// `ClaudeCode` / `OpenCode` / `Pi` / `Codex` / `Devin` segment restoring
     /// `370b6228`'s removal), toggled deck-global by `Ctrl+m` / a bare `m`
     /// from command mode. Describes how someone is reading the deck right
     /// now, not which tab they happened to open — same shape as
@@ -7576,8 +7576,14 @@ fn handle_normal_key(
     // legacy terminals, where `Ctrl+m` decodes as `Enter` before this
     // function is ever reached. A hardcoded fallback, not a second
     // `ActionSpec` — an alias is by definition not remappable. Checked
-    // LAST, immediately before the trailing `Action::Continue`, so a user
-    // who has rebound another dashboard action onto `m` still wins.
+    // LAST, immediately before the trailing `Action::Continue`, so any
+    // remappable action a user has rebound onto `m` is matched first and
+    // wins — but only where that action's own preconditions hold (e.g.
+    // `Rename`/`FocusPane`/`GenerateConfig` need `total > 0`;
+    // `ApprovePermission`/`DenyPermission` additionally need the selected
+    // card to be `WaitingForInput`). Where those preconditions fail, this
+    // fallback still fires and toggles the badge — one key, two behaviours
+    // depending on state.
     if key.code == KeyCode::Char('m') && key.modifiers.is_empty() {
         return Action::ToggleAgentTypeBadge;
     }
@@ -17918,9 +17924,19 @@ fn render_help_overlay(
         // `toggle_orchestration_split` above. `m` is a hardcoded,
         // non-remappable fallback alongside the remappable `Ctrl+m` — the
         // only door on tmux and other legacy terminals, where `Ctrl+m`
-        // decodes as Enter (see `handle_normal_key`).
+        // decodes as Enter (see `handle_normal_key`). When the user has
+        // unbound `toggle_agent_type_badge` (`= ""`), only the hardcoded `m`
+        // still works, so the row shows just `m` rather than pairing it with
+        // `(unbound)`.
         help_key_line(
-            &format!("{} / m", n(KbAction::ToggleAgentTypeBadge)),
+            &if keybindings
+                .notation(KbAction::ToggleAgentTypeBadge)
+                .is_empty()
+            {
+                "m".to_string()
+            } else {
+                format!("{} / m", n(KbAction::ToggleAgentTypeBadge))
+            },
             "Show / hide agent badges",
         ),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
