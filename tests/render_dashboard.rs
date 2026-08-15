@@ -1165,12 +1165,14 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
 /// `SessionStart` `AgentEvent` carrying `model: Some("Opus")` through the
 /// real `AppState::apply_event` seam, then render the resulting session's
 /// card with the badge toggle on and confirm it shows `ClaudeCode (Opus) ·
-/// runtime-model`. Apply a second, later event carrying a DIFFERENT model
+/// runtime-01`. Apply a second, later event carrying a DIFFERENT model
 /// (`Some("Haiku")`) and confirm the rendered badge updates to `ClaudeCode
-/// (Haiku) · runtime-model`, with no trace of the stale `Opus` value. Apply
+/// (Haiku) · runtime-01`, with no trace of the stale `Opus` value. Apply
 /// a third event carrying no model at all (`None`) and confirm the badge
-/// still reads `ClaudeCode (Haiku) · runtime-model` — most events don't
+/// still reads `ClaudeCode (Haiku) · runtime-01` — most events don't
 /// carry a model, and a `None` on one must not clear a previously-known one.
+/// The session id is kept to 11 chars or fewer because the bare-id fallback
+/// render in `src/ui.rs` hard-caps at 11 chars.
 #[spec("dashboard/agent-badge/004")]
 #[test]
 fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
@@ -1184,7 +1186,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     let claude_color = dot_agent_deck::agent_registry::spec(&AgentType::ClaudeCode).badge_color;
 
     state.apply_event(AgentEvent {
-        session_id: "runtime-model".to_string(),
+        session_id: "runtime-01".to_string(),
         agent_type: AgentType::ClaudeCode,
         event_type: EventType::SessionStart,
         tool_name: None,
@@ -1202,7 +1204,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     });
     let session = state
         .sessions
-        .get("runtime-model")
+        .get("runtime-01")
         .expect("the session exists after SessionStart")
         .clone();
     assert_eq!(
@@ -1224,13 +1226,13 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
     let text = buffer_to_text(&buffer);
     assert!(
-        text.contains("ClaudeCode (Opus) · runtime-model"),
+        text.contains("ClaudeCode (Opus) · runtime-01"),
         "the badge must render the initial model:\n{text}"
     );
 
     // A later event with a DIFFERENT model overwrites it.
     state.apply_event(AgentEvent {
-        session_id: "runtime-model".to_string(),
+        session_id: "runtime-01".to_string(),
         agent_type: AgentType::ClaudeCode,
         event_type: EventType::Thinking,
         tool_name: None,
@@ -1248,7 +1250,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     });
     let session = state
         .sessions
-        .get("runtime-model")
+        .get("runtime-01")
         .expect("the session still exists")
         .clone();
     assert_eq!(
@@ -1270,7 +1272,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
     let text = buffer_to_text(&buffer);
     assert!(
-        text.contains("ClaudeCode (Haiku) · runtime-model"),
+        text.contains("ClaudeCode (Haiku) · runtime-01"),
         "the badge must update to the new model:\n{text}"
     );
     assert!(
@@ -1280,7 +1282,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
 
     // A later event carrying NO model must NOT clear the previously-known one.
     state.apply_event(AgentEvent {
-        session_id: "runtime-model".to_string(),
+        session_id: "runtime-01".to_string(),
         agent_type: AgentType::ClaudeCode,
         event_type: EventType::ToolStart,
         tool_name: Some("Read".to_string()),
@@ -1298,7 +1300,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     });
     let session = state
         .sessions
-        .get("runtime-model")
+        .get("runtime-01")
         .expect("the session still exists")
         .clone();
     assert_eq!(
@@ -1320,7 +1322,7 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
     let text = buffer_to_text(&buffer);
     assert!(
-        text.contains("ClaudeCode (Haiku) · runtime-model"),
+        text.contains("ClaudeCode (Haiku) · runtime-01"),
         "the badge must keep showing the last-known model after a modelless event:\n{text}"
     );
 
