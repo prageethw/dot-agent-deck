@@ -4,11 +4,11 @@
 
 **Priority**: Medium
 
-**Status** *(corrected 2026-08-16)*: **Merged into the fork — M1–M8 complete, every resume-checklist step discharged.** PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) merged 2026-08-15 as `a9ca72cc`, first released in **v0.38.2**. The `reviewer` and `auditor` findings named below were resolved before merge (step 7); step 8 (`release` → `/prd-done`) is done; step 9 — the rule 19 upstream-offer issue — is discharged as [fork #347](https://github.com/prageethw/dot-agent-deck/issues/347), which carries the reframing the next paragraph describes. Nothing remains open on this PRD.
+**Status** *(corrected 2026-08-16)*: **Merged into the fork — M1–M8 complete, every resume-checklist step discharged.** PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) merged 2026-08-15, first released in **v0.38.2**. **Two SHAs are correct for it, and which one you want depends on the question:** GitHub records the merge commit as `5d2a9205` (a real two-parent merge, and the SHA [#347](https://github.com/prageethw/dot-agent-deck/issues/347) cites), but that commit is **unreachable from any ref** after the 2026-08-15 history rewrite; the branch content lives on `main` as the single-parent replay `a9ca72cc`. Use `5d2a9205` for "what merged", `a9ca72cc` for "where it is now" — `git merge-base --is-ancestor 5d2a9205 origin/main` fails, which is expected rather than a sign anything is wrong. The `reviewer` and `auditor` findings from step 7 were resolved before merge; step 8 (`release` → `/prd-done`) is done; step 9 — the rule 19 upstream-offer issue — is discharged as #347, filed 43 seconds after the merge, and the **Fork-only?** section below describes the reframing it carries. Nothing remains open on this PRD.
 
 *(This line read "In progress … Draft PR #342 open" until 2026-08-16 — the PR had merged the day before, so the file advertised work that was already shipped. Corrected while clearing the PRD queue; the stale status is what made the PRD look actionable in a queue sweep.)*
 
-**Branch prefix — one deliberate deviation from the resume checklist below.** Step 2 prescribes `fix/<n>-…`. This branch is `feat/339-…` instead, because [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)'s tier-2 supplier maps `fix/` → `bug` while this change ships a `.feature.md` fragment (M8), so `work-type-check`'s R0 would fail on tier disagreement the moment that gate lands. `feat/` is the correct prefix for a `prd`-type change.
+**Branch prefix — one deliberate deviation from the resume checklist below.** Step 2 prescribes `fix/<n>-…`. This branch was `feat/339-…` instead, because [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)'s tier-2 supplier maps `fix/` → `bug` while this change ships a `.feature.md` fragment (M8), so `work-type-check`'s R0 would fail on tier disagreement the moment that gate lands — it has since landed (PRD fork#340, PR #348). `feat/` is the correct prefix for a `prd`-type change.
 
 **Fork-only?** **No — upstream-worthy.** The badge removal (`370b6228`) is a fork preference, but *a toggle for it* is a genuine feature in upstream's own card renderer. Per CLAUDE.md rule 19 the ordering is: build it here, merge it here, then file the upstream-offer issue **at merge time**. Note the offer would need reframing for upstream, where the badge is shown unconditionally — there the same toggle hides it rather than reveals it.
 
@@ -190,7 +190,7 @@ Likewise the five e2e files touched by `370b6228` — `e2e_codex_hooks.rs:203`, 
 
 ## Resume checklist
 
-Everything below is unstarted. `main` was clean at `17245088` when this was written; re-verify before branching.
+**This checklist is spent — every step below was executed and the PRD merged (see Status). It is retained as the execution record, not as work to do.** It was written when `main` was clean at `17245088`; do not re-run it.
 
 1. **File the fork issue** on `prageethw/dot-agent-deck` titled *"Command-mode toggle (`Ctrl+M` / `m`) to show the agent-type badge on session cards"*. Rule 20 searches were run 2026-08-15 over both trackers, issues **and** PRs — nothing overlapping is open. Re-run them; they are cheap:
    ```bash
