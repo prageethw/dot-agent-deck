@@ -60,7 +60,7 @@ Then read what the existing reviewers already found, per rule 8:
 gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate
 ```
 
-That endpoint is the only place Greptile's P1/P2 findings live. The summary comment and the review state do not carry them, and a green `Greptile Review` check-run is **not** the review. Note which findings the author has already answered — do not re-litigate those, and do not pad your report by restating Greptile verbatim. Your job is what Greptile could not check: whether the thing actually works, and whether it obeys this repo's rules.
+That endpoint is where an existing reviewer's inline findings live, if any exist — the summary comment and the review state do not carry them. No bot posts an automated review here (fork issue #226; CLAUDE.md rule 8) — bot-review configuration is repo-level, not PR-level, so this is empty for a contributor's or Renovate's PR too, not only the maintainers' own. So for a PR on this fork this will usually be empty; anything present is a human reviewer's comment, or an upstream review if you are verifying a PR there. Note which findings the author has already answered — do not re-litigate those, and do not pad your report by restating them verbatim. Your job is what no existing review already checked: whether the thing actually works, and whether it obeys this repo's rules.
 
 ## Phase 1 — Isolate
 
@@ -251,7 +251,7 @@ UNVERIFIED. Nothing in CI covers it.>
 ## Nits
 <optional, no action needed.>
 
-## Already covered by Greptile
+## Already covered by an existing review
 <findings from the inline comments, and whether the author answered them. Do not duplicate them above.>
 
 ## NOT verified

@@ -2,7 +2,7 @@
 
 A check that cannot fail is not a gate. A check that never ran is not a pass. Neither is distinguishable, at a glance, from a genuinely clean result — and in this repo both happen routinely.
 
-CLAUDE.md rule 8 states the policy: **before treating any check as evidence, read the surface that carries the result — the review body, the alert list, the job log — not the check's colour.** This document is the operational companion: the specific surfaces, the exact commands, and the failure modes that have actually cost time here.
+CLAUDE.md rule 8 states the policy: **before treating any check as evidence, read the surface that carries the result — the delegated `reviewer`/`auditor` findings file, the alert list, the job log — not the check's colour.** This document is the operational companion: the specific surfaces, the exact commands, and the failure modes that have actually cost time here.
 
 ## The catalogue
 
@@ -12,7 +12,6 @@ One caveat on that, since a reviewer went looking: the `Closes` row leaves **no 
 
 | Signal | How it goes empty | What to read instead |
 |---|---|---|
-| **Greptile** | Publishes nothing at all when absent, or a `COMMENTED` review with **zero** inline comments when credit-limited. Neither produces a `Greptile Review` check-run, so the checks board is all-green with no Greptile row on it. | The **review body**. A credit-limited account carries *"prageethw has reached the 50-credit limit for trial accounts."* Absence carries nothing. |
 | **`sonarqube`** | Every scan step is gated on `if: env.SONAR_TOKEN != ''`. On a fork PR the secret is absent, so the job runs one `echo` and goes green **having analysed nothing**. | The job log — a skipped run and a clean run look identical on the board. |
 | **`semgrep`** | **Not** an empty gate: it is blocking via an explicit `--error` (`ci.yml:441`). Listed because a stale claim that it runs `--no-error` circulated in this repo's own docs — see below. | Findings still live in GitHub code scanning, not in the check. |
 | **`e2e`** | `continue-on-error: true` by design, so the **workflow** conclusion reads `success` even when the job failed outright. | The **job** conclusion and the nextest failure list. |
@@ -23,7 +22,7 @@ One caveat on that, since a reviewer went looking: the `Closes` row leaves **no 
 
 ### The semgrep claim, as a worked example
 
-While writing this document, its `semgrep` row initially said the job runs with `--no-error` and therefore reports success regardless of findings. That is what **CLAUDE.md rule 8 currently claims**. It is wrong, and it was caught only because [`CONTRIBUTING.md`](../../CONTRIBUTING.md) says the opposite — that the job is blocking via `--error`.
+While writing this document, its `semgrep` row initially said the job runs with `--no-error` and therefore reports success regardless of findings. That is what **CLAUDE.md rule 8 claimed before its 2026-08-12 correction**. It was wrong, and it was caught only because [`CONTRIBUTING.md`](../../CONTRIBUTING.md) says the opposite — that the job is blocking via `--error`.
 
 `ci.yml:441` passes `--error`, and the comment at `ci.yml:380-382` records the correction explicitly:
 

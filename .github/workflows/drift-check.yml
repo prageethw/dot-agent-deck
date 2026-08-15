@@ -115,9 +115,9 @@ jobs:
 
           # "Could not determine" must never look like a pass — a job that
           # silently reports success when it could not measure is the same
-          # empty-gate failure mode CLAUDE.md rule 8 documents for Greptile/
-          # Semgrep/Sonar. A missing or unreachable fork-only branch is exactly
-          # that case, not "zero drift".
+          # empty-gate failure mode CLAUDE.md rule 8 documents for Sonar/
+          # e2e/a CONFLICTING PR. A missing or unreachable fork-only branch
+          # is exactly that case, not "zero drift".
           if ! git rev-parse --verify "origin/$FORK_BRANCH" >/dev/null 2>&1; then
             {
               echo "## Drift check: COULD NOT DETERMINE"
