@@ -1,10 +1,12 @@
-# PRD fork: A command-mode toggle that shows the agent-type badge on session cards
+# PRD fork#339: A command-mode toggle that shows the agent-type badge on session cards
 
-**GitHub Issue**: **not yet filed** — filing it is step 1 of the resume checklist below. Rename this file to `prds/fork-<n>-agent-type-badge-toggle.md` once the number exists.
+**GitHub Issue**: [fork #339](https://github.com/prageethw/dot-agent-deck/issues/339)
 
 **Priority**: Medium
 
-**Status** *(2026-08-15)*: **Planned, nothing implemented.** Research and design complete and recorded here; no worktree, no branch, no issue, no code. `main` is clean at `17245088`. A fresh session can start at "Resume checklist" and needs nothing from the conversation that produced this.
+**Status** *(2026-08-15)*: **In progress — M1–M8 unstarted.** Research and design complete and recorded here. Issue filed, worktree `../dot-agent-deck-agent-badge` created on branch `feat/339-agent-type-badge-toggle` from `12ccb6df`, issue claimed. Execution begins at "Resume checklist" step 4 (the tester RED round); steps 1–3 are done.
+
+**Branch prefix — one deliberate deviation from the resume checklist below.** Step 2 prescribes `fix/<n>-…`. This branch is `feat/339-…` instead, because [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)'s tier-2 supplier maps `fix/` → `bug` while this change ships a `.feature.md` fragment (M8), so `work-type-check`'s R0 would fail on tier disagreement the moment that gate lands. `feat/` is the correct prefix for a `prd`-type change.
 
 **Fork-only?** **No — upstream-worthy.** The badge removal (`370b6228`) is a fork preference, but *a toggle for it* is a genuine feature in upstream's own card renderer. Per CLAUDE.md rule 19 the ordering is: build it here, merge it here, then file the upstream-offer issue **at merge time**. Note the offer would need reframing for upstream, where the badge is shown unconditionally — there the same toggle hides it rather than reveals it.
 
