@@ -69,11 +69,12 @@ use crate::config::IssueDispatchConfig;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch::{
     CLAIM_COMMENT_PREFIX, DispatchDecision, IN_PROGRESS_LABEL, IN_PROGRESS_LABEL_COLOR,
-    IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, claim_comment_body,
-    derive_issue_paths, dispatch_decision, gh_current_login_argv, issue_comment_argv,
-    issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv, issue_view_comments_argv,
-    label_create_argv, parse_current_assignees, parsed_claim_from_comment_json,
-    pr_list_for_issue_argv, substitute_issue_number, triage_instruction, validate_gh_login,
+    IN_PROGRESS_LABEL_DESCRIPTION, Identity, ParsedClaim, TRIAGE_LABELS, TYPE_LABELS,
+    claim_comment_body, derive_issue_paths, dispatch_decision, gh_current_login_argv,
+    issue_comment_argv, issue_edit_add_label_argv, issue_edit_assignee_argv, issue_list_argv,
+    issue_view_comments_argv, label_create_argv, parse_current_assignees,
+    parsed_claim_from_comment_json, pr_list_for_issue_argv, substitute_issue_number,
+    triage_instruction, validate_gh_login,
 };
 use crate::scheduler::{Notifier, NotifyEvent, SkipReason};
 use crate::spawn::{SpawnKind, SpawnRequest, spawn};
@@ -876,8 +877,13 @@ async fn ensure_claim_label(repo: &str) {
 /// failure on one label is logged and skipped, never propagated — it must not
 /// abort the run, and a run with no labelling failure must never be reported
 /// as one either.
+///
+/// Also ensures [`TYPE_LABELS`] (PRD fork#340 M5) in the same loop —
+/// deliberately decoupled from `cargo xtask work-type-check`, which never
+/// reads labels, so this is optional polish rather than something the gate
+/// depends on.
 async fn ensure_triage_labels(repo: &str) {
-    for label in TRIAGE_LABELS {
+    for label in TRIAGE_LABELS.into_iter().chain(TYPE_LABELS) {
         let argv = label_create_argv(repo, label.name, label.color, label.description);
         if let Err(e) = run_status_args("gh", &argv).await {
             tracing::warn!(
