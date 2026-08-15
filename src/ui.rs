@@ -2156,6 +2156,14 @@ struct UiState {
     /// is likewise driven by a single global chord (`Ctrl+t`). Not
     /// persisted: every deck starts at `Default` on launch.
     split_stage: SplitStage,
+    /// Fork #339: whether session cards show the agent-type badge (the
+    /// `ClaudeCode` / `OpenCode` / `Pi` / `Codex` / `Devin` segment restoring
+    /// `370b6228`'s removal), toggled deck-global by `Ctrl+m` / a bare `m`
+    /// from command mode. Describes how someone is reading the deck right
+    /// now, not which tab they happened to open — same shape as
+    /// [`Self::split_stage`] and [`Self::pane_layout`] above. Not
+    /// persisted: every deck starts with the badge hidden.
+    show_agent_type_badge: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -2491,6 +2499,7 @@ impl UiState {
             pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             split_stage: SplitStage::Default,
+            show_agent_type_badge: false,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             warned_orchestration_surface_configs: HashSet::new(),
@@ -5462,6 +5471,9 @@ pub enum Action {
     /// focused Dashboard pane forwards Ctrl+L to its PTY instead). No effect
     /// on a Mode tab.
     CycleSplitStage,
+    /// Fork #339: toggle the deck-global agent-type badge on session cards
+    /// (`Ctrl+m` / a bare `m`, command mode only). Off by default.
+    ToggleAgentTypeBadge,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -6786,12 +6798,12 @@ pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> O
 
 /// Truncate a sequence of styled title segments to `max_chars` total characters,
 /// appending a single `…` (in the last surviving segment's style) when they
-/// don't all fit, while preserving each segment's style. Fork-only removed the
-/// coloured agent-type badge from the title, so the styles this now protects are
-/// the dimmed numeric shortcut prefix and the `history` / `view-only` marker —
-/// each keeps its own styling even on a narrow card. (PRD #339 separately moved
-/// the Last/Tools stats off the title onto the bottom border, so those never
-/// reach this function.)
+/// don't all fit, while preserving each segment's style. The styles this
+/// protects are the dimmed numeric shortcut prefix, the `history` /
+/// `view-only` marker, and — when fork #339's agent-type badge toggle is on —
+/// the registry-coloured type badge; each keeps its own styling even on a
+/// narrow card. (PRD #339 separately moved the Last/Tools stats off the title
+/// onto the bottom border, so those never reach this function.)
 ///
 /// For single-width text this produces the same character sequence as
 /// [`truncate_with_ellipsis`] on the concatenated input, so text-only snapshots
@@ -7560,6 +7572,21 @@ fn handle_normal_key(
             ui.filter_text.clear();
         }
         return Action::Continue;
+    }
+    // Fork #339 D2/D5: bare `m` is the only working door on tmux and other
+    // legacy terminals, where `Ctrl+m` decodes as `Enter` before this
+    // function is ever reached. A hardcoded fallback, not a second
+    // `ActionSpec` — an alias is by definition not remappable. Checked
+    // LAST, immediately before the trailing `Action::Continue`, so any
+    // remappable action a user has rebound onto `m` is matched first and
+    // wins — but only where that action's own preconditions hold (e.g.
+    // `Rename`/`FocusPane`/`GenerateConfig` need `total > 0`;
+    // `ApprovePermission`/`DenyPermission` additionally need the selected
+    // card to be `WaitingForInput`). Where those preconditions fail, this
+    // fallback still fires and toggles the badge — one key, two behaviours
+    // depending on state.
+    if key.code == KeyCode::Char('m') && key.modifiers.is_empty() {
+        return Action::ToggleAgentTypeBadge;
     }
     Action::Continue
 }
@@ -8612,6 +8639,13 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleOrchestrationLock, key) {
         return Some(Action::ToggleOrchestrationLock);
     }
+    // Fork #339 D2: `Ctrl+m` resolves here from any mode; the bare `m`
+    // alias is handled separately in `handle_normal_key` since it must
+    // never claim command mode's text-entry fields. Command-mode scoping
+    // for both is applied below in `global_action_for_mode`.
+    if kb.matches(KbAction::ToggleAgentTypeBadge, key) {
+        return Some(Action::ToggleAgentTypeBadge);
+    }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
     }
@@ -8661,6 +8695,12 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
     match global_action(kb, key) {
         Some(Action::CloseSelected) if mode != UiMode::Normal => None,
+        // Fork #339 risk 1 (highest severity): `Ctrl+m` is `0x0d`, the CR
+        // submit byte for every supported agent. Un-resolving it outside
+        // command mode is what lets it fall through to
+        // `handle_pane_input_key` → `keyevent_to_bytes` → `0x0d` on the
+        // PTY instead of toggling the badge out from under a typing user.
+        Some(Action::ToggleAgentTypeBadge) if mode != UiMode::Normal => None,
         other => other,
     }
 }
@@ -9311,6 +9351,24 @@ fn dispatch_action(
                 ui.status_message =
                     Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
             }
+        }
+        // Ctrl+m / m: toggle the deck-global agent-type badge on session
+        // cards. The action only ever reaches here in command mode —
+        // `global_action_for_mode` un-resolves `Ctrl+m` everywhere else, and
+        // the bare `m` alias is only ever emitted by `handle_normal_key`,
+        // which the caller reaches only in `UiMode::Normal` — so there is no
+        // per-mode guard left to apply here.
+        Action::ToggleAgentTypeBadge => {
+            ui.show_agent_type_badge = !ui.show_agent_type_badge;
+            let shown_name = if ui.show_agent_type_badge {
+                "shown"
+            } else {
+                "hidden"
+            };
+            ui.status_message = Some((
+                format!("Agent badge: {shown_name}"),
+                std::time::Instant::now(),
+            ));
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
@@ -15534,6 +15592,9 @@ fn render_frame(
                 // PRD #341 M4: the live deck's mode, so the seam that pins the
                 // selection accent and the running app cannot disagree.
                 ui.mode,
+                // Fork #339: one deck-global toggle read by every card, on
+                // every tab, including one opened after the toggle fired.
+                ui.show_agent_type_badge,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -17860,6 +17921,25 @@ fn render_help_overlay(
             &n(KbAction::ToggleOrchestrationSplit),
             "Cycle sidebar split stage",
         ),
+        // Fork #339: command-mode only, same reasoning as
+        // `toggle_orchestration_split` above. `m` is a hardcoded,
+        // non-remappable fallback alongside the remappable `Ctrl+m` — the
+        // only door on tmux and other legacy terminals, where `Ctrl+m`
+        // decodes as Enter (see `handle_normal_key`). When the user has
+        // unbound `toggle_agent_type_badge` (`= ""`), only the hardcoded `m`
+        // still works, so the row shows just `m` rather than pairing it with
+        // `(unbound)`.
+        help_key_line(
+            &if keybindings
+                .notation(KbAction::ToggleAgentTypeBadge)
+                .is_empty()
+            {
+                "m".to_string()
+            } else {
+                format!("{} / m", n(KbAction::ToggleAgentTypeBadge))
+            },
+            "Show / hide agent badges",
+        ),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -19183,6 +19263,8 @@ fn render_session_card(
     // PRD #341 M4: which mode the deck is being rendered in. Only the selected
     // card's accent reads it (see `selected_card_border_style`).
     mode: UiMode,
+    // Fork #339: deck-global toggle for the agent-type badge (`ui.show_agent_type_badge`).
+    show_agent_type_badge: bool,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
@@ -19223,15 +19305,42 @@ fn render_session_card(
         crate::event::Writable::HistoryOnly => " history ",
         crate::event::Writable::None => " view-only ",
     };
-    // Fork-only: the agent-type badge (registry-coloured type label) is
-    // removed from the card title entirely — no colour, no text. The title
-    // now shows only the friendly `display_name`, or the session id when
-    // there is none. A non-live card additionally shows a trailing
-    // `history` / `view-only` marker.
-    let identity_text = display_name
-        .map(|name| format!("{name} "))
-        .unwrap_or_else(|| format!("{id_display} "));
-    let title_segments: Vec<(String, Style)> = {
+    // Fork #339: the agent-type badge (registry-coloured type label),
+    // `370b6228`'s removal, restored behind the deck-global
+    // `show_agent_type_badge` toggle (`Ctrl+m` / `m`, off by default). D4:
+    // skipped on a placeholder card even when the toggle is on —
+    // `agent_registry::spec(&AgentType::None).label` is "No agent", which
+    // would collide with the status text as a second "No agent" segment.
+    let show_badge = show_agent_type_badge && !is_placeholder;
+    let title_segments: Vec<(String, Style)> = if show_badge {
+        // PRD #20 M5 / finding #9: the agent-type label carries its
+        // registry badge colour. A friendly `display_name` renders
+        // ALONGSIDE the badge (`<type> · <name>`) rather than replacing it.
+        let badge_style = Style::default()
+            .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+            .add_modifier(Modifier::BOLD);
+        // The marker is appended AFTER the `<type> · <id-or-name>` so the
+        // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
+        // stays intact — only a trailing view-only annotation is added.
+        let label_after_badge = display_name
+            .map(|name| format!(" · {name} "))
+            .unwrap_or_else(|| format!(" · {id_display} "));
+        let mut segs = vec![
+            (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
+            (format!("{}", session.agent_type), badge_style),
+            (label_after_badge, title_bold),
+        ];
+        if !is_live {
+            segs.push((liveness_marker.to_string(), text_dim()));
+        }
+        segs
+    } else {
+        // The title shows only the friendly `display_name`, or the session
+        // id when there is none. A non-live card additionally shows a
+        // trailing `history` / `view-only` marker.
+        let identity_text = display_name
+            .map(|name| format!("{name} "))
+            .unwrap_or_else(|| format!("{id_display} "));
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (identity_text, title_bold),
@@ -19874,6 +19983,7 @@ pub fn render_card_to_buffer(
         UiMode::Normal,
         width,
         height,
+        false,
     )
 }
 
@@ -19897,6 +20007,10 @@ pub fn render_card_for_mode_to_buffer(
     mode: UiMode,
     width: u16,
     height: u16,
+    // Fork #339: threaded straight through to `render_session_card`, so an
+    // assertion made through this seam is an assertion about what the live
+    // Dashboard renders (see the fn doc above).
+    show_agent_type_badge: bool,
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -19923,6 +20037,7 @@ pub fn render_card_for_mode_to_buffer(
                 density.into(),
                 None,
                 mode,
+                show_agent_type_badge,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -19988,6 +20103,11 @@ pub fn render_dashboard_cards_to_buffer(
                     card_density,
                     None,
                     UiMode::Normal,
+                    // Fork #339: this seam is the documented 8-arg
+                    // compatibility baseline (see `render_card_to_buffer`'s
+                    // doc) — hidden-by-default IS that baseline, so this
+                    // stays hardcoded rather than gaining a parameter.
+                    false,
                 );
             }
         })
@@ -36468,6 +36588,90 @@ mod tests {
         assert!(
             ui.command_entry_locked,
             "the second Ctrl+e toggle should RE-LOCK the deck-global lock"
+        );
+    }
+
+    /// Scenario: Dispatch `Action::ToggleAgentTypeBadge` twice against a fresh
+    /// `UiState` and confirm `ui.show_agent_type_badge` cycles
+    /// hidden -> shown -> hidden, with `ui.status_message` reporting each
+    /// transition. Also confirm `handle_normal_key` resolves a bare `m` to
+    /// the toggle action, and that the alias does not displace `Enter`'s
+    /// existing `Action::Focus` resolution (via `KbAction::FocusPane`).
+    #[spec("dashboard/agent-badge/002")]
+    #[test]
+    fn agent_badge_002_toggle_cycles_hidden_shown_hidden() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        assert!(
+            !ui.show_agent_type_badge,
+            "a fresh UiState must start with the agent-type badge hidden"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleAgentTypeBadge,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.show_agent_type_badge,
+            "the first toggle should SHOW the agent-type badge"
+        );
+        assert_eq!(
+            ui.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Agent badge: shown"),
+            "the first toggle must report the shown status message"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleAgentTypeBadge,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            !ui.show_agent_type_badge,
+            "the second toggle should HIDE the agent-type badge"
+        );
+        assert_eq!(
+            ui.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Agent badge: hidden"),
+            "the second toggle must report the hidden status message"
+        );
+
+        let kb = KeybindingConfig::default();
+        let bare_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert!(
+            matches!(
+                handle_normal_key(bare_m, &mut ui, 0, None, &kb),
+                Action::ToggleAgentTypeBadge
+            ),
+            "a bare `m` in command mode must resolve to the agent-badge toggle"
+        );
+
+        // The alias must not displace FocusPane's existing Enter resolution.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(
+                handle_normal_key(enter, &mut ui, 1, None, &kb),
+                Action::Focus
+            ),
+            "Enter must still resolve to Action::Focus after adding the `m` alias"
         );
     }
 

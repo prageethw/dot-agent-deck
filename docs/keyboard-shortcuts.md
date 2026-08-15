@@ -19,6 +19,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+L` | Cycle the sidebar/pane-column split: Default → Narrow (25/75) → Hidden (sidebar gone, pane column full-width) → Default. One stage for the whole deck — cycling on any tab moves every other tab too, and a tab you open afterwards adopts the current stage | **Command mode only**, on **Dashboard and Orchestration tabs** |
+| `Ctrl+M` / `m` | Show / hide the agent-type badge on every session card. One setting for the whole deck, off by default. See [`Ctrl+M` / `m` shows the agent-type badge](#ctrlm--m-shows-the-agent-type-badge) | **Command mode only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 | `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, and only while the `experimental` flag is on |
 
@@ -43,6 +44,12 @@ The stage is a single deck-wide value, not one per tab. Cycling it on any Dashbo
 `Ctrl+W` is delete-previous-word in shells, readline, vim, and essentially every program you run inside a pane. So while you are typing in a pane, `Ctrl+W` is sent straight through to that program as `^W` (byte `0x17`) and deletes a word — it does not close anything. Press `Ctrl+D` first, and `Ctrl+W` there asks you to confirm before closing.
 
 The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a reflexive `Enter` leaves your pane exactly where it was. Choosing **Close** stops the agent and removes the card.
+
+### `Ctrl+M` / `m` shows the agent-type badge
+
+`Ctrl+M` (or a bare `m`) toggles a coloured `ClaudeCode` / `OpenCode` / `Pi` / `Codex` / `Devin` badge on every session card's title. It is one setting for the whole deck — toggling it on any tab changes every card everywhere, including a pane you open afterwards — and it resets to hidden the next time you launch, rather than persisting.
+
+`Ctrl+M` is byte `0x0d`, which on tmux and older terminals is indistinguishable from `Enter`. The byte does reach the deck there — but `FocusPane` claims it first, so pressing it there focuses the selected pane instead of toggling anything, and every keystroke you type after that lands in the live agent's pane (` TYPING `; recoverable with `Ctrl+D`) rather than the deck — press the bare `m`, which always works. `Ctrl+M` reaches the deck only on terminals that support the kitty keyboard protocol (kitty, Ghostty, WezTerm, iTerm2 with CSIu enabled). Inside a pane, `Ctrl+M` passes straight through as `^M` (`0x0d`) exactly like `Enter` does — that byte is what submits your input to the agent, so typing it while focused on a pane still submits rather than toggling anything.
 
 ### `Ctrl+E` locks command entry to the orchestrator pane
 
@@ -203,9 +210,10 @@ help = "F1"                      # open help with F1 instead of ?
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag; without it the chord is never claimed.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
 | `toggle_orchestration_split` | `Ctrl+l` | Cycle the deck's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**, **command mode only**; one stage shared by every tab, and in a pane the chord is ordinary input (clear-screen) for whatever is running there |
+| `toggle_agent_type_badge` | `Ctrl+m` | Show / hide the agent-type badge on every session card — **command mode only**; one setting for the whole deck, and in a pane the chord is ordinary input (submits, same as `Enter`) for whatever is running there. A bare `m` always works alongside it and is not remappable |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
-`close_pane`, `toggle_orchestration_lock`, and `toggle_orchestration_split` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind any of them to is command-mode only and reaches the pane as ordinary input everywhere else.
+`close_pane`, `toggle_orchestration_lock`, `toggle_orchestration_split`, and `toggle_agent_type_badge` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind any of them to is command-mode only and reaches the pane as ordinary input everywhere else.
 
 `[dashboard]` (command mode):
 
@@ -226,7 +234,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `scroll_pane_up` | `PageUp` | Scroll the focused pane back — **command mode only**; in a pane the key is passed to the agent |
 | `scroll_pane_down` | `PageDown` | Scroll the focused pane forward — **command mode only**; in a pane the key is passed to the agent |
 
-The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings. Because `Ctrl+PageUp` / `Ctrl+PageDown` are separate chords from the unmodified `PageUp` / `PageDown`, remapping the scroll actions does not affect tab navigation.
+The `Down`/`Up`/`Tab`/`Shift+Tab`/`Left`/`Right` aliases, the bare `m` alias for `toggle_agent_type_badge`, and `Ctrl+PageUp` / `Ctrl+PageDown` tab navigation are not remappable and always work alongside your bindings, including when the corresponding action is unbound. Because `Ctrl+PageUp` / `Ctrl+PageDown` are separate chords from the unmodified `PageUp` / `PageDown`, remapping the scroll actions does not affect tab navigation.
 
 Rebinding an action both enables the new chord and retires the default, so `scroll_pane_up = "Ctrl+u"` leaves plain `PageUp` doing nothing in command mode. Setting either scroll action to `""` leaves the wheel as the only way to scroll that pane.
 
