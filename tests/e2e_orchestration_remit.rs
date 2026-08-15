@@ -397,12 +397,19 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
         "the fixture script never emitted its history-only session_start within 5s"
     );
 
+    // Reuse the fixture's own boot session id here, unlike `_001`/`_002`'s
+    // synthetic per-call ids: a real `Compacting` hook carries the agent's
+    // own session id (its `PreCompact` originates from that agent's own
+    // process), so a differing synthetic id models an event shape that does
+    // not occur in production. `_003` is the only test in this file whose
+    // flow (history-only -> live-again) makes the resulting id-overwrite
+    // observable, which is why only this call needs the boot id.
     inject_compacting(
         &deck,
         &socket,
         &pane_id,
         &agent_id,
-        &format!("{agent_id}-remit003-session"),
+        "remit-reassert-boot-session",
     );
 
     let wrote_blindly =
