@@ -34390,74 +34390,31 @@ mod tests {
         }
     }
 
-    /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
+    /// Scenario: Let a TUI seed reach its reporting pane, then type an unsent user draft after the automatic-write timestamp exists but before the next submit-only probe is due. The next automatic attempt must send no bytes, so it does not submit the user's draft.
     #[cfg(unix)]
     #[spec("prompt/pane-input/032")]
     #[test]
     fn pane_input_032_user_input_disarms_submit_only_probe() {
+        // Retired here: a "replacement" pane sub-scenario used to precede this
+        // one, typing an unsent draft between attempt 1 and attempt 2 and
+        // asserting attempt 2 appended no replacement payload. It exercised
+        // `write_guarded`'s non-empty-payload branch
+        // (`registry.user_typed_since_writing_payload`) on attempt 2 — the one
+        // bounded replacement payload. Fork #194 set
+        // `MAX_PAYLOAD_SUBMISSIONS = 1` (`src/prompt_delivery.rs`), so
+        // `attempt_writes_payload(2)` is now `false` and attempt 2 takes the
+        // empty-payload probe branch instead (`user_typed_since_automatic_write`)
+        // — the exact branch the retained scenario below already exercises at
+        // attempt 3. Unlike `scheduler/dispatch/018`'s retired half, this one
+        // was not vacuous (it still failed if the probe guard broke); it was a
+        // duplicate of the retained scenario, so it is removed rather than kept
+        // for appearances. Recovering a launcher that genuinely consumes
+        // attempt 1 — what would make the replacement-payload branch reachable
+        // again and give the two scenarios distinct meanings — is deferred to
+        // fork issue #343.
         const PANE_ID: &str = "user-draft-safety-pane";
         const PROMPT: &str = "automatic prompt before the user's draft";
         const USER_DRAFT: &str = "user draft deliberately left unsent";
-
-        const REPLACEMENT_PANE_ID: &str = "user-draft-before-replacement-pane";
-        const REPLACEMENT_PROMPT: &str = "automatic prompt before replacement guard";
-        const REPLACEMENT_DRAFT: &str = "draft before replacement payload";
-
-        let replacement_controller =
-            Arc::new(RegistryBackedPaneController::new(REPLACEMENT_PANE_ID));
-        let replacement_pane: Arc<dyn PaneController> = replacement_controller.clone();
-        let mut replacement_ui = default_ui();
-        replacement_ui
-            .pending_seed_prompts
-            .push(ready_seed_prompt(REPLACEMENT_PANE_ID, REPLACEMENT_PROMPT));
-        let replacement_snapshot =
-            ready_prompt_snapshot(REPLACEMENT_PANE_ID, &replacement_controller.agent_id);
-
-        process_pending_seed_prompts(
-            &mut replacement_ui,
-            &replacement_pane,
-            &replacement_snapshot,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(75));
-        let after_initial_delivery = replacement_controller.snapshot();
-        assert!(
-            after_initial_delivery
-                .windows(REPLACEMENT_PROMPT.len())
-                .any(|window| window == REPLACEMENT_PROMPT.as_bytes()),
-            "precondition: attempt 1 must reach the TUI pane before any automatic-write timestamp exists; output={:?}",
-            String::from_utf8_lossy(&after_initial_delivery)
-        );
-
-        replacement_controller.type_user_draft(REPLACEMENT_PANE_ID, REPLACEMENT_DRAFT);
-        let before_replacement = replacement_controller.snapshot();
-        assert!(
-            before_replacement
-                .windows(REPLACEMENT_DRAFT.len())
-                .any(|window| window == REPLACEMENT_DRAFT.as_bytes()),
-            "precondition: the unsent user draft must physically reach the TUI PTY; output={:?}",
-            String::from_utf8_lossy(&before_replacement)
-        );
-        replacement_ui
-            .send_retry_backoff
-            .get_mut(REPLACEMENT_PANE_ID)
-            .expect("first write arms replacement payload")
-            .next_attempt_at = std::time::Instant::now();
-        process_pending_seed_prompts(
-            &mut replacement_ui,
-            &replacement_pane,
-            &replacement_snapshot,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(75));
-        let after_replacement = replacement_controller.snapshot();
-
-        replacement_controller.registry.shutdown_all();
-        assert_eq!(
-            after_replacement,
-            before_replacement,
-            "TUI attempt 2 must append no replacement payload and send no submit CR after user input; before={:?}, after={:?}",
-            String::from_utf8_lossy(&before_replacement),
-            String::from_utf8_lossy(&after_replacement)
-        );
 
         let controller = Arc::new(RegistryBackedPaneController::new(PANE_ID));
         let pane: Arc<dyn PaneController> = controller.clone();
@@ -34469,7 +34426,7 @@ mod tests {
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         ui.send_retry_backoff
             .get_mut(PANE_ID)
-            .expect("first write arms replacement attempt")
+            .expect("first write arms the next probe attempt")
             .next_attempt_at = std::time::Instant::now();
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         std::thread::sleep(std::time::Duration::from_millis(75));
