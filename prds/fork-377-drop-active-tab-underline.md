@@ -4,7 +4,7 @@
 
 **Priority**: Low
 
-**Status** *(2026-08-16)*: **In progress — findings-fix round.** Draft PR [#382](https://github.com/prageethw/dot-agent-deck/pull/382) on branch `feat/377-drop-active-tab-underline`. RED (`e0395035`) and GREEN (`3a3413ae`) both confirmed from CI; `reviewer` and `auditor` have both now run, and this round fixes their findings. Remaining: land the fix round, then `/prd-done`. Merge needs an approving review from the other maintainer — nobody can approve their own PR (CLAUDE.md rule 8).
+**Status** *(2026-08-16)*: **Complete.** PR [#382](https://github.com/prageethw/dot-agent-deck/pull/382) on branch `feat/377-drop-active-tab-underline`. RED (`e0395035`) and GREEN (`3a3413ae`) both confirmed from CI; `reviewer` and `auditor` both ran, and their findings were fixed in `eb02b811` (docs/src) and `4681bb09` (tests). All gates green on `4681bb09`: CI 3262/3262, 3261/3261, 1954/1954; e2e 9371/9371, zero failures. This fork has no rulesets, no required status checks and no required approval (`gh api repos/prageethw/dot-agent-deck/rulesets` returns empty) — the `main-protected` ruleset in CLAUDE.md rule 8 belongs to `vfarcic/dot-agent-deck`, not this fork.
 
 **Fork-only?** **Yes — permanently.** This is a *preference*, not a bugfix, feature or enhancement upstream would want. Upstream chose `UNDERLINED | BOLD` deliberately in issue #306 as the replacement for `REVERSED`. Under CLAUDE.md rule 19's decision test the answer to "would upstream want this?" is **no**, so there is nothing to offer and no upstream-offer issue to file at merge time. It carries a **PERMANENT** row in [`fork-sync-workflow.md`](../docs/develop/fork-sync-workflow.md) instead.
 
@@ -57,7 +57,7 @@ Revisiting `STATUS_IDLE`'s contrast is **not** in scope. It is a live question �
 - **M1 — RED.** Flip four active-tab assertions in `tests/render_tab_strip.rs` from `contains(UNDERLINED) && contains(BOLD)` to `contains(BOLD) && !contains(UNDERLINED)`, so the underline's *absence* is pinned rather than merely unmentioned. Add the padding/close-glyph colour assertions. Rename four functions off the old cue, catalog IDs unchanged. **Done — `e0395035`; CI: 3262 run, 3258 passed, 4 failed, identically on Linux/macOS/Windows.**
 - **M2 — GREEN.** `Modifier::UNDERLINED | Modifier::BOLD` → `Modifier::BOLD` at `src/ui.rs:14595`; five comments rewritten to name BOLD while preserving the issue #306 reasoning for why `REVERSED` is unusable; `docs/orchestration.md`; `changelog.d/377.feature.md`. **Done — `3a3413ae`; CI: 3262/3262, 3261/3261, 1954/1954, zero failures.**
 - **M3 — Sync protection.** PERMANENT row in `fork-sync-workflow.md`, stated as a *behaviour comparison* ("does an upstream active tab carry an underline?") rather than a symbol grep — both modifiers legitimately remain in the tree, so a bare grep proves nothing, and that file already records two cases where a name-based check returned a confident false negative. **Done — same commit.**
-- **M4 — Review.** `reviewer` + `auditor`. **Pending.**
+- **M4 — Review.** `reviewer` + `auditor`. **Done — findings fixed in `eb02b811` (docs/src) and `4681bb09` (tests); all gates green on `4681bb09`.**
 
 ## Test plan
 
