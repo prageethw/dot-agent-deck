@@ -71,8 +71,12 @@ fn run_features_status(dir: &Path, extra_env: &[(&str, &str)]) -> (std::process:
 /// non-PTY drive. `dir` is used as BOTH the process cwd (what the ancestor
 /// walk resolves against) and `HOME`/socket root, so a lazily spawned daemon
 /// stays fully isolated per test and per-test cwd control is independent of
-/// where sockets/state land.
-fn run_tui_startup_isolated(dir: &Path) -> (std::process::Output, String) {
+/// where sockets/state land. `extra_env` is applied on top of the isolated
+/// base (e.g. `DOT_AGENT_DECK_FEATURES_CONFIG` for the override axis).
+fn run_tui_startup_isolated(
+    dir: &Path,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Output, String) {
     let mut cmd = Command::new(bin());
     cmd.current_dir(dir);
     cmd.env_clear();
@@ -93,6 +97,9 @@ fn run_tui_startup_isolated(dir: &Path) -> (std::process::Output, String) {
     // calls `ratatui::init()` — the same safety net `handshake_004` uses to
     // drive the startup path without a PTY.
     cmd.env("DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -208,7 +215,7 @@ fn status_003_no_config_found_defaults_off() {
 #[test]
 fn startup_warning_001_fires_when_no_config_found() {
     let dir = common::race_safe_tempdir();
-    let (out, text) = run_tui_startup_isolated(dir.path());
+    let (out, text) = run_tui_startup_isolated(dir.path(), &[]);
 
     assert!(
         out.status.success(),
@@ -239,7 +246,7 @@ fn startup_warning_002_silent_when_config_present() {
     )
     .expect("write project config");
 
-    let (out, text) = run_tui_startup_isolated(dir.path());
+    let (out, text) = run_tui_startup_isolated(dir.path(), &[]);
 
     assert!(
         out.status.success(),
@@ -250,5 +257,84 @@ fn startup_warning_002_silent_when_config_present() {
     assert!(
         !stderr.contains("experimental flags default to OFF"),
         "expected NO missing-config warning when a project config is present, got:\n{text}"
+    );
+}
+
+/// Scenario: Launch the real binary's TUI startup path with
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` pointed at a path that does not exist,
+/// from an isolated tempdir with no `.dot-agent-deck.toml` anywhere in its
+/// own ancestry either. Stderr must carry NO missing-config warning —
+/// `missing_config_warning` deliberately treats an operator-supplied
+/// override pointing nowhere as a different problem from nobody having set
+/// one up, and stays silent whenever the override is set at all, regardless
+/// of whether its target exists.
+#[spec("features/startup-warning/003")]
+#[test]
+fn startup_warning_003_silent_when_override_points_at_missing_file() {
+    let dir = common::race_safe_tempdir();
+    let missing = dir.path().join("does-not-exist.dot-agent-deck.toml");
+
+    let (out, text) = run_tui_startup_isolated(
+        dir.path(),
+        &[(
+            "DOT_AGENT_DECK_FEATURES_CONFIG",
+            missing.to_str().expect("utf8 override path"),
+        )],
+    );
+
+    assert!(
+        out.status.success(),
+        "the exit-after-handshake path should still exit 0, got {:?}\n{text}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("experimental flags default to OFF"),
+        "expected NO missing-config warning when DOT_AGENT_DECK_FEATURES_CONFIG is set, even to \
+         a missing target, got:\n{text}"
+    );
+}
+
+/// Scenario: Run `dot-agent-deck features status` with
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` pointed at an existing file outside the
+/// isolated process cwd's own ancestry. The config-path line must name the
+/// override (not the ancestor walk) as the winning path source, and the
+/// value-source line must name the override target — not "project file" —
+/// as the winning value source, since the two are different things once an
+/// override is in play.
+#[spec("features/status/004")]
+#[test]
+fn status_004_override_names_override_target() {
+    let dir = common::race_safe_tempdir();
+    let override_dir = common::race_safe_tempdir();
+    let override_path = override_dir.path().join("override.toml");
+    std::fs::write(&override_path, "[features]\nexperimental = true\n")
+        .expect("write override config");
+
+    let (out, text) = run_features_status(
+        dir.path(),
+        &[(
+            "DOT_AGENT_DECK_FEATURES_CONFIG",
+            override_path.to_str().expect("utf8 override path"),
+        )],
+    );
+
+    assert!(
+        out.status.success(),
+        "features status should exit 0, got {:?}\n{text}",
+        out.status.code()
+    );
+    assert!(
+        text.contains("DOT_AGENT_DECK_FEATURES_CONFIG override"),
+        "expected the override to be named as the winning path source, got:\n{text}"
+    );
+    assert!(
+        text.contains("(override target)"),
+        "expected the override target — not \"project file\" — to be named as the winning value \
+         source, got:\n{text}"
+    );
+    assert!(
+        text.contains("experimental: on"),
+        "expected experimental: on from the override target, got:\n{text}"
     );
 }

@@ -987,34 +987,75 @@ fn main() -> ExitCode {
         Some(Commands::Features { action }) => match action {
             FeaturesAction::Status => {
                 use dot_agent_deck::config::{
-                    EXPERIMENTAL_ENV, features_config_path, load_features_file, resolve_features,
+                    EXPERIMENTAL_ENV, FeaturesFileOutcome, describe_features_file,
+                    features_config_path, load_features_file, resolve_features,
                 };
                 use dot_agent_deck::features::Features;
                 use dot_agent_deck::project_config::CONFIG_FILE_NAME;
+                use dot_agent_deck::terminal_sanitize::sanitize_path_for_terminal_display;
 
-                // Reuses the exact same resolution functions the real
-                // startup path calls — no reimplementation, so this can
-                // never disagree with what the deck actually does (the
-                // whole point of a diagnostic: CLAUDE.md rule about not
-                // reimplementing what you're diagnosing applies here).
+                // The ON/OFF answer below is produced by the exact same
+                // resolution functions the real startup path calls
+                // (`features_config_path`, `load_features_file`,
+                // `resolve_features`) — no reimplementation, so it can never
+                // disagree with what the deck applies from this same path.
+                //
+                // The SOURCE label is a separate question and can genuinely
+                // differ from a running deck's own explanation: this command
+                // passes `Features::default()` as `load_features_file`'s
+                // `previous`, while the live watcher passes the deck's
+                // current value. On a load failure (malformed TOML, an
+                // unreadable or non-regular target, an oversized file) both
+                // return their respective `previous` — so the value printed
+                // here can read OFF while a running deck, which fell back to
+                // a previously-loaded ON, still shows the experimental
+                // surfaces. `describe_features_file` mirrors the same
+                // branching `load_features_file` took (without recomputing
+                // the value) so that distinction is named instead of
+                // silently collapsing into "(project file)".
                 let path = features_config_path();
-                let exists = path.is_file();
-                let path_source = if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok() {
+                let is_override = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok();
+                let path_source = if is_override {
                     "DOT_AGENT_DECK_FEATURES_CONFIG override"
                 } else {
                     "ancestor walk from the current directory"
                 };
+                let file_kind = if is_override {
+                    "override target"
+                } else {
+                    "project file"
+                };
+                let file_outcome = describe_features_file(&path);
+                let exists = !matches!(file_outcome, FeaturesFileOutcome::NotFound);
                 let file_value = load_features_file(&path, Features::default());
                 let resolved = resolve_features(file_value);
                 let value_source = if std::env::var(EXPERIMENTAL_ENV).is_ok() {
                     format!("{EXPERIMENTAL_ENV} env override")
-                } else if exists {
-                    "project file".to_string()
                 } else {
-                    format!("default (no {CONFIG_FILE_NAME} found)")
+                    match file_outcome {
+                        FeaturesFileOutcome::Parsed => file_kind.to_string(),
+                        FeaturesFileOutcome::NotFound => {
+                            format!("default (no {CONFIG_FILE_NAME} found)")
+                        }
+                        FeaturesFileOutcome::NotRegular => {
+                            format!("default ({file_kind} is not a regular file)")
+                        }
+                        FeaturesFileOutcome::Oversized => {
+                            format!("default ({file_kind} exceeds the size cap)")
+                        }
+                        FeaturesFileOutcome::Unreadable => {
+                            format!("default ({file_kind} exists but could not be read)")
+                        }
+                        FeaturesFileOutcome::Malformed => format!(
+                            "default ({file_kind} has malformed TOML; a running deck would keep its previous value instead)"
+                        ),
+                    }
                 };
 
-                println!("config path: {} ({path_source})", path.display());
+                println!(
+                    "config path: {} ({path_source})",
+                    sanitize_path_for_terminal_display(&path)
+                );
                 println!("config path exists: {exists}");
                 println!(
                     "experimental: {} ({value_source})",
@@ -2402,6 +2443,13 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // PRD #139 M1.2/M2.1: the daemon reads the experimental flag from the same
     // `.dot-agent-deck.toml` source of truth and watches it independently of
     // the TUI (the file is the contract; no cross-process sync).
+    //
+    // The `Option<String>` diagnosability warning (fork issue #303) is
+    // deliberately discarded here, unlike the TUI's `run_tui_session` call:
+    // a detached daemon has no terminal — `platform::detach::unix` sends both
+    // its stdout and stderr to `<state_dir>/daemon.log` — so there is nowhere
+    // useful to `eprintln!` it, and the paired `tracing::warn!` inside
+    // `init_and_watch` already lands in that same log file.
     dot_agent_deck::features::init_and_watch();
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();

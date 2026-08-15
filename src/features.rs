@@ -146,12 +146,18 @@ fn missing_config_warning(path: &std::path::Path) -> Option<String> {
     if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok() || path.is_file() {
         return None;
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     Some(format!(
         "no {} found in {} or any ancestor directory; experimental flags default to OFF",
         crate::project_config::CONFIG_FILE_NAME,
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .display()
+        // SECURITY (issue #303 M1): this cwd is attacker-influenceable —
+        // any directory the process was launched from — and this warning is
+        // printed raw to the terminal ahead of the alt-screen switch
+        // (`main.rs::run_tui_session`). Sanitize it the same way
+        // `worktree_reclaim.rs`/`daemon_client.rs`/`keybindings.rs` sanitize
+        // other operator-facing paths, or an embedded CR+ESC[2K can erase
+        // this very warning and forge a reassuring line in its place.
+        crate::terminal_sanitize::sanitize_path_for_terminal_display(&cwd)
     ))
 }
 

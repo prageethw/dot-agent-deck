@@ -5117,7 +5117,14 @@ These entries cover fork issue #303 Phase 2: `dot-agent-deck features status`, a
 - **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive). An isolated, empty tempdir with no `.dot-agent-deck.toml` in its ancestry is the process cwd; no env override is set.
 - **Agent:** none.
 - **Asserts:** stdout reports `config path exists: false`, names `default (no .dot-agent-deck.toml found)` as the source, and reports `experimental: off`.
-- **Does not assert:** the env-override or project-file cases (`features/status/001`–`002`).
+- **Does not assert:** the env-override or project-file cases (`features/status/001`–`002`); the `DOT_AGENT_DECK_FEATURES_CONFIG` path-override axis (`features/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### features/status/004 — `dot-agent-deck features status` names `DOT_AGENT_DECK_FEATURES_CONFIG` (not the ancestor walk) as the path source and the override target (not "project file") as the value source, when the override is set to an existing file (fork #303/#349 review — reviewer F4/auditor L2: the override axis had zero coverage at any tier).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive). Two isolated tempdirs: the process cwd (no `.dot-agent-deck.toml` in its own ancestry) and a separate directory holding `override.toml` (`[features] experimental = true`), pointed at via `DOT_AGENT_DECK_FEATURES_CONFIG`.
+- **Agent:** none.
+- **Asserts:** stdout names `DOT_AGENT_DECK_FEATURES_CONFIG override` as the path source, `(override target)` — distinct from `(project file)` — as the value source, and `experimental: on`.
+- **Does not assert:** the no-override cases (`features/status/001`–`003`); an override pointed at a missing/malformed/non-regular target (unit-covered via `describe_features_file` in `src/config.rs`).
 - **Platform coverage:** mac+linux.
 
 #### features/startup-warning
@@ -5135,7 +5142,14 @@ These entries cover fork issue #303 Phase 2's other diagnosability surface: a st
 - **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive — same `DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE` drive as `features/startup-warning/001`). An isolated tempdir carrying `[features] experimental = false` is both the process cwd and `HOME`.
 - **Agent:** none.
 - **Asserts:** the process exits 0 and stderr contains no missing-config warning.
-- **Does not assert:** the missing-config case (`features/startup-warning/001`); any behavior of the `experimental` value itself (covered elsewhere in this section).
+- **Does not assert:** the missing-config case (`features/startup-warning/001`); any behavior of the `experimental` value itself (covered elsewhere in this section); the `DOT_AGENT_DECK_FEATURES_CONFIG` override axis (`features/startup-warning/003`).
+- **Platform coverage:** mac+linux.
+
+##### features/startup-warning/003 — The deck's TUI startup path is completely silent on stderr when `DOT_AGENT_DECK_FEATURES_CONFIG` is set, even to a target that does not exist, and no `.dot-agent-deck.toml` exists in the process cwd's own ancestry either (fork #303/#349 review — reviewer F4/auditor L2: `missing_config_warning`'s override branch had zero coverage at any tier, and this is the distinction the design singled out — an operator-supplied override pointing at a missing file is a different problem from nobody having configured one).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive — same `DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE` drive as `features/startup-warning/001`–`002`). An isolated, empty tempdir with no `.dot-agent-deck.toml` in its ancestry is both the process cwd and `HOME`; `DOT_AGENT_DECK_FEATURES_CONFIG` is set to a sibling path inside that same tempdir that is never created.
+- **Agent:** none.
+- **Asserts:** the process exits 0 and stderr contains no missing-config warning.
+- **Does not assert:** the no-override cases (`features/startup-warning/001`–`002`); an override pointed at an existing-but-unusable target (malformed TOML, non-regular, oversized — unit-covered via `describe_features_file` in `src/config.rs`, which backs the `features status` labeling for the same outcomes).
 - **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
