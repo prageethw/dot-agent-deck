@@ -63,6 +63,9 @@ pub enum Action {
     /// Hidden. Claimed on any tab with a sidebar split (Dashboard and
     /// Orchestration tabs), not orchestration tabs only.
     ToggleOrchestrationSplit,
+    /// Fork #339: toggle the deck-global agent-type badge on session cards
+    /// (`Ctrl+m` / a bare `m`, command mode only). Off by default.
+    ToggleAgentTypeBadge,
     /// PRD #374 (#361 Item 3): toggle an orchestration tab's command-entry
     /// lock — whether direct keystrokes reach a focused non-orchestrator
     /// role pane's PTY.
@@ -162,6 +165,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_orchestration_split",
         default: "Ctrl+l",
         description: "Toggle orchestration split",
+    },
+    ActionSpec {
+        action: Action::ToggleAgentTypeBadge,
+        section: Section::Global,
+        name: "toggle_agent_type_badge",
+        default: "Ctrl+m",
+        description: "Toggle agent-type badge on cards",
     },
     ActionSpec {
         action: Action::Jump1,
