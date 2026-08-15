@@ -273,11 +273,16 @@ pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
 ///
 /// This is a SAFETY NET, not the remedy. The remedy is [`attempt_writes_payload`]
 /// — not producing the accumulation in the first place; with only the first
-/// attempt writing a payload (fork #194), ordinary delivery cannot double a
-/// prompt on its own. The net stays because doubling is still reachable from
-/// outside this module's own bookkeeping — e.g. a stale confirmation arriving
-/// late for a prompt that was independently retyped by another path — and
-/// because it is what stops a THIRD copy once a doubled turn has already been
+/// attempt writing a payload (fork #194), the retry ladder itself cannot double
+/// a prompt. The net stays because doubling is still reachable elsewhere,
+/// including a case inside this same module's bookkeeping: the remit re-arm
+/// clears `prompt_delivery` on compaction and starts a fresh cycle at attempt
+/// 1, so if the previous cycle's write is still unconfirmed and sitting in the
+/// composer, the new cycle's attempt-1 write concatenates with it — the same
+/// text twice, from two different delivery cycles rather than two attempts of
+/// one. A stale confirmation arriving late for a prompt independently retyped
+/// by another path is a second, module-external way to reach the same shape.
+/// The net is also what stops a THIRD copy once a doubled turn has already been
 /// observed, per the paragraph above.
 pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
     let expected = normalize_for_match(expected);

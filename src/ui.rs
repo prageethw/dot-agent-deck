@@ -3757,10 +3757,11 @@ fn process_pending_seed_prompts(
             // rides its own wire id, or the daemon's ledger would replay the
             // first `Applied` and this retry would never reach the PTY at all.
             let attempt = delivery.attempts.saturating_add(1);
-            // Issue #424 D5: after the one bounded replacement payload, later
-            // attempts probe SUBMISSION rather than typing the seed in again —
-            // same identity guards, same terminal-outcome classification, empty
-            // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
+            // Issue #424 D5 / fork #194: only the FIRST attempt writes the
+            // payload — every attempt after that probes SUBMISSION rather than
+            // typing the seed in again — same identity guards, same
+            // terminal-outcome classification, empty payload. See
+            // [`crate::prompt_delivery::attempt_writes_payload`].
             let writes_payload = attempt_writes_payload(attempt);
             let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
@@ -4820,9 +4821,9 @@ fn deliver_orchestrator_prompt(
         }
         None => (None, 0),
     };
-    // Issue #424 D5: after the one bounded replacement payload, later attempts
-    // probe SUBMISSION rather than typing the role prompt in again. See
-    // [`crate::prompt_delivery::attempt_writes_payload`].
+    // Issue #424 D5 / fork #194: only the FIRST attempt writes the payload —
+    // every attempt after that probes SUBMISSION rather than typing the role
+    // prompt in again. See [`crate::prompt_delivery::attempt_writes_payload`].
     let writes_payload = attempt_writes_payload(attempt);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a

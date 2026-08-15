@@ -1026,13 +1026,17 @@ async fn deliver(
         .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
         || drained_capability;
     // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
-    // recorded rather than folded into the answer above. Arming here instead
-    // would put the one replacement payload on the retry schedule's clock —
-    // ~500 ms after the write — which for `scheduler/dispatch/015` means typing
-    // it into a launcher that has not exec'd the real agent yet, and every
-    // attempt after that is a submit-only probe with nothing to submit. What the
-    // handoff licenses is accepting the successor WHEN IT ANNOUNCES ITSELF, so
-    // the payload goes in exactly when the agent is there to receive it. See
+    // recorded rather than folded into the answer above. With
+    // `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194) there is no replacement
+    // payload left to put on the retry schedule's clock: arming here means
+    // every attempt from here on is a submit-only probe with nothing to
+    // submit, so for `scheduler/dispatch/015`'s launcher-consumed case the
+    // handoff now arms blind CRs into the real agent's pane rather than
+    // recovering the lost prompt. What the handoff licenses is accepting the
+    // successor WHEN IT ANNOUNCES ITSELF; recovering the prompt itself for
+    // that successor is deferred to #343, which also has to weigh whether
+    // arming probes with nothing to submit is still the right default (see
+    // #343's blind-CR cost). See
     // [`crate::state::SessionStartWait::launcher_handoff`].
     if observed.launcher_handoff {
         registry.note_launcher_handoff(agent_id);
@@ -1252,10 +1256,12 @@ fn drain_pre_write_events(
 /// of whoever happens to own the pane string by then.
 ///
 /// Bounded by [`AUTOMATIC_PROMPT_DEADLINE`], after which the prompt is abandoned
-/// with a warn, a durable report on the pane's card, and no further write. Every
-/// retry types the prompt into the pane again, so the escalating
-/// [`unconfirmed_retry_delay`] keeps that to single digits across the whole
-/// window (see its docs).
+/// with a warn, a durable report on the pane's card, and no further write. The
+/// prompt itself is typed once, by the caller, before this loop starts; with
+/// `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194) every retry THIS loop makes is a
+/// submit-only probe, not a re-type. The escalating [`unconfirmed_retry_delay`]
+/// keeps the retry count to single digits across the whole window regardless
+/// (see its docs).
 ///
 /// `can_report_prompts` is the initial answer to "can this pane's delivery ever
 /// be confirmed" — `true` when a pre-write event came from a producer that
@@ -1314,8 +1320,12 @@ async fn confirm_prompt_delivery(
     // Issue #424 S2: ONE HOLDER PER PAYLOAD WRITE. A record is now per write
     // rather than per distinct payload, so that a delivery sharing its bytes
     // with a concurrent one cannot release the other's guard — which means this
-    // delivery must hold (and drop) as many as it wrote. The replacement
-    // payload's holder is pushed below, at the write that creates it.
+    // delivery must hold (and drop) as many as it wrote. While
+    // `MAX_PAYLOAD_SUBMISSIONS == 1` (fork #194) that is exactly the one record
+    // below; a would-be second holder, for a replacement payload write, is
+    // pushed at `guarded_submit`'s call site further down but is currently
+    // unreachable (see the `GuardedOutcome::Written if writes_payload` arm) —
+    // ready for #343 to make it live again.
     let mut payload_records = vec![PayloadRecordRelease {
         registry: &registry,
         pane_id: &pane_id,
@@ -1482,11 +1492,11 @@ async fn confirm_prompt_delivery(
         armed |= gap_capability && accepts_late_producer;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
-        // Issue #424 D5: after the one bounded replacement payload, later
-        // attempts PROBE SUBMISSION instead of typing the prompt in again — same
-        // guarded path, same writer serialization, same deadline, same
-        // partial-write classification, only an empty payload so the target
-        // receives just the delayed submit CR. See
+        // Issue #424 D5 / fork #194: only the FIRST attempt writes the payload
+        // — every attempt after that PROBES SUBMISSION instead of typing the
+        // prompt in again — same guarded path, same writer serialization, same
+        // deadline, same partial-write classification, only an empty payload so
+        // the target receives just the delayed submit CR. See
         // [`crate::prompt_delivery::attempt_writes_payload`].
         let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt);
         // Issue #424 F1 (auditor HIGH): a probe submits whatever the target is
@@ -1501,14 +1511,16 @@ async fn confirm_prompt_delivery(
         // strictly worse than stopping — so it is terminal, and the notice tells
         // the user their pane holds an automatic prompt they never submitted.
         //
-        // Issue #424 F1, replacement-payload half: the SAME stop applies to the
-        // one bounded replacement payload (attempt 2). Left unguarded it was the
-        // worse half of the finding — the probe merely submits the user's draft,
-        // whereas the replacement APPENDS our prompt to that draft and submits
-        // the pair as a single turn. The registry asks the byte-keyed question
-        // ("would this repeat what we already put in that box?"); this loop asks
-        // the same one, for the same reason it asks the probe's, so the stop is
-        // reported rather than surfacing as a bare `target went stale`.
+        // Issue #424 F1, replacement-payload half: the SAME stop applied to the
+        // one bounded replacement payload (attempt 2), which appended our
+        // prompt to the user's draft and submitted the pair as a single turn
+        // rather than merely submitting the draft as a probe does. With
+        // `MAX_PAYLOAD_SUBMISSIONS` now 1 (fork #194), `writes_payload` is never
+        // true inside this loop, so the `if writes_payload` arm below —
+        // `registry.user_typed_since_writing_payload` — is currently
+        // unreachable from here. Left in place, and the reasoning kept, because
+        // #343's evidence-based recovery restores a case where this loop writes
+        // a replacement payload again.
         //
         // Issue #424 S1/S2 (both reviewers): the FIRST of the two questions
         // below is this delivery's OWN — has user input reached this pane since
@@ -1546,11 +1558,19 @@ async fn confirm_prompt_delivery(
         }
         let payload = if writes_payload { prompt.as_str() } else { "" };
         match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
+            // Currently UNREACHABLE while `MAX_PAYLOAD_SUBMISSIONS == 1` (fork
+            // #194): `attempt` is incremented above, before `writes_payload` is
+            // computed, so this loop's first write is attempt 2 and
+            // `writes_payload` is always false here. Kept, rather than removed,
+            // because #343's evidence-based recovery is expected to make this
+            // loop write a replacement payload again, at which point this arm
+            // — and the record it takes below — becomes live once more.
+            //
+            // Issue #424 S2: the replacement left a SECOND record of these
+            // bytes on the pane. Take a holder for it here, at the write
+            // that created it, so this delivery releases exactly what it
+            // wrote and leaves nothing behind to refuse a later one.
             GuardedOutcome::Written if writes_payload => {
-                // Issue #424 S2: the replacement left a SECOND record of these
-                // bytes on the pane. Take a holder for it here, at the write
-                // that created it, so this delivery releases exactly what it
-                // wrote and leaves nothing behind to refuse a later one.
                 payload_records.push(PayloadRecordRelease {
                     registry: &registry,
                     pane_id: &pane_id,
