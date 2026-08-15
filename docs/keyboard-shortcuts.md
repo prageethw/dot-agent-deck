@@ -24,7 +24,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame, and the card sidebar and the other panes are not drawn. Press it again to restore the view you had. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
 | `Ctrl+M` / `m` | Show / hide the agent-type badge on every session card. One setting for the whole deck, off by default. See [`Ctrl+M` / `m` shows the agent-type badge](#ctrlm--m-shows-the-agent-type-badge) | **Command mode only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
-| `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, and only while the `experimental` flag is on |
+| `Ctrl+E` | Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab** |
 
 ### Which mode you're in
 
@@ -56,11 +56,7 @@ The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a
 
 ### `Ctrl+E` locks command entry to the orchestrator pane
 
-> **Experimental — the whole of this section is off unless you turn it on.**
->
-> The command-entry lock is gated behind the `experimental` feature flag while it is evaluated in real use. With the flag off — the default — `Ctrl+E` is not claimed anywhere, keystrokes reach a focused worker pane exactly as they always have, and the deck never moves focus on its own. To try it, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). Note that the focus steering described at the end of this section is part of the same gated surface — it only ever runs while the lock is engaged.
-
-With the flag on, on an **orchestration tab**, typing into a worker pane is locked by default. Your keystrokes reach the orchestrator's pane exactly as before; aim them at a worker role and they are dropped rather than delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D` to reach command mode, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`; the same chord locks it again. `Ctrl+E` leaves you in command mode, so press `Ctrl+D` once more to return to the pane and type.
+On an **orchestration tab**, typing into a worker pane is locked by default. Your keystrokes reach the orchestrator's pane exactly as before; aim them at a worker role and they are dropped rather than delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D` to reach command mode, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`; the same chord locks it again. `Ctrl+E` leaves you in command mode, so press `Ctrl+D` once more to return to the pane and type.
 
 **This is not a read-only mode, and it does not apply anywhere else.** Dashboard and mode tabs are untouched, nothing is disabled, and every pane still shows live output and scrolls normally. On an orchestration tab the lock costs one deliberate `Ctrl+D`, `Ctrl+E` before you can type at a worker — and that pause is the point. Why it is worth a pause, and why the default has to be locked for it to mean anything, is covered in [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
 
@@ -242,7 +238,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) — works from any mode |
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
-| `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag; without it the chord is never claimed.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
+| `toggle_orchestration_lock` | `Ctrl+e` | Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
 | `toggle_orchestration_split` | `Ctrl+l` | Cycle the deck's sidebar/pane-column split — Default → Narrow (25/75) → Hidden (0/100) → Default — on **Dashboard and Orchestration tabs**, **command mode only**; one stage shared by every tab, and in a pane the chord is ordinary input (clear-screen) for whatever is running there |
 | `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame, hiding the card sidebar and the other panes; press again to restore. Per-tab, and never saved. **Dashboard and orchestration tabs, command mode only**; in a pane it is still job control for your agent, and in the filter/rename rows and on a Mode tab it is ordinary input |
 | `toggle_agent_type_badge` | `Ctrl+m` | Show / hide the agent-type badge on every session card — **command mode only**; one setting for the whole deck, and in a pane the chord is ordinary input (submits, same as `Enter`) for whatever is running there. A bare `m` always works alongside it and is not remappable |
