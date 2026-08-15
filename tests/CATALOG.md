@@ -729,6 +729,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the CREATE case (`git worktree add -b <new-branch>`), which the issue's own measurement found safe (git's ref lock serializes it) — only the ATTACH case (no `-b`), which is not; the shape of whatever lock the fix introduces.
 - **Platform coverage:** mac+linux.
 
+##### worktree/create/002 — `create_worktree_sync` succeeds when called with `clone_dir` pointing at a LINKED worktree rather than the main working tree (fork #331 audit B2).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/issue_dispatch_run.rs`'s own `#[cfg(test)] mod tests` (as `worktree/create/001`). Real `git` subprocesses — a main repo, then a linked worktree of it created via `git worktree add`, then a third worktree attached through `create_worktree_sync` with `clone_dir` set to the LINKED one — no PTY, no daemon.
+- **Agent:** none.
+- **Asserts:** a fixture precondition that the linked worktree's `.git` is genuinely a FILE, not a directory (or the test would not be exercising B2 at all); then that attaching a third worktree through it succeeds (`WorktreeCreation::Created`). Before the fix, `worktree_attach_lock_path` joined `clone_dir` with a literal `.git`, which resolves to that file rather than a directory inside a linked worktree, so `ensure_owner_only_dir` failed with `ENOTDIR` and the attach errored out before `git worktree add` ever ran.
+- **Does not assert:** the CREATE case (`-b`); that the lock is anchored at the SAME path as an equivalent call made from the main working tree (that property is closed by the B2 fix but not independently pinned by a test).
+- **Platform coverage:** mac+linux.
+
 #### worktree/reclaim
 
 ##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.

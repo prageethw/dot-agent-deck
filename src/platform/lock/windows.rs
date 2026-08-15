@@ -50,10 +50,11 @@
 
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree, WAIT_ABANDONED,
-    WAIT_OBJECT_0,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -135,7 +136,7 @@ pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     let owner = std::thread::Builder::new()
         .name("spawn-lock".to_string())
         .spawn(move || {
-            let held = match create_and_acquire(&thread_name, &user) {
+            let held = match create_and_acquire(&thread_name, &user, INFINITE) {
                 Ok(held) => held,
                 Err(err) => {
                     // Receiver gone (caller cancelled) → nothing to report to.
@@ -195,7 +196,7 @@ pub struct PathLock {
 impl Drop for PathLock {
     fn drop(&mut self) {
         // SAFETY: `held.0` is a live mutex handle acquired by THIS thread in
-        // `acquire_path_lock_sync`, and this `Drop` runs on that same thread
+        // `acquire_path_lock_sync_bounded`, and this `Drop` runs on that same thread
         // (no `.await`, no `std::thread::spawn` of the guard in between) —
         // exactly the thread that owns the mutex, which `ReleaseMutex`
         // requires.
@@ -216,16 +217,28 @@ impl Drop for PathLock {
 /// owner thread. Safe here specifically because the caller never `.await`s
 /// between acquiring and dropping the guard, so there is no thread migration
 /// for `ReleaseMutex`'s thread-affinity rule to trip over.
-pub fn acquire_path_lock_sync(path: &Path) -> std::io::Result<PathLock> {
+///
+/// Bounded (fork #331 audit S1): waits at most `timeout` rather than
+/// `INFINITE`, refusing with an `ErrorKind::TimedOut` error on expiry rather
+/// than blocking the caller forever. The sole caller,
+/// [`crate::issue_dispatch_run::create_worktree_sync`], runs directly on the
+/// TUI's synchronous render/event loop, so an unbounded wait here would
+/// reopen the freeze `WORKTREE_GIT_TIMEOUT` exists to prevent on the `git`
+/// calls either side of it. [`acquire_spawn_lock`] above stays unbounded —
+/// the daemon-start/lazy-spawn callers deliberately wait for the in-flight
+/// spawn to finish.
+pub fn acquire_path_lock_sync_bounded(path: &Path, timeout: Duration) -> std::io::Result<PathLock> {
     let user = crate::platform::paths::endpoint_user_suffix();
     let name = super::spawn_mutex_name(&user, path);
-    let held = create_and_acquire(&name, &user)?;
+    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let held = create_and_acquire(&name, &user, timeout_ms)?;
     Ok(PathLock { held, name })
 }
 
-/// Create-or-open the named mutex and block until this thread owns it. Runs on —
-/// and must only ever be called from — the guard's owner thread.
-fn create_and_acquire(name: &str, user_sid: &str) -> std::io::Result<OwnedHandle> {
+/// Create-or-open the named mutex and block until this thread owns it, or
+/// until `timeout_ms` elapses (`INFINITE` for no bound). Runs on — and must
+/// only ever be called from — the guard's owner thread.
+fn create_and_acquire(name: &str, user_sid: &str, timeout_ms: u32) -> std::io::Result<OwnedHandle> {
     // Held until the end of this function, so the descriptor `attrs` points at
     // stays alive across the `CreateMutexW` call (which copies it into the object).
     let sd = owner_only_security_descriptor(user_sid)?;
@@ -276,9 +289,10 @@ fn create_and_acquire(name: &str, user_sid: &str) -> std::io::Result<OwnedHandle
         ));
     }
 
-    // SAFETY: `held.0` is a live mutex handle; `INFINITE` is the documented
-    // "block until granted" timeout.
-    match unsafe { WaitForSingleObject(held.0, INFINITE) } {
+    // SAFETY: `held.0` is a live mutex handle; `timeout_ms` is either
+    // `INFINITE` (unbounded, the async caller's contract) or a caller-chosen
+    // finite bound (the sync worktree-lock caller).
+    match unsafe { WaitForSingleObject(held.0, timeout_ms) } {
         WAIT_OBJECT_0 => Ok(held),
         WAIT_ABANDONED => {
             tracing::warn!(
@@ -288,6 +302,10 @@ fn create_and_acquire(name: &str, user_sid: &str) -> std::io::Result<OwnedHandle
             );
             Ok(held)
         }
+        WAIT_TIMEOUT => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out after {timeout_ms}ms waiting for the lock {name}"),
+        )),
         other => {
             let err = std::io::Error::last_os_error();
             Err(std::io::Error::other(format!(

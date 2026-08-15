@@ -3,6 +3,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// RAII guard for the `spawn.lock` flock. Drop releases the lock by closing the
 /// file descriptor (and explicitly `LOCK_UN`'ing for clarity).
@@ -25,9 +26,7 @@ impl Drop for SpawnLock {
 
 /// Open or create `path` and acquire an exclusive `flock(2)` on it, blocking
 /// the CALLING thread until granted. This is the core primitive; the async
-/// [`acquire_spawn_lock`] below just runs it on `spawn_blocking`, and fork
-/// #282's [`crate::issue_dispatch_run::create_worktree_sync`] (the sync TUI
-/// hot path, which cannot `.await`) calls it directly.
+/// [`acquire_spawn_lock`] below just runs it on `spawn_blocking`.
 pub fn acquire_spawn_lock_sync(path: &Path) -> std::io::Result<SpawnLock> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -63,4 +62,62 @@ pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     tokio::task::spawn_blocking(move || acquire_spawn_lock_sync(&path))
         .await
         .map_err(std::io::Error::other)?
+}
+
+/// Bounded counterpart to [`acquire_spawn_lock_sync`] (fork #331 audit S1):
+/// open or create `path` and acquire an exclusive `flock(2)` on it, refusing
+/// with an `ErrorKind::TimedOut` error rather than blocking the calling
+/// thread indefinitely if the lock cannot be granted within `timeout`. For
+/// [`crate::issue_dispatch_run::create_worktree_sync`] (the sync TUI hot
+/// path, which cannot `.await` the unbounded primitive above and runs
+/// directly on the render/event loop), an unbounded wait here would reopen
+/// the freeze `WORKTREE_GIT_TIMEOUT` exists to prevent on the `git` calls
+/// either side of it.
+///
+/// `flock(2)` has no wait-with-timeout form, so this polls `LOCK_EX |
+/// LOCK_NB` against a deadline rather than blocking on a single syscall —
+/// the standard shape for a bounded flock. Under real contention the loser
+/// typically crosses only one or two polls before the holder's own bounded
+/// `git` call finishes and releases.
+pub fn acquire_spawn_lock_sync_bounded(
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<SpawnLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: same as `acquire_spawn_lock_sync` — valid fd, valid op
+        // constant; flock(2) does not retain any reference to the address
+        // space.
+        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if res == 0 {
+            return Ok(SpawnLock { file });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(err);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {timeout:?} waiting for the lock on {}",
+                    path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL.min(deadline - now));
+    }
 }

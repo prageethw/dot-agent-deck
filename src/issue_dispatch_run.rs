@@ -1488,31 +1488,113 @@ fn notify_marker_warning_if_any(
 /// on-disk path being contended over (never the branch name: two different
 /// target paths must never contend on one lock).
 ///
-/// Anchored under the shared clone's OWN `.git` dir rather than a
+/// Anchored under the shared clone's common `.git` dir rather than a
 /// machine-global lock root (contrast [`crate::daemon`]'s
 /// `XDG_RUNTIME_DIR`-then-`~/.cache` lock-root dance for the daemon socket
-/// lock): `.git` already belongs to whoever owns the repository, so this
-/// introduces no new local-attacker DoS surface the way a sibling lock file
-/// under a world-writable `/tmp` would, and it keeps every test's own
+/// lock): the common dir already belongs to whoever owns the repository, so
+/// this introduces no new local-attacker DoS surface the way a sibling lock
+/// file under a world-writable `/tmp` would, and it keeps every test's own
 /// tempdir clone naturally isolated with no env-var override needed.
+///
+/// Fork #331 audit B2: `clone_dir` is **not** joined with a literal `.git`
+/// component. In a linked worktree (which CLAUDE.md rule 1 mandates for
+/// essentially all work in this repo), `.git` is a regular *file* pointing at
+/// the real admin dir elsewhere — not a directory — so `clone_dir.join(".git")`
+/// used to hand `ensure_owner_only_dir` a path whose parent is a file, and
+/// `create_dir_all` semantics fail that with `ENOTDIR`. The same shape breaks
+/// for a `git clone --separate-git-dir` checkout and for a submodule. Instead
+/// this asks git itself, exactly the way [`is_shallow_repo`] in
+/// `worktree_reclaim.rs` already does for the identical ambiguity (its doc
+/// comment names this trap explicitly): `git rev-parse --path-format=absolute
+/// --git-common-dir`, run with `clone_dir` as the working directory, resolves
+/// to the ONE shared admin dir regardless of whether `clone_dir` is the main
+/// working tree or one of its linked worktrees — so the lock also becomes
+/// genuinely shared across every worktree of one clone, which is what the
+/// changelog already claims it is.
 ///
 /// The filename hashes the FULL `worktree_dir` path (not just its basename)
 /// so two different target paths never collide onto one lock file — the same
-/// reasoning as `daemon::lock_path_for`.
-fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> PathBuf {
+/// reasoning as `daemon::lock_path_for`. Both `clone_dir` (via
+/// `--git-common-dir`) and `worktree_dir` are canonicalized before hashing —
+/// on a best-effort basis: `worktree_dir` does not exist yet at this point
+/// (that's the whole point of the call), so only its parent (already created
+/// by [`ensure_worktree_parent_dir`], which runs before this) is
+/// canonicalized and the original basename rejoined. A canonicalization
+/// failure falls back to the path as given rather than erroring — under-
+/// serializing two differently-spelled paths to the same target (`/var` vs
+/// `/private/var` on macOS, a symlinked checkout) is the SAME failure mode
+/// this function already had before this fix, not a new one, so it does not
+/// need to become fatal here.
+fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    let common_dir = git_common_dir(clone_dir)?;
+    let canonical_worktree_dir = canonicalize_best_effort(worktree_dir);
+
     let mut hasher = DefaultHasher::new();
-    worktree_dir.as_os_str().hash(&mut hasher);
+    canonical_worktree_dir.as_os_str().hash(&mut hasher);
     let hash = hasher.finish();
     let basename = worktree_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("worktree");
-    clone_dir
-        .join(".git")
+    Ok(common_dir
         .join("dot-agent-deck-worktree-locks")
-        .join(format!("{basename}-{hash:016x}.lock"))
+        .join(format!("{basename}-{hash:016x}.lock")))
+}
+
+/// Fork #331 audit B2: resolves the repository's shared common `.git` dir the
+/// same way [`is_shallow_repo`] (`worktree_reclaim.rs`) resolves shallow-ness
+/// — by asking git rather than assuming `repo_dir.join(".git")` is a
+/// directory, which is false for a linked worktree, a `--separate-git-dir`
+/// checkout, or a submodule. Unlike that advisory probe, a failure here is
+/// fatal: without a correct common dir there is no safe place to put the
+/// lock, and proceeding on a guess risks silently under-serializing (or, pre-
+/// fix, an outright `ENOTDIR`) — the exact defect this function exists to
+/// close.
+fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|e| {
+            format!("failed to run git rev-parse --git-common-dir in {clone_dir:?}: {e}")
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir in {clone_dir:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() {
+        return Err(format!(
+            "git rev-parse --git-common-dir in {clone_dir:?} printed no output"
+        ));
+    }
+    Ok(PathBuf::from(dir))
+}
+
+/// Best-effort canonicalization for hashing purposes only (fork #331 audit
+/// B2): if `path` exists, canonicalize it directly; otherwise canonicalize
+/// its parent (which must already exist — see the caller) and rejoin the
+/// original file name, so a not-yet-created `worktree_dir` still collapses
+/// symlinks/relative components in the part of the path that DOES exist.
+/// Falls back to `path` unchanged if neither succeeds — never fatal, since
+/// this only affects whether two spellings of one target collide onto the
+/// same lock file, not whether the lock is taken at all.
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Sync twin of [`create_worktree`] for the TUI's synchronous `SpawnPane`
@@ -1544,6 +1626,16 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> PathBuf {
 /// so it always sees the directory in its final state and classifies
 /// correctly (`AlreadyClaimed` when the winner succeeded, its own fresh
 /// attempt otherwise) rather than racing the winner's in-progress write.
+///
+/// Fork #331 audit S1: the lock acquisition itself is bounded by
+/// [`WORKTREE_GIT_TIMEOUT`] — the same constant the `git` calls immediately
+/// below already use — rather than blocking this thread indefinitely.
+/// `create_worktree_sync` runs directly on the TUI's synchronous
+/// render/event loop (see above), and an unbounded `flock`/`WaitForSingleObject`
+/// wait here would reopen exactly the freeze `WORKTREE_GIT_TIMEOUT` exists to
+/// prevent, ahead of the bounded calls it protects. On expiry the acquisition
+/// refuses with an error rather than proceeding unlocked — this function
+/// never reaches `git worktree add` without holding the lock.
 pub(crate) fn create_worktree_sync(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -1552,7 +1644,8 @@ pub(crate) fn create_worktree_sync(
 ) -> Result<WorktreeCreation, String> {
     ensure_worktree_parent_dir(worktree_dir)?;
 
-    let lock_path = worktree_attach_lock_path(clone_dir, worktree_dir);
+    let lock_path = worktree_attach_lock_path(clone_dir, worktree_dir)
+        .map_err(|e| format!("failed to resolve worktree lock path: {e}"))?;
     if let Some(parent) = lock_path.parent() {
         crate::platform::fsperm::ensure_owner_only_dir(parent).map_err(|e| {
             format!(
@@ -1562,12 +1655,13 @@ pub(crate) fn create_worktree_sync(
         })?;
     }
     let _attach_lock =
-        crate::platform::lock::acquire_worktree_lock_sync(&lock_path).map_err(|e| {
-            format!(
-                "failed to acquire worktree attach lock {}: {e}",
-                lock_path.display()
-            )
-        })?;
+        crate::platform::lock::acquire_worktree_lock_sync(&lock_path, WORKTREE_GIT_TIMEOUT)
+            .map_err(|e| {
+                format!(
+                    "failed to acquire worktree attach lock {}: {e}",
+                    lock_path.display()
+                )
+            })?;
 
     let branch_exists = run_status_sync(
         "git",
@@ -3222,6 +3316,79 @@ exit 0
              {duplicate_listed}/{TRIALS} trials showed the path more than once in `git worktree \
              list`. Failures:\n{}",
             failures.join("\n")
+        );
+    }
+
+    /// Scenario: fork #331 audit B2. Creates a real repo, then a SECOND,
+    /// LINKED worktree of it via `git worktree add` — confirming its `.git`
+    /// is a plain FILE, not a directory, which is what CLAUDE.md rule 1
+    /// mandates for essentially all work in this repo. Calls
+    /// `create_worktree_sync` with `clone_dir` set to that linked worktree
+    /// (not the main working tree) to attach a third worktree onto an
+    /// already-existing branch. Before the fix, `worktree_attach_lock_path`
+    /// joined `clone_dir` with a literal `.git`, which resolves to that
+    /// file rather than a directory inside a linked worktree, so
+    /// `ensure_owner_only_dir(parent)` failed with `ENOTDIR` and the whole
+    /// attach errored out before `git worktree add` ever ran — orchestration
+    /// spawn failing outright from the exact working directory rule 1
+    /// mandates. Asserts the attach succeeds.
+    #[spec("worktree/create/002")]
+    #[test]
+    fn create_002_attach_succeeds_from_inside_a_linked_worktree() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let main_repo = ws.path().join("main");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        git(&main_repo, &["init", "--initial-branch=main", "--quiet"]);
+        git(&main_repo, &["config", "user.email", "test@example.com"]);
+        git(&main_repo, &["config", "user.name", "Test"]);
+        git(&main_repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(main_repo.join("README.md"), "seed\n").unwrap();
+        git(&main_repo, &["add", "README.md"]);
+        git(&main_repo, &["commit", "--quiet", "-m", "seed"]);
+
+        // A linked worktree OF the main repo -- `clone_dir` below points
+        // HERE, not at `main_repo`, reproducing exactly the shape rule 1
+        // mandates for real work in this repo.
+        let linked = ws.path().join("linked-caller");
+        git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "caller-branch",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            linked.join(".git").is_file(),
+            "the linked worktree's .git must be a FILE, not a directory, or this test is not \
+             exercising B2 at all"
+        );
+
+        // A branch that already exists, so `create_worktree_sync` takes the
+        // ATTACH path (no `-b`) -- the exact shape B2 was found on.
+        git(&main_repo, &["branch", "attach-target"]);
+        let target = ws.path().join("attached");
+
+        let result = create_worktree_sync(&linked, &target, "attach-target", "tester");
+
+        assert!(
+            matches!(result, Ok(WorktreeCreation::Created { .. })),
+            "attach through a linked worktree must succeed, got {result:?}"
         );
     }
 
