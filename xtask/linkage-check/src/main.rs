@@ -125,6 +125,10 @@ mod sidecar_staging;
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
 mod verify_pr_stream;
+// PRD fork#340 M3, RED round (tester): signatures only, every body
+// `todo!()`. Not wired into the subcommand multiplexer below — that is the
+// coder delegation that follows this one.
+mod work_type;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
