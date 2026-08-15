@@ -1758,15 +1758,16 @@ async fn run_tui_session() -> ExitCode {
     // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal.
     //
     // Fork issue #303: when no `.dot-agent-deck.toml` was found in the cwd or
-    // any ancestor, `init_and_watch` returns a diagnosability warning. Print
-    // it here, before `ensure_external_daemon_or_die`/`run_tui`'s
-    // `ratatui::init()` flips into the alternate screen, so it lands on
+    // any ancestor, and fork issue #309: when an ancestor was declined as
+    // world-writable, `init_and_watch` returns diagnosability warnings.
+    // Print them here, before `ensure_external_daemon_or_die`/`run_tui`'s
+    // `ratatui::init()` flips into the alternate screen, so they land on
     // stderr in the normal terminal — mirroring how `KeybindingConfig::load()`
     // below prints its own malformed-config warnings ahead of the alt-screen
     // switch. No `DOT_AGENT_DECK_LOG` and no restart flag required, which is
     // the whole point: today's `tracing::warn!` above is invisible without
     // both.
-    if let Some(warning) = dot_agent_deck::features::init_and_watch() {
+    for warning in dot_agent_deck::features::init_and_watch() {
         eprintln!("Warning: {warning}");
     }
 
@@ -2444,12 +2445,13 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // `.dot-agent-deck.toml` source of truth and watches it independently of
     // the TUI (the file is the contract; no cross-process sync).
     //
-    // The `Option<String>` diagnosability warning (fork issue #303) is
-    // deliberately discarded here, unlike the TUI's `run_tui_session` call:
-    // a detached daemon has no terminal — `platform::detach::unix` sends both
-    // its stdout and stderr to `<state_dir>/daemon.log` — so there is nowhere
-    // useful to `eprintln!` it, and the paired `tracing::warn!` inside
-    // `init_and_watch` already lands in that same log file.
+    // The `Vec<String>` diagnosability warnings (fork issues #303 and #309)
+    // are deliberately discarded here, unlike the TUI's `run_tui_session`
+    // call: a detached daemon has no terminal — `platform::detach::unix`
+    // sends both its stdout and stderr to `<state_dir>/daemon.log` — so
+    // there is nowhere useful to `eprintln!` them, and the paired
+    // `tracing::warn!` calls inside `init_and_watch` already land in that
+    // same log file.
     dot_agent_deck::features::init_and_watch();
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();

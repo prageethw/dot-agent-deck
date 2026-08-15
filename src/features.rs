@@ -121,13 +121,24 @@ static INIT: Once = Once::new();
 /// that points at a missing file is a different problem. Returns `None` when
 /// a config was found (or an override is set), so callers can stay silent in
 /// the common case.
+///
+/// Reviewer F5: this can also fire when something DOES exist at the
+/// resolved path — a non-regular file of that name, or an ancestor whose
+/// `stat` failed (`is_file()` reads `EACCES` the same as absent) — so the
+/// wording says what was actually determined (no *readable regular file*
+/// found) rather than asserting outright absence. `no {CONFIG_FILE_NAME}
+/// found` stays intact as the opening clause (verbatim, unchanged) because
+/// `e2e_features_status.rs`'s `startup_warning_001`/`002`/`003` pin that
+/// exact substring on stderr.
 fn missing_config_warning(path: &std::path::Path) -> Option<String> {
     if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok() || path.is_file() {
         return None;
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     Some(format!(
-        "no {} found in {} or any ancestor directory; experimental flags default to OFF",
+        "no {} found in {} or any ancestor directory (or one exists there but \
+         is not a readable regular file — indistinguishable from absent \
+         here); experimental flags default to OFF",
         crate::project_config::CONFIG_FILE_NAME,
         // SECURITY (issue #303 M1): this cwd is attacker-influenceable —
         // any directory the process was launched from — and this warning is
@@ -149,17 +160,29 @@ fn missing_config_warning(path: &std::path::Path) -> Option<String> {
 /// agreeing on anything today. Idempotent: the body runs at most once per
 /// process, so a second call cannot spawn a duplicate watcher thread.
 ///
-/// Returns the fork issue #303 diagnosability message (see
-/// [`missing_config_warning`]) the FIRST time this is called, so a caller
-/// with a user-visible seam (the TUI's startup path, before it enters the
-/// alternate screen) can surface it without needing `DOT_AGENT_DECK_LOG` or a
-/// restart. Returns `None` on a config found (or an override set), and also
-/// on any call after the first — `init_and_watch` is only ever called once
-/// per process in production, so this is not a real limitation.
-pub fn init_and_watch() -> Option<String> {
-    let mut warning = None;
+/// Returns every diagnosability message produced by this call (fork issue
+/// #309's declined-ancestor warnings, then fork issue #303's
+/// [`missing_config_warning`], then — when either fired — one trailing
+/// coda naming the frozen resolution path, reviewer F4) the FIRST time this
+/// is called, so a caller with a user-visible seam (the TUI's startup path,
+/// before it enters the alternate screen) can surface them without needing
+/// `DOT_AGENT_DECK_LOG` or a restart. Every message here is also
+/// `tracing::warn!`-logged as it is produced, so `DOT_AGENT_DECK_LOG` still
+/// captures them even for a caller (the daemon) that discards the returned
+/// `Vec`. Returns empty when a config was cleanly found (or an override is
+/// set), and also on any call after the first — `init_and_watch` is only
+/// ever called once per process in production, so this is not a real
+/// limitation.
+///
+/// Reviewer F4: resolution happens exactly once, here, inside
+/// `INIT.call_once` — [`spawn_watcher`] re-reads the SAME resolved `path` on
+/// every tick but the ancestor walk itself never repeats. So "I'll fix this
+/// by creating/moving a config" has no effect until the process restarts
+/// unless the operator creates it at exactly the path named in the coda.
+pub fn init_and_watch() -> Vec<String> {
+    let mut warnings = Vec::new();
     INIT.call_once(|| {
-        let path = crate::config::features_config_path();
+        let (path, declined) = crate::config::features_config_path_with_diagnostics();
         let resolved = crate::config::resolve_features(crate::config::load_features_file(
             &path,
             Features::default(),
@@ -170,13 +193,24 @@ pub fn init_and_watch() -> Option<String> {
             if resolved.experimental { "ON" } else { "OFF" },
             path.display()
         );
+        warnings.extend(declined);
         if let Some(message) = missing_config_warning(&path) {
             tracing::warn!("{message}");
-            warning = Some(message);
+            warnings.push(message);
+        }
+        if !warnings.is_empty() {
+            let coda = format!(
+                "this resolution is frozen for the rest of this run at {} \
+                 (fork issue #309 F4) — a config created or moved after \
+                 startup has no effect until the deck is restarted",
+                crate::terminal_sanitize::sanitize_path_for_terminal_display(&path)
+            );
+            tracing::warn!("{coda}");
+            warnings.push(coda);
         }
         spawn_watcher(path);
     });
-    warning
+    warnings
 }
 
 /// Periodic re-read watcher (OQ1). The deck has no existing config-reload

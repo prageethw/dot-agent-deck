@@ -1252,49 +1252,102 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
 
 /// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
 /// flag. Walks up from the process cwd to the nearest ancestor directory
-/// containing `crate::project_config::CONFIG_FILE_NAME`, so a deck launched
+/// containing a *regular file* named `crate::project_config::CONFIG_FILE_NAME`
+/// (`candidate.is_file()`, not merely present — a directory or other
+/// non-regular target of that name does not count), so a deck launched
 /// from a subdirectory of the project still finds the project's own config
-/// (fork issue #303) rather than the process's own cwd. When no ancestor
-/// contains the file, falls back to the cwd-joined path — `load_features_file`
-/// treats a missing file as `Features::default()` (OFF).
-/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override, checked first,
-/// so tests never touch the real cwd.
+/// (fork issue #303) rather than the process's own cwd. When no such
+/// ancestor exists, falls back to the nearest *safe* ancestor's joined path
+/// (see below) — `load_features_file` treats a missing file as
+/// `Features::default()` (OFF). `DOT_AGENT_DECK_FEATURES_CONFIG` is an
+/// explicit override, checked first, so tests never touch the real cwd.
+/// Thin wrapper over [`features_config_path_with_diagnostics`] for callers
+/// that don't need the skipped-ancestor diagnostics.
 ///
-/// An ancestor directory that is world-writable is skipped rather than
+/// An ancestor directory that is world-writable is declined rather than
 /// trusted (fork issue #309): the walk is otherwise unbounded, so a deck
 /// launched anywhere under a shared directory like `/tmp` would adopt a
 /// config another user planted there. The search continues to the next
-/// ancestor up rather than aborting, with a warning naming the skipped path
-/// — a silent skip here is exactly what made the original defect invisible.
+/// ancestor up rather than aborting, with a warning naming the declined
+/// path.
 pub fn features_config_path() -> PathBuf {
+    features_config_path_with_diagnostics().0
+}
+
+/// [`features_config_path`], additionally returning one diagnostic message
+/// per declined world-writable ancestor whose candidate file actually
+/// existed there — nothing is emitted for an ancestor that was merely
+/// world-writable but held no config (reviewer minor 1: warning on every
+/// `/tmp`-launched deck when nothing was ever declined is noise, not
+/// diagnostics). Each message is also `tracing::warn!`-logged as it is
+/// found, so `DOT_AGENT_DECK_LOG` still captures it even if the caller
+/// discards the returned `Vec`.
+///
+/// The walk tracks the nearest ancestor it has confirmed safe (not
+/// world-writable) as it goes, and falls back to *that* directory's joined
+/// path when no ancestor holds a config — never unconditionally to `cwd`
+/// (fork issue #309 auditor finding M-1). Before this guard, a `cd /tmp &&
+/// deck` launched directly inside a world-writable directory declined that
+/// directory's own attacker-planted config, logged the decline, and then
+/// handed the identical attacker path back anyway via the old unconditional
+/// `cwd.join(...)` fallback — #309's own headline scenario, still reachable
+/// despite the warning claiming otherwise. In the degenerate case where
+/// every ancestor up to the root is world-writable, the walk still has to
+/// resolve to *something*; falling back to the cwd-joined path there is the
+/// deliberate last resort, not the default.
+pub fn features_config_path_with_diagnostics() -> (PathBuf, Vec<String>) {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
-        return PathBuf::from(p);
+        return (PathBuf::from(p), Vec::new());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut safe_fallback: Option<&std::path::Path> = None;
+    let mut declined = Vec::new();
     for ancestor in cwd.ancestors() {
-        if is_world_writable_dir(ancestor) {
-            tracing::warn!(
-                "skipping {} in features-config search: world-writable \
-                 directory, refusing to trust a config planted there (fork \
-                 issue #309); continuing search upward",
-                ancestor.display()
-            );
-            continue;
-        }
+        let safe = !is_world_writable_dir(ancestor);
         let candidate = ancestor.join(crate::project_config::CONFIG_FILE_NAME);
         if candidate.is_file() {
-            return candidate;
+            if safe {
+                return (candidate, declined);
+            }
+            let message = format!(
+                "declining {} in features-config search: its directory is \
+                 world-writable, so the file may have been planted by \
+                 another user (fork issue #309); continuing search upward",
+                crate::terminal_sanitize::sanitize_path_for_terminal_display(&candidate)
+            );
+            tracing::warn!("{message}");
+            declined.push(message);
+            continue;
+        }
+        if safe {
+            safe_fallback.get_or_insert(ancestor);
         }
     }
-    cwd.join(crate::project_config::CONFIG_FILE_NAME)
+    let fallback_dir = safe_fallback.unwrap_or(&cwd);
+    (
+        fallback_dir.join(crate::project_config::CONFIG_FILE_NAME),
+        declined,
+    )
 }
 
 /// Whether `dir` is writable by any user (Unix "other" write bit). Used to
 /// bound the ancestor walk in [`features_config_path`] at a trust boundary
-/// (fork issue #309). On non-Unix targets there is no equivalent POSIX mode
-/// bit to check — Windows ACLs don't map onto it cheaply — so this always
-/// returns `false` there and the walk behaves as it did before, same as
-/// `platform::paths::is_executable_file`'s split for the same reason.
+/// (fork issue #309). Deliberately narrower than #309's own suggested
+/// predicate — group-writable and attacker-*owned* ancestors are not
+/// covered (tracked separately as fork issue #384; not folded in here). On
+/// non-Unix targets there is no equivalent POSIX mode bit to check —
+/// Windows ACLs don't map onto it cheaply — so this always returns `false`
+/// there and the walk behaves as it did before, same as
+/// `platform::paths::is_executable_file`'s split for the same reason
+/// (Windows follow-up tracked as fork issue #383).
+///
+/// Fails **open** (`false`, i.e. "trust it") when `dir` cannot be stat'd.
+/// This is sound here even though a security predicate answering "safe" on
+/// an indeterminate result is usually the wrong default: if `stat` fails on
+/// the directory itself, `candidate.is_file()` on a file inside it fails
+/// the same way for the same reason, so the walk finds nothing there either
+/// way — there is no path through which failing open on the *directory*
+/// stat lets an unvetted *file* through.
 #[cfg(unix)]
 fn is_world_writable_dir(dir: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1315,25 +1368,53 @@ fn is_world_writable_dir(_dir: &std::path::Path) -> bool {
 /// from exhausting memory on the detached ~2s watcher thread (audit LOW-1).
 const MAX_FEATURES_CONFIG_BYTES: u64 = 64 * 1024;
 
-/// Open `path` for the features-config loaders. On Unix this sets
-/// `O_NONBLOCK` so that if the target has been swapped for a FIFO between
-/// resolution and this call, `open` returns immediately instead of blocking
-/// until a writer appears (fork issue #310) — a `is_file()` check on the
-/// resulting handle then rejects it below. `O_NONBLOCK` does not affect
-/// reads from a regular file, only special files like FIFOs and sockets, so
-/// it is safe to leave set for the read that follows. Windows has no
-/// equivalent non-blocking open and no FIFO-swap hazard to guard against, so
-/// it opens normally there.
+/// Open `path` for the features-config loaders, opening before checking so
+/// there is no window between "confirm what this is" and "use it" (see
+/// [`load_features_file`]'s doc comment for the full TOCTOU rationale). On
+/// Unix this sets `O_NONBLOCK` so that if the target has been swapped for a
+/// FIFO between resolution and this call, `open` returns immediately instead
+/// of blocking until a writer appears (fork issue #310) — a `is_file()`
+/// check on the resulting handle then rejects it below. `O_NONBLOCK` does
+/// not affect reads from a regular file, only special files like FIFOs and
+/// sockets, so it is safe to leave set for the read that follows. Also sets
+/// `O_NOCTTY` (auditor m-1): without it, a symlinked TTY device at the
+/// resolved path would be acquired as the controlling terminal of the
+/// `setsid`-detached daemon, which otherwise has none — a real open-time
+/// side effect `O_NONBLOCK` alone does not touch. Every other open-time
+/// device side effect (e.g. `/dev/watchdog` arming on open) has no portable
+/// guard and is accepted as a residual: reaching it requires an ancestor the
+/// walk already trusts, i.e. an attacker who can already plant a config
+/// there.
 #[cfg(unix)]
 fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
 }
 
-#[cfg(not(unix))]
+/// Windows has no FIFO-swap hazard to guard against (no equivalent
+/// non-blocking open exists), but a plain `File::open` cannot obtain a
+/// handle to a *directory* at all without `FILE_FLAG_BACKUP_SEMANTICS` — so
+/// without it, a directory target fails at `open` with an opaque error and
+/// collapses into [`FeaturesFileOutcome::Unreadable`] downstream instead of
+/// [`FeaturesFileOutcome::NotRegular`], regressing the label the pre-#310
+/// stat-first order produced (the pre-existing
+/// `describe_features_file_reports_not_regular_for_a_directory` test pins
+/// this). Requesting the flag lets a directory handle open successfully
+/// here too, so the same downstream `is_file()` check on the handle rejects
+/// it exactly as it does on Unix.
+#[cfg(windows)]
+fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
@@ -1350,7 +1431,12 @@ fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs:
 /// be replaced, and if the replacement is a FIFO, opening it blocks
 /// indefinitely on the startup path. Checking and using the same handle
 /// closes that window; `is_file()` on the handle still rejects a FIFO (or a
-/// symlink resolved to one) exactly as the old path-based check did.
+/// symlink resolved to one) exactly as the old path-based check did. One
+/// consequence of the reorder: every target, including a non-regular one
+/// that the old stat-first order would have rejected before ever touching
+/// it, is now genuinely opened before it is rejected — see
+/// [`open_features_config_file`]'s doc comment for what that costs and why
+/// `O_NOCTTY` is there.
 pub fn load_features_file(
     path: &std::path::Path,
     previous: crate::features::Features,
@@ -1444,13 +1530,19 @@ pub fn load_features_file(
 pub enum FeaturesFileOutcome {
     /// No file at the resolved path; the default applies.
     NotFound,
-    /// The target exists but is not a regular file (FIFO, device, directory,
-    /// symlink to one of those, …).
+    /// The target exists, opened successfully, but is not a regular file
+    /// (FIFO, device, directory, symlink to one of those, …) once fstat'd
+    /// on the open handle. A target of the same shape that *fails to open*
+    /// (a Unix-domain socket returns `ENXIO`; an unreadable directory on
+    /// some platforms) is [`Unreadable`](Self::Unreadable) instead, since
+    /// this variant can only be produced by successfully opening first
+    /// (fork issue #310's open-then-fstat order).
     NotRegular,
     /// The target exists but exceeds `MAX_FEATURES_CONFIG_BYTES`.
     Oversized,
-    /// The target exists but could not be stat'd or opened/read (e.g.
-    /// permissions).
+    /// The target exists but could not be opened, or could not be stat'd or
+    /// read once opened (permissions, a Unix-domain socket, or any other
+    /// `open`-time failure that isn't `NotFound`).
     Unreadable,
     /// The target was read but its TOML is malformed.
     Malformed,
@@ -1463,10 +1555,8 @@ pub enum FeaturesFileOutcome {
 /// Diagnostic-only mirror of [`load_features_file`]'s branching over `path`,
 /// reporting which branch was taken instead of the resulting `Features`. See
 /// [`FeaturesFileOutcome`]. Uses the same open-first-then-fstat-the-handle
-/// sequence as `load_features_file` (fork issue #310) — this function has
-/// the identical stat-then-open TOCTOU shape, and its own doc contract is
-/// that it never disagrees with `load_features_file` about the outcome, so
-/// it needs the same fix, not just a mention of one.
+/// sequence as `load_features_file` (fork issue #310), so the two functions
+/// cannot drift on which targets they open or reject.
 pub fn describe_features_file(path: &std::path::Path) -> FeaturesFileOutcome {
     use std::io::Read;
 
@@ -2852,11 +2942,14 @@ label = "-rf"
     }
 
     // Fork issue #309: an ancestor directory that is world-writable must be
-    // skipped rather than trusted — a config planted there by another user
+    // declined rather than trusted — a config planted there by another user
     // must not be adopted — while the walk must keep going up and still find
     // a legitimate config in a normal ancestor further above it. This pins
     // both halves of the required behavior in one fixture, since the second
-    // half only means something in the presence of the first.
+    // half only means something in the presence of the first. It also pins
+    // auditor finding M-1: when cwd itself is the unsafe directory and no
+    // ancestor above it holds a config, the fallback must land on the
+    // nearest SAFE ancestor, never back on cwd's own declined config.
     #[test]
     #[cfg(unix)]
     fn features_config_path_skips_world_writable_ancestor_but_finds_a_normal_one_above_it() {
@@ -2882,12 +2975,14 @@ label = "-rf"
         let attacker_config = world_writable.join(crate::project_config::CONFIG_FILE_NAME);
         std::fs::write(&attacker_config, "[features]\nexperimental = false\n").unwrap();
 
-        // The process cwd, nested below the world-writable directory.
+        // The process cwd, nested below the world-writable directory — the
+        // fallback-lands-under-a-safe-directory case, which already worked
+        // before the M-1 fix below.
         let cwd = world_writable.join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
         std::env::set_current_dir(&cwd).expect("chdir into fixture dir");
-        let resolved = features_config_path();
+        let (resolved, declined) = features_config_path_with_diagnostics();
 
         assert_eq!(
             resolved,
@@ -2899,14 +2994,68 @@ label = "-rf"
             legit_config.display(),
             resolved.display()
         );
+        assert_eq!(
+            declined.len(),
+            1,
+            "expected exactly one declined-ancestor diagnostic for the \
+             world-writable directory; got {declined:?}"
+        );
+
+        // Auditor finding M-1: cwd IS the world-writable, attacker-plantable
+        // directory this time (`cd /tmp && deck`, #309's own headline
+        // scenario), with no legitimate config in any ancestor above it — so
+        // the unguarded fallback the fix originally shipped with would
+        // return straight back into the attacker's own directory, undoing
+        // the decline above.
+        let bare_root = tempfile::tempdir().unwrap();
+        let safe_parent = bare_root.path().canonicalize().unwrap();
+        let unsafe_cwd = safe_parent.join("world-writable-cwd");
+        std::fs::create_dir_all(&unsafe_cwd).unwrap();
+        std::fs::set_permissions(&unsafe_cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let unsafe_cwd_config = unsafe_cwd.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&unsafe_cwd_config, "[features]\nexperimental = true\n").unwrap();
+
+        std::env::set_current_dir(&unsafe_cwd).expect("chdir into unsafe-cwd fixture dir");
+        let (resolved2, declined2) = features_config_path_with_diagnostics();
+
+        assert_ne!(
+            resolved2,
+            unsafe_cwd_config,
+            "features_config_path() must not fall back into the \
+             world-writable cwd's own attacker-plantable config after \
+             declining it; got {}",
+            resolved2.display()
+        );
+        assert_eq!(
+            resolved2,
+            safe_parent.join(crate::project_config::CONFIG_FILE_NAME),
+            "the guarded fallback must land on the nearest SAFE ancestor \
+             ({}), not cwd itself; got {}",
+            safe_parent.display(),
+            resolved2.display()
+        );
+        assert_eq!(
+            declined2.len(),
+            1,
+            "expected exactly one declined-ancestor diagnostic for the \
+             world-writable cwd; got {declined2:?}"
+        );
     }
 
-    // Fork issue #310: swapping the target for a FIFO must not hang
-    // `load_features_file` at `open` — it must return promptly, rejecting
-    // the FIFO as non-regular and keeping `previous`. Driven off a spawned
-    // thread with a bounded `recv_timeout` on the test thread, so a
-    // regression fails loudly with a clear panic message instead of hanging
-    // the whole suite waiting on a blocked `open` that never returns.
+    // This does NOT reproduce fork issue #310's race (reviewer M1): the
+    // pre-#310 code stats first and returns at `is_file()`, so `open` is
+    // never reached for a FIFO that already exists when the function is
+    // called — that pre-fix code passes this exact test too. #310's real
+    // race needs the target to be a regular file at `metadata()` time and a
+    // FIFO at `open()` time, a window that isn't deterministically
+    // reproducible from a unit test. What this DOES pin, and pins for real,
+    // is the post-fix shape's load-bearing half: `open_features_config_file`
+    // must keep `O_NONBLOCK` set, or a pre-existing FIFO target hangs
+    // `load_features_file` at `open` instead of returning promptly and
+    // rejecting it as non-regular. Driven off a spawned thread with a
+    // bounded `recv_timeout` on the test thread, so a regression fails
+    // loudly with a clear panic message instead of hanging the whole suite
+    // waiting on a blocked `open` that never returns.
     #[test]
     #[cfg(unix)]
     fn load_features_file_does_not_hang_on_a_fifo_and_keeps_previous() {
@@ -2932,7 +3081,8 @@ label = "-rf"
 
         let result = rx.recv_timeout(Duration::from_secs(5)).expect(
             "load_features_file blocked on a FIFO target instead of \
-             returning promptly (fork issue #310 regression)",
+             returning promptly — O_NONBLOCK was removed from \
+             open_features_config_file",
         );
         assert_eq!(
             result, previous,
