@@ -1759,8 +1759,8 @@ fn drain_pre_write_events(
                     return Some(reason);
                 }
             }
-            // Issue #717: neither variant is evidence about this pane.
-            // Grouped rather than wildcarded so a future variant still
+            // Issue #717 / PRD 236: neither variant is evidence about this
+            // pane. Grouped rather than wildcarded so a future variant still
             // fails this match and gets considered on its merits — and
             // `Unknown` (PRD #741 M8) is listed for the same reason rather
             // than standing in for one. It is the tag a future daemon sends
