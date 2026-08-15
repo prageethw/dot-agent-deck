@@ -118,8 +118,8 @@ fn dashboard_only_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// (maintainer decision 2026-08-15: colour is a total function of status,
 /// including Idle, reversing PRD #333 defect B); (d) `Thinking` + `Working`
 /// (no higher-priority state) -> Green, since Working outranks Thinking.
-/// Also asserts a non-orchestration tab (`None`) never gets colorized by
-/// this feature.
+/// Also asserts a tab with no status data (`None` — the Dashboard case)
+/// never gets colorized by this feature.
 #[spec("tabs/orchestration/009")]
 #[test]
 fn orchestration_009_tab_label_colored_by_highest_priority_status() {
