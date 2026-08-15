@@ -769,21 +769,20 @@ mod tests {
         ));
     }
 
-    /// D5: the retry schedule writes the payload twice and probes thereafter.
+    /// Fork #194: a retry targets a write whose bytes already reached the PTY,
+    /// so retyping the whole payload duplicates a prompt the composer already
+    /// holds. Only the very first attempt may write the payload — every attempt
+    /// after it must only probe submission.
     #[test]
-    fn only_the_first_two_attempts_write_the_payload() {
+    fn only_the_first_attempt_writes_the_payload() {
         assert!(
             attempt_writes_payload(1),
             "attempt 1 IS the delivery's payload"
         );
-        assert!(
-            attempt_writes_payload(2),
-            "one bounded replacement payload, because /015's launcher consumes the first"
-        );
-        for attempt in 3..=12 {
+        for attempt in 2..=12 {
             assert!(
                 !attempt_writes_payload(attempt),
-                "attempt {attempt} must probe submit rather than append another copy"
+                "attempt {attempt} must probe submit rather than (re)write the payload"
             );
         }
     }

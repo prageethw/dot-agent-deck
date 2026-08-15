@@ -1484,6 +1484,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the fix's internal clock-comparison location or the detached spawn watcher (covered by `scheduler/dispatch/018`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/033 — A confirmation retry writes the orchestrator prompt payload exactly once; every later attempt probes submission only.
+- **Layer:** L1 (in-process orchestrator consumer with a payload-recording `PaneController` and a controlled clock).
+- **Agent:** none.
+- **Asserts:** across five delivery attempts on a pane that never reports the prompt submitted, only the first recorded write carries the prompt text; every attempt after it carries an empty payload, proving the retry probes submission rather than retyping the prompt (fork #194).
+- **Does not assert:** the TUI-owned seed delivery path (covered by `prompt/pane-input/030`/`032`) or the daemon-owned spawn delivery in `src/spawn.rs` (out of this layer's reach).
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

@@ -34494,6 +34494,82 @@ mod tests {
         );
     }
 
+    /// Scenario: drive `deliver_orchestrator_prompt` through five delivery
+    /// attempts on a pane whose agent never reports the prompt submitted, using
+    /// a controlled clock so every attempt clears backoff and readiness. Assert
+    /// that only the very first recorded write carries the prompt text — every
+    /// later attempt must write an empty payload, probing submission rather
+    /// than retyping the prompt into a composer that already holds it.
+    #[spec("prompt/pane-input/033")]
+    #[test]
+    fn pane_input_033_confirmation_retry_writes_payload_exactly_once() {
+        const PANE_ID: &str = "never-confirmed-orchestrator-pane";
+        const AGENT_ID: &str = "never-confirmed-orchestrator-agent";
+        const PROMPT: &str = "Read the role prompt and begin";
+        const DELIVERY_ATTEMPTS: usize = 5;
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+
+        let mut ui = default_ui();
+        let tab_id: TabId = 30040;
+        let mut now = std::time::Instant::now();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        // Readiness already satisfied before the first call, so every
+        // attempt below is gated only by backoff, never by the spawn-time
+        // buffer.
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let role_panes = [PANE_ID.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(PROMPT.to_string());
+
+        for _ in 0..DELIVERY_ATTEMPTS {
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                now,
+                tab_id,
+                &role_panes,
+                0,
+                &mut role_statuses,
+                &mut role_prompt,
+            );
+            // Never confirmed, so the delivery stays armed. Clear backoff
+            // explicitly rather than waiting real wall-clock time for it —
+            // this is the same technique the surrounding retry tests use.
+            if let Some(state) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                state.next_attempt_at = now;
+            }
+            now += std::time::Duration::from_millis(1);
+        }
+
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            DELIVERY_ATTEMPTS,
+            "precondition: every iteration must clear backoff/readiness and reach a write; recorded={recorded:?}"
+        );
+        assert_eq!(
+            recorded[0].0, PROMPT,
+            "attempt 1 is the delivery and must carry the prompt payload"
+        );
+        for (index, (text, _, _)) in recorded.iter().enumerate().skip(1) {
+            assert_eq!(
+                text,
+                "",
+                "attempt {} must probe submission with an empty payload, not retype the prompt; recorded={recorded:?}",
+                index + 1
+            );
+        }
+    }
+
     /// Scenario: Write seed and orchestrator prompts into launcher panes with no hook generation, including writes whose successful daemon response is lost, then let generations arrive or roll over during backoff. A live generation may be bound before retry, but neither an observed end nor a whole start/end/successor burst may let either TUI path write into a successor; a later safe attempt probes submission rather than retyping.
     #[spec("prompt/pane-input/030")]
     #[test]
