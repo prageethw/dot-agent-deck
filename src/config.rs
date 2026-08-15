@@ -1368,6 +1368,72 @@ pub fn load_features_file(
     }
 }
 
+/// Diagnostic-only outcome of reading `path`, distinguishing "the file
+/// genuinely supplied the resolved value" from every reason
+/// [`load_features_file`] falls back instead — used only by
+/// `dot-agent-deck features status` (fork issue #303 Phase 2 review), which
+/// needs to *explain* a load failure that `load_features_file` itself only
+/// needs to survive. The applied `Features` value is still produced by
+/// [`load_features_file`] alone; this mirrors its branching to label the
+/// outcome, never to recompute the value, so the two can disagree about the
+/// wording but never about the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeaturesFileOutcome {
+    /// No file at the resolved path; the default applies.
+    NotFound,
+    /// The target exists but is not a regular file (FIFO, device, directory,
+    /// symlink to one of those, …).
+    NotRegular,
+    /// The target exists but exceeds `MAX_FEATURES_CONFIG_BYTES`.
+    Oversized,
+    /// The target exists but could not be stat'd or opened/read (e.g.
+    /// permissions).
+    Unreadable,
+    /// The target was read but its TOML is malformed.
+    Malformed,
+    /// The target was read and parsed successfully (an absent `[features]`
+    /// table still counts as parsed — `#[serde(default)]` makes that a valid,
+    /// genuinely-read outcome rather than a fallback).
+    Parsed,
+}
+
+/// Diagnostic-only mirror of [`load_features_file`]'s branching over `path`,
+/// reporting which branch was taken instead of the resulting `Features`. See
+/// [`FeaturesFileOutcome`].
+pub fn describe_features_file(path: &std::path::Path) -> FeaturesFileOutcome {
+    use std::io::Read;
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return FeaturesFileOutcome::NotFound;
+        }
+        Err(_) => return FeaturesFileOutcome::Unreadable,
+    };
+    if !metadata.is_file() {
+        return FeaturesFileOutcome::NotRegular;
+    }
+    if metadata.len() > MAX_FEATURES_CONFIG_BYTES {
+        return FeaturesFileOutcome::Oversized;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return FeaturesFileOutcome::Unreadable,
+    };
+    let mut contents = String::new();
+    if file
+        .take(MAX_FEATURES_CONFIG_BYTES)
+        .read_to_string(&mut contents)
+        .is_err()
+    {
+        return FeaturesFileOutcome::Unreadable;
+    }
+    match parse_features(&contents) {
+        Ok(_) => FeaturesFileOutcome::Parsed,
+        Err(_) => FeaturesFileOutcome::Malformed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2626,10 +2692,10 @@ label = "-rf"
         );
 
         // The resolved value for a project whose config carries
-        // `experimental = true` must be `true` from the nested cwd too —
-        // the assertion that fails today, since today's resolver returns
-        // <nested_cwd>/.dot-agent-deck.toml, which does not exist, and a
-        // missing file resolves to the default (OFF).
+        // `experimental = true` must be `true` from the nested cwd too. This
+        // now passes: the ancestor walk above already resolved `resolved` to
+        // the PROJECT's config, not `<nested_cwd>/.dot-agent-deck.toml` (which
+        // does not exist), so loading it and resolving the flag yields `true`.
         let loaded = load_features_file(&resolved, crate::features::Features::default());
         let resolved_flag = resolve_features(loaded);
         assert!(
@@ -2658,6 +2724,63 @@ label = "-rf"
             resolved_with_override, override_target,
             "DOT_AGENT_DECK_FEATURES_CONFIG must still win over the \
              project-directory resolution"
+        );
+    }
+
+    // fork #303/#349 review (auditor M2 / reviewer F3): `describe_features_file`
+    // backs `dot-agent-deck features status`'s ability to distinguish "the
+    // file genuinely supplied the value" from "the file exists but the value
+    // fell back to a default", so its branches get direct unit coverage
+    // rather than resting solely on the e2e `features/status/00N` tests,
+    // which only exercise the NotFound and Parsed outcomes end to end.
+
+    #[test]
+    fn describe_features_file_reports_not_found_for_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.toml");
+        assert_eq!(
+            describe_features_file(&missing),
+            FeaturesFileOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn describe_features_file_reports_parsed_for_valid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".dot-agent-deck.toml");
+        std::fs::write(&path, "[features]\nexperimental = true\n").unwrap();
+        assert_eq!(describe_features_file(&path), FeaturesFileOutcome::Parsed);
+    }
+
+    #[test]
+    fn describe_features_file_reports_parsed_when_features_table_absent() {
+        // An absent `[features]` table is still a successful parse
+        // (`#[serde(default)]`) — a genuinely-read outcome, not a fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".dot-agent-deck.toml");
+        std::fs::write(&path, "[[modes]]\nname = \"x\"\ncommand = \"echo\"\n").unwrap();
+        assert_eq!(describe_features_file(&path), FeaturesFileOutcome::Parsed);
+    }
+
+    #[test]
+    fn describe_features_file_reports_malformed_for_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".dot-agent-deck.toml");
+        std::fs::write(&path, "[features\nexperimental = true\n").unwrap();
+        assert_eq!(
+            describe_features_file(&path),
+            FeaturesFileOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn describe_features_file_reports_not_regular_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("a-directory.toml");
+        std::fs::create_dir(&subdir).unwrap();
+        assert_eq!(
+            describe_features_file(&subdir),
+            FeaturesFileOutcome::NotRegular
         );
     }
 }
