@@ -3201,6 +3201,20 @@ without depending on the config struct API.
 - **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
 - **Platform coverage:** mac+linux.
 
+##### orchestration/lock/015 — With NO project config discoverable anywhere (fork #346), the command-entry lock still holds — the mirror of `orchestration/lock/014`'s flag-off scenario, asserting the OPPOSITE outcome.
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Launched with `DOT_AGENT_DECK_FEATURES_CONFIG` pointed at a path that provably does not exist (a `project` subdirectory never created under a real tempdir), forcing `features_config_path()`'s override branch to resolve to a missing file — the same `load_features_file` "not found" branch a real ancestor walk hits when no `.dot-agent-deck.toml` exists anywhere above the process cwd, which is fork #346's reported scenario (a deck launched from the maintainer's home directory).
+- **Asserts:** on a real orchestration tab, a keystroke typed at the focused non-orchestrator worker pane does NOT reach its PTY and the `Pane locked` status message appears; the orchestrator pane's own input still reaches its PTY untouched. Currently FAILS — the lock is gated behind `features::show_command_entry_lock()`, which reads OFF here exactly as it does on a real config-less deck, so today the worker keystroke reaches its PTY and no lock message appears. Fork #346's fix (removing the gate) makes this pass unconditionally, matching `orchestration/lock/008`'s flag-on behaviour with no flag involved at all.
+- **Does not assert:** the `Ctrl+e` binding resolution in this same no-config scenario (`orchestration/lock/016`); the `WaitingForInput` carve-out (`orchestration/lock/006`/`011`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/016 — With NO project config discoverable anywhere (fork #346), `Ctrl+e` from command mode on a real Orchestration tab is still claimed as `Action::ToggleOrchestrationLock` — the mirror of `orchestration/lock/009`'s command-mode proof, with no flag involved at all.
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Same `DOT_AGENT_DECK_FEATURES_CONFIG`-pointed-at-a-missing-path mechanism as `orchestration/lock/015`.
+- **Asserts:** `Ctrl+d` into command mode then `Ctrl+e` produces the deck's `Pane entry: unlocked` report. Currently FAILS — `Ctrl+e`'s binding resolution is scoped by `is_orchestration_tab && features::show_command_entry_lock()`, which is FALSE with no config present, so today the chord resolves to nothing and no `Pane entry:` report ever appears. Fork #346's fix makes this pass unconditionally.
+- **Does not assert:** the forwarding gate itself (`orchestration/lock/015`); the caret-echo proof that `0x05` reaches a focused pane's PTY in `PaneInput` mode (`orchestration/lock/009`, unaffected by this flag either way since the orchestrator pane is never gated).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.
