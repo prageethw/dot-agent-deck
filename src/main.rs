@@ -2105,7 +2105,7 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     use dot_agent_deck::worktree_reclaim::{
         WorktreeListDocument, examine_worktrees, format_disagreement_warning,
         format_excluded_unknown_owner_warning, format_list_error_for_cli, format_list_human,
-        is_mine, owner_disagreements, sanitize_marker_creator,
+        is_mine, owner_disagreements, sanitize_marker_creator, shallow_repo_warning,
     };
 
     let owner_filter = if mine {
@@ -2187,6 +2187,14 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
     // below via `with_warnings`, reporting-only, never changing which rows
     // `is_mine` retains.
     let mut json_warnings: Vec<String> = Vec::new();
+    // Fork issue #325 M2: name a shallow enumerating repo and its repair
+    // BEFORE the `--mine` filtering below, so the warning fires regardless
+    // of whether this run is filtered -- unconditional, unlike the
+    // `--mine`-only warnings that follow.
+    if let Some(warning) = shallow_repo_warning(&cwd) {
+        eprintln!("{warning}");
+        json_warnings.push(warning);
+    }
     if let Some(owner) = &owner_filter {
         // Issue #221 / #230: before filtering, name any row where the marker
         // names this owner but the independent `owned` resolution disagrees

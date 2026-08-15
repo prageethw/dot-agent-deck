@@ -2384,3 +2384,149 @@ fn worktree_reclaim_046_kept_120_tree_stays_claimed_but_is_reclaimable() {
         combined(&reclaimed)
     );
 }
+
+// --- fork issue #325 M2: the shallow shared repository ---
+
+/// Scenario: fork issue #325 M2. `.git/shallow` lives in the common dir, so
+/// one shallow fetch truncates history for every linked worktree at once —
+/// nothing errors on its own (`git log`/`git status`/ref resolution all stay
+/// fine), only a later merge fails with "refusing to merge unrelated
+/// histories". `dot-agent-deck worktree list` (the existing subcommand — a
+/// dedicated detector does not exist yet) must name this condition when the
+/// enumerating repo is shallow, and must stay silent about it for a normal,
+/// full-history repo. Driven through the real binary against the existing
+/// `list` subcommand rather than a not-yet-existing Rust symbol, so this
+/// stays a compile-clean RED: today `worktree list` runs and succeeds
+/// either way, and never mentions shallowness at all. Both linked worktrees
+/// are named `wt-a`/`wt-b` (neither substring the assertion looks for), and
+/// the shallow scenario's assertion looks for the repair command (`fetch
+/// --unshallow`) a real detector must name — not a bare `"shallow"` word —
+/// so nothing in a fixture path, branch, or directory name can satisfy it by
+/// accident; only a genuine detector can.
+#[spec("worktree/guard/001")]
+#[test]
+#[cfg(unix)]
+fn guard_001_shallow_repo_is_detected_and_reported() {
+    let scratch = test_temp::tempdir().expect("scratch tempdir");
+
+    // A real, multi-commit seed repo -- the source both scenarios below
+    // clone/branch from.
+    let seed = scratch.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "--initial-branch=main", "--quiet"]);
+    git(&seed, &["config", "user.email", "test@example.com"]);
+    git(&seed, &["config", "user.name", "Test"]);
+    for i in 0..3 {
+        std::fs::write(seed.join("f.txt"), format!("v{i}\n")).unwrap();
+        git(&seed, &["add", "f.txt"]);
+        git(&seed, &["commit", "--quiet", "-m", &format!("commit {i}")]);
+    }
+
+    // A stub `gh` on PATH so `worktree list`'s PR-state resolution for the
+    // one linked worktree each scenario adds never touches a real `gh`
+    // session -- an empty `GHSTUB_DIR` makes it answer `[]` (no PR) for
+    // anything asked, exactly like `Fixture`'s own stub with no canned
+    // fixture file.
+    let bindir = scratch.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let gh = bindir.join("gh");
+    std::fs::write(&gh, GH_STUB_SCRIPT).expect("write gh stub");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod gh");
+    }
+    let ghstub = scratch.path().join("ghstub");
+    std::fs::create_dir_all(&ghstub).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run_list = |repo_dir: &Path| -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .current_dir(repo_dir)
+            .args(["worktree", "list"])
+            .env("PATH", &path_env)
+            .env("GHSTUB_DIR", &ghstub)
+            .output()
+            .expect("run dot-agent-deck worktree list")
+    };
+
+    // Shallow scenario: `git clone --depth 1` from the seed repo. `--no-local`
+    // is required here -- measured directly in CI: git silently IGNORES
+    // `--depth` for a same-filesystem local-path clone unless the local
+    // optimization is disabled, so without it the clone comes back with full
+    // history and this fixture's own precondition assertion below fails.
+    let shallow_repo = scratch.path().join("shallow");
+    git(
+        scratch.path(),
+        &[
+            "clone",
+            "--no-local",
+            "--depth",
+            "1",
+            &seed.to_string_lossy(),
+            &shallow_repo.to_string_lossy(),
+        ],
+    );
+    git(&shallow_repo, &["config", "user.email", "test@example.com"]);
+    git(&shallow_repo, &["config", "user.name", "Test"]);
+    assert!(
+        shallow_repo.join(".git").join("shallow").exists(),
+        "fixture precondition: the clone must actually be shallow"
+    );
+    // Named `wt-a` -- deliberately carrying no substring the assertion below
+    // could satisfy by accident (neither `shallow` nor `fetch --unshallow`).
+    let wt_a = scratch.path().join("wt-a");
+    git(
+        &shallow_repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/wt-a",
+            &wt_a.to_string_lossy(),
+        ],
+    );
+
+    let out = run_list(&shallow_repo);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        combined.contains("fetch --unshallow"),
+        "a shallow enumerating repo must be named as such and name its repair (`git fetch \
+         --unshallow`) -- no fixture path, branch, or directory name here can satisfy this \
+         needle by accident, so only a real detector can; got: {combined:?}"
+    );
+
+    // Normal scenario: the full-history seed repo itself, same shape (one
+    // linked worktree, named `wt-b` for the same reason as `wt-a` above),
+    // must stay silent about shallowness.
+    let wt_b = scratch.path().join("wt-b");
+    git(
+        &seed,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/wt-b",
+            &wt_b.to_string_lossy(),
+        ],
+    );
+    let out = run_list(&seed);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        !combined.contains("shallow"),
+        "a normal, full-history repo must pass silently, got: {combined:?}"
+    );
+}
