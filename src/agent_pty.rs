@@ -12210,7 +12210,6 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
     }
 
-
     // ---------------------------------------------------------------------
     // Issue #581 — one wedged agent's reap must not starve its siblings of
     // their phase-3 SIGKILL.
@@ -12593,7 +12592,6 @@ mod spawn_tests {
             "every agent must still be reaped, not merely signalled"
         );
     }
-
 
     /// Fork issue #163, reworked contract (PR #207 review + audit both
     /// converged: the shipped fix — tracking which agents phase 2 reaped
