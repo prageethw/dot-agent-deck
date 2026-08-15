@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.38.1] - 2026-08-15
+
+### Fixed
+
+  - **Orchestrator remit re-assertion after compaction works again**
+    The v0.38.0 upstream sync silently broke the mechanism that re-delivers an orchestrator's remit pointer when its pane compacts (issue 423). A hand-resolved rebase conflict replaced the re-arm eligibility check with a bare `orchestrator_prompt.is_none()`, which reads as "no delivery in flight" under the fork's old model but not under the confirmation model the same sync introduced: there, `orchestrator_prompt` stays set until the agent independently reports having submitted the text, so for any producer that does not report back, the re-arm block was permanently unreachable. The check now expresses the original intent against the new model's own `PromptDelivery::attempts` witness, and the per-cycle delivery state (`prompt_delivery`, `send_retry_backoff`, `orchestration_ready_since`) is cleared on re-arm again, so a re-armed cycle retypes the pointer instead of inheriting a stale attempt count and falling back to a submit-only probe. Upstream's confirmation model is untouched.
+    This was caught by the fork's own `e2e_orchestration_remit` tests, which is what they exist for — the tier reported it while the release went out anyway, because the e2e job runs with `continue-on-error: true` and its workflow-level conclusion cannot express failure. CLAUDE.md rule 8 now records that trap and the command that reads the real result.
+
+
+
 ## [0.38.0] - 2026-08-15
 
 ### Changed
