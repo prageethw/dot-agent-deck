@@ -63,14 +63,12 @@ This lets work-in-progress code merge to `main` without exposing unfinished UI d
 |---|---|---|---|
 | `show_experimental_footer()` | The experimental dashboard footer | #139 | — |
 | `show_issue_dispatch_authoring()` | The new-pane `schedule: issues` modal authoring option (PRD #120 creation UX) | #120 | `graduate-issue-dispatch` |
-| `show_command_entry_lock()` | The orchestration command-entry lock: the `Ctrl+E` binding, the keystroke gate on a focused worker pane, and the waiting-pane focus steering | #393 | `graduate-command-entry-lock` |
-
-> **`show_command_entry_lock()` was added AFTER the feature merged (#404), not before it.** PRD #393 shipped un-gated and locked-by-default; the flag was added while it was still unreleased, so no version ever exposed it on. Three seams in `src/ui.rs` read the wrapper — the `Ctrl+E` binding resolution, the `PaneInput` keystroke gate, and the auto-focus chain. Note the third: the focus steering is part of the same surface rather than a separate feature, because it only ever ran while the lock was engaged, so gating it off is what makes flag-off behaviour identical to v0.35.8. The helpers themselves (`scope_command_entry_lock`, `gate_pane_input_key`) stay flag-free so their unit tests exercise the real logic rather than the gate; `UiState::command_entry_locked` also still starts `true`, since the flag decides whether that value is *consulted*, not what it is.
 
 ## Graduated
 
 | Surface | PRD | Graduated |
 |---|---|---|
 | The new-pane `dispatcher` Mode-cycler option (PRD #220) — its `show_dispatcher()` wrapper is deleted and the branch inlined to `true`. The `dispatch` CLI verb and its daemon handler were never gated. Documented for users at [`docs/dispatcher-mode.md`](../dispatcher-mode.md). | #220 | in #220's own PR, before shipping |
+| The orchestration command-entry lock: the `Ctrl+E` binding, the keystroke gate on a focused worker pane, and the waiting-pane focus steering (PRD #393) — its `show_command_entry_lock()` wrapper is deleted and all three `src/ui.rs` seams inlined to unconditional. The lock now works regardless of where the deck is launched from. | #393 | fork #346 |
 
 > **`show_issue_dispatch_authoring()` is a render seam, like the others (redesigned 2026-06-24).** An earlier iteration gated `issue_dispatch` *behaviour* (the daemon's schedule-fire activation seam) — that is **gone**. A configured `issue_dispatch` task now runs **unconditionally**; the flag, config parsing, and the `schedule add --repo …` CLI are all flag-free. The wrapper now gates ONLY the new-pane Mode-cycler `schedule: issues` authoring option (a render/input seam in `src/ui.rs`) — i.e. the experimental *creation UX* for the task type, not the task type itself. This keeps the flag presentation-only, consistent with the default model.
