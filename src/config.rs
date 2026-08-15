@@ -1261,105 +1261,223 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
 /// (see below) — `load_features_file` treats a missing file as
 /// `Features::default()` (OFF). `DOT_AGENT_DECK_FEATURES_CONFIG` is an
 /// explicit override, checked first, so tests never touch the real cwd.
-/// Thin wrapper over [`features_config_path_with_diagnostics`] for callers
-/// that don't need the skipped-ancestor diagnostics.
 ///
-/// An ancestor directory that is world-writable is declined rather than
-/// trusted (fork issue #309): the walk is otherwise unbounded, so a deck
-/// launched anywhere under a shared directory like `/tmp` would adopt a
-/// config another user planted there. The search continues to the next
-/// ancestor up rather than aborting, with a warning naming the declined
-/// path.
+/// This is a **display-only** wrapper over
+/// [`features_config_path_with_diagnostics`] for callers (tests, and
+/// `features status`'s path line) that just want *a* path to show, not a
+/// trust decision: when the walk finds nowhere trustworthy at all, that
+/// function returns `None` and this wrapper substitutes `cwd.join(...)`
+/// purely so there is something non-empty to print. `init_and_watch` (the
+/// only caller that actually loads or watches a file) calls the
+/// diagnostics function directly and does **not** go through this wrapper,
+/// so it correctly does nothing on `None` rather than reading or polling
+/// the substituted path.
+///
+/// An ancestor directory that is world-writable — or whose safety could not
+/// be determined at all — is declined rather than trusted (fork issue
+/// #309): the walk is otherwise unbounded, so a deck launched anywhere
+/// under a shared directory like `/tmp` would adopt a config another user
+/// planted there. The search continues to the next ancestor up rather than
+/// aborting, with a warning naming the declined path.
 pub fn features_config_path() -> PathBuf {
-    features_config_path_with_diagnostics().0
+    let (path, _) = features_config_path_with_diagnostics();
+    path.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(crate::project_config::CONFIG_FILE_NAME)
+    })
 }
 
-/// [`features_config_path`], additionally returning one diagnostic message
-/// per declined world-writable ancestor whose candidate file actually
-/// existed there — nothing is emitted for an ancestor that was merely
-/// world-writable but held no config (reviewer minor 1: warning on every
-/// `/tmp`-launched deck when nothing was ever declined is noise, not
-/// diagnostics). Each message is also `tracing::warn!`-logged as it is
-/// found, so `DOT_AGENT_DECK_LOG` still captures it even if the caller
-/// discards the returned `Vec`.
+/// [`features_config_path`]'s real logic, returning one diagnostic message
+/// per declined ancestor whose candidate file actually existed there —
+/// nothing is emitted for an ancestor that was merely untrusted but held no
+/// config (reviewer minor 1: warning on every `/tmp`-launched deck when
+/// nothing was ever declined is noise, not diagnostics). Each message is
+/// also `tracing::warn!`-logged as it is found, so `DOT_AGENT_DECK_LOG`
+/// still captures it even if the caller discards the returned `Vec`.
 ///
-/// The walk tracks the nearest ancestor it has confirmed safe (not
-/// world-writable) as it goes, and falls back to *that* directory's joined
-/// path when no ancestor holds a config — never unconditionally to `cwd`
-/// (fork issue #309 auditor finding M-1). Before this guard, a `cd /tmp &&
-/// deck` launched directly inside a world-writable directory declined that
-/// directory's own attacker-planted config, logged the decline, and then
-/// handed the identical attacker path back anyway via the old unconditional
-/// `cwd.join(...)` fallback — #309's own headline scenario, still reachable
-/// despite the warning claiming otherwise. In the degenerate case where
-/// every ancestor up to the root is world-writable, the walk still has to
-/// resolve to *something*; falling back to the cwd-joined path there is the
-/// deliberate last resort, not the default.
-pub fn features_config_path_with_diagnostics() -> (PathBuf, Vec<String>) {
+/// Returns `None` for the path when NO ancestor could be trusted — every
+/// one was either world-writable or its safety was indeterminate (fork
+/// issue #309 auditor finding M-1r). `None` is a deliberate refusal to name
+/// a location at all, not a "safest guess": every candidate directory
+/// remaining at that point is one the walk has already declined to trust,
+/// so there is no path left to hand back that is not itself a live
+/// instance of the thing this function exists to reject. Callers that load
+/// or watch a file (`init_and_watch`) must treat `None` as "install the
+/// default and start no watcher"; only [`features_config_path`]'s
+/// display-only wrapper substitutes a path for it, and only for printing.
+///
+/// The walk classifies each ancestor with [`classify_dir_safety`], which
+/// returns one of three states rather than a bare bool, and the two
+/// non-`Safe` states are handled identically here (both decline a present
+/// candidate and are never a fallback candidate) — see that function's doc
+/// for why `Unknown` cannot be folded into `Safe` here even though it can
+/// be for the search itself. The walk tracks the nearest ancestor it has
+/// confirmed `Safe` as it goes, and falls back to *that* directory's joined
+/// path when no ancestor holds a trusted config — never unconditionally to
+/// `cwd`, and never to an ancestor whose safety is merely unknown. Before
+/// the M-1 fix, a `cd /tmp && deck` launched directly inside a
+/// world-writable directory declined that directory's own attacker-planted
+/// config, logged the decline, and then handed the identical attacker path
+/// back anyway via an unconditional `cwd.join(...)` fallback — #309's own
+/// headline scenario, still reachable despite the warning claiming
+/// otherwise. That headline scenario is closed. Two narrower residuals
+/// remained until this round (auditor M-1r / reviewer L-1) — both now
+/// closed by returning `None` instead of ever falling back to an untrusted
+/// path:
+///
+/// - `current_dir()` failing (e.g. `ENAMETOOLONG` behind a symlink into a
+///   deep attacker-controlled tree) makes `cwd` the placeholder `"."`, whose
+///   ancestors are `["." , ""]`. `std::fs::metadata("")` errors, so the
+///   empty ancestor used to be treated as `Safe` by the old fail-open bool
+///   — and `Path::new("").join(CONFIG_FILE_NAME)` is a *relative* path,
+///   which resolves against the real (attacker-controlled) process cwd, not
+///   against any directory the walk actually vetted. That let the very file
+///   just declined one iteration earlier be handed straight back. Under the
+///   three-state split, `""`'s `Unknown` result is never a fallback
+///   candidate and never trusted when a candidate is present, so this path
+///   can no longer be reached.
+/// - When every ancestor up to and including `/` is world-writable,
+///   `safe_fallback` stays `None` throughout; the old code substituted
+///   `cwd` there regardless, which is byte-identical to the declined
+///   attacker config if cwd itself was declined. Returning `None` all the
+///   way out removes that special case rather than papering over it — there
+///   genuinely is nowhere left to trust.
+pub fn features_config_path_with_diagnostics() -> (Option<PathBuf>, Vec<String>) {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
-        return (PathBuf::from(p), Vec::new());
+        return (Some(PathBuf::from(p)), Vec::new());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_ancestor_walk(cwd.ancestors())
+}
+
+/// The walk itself, factored out of [`features_config_path_with_diagnostics`]
+/// over an explicit ancestor sequence rather than calling `cwd.ancestors()`
+/// internally. This exists for testability, not for any production caller:
+/// the real walk always terminates at the real filesystem root, which is
+/// normally `Safe` on any machine these tests run on, so the "nowhere
+/// trustworthy" (`None`) outcome and the degenerate `current_dir()`-failed
+/// route (auditor M-1r) can't be produced by chdir'ing into a fixture alone
+/// without chmod-ing real system directories — not something a test may do.
+/// Taking the ancestor sequence as a parameter lets a test hand it a short,
+/// self-contained, entirely-fixture-owned list instead.
+fn resolve_ancestor_walk<'a, I>(ancestors: I) -> (Option<PathBuf>, Vec<String>)
+where
+    I: IntoIterator<Item = &'a std::path::Path>,
+{
     let mut safe_fallback: Option<&std::path::Path> = None;
     let mut declined = Vec::new();
-    for ancestor in cwd.ancestors() {
-        let safe = !is_world_writable_dir(ancestor);
+    for ancestor in ancestors {
+        let safety = classify_dir_safety(ancestor);
         let candidate = ancestor.join(crate::project_config::CONFIG_FILE_NAME);
         if candidate.is_file() {
-            if safe {
-                return (candidate, declined);
+            if safety == DirSafety::Safe {
+                return (Some(candidate), declined);
             }
+            let reason = match safety {
+                DirSafety::WorldWritable => {
+                    "its directory is world-writable, so the file may have \
+                     been planted by another user"
+                }
+                DirSafety::Unknown => {
+                    "its directory's write permissions could not be \
+                     determined, so it cannot be trusted"
+                }
+                DirSafety::Safe => unreachable!("handled above"),
+            };
             let message = format!(
-                "declining {} in features-config search: its directory is \
-                 world-writable, so the file may have been planted by \
-                 another user (fork issue #309); continuing search upward",
+                "declining {} in features-config search: {reason} (fork \
+                 issue #309); continuing search upward",
                 crate::terminal_sanitize::sanitize_path_for_terminal_display(&candidate)
             );
             tracing::warn!("{message}");
             declined.push(message);
             continue;
         }
-        if safe {
+        if safety == DirSafety::Safe {
             safe_fallback.get_or_insert(ancestor);
         }
     }
-    let fallback_dir = safe_fallback.unwrap_or(&cwd);
-    (
-        fallback_dir.join(crate::project_config::CONFIG_FILE_NAME),
-        declined,
-    )
+    let path = safe_fallback.map(|dir| dir.join(crate::project_config::CONFIG_FILE_NAME));
+    (path, declined)
 }
 
-/// Whether `dir` is writable by any user (Unix "other" write bit). Used to
-/// bound the ancestor walk in [`features_config_path`] at a trust boundary
-/// (fork issue #309). Deliberately narrower than #309's own suggested
-/// predicate — group-writable and attacker-*owned* ancestors are not
-/// covered (tracked separately as fork issue #384; not folded in here). On
-/// non-Unix targets there is no equivalent POSIX mode bit to check —
-/// Windows ACLs don't map onto it cheaply — so this always returns `false`
-/// there and the walk behaves as it did before, same as
-/// `platform::paths::is_executable_file`'s split for the same reason
-/// (Windows follow-up tracked as fork issue #383).
+/// The trust classification of a directory for the features-config ancestor
+/// walk (fork issue #309). Three states rather than a bare bool because the
+/// walk has two different consumers of this result with two different
+/// soundness requirements (round-2 auditor finding M-1r):
 ///
-/// Fails **open** (`false`, i.e. "trust it") when `dir` cannot be stat'd.
-/// This is sound here even though a security predicate answering "safe" on
-/// an indeterminate result is usually the wrong default: if `stat` fails on
-/// the directory itself, `candidate.is_file()` on a file inside it fails
-/// the same way for the same reason, so the walk finds nothing there either
-/// way — there is no path through which failing open on the *directory*
-/// stat lets an unvetted *file* through.
+/// - **Search** (a candidate file exists in this ancestor): `Unknown` and
+///   `WorldWritable` are handled identically — the candidate is declined,
+///   not trusted, and the search continues upward. Declining on `Unknown`
+///   here is a deliberate change from the original fail-open bool: that
+///   bool's doc argued a `stat` failure on the directory implies
+///   `candidate.is_file()` on a file inside it fails the same way, so
+///   nothing gets through — an argument that is sound for a genuine
+///   absolute-path ancestor but does not hold for the degenerate `""`
+///   ancestor produced by a failed `current_dir()` (see
+///   [`features_config_path_with_diagnostics`]'s doc), where the "candidate
+///   inside this ancestor" is actually a relative path that resolves
+///   against the real process cwd instead. Declining on `Unknown`
+///   unconditionally closes that gap without needing to special-case which
+///   ancestor triggered it.
+/// - **Fallback selection** (no candidate here, but this ancestor might
+///   still serve as the safe directory the resolver falls back to):
+///   `Unknown` is never recorded as the fallback. An ancestor whose
+///   writability could not be determined is not a place the resolver has
+///   any basis to trust, so it must not become the directory the watcher
+///   polls for the rest of the process's life (auditor M-1r, scenario B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirSafety {
+    /// Confirmed not world-writable. May supply a candidate or serve as a
+    /// fallback.
+    Safe,
+    /// Confirmed world-writable (Unix "other" write bit set). A candidate
+    /// here is declined; never a fallback.
+    WorldWritable,
+    /// `stat` on the directory itself failed, so its writability could not
+    /// be determined. A candidate here is declined (never trusted); never a
+    /// fallback. On Unix this is a genuine "don't know"; the non-Unix arm
+    /// below never produces it today (see its own doc for why).
+    Unknown,
+}
+
+/// Classify `dir`'s trust for the features-config ancestor walk. See
+/// [`DirSafety`] for how the two call sites in
+/// [`features_config_path_with_diagnostics`] use the three states
+/// differently.
+///
+/// Deliberately narrower than #309's own suggested predicate —
+/// group-writable and attacker-*owned* ancestors are not covered (tracked
+/// separately as fork issue #384; not folded in here).
 #[cfg(unix)]
-fn is_world_writable_dir(dir: &std::path::Path) -> bool {
+fn classify_dir_safety(dir: &std::path::Path) -> DirSafety {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(dir) {
-        Ok(meta) => meta.permissions().mode() & 0o002 != 0,
-        Err(_) => false,
+        Ok(meta) => {
+            if meta.permissions().mode() & 0o002 != 0 {
+                DirSafety::WorldWritable
+            } else {
+                DirSafety::Safe
+            }
+        }
+        Err(_) => DirSafety::Unknown,
     }
 }
 
+/// On non-Unix targets there is no equivalent POSIX mode bit to check —
+/// Windows ACLs don't map onto it cheaply — so this always reports `Safe`,
+/// unchanged from the pre-round-2 behavior (Windows follow-up tracked as
+/// fork issue #383). Deliberately `Safe`, not `Unknown`: `Unknown` declines
+/// every present candidate (see [`DirSafety`]'s doc), so returning it here
+/// unconditionally would decline every `.dot-agent-deck.toml` on Windows —
+/// there is no ACL check happening at all yet to justify that. `Unknown` on
+/// this crate's non-Unix build is reserved for a genuine "couldn't
+/// determine" outcome once #383 adds one; there isn't one today. Same split
+/// as `platform::paths::is_executable_file`'s, for the same reason.
 #[cfg(not(unix))]
-fn is_world_writable_dir(_dir: &std::path::Path) -> bool {
-    false
+fn classify_dir_safety(_dir: &std::path::Path) -> DirSafety {
+    DirSafety::Safe
 }
 
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
@@ -1405,6 +1523,21 @@ fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs:
 /// this). Requesting the flag lets a directory handle open successfully
 /// here too, so the same downstream `is_file()` check on the handle rejects
 /// it exactly as it does on Unix.
+///
+/// Privilege assumption (auditor i-2): `FILE_FLAG_BACKUP_SEMANTICS` has a
+/// second, unused effect here. Besides being the documented way to obtain a
+/// directory handle via `CreateFile` (the only effect this code relies on),
+/// it also *requests* backup/restore semantics, which bypass ACL checks —
+/// but only when `SeBackupPrivilege`/`SeRestorePrivilege` are both present
+/// AND enabled in the process token. Windows does not enable those by
+/// default even for Administrators (present-but-disabled, requiring an
+/// explicit `AdjustTokenPrivileges` call neither Rust's `std` nor this
+/// codebase makes), so for a normal deck process this flag's only reachable
+/// effect is the directory-handle one. If the deck is ever run under a
+/// token with `SeBackupPrivilege` enabled (a backup-operator service
+/// context), this open could read a features config whose ACL denies the
+/// invoking user — narrow and unlikely, but a real difference from
+/// `File::open` worth knowing about if that context ever applies.
 #[cfg(windows)]
 fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -2986,13 +3119,13 @@ label = "-rf"
 
         assert_eq!(
             resolved,
-            legit_config,
+            Some(legit_config.clone()),
             "features_config_path() must skip the world-writable ancestor's \
              attacker-plantable config ({}) and continue upward to the \
-             legitimate one ({}); got {}",
+             legitimate one ({}); got {:?}",
             attacker_config.display(),
             legit_config.display(),
-            resolved.display()
+            resolved
         );
         assert_eq!(
             declined.len(),
@@ -3020,25 +3153,113 @@ label = "-rf"
 
         assert_ne!(
             resolved2,
-            unsafe_cwd_config,
+            Some(unsafe_cwd_config.clone()),
             "features_config_path() must not fall back into the \
              world-writable cwd's own attacker-plantable config after \
-             declining it; got {}",
-            resolved2.display()
+             declining it; got {resolved2:?}"
         );
         assert_eq!(
             resolved2,
-            safe_parent.join(crate::project_config::CONFIG_FILE_NAME),
+            Some(safe_parent.join(crate::project_config::CONFIG_FILE_NAME)),
             "the guarded fallback must land on the nearest SAFE ancestor \
-             ({}), not cwd itself; got {}",
+             ({}), not cwd itself; got {:?}",
             safe_parent.display(),
-            resolved2.display()
+            resolved2
         );
         assert_eq!(
             declined2.len(),
             1,
             "expected exactly one declined-ancestor diagnostic for the \
              world-writable cwd; got {declined2:?}"
+        );
+    }
+
+    // Round 2 (auditor M-1r, Route A): `current_dir()` failing makes `cwd`
+    // the placeholder `PathBuf::from(".")`, whose `ancestors()` are exactly
+    // `[".", ""]`. The `""` ancestor's `metadata("")` fails
+    // (`classify_dir_safety` reports `Unknown`), and
+    // `Path::new("").join(CONFIG_FILE_NAME)` is a *relative* path that
+    // resolves against the real process cwd rather than against any
+    // directory the walk actually vetted — which, before this round, let
+    // the old fail-open bool treat `""` as trusted and hand back the exact
+    // file `"."` just declined one iteration earlier. This drives
+    // `resolve_ancestor_walk` directly over that literal `[".", ""]`
+    // sequence (see its doc for why the real `cwd.ancestors()` walk can't
+    // reproduce this in a test) with the real process cwd chdir'd into a
+    // world-writable fixture holding the attacker config, so `"."` and `""`
+    // both resolve to the same real, attacker-controlled file.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_ancestor_walk_never_trusts_the_degenerate_empty_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = FEATURES_CONFIG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = FeaturesConfigCwdEnvGuard::new();
+
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = fixture.path().canonicalize().unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let attacker_config = dir.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&attacker_config, "[features]\nexperimental = true\n").unwrap();
+
+        std::env::set_current_dir(&dir).expect("chdir into fixture dir");
+
+        let degenerate_ancestors = [std::path::Path::new("."), std::path::Path::new("")];
+        let (resolved, declined) = resolve_ancestor_walk(degenerate_ancestors);
+
+        assert_eq!(
+            resolved, None,
+            "the degenerate current_dir()-failed ancestor sequence must \
+             resolve to nowhere trustworthy rather than handing back the \
+             attacker's own declined config via the empty ancestor; got \
+             {resolved:?}"
+        );
+        assert_eq!(
+            declined.len(),
+            2,
+            "expected both the \".\" and \"\" ancestors to be declined \
+             (the same real attacker-controlled file, reached two \
+             different ways); got {declined:?}"
+        );
+    }
+
+    // Round 2 (auditor M-1r, scenario B / reviewer L-1): when NO ancestor in
+    // the (synthetic) sequence is trustworthy at all, the resolver must
+    // report that plainly rather than falling back to any of them —
+    // including the innermost one, which is exactly what the pre-round-2
+    // `unwrap_or(&cwd)` did. `resolve_ancestor_walk` is exercised directly
+    // (see its doc) because the real `cwd.ancestors()` walk always reaches
+    // the real filesystem root, which this test cannot make untrustworthy.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_ancestor_walk_reports_none_when_nothing_is_trustworthy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let outer_dir = outer.path().canonicalize().unwrap();
+        std::fs::set_permissions(&outer_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let inner_dir = outer_dir.join("inner");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        std::fs::set_permissions(&inner_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // No candidate config anywhere in this synthetic chain, so the walk
+        // reaches the end with `safe_fallback` still `None` — no ancestor
+        // was ever confirmed `Safe`.
+        let ancestors = [inner_dir.as_path(), outer_dir.as_path()];
+        let (resolved, declined) = resolve_ancestor_walk(ancestors);
+
+        assert_eq!(
+            resolved, None,
+            "a synthetic ancestor sequence with no Safe directory anywhere \
+             in it must resolve to nowhere trustworthy, not to the \
+             innermost world-writable one; got {resolved:?}"
+        );
+        assert!(
+            declined.is_empty(),
+            "no candidate file existed anywhere in this fixture, so no \
+             decline message should have been produced; got {declined:?}"
         );
     }
 
