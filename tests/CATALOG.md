@@ -5095,6 +5095,49 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the `DOT_AGENT_DECK_FEATURES_CONFIG` override precedence or the exact resolved path (unit-covered in `src/config.rs`); the OFF/default case (covered by `features/gating/002`/`003`); directory-walk depth limits.
 - **Platform coverage:** mac+linux.
 
+#### features/status
+
+These entries cover fork issue #303 Phase 2: `dot-agent-deck features status`, an on-demand diagnostic that reuses `features_config_path()` / `load_features_file()` / `resolve_features()` verbatim (no reimplementation) so it can never disagree with what the deck actually does.
+
+##### features/status/001 — `dot-agent-deck features status` names the env override as the winning source and reports the resolved value as ON (fork issue #303).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive). An isolated tempdir with no `.dot-agent-deck.toml` in its ancestry is the process cwd; `DOT_AGENT_DECK_EXPERIMENTAL=1` is set.
+- **Agent:** none.
+- **Asserts:** stdout names `DOT_AGENT_DECK_EXPERIMENTAL env override` as the winning source and reports `experimental: on`.
+- **Does not assert:** the resolved config path's existence or naming (covered by `features/status/002`–`003`); the `DOT_AGENT_DECK_FEATURES_CONFIG` path-override axis.
+- **Platform coverage:** mac+linux.
+
+##### features/status/002 — `dot-agent-deck features status` finds a project `.dot-agent-deck.toml`, names it as the winning source, and reports the resolved value as ON (fork issue #303).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive). An isolated tempdir carrying `[features] experimental = true` is the process cwd; no env override is set.
+- **Agent:** none.
+- **Asserts:** stdout reports `config path exists: true`, names `(project file)` as the winning source, and reports `experimental: on`.
+- **Does not assert:** the env-override case (`features/status/001`); the no-config-found case (`features/status/003`); the ancestor-walk mechanism itself (unit-covered in `src/config.rs`, and `features/config/001`).
+- **Platform coverage:** mac+linux.
+
+##### features/status/003 — `dot-agent-deck features status` reports the no-config-found default when no `.dot-agent-deck.toml` exists anywhere in the process cwd's ancestry, with no env override (fork issue #303 — the exact silent-failure state the issue was filed against, now visible on demand).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive). An isolated, empty tempdir with no `.dot-agent-deck.toml` in its ancestry is the process cwd; no env override is set.
+- **Agent:** none.
+- **Asserts:** stdout reports `config path exists: false`, names `default (no .dot-agent-deck.toml found)` as the source, and reports `experimental: off`.
+- **Does not assert:** the env-override or project-file cases (`features/status/001`–`002`).
+- **Platform coverage:** mac+linux.
+
+#### features/startup-warning
+
+These entries cover fork issue #303 Phase 2's other diagnosability surface: a startup warning on stderr, conditional on the ancestor walk finding no `.dot-agent-deck.toml` anywhere, requiring neither `DOT_AGENT_DECK_LOG` nor a restart to see — replacing the pre-fix behavior where the only signal was a `tracing::warn!` gated behind file logging.
+
+##### features/startup-warning/001 — The deck's TUI startup path prints a missing-config warning to stderr when no `.dot-agent-deck.toml` exists anywhere in the process cwd's ancestry, with no `DOT_AGENT_DECK_LOG` set (fork issue #303).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive — driven through `init_and_watch` and the daemon handshake via `DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE`, mirroring `lifecycle/handshake/004`'s non-PTY drive). An isolated tempdir with no `.dot-agent-deck.toml` in its ancestry is both the process cwd and `HOME`; `DOT_AGENT_DECK_LOG` is left unset.
+- **Agent:** none.
+- **Asserts:** the process exits 0 and stderr contains the missing-config warning naming `.dot-agent-deck.toml` and `experimental flags default to OFF`.
+- **Does not assert:** the silent case when a config is present (`features/startup-warning/002`); the exact wording beyond the required substrings; the `features status` subcommand's own output (`features/status/00N`).
+- **Platform coverage:** mac+linux.
+
+##### features/startup-warning/002 — The deck's TUI startup path is completely silent on stderr when a `.dot-agent-deck.toml` is present at the launch directory (fork issue #303 — proportionate: no warning for the common case).
+- **Layer:** L2 (thin real-binary subprocess spawn; no PTY drive — same `DOT_AGENT_DECK_EXIT_AFTER_HANDSHAKE` drive as `features/startup-warning/001`). An isolated tempdir carrying `[features] experimental = false` is both the process cwd and `HOME`.
+- **Agent:** none.
+- **Asserts:** the process exits 0 and stderr contains no missing-config warning.
+- **Does not assert:** the missing-config case (`features/startup-warning/001`); any behavior of the `experimental` value itself (covered elsewhere in this section).
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:

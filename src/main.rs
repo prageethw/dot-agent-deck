@@ -84,6 +84,11 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Inspect the resolved experimental-feature-flag state (fork issue #303)
+    Features {
+        #[command(subcommand)]
+        action: FeaturesAction,
+    },
     /// Generate ASCII art from session context via LLM
     Ascii {
         /// User prompts / session input context
@@ -607,6 +612,17 @@ enum ConfigAction {
     },
 }
 
+/// Fork issue #303: an on-demand diagnostic for the experimental-feature-flag
+/// resolution, so a user does not need `lsof` + a running process + log-file
+/// archaeology to find out why every experimental surface is off.
+#[derive(Subcommand)]
+enum FeaturesAction {
+    /// Print the resolved `.dot-agent-deck.toml` path, whether it exists, the
+    /// resolved `experimental` value, and which source won. Works whether or
+    /// not the deck is running.
+    Status,
+}
+
 /// Resolve the task/summary text for `delegate` / `work-done` from the mutually
 /// exclusive `--task` / `--task-file` inputs.
 ///
@@ -965,6 +981,45 @@ fn main() -> ExitCode {
                     eprintln!("{e}");
                     return ExitCode::FAILURE;
                 }
+                ExitCode::SUCCESS
+            }
+        },
+        Some(Commands::Features { action }) => match action {
+            FeaturesAction::Status => {
+                use dot_agent_deck::config::{
+                    EXPERIMENTAL_ENV, features_config_path, load_features_file, resolve_features,
+                };
+                use dot_agent_deck::features::Features;
+                use dot_agent_deck::project_config::CONFIG_FILE_NAME;
+
+                // Reuses the exact same resolution functions the real
+                // startup path calls — no reimplementation, so this can
+                // never disagree with what the deck actually does (the
+                // whole point of a diagnostic: CLAUDE.md rule about not
+                // reimplementing what you're diagnosing applies here).
+                let path = features_config_path();
+                let exists = path.is_file();
+                let path_source = if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok() {
+                    "DOT_AGENT_DECK_FEATURES_CONFIG override"
+                } else {
+                    "ancestor walk from the current directory"
+                };
+                let file_value = load_features_file(&path, Features::default());
+                let resolved = resolve_features(file_value);
+                let value_source = if std::env::var(EXPERIMENTAL_ENV).is_ok() {
+                    format!("{EXPERIMENTAL_ENV} env override")
+                } else if exists {
+                    "project file".to_string()
+                } else {
+                    format!("default (no {CONFIG_FILE_NAME} found)")
+                };
+
+                println!("config path: {} ({path_source})", path.display());
+                println!("config path exists: {exists}");
+                println!(
+                    "experimental: {} ({value_source})",
+                    if resolved.experimental { "on" } else { "off" }
+                );
                 ExitCode::SUCCESS
             }
         },
@@ -1660,7 +1715,19 @@ async fn run_tui_session() -> ExitCode {
     // live re-read watcher. The startup state is recorded via a single
     // `tracing::info!` line, which surfaces only when file logging is enabled
     // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal.
-    dot_agent_deck::features::init_and_watch();
+    //
+    // Fork issue #303: when no `.dot-agent-deck.toml` was found in the cwd or
+    // any ancestor, `init_and_watch` returns a diagnosability warning. Print
+    // it here, before `ensure_external_daemon_or_die`/`run_tui`'s
+    // `ratatui::init()` flips into the alternate screen, so it lands on
+    // stderr in the normal terminal — mirroring how `KeybindingConfig::load()`
+    // below prints its own malformed-config warnings ahead of the alt-screen
+    // switch. No `DOT_AGENT_DECK_LOG` and no restart flag required, which is
+    // the whole point: today's `tracing::warn!` above is invisible without
+    // both.
+    if let Some(warning) = dot_agent_deck::features::init_and_watch() {
+        eprintln!("Warning: {warning}");
+    }
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_path = attach_socket_path();

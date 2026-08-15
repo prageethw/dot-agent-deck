@@ -2626,10 +2626,10 @@ label = "-rf"
         );
 
         // The resolved value for a project whose config carries
-        // `experimental = true` must be `true` from the nested cwd too —
-        // the assertion that fails today, since today's resolver returns
-        // <nested_cwd>/.dot-agent-deck.toml, which does not exist, and a
-        // missing file resolves to the default (OFF).
+        // `experimental = true` must be `true` from the nested cwd too. This
+        // now passes: the ancestor walk above already resolved `resolved` to
+        // the PROJECT's config, not `<nested_cwd>/.dot-agent-deck.toml` (which
+        // does not exist), so loading it and resolving the flag yields `true`.
         let loaded = load_features_file(&resolved, crate::features::Features::default());
         let resolved_flag = resolve_features(loaded);
         assert!(
