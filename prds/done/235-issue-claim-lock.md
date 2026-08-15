@@ -275,7 +275,7 @@ Both refusals name the holder **and its host**: `held by \`orchestration:orch-A@
 | `issue/claim/006` | create | Pane env set, marker **absent** → **refuse**; specifically does not fall back to `human:<login>`. |
 | `issue/claim/007` | create | **Two orchestrations with the SAME name, different worktrees** (fork #201) — the second is **refused**, not treated as an idempotent self-refresh. |
 | `issue/claim/008` | create | The claim comment carries a worktree **digest**, never a raw path — no `/Users/`, no `/home/`. |
-| `scheduler/dispatch/014` | verify unchanged | A failed spawn still leaves the issue completely unmarked. |
+| ~~`scheduler/dispatch/014`~~ | verify unchanged | A failed spawn still leaves the issue completely unmarked. **Id retired 2026-08-15 (fork #194/#341, unrelated change):** the `scheduler/dispatch/014` id was reused for an unconnected prompt-delivery test and has since been removed outright; this row's claim-ordering property is untouched, but the id no longer resolves to any test. |
 | `scheduler/dispatch/015` | verify unchanged | Dispatch still skips a labelled issue — M3 must not alter the mechanical gate. |
 
 **Two tiers, deliberately.** `scheduler/dispatch/*` stays in `tests/e2e_issue_dispatch.rs` (e2e-gated, informational in CI). `issue/claim/*` is a **new sub-area** in a **new fast-tier file `tests/issue_claim.rs`** — following `tests/daemon_status.rs` (fork #47) and `tests/worktree_reclaim.rs` (PRD #422), neither of which carries `#![cfg(feature = "e2e")]`, and both of which drive the **real `dot-agent-deck` binary as a subprocess**. That is the correct shape for CLI exit-code assertions, and it puts the lock — the part that matters — in the tier CI actually blocks on, with a ~1–2 minute round trip rather than ~9–12.
