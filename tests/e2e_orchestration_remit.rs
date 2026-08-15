@@ -116,12 +116,19 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// into the workdir — later declares history-only and then live again;
 /// meanwhile the FOREGROUND script body reads and logs every line delivered
 /// to its real stdin, however many arrive, to `orchestrator-prompt.log`, and
-/// reports each one back over the hook socket as a `user_prompt`-carrying
-/// `thinking` event — the evidence `deliver_orchestrator_prompt`'s
-/// submission-confirmation logic accepts as CONFIRMATION that a written
-/// prompt was actually submitted rather than merely landed on the PTY.
-/// Without that confirmation every delivery against this fixture — the
-/// spawn-time seed included — is stuck permanently unconfirmed.
+/// — issue #424 — reports each one back over the hook socket as a
+/// `user_prompt`-carrying `thinking` event, the only evidence
+/// `prompt_submission_evidence` (`src/ui.rs`) accepts as CONFIRMATION that a
+/// written prompt was actually submitted rather than merely landed on the
+/// PTY. Without that confirmation every delivery against this fixture — the
+/// spawn-time seed included — is stuck permanently PROVISIONAL, so
+/// `MAX_PAYLOAD_SUBMISSIONS` (`src/prompt_delivery.rs`) fires its one
+/// automatic replacement write ~500ms later regardless of whether a real
+/// re-assertion was ever requested; `orchestration/remit/002` and `_003`
+/// pin behaviour that only starts once that spurious second write stops
+/// happening. Confirming does not touch the log: only the `read` loop's own
+/// `printf` line appends to `orchestrator-prompt.log`, so the tests' log
+/// substring counts still measure exactly what was delivered to the pane.
 ///
 /// The background/foreground split is load-bearing, not stylistic: a
 /// non-interactive POSIX shell reassigns an ASYNCHRONOUS (`&`) job's stdin to
@@ -130,10 +137,13 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// would silently read nothing — the delivered pointer would land on the
 /// real PTY (visible on the rendered grid) but never reach the log,
 /// producing a false RED against this file's own precondition assertion
-/// instead of the feature under test. The `emit_target` and
-/// `confirm_submission` subshells below never read stdin, so backgrounding
-/// or forking them is unaffected; the `read` loop stays in the foreground, so
-/// it keeps the real PTY stdin. Mirrors the `emit_target` helper
+/// instead of the feature under test (caught reading PR #177's first CI run:
+/// all three tests failed at the identical precondition line with the
+/// pointer plainly visible in the failure's `Final grid` dump). The
+/// `emit_target` and `confirm_submission` subshells below never read stdin,
+/// so backgrounding or forking them is unaffected; the `read` loop stays in
+/// the foreground, so it keeps the real PTY stdin. Mirrors the `emit_target`
+/// helper
 /// `tests/e2e_pane_send_result.rs::pane_input_007_orchestrator_prompt_retries_after_non_applied_result`
 /// uses for the identical raw hook-socket `session_start` technique.
 ///

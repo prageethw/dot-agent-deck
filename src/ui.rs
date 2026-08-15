@@ -14263,31 +14263,34 @@ pub fn run_tui(
                     // is true only after THIS loop's own delivery path has
                     // completed a delivery, which a warm-daemon reattach
                     // (`TabManager::open_orchestration_tab_with_existing_role_panes`,
-                    // `orchestrator_prompt: None` from construction — never
-                    // replay on reconnect) never reaches — so the re-arm
-                    // gate could never pass for the exact long-lived,
-                    // detach/reattach sessions this feature is meant to
-                    // target.
+                    // `orchestrator_prompt: None` from construction, design
+                    // decision 3: never replay on reconnect) never reaches —
+                    // so the re-arm gate could never pass for the exact
+                    // long-lived, detach/reattach sessions issue #423 is
+                    // stated to target.
                     //
                     // `orchestrator_prompt.is_none()` alone is NOT
                     // equivalent to "no delivery attempt is in-flight right
                     // now" under the capability-based confirmation model
-                    // (`src/prompt_delivery.rs`): a write that has LANDED
-                    // (bytes reached the PTY) leaves `orchestrator_prompt`
-                    // `Some` until the agent independently reports having
-                    // submitted it — which, for a producer that never
-                    // reports back (or simply hasn't yet), never happens,
-                    // permanently blocking this gate. A landed-but-unconfirmed
-                    // write must be as eligible for re-arm as no delivery
-                    // ever having started: a compaction is new information
-                    // and an argument for reasserting MORE, not less. Only a
+                    // (issue #424, `src/prompt_delivery.rs`): a write that
+                    // has LANDED (bytes reached the PTY) leaves
+                    // `orchestrator_prompt` `Some` until the agent
+                    // independently reports having submitted it — which,
+                    // for a producer that never reports back (or simply
+                    // hasn't yet), never happens, permanently blocking this
+                    // gate. A landed-but-unconfirmed write must be as
+                    // eligible for re-arm as no delivery ever having
+                    // started: a compaction is new information and an
+                    // argument for reasserting MORE, not less. Only a
                     // delivery still probing readiness/backoff BEFORE its
                     // first write is genuinely in-flight and must keep
-                    // blocking re-arm. `PromptDelivery::attempts > 0` is that
+                    // blocking re-arm — `orchestration/remit/003`'s
+                    // deferred-delivery (history-only) phase depends on
+                    // exactly that. `PromptDelivery::attempts > 0` is that
                     // "a write has landed" witness — see its own doc
                     // comment: it is set only inside the `Applied`/`Queued`
-                    // arm, so it is zero for exactly the still-probing case
-                    // and nonzero the moment a write lands.
+                    // arm, so it is zero for exactly the still-probing
+                    // case and nonzero the moment a write lands.
                     let no_delivery_pending = orchestrator_prompt.is_none()
                         || ui
                             .prompt_delivery
