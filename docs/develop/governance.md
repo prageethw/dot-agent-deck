@@ -117,7 +117,7 @@ The `required_review_thread_resolution` rule is not a problem here in practice �
 
 Everything that lands on `main`, uniformly: one approving review from a maintainer, all review threads resolved, no deletion, no force-push. There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
 
-The requirement that review threads resolve before merge is doing specific work. No bot reviews pull requests on this fork (CLAUDE.md rule 8) — the human maintainer's review, and the delegated `reviewer`/`auditor` pass that precedes it, leave findings as inline comments rather than in a check-run or summary, and a green check board never proves those were read. Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
+The requirement that review threads resolve before merge is doing specific work. No bot reviews pull requests on this fork (CLAUDE.md rule 8). The delegated `reviewer`/`auditor` pass leaves its findings in a file under the root checkout's `.dot-agent-deck/` (rule 15), never on the pull request — so the only thing that populates review threads here is the human maintainer's review, and a green check board never proves those comments were read. Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
 
 ## Making the gate bind the owner too
 
