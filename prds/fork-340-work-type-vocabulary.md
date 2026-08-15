@@ -1,10 +1,12 @@
-# PRD fork: One work-type vocabulary, derived from the diff and checked by a gate rather than a prompt
+# PRD fork#340: One work-type vocabulary, derived from the diff and checked by a gate rather than a prompt
 
-**GitHub Issue**: **not yet filed** — filing it is step 1 of the resume checklist. Rename this file to `prds/fork-<n>-work-type-vocabulary.md` once the number exists.
+**GitHub Issue**: [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)
 
 **Priority**: Medium
 
-**Status** *(2026-08-15)*: **Planned, nothing implemented.** Research and design complete and recorded here; no worktree, no branch, no issue, no code. A fresh session can start at "Resume checklist" and needs nothing from the conversation that produced this.
+**Status** *(2026-08-15)*: **In progress — M1 and M2 complete; M3–M5 unstarted.** Research and design complete and recorded here. Issue filed, worktree `../dot-agent-deck-worktype` created on branch `feat/340-work-type-vocabulary` from `5d2a9205`, issue claimed. Resume checklist steps 1–4 are done — M1 (`assemble-changelog.sh` now reads `pyproject.toml`) and M2 (`docs/develop/work-types.md`, the CLAUDE.md rule 1 clause, `changelog.d/340.feature.md`, and this file's F2 correction) have both landed on this branch. Resume at step 5 (M3, TDD with `tester` then `coder`).
+
+**Sibling**: [fork #339](https://github.com/prageethw/dot-agent-deck/issues/339) — the other PRD parked in `12ccb6df`, merged as PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) (`5d2a9205`). Its file was renamed to `prds/fork-339-agent-type-badge-toggle.md` on that branch, so **M4's optional rename is already done** — it is no longer the 1-of-129 `prds/` file lacking an issue number, and R4 has nothing left to fix up there.
 
 **Fork-only?** **Mixed, and the split is clean.** M1 (reconciling `assemble-changelog.sh` with `pyproject.toml`) and M3–M4 (the `xtask` gate) are **upstream-worthy** — they fix a latent release-blocker and add a general-purpose gate in shared code. M2's CLAUDE.md clause and the `docs/develop/work-types.md` vocabulary are **fork preference** (upstream's label set differs — it carries both `feature` and `enhancement`, and a live `PRD` label). Per rule 19: build and merge here, then file the upstream-offer issue at merge time for M1/M3/M4 only.
 
@@ -39,7 +41,7 @@ It is also the weaker mechanism regardless of vendor. **This repo has documented
 **F1 — the changelog suffix vocabulary is FROZEN at five, and this is not negotiable.**
 `.claude/skills/dot-ai-tag-release/analyze.sh:54-68` hard-errors (`ERROR=true`, `exit 1`) on any fragment suffix outside `feature|bugfix|breaking|doc|misc`, **and that file is in the `dot-ai-*` sync-clobbered zone** — CLAUDE.md rule 13 records `04a3641` being reverted byte-for-byte by `e94388d` five days later. So introducing a `.chore.md`, `.prd.md` or `.bug.md` suffix would break `/tag-release` at the first release, with a fix that **cannot be carried in-repo**. Every new work type must therefore **alias onto one of the five** — which is precisely the move `TYPE_HEADERS` (`assemble-changelog.sh:12-22`) already makes, collapsing nine names onto six headers (`added|feature → Added`, `fixed|bugfix → Fixed`, `changed|breaking → Changed`).
 
-**F2 — migration is zero.** `changelog.d/` on disk contains exactly `.gitkeep`; `assemble-changelog.sh`'s final loop `rm -f`s every processed fragment, so the backlog is consumed at each release. (An earlier count of "712 fragments" was counting add+delete events in git history — 226 distinct tracked paths ever existed, none of them on disk now.) **Nothing needs renaming and `CHANGELOG.md` is never rewritten.**
+**F2 — migration is zero.** *(corrected 2026-08-15: this originally said `changelog.d/` "contains exactly `.gitkeep`." That was true when this PRD was written and is now false — `changelog.d/` holds `194.bugfix.md` and `339.feature.md`, both unreleased at the time of writing, plus this PRD's own `340.feature.md` added in M2. The substantive claim is unaffected: fragments are consumed and deleted at each release, so there is no historical backlog to migrate and nothing on disk needs renaming.)* `assemble-changelog.sh`'s final loop `rm -f`s every processed fragment, so the backlog is consumed at each release. (An earlier count of "712 fragments" was counting add+delete events in git history — 226 distinct tracked paths ever existed, none of them on disk now.) **Nothing needs renaming and `CHANGELOG.md` is never rewritten.**
 
 **F3 — `breaking` is a severity axis, not a work type.** It feeds the version bump (`analyze.sh:84-99`; CLAUDE.md rule 12 — breaking → minor while `0.x`). A `bug` can be breaking and so can a `prd`. Keeping it out of the work-type vocabulary avoids forcing a wrong classification on the first breaking bugfix.
 

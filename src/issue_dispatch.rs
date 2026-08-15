@@ -1107,6 +1107,27 @@ pub const TRIAGE_LABELS: [LabelSpec; 7] = [
     },
 ];
 
+/// The work-type vocabulary's GitHub-label surface (PRD fork#340 M5) —
+/// deliberately **one entry**. `bug`, `documentation` and `enhancement`
+/// already exist on GitHub with its own default colour/description, and
+/// [`label_create_argv`]'s `--force` PATCHes name/colour/description on
+/// every [`ensure_labels`](crate::issue_dispatch_run) run: adding any
+/// of those three here with our own wording would silently overwrite the
+/// repo-wide default on every dispatch. `chore` is the only work type with
+/// no existing label, so it is the only one safe to add. The gate itself
+/// (`cargo xtask work-type-check`) never reads labels — this is optional and
+/// decoupled by design, which is also why only `chore` needs to exist at
+/// all. Colour `d93f0b` (a solid orange) is chosen to sit outside both
+/// `TRIAGE_LABELS` ramps (red→green priority, blue size, plus the
+/// `needs-triage` purple) and outside GitHub's own `bug`/`documentation`/
+/// `enhancement` defaults, so it reads as its own category rather than an
+/// accidental near-match.
+pub const TYPE_LABELS: [LabelSpec; 1] = [LabelSpec {
+    name: "chore",
+    color: "d93f0b",
+    description: "Maintenance work with no user-facing surface.",
+}];
+
 /// Build the `gh label create` argv (arguments after `gh`) that idempotently
 /// ensures `label` exists on `repo` with the given `color`/`description`.
 /// `--force` updates the label in place if it is already there instead of
@@ -1547,6 +1568,17 @@ mod tests {
                 "7",
             ]
         );
+    }
+
+    #[test]
+    fn type_labels_contains_only_chore() {
+        // M5: `bug`, `documentation` and `enhancement` already exist on
+        // GitHub with their own default colour/description, and
+        // `label_create_argv`'s `--force` would silently overwrite them on
+        // every dispatch run if they were listed here too. `chore` is the
+        // only work type with no pre-existing label.
+        assert_eq!(TYPE_LABELS.len(), 1);
+        assert_eq!(TYPE_LABELS[0].name, "chore");
     }
 
     #[test]
