@@ -732,8 +732,16 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
 /// command-mode only and re-entering `PaneInput` itself snaps scrollback to
 /// live output), and confirm a further dropped paste does not yank the view
 /// back to live output. Finally, in one burst, drop a paste and immediately
-/// unlock-and-forward an Enter-bearing keystroke, timing its arrival to prove
-/// the drop left no `SUBMIT_DEBOUNCE` (150ms) state behind for it to trip.
+/// unlock-and-forward a bare Enter — with a visible marker sent only AFTER
+/// the Enter, since anything forwarded before it (even the marker itself)
+/// would debounce it unconditionally and mask the very thing being tested —
+/// proving the drop left no `SUBMIT_DEBOUNCE` (150ms) state behind for it to
+/// trip. Not by comparing its arrival time against a fixed bound (render and
+/// harness-polling latency for the whole burst can itself run past 150ms on
+/// a loaded CI runner, making any fixed bound either flaky or vacuous), but
+/// by comparing it against a plain control keystroke's round trip measured
+/// moments later on the same runner, canceling the runner's shared baseline
+/// instead of hard-coding one.
 #[spec("orchestration/lock/017")]
 #[test]
 fn lock_017_paste_gated_by_lock_state() {
@@ -744,6 +752,11 @@ fn lock_017_paste_gated_by_lock_state() {
     const REGATED_PASTE_SENTINEL: &str = "LOCK017_REGATED_PASTE_5b18";
     const TIMING_DROP_SENTINEL: &str = "LOCK017_TIMING_DROP_7ee2";
     const TIMING_SENTINEL: &str = "LOCK017_TIMING_e04d";
+    const CONTROL_SENTINEL: &str = "LOCK017_CONTROL_b3af";
+    // Never sent to the grid; polling for it up to a timeout is this test's
+    // Decision-21-compliant substitute for a bare `std::thread::sleep`,
+    // which `cargo xtask linkage-check` forbids in e2e test bodies.
+    const NEVER_APPEARS_SENTINEL: &str = "LOCK017_NEVER_APPEARS_1a0e9c3f";
 
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
@@ -874,32 +887,98 @@ fn lock_017_paste_gated_by_lock_state() {
 
     // --- Part 3: the drop must also leave last_pane_keystroke_at untouched,
     // so a genuinely forwarded Enter right after it is not needlessly
-    // debounced (SUBMIT_DEBOUNCE == 150ms). Concatenated into ONE write so
-    // the deck's own event processing — not this test's IPC round trips —
-    // sets the gap between the drop and the forward.
+    // debounced (SUBMIT_DEBOUNCE == 150ms).
+    //
+    // The visible marker text goes AFTER the tested `\r`, not before it.
+    // Every forwarded byte — including an ordinary printable character,
+    // per the unconditional restamp at src/ui.rs:10953 — updates
+    // `last_pane_keystroke_at`, and the existing unit test
+    // `enter_following_recent_keystroke_sleeps_at_least_debounce_minus_elapsed`
+    // (src/ui.rs) pins that ANY recently-forwarded keystroke debounces the
+    // Enter that follows it, regardless of what that keystroke was. Typing
+    // the marker BEFORE the `\r` would make the `\r` see its own
+    // just-typed marker text as "the recent keystroke," debouncing it
+    // UNCONDITIONALLY — passing or failing on a signal that has nothing to
+    // do with the dropped paste. Sending `\r` first, with nothing
+    // forwarded in between it and the (denied) drop but the mode-toggle
+    // keys — which are not `Action::ForwardToPane` and so never touch the
+    // timestamp — means its debounce check reflects ONLY what the drop
+    // did or did not do. The marker that follows it is free to restamp
+    // harmlessly, since by then the tested check has already run; it
+    // exists purely so this test can observe that the whole burst,
+    // `\r` included, has been processed and rendered.
+    //
+    // Concatenated into ONE write so the deck's own event processing —
+    // not this test's IPC round trips — sets the (near-zero, if buggy)
+    // gap between the drop and the `\r`: splitting this into
+    // separately-confirmed sends would let real wall-clock time pass
+    // between the (potential) stamp and the forward, which would let even
+    // a genuine regression sail under SUBMIT_DEBOUNCE's 150ms window
+    // undetected — the debounce check only ever compares against the
+    // MOST RECENT stamp, so a stale one is invisible to it by design.
     let mut burst = format!("\x1b[200~{TIMING_DROP_SENTINEL}\x1b[201~"); // dropped, still locked
     burst.push('\x04'); // Ctrl+d -> command mode
     burst.push('\x05'); // Ctrl+e -> unlock
     burst.push('\x04'); // Ctrl+d -> back to PaneInput, now unlocked
-    burst.push_str(&format!("{TIMING_SENTINEL}\r"));
+    burst.push('\r'); // the tested keystroke: nothing forwarded before it but the drop
+    burst.push_str(TIMING_SENTINEL); // marker AFTER `\r`, so it cannot contaminate its debounce check
 
-    let sent_at = std::time::Instant::now();
+    let timed_start = std::time::Instant::now();
     deck.send_keys(burst.as_bytes());
     let observed = deck.wait_for_grid_string_within(TIMING_SENTINEL, Duration::from_secs(2));
-    let elapsed = sent_at.elapsed();
+    let timed_elapsed = timed_start.elapsed();
     assert!(
         observed,
         "the timing sentinel never reached the grid at all.\nGrid:\n{}",
         deck.snapshot_grid()
     );
+
+    // CONTROL: the same shape — a bare Enter, then a marker — sent only
+    // once SUBMIT_DEBOUNCE's 150ms window since the last genuinely
+    // forwarded byte (the timing `\r` above, which always stamps
+    // regardless of this test's outcome — src/ui.rs:10953) has
+    // unquestionably elapsed. This round trip's own latency is therefore
+    // guaranteed debounce-free and stands purely for "what does an
+    // unremarkable round trip cost right now, on this runner" — the same
+    // render + harness-polling pipeline the timed round trip above went
+    // through, measured moments later under the same load. A fixed
+    // absolute bound cannot separate that shared, load-driven baseline
+    // from a genuine 150ms debounce sleep: CI observed 433/484/678ms for
+    // this test's PRIOR form (marker BEFORE `\r`, production code
+    // confirmed not to stamp on a drop), strictly rising across three
+    // retries with no code change in between — and that form additionally
+    // had the marker-before-`\r` defect above, so part of that number was
+    // a guaranteed, unconditional debounce rather than pure baseline
+    // noise. Comparing against this control cancels the baseline either
+    // way, without needing to disentangle the two.
+    let _ = deck.wait_for_grid_string_within(NEVER_APPEARS_SENTINEL, Duration::from_millis(200));
+    let control_start = std::time::Instant::now();
+    deck.send_keys(format!("\r{CONTROL_SENTINEL}").as_bytes());
+    let control_observed =
+        deck.wait_for_grid_string_within(CONTROL_SENTINEL, Duration::from_secs(2));
+    let control_elapsed = control_start.elapsed();
     assert!(
-        elapsed < Duration::from_millis(100),
+        control_observed,
+        "the control sentinel never reached the grid at all.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // A genuine SUBMIT_DEBOUNCE sleep is a synchronous ~150ms added directly
+    // to the timed round trip and nowhere else, so a 100ms margin above the
+    // control leaves ample room for ordinary measurement-to-measurement
+    // jitter between two round trips a few hundred milliseconds apart,
+    // while staying well short of the 150ms signal a regression would add.
+    assert!(
+        timed_elapsed < control_elapsed + Duration::from_millis(100),
         "the Enter-bearing keystroke sent immediately after a DROPPED paste \
-         took {elapsed:?} to reach the grid — SUBMIT_DEBOUNCE is 150ms, so \
-         this implicates last_pane_keystroke_at having been stamped by the \
-         dropped paste. Event::Paste must not stamp it when \
-         gate_pane_input_key denies the write; only a genuinely forwarded \
-         keystroke may.\nGrid:\n{}",
+         took {timed_elapsed:?} to reach the grid, {:?} more than a plain \
+         control round trip measured moments later on this same runner \
+         ({control_elapsed:?}) — SUBMIT_DEBOUNCE is 150ms, so a gap this \
+         large above the runner's own current baseline implicates \
+         last_pane_keystroke_at having been stamped by the dropped paste. \
+         Event::Paste must not stamp it when gate_pane_input_key denies the \
+         write; only a genuinely forwarded keystroke may.\nGrid:\n{}",
+        timed_elapsed.saturating_sub(control_elapsed),
         deck.snapshot_grid()
     );
 }
