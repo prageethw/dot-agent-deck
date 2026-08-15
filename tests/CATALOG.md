@@ -62,18 +62,18 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the card-stats degradation thresholds (covered by `dashboard/card-stats/002` and `/004`); elapsed-time rollovers beyond the fixture's stable one-hour display.
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/007 — A Pi pane's card omits the agent-type badge, same as every other agent type (fork-only rename/hide, never pushed upstream — reverses PRD #201 M2.2 for this fork only).
+##### dashboard/pane/007 — A Pi pane's card omits the agent-type badge by default, same as every other agent type (fork-only rename/hide, never pushed upstream — reverses PRD #201 M2.2 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`-style buffer text assertion).
 - **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Pi` and no display name).
 - **Asserts:** a live Pi session with no friendly name renders its card title as the bare session id (`orch-01`), with NO `Pi` / `ClaudeCode` / `OpenCode` / `Codex` / `No agent` label text anywhere on the card and no cell carrying Pi's registry `badge_color` — a plain `pi` pane un-badged renders exactly like any other agent type, not falling back to showing its type name.
-- **Does not assert:** the status badge color (`status/badge/001`).
+- **Does not assert:** the status badge color (`status/badge/001`); the toggled-on state, where the badge does render (`dashboard/agent-badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/008 — Agent cards render with NO agent-type badge, even when they have friendly display names (fork-only rename/hide, never pushed upstream — reverses PRD #20 M7 / review finding 9 for this fork only).
+##### dashboard/pane/008 — Agent cards render with NO agent-type badge by default, even when they have friendly display names (fork-only rename/hide, never pushed upstream — reverses PRD #20 M7 / review finding 9 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
 - **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
 - **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain NO registry agent-type label text and NO cell anywhere on the card carries that agent's registry `badge_color`; complete color-aware buffers are snapshotted.
-- **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
+- **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`); the toggled-on state, where the badge does render (`dashboard/agent-badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/009 — A history-only session is visibly distinct from a live writable session (PRD #20 M4).
@@ -102,7 +102,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
 - **Layer:** L1 (in-process `AppState::aggregate_stats` + ratatui `TestBackend` stats render).
 - **Agent:** none (22 synthetic sessions: 14 Claude Code + 8 Codex).
-- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the breakdown was redundant anyway, since each card's status dot and label already summarize agent state (fork-only: cards no longer carry a registry-colored agent-type badge either).
+- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the breakdown was redundant anyway, since each card's status dot and label already summarize agent state (fork #339: cards can carry a registry-colored agent-type badge when the deck-global toggle is on, but that is off by default and this stats bar never renders one regardless).
 - **Does not assert:** priority-ordered truncation for bars too narrow even for the status counts, or exact badge colors.
 - **Platform coverage:** mac+linux+windows.
 
@@ -447,6 +447,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a Dashboard tab's default frame geometry is the fixed 33/67 split (`dashboard_area` / `panes_area` widths), distinct from Orchestration's 34/66; walking the pure `next_split_stage` resolver Default -> Narrow -> Hidden -> Default and recomputing the frame geometry at each step (via the single deck-global `ACTIVE_SPLIT_STAGE` thread-local, the SAME mirror `orchestration/layout/002` sets — no longer a Dashboard-only `ACTIVE_DASHBOARD_SPLIT_STAGE`) pins the 25/75 Narrow split, the 0/100 Hidden split (sidebar fully collapsed, pane column full-width), and the wrap back to the original 33/67 Default split.
 - **Does not assert:** the visible rendered grid (covered by the PTY-attached `tabs/dashboard/001`); cross-tab or cross-tab-type scoping (covered by `tabs/dashboard/001`); Orchestration-tab geometry (covered by `orchestration/layout/002`).
 - **Platform coverage:** mac+linux+windows.
+
+#### dashboard/agent-badge
+
+##### dashboard/agent-badge/001 — A session card shows the agent-type badge only when the deck-global toggle is on (fork #339 — restores `370b6228`'s removal behind an off-by-default toggle).
+- **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
+- **Agent:** none (a live Codex fixture rendered through `render_card_for_mode_to_buffer`, plus named ClaudeCode / OpenCode / Pi / Codex / Devin fixtures).
+- **Asserts:** with the toggle off, no card shows its agent-type label and no cell carries that agent's registry `badge_color`; with the toggle on, the card shows `<Label> · <name>` and a cell carries `badge_color` **and** `Modifier::BOLD`, repeated across all five shipped agent types. Also pins D4: a placeholder (`AgentType::None`) card shows `No agent` exactly once (its unrelated status text) even with the toggle on, never a second occurrence from a restored identity segment.
+- **Does not assert:** the toggle's keybinding resolution (`keybindings/safety/005`); the deck-global state transition itself (`dashboard/agent-badge/002`); the real binary's default-hidden render path (`dashboard/agent-badge/003`); no hints-bar test (the bar already omits `Ctrl+L`/`Ctrl+E`); no button-bar test (D7 — the feature has no button).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/002 — `Action::ToggleAgentTypeBadge` cycles the deck-global toggle hidden -> shown -> hidden, and a bare `m` resolves to the same action without displacing `Enter`'s `Focus` resolution.
+- **Layer:** L1 (in-process `dispatch_action` / `handle_normal_key`, in-crate — `handle_normal_key` is private).
+- **Agent:** none.
+- **Asserts:** a fresh `UiState` starts with the badge hidden; dispatching the toggle once shows it and sets `ui.status_message` to `"Agent badge: shown"`; dispatching again hides it and sets `"Agent badge: hidden"`; `handle_normal_key` resolves a bare `m` (no modifiers) to `Action::ToggleAgentTypeBadge`; `handle_normal_key` still resolves `Enter` to `Action::Focus`.
+- **Does not assert:** the rendered card difference (`dashboard/agent-badge/001`); the real binary's key dispatch (`dashboard/agent-badge/003`); no `keybindings/help/002` (the help overlay's rendering of `toggle_agent_type_badge` is unpinned — `keybindings/help/001`'s remapped-config snapshot remaps `toggle_layout` and `help`, not this binding, so it proves nothing about it).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/003 — Pressing `m` toggles the agent-type badge on every card through the real binary, proving both the deck-global reach and the bare-`m` alias as the door that works everywhere.
+- **Layer:** L2 (PTY end-to-end).
+- **Agent:** none (synthetic Claude Code + Codex `SessionStart` hooks).
+- **Asserts:** both cards' agent-type labels are absent at rest (default hidden — the only coverage of default-hidden through the real `render_frame`, which no L1 seam reaches); pressing `m` shows `"Agent badge: shown"` in the status bar and both labels appear; pressing `m` again shows `"Agent badge: hidden"` and both labels disappear. Presses only `m`, never `\x0d` — under a legacy PTY `Ctrl+M` decodes as Enter and `FocusPane` wins first (by design).
+- **Does not assert:** the enhanced-terminal `Ctrl+M` chord path (covered by `keybindings/safety/005`'s key-mapper assertion — no PTY harness here emulates the kitty keyboard protocol); real-agent execution.
+- **Platform coverage:** mac+linux.
 
 ### Statuses
 
@@ -2683,6 +2706,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
 - **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/safety/005 — `Ctrl+M` resolves to the agent-badge toggle only in command mode; PaneInput always forwards it as the CR submit byte, never the toggle (fork #339 — the highest-severity guard in the change).
+- **Layer:** L1 (in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** looping over every `UiMode` variant, `Ctrl+M` resolves to `Action::ToggleAgentTypeBadge` if and only if the mode is `Normal`; `PaneInput` + `Ctrl+M` forwards the exact byte `0x0d` to the PTY and is never claimed as the toggle; `PaneInput` + a bare `m` forwards `b'm'` as plain input; `Normal` + `Enter` is never claimed by the global command layer.
+- **Does not assert:** the bare-`m` alias in command mode (`dashboard/agent-badge/002`); the real PTY's decoding of `Ctrl+M` as `Enter` under a legacy terminal (`dashboard/agent-badge/003` presses `m`, never `\x0d`, for exactly this reason).
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/unbind
