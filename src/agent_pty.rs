@@ -2489,10 +2489,16 @@ pub struct AgentPtyRegistry {
     /// PRD #127 M2.2 (deliver-on-idle) + issue #424 F1: what each pane's input
     /// box is holding — the user-keystroke clock the scheduler's reuse path
     /// debounces on, and the record of what THIS daemon's guarded sends put
-    /// there. Together they answer the one question a submit-only probe and the
-    /// one bounded replacement payload have to ask before they fire — "is what
-    /// the target is holding still OUR payload, or has the user typed since?" —
-    /// out of clocks the daemon owns rather than ones a producer can assert.
+    /// there. Together they answer the one question a submit-only probe has to
+    /// ask before it fires — "is what the target is holding still OUR payload,
+    /// or has the user typed since?" — out of clocks the daemon owns rather
+    /// than ones a producer can assert. As of fork #194
+    /// ([`crate::prompt_delivery::MAX_PAYLOAD_SUBMISSIONS`] = 1) every attempt
+    /// past the first is a probe, so the equivalent question for a bounded
+    /// replacement payload ([`Self::user_typed_since_writing_payload`]) no
+    /// longer arises in practice — kept for the follow-up in
+    /// `docs/develop/fork-sync-workflow.md` that recovers a launcher-consumed
+    /// first write by evidence rather than attempt count.
     ///
     /// An `Arc` because every agent's [`PaneWriter`] holds the same state: that
     /// is what makes the user-input stamp atomic with respect to writer handoff
@@ -3436,7 +3442,7 @@ impl AgentPtyRegistry {
     /// question any of the existing guards answer. Identity, generation, writer
     /// serialization and the deadline all establish WHICH PANE the delivery may
     /// touch; none of them says anything about what the pane's input editor is
-    /// currently holding. Attempts 3 and later write an EMPTY payload plus a
+    /// currently holding. Attempt 2 and later write an EMPTY payload plus a
     /// submit CR ([`crate::prompt_delivery::attempt_writes_payload`]), whose
     /// entire effect is "submit whatever is in the box". That is exactly right
     /// while the box still holds the payload we wrote and wrong the moment it

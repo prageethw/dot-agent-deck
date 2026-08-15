@@ -2056,9 +2056,13 @@ pub(crate) struct SessionStartWait {
     /// producer that identifies itself only AFTER our bytes can legitimately be
     /// this delivery's target, because the launcher CONSUMED those bytes and the
     /// agent behind it is the authorized successor. It is the same single
-    /// handoff [`latch_generation`] already permits for the generation, and the
-    /// only reason the one replacement payload exists at all
-    /// ([`crate::prompt_delivery::attempt_writes_payload`]).
+    /// handoff [`latch_generation`] already permits for the generation. Before
+    /// fork #194 it was also the only reason the one bounded replacement
+    /// payload existed at all
+    /// ([`crate::prompt_delivery::attempt_writes_payload`]); with
+    /// `MAX_PAYLOAD_SUBMISSIONS` now 1, that write no longer fires, so a
+    /// launcher-consumed first write is a case the follow-up in
+    /// `docs/develop/fork-sync-workflow.md` still has to recover.
     ///
     /// Recorded even when the window then TIMES OUT, which is the whole point:
     /// `scheduler/dispatch/015`'s bootstrap launcher declares itself, holds the

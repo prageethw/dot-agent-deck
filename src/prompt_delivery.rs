@@ -78,31 +78,39 @@ const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
 /// later attempts fall back to the submit-only probe
 /// ([`attempt_writes_payload`]).
 ///
-/// Two, and each one is load-bearing:
+/// One. A retry targets a write whose bytes already reached the pane's PTY — a
+/// confirmation timing out does not mean the payload was lost, only that no
+/// [`EventType::Thinking`](crate::event::EventType::Thinking) has confirmed it
+/// yet — so re-typing the whole prompt on a later attempt duplicates it in a
+/// composer that already holds it (fork #194). Only the FIRST attempt writes the
+/// payload; every attempt after that probes: it leaves the pending bytes alone
+/// and simply asks the TUI to submit what it already holds.
 ///
-/// * the FIRST write is the delivery itself;
-/// * the SECOND is the one bounded REPLACEMENT payload. It has to exist because
-///   a launcher genuinely CONSUMES the first one — `scheduler/dispatch/015`'s
-///   bootstrap wrapper reads the bytes itself and the agent that starts behind it
-///   never sees them — so a delivery that only ever probed submit after attempt 1
-///   could never deliver in that case at all;
-/// * every attempt after that probes. By then a payload may be sitting unsubmitted
-///   in the agent's input box, and appending the whole prompt again is what
-///   produced the observed `seedseed` accumulation.
-const MAX_PAYLOAD_SUBMISSIONS: u32 = 2;
+/// **The accepted trade.** A value of 2 also recovered a bootstrap launcher that
+/// genuinely CONSUMES the first write — `scheduler/dispatch/015`'s bootstrap
+/// wrapper reads the bytes itself and the agent that starts behind it never sees
+/// them — by re-sending it as a bounded replacement payload on attempt 2. Setting
+/// this to 1 gives that recovery up; `scheduler/dispatch/015` is expected to
+/// regress as a result (it is a real-agent test that self-skips in CI for lack of
+/// credentials, so it will not turn the board red). That case is deliberately
+/// deferred to a follow-up that recovers it by **evidence** — confirming whether
+/// the launcher actually consumed the bytes — rather than by attempt count, since
+/// attempt count cannot tell the "launcher consumed it" case apart from the
+/// "composer already holds it" case this fix addresses.
+const MAX_PAYLOAD_SUBMISSIONS: u32 = 1;
 
 /// Whether attempt `attempt` (1-based) of a delivery writes the prompt PAYLOAD,
 /// or only probes submission.
 ///
-/// Issue #424 (both reviewers, D5). A retry existed for one reason — the submit
-/// CR may have been swallowed by a still-booting agent TUI — but it was
+/// Issue #194 / #424 (both reviewers, D5). A retry existed for one reason — the
+/// submit CR may have been swallowed by a still-booting agent TUI — but it was
 /// implemented as "type the whole prompt again", which is only the right recovery
-/// when the first payload never landed. When the payload DID land and only its CR
-/// was eaten, the payload is still sitting in the input box, so retyping appends a
-/// second copy and the agent eventually submits `seedseed`: a corrupted task, and
-/// one the confirmation matcher then rejects, which leaves the loop armed and
-/// types a THIRD copy. Probing submit instead leaves the pending bytes alone and
-/// simply asks the TUI to submit what it already holds.
+/// when the first payload never landed. In the common case the payload DID land
+/// and only its CR was eaten, so the payload is already sitting in the input box:
+/// retyping appends a second copy and the agent eventually submits `seedseed`, a
+/// corrupted task that the confirmation matcher then rejects, leaving the loop
+/// armed to type a THIRD copy. Probing submit instead leaves the pending bytes
+/// alone and simply asks the TUI to submit what it already holds.
 ///
 /// The probe is not a weaker write: it goes through the same identity-guarded,
 /// writer-serialized, deadline-bounded path as an ordinary attempt and classifies
@@ -252,10 +260,13 @@ pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
 /// claiming the delivery landed cleanly would not be.
 ///
 /// This is a SAFETY NET, not the remedy. The remedy is [`attempt_writes_payload`]
-/// — not producing the accumulation in the first place. The net exists because
-/// prevention starts at attempt 3 and the doubling can already have happened by
-/// then, and because a delivery whose first payload was consumed by a launcher
-/// still writes one replacement.
+/// — not producing the accumulation in the first place; with only the first
+/// attempt writing a payload (fork #194), ordinary delivery cannot double a
+/// prompt on its own. The net stays because doubling is still reachable from
+/// outside this module's own bookkeeping — e.g. a stale confirmation arriving
+/// late for a prompt that was independently retyped by another path — and
+/// because it is what stops a THIRD copy once a doubled turn has already been
+/// observed, per the paragraph above.
 pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
     let expected = normalize_for_match(expected);
     let reported = normalize_for_match(reported);
