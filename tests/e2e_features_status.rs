@@ -41,8 +41,10 @@ fn bin() -> &'static str {
 /// `features_config_path()` resolves against) and `extra_env` applied on top
 /// of a scrubbed environment. No daemon is involved — `features status` is a
 /// pure config read — so this needs no socket/HOME isolation beyond keeping
-/// the resolution off the developer's real cwd and env.
-fn run_features_status(dir: &Path, extra_env: &[(&str, &str)]) -> (std::process::Output, String) {
+/// the resolution off the developer's real cwd and env. Asserts a clean exit
+/// itself (identical across every caller) and returns the combined
+/// stdout/stderr text for the caller's own value-specific assertions.
+fn run_features_status(dir: &Path, extra_env: &[(&str, &str)]) -> String {
     let mut cmd = Command::new(bin());
     cmd.args(["features", "status"]);
     cmd.current_dir(dir);
@@ -57,12 +59,17 @@ fn run_features_status(dir: &Path, extra_env: &[(&str, &str)]) -> (std::process:
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let out = cmd.output().expect("spawn dot-agent-deck features status");
-    let combined = format!(
+    let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    (out, combined)
+    assert!(
+        out.status.success(),
+        "features status should exit 0, got {:?}\n{text}",
+        out.status.code()
+    );
+    text
 }
 
 /// Run the TUI entry point far enough to hit `init_and_watch` and the daemon
@@ -120,13 +127,8 @@ fn run_tui_startup_isolated(
 #[test]
 fn status_001_env_override_wins() {
     let dir = common::race_safe_tempdir();
-    let (out, text) = run_features_status(dir.path(), &[("DOT_AGENT_DECK_EXPERIMENTAL", "1")]);
+    let text = run_features_status(dir.path(), &[("DOT_AGENT_DECK_EXPERIMENTAL", "1")]);
 
-    assert!(
-        out.status.success(),
-        "features status should exit 0, got {:?}\n{text}",
-        out.status.code()
-    );
     assert!(
         text.contains("DOT_AGENT_DECK_EXPERIMENTAL env override"),
         "expected the env override to be named as the winning source, got:\n{text}"
@@ -152,13 +154,8 @@ fn status_002_project_file_found() {
     )
     .expect("write project config");
 
-    let (out, text) = run_features_status(dir.path(), &[]);
+    let text = run_features_status(dir.path(), &[]);
 
-    assert!(
-        out.status.success(),
-        "features status should exit 0, got {:?}\n{text}",
-        out.status.code()
-    );
     assert!(
         text.contains("config path exists: true"),
         "expected the project file to be found, got:\n{text}"
@@ -183,13 +180,8 @@ fn status_002_project_file_found() {
 #[test]
 fn status_003_no_config_found_defaults_off() {
     let dir = common::race_safe_tempdir();
-    let (out, text) = run_features_status(dir.path(), &[]);
+    let text = run_features_status(dir.path(), &[]);
 
-    assert!(
-        out.status.success(),
-        "features status should exit 0, got {:?}\n{text}",
-        out.status.code()
-    );
     assert!(
         text.contains("config path exists: false"),
         "expected no config file to be found, got:\n{text}"
@@ -311,7 +303,7 @@ fn status_004_override_names_override_target() {
     std::fs::write(&override_path, "[features]\nexperimental = true\n")
         .expect("write override config");
 
-    let (out, text) = run_features_status(
+    let text = run_features_status(
         dir.path(),
         &[(
             "DOT_AGENT_DECK_FEATURES_CONFIG",
@@ -319,11 +311,6 @@ fn status_004_override_names_override_target() {
         )],
     );
 
-    assert!(
-        out.status.success(),
-        "features status should exit 0, got {:?}\n{text}",
-        out.status.code()
-    );
     assert!(
         text.contains("DOT_AGENT_DECK_FEATURES_CONFIG override"),
         "expected the override to be named as the winning path source, got:\n{text}"
