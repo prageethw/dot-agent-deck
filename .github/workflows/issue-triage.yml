@@ -1,0 +1,39 @@
+name: Issue Triage Labels
+
+on:
+  issues:
+    types: [opened, reopened, labeled, unlabeled]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stamp or clear needs-triage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          ISSUE_LABELS_JSON: ${{ toJSON(github.event.issue.labels) }}
+        run: |
+          has_priority=$(jq -r 'any(.[]; .name | startswith("priority-"))' <<<"$ISSUE_LABELS_JSON")
+          has_size=$(jq -r 'any(.[]; .name | startswith("size-"))' <<<"$ISSUE_LABELS_JSON")
+          has_needs_triage=$(jq -r 'any(.[]; .name == "needs-triage")' <<<"$ISSUE_LABELS_JSON")
+
+          if [ "$has_priority" = "false" ] && [ "$has_size" = "false" ]; then
+            if [ "$has_needs_triage" = "false" ]; then
+              echo "no priority-*/size-* label on #$ISSUE_NUMBER — adding needs-triage"
+              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label needs-triage
+            else
+              echo "needs-triage already present on #$ISSUE_NUMBER — nothing to do"
+            fi
+          else
+            if [ "$has_needs_triage" = "true" ]; then
+              echo "priority-*/size-* now present on #$ISSUE_NUMBER — removing needs-triage"
+              gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-triage
+            else
+              echo "priority-*/size-* present, needs-triage absent — nothing to do"
+            fi
+          fi

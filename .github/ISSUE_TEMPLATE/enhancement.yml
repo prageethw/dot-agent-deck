@@ -1,0 +1,53 @@
+name: Enhancement request
+description: Propose a new feature or an improvement to existing behavior.
+title: "[enhancement]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This form cannot apply a `size-*`/`priority-*` label itself — GitHub
+        issue forms can't turn a dropdown answer into a label — so your
+        answers below land in the issue body, and this repo's
+        `issue-triage.yml` workflow adds `needs-triage` automatically until
+        someone applies the matching labels by hand. Picking "Not sure"
+        leaves it at `needs-triage` on purpose.
+  - type: textarea
+    id: description
+    attributes:
+      label: What do you want, and why?
+      description: The problem this solves and, if you have one, the shape of the solution.
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: >-
+        How much work does this look like? This does not directly apply the
+        matching `size-*` GitHub label — GitHub issue forms cannot do that —
+        so a maintainer (or you, if you have label-write access) applies it
+        by hand from this answer. See CLAUDE.md rule 26.
+      options:
+        - size-high — large amount of work
+        - size-medium — moderate amount of work
+        - size-low — small amount of work
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: >-
+        How urgent is this? Same caveat as Size — this records your answer,
+        it does not apply the label. If you are not confident, choose "Not
+        sure" rather than guessing: a wrong priority is worse than an absent
+        one (CLAUDE.md rule 26).
+      options:
+        - priority-high
+        - priority-medium
+        - priority-low
+        - Not sure
+    validations:
+      required: true
