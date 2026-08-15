@@ -1535,7 +1535,11 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<Pa
     let mut hasher = DefaultHasher::new();
     canonical_worktree_dir.as_os_str().hash(&mut hasher);
     let hash = hasher.finish();
-    let basename = worktree_dir
+    // Derived from the SAME canonical path as the hash (fork #331 audit
+    // F5), not the raw `worktree_dir` — two spellings whose `file_name()`
+    // differs but whose canonical form matches would otherwise hash
+    // identically under different filenames and so not contend.
+    let basename = canonical_worktree_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("worktree");
@@ -1553,6 +1557,19 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<Pa
 /// lock, and proceeding on a guess risks silently under-serializing (or, pre-
 /// fix, an outright `ENOTDIR`) — the exact defect this function exists to
 /// close.
+///
+/// NOTE (fork #331 audit F1, left as-is): unlike every other `git` call in
+/// `create_worktree_sync`, this one runs through plain `Command::output()`
+/// with no timeout, on the same synchronous TUI render/event loop S1 just
+/// bounded the lock acquisition on — and it runs BEFORE that acquisition.
+/// `git rev-parse --git-common-dir` is a cheap local metadata read (no
+/// network, no hooks, no ref locks, no index), so the odds of it wedging are
+/// far below `git worktree add`'s, but a stalled filesystem under the repo
+/// would still freeze the TUI here with no bound and no cancel. Bounding it
+/// properly needs a synchronous *capture* helper that does not exist today —
+/// `run_status_sync` returns no stdout, and `run_capture`/`run_capture_args`
+/// are `async` — so this is deliberately left unbounded rather than adding
+/// that helper in this fix. Tracked as a follow-up rather than fixed here.
 fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
     let out = std::process::Command::new("git")
         .current_dir(clone_dir)
@@ -1561,19 +1578,46 @@ fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
         .map_err(|e| {
             format!("failed to run git rev-parse --git-common-dir in {clone_dir:?}: {e}")
         })?;
-    if !out.status.success() {
+    if out.status.success() {
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if dir.is_empty() {
+            return Err(format!(
+                "git rev-parse --git-common-dir in {clone_dir:?} printed no output"
+            ));
+        }
+        return Ok(PathBuf::from(dir));
+    }
+
+    // `--path-format` requires git >= 2.31 (March 2021, and undocumented
+    // anywhere in this repo as a minimum version); an older git rejects the
+    // flag outright, which would otherwise turn this into the first FATAL
+    // failure on a `clone_dir` that `main` handled fine (fork #331 audit
+    // F3). Retry without it: plain `--git-common-dir` prints a path
+    // relative to `clone_dir` for the main working tree, and an absolute
+    // path for a linked worktree / `--separate-git-dir` checkout /
+    // submodule — `Path::join` handles both (an absolute `dir` replaces
+    // `clone_dir` outright; a relative one joins onto it), so one fallback
+    // covers every shape the flagged call did.
+    let fallback = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|e| {
+            format!("failed to run git rev-parse --git-common-dir in {clone_dir:?}: {e}")
+        })?;
+    if !fallback.status.success() {
         return Err(format!(
             "git rev-parse --git-common-dir in {clone_dir:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&fallback.stderr).trim()
         ));
     }
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = String::from_utf8_lossy(&fallback.stdout).trim().to_string();
     if dir.is_empty() {
         return Err(format!(
             "git rev-parse --git-common-dir in {clone_dir:?} printed no output"
         ));
     }
-    Ok(PathBuf::from(dir))
+    Ok(clone_dir.join(dir))
 }
 
 /// Best-effort canonicalization for hashing purposes only (fork #331 audit
@@ -1583,16 +1627,32 @@ fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
 /// symlinks/relative components in the part of the path that DOES exist.
 /// Falls back to `path` unchanged if neither succeeds — never fatal, since
 /// this only affects whether two spellings of one target collide onto the
-/// same lock file, not whether the lock is taken at all.
+/// same lock file, not whether the lock is taken at all. Logs on the
+/// fallback (fork #331 audit F5): the parent that reaches this branch was
+/// just created by `ensure_worktree_parent_dir` moments earlier, so failing
+/// to canonicalize it is genuinely anomalous, and this is a mutual-exclusion
+/// primitive silently under-serializing — worth a greppable trace even
+/// though it is not worth making fatal.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
     }
     match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => parent
-            .canonicalize()
-            .map(|p| p.join(name))
-            .unwrap_or_else(|_| path.to_path_buf()),
+        (Some(parent), Some(name)) => {
+            parent
+                .canonicalize()
+                .map(|p| p.join(name))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "canonicalize_best_effort: falling back to the raw path; \
+                         racers computing this lock from differently-spelled \
+                         paths will not contend"
+                    );
+                    path.to_path_buf()
+                })
+        }
         _ => path.to_path_buf(),
     }
 }
@@ -3125,10 +3185,12 @@ exit 0
     /// one 2-way race. Asserts, for every trial, that at most one caller
     /// reports `Created`, that `git worktree list` shows the target path
     /// exactly once, and that `.git/worktrees/` holds exactly one admin
-    /// entry for it. `create_worktree_sync` holds no lock around the attach
-    /// path today, so on at least some trials git itself lets both callers
-    /// win, producing two `Created` results and two admin entries for one
-    /// on-disk path.
+    /// entry for it. `create_worktree_sync` now holds a lock around the
+    /// attach path for this same-process race, so this test pins that the
+    /// lock actually serializes both callers — without it, git itself would
+    /// let both win on at least some trials, producing two `Created`
+    /// results and two admin entries for one on-disk path.
+    #[cfg(unix)]
     #[spec("worktree/create/001")]
     #[test]
     fn create_001_concurrent_attach_never_double_creates() {
@@ -3310,7 +3372,8 @@ exit 0
 
         assert!(
             failures.is_empty(),
-            "fork issue #282: create_worktree_sync holds no lock around the attach path -- \
+            "fork issue #282: create_worktree_sync's attach-path lock failed to serialize \
+             concurrent callers -- \
              {double_created}/{TRIALS} trials produced more than one `Created`, \
              {duplicate_admin}/{TRIALS} trials left more than one `.git/worktrees` admin entry, \
              {duplicate_listed}/{TRIALS} trials showed the path more than once in `git worktree \
@@ -3332,6 +3395,7 @@ exit 0
     /// attach errored out before `git worktree add` ever ran — orchestration
     /// spawn failing outright from the exact working directory rule 1
     /// mandates. Asserts the attach succeeds.
+    #[cfg(unix)]
     #[spec("worktree/create/002")]
     #[test]
     fn create_002_attach_succeeds_from_inside_a_linked_worktree() {

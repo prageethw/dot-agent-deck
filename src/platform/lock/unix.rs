@@ -95,7 +95,15 @@ pub fn acquire_spawn_lock_sync_bounded(
         .mode(0o600)
         .open(path)?;
 
-    let deadline = Instant::now() + timeout;
+    // `Instant + Duration` panics on overflow (fork #331 audit F4) -- the
+    // mirror-image of the Windows twin's `u32::MAX` sentinel trap. No
+    // reachable caller passes a `timeout` anywhere near that large today,
+    // but saturating to a distant-but-valid deadline keeps this fail-closed
+    // (a bounded, if generous, wait) instead of panicking the caller.
+    const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 50);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(|| Instant::now() + FAR_FUTURE);
     loop {
         // SAFETY: same as `acquire_spawn_lock_sync` — valid fd, valid op
         // constant; flock(2) does not retain any reference to the address

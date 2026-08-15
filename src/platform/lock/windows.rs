@@ -230,7 +230,10 @@ impl Drop for PathLock {
 pub fn acquire_path_lock_sync_bounded(path: &Path, timeout: Duration) -> std::io::Result<PathLock> {
     let user = crate::platform::paths::endpoint_user_suffix();
     let name = super::spawn_mutex_name(&user, path);
-    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // `u32::MAX` IS `INFINITE` (fork #331 audit F4) -- saturating a huge
+    // timeout onto it would silently turn a bounded wait unbounded, the
+    // opposite of this function's contract. Clamp one below it instead.
+    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
     let held = create_and_acquire(&name, &user, timeout_ms)?;
     Ok(PathLock { held, name })
 }
