@@ -3194,24 +3194,17 @@ without depending on the config struct API.
 - **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `orchestration/lock/008`/`011` carry the CI-visible coverage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 
-##### orchestration/lock/014 — With the `experimental` flag OFF (the default), the command-entry lock surface is absent entirely.
-- **Layer:** L2 (PTY end-to-end).
-- **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Deliberately launched WITHOUT `DOT_AGENT_DECK_EXPERIMENTAL`, unlike every other test in the file.
-- **Asserts:** on a real orchestration tab a keystroke typed at the focused non-orchestrator worker reaches its PTY with no unlock chord at all; the `Pane locked` message never appears; and `Ctrl+e` sent in command mode is not claimed, so no `Pane entry:` report is produced. This is the other side of the PRD #393 gate — a regression that shipped the lock unconditionally fails here rather than reaching every user silently.
-- **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
-- **Platform coverage:** mac+linux.
-
-##### orchestration/lock/015 — With NO project config discoverable anywhere (fork #346), the command-entry lock still holds — the mirror of `orchestration/lock/014`'s flag-off scenario, asserting the OPPOSITE outcome.
+##### orchestration/lock/015 — With NO project config discoverable anywhere (fork #346), the command-entry lock still holds.
 - **Layer:** L2 (PTY end-to-end).
 - **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Launched with `DOT_AGENT_DECK_FEATURES_CONFIG` pointed at a path that provably does not exist (a `project` subdirectory never created under a real tempdir), forcing `features_config_path()`'s override branch to resolve to a missing file — the same `load_features_file` "not found" branch a real ancestor walk hits when no `.dot-agent-deck.toml` exists anywhere above the process cwd, which is fork #346's reported scenario (a deck launched from the maintainer's home directory).
-- **Asserts:** on a real orchestration tab, a keystroke typed at the focused non-orchestrator worker pane does NOT reach its PTY and the `Pane locked` status message appears; the orchestrator pane's own input still reaches its PTY untouched. Currently FAILS — the lock is gated behind `features::show_command_entry_lock()`, which reads OFF here exactly as it does on a real config-less deck, so today the worker keystroke reaches its PTY and no lock message appears. Fork #346's fix (removing the gate) makes this pass unconditionally, matching `orchestration/lock/008`'s flag-on behaviour with no flag involved at all.
+- **Asserts:** on a real orchestration tab, a keystroke typed at the focused non-orchestrator worker pane does NOT reach its PTY and the `Pane locked` status message appears; the orchestrator pane's own input still reaches its PTY untouched. The lock is unconditional (fork #346's graduation), matching `orchestration/lock/008`'s behaviour with no flag or project config involved at all.
 - **Does not assert:** the `Ctrl+e` binding resolution in this same no-config scenario (`orchestration/lock/016`); the `WaitingForInput` carve-out (`orchestration/lock/006`/`011`).
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/lock/016 — With NO project config discoverable anywhere (fork #346), `Ctrl+e` from command mode on a real Orchestration tab is still claimed as `Action::ToggleOrchestrationLock` — the mirror of `orchestration/lock/009`'s command-mode proof, with no flag involved at all.
 - **Layer:** L2 (PTY end-to-end).
 - **Agent:** none (`orch-deck` fixture, two stub `cat` roles). Same `DOT_AGENT_DECK_FEATURES_CONFIG`-pointed-at-a-missing-path mechanism as `orchestration/lock/015`.
-- **Asserts:** `Ctrl+d` into command mode then `Ctrl+e` produces the deck's `Pane entry: unlocked` report. Currently FAILS — `Ctrl+e`'s binding resolution is scoped by `is_orchestration_tab && features::show_command_entry_lock()`, which is FALSE with no config present, so today the chord resolves to nothing and no `Pane entry:` report ever appears. Fork #346's fix makes this pass unconditionally.
+- **Asserts:** `Ctrl+d` into command mode then `Ctrl+e` produces the deck's `Pane entry: unlocked` report. `Ctrl+e`'s binding resolution is unconditional (fork #346's graduation), so it still resolves with no config present.
 - **Does not assert:** the forwarding gate itself (`orchestration/lock/015`); the caret-echo proof that `0x05` reaches a focused pane's PTY in `PaneInput` mode (`orchestration/lock/009`, unaffected by this flag either way since the orchestrator pane is never gated).
 - **Platform coverage:** mac+linux.
 
@@ -3271,13 +3264,6 @@ without depending on the config struct API.
 - **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
 - **Asserts:** with a real `TabManager`-opened 3-role Orchestration tab (`orchestrator` < `alpha` < `beta`), `beta` (higher role order) goes `WaitingForInput` and steals focus with no input pending, as `orchestration/focus/001` pins; `alpha` (LOWER role order than `beta`) then ALSO goes `WaitingForInput` on a frame where `input_pending` is true (modeling a keystroke still queued for `beta`) — the steal to `alpha` must be deferred, returning `None` and leaving focus on `beta`, not yanked away from the pane the queued keystroke is aimed at; once `input_pending` clears on a later frame, the deferred steer to `alpha` must still fire, proving the guard DEFERS the move rather than dropping it, mirroring `TabManager::auto_focus_all_clear`'s existing "no one-shot latch" contract. Drives `TabManager::auto_focus_locked(pane_status, input_pending)`, the seam that folds both `auto_focus_waiting_pane` and `auto_focus_all_clear` behind ONE shared `input_pending` guard mirroring the real per-frame call site's shape.
 - **Does not assert:** the real `src/ui.rs` per-frame call site actually computing `input_pending` from `crossterm::event::poll` or applying the result via `pane.focus_pane` (out of L1 `TabManager` reach — it would need a PTY-attached L2 test, and an L2 test was evaluated and rejected: the underlying terminal race is not economically reproducible there, since it requires a keystroke to be sitting in the terminal's input queue on the exact frame a lower-order pane transitions to `WaitingForInput`); the deck-global lock gate itself (`ui.command_entry_locked`, covered by `orchestration/focus/005`/`006`); the multi-waiter ordering contract, covered exhaustively by `orchestration/focus/001`/`004`.
-- **Platform coverage:** mac+linux+windows.
-
-##### orchestration/focus/009 — Turning the `experimental` flag OFF mid-session clears the waiting-episode latch, so re-enabling it replays no stale all-clear edge.
-- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`/`008`).
-- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
-- **Asserts:** with the flag on and the deck locked, `alpha` goes `WaitingForInput`, latching the episode and stealing focus; the flag then flips OFF (the watcher re-reads `.dot-agent-deck.toml` roughly every 2s, so this is reachable without a restart) and `alpha` resolves unobserved; on the first frame after the flag returns, no focus move may be produced. A latch left standing while the flag was off would read there as a stale `true` -> `false` all-clear and yank focus to the orchestrator for an episode already dealt with. Mirrors `orchestration/focus/006`, which pins the same contract for the `Ctrl+E` unlock — the flag is simply a second way to stop observing.
-- **Does not assert:** the real `src/ui.rs` per-frame call site (out of L1 `TabManager` reach, as `orchestration/focus/008` records); the gating of the keystroke path or the `Ctrl+E` binding (`orchestration/lock/014`).
 - **Platform coverage:** mac+linux+windows.
 
 #### orchestration/layout
