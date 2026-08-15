@@ -8,9 +8,8 @@ use tracing::warn;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, GuardedSendDetail};
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateResponse,
-    DelegateSignal, EventType, LiveTarget, OrchestrationSurface, WorkDoneSignal,
-    WorktreeKeptNotice, Writable,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
+    LiveTarget, OrchestrationSurface, WorkDoneSignal, WorktreeKeptNotice, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -2619,6 +2618,7 @@ pub(crate) async fn wait_for_prompt_submission(
                 }
             }
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            Ok(Ok(BroadcastMsg::WorktreeKept(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => return PromptWatch::Indeterminate,
             Ok(Err(broadcast::error::RecvError::Closed)) => return PromptWatch::Closed,
             Err(_) => return PromptWatch::Elapsed { can_report_prompts },
