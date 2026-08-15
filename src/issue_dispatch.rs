@@ -1111,7 +1111,7 @@ pub const TRIAGE_LABELS: [LabelSpec; 7] = [
 /// deliberately **one entry**. `bug`, `documentation` and `enhancement`
 /// already exist on GitHub with its own default colour/description, and
 /// [`label_create_argv`]'s `--force` PATCHes name/colour/description on
-/// every [`ensure_triage_labels`](crate::issue_dispatch_run) run: adding any
+/// every [`ensure_labels`](crate::issue_dispatch_run) run: adding any
 /// of those three here with our own wording would silently overwrite the
 /// repo-wide default on every dispatch. `chore` is the only work type with
 /// no existing label, so it is the only one safe to add. The gate itself

@@ -35,6 +35,19 @@
 //! success, and [`run_in`] must exit non-zero with a *distinct* code
 //! ([`EXIT_BASE_UNRESOLVABLE`]) rather than the generic rule-violation code
 //! ([`EXIT_RULE_VIOLATION`]) — otherwise this gate is empty on day one.
+//!
+//! # The merged-base skip (post-merge review finding B1)
+//!
+//! `ci.yml` also runs `build` on `push: [main]` (post-merge verification —
+//! see that trigger's own comment for why). On that event the resolved base
+//! and `HEAD` are the same commit: there is no diff, so there is nothing to
+//! classify. [`run_in`] treats `base_sha == HEAD` as a **printed skip**
+//! returning [`ExitCode::SUCCESS`], deliberately kept out of
+//! [`EXEMPT_BRANCH_PREFIXES`] — `main` is not a work-type-exempt branch, it
+//! is a diff with nothing left in it. Without this, every merge to `main`
+//! trips [`WorkTypeError::NoSupplier`] and the post-merge signal this repo
+//! depends on to catch a broken `main` (`ci.yml`'s own twelve-line
+//! rationale, naming the 2026-07-29 incident) trains everyone to ignore it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -47,7 +60,21 @@ use crate::list_tests::TestEntry;
 /// without a human (`ci.yml:14-16`), so a gate that blocked them would get
 /// disabled rather than obeyed. `sync/` and `upstream/` carry fork-sync
 /// commits, which are equally not a human's PR to label.
+///
+/// **This is advisory, not a security boundary (F3).** It is matched
+/// against the branch *name*, and any PR author can rename their branch to
+/// one of these prefixes to skip the gate — the unforgeable signal would be
+/// the PR *author* (`ci.yml`'s `changes` job already reads exactly that for
+/// Renovate), which this gate does not, because re-plumbing it to read the
+/// CI event payload would couple the binary to CI env and break the
+/// local-invocation property `CONTRIBUTING.md:55` protects. A PR still
+/// needs an approving human review to merge either way.
 const EXEMPT_BRANCH_PREFIXES: [&str; 3] = ["renovate/", "sync/", "upstream/"];
+
+/// The single source for the "N rules" count in [`describe_success`]'s
+/// success line and [`self_test`]'s case array length (N1) — one literal
+/// for one fact, rather than the two that used to drift independently.
+const RULE_COUNT: usize = 5;
 
 /// `git merge-base HEAD <base>` target when `--base` is not given.
 pub const DEFAULT_BASE: &str = "origin/main";
@@ -321,13 +348,39 @@ pub fn resolve_base(explicit: Option<&str>, repo_dir: &Path) -> Result<String, W
     Ok(sha)
 }
 
+/// `git rev-parse HEAD` in `repo_dir` — used only by the B1 merged-base skip
+/// in [`run_in`], which compares this against the resolved base to detect
+/// "nothing left in this diff to classify."
+fn current_head_sha(repo_dir: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git rev-parse HEAD: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err("git rev-parse HEAD returned empty output".to_string());
+    }
+    Ok(sha)
+}
+
 /// The testable core of `cargo xtask work-type-check`: parses `args`,
 /// derives the work type for the diff in `repo_dir` against the resolved
 /// base, and returns the process exit code — [`ExitCode::SUCCESS`],
 /// [`EXIT_RULE_VIOLATION`], or [`EXIT_BASE_UNRESOLVABLE`]. Split from
 /// [`run`] so a test can point it at a scratch git repo instead of the real
 /// one.
-pub fn run_in(args: &[String], repo_dir: &Path) -> ExitCode {
+///
+/// `branch_override`, when `Some`, is used verbatim instead of consulting
+/// [`current_branch`] (B2: a test built against a scratch repo must not
+/// have its branch silently overridden by `GITHUB_HEAD_REF`/`GITHUB_REF_NAME`
+/// — those are set from the *real* PR whenever this runs in CI, which is
+/// exactly the trap [`run_pipeline_for_self_test`]'s own doc comment
+/// already names). Production (`run`) always passes `None`.
+pub fn run_in(args: &[String], repo_dir: &Path, branch_override: Option<&str>) -> ExitCode {
     let parsed = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(msg) => {
@@ -344,12 +397,15 @@ pub fn run_in(args: &[String], repo_dir: &Path) -> ExitCode {
         return self_test();
     }
 
-    let branch = match current_branch(repo_dir) {
-        Ok(branch) => branch,
-        Err(e) => {
-            eprintln!("work-type-check: could not determine the current branch: {e}");
-            return ExitCode::from(EXIT_RULE_VIOLATION);
-        }
+    let branch = match branch_override {
+        Some(branch) => branch.to_string(),
+        None => match current_branch(repo_dir) {
+            Ok(branch) => branch,
+            Err(e) => {
+                eprintln!("work-type-check: could not determine the current branch: {e}");
+                return ExitCode::from(EXIT_RULE_VIOLATION);
+            }
+        },
     };
 
     if is_exempt_branch(&branch) {
@@ -372,6 +428,22 @@ pub fn run_in(args: &[String], repo_dir: &Path) -> ExitCode {
             return ExitCode::from(EXIT_RULE_VIOLATION);
         }
     };
+
+    // B1: a merged base has nothing left to classify — this is the exact
+    // shape of a post-merge `push: [main]` run (`resolve_base` walks to
+    // `HEAD` itself once `origin/main` already includes it). Kept distinct
+    // from `is_exempt_branch` above: `main` is not being treated as an
+    // exempt branch name, it is a diff with no content. A `current_head_sha`
+    // failure here is not this check's concern — it falls through and
+    // surfaces (correctly) wherever the pipeline below next needs `HEAD`.
+    if let Ok(head_sha) = current_head_sha(repo_dir)
+        && head_sha == base_sha
+    {
+        println!(
+            "work-type-check: skipped (a merged base has no work type to derive — branch '{branch}')"
+        );
+        return ExitCode::SUCCESS;
+    }
 
     let fragments = match collect_added_fragments(repo_dir, &base_sha) {
         Ok(fragments) => fragments,
@@ -402,10 +474,11 @@ pub fn run_in(args: &[String], repo_dir: &Path) -> ExitCode {
 }
 
 /// `cargo xtask work-type-check`'s entry point — [`run_in`] against the
-/// current directory.
+/// current directory, with no branch override (production always derives
+/// the branch from the environment/git, per [`current_branch`]).
 pub fn run(args: &[String]) -> ExitCode {
     let repo_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    run_in(args, &repo_dir)
+    run_in(args, &repo_dir, None)
 }
 
 struct ParsedArgs {
@@ -490,15 +563,20 @@ fn current_branch(repo_dir: &Path) -> Result<String, String> {
 }
 
 /// Every `changelog.d/*.md` fragment **added** (not modified, not deleted)
-/// between `base_sha` and `HEAD` — tier 1's supply. `--diff-filter=A` is
-/// load-bearing: a fragment merely touched by this diff (e.g. a rebase
-/// conflict resolution) is not "added in this diff" and must not count.
+/// between `base_sha` and `HEAD` — tier 1's supply. `--diff-filter=AR` is
+/// load-bearing on the `A` half: a fragment merely touched by this diff
+/// (e.g. a rebase conflict resolution) is not "added in this diff" and must
+/// not count. `R` is included and resolved to its *destination* path (F2):
+/// git's default rename detection reports a fragment suffix correction
+/// (`git mv 194.bugfix.md 500.feature.md`) as `R100`, not `A`, so `A` alone
+/// let a renamed-into-existence fragment through invisibly.
 fn collect_added_fragments(repo_dir: &Path, base_sha: &str) -> Result<Vec<AddedFragment>, String> {
     let out = Command::new("git")
         .args([
             "diff",
+            "-z",
             "--name-status",
-            "--diff-filter=A",
+            "--diff-filter=AR",
             base_sha,
             "HEAD",
             "--",
@@ -511,29 +589,53 @@ fn collect_added_fragments(repo_dir: &Path, base_sha: &str) -> Result<Vec<AddedF
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
 
-    let mut fragments: Vec<AddedFragment> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (_status, path) = line.split_once('\t')?;
-            let path = path.trim();
+    let mut fragments: Vec<AddedFragment> = parse_name_status_z(&out.stdout)
+        .into_iter()
+        .filter_map(|path| {
             if !path.ends_with(".md") {
                 return None;
             }
-            let file_name = Path::new(path).file_name()?.to_str()?;
+            let file_name = Path::new(&path).file_name()?.to_str()?.to_string();
             // "<stem>.<suffix>.md" — the suffix is whatever sits immediately
             // before the trailing ".md", however many dots the stem itself
             // carries (towncrier's `<issue>.<counter>.<suffix>.md` form).
             let mut segments = file_name.rsplitn(3, '.');
             segments.next()?; // "md"
             let suffix = segments.next()?.to_string();
-            Some(AddedFragment {
-                path: path.to_string(),
-                suffix,
-            })
+            Some(AddedFragment { path, suffix })
         })
         .collect();
     fragments.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(fragments)
+}
+
+/// Parse `git diff -z --name-status ...`'s NUL-separated output into the
+/// resulting path of each change — the *destination* path for a rename/copy
+/// (a status starting with `R`/`C`, which carries the old path then the new
+/// one), the sole path otherwise. `-z` is what makes this parseable at all
+/// (F1): git's default newline-separated `--name-status` C-quotes any
+/// non-ASCII or control byte in a path (`core.quotePath`, on by default),
+/// wrapping it in `"..."` with octal escapes — every caller here used to
+/// read that quoted form verbatim, so `starts_with`/`ends_with` against a
+/// bare prefix or suffix silently never matched and the file fell out of
+/// the gate entirely. `-z` disables the quoting.
+fn parse_name_status_z(stdout: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut fields = text.split('\0');
+    let mut paths = Vec::new();
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            continue; // trailing NUL after the last record
+        }
+        let Some(path) = fields.next() else { break };
+        if status.starts_with('R') || status.starts_with('C') {
+            let Some(dest) = fields.next() else { break };
+            paths.push(dest.to_string());
+        } else {
+            paths.push(path.to_string());
+        }
+    }
+    paths
 }
 
 /// The gate's own success line — names the derived type, the tier that
@@ -560,17 +662,30 @@ fn describe_success(
         }
     };
     format!(
-        "work type '{}' from {supplier}, base {base_sha}, 5 rules",
+        "work type '{}' from {supplier}, base {base_sha}, {RULE_COUNT} rules",
         derivation.work_type
     )
 }
 
 /// Run `git <args>` in `dir`, collapsing failure to a single message —
 /// [`self_test`]'s own scratch-repo setup, not the thing under test.
+///
+/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are pinned to `/dev/null` (S4): a
+/// developer's own `~/.gitconfig` — `commit.gpgsign = true`, a global
+/// `core.hooksPath`, an `init.templateDir` — would otherwise apply inside
+/// these scratch repos too and make `--self-test` fail (or run hooks) for
+/// reasons having nothing to do with the gate. CI carries neither file, so
+/// this is a no-op there; it only isolates the local-invocation property
+/// `CONTRIBUTING.md:55` protects. Each repo's own local `user.email`/
+/// `user.name` (set immediately after `git init` below) is unaffected — it
+/// lives in the scratch repo's own `.git/config`, never in the global/system
+/// files this points away from.
 fn run_git(args: &[&str], dir: &Path) -> Result<(), String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .map_err(|e| format!("invoke git {args:?}: {e}"))?;
     if !out.status.success() {
@@ -650,12 +765,19 @@ fn init_self_test_repo(dir: &Path) -> Result<(), String> {
 /// shown failing on broken cases immediately before the real invocation runs
 /// (`ci.yml:325-326`'s pattern for `work-type-check`).
 ///
-/// E5: none of these may decay into `assert!(derive("").is_err())`. Each
-/// case checks its own preconditions before trusting the result, so it fails
-/// loudly — rather than passing vacuously — if the case it builds ever stops
-/// violating.
+/// E5: none of these may decay into `assert!(derive("").is_err())` — each
+/// case matches a *specific* [`PipelineError`] variant, so a wrong-reason
+/// rejection reports FAILED rather than passing vacuously. **Only
+/// `self_test_r0` additionally checks its own precondition** (that its
+/// scratch branch still carries no recognized prefix) before trusting the
+/// result; R1–R4 rely on the variant match above for their protection
+/// instead. That is real and it is not nothing — a break in one rule's
+/// extraction glue surfaces as the *wrong* variant, not a silent pass — but
+/// it is weaker than R0's belt-and-braces check, and it does not mean each
+/// case isolates exactly the limb it names (see B4/R1's own fix, below, for
+/// a case that did not).
 fn self_test() -> ExitCode {
-    let cases: [fn() -> Result<String, String>; 5] = [
+    let cases: [fn() -> Result<String, String>; RULE_COUNT] = [
         self_test_r0,
         self_test_r1,
         self_test_r2,
@@ -691,7 +813,25 @@ fn self_test_r0() -> Result<String, String> {
 
     let branch = "self-test-r0-no-supplier";
     run_git(&["checkout", "-q", "-b", branch], dir)?;
-    // No further changes: this branch/diff supplies nothing to either tier.
+    // N6: a real change with no fragment and no branch prefix — an empty
+    // diff is a degenerate stand-in for the realistic violation this rule
+    // actually defends against ("real changes shipped with neither
+    // supplier"), not a proof of it.
+    std::fs::write(
+        dir.join("stray.txt"),
+        "R0 self-test: a real change with no changelog fragment and no branch prefix.\n",
+    )
+    .map_err(|e| format!("write stray.txt: {e}"))?;
+    run_git(&["add", "stray.txt"], dir)?;
+    run_git(
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "r0 self-test: real change, no fragment",
+        ],
+        dir,
+    )?;
 
     if branch_prefix_to_work_type(branch).is_some() {
         return Err(format!(
@@ -718,6 +858,17 @@ fn self_test_r0() -> Result<String, String> {
 /// R1: a `doc`-typed diff (supplied by the `docs/` branch prefix) that adds
 /// a `#[spec(` occurrence must be rejected as `DocAddsSpecTest` — the narrow
 /// negative limb.
+///
+/// **B4 fix:** the fixture's `#[spec(` line lives in `src/`, not `tests/`,
+/// and the diff also adds a `docs/` page — so this trips exactly the one
+/// limb it names (`adds_spec_attr`) rather than all three of R1's limbs at
+/// once (`touches_tests` would also fire from a `tests/` fixture, and
+/// `touches_doc_paths` would stay false with no `docs/` page in the diff at
+/// all). Before this fix the case only "passed" because `check_r1_doc`
+/// happens to test `adds_spec_attr` first — it could not tell "this limb
+/// works" apart from "some limb works." B3's fix (restricting the
+/// `adds_spec_attr` search to `.rs` files) is why the fixture must stay a
+/// `.rs` file rather than moving to Markdown.
 fn self_test_r1() -> Result<String, String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("could not create a scratch dir: {e}"))?;
     let dir = tmp.path();
@@ -725,13 +876,22 @@ fn self_test_r1() -> Result<String, String> {
 
     let branch = "docs/999001-self-test-r1";
     run_git(&["checkout", "-q", "-b", branch], dir)?;
-    std::fs::create_dir_all(dir.join("tests")).map_err(|e| format!("mkdir tests: {e}"))?;
+    std::fs::create_dir_all(dir.join("src")).map_err(|e| format!("mkdir src: {e}"))?;
+    std::fs::create_dir_all(dir.join("docs")).map_err(|e| format!("mkdir docs: {e}"))?;
     std::fs::write(
-        dir.join("tests/self_test_r1_fixture.rs"),
+        dir.join("src/self_test_r1_fixture.rs"),
         "#[spec(\"fixture/self-test/r1\")]\nfn placeholder() {}\n",
     )
-    .map_err(|e| format!("write tests/self_test_r1_fixture.rs: {e}"))?;
-    run_git(&["add", "tests/self_test_r1_fixture.rs"], dir)?;
+    .map_err(|e| format!("write src/self_test_r1_fixture.rs: {e}"))?;
+    std::fs::write(
+        dir.join("docs/self-test-r1.md"),
+        "R1 self-test fixture doc page — supplies the positive doc-paths limb.\n",
+    )
+    .map_err(|e| format!("write docs/self-test-r1.md: {e}"))?;
+    run_git(
+        &["add", "src/self_test_r1_fixture.rs", "docs/self-test-r1.md"],
+        dir,
+    )?;
     run_git(&["commit", "-q", "-m", "r1 self-test violation"], dir)?;
 
     match run_pipeline_for_self_test(dir, branch) {
@@ -1240,10 +1400,14 @@ fn check_rule(
     Ok(())
 }
 
-/// Every path changed (any status) between `base_sha` and `HEAD`.
+/// Every path changed (any status) between `base_sha` and `HEAD`. `-z`
+/// (F1) so a non-ASCII path is not C-quoted by `core.quotePath` — a quoted
+/// path begins and ends with `"`, so every `starts_with`/`ends_with` check
+/// downstream (`is_doc_path`, `is_test_path`) would otherwise silently fail
+/// to match and the file would fall out of R1 invisibly.
 fn changed_files(repo_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
     let out = Command::new("git")
-        .args(["diff", "--name-only", base_sha, "HEAD"])
+        .args(["diff", "-z", "--name-only", base_sha, "HEAD"])
         .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("invoke git diff --name-only {base_sha} HEAD: {e}"))?;
@@ -1251,17 +1415,26 @@ fn changed_files(repo_dir: &Path, base_sha: &str) -> Result<Vec<String>, String>
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.to_string())
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
         .collect())
 }
 
 /// Every path newly *added* between `base_sha` and `HEAD` — R2's "new page
 /// under docs/" must not count a file that already existed and was merely
-/// edited.
+/// edited. `-z` (F1), same reasoning and same NUL-safe parse as
+/// [`collect_added_fragments`].
 fn added_files(repo_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
     let out = Command::new("git")
-        .args(["diff", "--name-status", "--diff-filter=A", base_sha, "HEAD"])
+        .args([
+            "diff",
+            "-z",
+            "--name-status",
+            "--diff-filter=A",
+            base_sha,
+            "HEAD",
+        ])
         .current_dir(repo_dir)
         .output()
         .map_err(|e| {
@@ -1270,16 +1443,18 @@ fn added_files(repo_dir: &Path, base_sha: &str) -> Result<Vec<String>, String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.split_once('\t').map(|(_, p)| p.trim().to_string()))
-        .collect())
+    Ok(parse_name_status_z(&out.stdout))
 }
 
-/// Every line *added* by the diff between `base_sha` and `HEAD` (a unified-
-/// diff `+` line, excluding the `+++` file header), concatenated — R1's
-/// `adds_spec_attr` and R2's `adds_cli_flag` are both "did this diff add a
-/// line matching X" checks over that text.
+/// Every line *added* by the diff between `base_sha` and `HEAD`, restricted
+/// to hunks under `.rs` files (a unified-diff `+` line, excluding the `+++`
+/// file header), concatenated — R1's `adds_spec_attr` and R2's
+/// `adds_cli_flag` are both "did this diff add a line matching X" checks
+/// over that text, and both only care about Rust *source*, never prose that
+/// merely quotes the same syntax (B3: eight files on this branch alone quote
+/// `#[spec(` in Markdown — `CLAUDE.md`, `CONTRIBUTING.md`, `prds/*.md` — all
+/// on R1's positive `docs/**`/`prds/**` limb, so an unrestricted search
+/// rejected an ordinary docs PR as `DocAddsSpecTest`).
 fn added_diff_text(repo_dir: &Path, base_sha: &str) -> Result<String, String> {
     let out = Command::new("git")
         .args(["diff", base_sha, "HEAD"])
@@ -1289,9 +1464,22 @@ fn added_diff_text(repo_dir: &Path, base_sha: &str) -> Result<String, String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut in_rs_file = false;
+    Ok(text
         .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .filter(|l| {
+            if let Some(path) = l.strip_prefix("+++ b/") {
+                in_rs_file = path.ends_with(".rs");
+                return false;
+            }
+            if l.starts_with("+++ ") {
+                // "+++ /dev/null" — a deleted file, never a `.rs` addition.
+                in_rs_file = false;
+                return false;
+            }
+            in_rs_file && l.starts_with('+') && !l.starts_with("+++")
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -1304,9 +1492,14 @@ fn is_doc_path(path: &str) -> bool {
         || (!path.contains('/') && path.ends_with(".md"))
 }
 
-/// R1's narrow negative limb, the `tests/**` half.
+/// R1's narrow negative limb, the `tests/**` half. Excludes `tests/**/*.md`
+/// (S5): `tests/CATALOG.md` is prose documentation of the test suite, edited
+/// as doc work, and R3's own design already treats a CATALOG.md edit as not
+/// evidence of a test change ("a whitespace edit to CATALOG.md satisfies
+/// it" is the exact weakness R3 was sharpened to reject) — counting it as
+/// test-touching here would be inconsistent with that.
 fn is_test_path(path: &str) -> bool {
-    path.starts_with("tests/")
+    path.starts_with("tests/") && !path.ends_with(".md")
 }
 
 fn collect_doc_diff(repo_dir: &Path, base_sha: &str) -> Result<DocDiff, String> {
@@ -1401,6 +1594,11 @@ fn collect_bug_diff(
     let head_tests = collect_spec_sources_at(repo_dir, "HEAD")?;
     let delta = spec_test_delta(&base_tests, &head_tests);
 
+    // N3: deliberately the working tree, not `git show HEAD:<path>` like
+    // every other input in this module — `repo_dir` is always checked out
+    // at `HEAD` in both CI and `--self-test`'s scratch repos, so the two
+    // are identical in practice, and `.ok()?` fails *closed* on a missing
+    // file (no escape hatch found, rather than one silently assumed).
     let no_test_reason = fragments
         .iter()
         .filter(|f| suffix_to_work_type(&f.suffix) == Some(WorkType::Bug))
@@ -1685,7 +1883,16 @@ mod tests {
         git(&["config", "user.name", "test"], tmp.path());
         git(&["commit", "-q", "--allow-empty", "-m", "init"], tmp.path());
 
-        let code = run_in(&[], tmp.path());
+        // B2: pass the scratch repo's own branch explicitly rather than
+        // letting `run_in` fall back to `current_branch`, which prefers
+        // `GITHUB_HEAD_REF`/`GITHUB_REF_NAME` — set from the *real* PR
+        // whenever this runs in CI — over the checked-out branch here. Not
+        // exempt, so it does not take the skip path before reaching
+        // `resolve_base`.
+        let branch = "e1-unresolvable-base-scratch-branch";
+        git(&["checkout", "-q", "-b", branch], tmp.path());
+
+        let code = run_in(&[], tmp.path(), Some(branch));
         assert_ne!(
             code,
             ExitCode::SUCCESS,
@@ -1728,6 +1935,13 @@ mod tests {
         // edited as doc work (`xtask/linkage-check/src/main.rs:1-60` is a
         // 60-line module doc; branch `fix/242-crossterm-doc-contract` is a
         // live case) — this must NOT fail merely for touching `src/`.
+        //
+        // S6: this constructs no `src/` path at all — `DocDiff` carries no
+        // `touches_src` field to construct one with. The real protection is
+        // structural: re-adding that field would break this struct literal
+        // at compile time, forcing a human to look, which is a better pin
+        // than a runtime assertion. The name describes the behavior that
+        // absence guarantees, not a diff this test builds.
         let diff = DocDiff {
             touches_doc_paths: true,
             adds_spec_attr: false,
@@ -1756,6 +1970,13 @@ mod tests {
         // the bare-`tempfile` sweep (`main.rs:74-120`) is a pure chore
         // touching all of `tests/` — this must NOT fail merely for
         // touching `tests/`.
+        //
+        // S6: this constructs no `tests/` path at all — `ChoreDiff` carries
+        // no `touches_tests` field to construct one with. Same structural
+        // guarantee as `r1_doc_touching_only_rustdoc_in_src_plus_docs_passes`
+        // above: re-adding that field breaks this struct literal at compile
+        // time. The name describes the behavior the field's absence
+        // guarantees, not a diff this test builds.
         let diff = ChoreDiff {
             adds_cli_flag: false,
             adds_command_variant: false,
