@@ -20,7 +20,7 @@ xtask-docs = { path = "../docs" }
 # PRD fork#340 M3: `work-type-check --self-test` builds a scratch git repo at
 # runtime (production code, not `#[cfg(test)]`) to prove the gate genuinely
 # rejects a violating case — `tempfile` therefore has to be a real dependency
-# here, not only a dev one. Already a workspace dependency at the same "3"
+# here, not only a dev one. Already a root dev-dependency at the same "3"
 # version (root `Cargo.toml`), so this pulls no new crate into Cargo.lock.
 tempfile = "3"
 
