@@ -14560,9 +14560,9 @@ struct TabStripRects {
 /// which this feature deliberately doesn't touch) so a tab's label can
 /// render in `palette::status_color()` of the highest-priority status among
 /// them — issue #306 extends this to the active tab too, since its
-/// `UNDERLINED` cue no longer fights a stacked `fg` tint. Any tab whose
-/// aggregate resolves to Idle still renders in the ordinary tab style — see
-/// the carve-out comment in the loop.
+/// `UNDERLINED` cue no longer fights a stacked `fg` tint. Colour is a total
+/// function of status: every state paints, Idle included — see the
+/// `FORK-ONLY` comment in the loop for why.
 fn render_tab_strip(
     frame: &mut Frame,
     area: Rect,
@@ -14608,12 +14608,6 @@ fn render_tab_strip(
         // PRD #333 / fork issue #351: a tab's label takes the color of the
         // single highest-priority status among its pane(s) instead of the
         // base label color, so color means "something here needs attention".
-        // One carve-out keeps the label readable:
-        //   - an aggregate that resolves to Idle (including `Unknown`, which
-        //     `status_color` aliases to it) falls through to the base style
-        //     rather than painting `STATUS_IDLE` (a grey) onto read-critical
-        //     text — the low-contrast-on-light pattern PRD #13 removed from
-        //     `ui.rs`. An idle tab simply looks like an ordinary tab.
         // Issue #306: the ACTIVE tab used to be excluded here too, on the
         // reasoning that its `REVERSED` highlight would invert an absolute fg
         // into the label's background. Now that the active cue is
@@ -14622,15 +14616,24 @@ fn render_tab_strip(
         // the same tint an inactive one gets.
         // Dashboard (`None`) is untouched — see `tab_status_data`'s doc
         // comment for why.
+        //
+        // FORK-ONLY, maintainer decision 2026-08-15: an aggregate that
+        // resolves to Idle now paints `palette::STATUS_IDLE` like every
+        // other status, rather than falling through to the base style. This
+        // reverses two prior decisions that deliberately carved Idle out —
+        // PRD #333's original design ("An aggregate that resolves to Idle is
+        // not painted grey") and, before that, upstream's maintainer on
+        // review of upstream PR #356 as an explicit contrast fix. The
+        // accepted cost: `STATUS_IDLE` is an absolute `DarkGray`, so an idle
+        // tab label is low-contrast on a dark terminal — the pattern PRD #13
+        // generally bans on read-critical text — accepted here so a tab's
+        // colour always equals its worker's status colour with no
+        // exceptions, matching the idle status badge on the deck cards. A
+        // future upstream sync must not silently restore the carve-out.
         let style = match tab_statuses.get(i).copied().flatten() {
-            Some(statuses) => {
-                let color = palette::status_color(&palette::highest_priority_status(statuses));
-                if color == palette::STATUS_IDLE {
-                    style
-                } else {
-                    style.fg(color)
-                }
-            }
+            Some(statuses) => style.fg(palette::status_color(&palette::highest_priority_status(
+                statuses,
+            ))),
             _ => style,
         };
 
