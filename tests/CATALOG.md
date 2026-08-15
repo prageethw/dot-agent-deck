@@ -62,18 +62,18 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the card-stats degradation thresholds (covered by `dashboard/card-stats/002` and `/004`); elapsed-time rollovers beyond the fixture's stable one-hour display.
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/007 — A Pi pane's card omits the agent-type badge, same as every other agent type (fork-only rename/hide, never pushed upstream — reverses PRD #201 M2.2 for this fork only).
+##### dashboard/pane/007 — A Pi pane's card omits the agent-type badge by default, same as every other agent type (fork-only rename/hide, never pushed upstream — reverses PRD #201 M2.2 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`-style buffer text assertion).
 - **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Pi` and no display name).
 - **Asserts:** a live Pi session with no friendly name renders its card title as the bare session id (`orch-01`), with NO `Pi` / `ClaudeCode` / `OpenCode` / `Codex` / `No agent` label text anywhere on the card and no cell carrying Pi's registry `badge_color` — a plain `pi` pane un-badged renders exactly like any other agent type, not falling back to showing its type name.
-- **Does not assert:** the status badge color (`status/badge/001`).
+- **Does not assert:** the status badge color (`status/badge/001`); the toggled-on state, where the badge does render (`dashboard/agent-badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/pane/008 — Agent cards render with NO agent-type badge, even when they have friendly display names (fork-only rename/hide, never pushed upstream — reverses PRD #20 M7 / review finding 9 for this fork only).
+##### dashboard/pane/008 — Agent cards render with NO agent-type badge by default, even when they have friendly display names (fork-only rename/hide, never pushed upstream — reverses PRD #20 M7 / review finding 9 for this fork only).
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
 - **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
 - **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain NO registry agent-type label text and NO cell anywhere on the card carries that agent's registry `badge_color`; complete color-aware buffers are snapshotted.
-- **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
+- **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`); the toggled-on state, where the badge does render (`dashboard/agent-badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/pane/009 — A history-only session is visibly distinct from a live writable session (PRD #20 M4).

@@ -671,11 +671,13 @@ fn guard_002_no_absolute_bg_in_source() {
 /// Scenario: Render a single dashboard card for a live `AgentType::Pi` session
 /// with NO display name (so the card title falls back to the plain
 /// `<session-id>` form) into a `TestBackend` buffer, then assert the rendered
-/// card surface shows the session id but carries no agent-type badge — no
-/// `Pi` / `ClaudeCode` / `OpenCode` / `No agent` label text anywhere, and no
-/// cell in Pi's registry `badge_color`. Fork-only: the badge is removed from
-/// every card, so a Pi pane must render exactly like any other agent type
-/// once un-badged, not fall back to showing its type name.
+/// card surface shows the session id but carries no agent-type badge by
+/// default — no `Pi` / `ClaudeCode` / `OpenCode` / `No agent` label text
+/// anywhere, and no cell in Pi's registry `badge_color`. Fork-only: the
+/// badge is removed from every card by default, so a Pi pane must render
+/// exactly like any other agent type once un-badged, not fall back to
+/// showing its type name. Does not assert the toggled-on state, where the
+/// badge does render (`dashboard/agent-badge/001`).
 #[spec("dashboard/pane/007")]
 #[test]
 fn pane_007_pi_card_omits_agent_type_badge() {
@@ -756,10 +758,12 @@ fn pane_007_pi_card_omits_agent_type_badge() {
 
 /// Scenario: Render a live Codex session with no friendly display name into a
 /// color-aware card buffer. Fork-only rename/hide (never pushed upstream):
-/// the agent-type badge is removed entirely, so the card must show NO
+/// the agent-type badge is removed by default, so the card must show NO
 /// `Codex` label text and NO cell anywhere on the card in Codex's registry
 /// badge color. Repeats the check for named Claude Code / OpenCode / Pi /
-/// Codex cards, where the friendly display name must still render.
+/// Codex cards, where the friendly display name must still render. Does not
+/// assert the toggled-on state, where the badge does render
+/// (`dashboard/agent-badge/001`).
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_omits_agent_type_badge() {
