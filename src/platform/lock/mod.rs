@@ -19,6 +19,28 @@ pub use unix::{SpawnLock, acquire_spawn_lock};
 #[cfg(windows)]
 pub use windows::{SpawnLock, acquire_spawn_lock};
 
+/// Synchronous, cross-process exclusive lock scoped to an arbitrary path —
+/// the counterpart to [`acquire_spawn_lock`] for callers that cannot
+/// `.await` (fork #282: [`crate::issue_dispatch_run::create_worktree_sync`],
+/// the sync TUI hot path). Unix reuses the same `flock(2)` primitive
+/// ([`unix::acquire_spawn_lock_sync_bounded`]); Windows reuses the same
+/// named-mutex identity and security model as [`acquire_spawn_lock`]
+/// ([`windows::acquire_path_lock_sync_bounded`]) but blocks the calling
+/// thread directly instead of handing off to a dedicated owner thread — safe
+/// there because a sync caller never `.await`s between acquire and drop, so
+/// the guard never migrates threads.
+///
+/// Bounded (fork #331 audit S1), unlike [`acquire_spawn_lock`]: the caller
+/// passes a `timeout`, and acquisition refuses with an `ErrorKind::TimedOut`
+/// error rather than blocking indefinitely if it is not granted within that
+/// bound. `create_worktree_sync` runs directly on the TUI's synchronous
+/// render/event loop, where an unbounded wait would reopen the freeze
+/// `WORKTREE_GIT_TIMEOUT` exists to prevent — see the call site.
+#[cfg(unix)]
+pub use unix::acquire_spawn_lock_sync_bounded as acquire_worktree_lock_sync;
+#[cfg(windows)]
+pub use windows::acquire_path_lock_sync_bounded as acquire_worktree_lock_sync;
+
 /// Name of the Windows named mutex that stands in for the Unix `flock(2)` on
 /// `lock_path` (PRD #163 M2). `user_token` is
 /// [`crate::platform::paths::endpoint_user_suffix`] — the current user's SID.
@@ -166,6 +188,67 @@ mod tests {
         // And the second guard releases cleanly in turn (on Windows this is the
         // ReleaseMutex-on-the-owning-thread path).
         drop(second);
+    }
+
+    /// Fork #331 audit S1: [`acquire_worktree_lock_sync`] must REFUSE rather
+    /// than block indefinitely when it cannot be granted within its
+    /// timeout. Holds the lock on one thread (via the same bounded
+    /// primitive, with a generous 30s timeout so the holder itself is never
+    /// the source of flakiness), then contends for it on a second thread
+    /// with a short 200ms timeout while the first is still held. The
+    /// contending attempt is run on its own thread and joined through a
+    /// bounded `recv_timeout` rather than awaited directly — deliberately,
+    /// so that an UNBOUNDED acquisition (the pre-fix behavior, which would
+    /// wait the full 30s+ for the holder to release rather than honoring its
+    /// own timeout) fails this test with a clear message instead of hanging
+    /// the suite.
+    #[test]
+    fn acquire_worktree_lock_sync_refuses_rather_than_blocking_forever() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("worktree-attach.lock");
+
+        let (holder_ready_tx, holder_ready_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = acquire_worktree_lock_sync(&holder_path, Duration::from_secs(30))
+                .expect("holder acquire must succeed (uncontended)");
+            holder_ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        holder_ready_rx
+            .recv()
+            .expect("holder must signal ready before the contending attempt starts");
+
+        let contender_path = path.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        let contender = std::thread::spawn(move || {
+            let result = acquire_worktree_lock_sync(&contender_path, Duration::from_millis(200));
+            let _ = result_tx.send((result.is_ok(), start.elapsed()));
+        });
+
+        // The contender's own bound is 200ms; 5s is generous headroom above
+        // that for CI scheduling noise while staying far short of the
+        // holder's 30s hold.
+        let (acquired, elapsed) = result_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "the bounded acquisition did not return within 5s of its own 200ms timeout -- it is \
+             blocking far longer than its bound allows, which is the exact regression this test \
+             exists to catch",
+        );
+
+        drop(release_tx);
+        holder.join().expect("holder thread must not panic");
+        contender.join().expect("contender thread must not panic");
+
+        assert!(
+            !acquired,
+            "a bounded acquisition must refuse rather than proceed while the lock is held"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a bounded acquisition must not block far past its own 200ms timeout, took {elapsed:?}"
+        );
     }
 
     /// The Windows spawn-mutex name is scoped `Global\`, carries the per-user

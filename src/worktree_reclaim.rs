@@ -516,6 +516,69 @@ pub fn format_excluded_unknown_owner_warning(path: &Path) -> String {
     )
 }
 
+/// Fork issue #325 M2: `.git/shallow` lives in the repo's **common dir**, so
+/// one shallow fetch (`git clone --depth`, `git fetch --depth`) truncates
+/// history for every linked worktree and every orchestration sharing this
+/// clone at once, not just whoever ran it. Nothing else about a shallow repo
+/// errors -- `git log`, `git status`, and ref resolution all work fine -- so
+/// the only symptom is a later merge or rebase against upstream failing with
+/// "refusing to merge unrelated histories," which reads like a wrong remote
+/// rather than truncated history.
+///
+/// `git rev-parse --is-shallow-repository` (rather than statting
+/// `.git/shallow` directly) is what git itself uses to answer this, and it
+/// resolves the common dir correctly whether `repo_dir` is the main working
+/// tree or a linked worktree -- exactly the ambiguity this bug lives in, so
+/// deferring to git's own answer avoids duplicating that resolution logic.
+///
+/// A spawn failure or non-zero exit is NOT reported as shallow -- this is an
+/// advisory warning, not a correctness gate, and a probe that could not run
+/// says nothing either way; fails silent rather than fails loud, matching a
+/// plain repo.
+fn is_shallow_repo(repo_dir: &Path) -> bool {
+    let out = Command::new("git")
+        .current_dir(repo_dir)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
+        _ => false,
+    }
+}
+
+/// Formats the fork issue #325 M2 warning `run_worktree_list_cli` emits when
+/// [`is_shallow_repo`] finds the enumerating repo shallow. Names both the
+/// condition AND its repair (`git fetch --unshallow`) rather than only the
+/// symptom -- the failure this exists to head off ("refusing to merge
+/// unrelated histories") reads like a wrong remote, not a truncated one, so
+/// naming the repair command is what actually gets an operator unstuck.
+/// `path` is display-only and goes through the same terminal sanitizer as
+/// every other path this module prints (issue #232).
+fn format_shallow_repo_warning(repo_dir: &Path) -> String {
+    format!(
+        "warning: {path} is a SHALLOW git repository -- \".git/shallow\" lives in the shared \
+         common dir, so every linked worktree and every orchestration sharing this clone sees \
+         the same truncated history, not just whoever ran the shallow fetch. A later merge or \
+         rebase against upstream may fail with \"refusing to merge unrelated histories\", which \
+         reads like a wrong remote rather than truncated history. Repair with: git -C {path} \
+         fetch --unshallow",
+        path = sanitize_path_for_terminal_display(repo_dir)
+    )
+}
+
+/// `Some(warning)` when [`is_shallow_repo`] finds `repo_dir` shallow, `None`
+/// for a normal, full-history repo. `run_worktree_list_cli` prints the
+/// warning to stderr AND (fork issues #230/#231 precedent) folds it into the
+/// `--json` document's `warnings` array, so a `--json` consumer sees it too
+/// rather than it being visible only on a human terminal.
+pub fn shallow_repo_warning(repo_dir: &Path) -> Option<String> {
+    if is_shallow_repo(repo_dir) {
+        Some(format_shallow_repo_warning(repo_dir))
+    } else {
+        None
+    }
+}
+
 /// Top-level `--json` document.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeListDocument {
