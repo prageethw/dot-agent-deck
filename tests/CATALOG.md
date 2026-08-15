@@ -95,7 +95,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
 - **Layer:** L1 (in-process `AppState::aggregate_stats` + ratatui `TestBackend` stats render).
 - **Agent:** none (22 synthetic sessions: 14 Claude Code + 8 Codex).
-- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the breakdown was redundant anyway, since each card's status dot and label already summarize agent state (fork-only: cards no longer carry a registry-colored agent-type badge either).
+- **Asserts:** rendered at 60 columns — the width the bar gets from the left dashboard column when panes are open — the bar still shows `22 active` and the `tools` total, and contains no `ClaudeCode` / `Codex` per-type segments. The breakdown (PRD #20, review finding 10) cost ~30 columns at this width and silently clipped the `tools` total off the right edge; the breakdown was redundant anyway, since each card's status dot and label already summarize agent state (fork #339: cards can carry a registry-colored agent-type badge when the deck-global toggle is on, but that is off by default and this stats bar never renders one regardless).
 - **Does not assert:** priority-ordered truncation for bars too narrow even for the status counts, or exact badge colors.
 - **Platform coverage:** mac+linux+windows.
 

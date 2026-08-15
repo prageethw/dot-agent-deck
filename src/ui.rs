@@ -2163,13 +2163,6 @@ struct UiState {
     /// now, not which tab they happened to open — same shape as
     /// [`Self::split_stage`] and [`Self::pane_layout`] above. Not
     /// persisted: every deck starts with the badge hidden.
-    ///
-    /// Fork #339 M6 RED skeleton: this field, its dispatch no-op arm, and the
-    /// `render_card_for_mode_to_buffer` parameter it will eventually feed all
-    /// land in this compile-only commit ahead of the M1-M5 delegation that
-    /// wires resolution, scoping, and the render conditional — the same
-    /// foundation-before-render-side shape as `Self::button_rects`.
-    #[allow(dead_code)]
     show_agent_type_badge: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
@@ -6804,12 +6797,12 @@ pub fn card_stats_border_label(usable_width: u16, last: &str, tools: usize) -> O
 
 /// Truncate a sequence of styled title segments to `max_chars` total characters,
 /// appending a single `…` (in the last surviving segment's style) when they
-/// don't all fit, while preserving each segment's style. Fork-only removed the
-/// coloured agent-type badge from the title, so the styles this now protects are
-/// the dimmed numeric shortcut prefix and the `history` / `view-only` marker —
-/// each keeps its own styling even on a narrow card. (PRD #339 separately moved
-/// the Last/Tools stats off the title onto the bottom border, so those never
-/// reach this function.)
+/// don't all fit, while preserving each segment's style. The styles this
+/// protects are the dimmed numeric shortcut prefix, the `history` /
+/// `view-only` marker, and — when fork #339's agent-type badge toggle is on —
+/// the registry-coloured type badge; each keeps its own styling even on a
+/// narrow card. (PRD #339 separately moved the Last/Tools stats off the title
+/// onto the bottom border, so those never reach this function.)
 ///
 /// For single-width text this produces the same character sequence as
 /// [`truncate_with_ellipsis`] on the concatenated input, so text-only snapshots
@@ -7578,6 +7571,15 @@ fn handle_normal_key(
             ui.filter_text.clear();
         }
         return Action::Continue;
+    }
+    // Fork #339 D2/D5: bare `m` is the only working door on tmux and other
+    // legacy terminals, where `Ctrl+m` decodes as `Enter` before this
+    // function is ever reached. A hardcoded fallback, not a second
+    // `ActionSpec` — an alias is by definition not remappable. Checked
+    // LAST, immediately before the trailing `Action::Continue`, so a user
+    // who has rebound another dashboard action onto `m` still wins.
+    if key.code == KeyCode::Char('m') && key.modifiers.is_empty() {
+        return Action::ToggleAgentTypeBadge;
     }
     Action::Continue
 }
@@ -8630,6 +8632,13 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ToggleOrchestrationLock, key) {
         return Some(Action::ToggleOrchestrationLock);
     }
+    // Fork #339 D2: `Ctrl+m` resolves here from any mode; the bare `m`
+    // alias is handled separately in `handle_normal_key` since it must
+    // never claim command mode's text-entry fields. Command-mode scoping
+    // for both is applied below in `global_action_for_mode`.
+    if kb.matches(KbAction::ToggleAgentTypeBadge, key) {
+        return Some(Action::ToggleAgentTypeBadge);
+    }
     if kb.matches(KbAction::NewPane, key) {
         return Some(Action::NewPane);
     }
@@ -8679,6 +8688,12 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
     match global_action(kb, key) {
         Some(Action::CloseSelected) if mode != UiMode::Normal => None,
+        // Fork #339 risk 1 (highest severity): `Ctrl+m` is `0x0d`, the CR
+        // submit byte for every supported agent. Un-resolving it outside
+        // command mode is what lets it fall through to
+        // `handle_pane_input_key` → `keyevent_to_bytes` → `0x0d` on the
+        // PTY instead of toggling the badge out from under a typing user.
+        Some(Action::ToggleAgentTypeBadge) if mode != UiMode::Normal => None,
         other => other,
     }
 }
@@ -9330,10 +9345,24 @@ fn dispatch_action(
                     Some((format!("Split: {left}/{panes}"), std::time::Instant::now()));
             }
         }
-        // Fork #339 M6 RED skeleton: the dispatcher's match is exhaustive, so
-        // the enum variant needs an arm to compile — this no-op stands in
-        // until the M3 delegation wires the actual flip + status message.
-        Action::ToggleAgentTypeBadge => {}
+        // Ctrl+m / m: toggle the deck-global agent-type badge on session
+        // cards. The action only ever reaches here in command mode —
+        // `global_action_for_mode` un-resolves `Ctrl+m` everywhere else, and
+        // the bare `m` alias is only ever emitted by `handle_normal_key`,
+        // which the caller reaches only in `UiMode::Normal` — so there is no
+        // per-mode guard left to apply here.
+        Action::ToggleAgentTypeBadge => {
+            ui.show_agent_type_badge = !ui.show_agent_type_badge;
+            let shown_name = if ui.show_agent_type_badge {
+                "shown"
+            } else {
+                "hidden"
+            };
+            ui.status_message = Some((
+                format!("Agent badge: {shown_name}"),
+                std::time::Instant::now(),
+            ));
+        }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
         //
@@ -15556,6 +15585,9 @@ fn render_frame(
                 // PRD #341 M4: the live deck's mode, so the seam that pins the
                 // selection accent and the running app cannot disagree.
                 ui.mode,
+                // Fork #339: one deck-global toggle read by every card, on
+                // every tab, including one opened after the toggle fired.
+                ui.show_agent_type_badge,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -17882,6 +17914,15 @@ fn render_help_overlay(
             &n(KbAction::ToggleOrchestrationSplit),
             "Cycle sidebar split stage",
         ),
+        // Fork #339: command-mode only, same reasoning as
+        // `toggle_orchestration_split` above. `m` is a hardcoded,
+        // non-remappable fallback alongside the remappable `Ctrl+m` — the
+        // only door on tmux and other legacy terminals, where `Ctrl+m`
+        // decodes as Enter (see `handle_normal_key`).
+        help_key_line(
+            &format!("{} / m", n(KbAction::ToggleAgentTypeBadge)),
+            "Show / hide agent badges",
+        ),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -19205,6 +19246,8 @@ fn render_session_card(
     // PRD #341 M4: which mode the deck is being rendered in. Only the selected
     // card's accent reads it (see `selected_card_border_style`).
     mode: UiMode,
+    // Fork #339: deck-global toggle for the agent-type badge (`ui.show_agent_type_badge`).
+    show_agent_type_badge: bool,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
@@ -19245,15 +19288,42 @@ fn render_session_card(
         crate::event::Writable::HistoryOnly => " history ",
         crate::event::Writable::None => " view-only ",
     };
-    // Fork-only: the agent-type badge (registry-coloured type label) is
-    // removed from the card title entirely — no colour, no text. The title
-    // now shows only the friendly `display_name`, or the session id when
-    // there is none. A non-live card additionally shows a trailing
-    // `history` / `view-only` marker.
-    let identity_text = display_name
-        .map(|name| format!("{name} "))
-        .unwrap_or_else(|| format!("{id_display} "));
-    let title_segments: Vec<(String, Style)> = {
+    // Fork #339: the agent-type badge (registry-coloured type label),
+    // `370b6228`'s removal, restored behind the deck-global
+    // `show_agent_type_badge` toggle (`Ctrl+m` / `m`, off by default). D4:
+    // skipped on a placeholder card even when the toggle is on —
+    // `agent_registry::spec(&AgentType::None).label` is "No agent", which
+    // would collide with the status text as a second "No agent" segment.
+    let show_badge = show_agent_type_badge && !is_placeholder;
+    let title_segments: Vec<(String, Style)> = if show_badge {
+        // PRD #20 M5 / finding #9: the agent-type label carries its
+        // registry badge colour. A friendly `display_name` renders
+        // ALONGSIDE the badge (`<type> · <name>`) rather than replacing it.
+        let badge_style = Style::default()
+            .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+            .add_modifier(Modifier::BOLD);
+        // The marker is appended AFTER the `<type> · <id-or-name>` so the
+        // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
+        // stays intact — only a trailing view-only annotation is added.
+        let label_after_badge = display_name
+            .map(|name| format!(" · {name} "))
+            .unwrap_or_else(|| format!(" · {id_display} "));
+        let mut segs = vec![
+            (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
+            (format!("{}", session.agent_type), badge_style),
+            (label_after_badge, title_bold),
+        ];
+        if !is_live {
+            segs.push((liveness_marker.to_string(), text_dim()));
+        }
+        segs
+    } else {
+        // The title shows only the friendly `display_name`, or the session
+        // id when there is none. A non-live card additionally shows a
+        // trailing `history` / `view-only` marker.
+        let identity_text = display_name
+            .map(|name| format!("{name} "))
+            .unwrap_or_else(|| format!("{id_display} "));
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (identity_text, title_bold),
@@ -19920,12 +19990,10 @@ pub fn render_card_for_mode_to_buffer(
     mode: UiMode,
     width: u16,
     height: u16,
-    // fork#339 M6 RED skeleton: accepted but not yet threaded into
-    // `render_session_card` — that wiring is M4's, not this compile-only
-    // scaffold's. Underscored so the four RED tests fail on assertions
-    // (the toggle currently has no rendering effect), never on an
-    // unused-variable warning under `-D warnings`.
-    _show_agent_type_badge: bool,
+    // Fork #339: threaded straight through to `render_session_card`, so an
+    // assertion made through this seam is an assertion about what the live
+    // Dashboard renders (see the fn doc above).
+    show_agent_type_badge: bool,
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -19952,6 +20020,7 @@ pub fn render_card_for_mode_to_buffer(
                 density.into(),
                 None,
                 mode,
+                show_agent_type_badge,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -20017,6 +20086,11 @@ pub fn render_dashboard_cards_to_buffer(
                     card_density,
                     None,
                     UiMode::Normal,
+                    // Fork #339: this seam is the documented 8-arg
+                    // compatibility baseline (see `render_card_to_buffer`'s
+                    // doc) — hidden-by-default IS that baseline, so this
+                    // stays hardcoded rather than gaining a parameter.
+                    false,
                 );
             }
         })
