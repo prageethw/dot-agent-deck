@@ -41,10 +41,10 @@
 //!      integration-test crate that needs a disk-backed scratch dir.
 //!      Issue #474. See [`SELF_CONTAINED_RULE`].
 //!   10. No `##### <id>` catalog heading appears more than once
-//!      (fork #148). `parse_catalog_ids` counts headings per ID
-//!      rather than deduplicating into a set, so a repeat is
-//!      representable instead of silently collapsing to whichever
-//!      heading was parsed last.
+//!       (fork #148). `parse_catalog_ids` counts headings per ID
+//!       rather than deduplicating into a set, so a repeat is
+//!       representable instead of silently collapsing to whichever
+//!       heading was parsed last.
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses

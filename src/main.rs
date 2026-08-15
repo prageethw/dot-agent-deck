@@ -951,7 +951,7 @@ fn main() -> ExitCode {
             FeaturesAction::Status => {
                 use dot_agent_deck::config::{
                     EXPERIMENTAL_ENV, FeaturesFileOutcome, describe_features_file,
-                    features_config_path, load_features_file, resolve_features,
+                    features_config_path_with_diagnostics, load_features_file, resolve_features,
                 };
                 use dot_agent_deck::features::Features;
                 use dot_agent_deck::project_config::CONFIG_FILE_NAME;
@@ -959,9 +959,10 @@ fn main() -> ExitCode {
 
                 // The ON/OFF answer below is produced by the exact same
                 // resolution functions the real startup path calls
-                // (`features_config_path`, `load_features_file`,
-                // `resolve_features`) — no reimplementation, so it can never
-                // disagree with what the deck applies from this same path.
+                // (`features_config_path_with_diagnostics`,
+                // `load_features_file`, `resolve_features`) — no
+                // reimplementation, so it can never disagree with what the
+                // deck applies from this same path.
                 //
                 // The SOURCE label is a separate question and can genuinely
                 // differ from a running deck's own explanation: this command
@@ -976,7 +977,18 @@ fn main() -> ExitCode {
                 // branching `load_features_file` took (without recomputing
                 // the value) so that distinction is named instead of
                 // silently collapsing into "(project file)".
-                let path = features_config_path();
+                //
+                // Round 2 (reviewer M-2): before this, this command called
+                // the discarding `features_config_path()` wrapper, so it was
+                // the one diagnostic surface that could not see a declined
+                // ancestor and reported "no config found" when one was found
+                // and declined — the opposite of the truth. Calling the
+                // `_with_diagnostics` variant directly and printing each
+                // declined message closes that.
+                let (path, declined) = features_config_path_with_diagnostics(&launch_project_dir());
+                for message in &declined {
+                    println!("declined: {message}");
+                }
                 let is_override = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok();
                 let path_source = if is_override {
                     "DOT_AGENT_DECK_FEATURES_CONFIG override"
@@ -988,6 +1000,28 @@ fn main() -> ExitCode {
                 } else {
                     "project file"
                 };
+
+                let Some(path) = path else {
+                    // No ancestor was trustworthy at all — see
+                    // `features_config_path_with_diagnostics`'s doc. This is
+                    // the same resolution `init_and_watch` reaches; there is
+                    // no path to describe or load, only the env override
+                    // (which needs no file) to check.
+                    let resolved = resolve_features(Features::default());
+                    let value_source = if std::env::var(EXPERIMENTAL_ENV).is_ok() {
+                        format!("{EXPERIMENTAL_ENV} env override")
+                    } else {
+                        "default (no ancestor directory could be trusted)".to_string()
+                    };
+                    println!("config path: none (no ancestor directory could be trusted)");
+                    println!("config path exists: false");
+                    println!(
+                        "experimental: {} ({value_source})",
+                        if resolved.experimental { "on" } else { "off" }
+                    );
+                    return ExitCode::SUCCESS;
+                };
+
                 let file_outcome = describe_features_file(&path);
                 let exists = !matches!(file_outcome, FeaturesFileOutcome::NotFound);
                 let file_value = load_features_file(&path, Features::default());
@@ -998,7 +1032,13 @@ fn main() -> ExitCode {
                     match file_outcome {
                         FeaturesFileOutcome::Parsed => file_kind.to_string(),
                         FeaturesFileOutcome::NotFound => {
-                            format!("default (no {CONFIG_FILE_NAME} found)")
+                            if declined.is_empty() {
+                                format!("default (no {CONFIG_FILE_NAME} found)")
+                            } else {
+                                format!(
+                                    "default (all candidate {CONFIG_FILE_NAME} files were declined)"
+                                )
+                            }
                         }
                         FeaturesFileOutcome::NotRegular => {
                             format!("default ({file_kind} is not a regular file)")
@@ -1749,15 +1789,16 @@ async fn run_tui_session() -> ExitCode {
     // #577) — see `launch_project_dir`.
     //
     // Fork issue #303: when no `.dot-agent-deck.toml` was found in the
-    // project directory or any ancestor, `init_and_watch` returns a
-    // diagnosability warning. Print it here, before
+    // project directory or any ancestor, and fork issue #309: when an
+    // ancestor was declined as world-writable, `init_and_watch` returns
+    // diagnosability warnings. Print them here, before
     // `ensure_external_daemon_or_die`/`run_tui`'s `ratatui::init()` flips
-    // into the alternate screen, so it lands on stderr in the normal
+    // into the alternate screen, so they land on stderr in the normal
     // terminal — mirroring how `KeybindingConfig::load()` below prints its
     // own malformed-config warnings ahead of the alt-screen switch. No
     // `DOT_AGENT_DECK_LOG` and no restart flag required, which is the whole
     // point: today's `tracing::warn!` above is invisible without both.
-    if let Some(warning) = dot_agent_deck::features::init_and_watch(&launch_project_dir()) {
+    for warning in dot_agent_deck::features::init_and_watch(&launch_project_dir()) {
         eprintln!("Warning: {warning}");
     }
 
@@ -2443,12 +2484,13 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // inherits the launching TUI's directory and the two agree on the file by
     // construction.
     //
-    // The `Option<String>` diagnosability warning (fork issue #303) is
-    // deliberately discarded here, unlike the TUI's `run_tui_session` call:
-    // a detached daemon has no terminal — `platform::detach::unix` sends both
-    // its stdout and stderr to `<state_dir>/daemon.log` — so there is nowhere
-    // useful to `eprintln!` it, and the paired `tracing::warn!` inside
-    // `init_and_watch` already lands in that same log file.
+    // The `Vec<String>` diagnosability warnings (fork issues #303 and #309)
+    // are deliberately discarded here, unlike the TUI's `run_tui_session`
+    // call: a detached daemon has no terminal — `platform::detach::unix`
+    // sends both its stdout and stderr to `<state_dir>/daemon.log` — so
+    // there is nowhere useful to `eprintln!` them, and the paired
+    // `tracing::warn!` calls inside `init_and_watch` already land in that
+    // same log file.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
