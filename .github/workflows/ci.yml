@@ -511,14 +511,15 @@ jobs:
       - run: nix flake check -L --all-systems
 
   # Semgrep CE (open source) static analysis. Runs alongside cargo audit above
-  # and alongside Greptile's PR review (CLAUDE.md rule 8) -- neither replaces the
-  # other. `auto` is deliberately not used: it is broad, slower, and phones home
-  # telemetry. These packs are scoped to where CE's coverage actually pays off on
-  # this repo -- the GitHub Actions workflows themselves and secrets -- since
-  # `cargo clippy --all-targets --features e2e -- -D warnings` (rule 2) covers most of what
-  # CE's thin Rust ruleset would add. `p/bash` was tried and dropped: it 404s --
-  # the current Semgrep registry has no general bash/shell ruleset pack, only an
-  # unrelated `reverse-shells` pack that happens to tag `bash` as a language.
+  # and alongside the delegated reviewer/auditor pass (CLAUDE.md rule 8) --
+  # neither replaces the other. `auto` is deliberately not used: it is broad,
+  # slower, and phones home telemetry. These packs are scoped to where CE's
+  # coverage actually pays off on this repo -- the GitHub Actions workflows
+  # themselves and secrets -- since `cargo clippy --all-targets --features e2e
+  # -- -D warnings` (rule 2) covers most of what CE's thin Rust ruleset would
+  # add. `p/bash` was tried and dropped: it 404s -- the current Semgrep
+  # registry has no general bash/shell ruleset pack, only an unrelated
+  # `reverse-shells` pack that happens to tag `bash` as a language.
   #
   # `--error` makes this job fail when the scan finds anything. It is safe to
   # block on: `main` has no branch protection and nothing `needs:` this job, so
