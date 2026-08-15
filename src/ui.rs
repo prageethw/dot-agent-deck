@@ -36727,7 +36727,11 @@ mod tests {
     /// hidden -> shown -> hidden, with `ui.status_message` reporting each
     /// transition. Also confirm `handle_normal_key` resolves a bare `m` to
     /// the toggle action, and that the alias does not displace `Enter`'s
-    /// existing `Action::Focus` resolution (via `KbAction::FocusPane`).
+    /// existing `Action::Focus` resolution (via `KbAction::FocusPane`). PRD
+    /// fork#378: this toggle transition and its status messages are
+    /// deck-global `UiState`/`Action` plumbing with no `SessionState` or
+    /// model segment involved, so adding a model to the badge (`dashboard/
+    /// agent-badge/001`) must leave this test's assertions unchanged.
     #[spec("dashboard/agent-badge/002")]
     #[test]
     fn agent_badge_002_toggle_cycles_hidden_shown_hidden() {

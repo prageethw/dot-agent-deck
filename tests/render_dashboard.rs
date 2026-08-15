@@ -886,7 +886,11 @@ fn pane_008_codex_card_omits_agent_type_badge() {
 /// carrying both `badge_color` and `Modifier::BOLD`. Also pins D4: a
 /// placeholder (`AgentType::None`) card shows no badge even when the toggle
 /// is on — only its unrelated `● No agent` status text, never a doubled
-/// occurrence from a restored identity segment.
+/// occurrence from a restored identity segment. PRD fork#378: a session
+/// carrying a known `model` renders `<Label> (<Model>) · <name>` when the
+/// toggle is on, in the same registry `badge_color` + `Modifier::BOLD` cell,
+/// and shows neither the label nor the model when the toggle is off; a
+/// session with no model keeps the bare `<Label> · <name>` form.
 #[spec("dashboard/agent-badge/001")]
 #[test]
 fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
@@ -908,6 +912,9 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        // PRD fork#378: no model known — the badge must keep the bare
+        // `<Label> · <name>` form asserted below unchanged.
+        model: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -970,6 +977,74 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         buffer_to_color_text(&on)
     );
     insta::assert_snapshot!("agent_badge_001_codex_on", buffer_to_color_text(&on));
+
+    // PRD fork#378: the same session but with a known model. With the
+    // toggle off, neither the label nor the model string may leak onto the
+    // card; with the toggle on, the badge grows a bracketed model segment
+    // inside the SAME registry-coloured, bold span — `Codex (Opus) ·
+    // wrapped-01`, never the bare `Codex · wrapped-01` form once a model is
+    // known.
+    let mut session_with_model = session.clone();
+    session_with_model.model = Some("Opus".to_string());
+
+    let off_model = render_card_for_mode_to_buffer(
+        &session_with_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false,
+    );
+    let off_model_text = buffer_to_text(&off_model);
+    assert!(
+        !off_model_text.contains("Codex"),
+        "with the badge toggle off, a Codex card with a known model must \
+         still show no `Codex` label:\n{off_model_text}"
+    );
+    assert!(
+        !off_model_text.contains("Opus"),
+        "with the badge toggle off, a Codex card's known model must not \
+         leak onto the card:\n{off_model_text}"
+    );
+
+    let on_model = render_card_for_mode_to_buffer(
+        &session_with_model,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let on_model_text = buffer_to_text(&on_model);
+    assert!(
+        on_model_text.contains("Codex (Opus) · wrapped-01"),
+        "with the badge toggle on, a Codex card with a known model must show \
+         `Codex (Opus) · wrapped-01`:\n{on_model_text}"
+    );
+    assert!(
+        !on_model_text.contains("Codex · wrapped-01"),
+        "once a model is known, the bare `Codex · wrapped-01` form must not \
+         also appear alongside the bracketed one:\n{on_model_text}"
+    );
+    let on_model_has_bold_badge_cell = (0..on_model.area().height).any(|y| {
+        (0..on_model.area().width).any(|x| {
+            on_model[(x, y)].fg == codex_color && on_model[(x, y)].modifier.contains(Modifier::BOLD)
+        })
+    });
+    assert!(
+        on_model_has_bold_badge_cell,
+        "with the badge toggle on and a known model, a cell must carry \
+         Codex's registry badge color {codex_color:?} AND Modifier::BOLD:\n{}",
+        buffer_to_color_text(&on_model)
+    );
 
     for (agent_type, friendly_name) in [
         (AgentType::ClaudeCode, "friendly-claude"),
@@ -1057,6 +1132,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     let placeholder_on = render_card_for_mode_to_buffer(
         &placeholder,
@@ -1077,6 +1153,182 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         "D4: a placeholder card must show `No agent` exactly once (its status \
          text) even with the badge toggle on — never a second, doubled \
          occurrence from a restored identity segment:\n{placeholder_text}"
+    );
+}
+
+/// Scenario: PRD fork#378. Register a pane and apply a synthetic
+/// `SessionStart` `AgentEvent` carrying `model: Some("Opus")` through the
+/// real `AppState::apply_event` seam, then render the resulting session's
+/// card with the badge toggle on and confirm it shows `ClaudeCode (Opus) ·
+/// runtime-model`. Apply a second, later event carrying a DIFFERENT model
+/// (`Some("Haiku")`) and confirm the rendered badge updates to `ClaudeCode
+/// (Haiku) · runtime-model`, with no trace of the stale `Opus` value. Apply
+/// a third event carrying no model at all (`None`) and confirm the badge
+/// still reads `ClaudeCode (Haiku) · runtime-model` — most events don't
+/// carry a model, and a `None` on one must not clear a previously-known one.
+#[spec("dashboard/agent-badge/004")]
+#[test]
+fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
+    let mut state = AppState::default();
+    state.register_pane("pane-badge-model".to_string());
+    let started = chrono::Utc::now();
+
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let claude_color = dot_agent_deck::agent_registry::spec(&AgentType::ClaudeCode).badge_color;
+
+    state.apply_event(AgentEvent {
+        session_id: "runtime-model".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-model".to_string()),
+        agent_id: Some("agent-badge-model".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: Some("Opus".to_string()),
+    });
+    let session = state
+        .sessions
+        .get("runtime-model")
+        .expect("the session exists after SessionStart")
+        .clone();
+    assert_eq!(
+        session.model.as_deref(),
+        Some("Opus"),
+        "a SessionStart carrying model:Some(\"Opus\") must set SessionState.model"
+    );
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("ClaudeCode (Opus) · runtime-model"),
+        "the badge must render the initial model:\n{text}"
+    );
+
+    // A later event with a DIFFERENT model overwrites it.
+    state.apply_event(AgentEvent {
+        session_id: "runtime-model".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::Thinking,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started + chrono::Duration::seconds(1),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-model".to_string()),
+        agent_id: Some("agent-badge-model".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: Some("Haiku".to_string()),
+    });
+    let session = state
+        .sessions
+        .get("runtime-model")
+        .expect("the session still exists")
+        .clone();
+    assert_eq!(
+        session.model.as_deref(),
+        Some("Haiku"),
+        "a later event carrying a DIFFERENT model must overwrite the known model"
+    );
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("ClaudeCode (Haiku) · runtime-model"),
+        "the badge must update to the new model:\n{text}"
+    );
+    assert!(
+        !text.contains("Opus"),
+        "the stale model must not remain on the rendered badge:\n{text}"
+    );
+
+    // A later event carrying NO model must NOT clear the previously-known one.
+    state.apply_event(AgentEvent {
+        session_id: "runtime-model".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::ToolStart,
+        tool_name: Some("Read".to_string()),
+        tool_detail: None,
+        cwd: None,
+        timestamp: started + chrono::Duration::seconds(2),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-badge-model".to_string()),
+        agent_id: Some("agent-badge-model".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
+    let session = state
+        .sessions
+        .get("runtime-model")
+        .expect("the session still exists")
+        .clone();
+    assert_eq!(
+        session.model.as_deref(),
+        Some("Haiku"),
+        "an event carrying no model must NOT clear a previously-known model"
+    );
+    let buffer = render_card_for_mode_to_buffer(
+        &session,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("ClaudeCode (Haiku) · runtime-model"),
+        "the badge must keep showing the last-known model after a modelless event:\n{text}"
+    );
+
+    let has_bold_badge_cell = (0..buffer.area().height).any(|y| {
+        (0..buffer.area().width).any(|x| {
+            buffer[(x, y)].fg == claude_color && buffer[(x, y)].modifier.contains(Modifier::BOLD)
+        })
+    });
+    assert!(
+        has_bold_badge_cell,
+        "the badge cell must carry ClaudeCode's registry badge color \
+         {claude_color:?} AND Modifier::BOLD:\n{}",
+        buffer_to_color_text(&buffer)
     );
 }
 
