@@ -1067,6 +1067,65 @@ impl Drop for ConfigGenStateEnvGuard {
     }
 }
 
+/// Serializes cwd/env mutation only among the tests IN THIS MODULE that take
+/// this specific lock — process cwd and/or `DOT_AGENT_DECK_FEATURES_CONFIG`
+/// are both process-global (fork issue #303). It does NOT serialize against
+/// other tests elsewhere in the crate that separately mutate the process
+/// cwd (e.g. `schedule_cli.rs`'s own function-local cwd mutex) — two
+/// independent mutexes do not exclude each other. That gap is harmless
+/// today only because `cargo nextest` runs each test in its own process, so
+/// no two tests' cwd mutations can interleave regardless of which lock (if
+/// any) they hold; it would not be safe under a same-process test runner.
+/// Any test that wants to observe a specific resolved value from
+/// `features_config_path_for_display()` must hold this lock for the duration
+/// of its cwd/env fiddling.
+#[cfg(test)]
+static FEATURES_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only RAII guard: snapshots the process cwd and
+/// `DOT_AGENT_DECK_FEATURES_CONFIG`, clears the env var so a value leaking in
+/// from the outer test-runner environment can't mask the defect under test,
+/// and restores BOTH on drop — even if the test panics. Callers must hold
+/// `FEATURES_CONFIG_TEST_LOCK` for the guard's lifetime.
+#[cfg(test)]
+struct FeaturesConfigCwdEnvGuard {
+    prev_cwd: PathBuf,
+    prev_override: Option<String>,
+}
+
+#[cfg(test)]
+impl FeaturesConfigCwdEnvGuard {
+    fn new() -> Self {
+        let prev_cwd = std::env::current_dir().expect("read process cwd");
+        let prev_override = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").ok();
+        // SAFETY: callers hold FEATURES_CONFIG_TEST_LOCK for the duration of
+        // this guard, which serializes env-var access.
+        unsafe {
+            std::env::remove_var("DOT_AGENT_DECK_FEATURES_CONFIG");
+        }
+        Self {
+            prev_cwd,
+            prev_override,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FeaturesConfigCwdEnvGuard {
+    fn drop(&mut self) {
+        // Best-effort: if this fails the process cwd is left wherever the
+        // test last set it, but there is nothing more corrective to do here.
+        let _ = std::env::set_current_dir(&self.prev_cwd);
+        // SAFETY: see FeaturesConfigCwdEnvGuard::new.
+        unsafe {
+            match self.prev_override.take() {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_FEATURES_CONFIG", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_FEATURES_CONFIG"),
+            }
+        }
+    }
+}
+
 /// Home directory used to anchor config/state/cache paths. Delegates to
 /// [`crate::platform::paths::home_dir`] (PRD #42 M1): `$HOME` (fallback `/`) on
 /// Unix, `%USERPROFILE%` on Windows.
@@ -1153,6 +1212,95 @@ pub fn features_config_path(project_dir: &Path) -> PathBuf {
         return PathBuf::from(p);
     }
     project_dir.join(crate::project_config::CONFIG_FILE_NAME)
+}
+
+/// Display-only convenience wrapper over
+/// [`features_config_path_with_diagnostics`] for callers (currently only
+/// tests) that just want *a* path to show, not a trust decision: when the
+/// walk finds nowhere trustworthy at all, that function returns `None` and
+/// this wrapper substitutes `cwd.join(crate::project_config::CONFIG_FILE_NAME)`
+/// purely so there is something non-empty to print. See that function's own
+/// doc for the actual ancestor walk, its `DOT_AGENT_DECK_FEATURES_CONFIG`
+/// override, and its world-writable/indeterminate-ancestor trust rules
+/// (fork issue #309) — this wrapper does not reimplement any of it.
+///
+/// Reads the process cwd itself, unlike [`features_config_path_with_diagnostics`]
+/// (issue #577: production callers pass an explicit `project_dir` instead) —
+/// acceptable here because this wrapper is display/test-only and never feeds
+/// a value back into loading or watching a file.
+pub fn features_config_path_for_display() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (path, _) = features_config_path_with_diagnostics(&cwd);
+    path.unwrap_or_else(|| cwd.join(crate::project_config::CONFIG_FILE_NAME))
+}
+
+/// [`features_config_path_for_display`]'s real logic, returning one diagnostic message
+/// per declined ancestor whose candidate file actually existed there —
+/// nothing is emitted for an ancestor that was merely untrusted but held no
+/// config (reviewer minor 1: warning on every `/tmp`-launched deck when
+/// nothing was ever declined is noise, not diagnostics). Each message is
+/// also `tracing::warn!`-logged as it is found, so `DOT_AGENT_DECK_LOG`
+/// still captures it even if the caller discards the returned `Vec`.
+///
+/// `project_dir` is passed in rather than derived here (issue #577): the
+/// caller decides which directory the walk starts from, exactly as
+/// [`features_config_path`] does — production callers pass
+/// [`resolve_project_dir`]'s result via `main.rs`'s `launch_project_dir`, so
+/// this walk runs a SECOND, independent hardening pass starting from a
+/// directory the ownership-based walk already vetted.
+///
+/// Returns `None` for the path when NO ancestor could be trusted — every
+/// one was either world-writable or its safety was indeterminate (fork
+/// issue #309 auditor finding M-1r). `None` is a deliberate refusal to name
+/// a location at all, not a "safest guess": every candidate directory
+/// remaining at that point is one the walk has already declined to trust,
+/// so there is no path left to hand back that is not itself a live
+/// instance of the thing this function exists to reject. Callers that load
+/// or watch a file (`init_and_watch`) must treat `None` as "install the
+/// default and start no watcher"; only [`features_config_path_for_display`]'s
+/// display-only wrapper substitutes a path for it, and only for printing.
+///
+/// The walk classifies each ancestor with [`classify_dir_safety`], which
+/// returns one of three states rather than a bare bool, and the two
+/// non-`Safe` states are handled identically here (both decline a present
+/// candidate and are never a fallback candidate) — see that function's doc
+/// for why `Unknown` cannot be folded into `Safe` here even though it can
+/// be for the search itself. The walk tracks the nearest ancestor it has
+/// confirmed `Safe` as it goes, and falls back to *that* directory's joined
+/// path when no ancestor holds a trusted config — never unconditionally to
+/// `project_dir`, and never to an ancestor whose safety is merely unknown.
+/// Before the M-1 fix, a `cd /tmp && deck` launched directly inside a
+/// world-writable directory declined that directory's own attacker-planted
+/// config, logged the decline, and then handed the identical attacker path
+/// back anyway via an unconditional `cwd.join(...)` fallback — #309's own
+/// headline scenario, still reachable despite the warning claiming
+/// otherwise. That headline scenario is closed. Two narrower residuals
+/// remained until this round (auditor M-1r / reviewer L-1) — both now
+/// closed by returning `None` instead of ever falling back to an untrusted
+/// path:
+///
+/// - `current_dir()` failing (e.g. `ENAMETOOLONG` behind a symlink into a
+///   deep attacker-controlled tree) makes `cwd` the placeholder `"."`, whose
+///   ancestors are `["." , ""]`. `std::fs::metadata("")` errors, so the
+///   empty ancestor used to be treated as `Safe` by the old fail-open bool
+///   — and `Path::new("").join(CONFIG_FILE_NAME)` is a *relative* path,
+///   which resolves against the real (attacker-controlled) process cwd, not
+///   against any directory the walk actually vetted. That let the very file
+///   just declined one iteration earlier be handed straight back. Under the
+///   three-state split, `""`'s `Unknown` result is never a fallback
+///   candidate and never trusted when a candidate is present, so this path
+///   can no longer be reached.
+/// - When every ancestor up to and including `/` is world-writable,
+///   `safe_fallback` stays `None` throughout; the old code substituted
+///   `cwd` there regardless, which is byte-identical to the declined
+///   attacker config if cwd itself was declined. Returning `None` all the
+///   way out removes that special case rather than papering over it — there
+///   genuinely is nowhere left to trust.
+pub fn features_config_path_with_diagnostics(project_dir: &Path) -> (Option<PathBuf>, Vec<String>) {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
+        return (Some(PathBuf::from(p)), Vec::new());
+    }
+    resolve_ancestor_walk(project_dir.ancestors())
 }
 
 /// Decide whether a candidate `.dot-agent-deck.toml` found by the ancestor
@@ -1263,11 +1411,211 @@ fn config_candidate_is_trusted(path: &Path) -> bool {
     }
 }
 
+/// The walk itself, factored out of [`features_config_path_with_diagnostics`]
+/// over an explicit ancestor sequence rather than calling `cwd.ancestors()`
+/// internally. This exists for testability, not for any production caller:
+/// the real walk always terminates at the real filesystem root, which is
+/// normally `Safe` on any machine these tests run on, so the "nowhere
+/// trustworthy" (`None`) outcome and the degenerate `current_dir()`-failed
+/// route (auditor M-1r) can't be produced by chdir'ing into a fixture alone
+/// without chmod-ing real system directories — not something a test may do.
+/// Taking the ancestor sequence as a parameter lets a test hand it a short,
+/// self-contained, entirely-fixture-owned list instead.
+fn resolve_ancestor_walk<'a, I>(ancestors: I) -> (Option<PathBuf>, Vec<String>)
+where
+    I: IntoIterator<Item = &'a std::path::Path>,
+{
+    let mut safe_fallback: Option<&std::path::Path> = None;
+    let mut declined = Vec::new();
+    for ancestor in ancestors {
+        let safety = classify_dir_safety(ancestor);
+        let candidate = ancestor.join(crate::project_config::CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            if safety == DirSafety::Safe {
+                return (Some(candidate), declined);
+            }
+            let reason = match safety {
+                DirSafety::WorldWritable => {
+                    "its directory is world-writable, so the file may have \
+                     been planted by another user"
+                }
+                DirSafety::Unknown => {
+                    "its directory's write permissions could not be \
+                     determined, so it cannot be trusted"
+                }
+                DirSafety::Safe => unreachable!("handled above"),
+            };
+            let message = format!(
+                "declining {} in features-config search: {reason} (fork \
+                 issue #309); continuing search upward",
+                crate::terminal_sanitize::sanitize_path_for_terminal_display(&candidate)
+            );
+            tracing::warn!("{message}");
+            declined.push(message);
+            continue;
+        }
+        if safety == DirSafety::Safe {
+            safe_fallback.get_or_insert(ancestor);
+        }
+    }
+    let path = safe_fallback.map(|dir| dir.join(crate::project_config::CONFIG_FILE_NAME));
+    (path, declined)
+}
+
+/// The trust classification of a directory for the features-config ancestor
+/// walk (fork issue #309). Three states rather than a bare bool because the
+/// walk has two different consumers of this result with two different
+/// soundness requirements (round-2 auditor finding M-1r):
+///
+/// - **Search** (a candidate file exists in this ancestor): `Unknown` and
+///   `WorldWritable` are handled identically — the candidate is declined,
+///   not trusted, and the search continues upward. Declining on `Unknown`
+///   here is a deliberate change from the original fail-open bool: that
+///   bool's doc argued a `stat` failure on the directory implies
+///   `candidate.is_file()` on a file inside it fails the same way, so
+///   nothing gets through — an argument that is sound for a genuine
+///   absolute-path ancestor but does not hold for the degenerate `""`
+///   ancestor produced by a failed `current_dir()` (see
+///   [`features_config_path_with_diagnostics`]'s doc), where the "candidate
+///   inside this ancestor" is actually a relative path that resolves
+///   against the real process cwd instead. Declining on `Unknown`
+///   unconditionally closes that gap without needing to special-case which
+///   ancestor triggered it.
+/// - **Fallback selection** (no candidate here, but this ancestor might
+///   still serve as the safe directory the resolver falls back to):
+///   `Unknown` is never recorded as the fallback. An ancestor whose
+///   writability could not be determined is not a place the resolver has
+///   any basis to trust, so it must not become the directory the watcher
+///   polls for the rest of the process's life (auditor M-1r, scenario B).
+// `WorldWritable` and `Unknown` are only constructed on Unix (see
+// `classify_dir_safety` below); the non-Unix arm always returns `Safe`, so
+// `-D dead-code` flags both variants there. Remove this once #383 lands a
+// Windows ACL check that can construct them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum DirSafety {
+    /// Confirmed not world-writable. May supply a candidate or serve as a
+    /// fallback.
+    Safe,
+    /// Confirmed world-writable (Unix "other" write bit set). A candidate
+    /// here is declined; never a fallback.
+    WorldWritable,
+    /// `stat` on the directory itself failed, so its writability could not
+    /// be determined. A candidate here is declined (never trusted); never a
+    /// fallback. On Unix this is a genuine "don't know"; the non-Unix arm
+    /// below never produces it today (see its own doc for why).
+    Unknown,
+}
+
+/// Classify `dir`'s trust for the features-config ancestor walk. See
+/// [`DirSafety`] for how the two call sites in
+/// [`features_config_path_with_diagnostics`] use the three states
+/// differently.
+///
+/// Deliberately narrower than #309's own suggested predicate —
+/// group-writable and attacker-*owned* ancestors are not covered (tracked
+/// separately as fork issue #384; not folded in here).
+#[cfg(unix)]
+fn classify_dir_safety(dir: &std::path::Path) -> DirSafety {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            if meta.permissions().mode() & 0o002 != 0 {
+                DirSafety::WorldWritable
+            } else {
+                DirSafety::Safe
+            }
+        }
+        Err(_) => DirSafety::Unknown,
+    }
+}
+
+/// On non-Unix targets there is no equivalent POSIX mode bit to check —
+/// Windows ACLs don't map onto it cheaply — so this always reports `Safe`,
+/// unchanged from the pre-round-2 behavior (Windows follow-up tracked as
+/// fork issue #383). Deliberately `Safe`, not `Unknown`: `Unknown` declines
+/// every present candidate (see [`DirSafety`]'s doc), so returning it here
+/// unconditionally would decline every `.dot-agent-deck.toml` on Windows —
+/// there is no ACL check happening at all yet to justify that. `Unknown` on
+/// this crate's non-Unix build is reserved for a genuine "couldn't
+/// determine" outcome once #383 adds one; there isn't one today. Same split
+/// as `platform::paths::is_executable_file`'s, for the same reason.
+#[cfg(not(unix))]
+fn classify_dir_safety(_dir: &std::path::Path) -> DirSafety {
+    DirSafety::Safe
+}
+
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
 /// read. A `[features]` table is a handful of bytes; this cap stops a
 /// pathological `DOT_AGENT_DECK_FEATURES_CONFIG` target (a huge regular file)
 /// from exhausting memory on the detached ~2s watcher thread (audit LOW-1).
 const MAX_FEATURES_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Open `path` for the features-config loaders, opening before checking so
+/// there is no window between "confirm what this is" and "use it" (see
+/// [`load_features_file`]'s doc comment for the full TOCTOU rationale). On
+/// Unix this sets `O_NONBLOCK` so that if the target has been swapped for a
+/// FIFO between resolution and this call, `open` returns immediately instead
+/// of blocking until a writer appears (fork issue #310) — a `is_file()`
+/// check on the resulting handle then rejects it below. `O_NONBLOCK` does
+/// not affect reads from a regular file, only special files like FIFOs and
+/// sockets, so it is safe to leave set for the read that follows. Also sets
+/// `O_NOCTTY` (auditor m-1): without it, a symlinked TTY device at the
+/// resolved path would be acquired as the controlling terminal of the
+/// `setsid`-detached daemon, which otherwise has none — a real open-time
+/// side effect `O_NONBLOCK` alone does not touch. Every other open-time
+/// device side effect (e.g. `/dev/watchdog` arming on open) has no portable
+/// guard and is accepted as a residual: reaching it requires an ancestor the
+/// walk already trusts, i.e. an attacker who can already plant a config
+/// there.
+#[cfg(unix)]
+fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+}
+
+/// Windows has no FIFO-swap hazard to guard against (no equivalent
+/// non-blocking open exists), but a plain `File::open` cannot obtain a
+/// handle to a *directory* at all without `FILE_FLAG_BACKUP_SEMANTICS` — so
+/// without it, a directory target fails at `open` with an opaque error and
+/// collapses into [`FeaturesFileOutcome::Unreadable`] downstream instead of
+/// [`FeaturesFileOutcome::NotRegular`], regressing the label the pre-#310
+/// stat-first order produced (the pre-existing
+/// `describe_features_file_reports_not_regular_for_a_directory` test pins
+/// this). Requesting the flag lets a directory handle open successfully
+/// here too, so the same downstream `is_file()` check on the handle rejects
+/// it exactly as it does on Unix.
+///
+/// Privilege assumption (auditor i-2): `FILE_FLAG_BACKUP_SEMANTICS` has a
+/// second, unused effect here. Besides being the documented way to obtain a
+/// directory handle via `CreateFile` (the only effect this code relies on),
+/// it also *requests* backup/restore semantics, which bypass ACL checks —
+/// but only when `SeBackupPrivilege`/`SeRestorePrivilege` are both present
+/// AND enabled in the process token. Windows does not enable those by
+/// default even for Administrators (present-but-disabled, requiring an
+/// explicit `AdjustTokenPrivileges` call neither Rust's `std` nor this
+/// codebase makes), so for a normal deck process this flag's only reachable
+/// effect is the directory-handle one. If the deck is ever run under a
+/// token with `SeBackupPrivilege` enabled (a backup-operator service
+/// context), this open could read a features config whose ACL denies the
+/// invoking user — narrow and unlikely, but a real difference from
+/// `File::open` worth knowing about if that context ever applies.
+#[cfg(windows)]
+fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_features_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
 
 /// Load the `[features]` table from `path`. A missing file is the default
 /// (OFF). A non-regular target (FIFO, device, …), an oversized file, or
@@ -1275,20 +1623,40 @@ const MAX_FEATURES_CONFIG_BYTES: u64 = 64 * 1024;
 /// watcher relies on (PRD #139 M2.1) plus the runaway-target guard from audit
 /// LOW-1. Warnings never echo file content (audit INFO-2): only the path is
 /// logged, so pointing the override at a sensitive file can't leak its bytes.
+///
+/// Opens `path` first and stats the resulting *handle* rather than the path
+/// (fork issue #310): stat-then-open leaves a window in which the target can
+/// be replaced, and if the replacement is a FIFO, opening it blocks
+/// indefinitely on the startup path. Checking and using the same handle
+/// closes that window; `is_file()` on the handle still rejects a FIFO (or a
+/// symlink resolved to one) exactly as the old path-based check did. One
+/// consequence of the reorder: every target, including a non-regular one
+/// that the old stat-first order would have rejected before ever touching
+/// it, is now genuinely opened before it is rejected — see
+/// [`open_features_config_file`]'s doc comment for what that costs and why
+/// `O_NOCTTY` is there.
 pub fn load_features_file(
     path: &std::path::Path,
     previous: crate::features::Features,
 ) -> crate::features::Features {
     use std::io::Read;
 
-    // Stat first so a non-regular or oversized target is rejected before any
-    // read. `metadata` follows symlinks, so a symlink to /dev/zero or a FIFO
-    // is caught by the `is_file()` check on the resolved target (audit LOW-1).
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+    let file = match open_features_config_file(path) {
+        Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return crate::features::Features::default();
         }
+        Err(_) => {
+            tracing::warn!(
+                "failed to open {}; keeping previous experimental={}",
+                path.display(),
+                previous.experimental
+            );
+            return previous;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(m) => m,
         Err(_) => {
             tracing::warn!(
                 "failed to stat {}; keeping previous experimental={}",
@@ -1315,19 +1683,8 @@ pub fn load_features_file(
         return previous;
     }
 
-    // Read with a hard cap as defense-in-depth against a TOCTOU grow between
-    // the stat above and this read.
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => {
-            tracing::warn!(
-                "failed to open {}; keeping previous experimental={}",
-                path.display(),
-                previous.experimental
-            );
-            return previous;
-        }
-    };
+    // Read with a hard cap as defense-in-depth against growth after the
+    // fstat above.
     let mut contents = String::new();
     if file
         .take(MAX_FEATURES_CONFIG_BYTES)
@@ -1371,13 +1728,19 @@ pub fn load_features_file(
 pub enum FeaturesFileOutcome {
     /// No file at the resolved path; the default applies.
     NotFound,
-    /// The target exists but is not a regular file (FIFO, device, directory,
-    /// symlink to one of those, …).
+    /// The target exists, opened successfully, but is not a regular file
+    /// (FIFO, device, directory, symlink to one of those, …) once fstat'd
+    /// on the open handle. A target of the same shape that *fails to open*
+    /// (a Unix-domain socket returns `ENXIO`; an unreadable directory on
+    /// some platforms) is [`Unreadable`](Self::Unreadable) instead, since
+    /// this variant can only be produced by successfully opening first
+    /// (fork issue #310's open-then-fstat order).
     NotRegular,
     /// The target exists but exceeds `MAX_FEATURES_CONFIG_BYTES`.
     Oversized,
-    /// The target exists but could not be stat'd or opened/read (e.g.
-    /// permissions).
+    /// The target exists but could not be opened, or could not be stat'd or
+    /// read once opened (permissions, a Unix-domain socket, or any other
+    /// `open`-time failure that isn't `NotFound`).
     Unreadable,
     /// The target was read but its TOML is malformed.
     Malformed,
@@ -1389,15 +1752,21 @@ pub enum FeaturesFileOutcome {
 
 /// Diagnostic-only mirror of [`load_features_file`]'s branching over `path`,
 /// reporting which branch was taken instead of the resulting `Features`. See
-/// [`FeaturesFileOutcome`].
+/// [`FeaturesFileOutcome`]. Uses the same open-first-then-fstat-the-handle
+/// sequence as `load_features_file` (fork issue #310), so the two functions
+/// cannot drift on which targets they open or reject.
 pub fn describe_features_file(path: &std::path::Path) -> FeaturesFileOutcome {
     use std::io::Read;
 
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+    let file = match open_features_config_file(path) {
+        Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return FeaturesFileOutcome::NotFound;
         }
+        Err(_) => return FeaturesFileOutcome::Unreadable,
+    };
+    let metadata = match file.metadata() {
+        Ok(m) => m,
         Err(_) => return FeaturesFileOutcome::Unreadable,
     };
     if !metadata.is_file() {
@@ -1406,10 +1775,6 @@ pub fn describe_features_file(path: &std::path::Path) -> FeaturesFileOutcome {
     if metadata.len() > MAX_FEATURES_CONFIG_BYTES {
         return FeaturesFileOutcome::Oversized;
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return FeaturesFileOutcome::Unreadable,
-    };
     let mut contents = String::new();
     if file
         .take(MAX_FEATURES_CONFIG_BYTES)
@@ -2655,6 +3020,83 @@ label = "-rf"
         }
     }
 
+    // Fork issue #303: `features_config_path()` resolved the feature-flag
+    // config against the process's OWN cwd, while every other config read in
+    // the deck resolves against the explicit project directory. This pins
+    // the corrected contract: launched from a process cwd nested several
+    // levels below the project root, the resolver must still find the
+    // PROJECT's `.dot-agent-deck.toml` — not join the process cwd directly —
+    // and `DOT_AGENT_DECK_FEATURES_CONFIG` must keep overriding both.
+    #[test]
+    fn features_config_path_resolves_against_project_dir_not_process_cwd() {
+        let _lock = FEATURES_CONFIG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = FeaturesConfigCwdEnvGuard::new();
+
+        // Isolated fixture: this repo's own `.dot-agent-deck.toml` sets
+        // `[features] experimental = true` too, so a bug that accidentally
+        // read the real repo config here would pass for the wrong reason.
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        let project_config = project_root.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&project_config, "[features]\nexperimental = true\n").unwrap();
+
+        // A process cwd nested three levels below the project root —
+        // deliberately not the project directory itself.
+        let nested_cwd = project_root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+
+        std::env::set_current_dir(&nested_cwd).expect("chdir into nested fixture dir");
+        let resolved = features_config_path_for_display();
+
+        assert_eq!(
+            resolved,
+            project_config,
+            "features_config_path_for_display() must resolve to the project directory's \
+             .dot-agent-deck.toml ({}) even when the process cwd is nested \
+             elsewhere under the project ({}); got {}",
+            project_config.display(),
+            nested_cwd.display(),
+            resolved.display()
+        );
+
+        // The resolved value for a project whose config carries
+        // `experimental = true` must be `true` from the nested cwd too. This
+        // now passes: the ancestor walk above already resolved `resolved` to
+        // the PROJECT's config, not `<nested_cwd>/.dot-agent-deck.toml` (which
+        // does not exist), so loading it and resolving the flag yields `true`.
+        let loaded = load_features_file(&resolved, crate::features::Features::default());
+        let resolved_flag = resolve_features(loaded);
+        assert!(
+            resolved_flag.experimental,
+            "expected experimental=true from the project's \
+             .dot-agent-deck.toml when the process cwd is nested elsewhere \
+             in the project; got false (resolved path: {})",
+            resolved.display()
+        );
+
+        // DOT_AGENT_DECK_FEATURES_CONFIG must still win over both the
+        // process cwd and the project-directory resolution — existing
+        // behavior this fix must not regress.
+        let override_target = project_root.join("override-features.toml");
+        std::fs::write(&override_target, "[features]\nexperimental = false\n").unwrap();
+        // SAFETY: FEATURES_CONFIG_TEST_LOCK is held for the guard's (and
+        // hence this test's) lifetime.
+        unsafe {
+            std::env::set_var(
+                "DOT_AGENT_DECK_FEATURES_CONFIG",
+                override_target.to_str().unwrap(),
+            );
+        }
+        let resolved_with_override = features_config_path_for_display();
+        assert_eq!(
+            resolved_with_override, override_target,
+            "DOT_AGENT_DECK_FEATURES_CONFIG must still win over the \
+             project-directory resolution"
+        );
+    }
+
     // fork #303/#349 review (auditor M2 / reviewer F3): `describe_features_file`
     // backs `dot-agent-deck features status`'s ability to distinguish "the
     // file genuinely supplied the value" from "the file exists but the value
@@ -2709,6 +3151,243 @@ label = "-rf"
         assert_eq!(
             describe_features_file(&subdir),
             FeaturesFileOutcome::NotRegular
+        );
+    }
+
+    // Fork issue #309: an ancestor directory that is world-writable must be
+    // declined rather than trusted — a config planted there by another user
+    // must not be adopted — while the walk must keep going up and still find
+    // a legitimate config in a normal ancestor further above it. This pins
+    // both halves of the required behavior in one fixture, since the second
+    // half only means something in the presence of the first. It also pins
+    // auditor finding M-1: when cwd itself is the unsafe directory and no
+    // ancestor above it holds a config, the fallback must land on the
+    // nearest SAFE ancestor, never back on cwd's own declined config.
+    #[test]
+    #[cfg(unix)]
+    fn features_config_path_skips_world_writable_ancestor_but_finds_a_normal_one_above_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = FEATURES_CONFIG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = FeaturesConfigCwdEnvGuard::new();
+
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+
+        // A legitimate config in a normal (non-world-writable) ancestor.
+        let legit_config = project_root.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&legit_config, "[features]\nexperimental = true\n").unwrap();
+
+        // A world-writable directory nested under it, carrying an
+        // attacker-plantable config that must never be adopted.
+        let world_writable = project_root.join("world-writable");
+        std::fs::create_dir_all(&world_writable).unwrap();
+        std::fs::set_permissions(&world_writable, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let attacker_config = world_writable.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&attacker_config, "[features]\nexperimental = false\n").unwrap();
+
+        // The process cwd, nested below the world-writable directory — the
+        // fallback-lands-under-a-safe-directory case, which already worked
+        // before the M-1 fix below.
+        let cwd = world_writable.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        std::env::set_current_dir(&cwd).expect("chdir into fixture dir");
+        let (resolved, declined) = features_config_path_with_diagnostics(&cwd);
+
+        assert_eq!(
+            resolved,
+            Some(legit_config.clone()),
+            "features_config_path() must skip the world-writable ancestor's \
+             attacker-plantable config ({}) and continue upward to the \
+             legitimate one ({}); got {:?}",
+            attacker_config.display(),
+            legit_config.display(),
+            resolved
+        );
+        assert_eq!(
+            declined.len(),
+            1,
+            "expected exactly one declined-ancestor diagnostic for the \
+             world-writable directory; got {declined:?}"
+        );
+
+        // Auditor finding M-1: cwd IS the world-writable, attacker-plantable
+        // directory this time (`cd /tmp && deck`, #309's own headline
+        // scenario), with no legitimate config in any ancestor above it — so
+        // the unguarded fallback the fix originally shipped with would
+        // return straight back into the attacker's own directory, undoing
+        // the decline above.
+        let bare_root = tempfile::tempdir().unwrap();
+        let safe_parent = bare_root.path().canonicalize().unwrap();
+        let unsafe_cwd = safe_parent.join("world-writable-cwd");
+        std::fs::create_dir_all(&unsafe_cwd).unwrap();
+        std::fs::set_permissions(&unsafe_cwd, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let unsafe_cwd_config = unsafe_cwd.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&unsafe_cwd_config, "[features]\nexperimental = true\n").unwrap();
+
+        std::env::set_current_dir(&unsafe_cwd).expect("chdir into unsafe-cwd fixture dir");
+        let (resolved2, declined2) = features_config_path_with_diagnostics(&unsafe_cwd);
+
+        assert_ne!(
+            resolved2,
+            Some(unsafe_cwd_config.clone()),
+            "features_config_path() must not fall back into the \
+             world-writable cwd's own attacker-plantable config after \
+             declining it; got {resolved2:?}"
+        );
+        assert_eq!(
+            resolved2,
+            Some(safe_parent.join(crate::project_config::CONFIG_FILE_NAME)),
+            "the guarded fallback must land on the nearest SAFE ancestor \
+             ({}), not cwd itself; got {:?}",
+            safe_parent.display(),
+            resolved2
+        );
+        assert_eq!(
+            declined2.len(),
+            1,
+            "expected exactly one declined-ancestor diagnostic for the \
+             world-writable cwd; got {declined2:?}"
+        );
+    }
+
+    // Round 2 (auditor M-1r, Route A): `current_dir()` failing makes `cwd`
+    // the placeholder `PathBuf::from(".")`, whose `ancestors()` are exactly
+    // `[".", ""]`. The `""` ancestor's `metadata("")` fails
+    // (`classify_dir_safety` reports `Unknown`), and
+    // `Path::new("").join(CONFIG_FILE_NAME)` is a *relative* path that
+    // resolves against the real process cwd rather than against any
+    // directory the walk actually vetted — which, before this round, let
+    // the old fail-open bool treat `""` as trusted and hand back the exact
+    // file `"."` just declined one iteration earlier. This drives
+    // `resolve_ancestor_walk` directly over that literal `[".", ""]`
+    // sequence (see its doc for why the real `cwd.ancestors()` walk can't
+    // reproduce this in a test) with the real process cwd chdir'd into a
+    // world-writable fixture holding the attacker config, so `"."` and `""`
+    // both resolve to the same real, attacker-controlled file.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_ancestor_walk_never_trusts_the_degenerate_empty_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = FEATURES_CONFIG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = FeaturesConfigCwdEnvGuard::new();
+
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = fixture.path().canonicalize().unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let attacker_config = dir.join(crate::project_config::CONFIG_FILE_NAME);
+        std::fs::write(&attacker_config, "[features]\nexperimental = true\n").unwrap();
+
+        std::env::set_current_dir(&dir).expect("chdir into fixture dir");
+
+        let degenerate_ancestors = [std::path::Path::new("."), std::path::Path::new("")];
+        let (resolved, declined) = resolve_ancestor_walk(degenerate_ancestors);
+
+        assert_eq!(
+            resolved, None,
+            "the degenerate current_dir()-failed ancestor sequence must \
+             resolve to nowhere trustworthy rather than handing back the \
+             attacker's own declined config via the empty ancestor; got \
+             {resolved:?}"
+        );
+        assert_eq!(
+            declined.len(),
+            2,
+            "expected both the \".\" and \"\" ancestors to be declined \
+             (the same real attacker-controlled file, reached two \
+             different ways); got {declined:?}"
+        );
+    }
+
+    // Round 2 (auditor M-1r, scenario B / reviewer L-1): when NO ancestor in
+    // the (synthetic) sequence is trustworthy at all, the resolver must
+    // report that plainly rather than falling back to any of them —
+    // including the innermost one, which is exactly what the pre-round-2
+    // `unwrap_or(&cwd)` did. `resolve_ancestor_walk` is exercised directly
+    // (see its doc) because the real `cwd.ancestors()` walk always reaches
+    // the real filesystem root, which this test cannot make untrustworthy.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_ancestor_walk_reports_none_when_nothing_is_trustworthy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let outer_dir = outer.path().canonicalize().unwrap();
+        std::fs::set_permissions(&outer_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let inner_dir = outer_dir.join("inner");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        std::fs::set_permissions(&inner_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // No candidate config anywhere in this synthetic chain, so the walk
+        // reaches the end with `safe_fallback` still `None` — no ancestor
+        // was ever confirmed `Safe`.
+        let ancestors = [inner_dir.as_path(), outer_dir.as_path()];
+        let (resolved, declined) = resolve_ancestor_walk(ancestors);
+
+        assert_eq!(
+            resolved, None,
+            "a synthetic ancestor sequence with no Safe directory anywhere \
+             in it must resolve to nowhere trustworthy, not to the \
+             innermost world-writable one; got {resolved:?}"
+        );
+        assert!(
+            declined.is_empty(),
+            "no candidate file existed anywhere in this fixture, so no \
+             decline message should have been produced; got {declined:?}"
+        );
+    }
+
+    // This does NOT reproduce fork issue #310's race (reviewer M1): the
+    // pre-#310 code stats first and returns at `is_file()`, so `open` is
+    // never reached for a FIFO that already exists when the function is
+    // called — that pre-fix code passes this exact test too. #310's real
+    // race needs the target to be a regular file at `metadata()` time and a
+    // FIFO at `open()` time, a window that isn't deterministically
+    // reproducible from a unit test. What this DOES pin, and pins for real,
+    // is the post-fix shape's load-bearing half: `open_features_config_file`
+    // must keep `O_NONBLOCK` set, or a pre-existing FIFO target hangs
+    // `load_features_file` at `open` instead of returning promptly and
+    // rejecting it as non-regular. Driven off a spawned thread with a
+    // bounded `recv_timeout` on the test thread, so a regression fails
+    // loudly with a clear panic message instead of hanging the whole suite
+    // waiting on a blocked `open` that never returns.
+    #[test]
+    #[cfg(unix)]
+    fn load_features_file_does_not_hang_on_a_fifo_and_keeps_previous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".dot-agent-deck.toml");
+
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated string for the
+        // lifetime of this call, and 0o600 is a standard owner-only mode —
+        // the mkfifo(2) FFI contract is satisfied.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let previous = crate::features::Features::test_with(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            let result = load_features_file(&path_for_thread, previous);
+            // The receiver may already be gone if this test timed out and
+            // panicked first; a dropped result is fine either way.
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "load_features_file blocked on a FIFO target instead of \
+             returning promptly — O_NONBLOCK was removed from \
+             open_features_config_file",
+        );
+        assert_eq!(
+            result, previous,
+            "a FIFO target must be rejected as non-regular and keep `previous`"
         );
     }
 }

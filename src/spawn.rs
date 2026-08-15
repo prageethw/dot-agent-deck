@@ -5083,6 +5083,7 @@ mod tests {
                 }),
             }),
             compose_orchestrator_context: false,
+            owner: None,
         };
 
         let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;

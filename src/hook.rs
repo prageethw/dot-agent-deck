@@ -823,7 +823,7 @@ fn request_from_socket_at_detailed(
 ///
 /// Every variant folds into [`SocketReply::NoReply`] at the boundary, so this
 /// changes no caller's behavior; it exists so a failure names itself instead
-/// of collapsing four distinct causes into one `None`. Issue #564: a
+/// of collapsing multiple distinct causes into one `None`. Issue #564: a
 /// `get-seed` that silently degrades to PTY injection looks identical to one
 /// that never had a daemon to talk to, which is exactly the ambiguity that
 /// made a macOS-only flake take two occurrences and a log excavation to place.
@@ -843,6 +843,9 @@ enum ReplyReadError {
     Io(std::io::Error),
     /// A reply line arrived but was not valid UTF-8.
     InvalidUtf8,
+    /// The reply line grew past [`MAX_REPLY_LINE_BYTES`] without ever
+    /// completing — a peer that floods rather than staying silent.
+    LineTooLong,
 }
 
 impl std::fmt::Display for ReplyReadError {
@@ -852,6 +855,10 @@ impl std::fmt::Display for ReplyReadError {
             Self::ClosedWithoutReply => write!(f, "peer closed without writing any bytes"),
             Self::Io(err) => write!(f, "read failed: {err} (kind {:?})", err.kind()),
             Self::InvalidUtf8 => write!(f, "reply line was not valid UTF-8"),
+            Self::LineTooLong => write!(
+                f,
+                "reply line exceeded {MAX_REPLY_LINE_BYTES} bytes without completing"
+            ),
         }
     }
 }
@@ -1015,7 +1022,7 @@ fn read_reply_line(
         // that completes the line can itself be the one that busts the cap,
         // and growing past the bound to discover that would defeat it.
         if line.len().saturating_add(end) > MAX_REPLY_LINE_BYTES {
-            return None;
+            return Err(ReplyReadError::LineTooLong);
         }
         line.extend_from_slice(&buf[..end]);
         if newline_pos.is_some() {

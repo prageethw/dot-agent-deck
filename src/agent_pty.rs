@@ -10464,7 +10464,7 @@ mod spawn_tests {
     #[spec("status/shell-activity/009")]
     #[test]
     fn shell_activity_009_unconfirmed_names_the_specific_pane_not_just_a_count() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id_a = registry
             .spawn_agent(SpawnOptions {
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
@@ -12063,7 +12063,6 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
     }
 
-
     // ---------------------------------------------------------------------
     // Issue #581 — one wedged agent's reap must not starve its siblings of
     // their phase-3 SIGKILL.
@@ -12447,7 +12446,6 @@ mod spawn_tests {
         );
     }
 
-
     /// Fork issue #163, reworked contract (PR #207 review + audit both
     /// converged: the shipped fix — tracking which agents phase 2 reaped
     /// and skipping exactly those in phase 3 — is issue #163's option 1,
@@ -12616,6 +12614,7 @@ mod spawn_tests {
                 exited: Arc::new(AtomicBool::new(false)),
                 pending_seed: None,
                 seed_delivered_native: false,
+                pane_handed_over: false,
             };
             (agent, log, pid)
         }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree, run_status,
+    RemovalPolicy, RemoveOutcome, WorktreeCreation, WorktreeRegistry, create_worktree,
+    record_worktree, remove_worktree, run_status,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -590,7 +590,21 @@ async fn rollback_dispatched_worktree(
     // rooted here: this worktree was created seconds ago for an agent that is not
     // running, so there is no user work to protect — and it MUST actually go, or
     // the leftover dir and branch wedge this name for every later dispatch.
-    remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await;
+    let remove_outcome = remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await;
+    if let RemoveOutcome::RemoveFailed(error) = remove_outcome {
+        // PRD 236 review: `#[must_use]` exists precisely so this can't be
+        // discarded and read back as success. There is no event channel here
+        // to surface it to an attached TUI (unlike the tab-close path in
+        // `daemon_protocol`), so this is the only trace a failed rollback
+        // removal leaves.
+        tracing::warn!(
+            worktree = %worktree_dir.display(),
+            error = %error,
+            branch = %branch,
+            "dispatch rollback: `git worktree remove` failed; the directory may \
+             still be on disk"
+        );
+    }
     // Also delete the branch: `git worktree remove` never deletes it, but on this
     // rollback path no agent is running so there is no committed work to protect —
     // leaving the branch would wedge this name for every later dispatch.

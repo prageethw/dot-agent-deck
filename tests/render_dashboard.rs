@@ -2800,6 +2800,7 @@ fn role_session(index: usize, role: &str) -> SessionState {
         agent_id: Some(format!("agent-role-{index:02}")),
         display_name: Some(role.to_string()),
         shell_synthetic_working: false,
+        pending_permission_tool: None,
     }
 }
 
