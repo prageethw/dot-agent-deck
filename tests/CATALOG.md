@@ -808,6 +808,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** exact human status wording or column layout; the exact JSON status string and schema field names (`daemon/status/002`); a literal TUI detach/reconnect (`session/live/012`).
 - **Platform coverage:** mac+linux.
 
+#### worktree/create
+
+##### worktree/create/001 — Two concurrent callers of `create_worktree_sync`, both attaching to the SAME already-existing branch at the SAME target path (fork issue #282's "attach race"), never both report `Created`, and git's own worktree admin state never ends up registering the path twice.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/issue_dispatch_run.rs`'s own `#[cfg(test)] mod tests` — `create_worktree_sync` is `pub(crate)`, invisible to an external integration-test crate. Real `git` subprocesses, a real repo in a tempdir, no PTY, no daemon.
+- **Agent:** none.
+- **Asserts:** across 60 independently-raced trials (a single trial only corrupts ~8% of the time per the issue's own measurement), that at most one of the two concurrent callers reports `WorktreeCreation::Created`, that `git worktree list --porcelain` shows the target path exactly once, and that `.git/worktrees/` holds exactly one admin entry (by `gitdir` back-pointer) for it.
+- **Does not assert:** the CREATE case (`git worktree add -b <new-branch>`), which the issue's own measurement found safe (git's ref lock serializes it) — only the ATTACH case (no `-b`), which is not; the shape of whatever lock the fix introduces.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` — 60 trials × 2 threads of real `git worktree add` calls starved `build-windows`'s shared CI runner badly enough to fail unrelated tests elsewhere in the same tier; the race it measures is the Unix `flock` path anyway).
+
+##### worktree/create/002 — `create_worktree_sync` succeeds when called with `clone_dir` pointing at a LINKED worktree rather than the main working tree (fork #331 audit B2).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/issue_dispatch_run.rs`'s own `#[cfg(test)] mod tests` (as `worktree/create/001`). Real `git` subprocesses — a main repo, then a linked worktree of it created via `git worktree add`, then a third worktree attached through `create_worktree_sync` with `clone_dir` set to the LINKED one — no PTY, no daemon.
+- **Agent:** none.
+- **Asserts:** a fixture precondition that the linked worktree's `.git` is genuinely a FILE, not a directory (or the test would not be exercising B2 at all); then that attaching a third worktree through it succeeds (`WorktreeCreation::Created`). Before the fix, `worktree_attach_lock_path` joined `clone_dir` with a literal `.git`, which resolves to that file rather than a directory inside a linked worktree, so `ensure_owner_only_dir` failed with `ENOTDIR` and the attach errored out before `git worktree add` ever ran.
+- **Does not assert:** the CREATE case (`-b`); that the lock is anchored at the SAME path as an equivalent call made from the main working tree (that property is closed by the B2 fix but not independently pinned by a test).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `worktree/create/001` — this is a POSIX-shaped fixture, a linked worktree whose `.git` is a plain file).
+
 #### worktree/reclaim
 
 ##### worktree/reclaim/001 — `dot-agent-deck worktree list` succeeds in a git repo and names the worktree it examined.
@@ -1116,7 +1132,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a `WorktreeKept(WorktreeKeptNotice { reason: KeptReason::Dirty, error: None })` serializes with `"kind":"worktree_kept"` and the expected `path`/`reason` fields, omits `error` from the wire entirely (`skip_serializing_if`) rather than sending `null`, and deserializes back to an equal value; a second message with `reason: KeptReason::RemovalFailed, error: Some(..)` also round-trips, including the error string.
 - **Does not assert:** that the daemon's close handler (`daemon_protocol.rs`) actually sends this broadcast, or that `apply_broadcast`/`queue_kept_worktree` (`reconnect.rs`/`state.rs`) route it into `AppState` — those remain covered only by `dispatch/close/002`'s last-hop test and by reading the source, not by an automated test on this branch.
 - **Platform coverage:** mac+linux.
+#### worktree/guard
 
+##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), driving the existing `list` subcommand rather than a not-yet-existing Rust symbol so the RED stays compile-clean.
+- **Agent:** none (a `--depth 1` local clone of a real multi-commit seed repo, each with one linked worktree so `worktree list` has a row to report).
+- **Asserts:** a **fixture precondition** that the clone genuinely carries `.git/shallow`, so the test provably exercises a shallow repo; then that the shallow repo's combined stdout+stderr contains the repair phrase "fetch --unshallow" (case-insensitive) — not a bare "shallow" substring, since both linked worktrees are deliberately named `wt-a`/`wt-b` so no fixture path, branch, or directory name can satisfy that needle by accident — and that the same command against the full-history seed repo does not contain "shallow" at all.
+- **Does not assert:** the exact wording of the detection message beyond naming the repair — only that shallowness is surfaced, and its repair named, today it is not, for any repo.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other creator-identity tests).
 #### issue/claim
 
 Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's WORKTREE — its absolute path plus its git branch (CLAUDE.md rule 23) — never a `DOT_AGENT_DECK_PANE_ID` value (round 2, dropped: those ids recycle across a daemon restart, fork #160/#163/#166) and never the worktree ownership marker (round 1, dropped: the marker is almost never present under CLAUDE.md rule 1's mandated hand-made `git worktree add`). Both the path and the branch are derivable straight from `git`, so no marker is required at all — the marker, when present, supplies human-readable DECORATION only and is never part of the compared identity. A human claiming outside any worktree still resolves as `human:<login>@<host>` — that half is unchanged since round 1. `issue claim` is a real, already-wired subcommand (`src/issue_claim.rs`); what these tests pin is round 3's identity, which `src/issue_claim.rs`'s `resolve_caller_identity` does not yet implement (still pane-id-based), so a failure here is a genuine behavioral mismatch, not a missing-subcommand error.
