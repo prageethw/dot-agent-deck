@@ -23370,6 +23370,156 @@ mod tests {
         );
     }
 
+    /// Scenario: build a `TabManager`-independent `&[Tab]` covering all four
+    /// variants — a `Mode` tab whose agent pane is live, a `Mode` tab whose
+    /// agent pane isn't live yet, an `Orchestration` tab with two role
+    /// panes, and the `Dashboard` — and confirm `tab_status_data` keys each
+    /// one positionally: a `Mode` tab's own pane status (fork issue #351;
+    /// the inline builder in `run_tui` currently maps every non-Orchestration
+    /// tab, Mode included, to `None`, which is the defect this pins), an
+    /// `Orchestration` tab's role statuses (unchanged), and `None` for the
+    /// Dashboard (the deliberate scope boundary). The Mode and Orchestration
+    /// panes carry deliberately distinct statuses so a wrong lookup key
+    /// can't accidentally produce a passing result.
+    #[spec("tabs/label/001")]
+    #[test]
+    fn label_001_tab_status_data_keys_mode_tab_by_its_own_agent_pane() {
+        use SessionStatus::*;
+
+        struct NoopPC;
+        impl crate::pane::PaneController for NoopPC {
+            fn create_pane(
+                &self,
+                _cmd: Option<&str>,
+                _cwd: Option<&str>,
+            ) -> Result<String, crate::pane::PaneError> {
+                Ok(String::new())
+            }
+            fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn rename_pane(
+                &self,
+                _id: &str,
+                name: &str,
+            ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+                Ok(crate::pane::RenameOutcome::applied(name))
+            }
+            fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+                Ok(Vec::new())
+            }
+            fn resize_pane(
+                &self,
+                _id: &str,
+                _direction: crate::pane::PaneDirection,
+                _amount: u16,
+            ) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        fn mk_role(name: &str, start: bool) -> crate::project_config::OrchestrationRoleConfig {
+            crate::project_config::OrchestrationRoleConfig {
+                name: name.to_string(),
+                command: String::new(),
+                start,
+                description: None,
+                prompt_template: None,
+                clear: true,
+            }
+        }
+
+        fn mk_mode_tab(id: TabId, agent_pane_id: &str) -> Tab {
+            Tab::Mode {
+                id,
+                name: format!("mode-{id}"),
+                agent_pane_id: agent_pane_id.to_string(),
+                mode_manager: Box::new(crate::mode_manager::ModeManager::new(Arc::new(NoopPC))),
+                last_routed_timestamp: HashMap::new(),
+                cwd: "/work".to_string(),
+                focused_pane_id: None,
+            }
+        }
+
+        // A Mode tab whose agent pane is live and Working.
+        let mode_live = mk_mode_tab(1, "pane-mode-live");
+        // A Mode tab whose agent pane hasn't spawned yet — no entry in
+        // `pane_status` at all.
+        let mode_cold = mk_mode_tab(2, "pane-mode-cold");
+
+        let orch_config = OrchestrationConfig {
+            name: "squad".to_string(),
+            roles: vec![mk_role("orch", true), mk_role("coder", false)],
+        };
+        let orchestration = Tab::Orchestration {
+            id: 3,
+            name: "squad".to_string(),
+            role_pane_ids: vec!["pane-orch".to_string(), "pane-coder".to_string()],
+            role_statuses: vec![OrchestrationRoleStatus::Waiting; 2],
+            cwd: "/work".to_string(),
+            focused_role_pane_id: None,
+            start_role_index: 0,
+            orchestrator_prompt: None,
+            config: orch_config,
+            status: OrchestrationStatus::WaitingForOrchestrator,
+            had_waiting_pane: false,
+            all_clear_pending: false,
+        };
+
+        let dashboard = Tab::Dashboard {
+            selected_session_id: None,
+        };
+
+        let tabs = vec![mode_live, mode_cold, orchestration, dashboard];
+
+        let mut pane_status: HashMap<&str, SessionStatus> = HashMap::new();
+        pane_status.insert("pane-mode-live", Working);
+        pane_status.insert("pane-orch", Error);
+        pane_status.insert("pane-coder", Idle);
+        // "pane-mode-cold" deliberately absent: the pane isn't live yet.
+
+        let result = tab_status_data(&tabs, &pane_status);
+
+        assert_eq!(result.len(), 4, "one entry per tab, positionally");
+        assert_eq!(
+            result[0],
+            Some(vec![Working]),
+            "a Mode tab must yield its own agent pane's status, not None"
+        );
+        assert_eq!(
+            result[1],
+            Some(vec![]),
+            "a Mode tab whose agent pane isn't live yet must still yield Some(empty), not None"
+        );
+        assert_eq!(
+            result[2],
+            Some(vec![Error, Idle]),
+            "an Orchestration tab's role statuses are unchanged by the Mode extraction"
+        );
+        assert_eq!(
+            result[3], None,
+            "the Dashboard tab carries no status data — the deliberate scope boundary"
+        );
+    }
+
     #[test]
     fn test_render_empty_state() {
         let backend = TestBackend::new(80, 24);

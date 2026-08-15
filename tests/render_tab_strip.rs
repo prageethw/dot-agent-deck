@@ -13,6 +13,7 @@
 //! `closeable` mask passed to the renderer encodes that — `false` for the
 //! Dashboard tab, `true` for Mode/Orchestration tabs.
 
+use dot_agent_deck::palette;
 use dot_agent_deck::state::SessionStatus;
 use dot_agent_deck::ui::render_tab_bar_to_buffer;
 use ratatui::style::{Color, Modifier};
@@ -319,9 +320,11 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
 /// label carries `UNDERLINED | BOLD` as the active cue, contains no
 /// `REVERSED`, and carries no absolute foreground color (`Color::Reset`, the
 /// same as an ordinary unstyled tab) — proving the active cue applies
-/// uniformly to tabs this feature (issue #306) doesn't touch. RED today: the
-/// active style is still `Modifier::REVERSED | Modifier::BOLD` with no
-/// `UNDERLINED`.
+/// uniformly to the Dashboard tab, which carries no status data (fork issue
+/// #351 narrows this from "tabs this feature doesn't touch" now that Mode
+/// tabs also carry status data via `tab_status_data`; the Dashboard remains
+/// the deliberate scope boundary). RED today: the active style is still
+/// `Modifier::REVERSED | Modifier::BOLD` with no `UNDERLINED`.
 #[spec("tabs/orchestration/012")]
 #[test]
 fn orchestration_012_active_non_orchestration_tab_underlined_no_reversed() {
@@ -385,5 +388,95 @@ fn orchestration_014_active_idle_falls_through_no_grey() {
     assert!(
         !modifier.contains(Modifier::REVERSED),
         "an ACTIVE orchestration tab must NOT carry REVERSED, got {modifier:?}"
+    );
+}
+
+/// Scenario: Render the tab strip with a Dashboard tab plus a second tab made
+/// ACTIVE and carrying `Some(&[Working])` — the shape `tab_status_data`
+/// (fork issue #351) produces for a Mode tab whose agent pane is Working —
+/// and assert its label renders in `palette::STATUS_WORKING` (Green) as
+/// ordinary foreground text, still cued active via `UNDERLINED | BOLD` with
+/// no `REVERSED`. This is a regression guard, GREEN from the start: the
+/// render half (`render_tab_strip`) already colors any tab whose
+/// `orchestration_statuses` slot is `Some(..)` regardless of tab kind — the
+/// defect is one level up, in the inline builder that currently maps every
+/// Mode tab to `None` before it ever reaches this renderer.
+#[spec("tabs/label/002")]
+#[test]
+fn label_002_active_tab_with_status_data_renders_status_color_underlined() {
+    use SessionStatus::*;
+
+    let buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, true],
+        1,
+        80,
+        &[None, Some(&[Working])],
+    );
+    assert_eq!(
+        tab_label_fg(&buf, "demo"),
+        palette::STATUS_WORKING,
+        "a tab carrying Some(&[Working]) status data must render its label in STATUS_WORKING"
+    );
+    let modifier = tab_label_modifier(&buf, "demo");
+    assert!(
+        modifier.contains(Modifier::UNDERLINED) && modifier.contains(Modifier::BOLD),
+        "the active tab must still carry UNDERLINED | BOLD as its active cue, got {modifier:?}"
+    );
+    assert!(
+        !modifier.contains(Modifier::REVERSED),
+        "the active tab must NOT carry REVERSED, got {modifier:?}"
+    );
+}
+
+/// Scenario: Render the tab strip with a second tab carrying `Some(&[Idle])`
+/// and, separately, `Some(&[])` — the shape `tab_status_data` (fork issue
+/// #351) produces for a Mode tab whose agent is Idle, and for one whose
+/// agent pane isn't live yet — and assert both fall through to the SAME base
+/// label color an ordinary `None` tab gets, never `Color::DarkGray`. This is
+/// a regression guard, GREEN from the start, following the two-buffer
+/// comparison pattern in `orchestration_014_active_idle_falls_through_no_grey`:
+/// the render half already special-cases an aggregate that resolves to Idle
+/// (including the no-panes-yet empty-slice case, which
+/// `palette::highest_priority_status` also resolves to Idle).
+#[spec("tabs/label/003")]
+#[test]
+fn label_003_idle_and_empty_status_data_fall_through_no_grey() {
+    use SessionStatus::*;
+
+    let base_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, None],
+    );
+
+    let idle_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, Some(&[Idle])],
+    );
+    assert_eq!(
+        tab_label_fg(&idle_buf, "demo"),
+        tab_label_fg(&base_buf, "demo"),
+        "a tab carrying Some(&[Idle]) must render with the same base label color as an \
+         ordinary None tab, not DarkGray"
+    );
+
+    let empty_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, Some(&[])],
+    );
+    assert_eq!(
+        tab_label_fg(&empty_buf, "demo"),
+        tab_label_fg(&base_buf, "demo"),
+        "a tab carrying Some(&[]) (no panes live yet) must render with the same base label \
+         color as an ordinary None tab, not DarkGray"
     );
 }

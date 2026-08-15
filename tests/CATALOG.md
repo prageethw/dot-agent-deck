@@ -1909,10 +1909,10 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the resolver's own selection logic in isolation (`tabs/orchestration/013` and the `orchestration/focus/*` suite); any other layout mode.
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/012 — An ACTIVE non-orchestration tab (this feature doesn't touch it) still carries the UNDERLINED | BOLD active cue, no REVERSED, and no absolute foreground color (issue #306).
+##### tabs/orchestration/012 — An ACTIVE Dashboard tab — the tab that carries no status data — still carries the UNDERLINED | BOLD active cue, no REVERSED, and no absolute foreground color (issue #306).
 - **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
 - **Agent:** none (synthetic; no `orchestration_statuses` entry, no panes/PTYs).
-- **Asserts:** a single active Dashboard tab with `orchestration_statuses = [None]` renders `UNDERLINED | BOLD` as its active cue, contains no `REVERSED`, and carries `Color::Reset` (no absolute foreground color) — proving the new active cue applies uniformly to tabs PRD #333's status-tint feature does not touch.
+- **Asserts:** a single active Dashboard tab with `orchestration_statuses = [None]` renders `UNDERLINED | BOLD` as its active cue, contains no `REVERSED`, and carries `Color::Reset` (no absolute foreground color) — proving the new active cue applies uniformly to the Dashboard, the one tab kind that carries no status data (fork issue #351 narrows this from "tabs PRD #333's status-tint feature does not touch" now that Mode tabs also carry status data via `tab_status_data`; see `tabs/label/001`).
 - **Does not assert:** any status-tinted tab (covered by `tabs/orchestration/009`/`010`); the Idle fall-through on an active orchestration tab (covered by `tabs/orchestration/014`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1929,6 +1929,29 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Asserts:** opening a real orchestration tab from the `orch-bash-role` fixture lands the deck in `PaneInput` mode with the orchestrator role pane already focused; printing a unique sentinel line then pressing `Ctrl+l` must trigger readline's `clear-screen` binding and remove the sentinel from the rendered grid, proving the raw `0x0c` byte reached the role pane's PTY rather than being claimed as `Action::CycleSplitStage`. Regression coverage for PRD #387 Defect 1: orchestration tabs claimed `Ctrl+l` mode-independently, so a focused role pane's agent never received its own clear-screen.
 - **Does not assert:** the split-cycle toggle behavior itself when NOT a role pane is focused (covered by `tabs/orchestration/006`); the already-guarded Dashboard-tab case (covered by `tabs/orchestration/007`); Mode-tab coverage (Mode tabs never claim `Ctrl+l` and have no sidebar split to toggle).
 - **Platform coverage:** mac+linux.
+
+#### tabs/label
+
+##### tabs/label/001 — `tab_status_data`, the pure-data extraction behind the `run_tui` tab-bar builder, keys a Mode tab by its OWN agent pane's status instead of `None` (fork issue #351: clicking a worker tab highlighted it with a neutral underline instead of the worker's status colour, because the inline builder mapped every non-Orchestration tab — Mode included — to `None`).
+- **Layer:** L1 (in-process unit test; `src/ui.rs`).
+- **Agent:** none (a `TabManager`-independent `&[Tab]` fixture plus a synthetic `pane_status` map; the Mode tab's `ModeManager` is backed by a no-op `PaneController` stub that is never called).
+- **Asserts:** given one `Tab::Mode` whose agent pane is `Working`, one `Tab::Mode` whose agent pane has no entry in the map (not live yet), one `Tab::Orchestration` with two role panes carrying distinct statuses, and the `Tab::Dashboard`, `tab_status_data` returns positionally: `Some(vec![Working])` for the live Mode tab; `Some(vec![])` (not `None`) for the not-yet-live Mode tab; `Some(<the two role statuses>)` for the Orchestration tab, unchanged from before the extraction; and `None` for the Dashboard. The Mode and Orchestration panes carry deliberately distinct statuses so a wrong lookup key can't accidentally produce a passing result.
+- **Does not assert:** the render half that turns this data into a colored label (covered by `tabs/label/002`/`003` and `tabs/orchestration/009`/`010`/`014`, which pass `orchestration_statuses` as a parameter and so cannot exercise the builder itself).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/label/002 — An active tab carrying `Some(&[Working])` status data — the shape `tab_status_data` produces for a Mode tab whose agent is Working — renders its label in `palette::STATUS_WORKING`, still cued active via UNDERLINED | BOLD with no REVERSED (fork issue #351 regression guard).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** a tab made the ACTIVE tab and carrying `Some(&[Working])` renders its label foreground in `palette::STATUS_WORKING` (Green), while still carrying `UNDERLINED | BOLD` as its active cue and no `REVERSED`. GREEN from the start — the render half (`render_tab_strip`) already colors any tab whose `orchestration_statuses` slot is `Some(..)` regardless of tab kind; this guards that half against regression while `tabs/label/001` pins the builder defect one level up.
+- **Does not assert:** that a Mode tab's builder output actually reaches this renderer today (that is `tabs/label/001`'s RED, at the `run_tui` call site, not this seam); the Idle/empty fall-through case (covered by `tabs/label/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### tabs/label/003 — A tab carrying `Some(&[Idle])` or `Some(&[])` status data — the shapes `tab_status_data` produces for a Mode tab whose agent is Idle, or whose agent pane isn't live yet — falls through to the same base label color as an ordinary `None` tab, never `Color::DarkGray` (fork issue #351 regression guard).
+- **Layer:** L1 (in-process `TestBackend` render via `render_tab_bar_to_buffer`, `tests/render_tab_strip.rs`).
+- **Agent:** none (synthetic `SessionStatus` values, no panes/PTYs).
+- **Asserts:** a tab carrying `Some(&[Idle])` and, separately, a tab carrying `Some(&[])` (the empty-slice shape `tab_status_data` yields for a Mode tab whose pane hasn't spawned yet) each render their label with the SAME base/unstyled foreground color as an ordinary `None` tab, never `DarkGray`. Follows the two-buffer comparison pattern in `orchestration_014_active_idle_falls_through_no_grey`. GREEN from the start — the render half already special-cases an aggregate that resolves to Idle, and `palette::highest_priority_status(&[])` already resolves the empty slice to Idle.
+- **Does not assert:** the active-tab Idle fall-through (covered by `tabs/orchestration/014`, same underlying render carve-out); that the builder actually produces `Some(&[])` for a not-yet-live Mode tab today (that is part of `tabs/label/001`'s RED).
+- **Platform coverage:** mac+linux+windows.
 
 #### tabs/dashboard
 
