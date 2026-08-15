@@ -413,7 +413,7 @@ pub async fn run_issue_dispatch(
     // failure here must not abort the run or turn a later successful dispatch
     // into a failure.
     if cfg.triage {
-        ensure_triage_labels(&cfg.repo).await;
+        ensure_labels(&cfg.repo).await;
     }
 
     // S2 — `max_per_run` caps the issues CONSIDERED per run (not the number newly
@@ -866,7 +866,7 @@ async fn resolve_current_login(repo: &str) -> Option<String> {
 
 /// PRD #421 review fix B1: idempotently ensure [`IN_PROGRESS_LABEL`] exists on
 /// `repo`, UNCONDITIONALLY (called once per run regardless of `cfg.triage` —
-/// see the call site). Same best-effort discipline as [`ensure_triage_labels`]:
+/// see the call site). Same best-effort discipline as [`ensure_labels`]:
 /// a `gh` failure here is logged and the run continues; the label being
 /// missing is instead caught (and now reported, via C3) when `claim_issue`'s
 /// own add-label call fails.
@@ -896,8 +896,9 @@ async fn ensure_claim_label(repo: &str) {
 /// Also ensures [`TYPE_LABELS`] (PRD fork#340 M5) in the same loop —
 /// deliberately decoupled from `cargo xtask work-type-check`, which never
 /// reads labels, so this is optional polish rather than something the gate
-/// depends on.
-async fn ensure_triage_labels(repo: &str) {
+/// depends on. (N2: named `ensure_labels`, not `ensure_triage_labels` — it
+/// ensures more than the triage vocabulary now.)
+async fn ensure_labels(repo: &str) {
     for label in TRIAGE_LABELS.into_iter().chain(TYPE_LABELS) {
         let argv = label_create_argv(repo, label.name, label.color, label.description);
         if let Err(e) = run_status_args("gh", &argv).await {

@@ -240,6 +240,12 @@ jobs:
       # (`build-windows` below) — the same binary is shown rejecting a
       # genuinely violating case seconds before it passes on the real diff,
       # so a green result here is never the vacuous kind (E3).
+      #
+      # This job also runs on `push: [main]` (the post-merge trigger above),
+      # where the resolved base and HEAD are the same commit. `run_in`
+      # treats that as a printed skip and exits 0 (the B1 review fix) — see
+      # `work_type.rs`'s "merged-base skip" module doc for why this is not
+      # folded into the branch-prefix exemption list.
       - run: cargo xtask work-type-check --self-test
       - run: cargo xtask work-type-check
 
