@@ -78,23 +78,38 @@ const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
 /// later attempts fall back to the submit-only probe
 /// ([`attempt_writes_payload`]).
 ///
-/// Two, and each one is load-bearing:
+/// One. A retry targets a write whose bytes already reached the pane's PTY — a
+/// confirmation timing out does not mean the payload was lost, only that no
+/// [`EventType::Thinking`](crate::event::EventType::Thinking) has confirmed it
+/// yet — so re-typing the whole prompt on a later attempt duplicates it in a
+/// composer that already holds it (fork #194). Only the FIRST attempt writes the
+/// payload; every attempt after that probes: it leaves the pending bytes alone
+/// and simply asks the TUI to submit what it already holds.
 ///
-/// * the FIRST write is the delivery itself;
-/// * the SECOND is the one bounded REPLACEMENT payload. It has to exist because
-///   a launcher genuinely CONSUMES the first one — `scheduler/dispatch/015`'s
-///   bootstrap wrapper reads the bytes itself and the agent that starts behind it
-///   never sees them — so a delivery that only ever probed submit after attempt 1
-///   could never deliver in that case at all;
-/// * every attempt after that probes BLINDLY. By then a payload may be sitting
-///   unsubmitted in the agent's input box, and appending the whole prompt again
-///   is what produced the observed `seedseed` accumulation;
-/// * issue #666: a delivery that accumulates positive evidence its payload was
-///   DESTROYED may make ONE further payload write beyond this cap
-///   ([`AgentStartRearm`]). That is evidence, not patience — a third BLIND
-///   rewrite is still refused forever, at every attempt number, and the total is
-///   still hard-capped at three.
-const MAX_PAYLOAD_SUBMISSIONS: u32 = 2;
+/// **The accepted trade.** A value of 2 also recovered a bootstrap launcher that
+/// genuinely CONSUMES the first write — the launcher's bootstrap wrapper reads
+/// the bytes itself and the agent that starts behind it never sees them — by
+/// re-sending it as a bounded replacement payload on attempt 2. Setting this to
+/// 1 gives that recovery up. Both `scheduler/dispatch/014` and
+/// `scheduler/dispatch/015` covered this launcher-consumed-first-write case:
+/// `/014` exercised it synthetically, with no credential gate, on every push —
+/// it went red, and has since been removed outright (round 2), because nothing
+/// survived narrowing; `/015` is a real-agent test that self-skips in CI for
+/// lack of credentials, so it never turned the board red either way. With
+/// `/014` gone, this capability has **no automated coverage at all**. Tracked
+/// in **#343**. That case is deliberately deferred to a follow-up that
+/// recovers it by **evidence** — confirming whether the launcher actually
+/// consumed the bytes — rather than by attempt count, since attempt count
+/// cannot tell the "launcher consumed it" case apart from the "composer
+/// already holds it" case this fix addresses.
+///
+/// **Why `= 1` is sound for the case fork #194 is actually about** (a direct
+/// native spawn, no launcher hop): PRD fork#257 proved empirically that Claude
+/// holds the payload in its composer and a bare CR submits it — a PTY relay
+/// suppressed the original write's CR, byte counters showed exactly one byte's
+/// difference between bytes read and bytes forwarded, across five real-agent
+/// runs including a mutation check.
+const MAX_PAYLOAD_SUBMISSIONS: u32 = 1;
 
 /// Issue #666: whether this producer's native `SessionStart` is emitted BEFORE
 /// it can accept its first prompt — i.e. whether the start is a STARTUP fact or
@@ -362,15 +377,15 @@ fn blind_payload(attempt: u32) -> bool {
 /// Whether attempt `attempt` (1-based) of a delivery writes the prompt PAYLOAD,
 /// or only probes submission.
 ///
-/// Issue #424 (both reviewers, D5). A retry existed for one reason — the submit
-/// CR may have been swallowed by a still-booting agent TUI — but it was
+/// Issue #194 / #424 (both reviewers, D5). A retry existed for one reason — the
+/// submit CR may have been swallowed by a still-booting agent TUI — but it was
 /// implemented as "type the whole prompt again", which is only the right recovery
-/// when the first payload never landed. When the payload DID land and only its CR
-/// was eaten, the payload is still sitting in the input box, so retyping appends a
-/// second copy and the agent eventually submits `seedseed`: a corrupted task, and
-/// one the confirmation matcher then rejects, which leaves the loop armed and
-/// types a THIRD copy. Probing submit instead leaves the pending bytes alone and
-/// simply asks the TUI to submit what it already holds.
+/// when the first payload never landed. In the common case the payload DID land
+/// and only its CR was eaten, so the payload is already sitting in the input box:
+/// retyping appends a second copy and the agent eventually submits `seedseed`, a
+/// corrupted task that the confirmation matcher then rejects, leaving the loop
+/// armed to type a THIRD copy. Probing submit instead leaves the pending bytes
+/// alone and simply asks the TUI to submit what it already holds.
 ///
 /// The probe is not a weaker write: it goes through the same identity-guarded,
 /// writer-serialized, deadline-bounded path as an ordinary attempt and classifies
@@ -540,10 +555,18 @@ pub fn prompt_submission_matches(expected: &str, reported: &str) -> bool {
 /// claiming the delivery landed cleanly would not be.
 ///
 /// This is a SAFETY NET, not the remedy. The remedy is [`attempt_writes_payload`]
-/// — not producing the accumulation in the first place. The net exists because
-/// prevention starts at attempt 3 and the doubling can already have happened by
-/// then, and because a delivery whose first payload was consumed by a launcher
-/// still writes one replacement.
+/// — not producing the accumulation in the first place; with only the first
+/// attempt writing a payload (fork #194), the retry ladder itself cannot double
+/// a prompt. The net stays because doubling is still reachable elsewhere,
+/// including a case inside this same module's bookkeeping: the remit re-arm
+/// clears `prompt_delivery` on compaction and starts a fresh cycle at attempt
+/// 1, so if the previous cycle's write is still unconfirmed and sitting in the
+/// composer, the new cycle's attempt-1 write concatenates with it — the same
+/// text twice, from two different delivery cycles rather than two attempts of
+/// one. A stale confirmation arriving late for a prompt independently retyped
+/// by another path is a second, module-external way to reach the same shape.
+/// The net is also what stops a THIRD copy once a doubled turn has already been
+/// observed, per the paragraph above.
 pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
     let expected = normalize_for_match(expected);
     let reported = normalize_for_match(reported);
@@ -1058,29 +1081,28 @@ mod tests {
         ));
     }
 
-    /// D5: the retry schedule writes the payload twice and probes thereafter.
+    /// Fork #194: a retry targets a write whose bytes already reached the PTY,
+    /// so retyping the whole payload duplicates a prompt the composer already
+    /// holds. Only the very first attempt may write the payload — every attempt
+    /// after it must only probe submission.
     ///
     /// Issue #666 restates it against an explicitly DISARMED rearm, which is the
     /// state every delivery is in unless it earns otherwise. This is the BLIND
     /// refusal contract — the thing that stops the `seedseed` accumulation of
-    /// #424/#570 — and nothing in #666 softens it: without evidence, attempt 3
+    /// #424/#570 — and nothing in #666 softens it: without evidence, attempt 2
     /// and every attempt after it probes, forever.
     #[test]
-    fn only_the_first_two_attempts_write_the_payload() {
+    fn only_the_first_attempt_writes_the_payload() {
         let now = Instant::now();
         let disarmed = AgentStartRearm::default();
         assert!(
             attempt_writes_payload(1, &disarmed, now),
             "attempt 1 IS the delivery's payload"
         );
-        assert!(
-            attempt_writes_payload(2, &disarmed, now),
-            "one bounded replacement payload, because /015's launcher consumes the first"
-        );
-        for attempt in 3..=12 {
+        for attempt in 2..=12 {
             assert!(
                 !attempt_writes_payload(attempt, &disarmed, now),
-                "attempt {attempt} must probe submit rather than append another copy"
+                "attempt {attempt} must probe submit rather than (re)write the payload"
             );
             // ...and a disarmed delivery has nothing to spend at any attempt,
             // so the probe cannot be mistaken for a consumed rearm.
