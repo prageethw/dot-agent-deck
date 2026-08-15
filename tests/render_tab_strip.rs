@@ -112,16 +112,14 @@ fn dashboard_only_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// orchestration tab's label renders in the `palette::status_color()` of the
 /// SINGLE highest-priority status among its panes — fixed order Error(Red) >
 /// WaitingForInput(Yellow) > Working(Green) > Thinking/Compacting(Blue) >
-/// Idle/Unknown(no tint) (PRD #333). Covers: (a) one `Error` among `Idle`
-/// panes -> Red; (b) one `WaitingForInput` among `Working`/`Idle` (no Error)
-/// -> Yellow; (c) all `Idle` -> the SAME base label color as an ordinary
-/// tab, NOT `Color::DarkGray` (PRD #333 defect B: PRD #13 reserves DarkGray
-/// for purely-decorative elements, not label text); (d) `Thinking` +
-/// `Working` (no higher-priority state) -> Green, since Working outranks
-/// Thinking. Also asserts a non-orchestration tab (`None`) never gets
-/// colorized by this feature. RED today on (c): the Idle branch still
-/// applies `.fg(palette::status_color(Idle))` (`DarkGray`) instead of
-/// falling through to the base style.
+/// Idle/Unknown(`palette::STATUS_IDLE`) (PRD #333, fork issue #351). Covers:
+/// (a) one `Error` among `Idle` panes -> Red; (b) one `WaitingForInput` among
+/// `Working`/`Idle` (no Error) -> Yellow; (c) all `Idle` -> `STATUS_IDLE`
+/// (maintainer decision 2026-08-15: colour is a total function of status,
+/// including Idle, reversing PRD #333 defect B); (d) `Thinking` + `Working`
+/// (no higher-priority state) -> Green, since Working outranks Thinking.
+/// Also asserts a non-orchestration tab (`None`) never gets colorized by
+/// this feature.
 #[spec("tabs/orchestration/009")]
 #[test]
 fn orchestration_009_tab_label_colored_by_highest_priority_status() {
@@ -155,10 +153,13 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         "a tab with a WaitingForInput pane (no Error present) must render its label Yellow"
     );
 
-    // (c) Every pane Idle -> falls through to the base/unstyled label color,
-    // exactly like an ordinary tab. PRD #13 reserves DarkGray for
-    // purely-decorative, non-read elements only; a tab label is text, so an
-    // all-Idle orchestration tab must NOT be DarkGray (PRD #333 defect B).
+    // (c) Every pane Idle -> paints palette::STATUS_IDLE. Idle now paints
+    // STATUS_IDLE by maintainer decision (2026-08-15), deliberately
+    // reversing PRD #333's "an aggregate that resolves to Idle is not
+    // painted grey" and, before that, upstream's maintainer requiring the
+    // carve-out on review of upstream PR #356. Accepted trade-off:
+    // STATUS_IDLE is an absolute DarkGray and reads low-contrast on a dark
+    // terminal — this was chosen, not overlooked.
     let buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
@@ -166,18 +167,10 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         80,
         &[None, Some(&[Idle, Idle, Idle])],
     );
-    let base_buf = render_tab_bar_to_buffer(
-        &["Dashboard", "demo"],
-        &[false, false],
-        0,
-        80,
-        &[None, None],
-    );
     assert_eq!(
         tab_label_fg(&buf, "squad"),
-        tab_label_fg(&base_buf, "demo"),
-        "an all-Idle orchestration tab must render with the same base label color as an \
-         ordinary tab, not DarkGray"
+        palette::STATUS_IDLE,
+        "an all-Idle orchestration tab must render palette::STATUS_IDLE"
     );
 
     // (d) Thinking and Working present, nothing higher-priority -> Green,
