@@ -34640,8 +34640,10 @@ mod tests {
                  /clear can take the same prompt with no session guard at all"
             );
             assert_eq!(
-                writes[1].0, PROMPT,
-                "attempt 2 is the one bounded replacement payload"
+                writes[1].0, "",
+                "fork #194: MAX_PAYLOAD_SUBMISSIONS = 1 means there is no bounded \
+                 replacement payload any more — attempt 2 already probes \
+                 submission with an empty payload, same as every attempt after it"
             );
         }
         assert_eq!(
@@ -34663,8 +34665,8 @@ mod tests {
             assert_eq!(writes.len(), 3);
             assert_eq!(
                 writes[2].0, "",
-                "D5: by attempt 3 a payload may be sitting in the input box, so \
-                 the attempt probes submission instead of appending another copy"
+                "D5: attempt 3 probes submission too — the binding must survive \
+                 more than one retry, not just the first probe after it"
             );
             assert_eq!(
                 writes[2].1.as_deref(),
@@ -34673,7 +34675,11 @@ mod tests {
             );
             assert_ne!(
                 writes[2].2, writes[1].2,
-                "a probe's payload differs, so it needs its own ledger identity"
+                "two probes carry identical (empty) payloads, so only the wire \
+                 delivery id — minted per attempt regardless of payload content \
+                 — can tell them apart; sharing one would replay the first in \
+                 the daemon's ledger and the second retry would never reach the \
+                 PTY at all"
             );
         }
 
