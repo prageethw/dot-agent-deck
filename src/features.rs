@@ -98,27 +98,6 @@ pub fn show_issue_dispatch_authoring() -> bool {
     experimental_enabled()
 }
 
-/// Production wrapper for the orchestration command-entry lock (PRD #393),
-/// gated after it landed so it can be evaluated in real use before it reaches
-/// everyone. One wrapper per feature (CLAUDE.md #9) so
-/// `grep show_command_entry_lock` finds every gate at graduation — see the
-/// `graduate-command-entry-lock` issue.
-///
-/// A *presentation* switch, gated at three live-loop seams in `src/ui.rs`: the
-/// `Ctrl+E` binding resolution, the keystroke gate on a focused worker pane,
-/// and the auto-focus chain that steers toward waiting panes. Nothing else
-/// branches on it — `UiState::command_entry_locked` still starts `true` and the
-/// helpers (`scope_command_entry_lock`, `gate_pane_input_key`) are flag-free,
-/// so their unit tests keep exercising the real logic rather than the gate.
-///
-/// With the flag OFF the deck behaves exactly as v0.35.8 did: `Ctrl+E` is not
-/// claimed anywhere, keystrokes reach a focused worker pane untouched, and no
-/// automatic focus movement happens. Note that the focus steering is part of
-/// the gated surface, not a separate feature — it only ever ran while locked.
-pub fn show_command_entry_lock() -> bool {
-    experimental_enabled()
-}
-
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.

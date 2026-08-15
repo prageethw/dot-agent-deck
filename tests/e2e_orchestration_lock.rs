@@ -2,15 +2,18 @@
 
 //! L2 end-to-end coverage for the command-entry lock on Orchestration tabs.
 //!
-//! **Every deck here launches with `DOT_AGENT_DECK_EXPERIMENTAL=1`.** The lock
-//! is gated behind the experimental flag (`features::show_command_entry_lock`,
-//! CLAUDE.md #9) while it is evaluated in real use, so without the env var
-//! these decks would observe the un-gated pre-lock behaviour and every
-//! assertion below would be testing the wrong thing. `orchestration/lock/014`
-//! is the deliberate exception — it launches WITHOUT the flag and pins that
-//! flag-off behaviour, so the gate stays covered from both sides.
+//! The lock is unconditional (fork #346 graduated it out from behind the
+//! `experimental` flag): every deck locks a non-orchestrator role pane's
+//! input by default, with no flag and no project config required anywhere.
+//! `orchestration/lock/015`/`016` pin that with NO `.dot-agent-deck.toml`
+//! discoverable anywhere (via `DOT_AGENT_DECK_FEATURES_CONFIG` pointed at a
+//! path that provably does not exist, forcing the exact "missing file"
+//! resolution branch a real deck launched from a config-less home directory
+//! hits), the lock still holds and `Ctrl+e` still resolves — the permanent
+//! anti-regression property that a config-less deck is never silently
+//! unlocked.
 //!
-//! With the flag on: a keystroke typed while a non-orchestrator role pane is focused
+//! A keystroke typed while a non-orchestrator role pane is focused
 //! must not reach that pane's PTY; the orchestrator pane's own input is never
 //! gated; `Ctrl+d` then `Ctrl+e` toggles the lock; a pane reporting
 //! `WaitingForInput` is not gated at all; and the always-available
@@ -575,23 +578,111 @@ fn lock_012_real_agent_gated_by_lock_state() {
     );
 }
 
-/// Scenario: With the `experimental` flag OFF — the default — the whole
-/// command-entry lock surface is absent. On a real Orchestration tab
-/// (`orch-deck` fixture, two `cat` stub roles), focus the non-orchestrator
-/// worker and type: the keystrokes must reach its PTY immediately, with no
-/// unlock and no `Pane locked` message. Then send `Ctrl+e` in command mode and
-/// confirm the deck does not claim it — no `Pane entry:` report appears.
-#[spec("orchestration/lock/014")]
-#[test]
-fn lock_014_flag_off_leaves_worker_input_ungated() {
-    const WORKER_SENTINEL: &str = "LOCK014_WORKER_UNGATED_5b7d";
+/// A path that provably does not exist on disk: `root` is a real, empty
+/// harness-managed tempdir, but its `project` subdirectory is never created,
+/// so `root/project/.dot-agent-deck.toml` cannot exist. Pointing
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` at it forces `features_config_path()`'s
+/// override branch (checked FIRST, before any ancestor walk — `src/config.rs`)
+/// to resolve to a missing file, driving `load_features_file` down its exact
+/// `ErrorKind::NotFound -> Features::default()` branch — the SAME branch a
+/// real ancestor walk hits when no `.dot-agent-deck.toml` exists anywhere
+/// above the process cwd, which is fork #346's reported scenario (a deck
+/// launched from the maintainer's home directory, with no project config
+/// anywhere in its ancestry). `src/config.rs`'s own doc comment on
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` calls this override "so tests never touch
+/// the real cwd" — this reuses that sanctioned mechanism rather than
+/// `features::set_for_test`, which would only prove the gate's own if/else and
+/// say nothing about the no-config resolution fork #346 is actually about.
+/// The returned `TempDir` must be kept alive for the caller's whole test, or
+/// its `Drop` removes `root` (harmless here, since `project` was never
+/// created under it either way, but keeping it alive matches the harness's
+/// own convention for tempdir-backed fixtures).
+fn ghost_features_config_path() -> (tempfile::TempDir, String) {
+    let root = common::harness_tempdir().expect("create ghost tempdir");
+    let ghost = root
+        .path()
+        .join("project")
+        .join(".dot-agent-deck.toml")
+        .to_str()
+        .expect("ghost path is UTF-8")
+        .to_string();
+    (root, ghost)
+}
 
-    // Deliberately NO `.with_env("DOT_AGENT_DECK_EXPERIMENTAL", …)`: this test
-    // exists to pin what a DEFAULT install sees while PRD #393 is gated. Every
-    // other test in this file opts the flag ON; this is the other side of that
-    // gate, so a regression that shipped the lock unconditionally fails here
-    // rather than silently reaching every user.
+/// Scenario: With no project config discoverable anywhere (the
+/// `ghost_features_config_path` mechanism above), a real Orchestration tab
+/// still LOCKS: a keystroke typed at the focused non-orchestrator worker pane
+/// must not reach its PTY and the lock's own status message must appear,
+/// while the orchestrator pane's own input still reaches its PTY untouched.
+/// The lock is unconditional (fork #346), so it holds even with no config
+/// present anywhere, matching `orchestration/lock/008`'s behaviour with no
+/// flag involved at all.
+#[spec("orchestration/lock/015")]
+#[test]
+fn lock_015_gate_holds_with_no_project_config_present() {
+    const ORCH_SENTINEL: &str = "LOCK015_ORCH_2e9a";
+    const WORKER_SENTINEL: &str = "LOCK015_WORKER_c714";
+
+    let (_ghost_root, ghost_config) = ghost_features_config_path();
+
+    // Deliberately NO `DOT_AGENT_DECK_EXPERIMENTAL`: fork #346 is about the
+    // real no-flag-set, no-config-anywhere default, not the flag's own on/off
+    // behaviour (already covered by `orchestration/lock/008`/`014`).
     let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_FEATURES_CONFIG", ghost_config.as_str())
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-deck");
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+
+    // The orchestrator pane's own input must still reach its PTY even with no
+    // project config present anywhere.
+    deck.send_keys(format!("{ORCH_SENTINEL}\r").as_bytes());
+    deck.wait_for_string(ORCH_SENTINEL);
+
+    focus_worker_role(&deck);
+
+    // Locked: a keystroke aimed at the worker pane must NOT reach its PTY.
+    deck.send_keys(format!("{WORKER_SENTINEL}\r").as_bytes());
+    let leaked = deck.wait_for_grid_string_within(WORKER_SENTINEL, Duration::from_secs(2));
+    assert!(
+        !leaked,
+        "a keystroke typed into the non-orchestrator worker pane reached its \
+         PTY with NO project config present anywhere — expected the \
+         command-entry lock to hold regardless of the experimental flag (fork \
+         #346: the flag gate must be removed so this surface works with no \
+         project config present, the maintainer's actual environment).\n\
+         Grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // And the lock's own status message must have appeared for the dropped
+    // keystroke.
+    assert!(
+        deck.snapshot_grid().contains("Pane locked"),
+        "the command-entry lock dropped a keystroke but never reported its \
+         status message with no project config present anywhere.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: With no project config discoverable anywhere (same mechanism as
+/// `orchestration/lock/015`), send `Ctrl+e` from command mode on a real
+/// Orchestration tab and confirm the deck still claims it as
+/// `Action::ToggleOrchestrationLock` — reported via `Pane entry: unlocked` —
+/// rather than leaving it unclaimed for the global keybinding resolver to
+/// fall through to the PTY. `Ctrl+e`'s binding resolution is unconditional
+/// (fork #346), so it still resolves with no config present — the mirror of
+/// `orchestration/lock/009`'s proof, with no flag involved at all.
+#[spec("orchestration/lock/016")]
+#[test]
+fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
+    let (_ghost_root, ghost_config) = ghost_features_config_path();
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_FEATURES_CONFIG", ghost_config.as_str())
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -599,29 +690,15 @@ fn lock_014_flag_off_leaves_worker_input_ungated() {
     open_orchestration(&deck);
     deck.wait_for_absence("New Agent");
 
-    focus_worker_role(&deck);
-
-    // The keystroke must reach the worker's PTY with no unlock chord at all.
-    deck.send_keys(format!("{WORKER_SENTINEL}\r").as_bytes());
-    deck.wait_for_string(WORKER_SENTINEL);
-
-    // And the lock's own status message must never have appeared.
-    assert!(
-        !deck.snapshot_grid().contains("Pane locked"),
-        "the deck reported the command-entry lock while the experimental flag \
-         was off — the surface must be entirely absent by default.\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // Ctrl+e must not be claimed either: in command mode it should toggle
-    // nothing, so no `Pane entry:` report can appear.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
-    deck.send_bytes(b"\x05"); // Ctrl+e -> not claimed while the flag is off
-    let claimed = deck.wait_for_grid_string_within("Pane entry:", Duration::from_secs(2));
+    deck.send_bytes(b"\x05"); // Ctrl+e -> Action::ToggleOrchestrationLock
+
     assert!(
-        !claimed,
-        "Ctrl+e toggled the command-entry lock while the experimental flag was \
-         off — the binding must not be claimed at all.\nGrid:\n{}",
+        deck.wait_for_grid_string_within("Pane entry: unlocked", Duration::from_secs(3)),
+        "Ctrl+e from command mode was not claimed as \
+         Action::ToggleOrchestrationLock with no project config present \
+         anywhere — the deck never reported `Pane entry: unlocked` (fork \
+         #346).\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
