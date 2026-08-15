@@ -87,16 +87,28 @@ const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
 /// and simply asks the TUI to submit what it already holds.
 ///
 /// **The accepted trade.** A value of 2 also recovered a bootstrap launcher that
-/// genuinely CONSUMES the first write — `scheduler/dispatch/015`'s bootstrap
-/// wrapper reads the bytes itself and the agent that starts behind it never sees
-/// them — by re-sending it as a bounded replacement payload on attempt 2. Setting
-/// this to 1 gives that recovery up; `scheduler/dispatch/015` is expected to
-/// regress as a result (it is a real-agent test that self-skips in CI for lack of
-/// credentials, so it will not turn the board red). That case is deliberately
-/// deferred to a follow-up that recovers it by **evidence** — confirming whether
-/// the launcher actually consumed the bytes — rather than by attempt count, since
-/// attempt count cannot tell the "launcher consumed it" case apart from the
-/// "composer already holds it" case this fix addresses.
+/// genuinely CONSUMES the first write — the launcher's bootstrap wrapper reads
+/// the bytes itself and the agent that starts behind it never sees them — by
+/// re-sending it as a bounded replacement payload on attempt 2. Setting this to
+/// 1 gives that recovery up. Both `scheduler/dispatch/014` and
+/// `scheduler/dispatch/015` covered this launcher-consumed-first-write case:
+/// `/014` exercised it synthetically, with no credential gate, on every push —
+/// it went red, and has since been removed outright (round 2), because nothing
+/// survived narrowing; `/015` is a real-agent test that self-skips in CI for
+/// lack of credentials, so it never turned the board red either way. With
+/// `/014` gone, this capability has **no automated coverage at all**. Tracked
+/// in **#343**. That case is deliberately deferred to a follow-up that
+/// recovers it by **evidence** — confirming whether the launcher actually
+/// consumed the bytes — rather than by attempt count, since attempt count
+/// cannot tell the "launcher consumed it" case apart from the "composer
+/// already holds it" case this fix addresses.
+///
+/// **Why `= 1` is sound for the case fork #194 is actually about** (a direct
+/// native spawn, no launcher hop): PRD fork#257 proved empirically that Claude
+/// holds the payload in its composer and a bare CR submits it — a PTY relay
+/// suppressed the original write's CR, byte counters showed exactly one byte's
+/// difference between bytes read and bytes forwarded, across five real-agent
+/// runs including a mutation check.
 const MAX_PAYLOAD_SUBMISSIONS: u32 = 1;
 
 /// Whether attempt `attempt` (1-based) of a delivery writes the prompt PAYLOAD,
