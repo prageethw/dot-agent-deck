@@ -4,8 +4,18 @@
 //! introduced by in-flight work. Off by default. Opt-in via the
 //! `[features]` table in the project `.dot-agent-deck.toml` or the
 //! `DOT_AGENT_DECK_EXPERIMENTAL` env var (env wins, OQ3). Both the TUI and
-//! the daemon read the flag independently from the same source of truth (the
-//! file); see [`init_and_watch`].
+//! the daemon call [`init_and_watch`] and each resolves the flag from the
+//! same on-disk source, but as of fork issue #303's Phase 1 investigation
+//! this is NOT a live cross-process guarantee: every consumer
+//! (`show_experimental_footer`, `show_issue_dispatch_authoring`,
+//! `show_command_entry_lock`) lives in `src/ui.rs`, so the daemon's call
+//! installs a value into the daemon process's own `SHARED` that nothing
+//! ever reads. Treat "both processes resolve the same algorithm" as true
+//! and "the two processes therefore agree on anything" as not yet
+//! meaningful — it would need a real daemon-side (or pane-scoped) consumer
+//! to become one. If such a consumer is ever added, this premise breaks and
+//! per-surface resolution needs reconsidering (see the PRD/issue #303
+//! findings for the fuller argument).
 //!
 //! ## Gating convention (CLAUDE.md #9 / PRD #139 M3.2)
 //!
@@ -103,19 +113,56 @@ pub fn show_issue_dispatch_authoring() -> bool {
 /// no-op rather than leaking a duplicate poll thread.
 static INIT: Once = Once::new();
 
+/// Build the diagnosability message for fork issue #303: when the ancestor
+/// walk in `features_config_path()` found no `.dot-agent-deck.toml` anywhere
+/// above `project_dir`, the flag silently defaults to OFF with no other
+/// signal that anything went looking. Only diagnose this when no explicit
+/// override is in play — an operator-supplied `DOT_AGENT_DECK_FEATURES_CONFIG`
+/// that points at a missing file is a different problem. Returns `None` when
+/// a config was found (or an override is set), so callers can stay silent in
+/// the common case.
+fn missing_config_warning(path: &std::path::Path, project_dir: &std::path::Path) -> Option<String> {
+    if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_ok() || path.is_file() {
+        return None;
+    }
+    Some(format!(
+        "no {} found in {} or any ancestor directory; experimental flags default to OFF",
+        crate::project_config::CONFIG_FILE_NAME,
+        // SECURITY (issue #303 M1): `project_dir` is attacker-influenceable —
+        // any directory the process was launched from — and this warning is
+        // printed raw to the terminal ahead of the alt-screen switch
+        // (`main.rs::run_tui_session`). Sanitize it the same way
+        // `worktree_reclaim.rs`/`daemon_client.rs`/`keybindings.rs` sanitize
+        // other operator-facing paths, or an embedded CR+ESC[2K can erase
+        // this very warning and forge a reassuring line in its place.
+        crate::terminal_sanitize::sanitize_path_for_terminal_display(project_dir)
+    ))
+}
+
 /// Initialize the process-global `Features` from the `[features]` table of
 /// the `.dot-agent-deck.toml` in `project_dir` (env override wins), log the
 /// startup state and the file it came from (PRD #139 M1.3 / OQ4), and spawn
 /// the periodic re-read watcher (PRD #139 M2.1). Called once at startup by
 /// BOTH the TUI and the daemon so each process evaluates the flag from the
-/// same file. Idempotent: the body runs at most once per process, so a second
-/// call cannot spawn a duplicate watcher thread.
+/// same file — see the module doc for why that is not the same thing as the
+/// two processes agreeing on anything today. Idempotent: the body runs at
+/// most once per process, so a second call cannot spawn a duplicate watcher
+/// thread.
 ///
 /// `project_dir` is passed in rather than derived here (issue #577): the
 /// caller decides which project the flag belongs to, exactly as every other
 /// config read takes the directory it was handed
 /// ([`crate::project_config::load_project_config`]).
-pub fn init_and_watch(project_dir: &std::path::Path) {
+///
+/// Returns the fork issue #303 diagnosability message (see
+/// [`missing_config_warning`]) the FIRST time this is called, so a caller
+/// with a user-visible seam (the TUI's startup path, before it enters the
+/// alternate screen) can surface it without needing `DOT_AGENT_DECK_LOG` or a
+/// restart. Returns `None` on a config found (or an override set), and also
+/// on any call after the first — `init_and_watch` is only ever called once
+/// per process in production, so this is not a real limitation.
+pub fn init_and_watch(project_dir: &std::path::Path) -> Option<String> {
+    let mut warning = None;
     INIT.call_once(|| {
         let path = crate::config::features_config_path(project_dir);
         let resolved = crate::config::resolve_features(crate::config::load_features_file(
@@ -133,24 +180,13 @@ pub fn init_and_watch(project_dir: &std::path::Path) {
             if resolved.experimental { "ON" } else { "OFF" },
             path.display()
         );
-        // Fork issue #303: when the ancestor walk in `features_config_path()`
-        // found no `.dot-agent-deck.toml` anywhere above the process cwd, the
-        // flag silently defaults to OFF with no other signal that anything
-        // went looking. Only diagnose this when no explicit override is in
-        // play — an operator-supplied `DOT_AGENT_DECK_FEATURES_CONFIG` that
-        // points at a missing file is a different problem.
-        if std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG").is_err() && !path.is_file() {
-            tracing::warn!(
-                "no {} found in {} or any ancestor directory; experimental \
-                 flags default to OFF",
-                crate::project_config::CONFIG_FILE_NAME,
-                std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    .display()
-            );
+        if let Some(message) = missing_config_warning(&path, project_dir) {
+            tracing::warn!("{message}");
+            warning = Some(message);
         }
         spawn_watcher(path);
     });
+    warning
 }
 
 /// Periodic re-read watcher (OQ1). The deck has no existing config-reload
