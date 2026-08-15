@@ -880,7 +880,7 @@ fn pane_008_codex_card_omits_agent_type_badge() {
 
 /// Scenario: Render the same live Codex session card through
 /// `render_card_for_mode_to_buffer` with the agent-type badge toggle off and
-/// on, then repeat the on/off pair for every shipped agent type with a
+/// on, then repeat the on/off pair for all five shipped agent types with a
 /// friendly display name. Off must show no type label and no cell in that
 /// agent's registry `badge_color`; on must show `<Label> · <name>` and a cell
 /// carrying both `badge_color` and `Modifier::BOLD`. Also pins D4: a
@@ -976,6 +976,7 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         (AgentType::OpenCode, "friendly-opencode"),
         (AgentType::Pi, "friendly-pi"),
         (AgentType::Codex, "friendly-codex"),
+        (AgentType::Devin, "friendly-devin"),
     ] {
         let mut named = session.clone();
         named.agent_type = agent_type.clone();
