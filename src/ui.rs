@@ -11906,18 +11906,7 @@ fn handle_key_event(
         // typing at. Un-resolving it lets the key fall through to the normal
         // `PaneInput` forwarding path (`0x05`) instead.
         let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
-        // PRD #393 experimental gate (CLAUDE.md #9). Passing `false` for the
-        // tab term when the flag is off makes `scope_command_entry_lock`
-        // un-resolve `Ctrl+E` everywhere, exactly as it already does off an
-        // Orchestration tab — so the key falls through to the PTY and the lock
-        // has no binding at all. Expressed through the existing tab term rather
-        // than a second branch so there is only one place that decides whether
-        // the chord is claimed.
-        action = scope_command_entry_lock(
-            action,
-            is_orchestration_tab && crate::features::show_command_entry_lock(),
-            ui.mode,
-        );
+        action = scope_command_entry_lock(action, is_orchestration_tab, ui.mode);
         // PRD #336, extended to a 3-stage cycle by PRD #361 Item 4 and scoped
         // uniformly by PRD #387 M1: CycleSplitStage is claimed only in command
         // mode, and only on a tab type that HAS a sidebar/pane-column split.
@@ -12017,22 +12006,13 @@ fn handle_key_event(
                 // the plain `build_pane_status` the pane borders read: it omits
                 // any `pane_id` claimed by more than one session, so an
                 // ambiguous pane can never earn the carve-out.
-                //
-                // PRD #393 experimental gate (CLAUDE.md #9): with the flag off
-                // the keystroke is forwarded untouched, which also skips
-                // building the status join above — the lock is the only reader
-                // of it, so there is nothing to compute when it cannot act.
-                let gated = if crate::features::show_command_entry_lock() {
-                    gate_pane_input_key(
-                        candidate.clone(),
-                        ui,
-                        tab_manager,
-                        pane,
-                        &build_pane_status_for_gate(snapshot),
-                    )
-                } else {
-                    candidate.clone()
-                };
+                let gated = gate_pane_input_key(
+                    candidate.clone(),
+                    ui,
+                    tab_manager,
+                    pane,
+                    &build_pane_status_for_gate(snapshot),
+                );
                 if matches!(candidate, Action::ForwardToPane(_))
                     && matches!(gated, Action::Continue)
                 {
@@ -13653,43 +13633,7 @@ pub fn run_tui(
         // handler calls `clear_waiting_pane_latch` on the locked→unlocked half
         // to compensate (see that method's doc comment for the straddling trace
         // this protects).
-        //
-        // PRD #393 experimental gate (CLAUDE.md #9). The steering is part of the
-        // gated surface rather than a separate feature: it only ever ran while
-        // locked, so with the flag off it must not run either — otherwise the
-        // deck would move focus on its own for a lock the user cannot see or
-        // reach. Flag off therefore means no automatic focus movement at all,
-        // which is exactly v0.35.8's behaviour.
-        //
-        // Greptile PR #446: the flag is LIVE-RELOADED (`features::spawn_watcher`
-        // re-reads `.dot-agent-deck.toml` every ~2s), so unlike a compile-time
-        // gate it can flip mid-session — which makes it a second way to stop
-        // observing, alongside the `Ctrl+E` unlock. The latch this chain reads
-        // (`had_waiting_pane` / `all_clear_pending`) is EDGE-triggered, so
-        // stopping observation while it is set freezes it: a pane that resolves
-        // while the flag is off would be re-read on the next enable as a fresh
-        // all-clear edge and yank focus to the orchestrator for an episode the
-        // human already dealt with. The `Ctrl+E` handler compensates for its own
-        // half by calling `clear_waiting_pane_latch`; the flag needs the same
-        // compensation, done here rather than edge-tracked because holding no
-        // latch at all is the honest state while the surface does not exist.
-        // Read ONCE per frame into a local. The `else if` below tests
-        // `ui.command_entry_locked` — a `UiState` bool, not the flag — so this
-        // is already a single read and the local changes no behaviour; it is
-        // here to keep that property obvious, so a later edit cannot introduce
-        // a second read that disagrees with this one mid-frame.
-        //
-        // Note also why a torn read could not persist even if one occurred: the
-        // clear below is LEVEL-triggered, running on every frame the flag is
-        // off, not edge-triggered on the transition. So a frame that somehow
-        // observed the wrong value self-corrects on the next one (~16ms) —
-        // orders of magnitude faster than a human can resolve a waiting pane.
-        // That is the reason this compensates unconditionally rather than
-        // tracking the on->off edge.
-        let command_entry_lock_enabled = crate::features::show_command_entry_lock();
-        if !command_entry_lock_enabled {
-            tab_manager.clear_waiting_pane_latch();
-        } else if ui.command_entry_locked {
+        if ui.command_entry_locked {
             let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
             // The observation runs FIRST and outside the chain, because it must
             // happen on every locked frame no matter which branch below wins.
