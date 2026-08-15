@@ -4602,7 +4602,8 @@ fn finalize_orchestrator_prompt(
     orchestrator_prompt: &mut Option<String>,
 ) {
     *orchestrator_prompt = None;
-    role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+    role_statuses[start_role_index] =
+        next_start_role_status_after_delivery(role_statuses[start_role_index]);
     ui.orchestration_prompted.insert(tab_id);
     ui.send_retry_backoff.remove(start_pane_id);
     ui.prompt_delivery.remove(start_pane_id);
@@ -33797,7 +33798,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let mut ui = default_ui();
-            ui.orchestration_created_at.insert(tab_id, now);
+            ui.orchestration_prompt_anchor_at.insert(tab_id, now);
             ui.orchestration_ready_since.insert(
                 tab_id,
                 now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
@@ -34617,7 +34618,7 @@ mod tests {
         let tab_id: TabId = 30030;
         let mut held_role_ui = default_ui();
         held_role_ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .insert(tab_id, started);
         held_role_ui.orchestration_ready_since.insert(
             tab_id,
@@ -34750,7 +34751,7 @@ mod tests {
         let burst_tab_id: TabId = 30031;
         let mut burst_role_ui = default_ui();
         burst_role_ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .insert(burst_tab_id, burst_started);
         burst_role_ui.orchestration_ready_since.insert(
             burst_tab_id,
@@ -34872,7 +34873,7 @@ mod tests {
         let lost_tab_id: TabId = 30032;
         let mut lost_role_ui = default_ui();
         lost_role_ui
-            .orchestration_created_at
+            .orchestration_prompt_anchor_at
             .insert(lost_tab_id, lost_started);
         lost_role_ui.orchestration_ready_since.insert(
             lost_tab_id,
@@ -35118,7 +35119,7 @@ mod tests {
         let created = std::time::Instant::now();
         let tab_id: TabId = 25;
         let mut ui = default_ui();
-        ui.orchestration_created_at.insert(tab_id, created);
+        ui.orchestration_prompt_anchor_at.insert(tab_id, created);
         ui.orchestration_ready_since.insert(
             tab_id,
             created

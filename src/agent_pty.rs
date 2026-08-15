@@ -9282,7 +9282,11 @@ mod spawn_tests {
                 child,
                 process_group: group,
                 master: pair.master,
-                writer: Arc::new(AsyncMutex::new(writer)),
+                writer: Arc::new(AsyncMutex::new(PaneWriter::new(
+                    writer,
+                    None,
+                    Arc::new(Mutex::new(PaneInputState::default())),
+                ))),
                 bus: Arc::new(AgentBus::new()),
                 pane_id_env: None,
                 display_name: None,
