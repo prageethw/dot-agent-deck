@@ -109,7 +109,7 @@ In the default `Stacked` pane layout, only the focused role's pane is drawn — 
 
 ### Typing into a worker is locked by default
 
-You talk to the orchestrator; the orchestrator talks to the workers. On an orchestration tab the deck makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. The orchestrator's own pane is never locked, and Dashboard and mode tabs are not affected at all.
+You talk to the orchestrator; the orchestrator talks to the workers. On an orchestration tab the deck makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered — and so are pastes — and the bottom bar says `Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here`. A persistent ` LOCKED ` / ` UNLOCKED ` chip in the bottom bar shows the current state while you are typing into a pane. The orchestrator's own pane is never locked, and Dashboard and mode tabs are not affected at all.
 
 The reason is that an orchestration is one workflow with a single coordinator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
 
