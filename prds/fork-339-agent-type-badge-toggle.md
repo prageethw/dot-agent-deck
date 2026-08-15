@@ -4,7 +4,9 @@
 
 **Priority**: Medium
 
-**Status** *(2026-08-15)*: **In progress — M1–M8 complete and green.** Draft PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) open on branch `feat/339-agent-type-badge-toggle`. Execution is at "Resume checklist" step 7: `reviewer` and `auditor` have both run, and their findings are being resolved (this round). Step 8 (`release` → `/prd-done`) and step 9 (**file the upstream-offer issue at merge time**, per rule 19 — reframed for upstream, where the badge is currently unconditional) remain and must not be dropped before merge.
+**Status** *(corrected 2026-08-16)*: **Merged into the fork — M1–M8 complete, every resume-checklist step discharged.** PR [#342](https://github.com/prageethw/dot-agent-deck/pull/342) merged 2026-08-15 as `a9ca72cc`, first released in **v0.38.2**. The `reviewer` and `auditor` findings named below were resolved before merge (step 7); step 8 (`release` → `/prd-done`) is done; step 9 — the rule 19 upstream-offer issue — is discharged as [fork #347](https://github.com/prageethw/dot-agent-deck/issues/347), which carries the reframing the next paragraph describes. Nothing remains open on this PRD.
+
+*(This line read "In progress … Draft PR #342 open" until 2026-08-16 — the PR had merged the day before, so the file advertised work that was already shipped. Corrected while clearing the PRD queue; the stale status is what made the PRD look actionable in a queue sweep.)*
 
 **Branch prefix — one deliberate deviation from the resume checklist below.** Step 2 prescribes `fix/<n>-…`. This branch is `feat/339-…` instead, because [fork #340](https://github.com/prageethw/dot-agent-deck/issues/340)'s tier-2 supplier maps `fix/` → `bug` while this change ships a `.feature.md` fragment (M8), so `work-type-check`'s R0 would fail on tier disagreement the moment that gate lands. `feat/` is the correct prefix for a `prd`-type change.
 
