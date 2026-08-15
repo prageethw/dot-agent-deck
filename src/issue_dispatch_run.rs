@@ -1475,6 +1475,46 @@ fn notify_marker_warning_if_any(
     }
 }
 
+/// Fork #282: lock file for [`create_worktree_sync`]'s attach-race fix.
+/// `git worktree add <path> <existing-branch>` (no `-b`) is NOT serialized by
+/// git's own ref lock the way `-b` creation is — measured: a 3-way `-b` race
+/// gave one winner and two clean failures, while a 2-way attach race over 25
+/// trials corrupted ~8% of the time, with BOTH racers exiting 0 and git
+/// registering two `.git/worktrees/` admin entries for one on-disk path. The
+/// racers are two separate `worker-agent-deck` PROCESSES, not two threads in
+/// one process, so this needs a cross-process primitive — the same
+/// `flock(2)`-based one [`crate::platform::lock`] already establishes for
+/// `daemon_attach.rs`/`daemon.rs`, scoped here to `worktree_dir`, the exact
+/// on-disk path being contended over (never the branch name: two different
+/// target paths must never contend on one lock).
+///
+/// Anchored under the shared clone's OWN `.git` dir rather than a
+/// machine-global lock root (contrast [`crate::daemon`]'s
+/// `XDG_RUNTIME_DIR`-then-`~/.cache` lock-root dance for the daemon socket
+/// lock): `.git` already belongs to whoever owns the repository, so this
+/// introduces no new local-attacker DoS surface the way a sibling lock file
+/// under a world-writable `/tmp` would, and it keeps every test's own
+/// tempdir clone naturally isolated with no env-var override needed.
+///
+/// The filename hashes the FULL `worktree_dir` path (not just its basename)
+/// so two different target paths never collide onto one lock file — the same
+/// reasoning as `daemon::lock_path_for`.
+fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    worktree_dir.as_os_str().hash(&mut hasher);
+    let hash = hasher.finish();
+    let basename = worktree_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("worktree");
+    clone_dir
+        .join(".git")
+        .join("dot-agent-deck-worktree-locks")
+        .join(format!("{basename}-{hash:016x}.lock"))
+}
+
 /// Sync twin of [`create_worktree`] for the TUI's synchronous `SpawnPane`
 /// dispatch (fork #122): `dispatch_action` is not `async` and this runs on
 /// the hot input path, so it cannot `.await` the tokio-based creator. Shares
@@ -1486,6 +1526,24 @@ fn notify_marker_warning_if_any(
 /// drift on WHAT to run or how to interpret the result; only the actual
 /// process spawn (blocking `std::process::Command` here, `tokio::process`
 /// there) differs.
+///
+/// Fork #282: the whole probe→add→(cleanup) sequence below now runs under an
+/// exclusive [`worktree_attach_lock_path`] lock, held for the ENTIRE
+/// function (including the `TimedOut` cleanup arm). That is what closes the
+/// second, Windows-only corruption shape the fork #282 investigation found:
+/// a losing racer's own `AddOutcome::TimedOut` cleanup
+/// ([`attempt_worktree_cleanup`]) assumes it is only ever cleaning up after
+/// ITSELF, which was false when a concurrent winner could still be
+/// mid-registration at the same path — the loser's `git worktree remove
+/// --force` could remove the winner's just-created admin entry, producing a
+/// `Created` result with no admin entry or `worktree list` row afterwards.
+/// With the lock held for the whole function, only one caller's full
+/// attempt — probe, add, and any cleanup it triggers — is ever in flight for
+/// a given `worktree_dir` at a time; a second caller's own probe+add only
+/// starts once the first has fully finished (registration AND any cleanup),
+/// so it always sees the directory in its final state and classifies
+/// correctly (`AlreadyClaimed` when the winner succeeded, its own fresh
+/// attempt otherwise) rather than racing the winner's in-progress write.
 pub(crate) fn create_worktree_sync(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -1493,6 +1551,24 @@ pub(crate) fn create_worktree_sync(
     creator: &str,
 ) -> Result<WorktreeCreation, String> {
     ensure_worktree_parent_dir(worktree_dir)?;
+
+    let lock_path = worktree_attach_lock_path(clone_dir, worktree_dir);
+    if let Some(parent) = lock_path.parent() {
+        crate::platform::fsperm::ensure_owner_only_dir(parent).map_err(|e| {
+            format!(
+                "failed to prepare worktree lock directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let _attach_lock =
+        crate::platform::lock::acquire_worktree_lock_sync(&lock_path).map_err(|e| {
+            format!(
+                "failed to acquire worktree attach lock {}: {e}",
+                lock_path.display()
+            )
+        })?;
+
     let branch_exists = run_status_sync(
         "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),

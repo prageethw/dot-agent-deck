@@ -19,6 +19,21 @@ pub use unix::{SpawnLock, acquire_spawn_lock};
 #[cfg(windows)]
 pub use windows::{SpawnLock, acquire_spawn_lock};
 
+/// Synchronous, cross-process exclusive lock scoped to an arbitrary path —
+/// the counterpart to [`acquire_spawn_lock`] for callers that cannot
+/// `.await` (fork #282: [`crate::issue_dispatch_run::create_worktree_sync`],
+/// the sync TUI hot path). Unix reuses the same `flock(2)` primitive
+/// ([`unix::acquire_spawn_lock_sync`]); Windows reuses the same named-mutex
+/// identity and security model as [`acquire_spawn_lock`]
+/// ([`windows::acquire_path_lock_sync`]) but blocks the calling thread
+/// directly instead of handing off to a dedicated owner thread — safe there
+/// because a sync caller never `.await`s between acquire and drop, so the
+/// guard never migrates threads.
+#[cfg(unix)]
+pub use unix::acquire_spawn_lock_sync as acquire_worktree_lock_sync;
+#[cfg(windows)]
+pub use windows::acquire_path_lock_sync as acquire_worktree_lock_sync;
+
 /// Name of the Windows named mutex that stands in for the Unix `flock(2)` on
 /// `lock_path` (PRD #163 M2). `user_token` is
 /// [`crate::platform::paths::endpoint_user_suffix`] — the current user's SID.

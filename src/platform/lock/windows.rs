@@ -179,6 +179,50 @@ pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     }
 }
 
+/// RAII guard for the SYNCHRONOUS counterpart to [`SpawnLock`] (fork #282):
+/// callers like [`crate::issue_dispatch_run::create_worktree_sync`] (the sync
+/// TUI hot path) cannot `.await`, so they cannot use [`acquire_spawn_lock`]'s
+/// dedicated-owner-thread machinery. They don't need it either — the guard is
+/// acquired and dropped on the SAME calling thread with no `.await` in
+/// between to migrate it elsewhere, which is exactly the thread-affinity
+/// property `ReleaseMutex` requires (see the module docs), satisfied for free
+/// here instead of by parking a dedicated thread.
+pub struct PathLock {
+    held: OwnedHandle,
+    name: String,
+}
+
+impl Drop for PathLock {
+    fn drop(&mut self) {
+        // SAFETY: `held.0` is a live mutex handle acquired by THIS thread in
+        // `acquire_path_lock_sync`, and this `Drop` runs on that same thread
+        // (no `.await`, no `std::thread::spawn` of the guard in between) —
+        // exactly the thread that owns the mutex, which `ReleaseMutex`
+        // requires.
+        if unsafe { ReleaseMutex(self.held.0) } == 0 {
+            tracing::warn!(
+                mutex = %self.name,
+                error = %std::io::Error::last_os_error(),
+                "ReleaseMutex on the sync worktree lock failed"
+            );
+        }
+    }
+}
+
+/// Synchronous counterpart to [`acquire_spawn_lock`]: acquires the SAME kind
+/// of named mutex (same identity derivation, same owner-only DACL, same
+/// `WAIT_ABANDONED` handling — see [`create_and_acquire`]) but blocks the
+/// CALLING thread directly instead of handing acquisition off to a dedicated
+/// owner thread. Safe here specifically because the caller never `.await`s
+/// between acquiring and dropping the guard, so there is no thread migration
+/// for `ReleaseMutex`'s thread-affinity rule to trip over.
+pub fn acquire_path_lock_sync(path: &Path) -> std::io::Result<PathLock> {
+    let user = crate::platform::paths::endpoint_user_suffix();
+    let name = super::spawn_mutex_name(&user, path);
+    let held = create_and_acquire(&name, &user)?;
+    Ok(PathLock { held, name })
+}
+
 /// Create-or-open the named mutex and block until this thread owns it. Runs on —
 /// and must only ever be called from — the guard's owner thread.
 fn create_and_acquire(name: &str, user_sid: &str) -> std::io::Result<OwnedHandle> {

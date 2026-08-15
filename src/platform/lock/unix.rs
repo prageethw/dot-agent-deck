@@ -23,6 +23,31 @@ impl Drop for SpawnLock {
     }
 }
 
+/// Open or create `path` and acquire an exclusive `flock(2)` on it, blocking
+/// the CALLING thread until granted. This is the core primitive; the async
+/// [`acquire_spawn_lock`] below just runs it on `spawn_blocking`, and fork
+/// #282's [`crate::issue_dispatch_run::create_worktree_sync`] (the sync TUI
+/// hot path, which cannot `.await`) calls it directly.
+pub fn acquire_spawn_lock_sync(path: &Path) -> std::io::Result<SpawnLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: passing a valid fd and a valid op constant; flock(2) does
+    // not retain any reference to the address space, so the unsafe is a
+    // formality of the libc binding.
+    let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if res != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(SpawnLock { file })
+}
+
 /// Open or create `path` and acquire an exclusive `flock(2)` on it. flock is
 /// blocking, so we run the syscall on `spawn_blocking` to avoid stalling other
 /// tasks scheduled on the same tokio worker when contention is real (i.e.,
@@ -34,26 +59,8 @@ impl Drop for SpawnLock {
 /// probing a stale socket would otherwise both `remove_file` and both `bind`,
 /// clobbering each other's clients).
 pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)?;
-        // SAFETY: passing a valid fd and a valid op constant; flock(2) does
-        // not retain any reference to the address space, so the unsafe is a
-        // formality of the libc binding.
-        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if res != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(SpawnLock { file })
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    tokio::task::spawn_blocking(move || acquire_spawn_lock_sync(&path))
+        .await
+        .map_err(std::io::Error::other)?
 }
