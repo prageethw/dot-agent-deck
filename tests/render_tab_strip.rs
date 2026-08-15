@@ -13,6 +13,7 @@
 //! `closeable` mask passed to the renderer encodes that — `false` for the
 //! Dashboard tab, `true` for Mode/Orchestration tabs.
 
+use dot_agent_deck::palette;
 use dot_agent_deck::state::SessionStatus;
 use dot_agent_deck::ui::render_tab_bar_to_buffer;
 use ratatui::style::{Color, Modifier};
@@ -111,16 +112,14 @@ fn dashboard_only_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// orchestration tab's label renders in the `palette::status_color()` of the
 /// SINGLE highest-priority status among its panes — fixed order Error(Red) >
 /// WaitingForInput(Magenta) > Working(Green) > Thinking/Compacting(Blue) >
-/// Idle/Unknown(no tint) (PRD #333). Covers: (a) one `Error` among `Idle`
-/// panes -> Red; (b) one `WaitingForInput` among `Working`/`Idle` (no Error)
-/// -> Magenta; (c) all `Idle` -> the SAME base label color as an ordinary
-/// tab, NOT `Color::DarkGray` (PRD #333 defect B: PRD #13 reserves DarkGray
-/// for purely-decorative elements, not label text); (d) `Thinking` +
-/// `Working` (no higher-priority state) -> Green, since Working outranks
-/// Thinking. Also asserts a non-orchestration tab (`None`) never gets
-/// colorized by this feature. RED today on (c): the Idle branch still
-/// applies `.fg(palette::status_color(Idle))` (`DarkGray`) instead of
-/// falling through to the base style.
+/// Idle/Unknown(`palette::STATUS_IDLE`) (PRD #333, fork issue #351). Covers:
+/// (a) one `Error` among `Idle` panes -> Red; (b) one `WaitingForInput` among
+/// `Working`/`Idle` (no Error) -> Magenta; (c) all `Idle` -> `STATUS_IDLE`
+/// (maintainer decision 2026-08-15: colour is a total function of status,
+/// including Idle, reversing PRD #333 defect B); (d) `Thinking` + `Working`
+/// (no higher-priority state) -> Green, since Working outranks Thinking.
+/// Also asserts a tab with no status data (`None` — the Dashboard case)
+/// never gets colorized by this feature.
 #[spec("tabs/orchestration/009")]
 #[test]
 fn orchestration_009_tab_label_colored_by_highest_priority_status() {
@@ -158,10 +157,13 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         "a tab with a WaitingForInput pane (no Error present) must render its label Magenta"
     );
 
-    // (c) Every pane Idle -> falls through to the base/unstyled label color,
-    // exactly like an ordinary tab. PRD #13 reserves DarkGray for
-    // purely-decorative, non-read elements only; a tab label is text, so an
-    // all-Idle orchestration tab must NOT be DarkGray (PRD #333 defect B).
+    // (c) Every pane Idle -> paints palette::STATUS_IDLE. Idle now paints
+    // STATUS_IDLE by maintainer decision (2026-08-15), deliberately
+    // reversing PRD #333's "an aggregate that resolves to Idle is not
+    // painted grey" and, before that, upstream's maintainer requiring the
+    // carve-out on review of upstream PR #356. Accepted trade-off:
+    // STATUS_IDLE is an absolute DarkGray and reads low-contrast on a dark
+    // terminal — this was chosen, not overlooked.
     let buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
@@ -169,18 +171,10 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         80,
         &[None, Some(&[Idle, Idle, Idle])],
     );
-    let base_buf = render_tab_bar_to_buffer(
-        &["Dashboard", "demo"],
-        &[false, false],
-        0,
-        80,
-        &[None, None],
-    );
     assert_eq!(
         tab_label_fg(&buf, "squad"),
-        tab_label_fg(&base_buf, "demo"),
-        "an all-Idle orchestration tab must render with the same base label color as an \
-         ordinary tab, not DarkGray"
+        palette::STATUS_IDLE,
+        "an all-Idle orchestration tab must render palette::STATUS_IDLE"
     );
 
     // (d) Thinking and Working present, nothing higher-priority -> Green,
@@ -199,10 +193,10 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
          label Green — Working outranks Thinking"
     );
 
-    // Non-orchestration tabs are unaffected: a `None` entry must render with
-    // the SAME base label color as any other unaffected tab in the same row,
-    // never a status color, even though "demo" here also happens to carry no
-    // status data.
+    // A tab entry with no status data (the Dashboard case, now that Mode
+    // tabs also carry status data via `Some(..)`) is unaffected: a `None`
+    // entry must render with the SAME base label color as any other
+    // unaffected tab in the same row, never a status color.
     let buf = render_tab_bar_to_buffer(
         &["Dashboard", "demo"],
         &[false, false],
@@ -213,8 +207,8 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
     assert_eq!(
         tab_label_fg(&buf, "Dashboard"),
         tab_label_fg(&buf, "demo"),
-        "a non-orchestration tab (None) must render with the same base label color as any \
-         other unaffected tab, not a status color"
+        "a tab with no status data (the Dashboard case) must render with the same base label \
+         color as any other unaffected tab, not a status color"
     );
 }
 
@@ -226,16 +220,17 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
 /// fg/bg, so a stacked status `fg` used to invert into a BACKGROUND at
 /// display time instead of coloring text — the reason the active tab used to
 /// drop the tint entirely). Also asserts an INACTIVE orchestration tab whose
-/// aggregate status is `Idle` renders with the same base label color as an
-/// ordinary tab, not `Color::DarkGray` (PRD #333 defect B, unchanged), and
-/// that an INACTIVE orchestration tab with a non-idle (`Error`) aggregate
-/// status still colors its label text as today, with neither `REVERSED` nor
-/// `BOLD` nor `UNDERLINED` — pinning the active cue from both sides, so an
-/// inactive tab can never become indistinguishable from an active one
-/// (reviewer finding F3 on PR #307/issue #306).
+/// aggregate status is `Idle` renders `palette::STATUS_IDLE` (`Color::DarkGray`),
+/// not the base label color (fork issue #351, maintainer decision 2026-08-15:
+/// colour is now a total function of status, including Idle — reversing PRD
+/// #333 defect B), and that an INACTIVE orchestration tab with a non-idle
+/// (`Error`) aggregate status still colors its label text as today, with
+/// neither `REVERSED` nor `BOLD` nor `UNDERLINED` — pinning the active cue
+/// from both sides, so an inactive tab can never become indistinguishable
+/// from an active one (reviewer finding F3 on PR #307/issue #306).
 #[spec("tabs/orchestration/010")]
 #[test]
-fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
+fn orchestration_010_active_status_tint_underlined_and_idle_coloured() {
     use SessionStatus::*;
 
     // Case 1 (issue #306): an ACTIVE orchestration tab with a non-idle
@@ -267,9 +262,9 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
          status tint into a background, got {active_modifier:?}"
     );
 
-    // Case 2 (defect B): an INACTIVE orchestration tab whose aggregate
-    // status is Idle must render with the base/unstyled label color, not
-    // DarkGray — an idle tab must look like an ordinary tab.
+    // Case 2 (fork issue #351, reversing defect B): an INACTIVE orchestration
+    // tab whose aggregate status is Idle must render palette::STATUS_IDLE —
+    // colour is a total function of status, including Idle.
     let idle_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
@@ -277,18 +272,11 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
         80,
         &[None, Some(&[Idle, Idle, Idle])],
     );
-    let base_buf = render_tab_bar_to_buffer(
-        &["Dashboard", "demo"],
-        &[false, false],
-        0,
-        80,
-        &[None, None],
-    );
     assert_eq!(
         tab_label_fg(&idle_buf, "squad"),
-        tab_label_fg(&base_buf, "demo"),
-        "an INACTIVE orchestration tab whose aggregate status is Idle must render with the \
-         same base label color as an ordinary tab, not DarkGray"
+        palette::STATUS_IDLE,
+        "an INACTIVE orchestration tab whose aggregate status is Idle must render \
+         palette::STATUS_IDLE"
     );
 
     // Case 3 (no regression, and F3: pin the inactive side of the active
@@ -319,45 +307,45 @@ fn orchestration_010_active_status_tint_underlined_and_idle_no_grey() {
 }
 
 /// Scenario: Render the tab strip with only the Dashboard tab, active, and no
-/// orchestration status data (`orchestration_statuses = [None]`) — assert its
+/// status data (`tab_statuses = [None]`) — assert its
 /// label carries `UNDERLINED | BOLD` as the active cue, contains no
 /// `REVERSED`, and carries no absolute foreground color (`Color::Reset`, the
 /// same as an ordinary unstyled tab) — proving the active cue applies
-/// uniformly to tabs this feature (issue #306) doesn't touch. RED today: the
-/// active style is still `Modifier::REVERSED | Modifier::BOLD` with no
-/// `UNDERLINED`.
+/// uniformly to the Dashboard tab, which carries no status data (fork issue
+/// #351 narrows this from "tabs this feature doesn't touch" now that Mode
+/// tabs also carry status data via `tab_status_data`; the Dashboard remains
+/// the deliberate scope boundary).
 #[spec("tabs/orchestration/015")]
 #[test]
-fn orchestration_015_active_non_orchestration_tab_underlined_no_reversed() {
+fn orchestration_015_active_dashboard_tab_underlined_no_reversed() {
     let buf = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
     let modifier = tab_label_modifier(&buf, "Dashboard");
     assert!(
         modifier.contains(Modifier::UNDERLINED) && modifier.contains(Modifier::BOLD),
-        "an ACTIVE non-orchestration tab must carry UNDERLINED | BOLD as its active cue, got \
+        "an ACTIVE Dashboard tab must carry UNDERLINED | BOLD as its active cue, got \
          {modifier:?}"
     );
     assert!(
         !modifier.contains(Modifier::REVERSED),
-        "an ACTIVE non-orchestration tab must NOT carry REVERSED, got {modifier:?}"
+        "an ACTIVE Dashboard tab must NOT carry REVERSED, got {modifier:?}"
     );
     assert_eq!(
         tab_label_fg(&buf, "Dashboard"),
         Color::Reset,
-        "an ACTIVE non-orchestration tab must carry no absolute foreground color"
+        "an ACTIVE Dashboard tab must carry no absolute foreground color"
     );
 }
 
 /// Scenario: Render the tab strip with an orchestration tab made the ACTIVE
-/// tab and give it an all-`Idle` aggregate — assert its label falls through
-/// to the same base/unstyled foreground color as an ordinary tab (no grey
-/// painted on read-critical text, extending PRD #333 defect B to the active
-/// tab per issue #306), while still carrying `UNDERLINED | BOLD` as its
-/// active cue and no `REVERSED`. RED today: the active branch bypasses the
-/// status match entirely and renders `Modifier::REVERSED | Modifier::BOLD`
-/// instead of `UNDERLINED | BOLD`.
+/// tab and give it an all-`Idle` aggregate — assert its label renders
+/// `palette::STATUS_IDLE` (fork issue #351, maintainer decision 2026-08-15:
+/// colour is now a total function of status, extending that to the active
+/// tab and reversing PRD #333 defect B / issue #306's active-tab carve-out),
+/// while still carrying `UNDERLINED | BOLD` as its active cue and no
+/// `REVERSED` — the active cue is unchanged, only the colour changes.
 #[spec("tabs/orchestration/014")]
 #[test]
-fn orchestration_014_active_idle_falls_through_no_grey() {
+fn orchestration_014_active_idle_coloured_underlined() {
     use SessionStatus::*;
 
     let active_idle_buf = render_tab_bar_to_buffer(
@@ -367,18 +355,11 @@ fn orchestration_014_active_idle_falls_through_no_grey() {
         80,
         &[None, Some(&[Idle, Idle, Idle])],
     );
-    let base_buf = render_tab_bar_to_buffer(
-        &["Dashboard", "demo"],
-        &[false, false],
-        0,
-        80,
-        &[None, None],
-    );
     assert_eq!(
         tab_label_fg(&active_idle_buf, "squad"),
-        tab_label_fg(&base_buf, "demo"),
-        "an ACTIVE orchestration tab whose aggregate status is Idle must render with the same \
-         base label color as an ordinary tab, not DarkGray"
+        palette::STATUS_IDLE,
+        "an ACTIVE orchestration tab whose aggregate status is Idle must render \
+         palette::STATUS_IDLE"
     );
     let modifier = tab_label_modifier(&active_idle_buf, "squad");
     assert!(
@@ -389,5 +370,86 @@ fn orchestration_014_active_idle_falls_through_no_grey() {
     assert!(
         !modifier.contains(Modifier::REVERSED),
         "an ACTIVE orchestration tab must NOT carry REVERSED, got {modifier:?}"
+    );
+}
+
+/// Scenario: Render the tab strip with a Dashboard tab plus a second tab made
+/// ACTIVE and carrying `Some(&[Working])` — the shape `tab_status_data`
+/// (fork issue #351) produces for a Mode tab whose agent pane is Working —
+/// and assert its label renders in `palette::STATUS_WORKING` (Green) as
+/// ordinary foreground text, still cued active via `UNDERLINED | BOLD` with
+/// no `REVERSED`. This is a regression guard, GREEN from the start: the
+/// render half (`render_tab_strip`) already colors any tab whose
+/// `tab_statuses` slot is `Some(..)` regardless of tab kind, exercised here
+/// directly via `render_tab_bar_to_buffer`. That `tab_status_data` actually
+/// produces `Some(&[Working])` for a live Mode tab is `tabs/label/001`'s
+/// concern; that `run_tui`'s call site wires the two together is covered by
+/// no test.
+#[spec("tabs/label/002")]
+#[test]
+fn label_002_active_tab_with_status_data_renders_status_color_underlined() {
+    use SessionStatus::*;
+
+    let buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, true],
+        1,
+        80,
+        &[None, Some(&[Working])],
+    );
+    assert_eq!(
+        tab_label_fg(&buf, "demo"),
+        palette::STATUS_WORKING,
+        "a tab carrying Some(&[Working]) status data must render its label in STATUS_WORKING"
+    );
+    let modifier = tab_label_modifier(&buf, "demo");
+    assert!(
+        modifier.contains(Modifier::UNDERLINED) && modifier.contains(Modifier::BOLD),
+        "the active tab must still carry UNDERLINED | BOLD as its active cue, got {modifier:?}"
+    );
+    assert!(
+        !modifier.contains(Modifier::REVERSED),
+        "the active tab must NOT carry REVERSED, got {modifier:?}"
+    );
+}
+
+/// Scenario: Render the tab strip with a second tab carrying `Some(&[Idle])`
+/// and, separately, `Some(&[])` — the shape `tab_status_data` (fork issue
+/// #351) produces for a Mode tab whose agent is Idle, and for one whose
+/// agent pane isn't live yet — and assert both render `palette::STATUS_IDLE`
+/// (maintainer decision 2026-08-15: colour is a total function of status,
+/// including Idle, following the same colour rule pinned in
+/// `orchestration_014_active_idle_coloured_underlined`). The no-panes-yet
+/// empty-slice case is intended to paint the same as an explicit Idle:
+/// `palette::highest_priority_status(&[])` also resolves to Idle.
+#[spec("tabs/label/003")]
+#[test]
+fn label_003_idle_and_empty_status_data_coloured() {
+    use SessionStatus::*;
+
+    let idle_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, Some(&[Idle])],
+    );
+    assert_eq!(
+        tab_label_fg(&idle_buf, "demo"),
+        palette::STATUS_IDLE,
+        "a tab carrying Some(&[Idle]) must render palette::STATUS_IDLE"
+    );
+
+    let empty_buf = render_tab_bar_to_buffer(
+        &["Dashboard", "demo"],
+        &[false, false],
+        0,
+        80,
+        &[None, Some(&[])],
+    );
+    assert_eq!(
+        tab_label_fg(&empty_buf, "demo"),
+        palette::STATUS_IDLE,
+        "a tab carrying Some(&[]) (no panes live yet) must render palette::STATUS_IDLE"
     );
 }
