@@ -7,8 +7,8 @@
 //! the daemon call [`init_and_watch`] and each resolves the flag from the
 //! same on-disk source, but as of fork issue #303's Phase 1 investigation
 //! this is NOT a live cross-process guarantee: every consumer
-//! (`show_experimental_footer`, `show_issue_dispatch_authoring`,
-//! `show_command_entry_lock`) lives in `src/ui.rs`, so the daemon's call
+//! (`show_experimental_footer`, `show_issue_dispatch_authoring`) lives in
+//! `src/ui.rs`, so the daemon's call
 //! installs a value into the daemon process's own `SHARED` that nothing
 //! ever reads. Treat "both processes resolve the same algorithm" as true
 //! and "the two processes therefore agree on anything" as not yet
