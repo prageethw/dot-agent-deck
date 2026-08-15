@@ -155,6 +155,8 @@ The tab bar appears at the top when more than one tab is open. To cycle between 
 
 See [Keyboard Shortcuts](keyboard-shortcuts.md) for all keybindings.
 
+A mode tab's label is colored by its own agent pane's status, in priority order Error (red) > Needs Input (yellow) > Working (green) > Thinking (blue) > Idle — so you can tell which tab needs attention without switching to it, including the tab you're currently on. Idle is colored too, not left neutral: a tab's color always equals its worker's status color, with no exceptions. See [Orchestration](orchestration.md#navigating-the-orchestration-tab) for how the same coloring applies to orchestration tabs, aggregated across their roles.
+
 ### Closing a Mode Tab
 
 From command mode, press `Ctrl+w` on a mode tab and choose **Close** in the confirmation to tear down the entire workspace — the agent and all side panes are stopped. The dashboard tab cannot be closed.
