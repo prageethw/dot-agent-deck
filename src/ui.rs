@@ -6199,6 +6199,63 @@ fn gate_pane_input_key(
     Action::Continue
 }
 
+/// Outcome of gating a paste's forward-to-pane payload through
+/// [`gate_pane_input_key`]: either the lock clears it for delivery, or it is
+/// denied and only the status message changes.
+///
+/// Extracted out of `run_tui`'s `Event::Paste` handling (issue #390) so the
+/// property that a DENIED paste must not stamp `last_pane_keystroke_at` is a
+/// deterministic unit test rather than a PTY-driven stopwatch race.
+enum PasteGateOutcome {
+    /// The payload cleared the lock. `run_tui` still owns delivering it to
+    /// the pane (`reset_scrollback` + `write_raw_bytes`), since that needs a
+    /// live `EmbeddedPaneController` this function has no access to — but the
+    /// keystroke timestamp to stamp alongside it is decided here.
+    Delivered {
+        bytes: Vec<u8>,
+        keystroke_at: std::time::Instant,
+    },
+    /// The payload was denied by the lock; only the status message changes.
+    Denied {
+        status_message: (String, std::time::Instant),
+    },
+}
+
+/// Decides a paste's fate under the command-entry lock. `now` is injected
+/// (following [`submit_debounce_duration`]'s convention) rather than read
+/// from `Instant::now()` here, so a test can assert the DENIED branch never
+/// produces a `keystroke_at` without a wall clock.
+///
+/// Issue #302 defect 1: a paste is just another PTY-forwarded write, so it
+/// must clear the same command-entry-lock gate a keystroke does rather than
+/// being written directly — otherwise the lock's guarantee is keystroke-only.
+fn gate_paste_delivery(
+    payload: Vec<u8>,
+    now: std::time::Instant,
+    ui: &UiState,
+    tab_manager: &TabManager,
+    pane: &dyn PaneController,
+    pane_status: &HashMap<&str, SessionStatus>,
+) -> PasteGateOutcome {
+    let gated = gate_pane_input_key(
+        Action::ForwardToPane(payload),
+        ui,
+        tab_manager,
+        pane,
+        pane_status,
+    );
+    if let Action::ForwardToPane(bytes) = gated {
+        PasteGateOutcome::Delivered {
+            bytes,
+            keystroke_at: now,
+        }
+    } else {
+        PasteGateOutcome::Denied {
+            status_message: (ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(), now),
+        }
+    }
+}
+
 /// PRD #241 M3: the close-confirmation dialog's whole state — which option is
 /// highlighted, and how much the confirmed close would destroy. Index 0 is
 /// **Cancel** and it is the [`Default`], following the same reasoning as the
@@ -14418,36 +14475,34 @@ pub fn run_tui(
                     if use_bracketed {
                         payload.extend_from_slice(b"\x1b[201~");
                     }
-                    // Issue #302 defect 1: a paste is just another
-                    // PTY-forwarded write, so it must clear the same
-                    // command-entry-lock gate a keystroke does rather than
-                    // calling `write_raw_bytes` directly — otherwise the
-                    // lock's guarantee is keystroke-only.
-                    let gated = gate_pane_input_key(
-                        Action::ForwardToPane(payload),
+                    match gate_paste_delivery(
+                        payload,
+                        std::time::Instant::now(),
                         &ui,
                         &tab_manager,
                         &*pane,
                         &build_pane_status_for_gate(&snapshot),
-                    );
-                    if let Action::ForwardToPane(bytes) = gated {
-                        // A dropped paste must not touch the pane at all, so
-                        // both the scrollback reset and the debounce
-                        // timestamp move inside the delivered branch — a
-                        // dropped ordinary keystroke does neither.
-                        embedded.reset_scrollback(&pane_id);
-                        let _ = embedded.write_raw_bytes(&pane_id, &bytes);
-                        // PRD #76 M2.20: a paste is a forwarded keystroke event
-                        // too — mark the timestamp so a following Enter
-                        // (`Action::ForwardToPane(b"\r")`) is debounced and
-                        // arrives at the agent as a standalone submit, not fused
-                        // with the paste tail.
-                        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                    } else {
-                        ui.status_message = Some((
-                            ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
-                            std::time::Instant::now(),
-                        ));
+                    ) {
+                        PasteGateOutcome::Delivered {
+                            bytes,
+                            keystroke_at,
+                        } => {
+                            // A dropped paste must not touch the pane at all, so
+                            // both the scrollback reset and the debounce
+                            // timestamp move inside the delivered branch — a
+                            // dropped ordinary keystroke does neither.
+                            embedded.reset_scrollback(&pane_id);
+                            let _ = embedded.write_raw_bytes(&pane_id, &bytes);
+                            // PRD #76 M2.20: a paste is a forwarded keystroke event
+                            // too — mark the timestamp so a following Enter
+                            // (`Action::ForwardToPane(b"\r")`) is debounced and
+                            // arrives at the agent as a standalone submit, not fused
+                            // with the paste tail.
+                            ui.last_pane_keystroke_at = Some(keystroke_at);
+                        }
+                        PasteGateOutcome::Denied { status_message } => {
+                            ui.status_message = Some(status_message);
+                        }
                     }
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
