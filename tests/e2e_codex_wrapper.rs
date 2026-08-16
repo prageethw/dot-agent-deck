@@ -98,7 +98,7 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
     // dashboard's 11-char `id_display` prefix (`mint_pane_id`'s
     // "pane-<16-hex-nonce>-<seq>" shape is always longer than that, so the
     // truncation is exercised on every run, not just when it happens to be).
-    let id_display = &pane_id[..11];
+    let id_display = pane_id.get(..11).unwrap_or(pane_id);
     assert!(
         deck.wait_for_grid_string_within(id_display, Duration::from_secs(10)),
         "the live dashboard card did not show its pane identity ({id_display}):\n{}",

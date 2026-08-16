@@ -19,7 +19,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{attach_request_on, spawn_daemon_serve};
+use common::{agent_records_on, attach_request_on, spawn_daemon_serve};
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::daemon_protocol::{AttachRequest, KIND_REQ, KIND_RESP};
 use spec::spec;
@@ -88,8 +88,13 @@ fn start_agent_request(client_pane_id: &str) -> AttachRequest {
 /// each spawning a `cat` stub and each proposing its own
 /// `DOT_AGENT_DECK_PANE_ID` value in `env`. Assert both raw JSON responses
 /// carry a present, mutually-distinct, daemon-minted `pane_id` that is
-/// neither call's client-proposed value — proving the daemon, not the
-/// client, is authoritative for pane identity.
+/// neither call's client-proposed value, then call `ListAgents` and assert
+/// the registry's `pane_id_env` for the first call's agent equals the
+/// returned minted `pane_id` and not the client-proposed value — proving
+/// the daemon, not the client, is authoritative for pane identity both on
+/// the wire response and in the daemon's own registry (auditor A2: without
+/// this, the registry mirror could still leak the client's proposed value
+/// even though the response field is correct).
 #[spec("daemon/pane-id/001")]
 #[test]
 fn pane_id_001_start_agent_mints_distinct_daemon_pane_ids() {
@@ -146,6 +151,36 @@ fn pane_id_001_start_agent_mints_distinct_daemon_pane_ids() {
         "the daemon must not simply echo back the client-proposed \
          DOT_AGENT_DECK_PANE_ID; it must mint its own — got the client's \
          own value back unchanged"
+    );
+
+    // Auditor A2: the response field alone does not prove the strip
+    // happened — the registry mirror (`AgentRecord.pane_id_env`, what
+    // `hydrate_from_daemon` and the daemon's pane-keyed routing actually
+    // trust) is captured independently via `spawn_agent`'s own env
+    // extraction, and could still carry the client's proposed value even
+    // while the wire response is correct. Pin the registry directly.
+    let registry_id_a = resp_a["id"]
+        .as_str()
+        .expect("first StartAgent response carried no registry id");
+    let records = agent_records_on(&daemon.attach_socket);
+    let record_a = records
+        .iter()
+        .find(|r| r.id == registry_id_a)
+        .unwrap_or_else(|| {
+            panic!("ListAgents did not return a record for id {registry_id_a:?}: {records:?}")
+        });
+    assert_eq!(
+        record_a.pane_id_env.as_deref(),
+        Some(pane_id_a),
+        "the registry's pane_id_env must equal the daemon-minted pane_id \
+         returned to the client, not diverge from it"
+    );
+    assert_ne!(
+        record_a.pane_id_env.as_deref(),
+        Some("client-chosen-alpha"),
+        "the registry must never mirror the client-proposed \
+         DOT_AGENT_DECK_PANE_ID — this is the impersonation surface PRD \
+         #365 exists to close (auditor A2)"
     );
 }
 

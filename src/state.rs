@@ -7764,4 +7764,32 @@ clear = false
              keyed session"
         );
     }
+
+    /// [`is_minted_pane_id`] hand-reimplements [`crate::agent_pty::mint_pane_id`]'s
+    /// output shape in a different module with no shared constant (reviewer
+    /// P2). Every other test above pins that shape with hardcoded literals,
+    /// which stays green even if the two functions drift apart. This is a
+    /// live cross-check between the real minter and the real matcher, so a
+    /// future format change in either one shows up here first.
+    #[test]
+    fn is_minted_pane_id_matches_mint_pane_ids_real_output() {
+        assert!(
+            is_minted_pane_id(&crate::agent_pty::mint_pane_id()),
+            "is_minted_pane_id must recognize every id mint_pane_id actually \
+             produces, or session_id_for_pane silently starts double-prefixing \
+             real spawned panes again"
+        );
+    }
+
+    /// The converse of the above: a value `mint_pane_id` would never produce
+    /// (here, a legacy bare counter id) must not be mistaken for a minted
+    /// one, or a pre-#365 caller's pane_id would stop getting its `"pane-"`
+    /// prefix.
+    #[test]
+    fn is_minted_pane_id_rejects_a_value_mint_pane_id_would_not_produce() {
+        assert!(
+            !is_minted_pane_id("1"),
+            "a legacy bare pane_id must never match the minted shape"
+        );
+    }
 }
