@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.38.4] - 2026-08-16
+
+### Added
+
+- **A card's role name gets its own line, and the selected orchestrator tab is easier to find**
+  Two readability changes to the deck's own chrome.
+  **The role name now sits on its own line, directly beneath the tool and model.** Since fork #378 put the active model in the agent-type badge, everything identifying an agent shared one line — the card's top border — and that line has a fixed budget it has to share with the status indicator. The role name was the part that lost: titles are ellipsized left to right, so a long model id ate the very label you use to tell an orchestrator from a coder. A card now reads `ClaudeCode (Opus)` on its border and `Orchestrator` on the line below it, and the two no longer compete for space.
+  **That line is always there.** The tool-and-model badge is still hidden by default and still toggles with `Ctrl+D` then `Ctrl+M` — nothing about that changed. But the role name is not a debugging detail you opt into; it is what the card *is*, so it renders either way. One consequence worth knowing: with the badge hidden, a card's top border now shows just its number and status, because the name moved down rather than being duplicated.
+  **The selected orchestration tab is now highlighted in its own colour.** Previously the only thing distinguishing the selected tab was bold text, which is a weak signal on a tab bar where several tabs already carry a status tint. The selected orchestration tab now renders inverted, so whatever colour its status is painting becomes its background. Dashboard and single-agent tabs are untouched and still use bold alone — the highlight is deliberately scoped to the tab that most often has several agents behind it.
+  **The role name is a deep orange, and picking that colour took some care.** The deck's palette is otherwise built only from the sixteen colours a terminal theme can remap, and none of them is an orange — the closest, yellow and red, already mean "waiting for input" and "error", and a card cannot have one colour meaning two things. So this is the palette's first colour outside that set, chosen on measured contrast rather than looks: it reaches roughly 4.5:1 against black and 4.7:1 against white, which is the only candidate that stays legible on light *and* dark terminals. The obvious brighter orange looks better on a dark background and fails accessibility guidance on a light one, which is a trade the deck has been bitten by before.
+  **What it costs.** Every card is one row taller, so a crowded dashboard shows roughly one fewer card before it starts scrolling, and at a few specific window sizes cards drop to a more compact layout slightly sooner than they used to. And an orchestration tab sitting idle highlights in grey-on-background, which is visible but not loud; that follows from idle tabs being grey in the first place, and is the same trade already made there.
+  **One thing that does *not* cost you anything, because it was caught in review.** Idle ASCII art covers a card's whole body, so the name row would have vanished behind it — on the default configuration that left an idle card identified by nothing but its number, which is precisely what this change set out to fix. The art now starts one row lower and the name stays visible. It costs the art one row of the nine it had.
+
+### Fixed
+
+  Fixed the upgrade nudge to poll this fork's own releases instead of upstream's, so a fork build now shows `Update available` when a newer fork release exists rather than never firing (or, worse, advertising an upstream release that must not be installed here).
+
+
+
 ## [0.38.3] - 2026-08-16
 
 ### Added
