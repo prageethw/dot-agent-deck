@@ -6,9 +6,10 @@
 //! through the vt100/`TuiDeck` harness, with a REAL `pi` agent booting and
 //! working LIVE in a pane.
 //!
-//! * `pi/live/001` — a single live Pi pane whose card renders the first-class Pi
-//!   IDENTITY plus a REAL, extension-driven status TRANSITION on the vt100 grid,
-//!   with NO Claude-Code hook installed.
+//! * `pi/live/001` — a single live Pi pane whose card renders a REAL,
+//!   extension-driven status TRANSITION on the vt100 grid, with NO
+//!   Claude-Code hook installed (fork-only: Pi carries no agent-type badge,
+//!   so the card's identity is its pane-id fallback, not a Pi-specific one).
 //! * `pi/live/002` — GAP #1 / PRD #201: proves a REAL `pi` orchestrator receives
 //!   its seed NATIVELY (the restore path stashes it via `StartAgent.seed`; pi's
 //!   extension pulls it with `get-seed` → `pi.sendUserMessage` — NOT a CLI arg,
@@ -37,11 +38,13 @@
 //! by `pi/live/002` below.
 //!
 //! ## What makes the rendered assertion genuine (not a plumbing stand-in)
-//! - **Experimental flag ON** (`DOT_AGENT_DECK_EXPERIMENTAL=1`): the Pi
-//!   first-class identity is gated behind `features::show_pi_agent()` at the
-//!   render seam (CLAUDE.md rule 9). With the flag ON the card title reads
-//!   `Pi · <id>`; without it the Pi identity would be suppressed and the reel
-//!   clip would show no Pi surface. The deck reads the flag from its env.
+//! - **Experimental flag ON** (`DOT_AGENT_DECK_EXPERIMENTAL=1`): set to mirror
+//!   this fork's own committed default (CLAUDE.md rule 9), not because Pi
+//!   identity is gated by it — `features::show_pi_agent()` no longer exists.
+//!   Pi carries no agent-type badge at all, and PRD fork#405 M1 moved every
+//!   card's identity off the title row onto its own body row regardless; an
+//!   unnamed Pi pane's card falls back to its pane id there (see the
+//!   retained-identity comment near the end of this test).
 //! - **Bundled extension auto-materialized at daemon startup** (PRD #201):
 //!   the per-test HOME starts WITHOUT the extension; because this drives the REAL
 //!   binary, the deck's lazy-spawned daemon runs the `daemon serve` entry, whose
@@ -144,9 +147,10 @@ fn path_with_binary_dir() -> String {
 /// `agent_start`→running), an Idle → running transition the daemon never
 /// produces on its own for a hook-less Pi pane, then a settle back to `Idle`
 /// (extension `agent_settled`→finished, the mapping this fix changed — a
-/// regression to "Needs Input" would show here) — and its title carries the
-/// experimental-gated first-class Pi identity (`Pi ·`). Best-effort (logged, not
-/// gating): the directed sentinel file appears in the pane cwd. PTY-attached, so
+/// regression to "Needs Input" would show here) — and the card keeps its
+/// pane-id identity throughout (fork-only: Pi carries no agent-type badge).
+/// Best-effort (logged, not gating): the directed sentinel file appears in
+/// the pane cwd. PTY-attached, so
 /// it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
 /// (real LLM) — run once, not looped.
 #[spec("pi/live/001")]
@@ -173,7 +177,9 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         // (right) side by side — the reel clip shows both — and the Normal-mode
         // bar keeps full labels (PRD #127).
         .with_pty_size(200, 50)
-        // Gate ON so the first-class Pi identity renders (features::show_pi_agent).
+        // Mirrors this fork's own committed experimental=true default (CLAUDE.md
+        // rule 9); not load-bearing for Pi identity — `features::show_pi_agent`
+        // no longer exists, so nothing here is gated by this flag.
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         // pi authenticates to Anthropic with this (never printed); the deck's
         // daemon and the pi child inherit it.
@@ -204,10 +210,10 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         // Auto-open one pane running the real interactive pi against the fixture
         // cwd (the deck restores it on launch; PRD #89 no `--continue` flag). An
         // EMPTY pane name is deliberate: a user who opens a Pi pane without
-        // naming it sees the AGENT-TYPE identity as the card title, which is
-        // exactly the gated `Pi · <id>` surface under test. A non-empty name
-        // would flow into `ui.display_names` and title the card with that name
-        // instead, hiding the identity.
+        // naming it sees the pane-id fallback as the card's identity, which is
+        // the surface the retained-identity assertion below pins. A non-empty
+        // name would flow into `ui.display_names` and show that name on the
+        // identity row instead, hiding the fallback under test.
         .with_continue_session("", &pi_command)
         .launch_with_fixture("minimal");
 
@@ -489,7 +495,9 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         // orchestrator + claude worker) side by side — the reel clip shows the
         // delegation happening live.
         .with_pty_size(200, 50)
-        // Gate ON so the Pi first-class identity renders (features::show_pi_agent).
+        // Mirrors this fork's own committed experimental=true default (CLAUDE.md
+        // rule 9); not load-bearing for Pi identity — `features::show_pi_agent`
+        // no longer exists, so nothing here is gated by this flag.
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         // pi authenticates to Anthropic with this (never printed); the deck's
         // daemon and the pi child inherit it. Belt-and-braces since issue

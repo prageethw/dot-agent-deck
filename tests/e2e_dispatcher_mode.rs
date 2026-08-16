@@ -946,20 +946,35 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     );
 }
 
+/// PRD fork#405 M1: identity moved off the title row onto the card's own
+/// unconditional first body row, with no `<AgentType> · ` prefix — the role
+/// name renders alone there regardless of the agent-type badge toggle. The
+/// old `"ClaudeCode · {role}"` form only ever matched with the badge toggle
+/// ON; this test sends no keybinding to enable it, and fork #339 turned the
+/// badge off by default, so that needle was almost certainly already never
+/// matching the title row even before M1 (see the PRD fork#405 RED report
+/// for whether that was confirmed). The bare role name is what M1 makes
+/// this test correct again either way.
 fn card_label(role: &str) -> String {
-    format!("ClaudeCode · {role}")
+    role.to_string()
 }
 
-/// Match a role label only within one same-weight card top-border span.
+/// Match a role label only within one same-weight card's first BODY row —
+/// the row directly below its title/border row (PRD fork#405 M1 moved
+/// identity there; see `common::label_in_box_body_row`).
 ///
-/// Matched on the CARD TITLE ROW, not anywhere on the grid: the tab's right half
-/// renders the focused role's live terminal, so a bare `grid.contains` could be
-/// satisfied by the agent's own output echoing the text back. Cropping to the
-/// span between one weight's matching corners is what makes this specific to a
-/// card title — the predicate itself lives in the harness so the fast tier can
-/// guard it (`tests/grid_box_helpers.rs`; review of #465, S2/S5).
+/// Matched on that specific row, not anywhere on the grid: the tab's right
+/// half renders the focused role's live terminal, so a bare `grid.contains`
+/// could be satisfied by the agent's own output echoing the text back.
+/// Cropping to the span between one weight's matching verticals on the row
+/// directly below the box's top-left corner is what makes this specific to
+/// a card's own identity row. `label_in_box_body_row` now mirrors
+/// `label_in_box_top_border`'s per-box scoping — it used to take only the
+/// FIRST box on the row via `position()` (review finding) — and
+/// `tests/grid_box_helpers.rs`'s `body_row_predicate_finds_a_label_in_the_second_card_of_a_row`
+/// guards that in the fast tier.
 fn card_titled(grid: &str, role: &str) -> bool {
-    common::label_in_box_top_border(grid, &card_label(role))
+    common::label_in_box_body_row(grid, &card_label(role))
 }
 
 /// Scenario: Launch the deck on the `dispatch-orch-real` fixture, whose `real-team`
@@ -1146,8 +1161,10 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // Everything above is daemon-side truth. The reported class of failure is a
     // deck that looks fine, so the test has to read what is on the screen: switch
     // to the dispatched orchestration's tab and require that EVERY role named in
-    // the toml is on a card, beside the agent badge for the agent that is running
-    // in it (`<AgentType> · <role>` — the card title shape).
+    // the toml is on a card, on its own identity row (PRD fork#405 M1 moved
+    // that off the title row onto the card's unconditional first body row —
+    // `<role>` alone there, no `<AgentType> ·` prefix, regardless of the
+    // agent-type badge toggle).
     //
     // Ctrl+PageDown, not `l`/`h`: on an orchestration tab a role pane holds
     // keyboard focus and swallows plain keys as text.
@@ -1459,9 +1476,9 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     std::fs::write(&cfg, "default_command = \"agent-wrapper\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
-        // Roomy: at the default width a card title is ellipsized
+        // Roomy: at the default width a card's identity is ellipsized
         // (`dispatch-clo…`), so the selection check below could never match the
-        // full name on the title row.
+        // full name on the identity row.
         .with_pty_size(200, 50)
         .with_env(
             "PATH",

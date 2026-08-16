@@ -368,6 +368,7 @@ fn seam_bound_001_one_row_seams_are_deliberately_unbounded() {
                     0,
                     w,
                     &[None],
+                    &[false],
                 ))
             }),
         ),

@@ -405,22 +405,48 @@ fn has_collapsed_frame(grid: &str, role: &str) -> bool {
         .any(|line| line.trim_start().starts_with(&prefix))
 }
 
-/// A sidebar deck card's title row (`render_session_card` in `src/ui.rs`)
-/// carries the role's display name and its live status word on the SAME
-/// rendered line: the identity segment (` {num} {name} ` — no agent-type
-/// badge or `\u{00b7}` separator since the fork-only `349e895` removed both)
-/// sits left-aligned in the card's top border, the status segment
-/// (` {dot} {status} `) right-aligned on the same `Block::title`. The
-/// identity segment always carries a space immediately before AND after the
-/// role name (the numeric shortcut prefix ends in one, `identity_text` ends
-/// in the other), so `" {role} "` is a safe bounded needle. Search for it
-/// plus `status` together on one line so the check is scoped to `role`'s own
-/// card rather than any occurrence of `status` anywhere on the settled grid
-/// (e.g. another role's card, or pane content).
+/// PRD fork#405 M1 moved the role name off the card's title/border row onto
+/// its own unconditional first body row, directly beneath the title. Before
+/// M1, `render_session_card` (`src/ui.rs`) carried the role's display name
+/// and its live status word on the SAME rendered line — the identity segment
+/// left-aligned in the card's top border, the status segment right-aligned
+/// on the same `Block::title`. After M1 the title row carries ONLY the
+/// type/model badge and the status; the role name is the card's first
+/// content row, one line below. So the check is now "role's own content
+/// row is the line directly below its card's title row, and THAT title row
+/// carries `status`" — an adjacent-row check rather than a same-row one, but
+/// still scoped to `role`'s own card, not any occurrence of `status`
+/// anywhere on the settled grid (e.g. another role's card, or pane content).
+/// Unlike the old title row, the new body row carries NO leading pad —
+/// `render_session_card` (`src/ui.rs`) pushes the bare
+/// `Span::styled(role_name_text, ...)` with nothing before it, so the
+/// rendered cell immediately to the left of the role name is the card's own
+/// border glyph (`│` unselected, `┃` selected), not a space. `" {role} "`
+/// therefore never matches. Instead of assuming a fixed left/right pad,
+/// `contains_role_word` looks for `role` as its own token: bounded on both
+/// sides by anything that is NOT an identifier character (border glyph,
+/// whitespace, or line start/end) rather than specifically a space — this
+/// is what keeps `"beta"` from matching inside `"beta-agent"` while still
+/// matching regardless of which border glyph or how much padding precedes
+/// it. This relies on the role row being the unconditional FIRST body row
+/// directly beneath the title (the M1 design guarantee) — if that ever
+/// changes, this helper needs to change with it.
 fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
-    let role_needle = format!(" {role} ");
-    grid.lines()
-        .any(|line| line.contains(&role_needle) && line.contains(status))
+    let lines: Vec<&str> = grid.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .any(|(i, line)| i > 0 && lines[i - 1].contains(status) && contains_role_word(line, role))
+}
+
+/// `role` matches only as its own token, never as a substring of a longer
+/// identifier — e.g. `"beta"` must not match inside `"beta-agent"`, and must
+/// not match a stray occurrence of a DIFFERENT role's name that happens to
+/// contain `role` as a prefix/suffix. A character is "boundary" here when it
+/// is not alphanumeric, `-`, or `_` — that covers border glyphs, whitespace,
+/// and start/end of line without assuming any specific pad character.
+fn contains_role_word(line: &str, role: &str) -> bool {
+    common::contains_word_token(line, role)
 }
 
 /// Overwrite the fixture's `beta-agent.sh` placeholder with the ABSOLUTE path

@@ -32,6 +32,17 @@ fn close_glyph_count(buffer: &ratatui::buffer::Buffer) -> usize {
 /// `render_tab_strip` writes for every tab and samples the cell right after
 /// the leading pad space, so it survives label reordering / width changes as
 /// long as the label text itself is unique in the row.
+///
+/// PRD fork#405 auditor S3: on the active Orchestration tab, `Modifier::REVERSED`
+/// (M2) is applied on top of this same logical `fg` — the terminal paints a
+/// filled block of that colour and swaps which side is text vs. ground, which
+/// this buffer-level `cell.fg` read cannot see (`cell.bg` also can't: REVERSED
+/// is a modifier, not an absolute background fill). So a `tab_label_fg`
+/// assertion on a REVERSED tab pins the underlying palette-role colour that
+/// still drives the fill, not the colour a user's eye reads on screen. Callers
+/// that need to know the cell IS reversed pair this with a modifier check
+/// (e.g. `tab_label_modifier(..).contains(Modifier::REVERSED)`) rather than
+/// relying on `fg` alone.
 fn tab_label_fg(buffer: &ratatui::buffer::Buffer, label: &str) -> Color {
     let area = buffer.area();
     let row: String = (0..area.width)
@@ -125,7 +136,13 @@ fn close_glyph_fg_after(buffer: &ratatui::buffer::Buffer, label: &str) -> Color 
 #[test]
 fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
     // Dashboard alone: never closeable → no close glyph anywhere.
-    let dashboard_only = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
+    // PRD fork#405 M2: `render_tab_bar_to_buffer` grows a trailing
+    // `is_orchestration: &[bool]` parameter, aligned with `labels`, so the
+    // active-tab REVERSED highlight (`tabs/orchestration/016`) can be scoped
+    // to `Tab::Orchestration` tabs only. This test doesn't exercise that cue,
+    // so every entry here is `false`.
+    let dashboard_only =
+        render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None], &[false]);
     assert_eq!(
         close_glyph_count(&dashboard_only),
         0,
@@ -142,6 +159,7 @@ fn tabstrip_002_close_glyph_on_mode_orchestration_not_dashboard() {
         0,
         80,
         &[None, None, None],
+        &[false, false, false],
     );
     assert_eq!(
         close_glyph_count(&three_tabs),
@@ -184,6 +202,7 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         0,
         80,
         &[None, Some(&[Idle, Error, Idle])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&buf, "squad"),
@@ -198,6 +217,7 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         0,
         80,
         &[None, Some(&[Working, WaitingForInput, Idle])],
+        &[false, true],
     );
     // Magenta, not Yellow: issue #579 moved the waiting role off yellow, which
     // measured 1.70:1 against a white terminal background. A tab label is read
@@ -222,6 +242,7 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         0,
         80,
         &[None, Some(&[Idle, Idle, Idle])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&buf, "squad"),
@@ -237,6 +258,7 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         0,
         80,
         &[None, Some(&[Thinking, Working])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&buf, "squad"),
@@ -255,6 +277,7 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         0,
         80,
         &[None, None],
+        &[false, false],
     );
     assert_eq!(
         tab_label_fg(&buf, "Dashboard"),
@@ -268,46 +291,56 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
 /// tab (unlike `orchestration_009`, which always leaves Dashboard active) and
 /// give it a non-idle (`Error`) pane — assert its label renders its status
 /// `fg` tint (Red) as ordinary foreground text, cued as the active tab via
-/// `BOLD` ONLY — explicitly asserting the absence of `UNDERLINED` as well as
-/// `REVERSED` (fork issue #377: the maintainer dropped the underline from the
-/// active-tab cue as a preference, not a defect; `REVERSED` was already ruled
-/// out by issue #306, since it would invert an fg status tint into a
-/// background). Also asserts the padding spaces and the `[×]` close glyph
-/// around the label carry the SAME status fg as the label text itself, so
-/// the tint fills the whole tab rather than only the letters. Also asserts an
-/// INACTIVE orchestration tab whose aggregate status is `Idle` renders
-/// `palette::STATUS_IDLE` (`Color::DarkGray`), not the base label color (fork
-/// issue #351, maintainer decision 2026-08-15: colour is now a total function
-/// of status, including Idle — reversing PRD #333 defect B), and that an
-/// INACTIVE orchestration tab with a non-idle (`Error`) aggregate status
-/// still colors its label text as today, with neither `REVERSED` nor `BOLD`
-/// nor `UNDERLINED` — pinning the active cue from both sides, so an inactive
-/// tab can never become indistinguishable from an active one (reviewer
-/// finding F3 on PR #307/issue #306).
+/// BOTH `BOLD` and `REVERSED` — explicitly asserting the absence of
+/// `UNDERLINED` (fork issue #377: the maintainer dropped the underline from
+/// the active-tab cue as a preference, not a defect) and the PRESENCE of
+/// `REVERSED` (PRD fork#405 M2: a scoped, deliberate partial reversal of
+/// issue #306, which had ruled REVERSED out entirely — it is now reinstated
+/// for `Tab::Orchestration` only, so the active orchestration tab's own
+/// status fg becomes its background). Also asserts the padding spaces and
+/// the `[×]` close glyph around the label carry the SAME status fg as the
+/// label text itself, so the tint fills the whole tab rather than only the
+/// letters — REVERSED inverts that fg into the background at render time
+/// without changing the logical `fg` value ratatui stores on the cell, so
+/// these fg-equality checks stay valid whether or not REVERSED is present.
+/// Also asserts an INACTIVE orchestration tab whose aggregate status is
+/// `Idle` renders `palette::STATUS_IDLE` (`Color::DarkGray`), not the base
+/// label color (fork issue #351, maintainer decision 2026-08-15: colour is
+/// now a total function of status, including Idle — reversing PRD #333
+/// defect B), and that an INACTIVE orchestration tab with a non-idle
+/// (`Error`) aggregate status still colors its label text as today, with
+/// neither `REVERSED` nor `BOLD` nor `UNDERLINED` — pinning the active cue
+/// from both sides, so an inactive tab can never become indistinguishable
+/// from an active one (reviewer finding F3 on PR #307/issue #306).
 #[spec("tabs/orchestration/010")]
 #[test]
 fn orchestration_010_active_status_tint_bold_and_idle_coloured() {
     use SessionStatus::*;
 
-    // Case 1 (fork issue #377, on top of issue #306): an ACTIVE orchestration
-    // tab with a non-idle (Error) pane must render its status fg tint (Red)
-    // as ordinary foreground text, cued as active via BOLD only — never
-    // REVERSED, which would invert an fg tint into a background, and never
-    // UNDERLINED, which the maintainer dropped as a preference. The tint
-    // must also fill the tab's padding and its [×] close glyph, not just
-    // the label letters.
+    // Case 1 (PRD fork#405 M2, on top of fork issue #377 and issue #306): an
+    // ACTIVE orchestration tab with a non-idle (Error) pane must render its
+    // status fg tint (Red) as ordinary foreground text, cued as active via
+    // BOTH BOLD and REVERSED — never UNDERLINED, which the maintainer
+    // dropped as a preference. REVERSED is the M2 addition: issue #306
+    // removed it from the tab bar entirely because it would invert an
+    // absolute fg into the label's background; M2 scopes it back in for
+    // `Tab::Orchestration` tabs only, so that inversion is now the intended
+    // highlight. The tint must also fill the tab's padding and its [×]
+    // close glyph, not just the label letters.
     let active_orch_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
         1,
         80,
         &[None, Some(&[Idle, Error, Idle])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&active_orch_buf, "squad"),
         Color::Red,
         "an ACTIVE orchestration tab with an Error pane must render its label fg Red, the same \
-         tint an inactive one gets"
+         tint an inactive one gets — REVERSED inverts it visually but must not change the \
+         logical fg value"
     );
     let active_modifier = tab_label_modifier(&active_orch_buf, "squad");
     assert!(
@@ -316,9 +349,9 @@ fn orchestration_010_active_status_tint_bold_and_idle_coloured() {
          issue #377 dropped the underline), got {active_modifier:?}"
     );
     assert!(
-        !active_modifier.contains(Modifier::REVERSED),
-        "an ACTIVE orchestration tab must NOT carry REVERSED — REVERSED would invert an fg \
-         status tint into a background, got {active_modifier:?}"
+        active_modifier.contains(Modifier::REVERSED),
+        "an ACTIVE orchestration tab must carry REVERSED (PRD fork#405 M2) so its own status fg \
+         becomes its background, got {active_modifier:?}"
     );
     assert_eq!(
         tab_pad_fg(&active_orch_buf, "squad"),
@@ -342,6 +375,7 @@ fn orchestration_010_active_status_tint_bold_and_idle_coloured() {
         0,
         80,
         &[None, Some(&[Idle, Idle, Idle])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&idle_buf, "squad"),
@@ -353,14 +387,15 @@ fn orchestration_010_active_status_tint_bold_and_idle_coloured() {
     // Case 3 (no regression, and F3: pin the inactive side of the active
     // cue): an INACTIVE orchestration tab with a non-idle (Error) aggregate
     // status still colors its label text, exactly as today, with neither
-    // REVERSED nor BOLD nor UNDERLINED — so the BOLD cue that marks a tab
-    // active (case 1) cannot leak onto an inactive one.
+    // REVERSED nor BOLD nor UNDERLINED — so the BOLD+REVERSED cue that marks
+    // a tab active (case 1) cannot leak onto an inactive one.
     let err_buf = render_tab_bar_to_buffer(
         &["Dashboard", "squad"],
         &[false, true],
         0,
         80,
         &[None, Some(&[Idle, Error, Idle])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&err_buf, "squad"),
@@ -386,11 +421,14 @@ fn orchestration_010_active_status_tint_bold_and_idle_coloured() {
 /// uniformly to the Dashboard tab, which carries no status data (fork issue
 /// #351 narrows this from "tabs this feature doesn't touch" now that Mode
 /// tabs also carry status data via `tab_status_data`; the Dashboard remains
-/// the deliberate scope boundary).
-#[spec("tabs/orchestration/016")]
+/// the deliberate scope boundary). PRD fork#405 M2: the Dashboard tab is
+/// never `Tab::Orchestration`, so it must stay REVERSED-free even after M2 —
+/// this is the negative case the new `tabs/orchestration/016` also covers,
+/// pinned here independently since it predates M2.
+#[spec("tabs/orchestration/017")]
 #[test]
-fn orchestration_016_active_dashboard_tab_bold_no_reversed() {
-    let buf = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
+fn orchestration_017_active_dashboard_tab_bold_no_reversed() {
+    let buf = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None], &[false]);
     let modifier = tab_label_modifier(&buf, "Dashboard");
     assert!(
         modifier.contains(Modifier::BOLD) && !modifier.contains(Modifier::UNDERLINED),
@@ -399,7 +437,8 @@ fn orchestration_016_active_dashboard_tab_bold_no_reversed() {
     );
     assert!(
         !modifier.contains(Modifier::REVERSED),
-        "an ACTIVE Dashboard tab must NOT carry REVERSED, got {modifier:?}"
+        "an ACTIVE Dashboard tab must NOT carry REVERSED — it is never Tab::Orchestration \
+         (PRD fork#405 M2), got {modifier:?}"
     );
     assert_eq!(
         tab_label_fg(&buf, "Dashboard"),
@@ -413,9 +452,12 @@ fn orchestration_016_active_dashboard_tab_bold_no_reversed() {
 /// `palette::STATUS_IDLE` (fork issue #351, maintainer decision 2026-08-15:
 /// colour is now a total function of status, extending that to the active
 /// tab and reversing PRD #333 defect B / issue #306's active-tab carve-out),
-/// while still carrying `BOLD` ONLY as its active cue — explicitly no
-/// `UNDERLINED` (dropped as a maintainer preference, fork issue #377) and no
-/// `REVERSED` — the active cue's colour is unchanged, only its modifier.
+/// while still carrying `BOLD` as its active cue — explicitly no
+/// `UNDERLINED` (dropped as a maintainer preference, fork issue #377) — and,
+/// per PRD fork#405 M2, `REVERSED` too: the active cue's colour is
+/// unchanged, only its modifier, and REVERSED is scoped to
+/// `Tab::Orchestration` regardless of the underlying status colour, Idle
+/// included.
 #[spec("tabs/orchestration/014")]
 #[test]
 fn orchestration_014_active_idle_coloured_bold() {
@@ -427,6 +469,7 @@ fn orchestration_014_active_idle_coloured_bold() {
         1,
         80,
         &[None, Some(&[Idle, Idle, Idle])],
+        &[false, true],
     );
     assert_eq!(
         tab_label_fg(&active_idle_buf, "squad"),
@@ -441,8 +484,9 @@ fn orchestration_014_active_idle_coloured_bold() {
          UNDERLINED (fork issue #377 dropped the underline), got {modifier:?}"
     );
     assert!(
-        !modifier.contains(Modifier::REVERSED),
-        "an ACTIVE orchestration tab must NOT carry REVERSED, got {modifier:?}"
+        modifier.contains(Modifier::REVERSED),
+        "an ACTIVE orchestration tab must carry REVERSED (PRD fork#405 M2) even when Idle, got \
+         {modifier:?}"
     );
 }
 
@@ -452,7 +496,9 @@ fn orchestration_014_active_idle_coloured_bold() {
 /// and assert its label renders in `palette::STATUS_WORKING` (Green) as
 /// ordinary foreground text, still cued active via `BOLD` ONLY with no
 /// `UNDERLINED` (dropped as a maintainer preference, fork issue #377) and no
-/// `REVERSED`. The color assignment itself is a regression guard, GREEN from
+/// `REVERSED` — this tab is a Mode tab, and PRD fork#405 M2 scopes REVERSED
+/// to `Tab::Orchestration` only, so a Mode tab must stay REVERSED-free even
+/// after M2. The color assignment itself is a regression guard, GREEN from
 /// the start: the render half (`render_tab_strip`) already colors any tab
 /// whose `tab_statuses` slot is `Some(..)` regardless of tab kind, exercised
 /// here directly via `render_tab_bar_to_buffer`. That `tab_status_data`
@@ -470,6 +516,7 @@ fn label_002_active_tab_with_status_data_renders_status_color_bold() {
         1,
         80,
         &[None, Some(&[Working])],
+        &[false, false],
     );
     assert_eq!(
         tab_label_fg(&buf, "demo"),
@@ -484,7 +531,8 @@ fn label_002_active_tab_with_status_data_renders_status_color_bold() {
     );
     assert!(
         !modifier.contains(Modifier::REVERSED),
-        "the active tab must NOT carry REVERSED, got {modifier:?}"
+        "the active tab must NOT carry REVERSED — it is a Mode tab, not Tab::Orchestration \
+         (PRD fork#405 M2), got {modifier:?}"
     );
 }
 
@@ -508,6 +556,7 @@ fn label_003_idle_and_empty_status_data_coloured() {
         0,
         80,
         &[None, Some(&[Idle])],
+        &[false, false],
     );
     assert_eq!(
         tab_label_fg(&idle_buf, "demo"),
@@ -521,10 +570,140 @@ fn label_003_idle_and_empty_status_data_coloured() {
         0,
         80,
         &[None, Some(&[])],
+        &[false, false],
     );
     assert_eq!(
         tab_label_fg(&empty_buf, "demo"),
         palette::STATUS_IDLE,
         "a tab carrying Some(&[]) (no panes live yet) must render palette::STATUS_IDLE"
+    );
+}
+
+/// Scenario: PRD fork#405 M2. Render a three-tab strip (Dashboard, a Mode
+/// tab `"demo"`, an Orchestration tab `"squad"`) and drive
+/// `render_tab_bar_to_buffer` with its `active_index` moved across all three
+/// positions in turn, reusing the same label/closeable/status/kind fixture
+/// each time. Assert: (1) the orchestration tab, UNSELECTED, renders with
+/// neither `REVERSED` nor `BOLD` and its ordinary status fg (Red, from an
+/// Error pane); (2) the SAME orchestration tab, made ACTIVE, gains BOTH
+/// `BOLD` and `REVERSED` while its fg stays the same Red — REVERSED inverts
+/// the colour at render time without changing the logical fg ratatui stores
+/// on the cell; (3) the Mode tab, made ACTIVE, gains `BOLD` only, never
+/// `REVERSED`, fg its own status colour (Green, from a Working pane); (4)
+/// the Dashboard tab, made ACTIVE, also gains `BOLD` only, never `REVERSED`,
+/// with no absolute fg (`Color::Reset`) since it carries no status data.
+/// Cases (3) and (4) are the "do not change worker-tab styling" requirement
+/// M2 imposes: only `Tab::Orchestration` gets the new cue.
+#[spec("tabs/orchestration/016")]
+#[test]
+fn orchestration_016_active_orchestration_tab_reversed_others_bold_only() {
+    use SessionStatus::*;
+
+    // PRD fork#405 M2: `render_tab_strip`'s per-tab REVERSED-on-active cue
+    // needs to know which tabs are `Tab::Orchestration`, information the
+    // pre-M2 signature has no way to carry (labels/closeable/tab_statuses
+    // don't distinguish a Mode tab from an Orchestration tab — both are
+    // closeable and both carry `Some(..)` status data). `render_tab_strip`
+    // and its test-only wrapper `render_tab_bar_to_buffer` (src/ui.rs:21091)
+    // must therefore grow a trailing `is_orchestration: &[bool]` parameter,
+    // aligned index-for-index with `labels`, threaded through from the real
+    // call site (src/ui.rs:15334-15357) the same way `closeable` already is.
+    // Every other call in this file passes an all-`false` (or
+    // behavior-irrelevant) slice for that parameter; this is the one test
+    // that turns it on.
+    let labels = ["Dashboard", "demo", "squad"];
+    let closeable = [false, true, true];
+    let tab_statuses: [Option<&[SessionStatus]>; 3] =
+        [None, Some(&[Working]), Some(&[Idle, Error, Idle])];
+    let is_orchestration = [false, false, true];
+
+    // (1) Unselected orchestration tab: normal appearance.
+    let unselected = render_tab_bar_to_buffer(
+        &labels,
+        &closeable,
+        0, // Dashboard active; "squad" is not selected
+        80,
+        &tab_statuses,
+        &is_orchestration,
+    );
+    assert_eq!(
+        tab_label_fg(&unselected, "squad"),
+        Color::Red,
+        "an unselected orchestration tab must still render its status fg (Red, from the Error \
+         pane)"
+    );
+    let unselected_modifier = tab_label_modifier(&unselected, "squad");
+    assert!(
+        !unselected_modifier.contains(Modifier::REVERSED)
+            && !unselected_modifier.contains(Modifier::BOLD),
+        "an unselected orchestration tab must carry neither REVERSED nor BOLD, got \
+         {unselected_modifier:?}"
+    );
+
+    // (2) Selected orchestration tab: REVERSED + BOLD, fg unchanged.
+    let selected_orch = render_tab_bar_to_buffer(
+        &labels,
+        &closeable,
+        2, // "squad" (the orchestration tab) is now active
+        80,
+        &tab_statuses,
+        &is_orchestration,
+    );
+    assert_eq!(
+        tab_label_fg(&selected_orch, "squad"),
+        Color::Red,
+        "a SELECTED orchestration tab must keep its status fg (Red) as the logical cell value — \
+         REVERSED only inverts it visually, it must not replace the colour"
+    );
+    let selected_orch_modifier = tab_label_modifier(&selected_orch, "squad");
+    assert!(
+        selected_orch_modifier.contains(Modifier::REVERSED)
+            && selected_orch_modifier.contains(Modifier::BOLD),
+        "a SELECTED orchestration tab must carry BOTH REVERSED and BOLD (PRD fork#405 M2), got \
+         {selected_orch_modifier:?}"
+    );
+
+    // (3) Selected Mode tab: BOLD only, never REVERSED.
+    let selected_mode = render_tab_bar_to_buffer(
+        &labels,
+        &closeable,
+        1, // "demo" (the Mode tab) is now active
+        80,
+        &tab_statuses,
+        &is_orchestration,
+    );
+    assert_eq!(
+        tab_label_fg(&selected_mode, "demo"),
+        Color::Green,
+        "a SELECTED Mode tab must render its own status fg (Green, from the Working pane)"
+    );
+    let selected_mode_modifier = tab_label_modifier(&selected_mode, "demo");
+    assert!(
+        selected_mode_modifier.contains(Modifier::BOLD)
+            && !selected_mode_modifier.contains(Modifier::REVERSED),
+        "a SELECTED Mode tab must carry BOLD only, never REVERSED — M2 scopes REVERSED to \
+         Tab::Orchestration, got {selected_mode_modifier:?}"
+    );
+
+    // (4) Selected Dashboard tab: BOLD only, never REVERSED, no status fg.
+    let selected_dashboard = render_tab_bar_to_buffer(
+        &labels,
+        &closeable,
+        0, // Dashboard active
+        80,
+        &tab_statuses,
+        &is_orchestration,
+    );
+    assert_eq!(
+        tab_label_fg(&selected_dashboard, "Dashboard"),
+        Color::Reset,
+        "a SELECTED Dashboard tab must carry no absolute foreground color"
+    );
+    let selected_dashboard_modifier = tab_label_modifier(&selected_dashboard, "Dashboard");
+    assert!(
+        selected_dashboard_modifier.contains(Modifier::BOLD)
+            && !selected_dashboard_modifier.contains(Modifier::REVERSED),
+        "a SELECTED Dashboard tab must carry BOLD only, never REVERSED, got \
+         {selected_dashboard_modifier:?}"
     );
 }
