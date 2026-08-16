@@ -865,18 +865,33 @@ fn lock_017_paste_gated_by_lock_state() {
     deck.send_keys(bracketed_bulk.as_bytes());
     deck.wait_for_string(SCROLL_BOTTOM_MARKER);
 
-    // Issue #414 diagnostic: repeat the re-lock -> scroll -> deny -> check
-    // cycle many times within this ONE test run instead of once. The
-    // tester's diagnosis pinned the underlying recurrence at roughly 1-in-4
-    // under CI load, and this repo's nextest profile runs with `retries = 0`
+    // Re-lock ONCE, outside the loop below. `\x05` (Ctrl+e) is
+    // Action::ToggleOrchestrationLock — a TOGGLE, not an idempotent "ensure
+    // locked" — so it must fire exactly once here (UNLOCKED -> LOCKED,
+    // undoing the unlock above) and never again inside the loop, or every
+    // other iteration silently flips back to UNLOCKED. (First diagnostic
+    // push toggled it every iteration and got a 100%-reproducible,
+    // non-flaky failure at iteration 1 for exactly this reason — a test bug,
+    // not the product defect under investigation. See the loop comment
+    // below for how a "fresh PaneInput entry" is still produced every
+    // iteration without touching lock state.)
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x05"); // Ctrl+e -> lock (was unlocked since the bulk-paste send above)
+    deck.send_bytes(b"\x04"); // Ctrl+d -> back to PaneInput
+
+    // Issue #414 diagnostic: repeat the scroll -> deny -> check cycle many
+    // times within this ONE test run instead of once. The tester's
+    // diagnosis pinned the underlying recurrence at roughly 1-in-4 under CI
+    // load, and this repo's nextest profile runs with `retries = 0`
     // (`.config/nextest.toml`), so a single pass through the cycle has poor
     // odds of ever observing a real defect in one CI push. ~30 independent
     // passes brings the odds of a genuine defect going unobserved this run
     // below 0.1% (0.75^30). Every pass reuses the SAME scrollback content
-    // built above (nothing re-sends the bulk paste) — only the
-    // re-lock -> scroll -> deny -> check cycle repeats, each with its own
-    // sentinel so a failing assertion names exactly which pass tripped and
-    // the diagnostic log/grid dump are unambiguous about timing.
+    // built above (nothing re-sends the bulk paste) and the SAME locked
+    // state established once above — only the "fresh PaneInput entry ->
+    // scroll -> deny -> check" cycle repeats, each with its own sentinel so
+    // a failing assertion names exactly which pass tripped and the
+    // diagnostic log/grid dump are unambiguous about timing.
     //
     // TEMPORARY: once the hypothesis is confirmed/fixed or ruled out, this
     // reverts to the single-pass form (or becomes a real regression test, if
@@ -884,12 +899,15 @@ fn lock_017_paste_gated_by_lock_state() {
     const DIAG_ITERATIONS: usize = 30;
     const DENIAL_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
     for iteration in 0..DIAG_ITERATIONS {
-        // Re-lock. The final Ctrl+d back into PaneInput is itself a fresh mode
-        // entry, which snaps scrollback to live output (mode/scroll/003) — the
-        // right starting point for what follows, since the wheel scroll below
-        // must be the ONLY thing that moves the offset off zero.
+        // A plain Ctrl+d / Ctrl+d round trip (PaneInput -> Normal ->
+        // PaneInput, `Action::DetachToNormal` both ways — src/ui.rs) is
+        // itself a fresh mode entry, which snaps scrollback to live output
+        // (mode/scroll/003) — the right starting point for what follows,
+        // since the wheel scroll below must be the ONLY thing that moves the
+        // offset off zero. Deliberately NO `\x05` in between: the lock was
+        // already established once above and must stay untouched across
+        // every iteration.
         deck.send_bytes(b"\x04");
-        deck.send_bytes(b"\x05");
         deck.send_bytes(b"\x04");
 
         // Scroll the worker pane's OWN view back into its scrollback via the
