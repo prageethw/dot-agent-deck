@@ -140,6 +140,7 @@ pub fn current_worktree_missing(current: &Path) -> bool {
 /// latter used to collapse into the same silent "exempt" outcome as the
 /// former, which let an unrelated git failure disable checks 10-12 with zero
 /// output while `main.rs` still printed a clean success line.
+#[derive(Debug)]
 enum WorkTreeProbe {
     Inside,
     NotAGitRepo,
@@ -155,12 +156,30 @@ fn probe_work_tree(repo_dir: &Path) -> WorkTreeProbe {
     }
 }
 
+/// Build `git <args>` to run in `repo_dir`, with `LC_ALL`/`LANG` pinned to
+/// `C` so git's stderr/stdout comes back in the untranslated form
+/// [`probe_work_tree`]'s `"not a git repository"` substring match (and any
+/// future caller parsing git's text output) expects. Without this, a
+/// non-English-locale machine or CI runner gets git's *localized* message
+/// instead (verified: `LC_ALL=de_DE.UTF-8` → `Schwerwiegend: Kein
+/// Git-Repository (…)`), the match silently fails, and a legitimate
+/// non-git fixture takes the `ProbeFailed` error arm instead of the correct
+/// exemption (S7/N1). `LC_ALL` alone is authoritative for glibc/git's
+/// gettext lookup, but `LANG` is pinned too as the common idiom, in case
+/// some environment's git build consults it directly.
+fn git_command(repo_dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(repo_dir)
+        .env("LC_ALL", "C")
+        .env("LANG", "C");
+    cmd
+}
+
 /// Run `git <args>` in `repo_dir`, returning trimmed stdout on success or a
 /// message built from stderr (or the spawn error) on failure.
 fn run_git_capture(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
+    let out = git_command(repo_dir, args)
         .output()
         .map_err(|e| format!("invoke git {args:?}: {e}"))?;
     if !out.status.success() {
@@ -173,9 +192,7 @@ fn run_git_capture(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
 /// used only for `-z`-separated porcelain output, where the bytes must not
 /// be assumed UTF-8 before `[path_from_bytes]` gets to them.
 fn run_git_capture_bytes(repo_dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(repo_dir)
+    let out = git_command(repo_dir, args)
         .output()
         .map_err(|e| format!("invoke git {args:?}: {e}"))?;
     if !out.status.success() {
@@ -543,5 +560,75 @@ mod tests {
         assert!(result.failures[0].starts_with("[12]"));
         assert!(result.failures[0].contains("no longer exists on disk"));
         assert_eq!(result.skip_reason, None);
+    }
+
+    /// S7/N1: `probe_work_tree` must still classify a target as
+    /// `NotAGitRepo` when the underlying `git` observes a non-English
+    /// `LC_ALL` — proving the `git_command` locale override actually takes
+    /// effect, rather than relying on a real localized git binary or a
+    /// system locale package being installed (CI cannot be relied on to
+    /// have either). A fake `git` script on `PATH` reports its "not a git
+    /// repository" message in English when it sees `LC_ALL=C` (the override
+    /// this fix installs) and in German otherwise, so if the override were
+    /// ever removed this test would fail the same way a real German-locale
+    /// contributor's machine does.
+    #[cfg(unix)]
+    #[test]
+    fn probe_work_tree_is_locale_independent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fake_bin_dir = tmp.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin_dir).expect("mkdir fake-bin");
+        let fake_git = fake_bin_dir.join("git");
+        std::fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+             if [ \"$LC_ALL\" = \"C\" ]; then\n\
+             echo 'fatal: not a git repository (or any of the parent directories): .git' >&2\n\
+             else\n\
+             echo 'Schwerwiegend: Kein Git-Repository (oder irgendein Elternverzeichnis): .git' >&2\n\
+             fi\n\
+             exit 128\n",
+        )
+        .expect("write fake git script");
+        let mut perms = std::fs::metadata(&fake_git)
+            .expect("stat fake git script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_git, perms).expect("chmod fake git script");
+
+        let target = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&target).expect("mkdir not-a-repo");
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}:{}",
+            fake_bin_dir.display(),
+            original_path.to_string_lossy()
+        );
+        // SAFETY: `std::env::set_var` is process-global, but CLAUDE.md rule
+        // 5's fork addendum means every test run happens in CI via `cargo
+        // nextest`, which runs each test in its OWN process — so no sibling
+        // test in this module ever observes this mutation. The prior value
+        // is restored below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+            std::env::set_var("LC_ALL", "de_DE.UTF-8");
+        }
+
+        let result = probe_work_tree(&target);
+
+        // SAFETY: see the comment on the previous unsafe block.
+        unsafe {
+            std::env::set_var("PATH", original_path);
+            std::env::remove_var("LC_ALL");
+        }
+
+        assert!(
+            matches!(result, WorkTreeProbe::NotAGitRepo),
+            "expected the git_command locale override to force the English fatal message \
+             regardless of the inherited LC_ALL, got {result:?}"
+        );
     }
 }
