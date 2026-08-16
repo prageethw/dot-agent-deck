@@ -2882,8 +2882,15 @@ fn pane_011_role_name_on_its_own_body_row() {
         false,
     );
     let empty_body0 = row_text(&empty_buf, 1);
+    // `row_text` reads the WHOLE row including the card's own left/right
+    // border cells, which are never whitespace — crop those off before
+    // checking blankness, or this can never pass regardless of content.
+    let empty_body0_inner: String = {
+        let chars: Vec<char> = empty_body0.chars().collect();
+        chars[1..chars.len().saturating_sub(1)].iter().collect()
+    };
     assert!(
-        empty_body0.trim().is_empty(),
+        empty_body0_inner.trim().is_empty(),
         "the identity row must render blank (`Line::from(\"\")`) when both display_name and \
          session_id are empty:\n{empty_body0}"
     );
