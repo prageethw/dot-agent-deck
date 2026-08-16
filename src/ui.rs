@@ -42265,4 +42265,175 @@ mod tests {
             "no control character from a warning body may reach the terminal: {text:?}"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Issue #398 / PR #399 — the "update available" badge
+    // ---------------------------------------------------------------------------
+    //
+    // The badge (`render_bottom_bar`, `src/ui.rs:17370-17394`) is drawn from
+    // `ui.update_available: Option<String>`, a private `UiState` field with no
+    // setter reachable from `tests/`. The two existing `pub fn *_to_buffer`
+    // seams (`render_button_bar_to_buffer`,
+    // `render_button_bar_with_bindings_to_buffer`) construct their own
+    // `UiState` internally and never set it, so neither can drive the `Some`
+    // branch. Rather than widen either seam's public signature (or add a new
+    // one) purely for this, these tests call `render_bottom_bar` directly from
+    // inside this `#[cfg(test)]` module, which already sees the private field.
+
+    /// The exact text `render_bottom_bar` builds for the badge — mirrors
+    /// `src/ui.rs:17371-17374` byte for byte so a test failure here means the
+    /// production format string actually changed, not that the test guessed
+    /// wrong.
+    fn expected_update_badge(latest: &str) -> String {
+        format!(
+            " Update available: v{latest} (current: v{}) ",
+            env!("DAD_VERSION")
+        )
+    }
+
+    /// Renders `render_bottom_bar` in `UiMode::Normal` (no status message, no
+    /// lock context, `has_pane_control = true`, no extra buttons) with
+    /// `ui.update_available` set to `update_available`, into a `width x 1`
+    /// buffer. Mirrors `render_button_bar_to_buffer` above, plus the one field
+    /// that seam cannot reach.
+    fn render_bottom_bar_with_update_available_to_buffer(
+        update_available: Option<&str>,
+        width: u16,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.update_available = update_available.map(str::to_string);
+        terminal
+            .draw(|frame| {
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 1,
+                };
+                render_bottom_bar(frame, &mut ui, area, true, &[], None);
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_row_text(buffer: &Buffer, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    /// Scenario: Render the bottom bar at a comfortable 120-column width with
+    /// `ui.update_available` set to a fake newer version. The badge must show
+    /// both the fake latest version and the running `DAD_VERSION`, flush
+    /// against the terminal's right edge, styled black-on-yellow bold over
+    /// every cell it occupies. This is the half issue #398 was actually about:
+    /// the badge never fired at all before the fix, so proving it fires (in
+    /// the right shape) when it should is the point of this test.
+    #[spec("lifecycle/version/002")]
+    #[test]
+    fn version_002_update_available_badge_renders_when_some() {
+        let latest = "9.9.9";
+        let width = 120;
+        let buffer = render_bottom_bar_with_update_available_to_buffer(Some(latest), width);
+        let badge = expected_update_badge(latest);
+        let bw = badge.chars().count() as u16;
+
+        let row = buffer_row_text(&buffer, width);
+        assert!(
+            row.ends_with(&badge),
+            "badge must render right-aligned flush to the terminal's right edge, got row:\n{row:?}"
+        );
+
+        let start_x = width - bw;
+        for x in start_x..width {
+            let cell = &buffer[(x, 0)];
+            assert_eq!(
+                cell.fg,
+                Color::Black,
+                "badge cell at x={x} must be black-on-yellow, got fg={:?}",
+                cell.fg
+            );
+            assert_eq!(
+                cell.bg,
+                Color::Yellow,
+                "badge cell at x={x} must be black-on-yellow, got bg={:?}",
+                cell.bg
+            );
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "badge cell at x={x} must be bold, got modifier={:?}",
+                cell.modifier
+            );
+        }
+    }
+
+    /// Scenario: Render the bottom bar at the same 120-column width with
+    /// `ui.update_available` left at `None` (the default). No badge text
+    /// appears anywhere in the row, and the row renders byte-for-byte
+    /// identical to the pre-existing `render_button_bar_to_buffer` seam (which
+    /// never touches `update_available`) — proving the button bar itself is
+    /// completely unaffected, not merely that the badge text is absent.
+    /// Without this, the `Some` case above would pass against a badge that
+    /// renders unconditionally.
+    #[spec("lifecycle/version/003")]
+    #[test]
+    fn version_003_no_badge_when_update_available_is_none() {
+        let width = 120;
+        let without_badge = render_bottom_bar_with_update_available_to_buffer(None, width);
+        let row = buffer_row_text(&without_badge, width);
+        assert!(
+            !row.contains("Update available"),
+            "no badge text must render when update_available is None, got row:\n{row:?}"
+        );
+
+        let baseline = render_button_bar_to_buffer(width);
+        assert_eq!(
+            row,
+            buffer_row_text(&baseline, width),
+            "with update_available at None the row must match the plain button-bar seam exactly"
+        );
+    }
+
+    /// Scenario: Render the bottom bar with `ui.update_available` set to a
+    /// fake newer version, but at a terminal width chosen so the area left
+    /// after the mode chip is exactly as wide as the badge text itself
+    /// (`bw == area.width`) — the boundary of the `bw < area.width` guard at
+    /// `src/ui.rs:17376`. The badge must not render at or above that width,
+    /// covering the narrow-terminal early return the previous refusal flagged
+    /// as still owed. Then widen by one column (`bw + 1 == area.width`) and
+    /// assert the badge DOES render there, so the guard is bracketed on both
+    /// sides rather than pinned only against the never-render side — which a
+    /// badge that never renders at any width would also pass.
+    #[spec("lifecycle/version/004")]
+    #[test]
+    fn version_004_no_badge_when_terminal_too_narrow() {
+        let latest = "9.9.9";
+        let badge = expected_update_badge(latest);
+        let bw = badge.chars().count() as u16;
+        // UiMode::Normal with no lock context: the chip band is constant once
+        // the terminal clears `mode_chip_min_width()`, so deriving it at a
+        // generously wide terminal gives the exact value that applies at the
+        // narrow widths under test too.
+        let (chip_band, _) = mode_chip_bar_split(UiMode::Normal, 200, None);
+        let width = bw + chip_band;
+
+        let buffer = render_bottom_bar_with_update_available_to_buffer(Some(latest), width);
+        let row = buffer_row_text(&buffer, width);
+        assert!(
+            !row.contains("Update available"),
+            "badge must not render when bw >= post-chip area width (bw={bw}, width={width}), got row:\n{row:?}"
+        );
+
+        let width_plus_one = width + 1;
+        let buffer =
+            render_bottom_bar_with_update_available_to_buffer(Some(latest), width_plus_one);
+        let row = buffer_row_text(&buffer, width_plus_one);
+        assert!(
+            row.ends_with(&badge),
+            "badge must render, right-aligned, one column past the boundary \
+             (bw={bw}, width={width_plus_one}), got row:\n{row:?}"
+        );
+    }
 }

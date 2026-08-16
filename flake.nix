@@ -182,21 +182,27 @@
           # reproducibly from source.
           doCheck = false;
 
-          # The crux of the whole derivation. build.rs reads both of these from
-          # the build environment (build.rs:22-30) and bakes them in via
+          # The crux of the whole derivation. build.rs reads all three of these
+          # from the build environment (build.rs:22-30) and bakes them in via
           # `cargo:rustc-env`, so this is what makes `dot-agent-deck --version`
-          # report 0.35.7 instead of the 0.1.0 placeholder, and what gives the
-          # daemon handshake a build id that actually moves between commits.
+          # report 0.35.7 instead of the 0.1.0 placeholder, gives the daemon
+          # handshake a build id that actually moves between commits, and
+          # (issue #398) makes the upgrade nudge poll this fork's own releases
+          # instead of upstream's.
           #
-          # ON buildPackage ONLY, never on commonArgs. Both values move on every
-          # release, and DAD_BUILD_ID moves on every commit, so putting them in
-          # the shared args would rebuild the dependency closure and its C every
-          # time either changed, which is most of what moving to crane bought.
-          # Nothing in the dependency graph reads them; only our own build.rs
-          # does.
+          # ON buildPackage ONLY, never on commonArgs. DAD_VERSION and
+          # DAD_BUILD_ID move on every release / every commit respectively, so
+          # putting them in the shared args would rebuild the dependency
+          # closure and its C every time either changed, which is most of what
+          # moving to crane bought. DAD_RELEASE_REPO is a constant and would be
+          # harmless in commonArgs on its own, but it lives here beside its
+          # siblings so `build.rs`'s three build-time values have one source in
+          # this flake rather than two. Nothing in the dependency graph reads
+          # any of them; only our own build.rs does.
           env = {
             DAD_VERSION = version;
             DAD_BUILD_ID = buildId;
+            DAD_RELEASE_REPO = "prageethw/dot-agent-deck";
           };
 
           meta = {

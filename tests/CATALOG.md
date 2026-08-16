@@ -2627,12 +2627,33 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 
 #### lifecycle/version
 
-##### lifecycle/version/001 — A build environment that pre-sets `DAD_VERSION` / `DAD_BUILD_ID` produces a binary that reports those values, and changing either one invalidates the cached build (issue #250).
-- **Layer:** L2 (three real `cargo build`s into one shared scratch `CARGO_TARGET_DIR`, pinned to the rustc host target and capped at half the machine's cores, then plain subprocess runs of each produced binary — no PTY).
+##### lifecycle/version/001 — A build environment that pre-sets `DAD_VERSION` / `DAD_BUILD_ID` / `DAD_RELEASE_REPO` produces a binary that reports those values, and changing any one of them invalidates the cached build (issue #250, widened by issue #398 review finding F1).
+- **Layer:** L2 (four real `cargo build`s into one shared scratch `CARGO_TARGET_DIR`, pinned to the rustc host target and capped at half the machine's cores, then plain subprocess runs / binary-byte inspection of each produced binary — no PTY).
 - **Agent:** none.
-- **Asserts:** with `DAD_VERSION=42.7.13` / `DAD_BUILD_ID=42.7.13-ginjected0` pre-set only in the *build* environment, the produced binary's `--version` reports `42.7.13` (not the `0.1.0` `CARGO_PKG_VERSION` placeholder, and not the checkout's git tag) and `daemon hello` advertises both injected values as `daemon_version` / `build_version`; then that changing **only** `DAD_VERSION` (to `58.1.2`) and afterwards **only** `DAD_BUILD_ID` (to `58.1.2-ginjected1`) is each picked up by the next build in the same target dir — the one-at-a-time change is what pins each `cargo:rerun-if-env-changed` directive individually.
-- **Does not assert:** the full fallback order *below* an injection — an absent or invalid `DAD_VERSION` falling through to git and then to the `CARGO_PKG_VERSION` placeholder — nor the build-script directive-injection rejection (both are pure-data unit tests in `tests/build_version.rs`); the `cargo:warning` text on the placeholder path; that a git-less checkout degrades correctly (would need a second cold build).
+- **Asserts:** with `DAD_VERSION=42.7.13` / `DAD_BUILD_ID=42.7.13-ginjected0` / `DAD_RELEASE_REPO=injected-owner-a/injected-repo-a` pre-set only in the *build* environment, the produced binary's `--version` reports `42.7.13` (not the `0.1.0` `CARGO_PKG_VERSION` placeholder, and not the checkout's git tag), `daemon hello` advertises both injected values as `daemon_version` / `build_version`, and the binary's own bytes contain the release URL composed from the injected `DAD_RELEASE_REPO` (`https://api.github.com/repos/injected-owner-a/injected-repo-a/releases/latest`) — the only way to observe that value, since nothing on the CLI or the hello wire surfaces it; then that changing **only** `DAD_VERSION` (to `58.1.2`), afterwards **only** `DAD_BUILD_ID` (to `58.1.2-ginjected1`), and finally **only** `DAD_RELEASE_REPO` (to `injected-owner-b/injected-repo-b`) is each picked up by the next build in the same target dir — the one-at-a-time change is what pins each `cargo:rerun-if-env-changed` directive individually, including the one for `DAD_RELEASE_REPO` that F1 found unexercised.
+- **Does not assert:** the full fallback order *below* an injection — an absent or invalid `DAD_VERSION` / `DAD_RELEASE_REPO` falling through to git / `DEFAULT_RELEASE_REPO` and then to the `CARGO_PKG_VERSION` placeholder — nor the build-script directive-injection rejection (both are pure-data unit tests in `tests/build_version.rs`); the `cargo:warning` text on either fallback path; that a git-less checkout degrades correctly (would need a second cold build); the release workflow's own artifact-string assertion or the `cross`/Nix build paths (F2/F6, out of scope for this task).
 - **Platform coverage:** mac+linux.
+
+##### lifecycle/version/002 — The "update available" badge renders, right-aligned and styled, when `ui.update_available` is `Some` (issue #398, PR #399).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests` since `update_available` is a private `UiState` field neither existing `pub fn *_to_buffer` seam can set).
+- **Agent:** none.
+- **Asserts:** at a comfortable 120-column width, with `ui.update_available` set to a fake newer version, the badge renders flush against the terminal's right edge reading `Update available: v{latest} (current: v{DAD_VERSION})`, and every cell it occupies is styled black-on-yellow bold. Issue #398's bug was that the badge never fired at all (the nudge polled upstream's release feed, whose numbers the fork's build always runs ahead of), so proving it fires — in the right shape — when it should is the point of this test.
+- **Does not assert:** the `None` case (`lifecycle/version/003`); the narrow-terminal early return (`lifecycle/version/004`); that the badge's content tracks a REAL upstream/fork release comparison (`should_notify`'s own logic is unit-tested in `tests/build_version.rs`, unrelated to rendering).
+- **Platform coverage:** mac+linux+windows.
+
+##### lifecycle/version/003 — With `ui.update_available` at `None`, no badge renders and the bottom bar is byte-for-byte unaffected (issue #398, PR #399).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests`).
+- **Agent:** none.
+- **Asserts:** at the same 120-column width, with `ui.update_available` left at its default `None`, the rendered row contains no `Update available` text, and is byte-for-byte identical to the pre-existing `render_button_bar_to_buffer` seam (which never touches `update_available`) — proving the button bar itself is unaffected, not merely that the badge text happens to be absent. Without this, `lifecycle/version/002`'s `Some` assertion would pass against a badge that renders unconditionally.
+- **Does not assert:** the `Some` case (`lifecycle/version/002`); the narrow-terminal early return (`lifecycle/version/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### lifecycle/version/004 — The badge does not render when the post-mode-chip area is too narrow to hold it (`bw >= area.width`), and does render one column past that boundary (`bw == area.width`) (issue #398, PR #399).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests`).
+- **Agent:** none.
+- **Asserts:** with `ui.update_available` set to a fake newer version, at a terminal width chosen so the area left after the mode chip is exactly as wide as the badge text itself (`bw == area.width`, the exact boundary of the `bw < area.width` guard), the badge does not render; then, widened by exactly one column (`bw + 1 == area.width`), the badge does render, right-aligned. Brackets the guard on both sides — a badge that never renders at any width would pass a one-sided check.
+- **Does not assert:** the `Some` / comfortable-width case (`lifecycle/version/002`); the `None` case (`lifecycle/version/003`); a width narrower than the boundary (the guard is monotonic, so the boundary case is the one that matters).
+- **Platform coverage:** mac+linux+windows.
 
 #### lifecycle/handshake
 

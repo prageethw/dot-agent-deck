@@ -194,3 +194,90 @@ pub fn resolve_build_id(
         None => format!("{version}-unknown"),
     }
 }
+
+/// Is `owner` a valid GitHub username/org segment? GitHub's own allowlist
+/// alphabet: ASCII alphanumerics and `-`.
+///
+/// An allowlist rather than the denylist this replaced: the denylist rejected
+/// `.`/`..` segments explicitly, but that rejection was bypassable by
+/// percent-encoding (`%2e%2e` and case variants decode to `..` in the `url`
+/// crate this build links, `url-2.5.8/src/parser.rs:1319`), and it left every
+/// other URL-significant character (`?`, `#`, `:`, `@`, `\`, `%`) unrejected.
+/// This alphabet excludes all of them in one predicate, and also excludes
+/// non-ASCII codepoints the denylist let through (e.g. bidi-format
+/// characters). Uppercase is accepted deliberately — GitHub owner names are
+/// case-insensitive but may contain uppercase letters.
+///
+/// The old `.`/`..` whole-segment check is genuinely redundant here, unlike
+/// for [`is_valid_repo_name_segment`]: `.` is not in this alphabet at all, so
+/// no sequence of only `.` characters can pass the `chars().all(..)` check
+/// below regardless.
+fn is_valid_owner_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Is `name` a valid GitHub repository-name segment? GitHub's own allowlist
+/// alphabet: ASCII alphanumerics plus `.`, `-`, `_`.
+///
+/// Unlike [`is_valid_owner_segment`], the character-class swap alone does
+/// **not** make the old `.`/`..` whole-segment check redundant here: `.` is
+/// itself in this alphabet (real repo names contain dots, e.g.
+/// `dot-agent-deck` doesn't but plenty of real repos do), so a segment of
+/// *only* dots — `.` or `..` — passes `chars().all(..)` and would silently
+/// reintroduce the traversal segment the old denylist rejected explicitly
+/// (caught by `malformed_release_repo_falls_through_to_default`'s
+/// `"owner/.."` case going green under an earlier, character-only-allowlist
+/// version of this function). GitHub itself forbids a repository literally
+/// named `.` or `..`, so this keeps rejecting exactly those two, on top of
+/// the character allowlist.
+fn is_valid_repo_name_segment(segment: &str) -> bool {
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return false;
+    }
+    segment
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Normalize a candidate `DAD_RELEASE_REPO` injection (issue #398) into the
+/// `owner/name` GitHub repo slug to bake in, or `None` when it does not look
+/// like one.
+///
+/// The upgrade nudge (`src/version.rs`) composes this slug directly into a
+/// `https://api.github.com/repos/<slug>/releases/latest` URL, so the shape
+/// follows GitHub's own slug alphabet: exactly one `/`, an owner segment of
+/// ASCII alphanumerics and `-`, a name segment of ASCII alphanumerics plus
+/// `.`/`-`/`_`, single line. Anything else falls through to the caller's
+/// default — a malformed slug must degrade to "poll the known-good feed",
+/// never to a broken or attacker-influenced URL.
+pub fn normalize_release_repo(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if !is_single_line_directive_value(trimmed) {
+        return None;
+    }
+    let mut segments = trimmed.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    if !is_valid_owner_segment(owner) || !is_valid_repo_name_segment(name) {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// Resolve the `DAD_RELEASE_REPO` slug: a valid injected value wins,
+/// otherwise `default`.
+///
+/// An injection that fails [`normalize_release_repo`] falls through to
+/// `default` exactly as if it had been absent — `build.rs` warns about it
+/// separately.
+pub fn resolve_release_repo(injected: Option<&str>, default: &str) -> String {
+    injected
+        .and_then(normalize_release_repo)
+        .unwrap_or_else(|| default.to_string())
+}

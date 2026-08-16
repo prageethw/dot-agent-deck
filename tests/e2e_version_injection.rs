@@ -11,19 +11,32 @@
 //! tests in `tests/build_version.rs` cover the precedence and validation rules
 //! themselves.
 //!
+//! Issue #398 review finding F1 widened this to a third injected value,
+//! `DAD_RELEASE_REPO` (the upgrade nudge's poll target — `src/version.rs`'s
+//! `GITHUB_RELEASES_URL` `concat!`). That seam was previously pinned nowhere:
+//! the resolver tests in `tests/build_version.rs` cover the pure
+//! slug-normalisation function, and `lifecycle/version/002`-`004` cover badge
+//! rendering, but nothing crossed the build boundary the bug actually lived
+//! on. Reverting `src/version.rs` to a hardcoded upstream URL, or losing the
+//! `.cargo/config.toml` `[env]` line in a fork sync, left every other gate on
+//! this repo green.
+//!
 //! # Cost — read this before assuming the test is hung
 //!
-//! It runs **three** real `cargo build`s, all into the same scratch
+//! It runs **four** real `cargo build`s, all into the same scratch
 //! `CARGO_TARGET_DIR` under `target/`:
 //!
-//! 1. `(VERSION_A, BUILD_ID_A)` — the cold one. On a fresh worktree this
-//!    compiles the whole dependency graph: **~10 minutes and ~1.5 GB of disk,
-//!    once per worktree**. Every later run of this test is incremental.
-//! 2. `(VERSION_B, BUILD_ID_A)` — only `DAD_VERSION` changed.
-//! 3. `(VERSION_B, BUILD_ID_B)` — only `DAD_BUILD_ID` changed.
+//! 1. `(VERSION_A, BUILD_ID_A, RELEASE_REPO_A)` — the cold one. On a fresh
+//!    worktree this compiles the whole dependency graph: **~10 minutes and
+//!    ~1.5 GB of disk, once per worktree**. Every later run of this test is
+//!    incremental.
+//! 2. `(VERSION_B, BUILD_ID_A, RELEASE_REPO_A)` — only `DAD_VERSION` changed.
+//! 3. `(VERSION_B, BUILD_ID_B, RELEASE_REPO_A)` — only `DAD_BUILD_ID` changed.
+//! 4. `(VERSION_B, BUILD_ID_B, RELEASE_REPO_B)` — only `DAD_RELEASE_REPO`
+//!    changed.
 //!
-//! Builds 2 and 3 re-run the build script and relink (tens of seconds), which
-//! is exactly why the scratch dir is stable and shared rather than a fresh
+//! Builds 2-4 re-run the build script and relink (tens of seconds), which is
+//! exactly why the scratch dir is stable and shared rather than a fresh
 //! tempdir per step. The widened `slow-timeout` override for this test in
 //! `.config/nextest.toml` exists for the cold case.
 //!
@@ -59,6 +72,17 @@ const BUILD_ID_A: &str = "42.7.13-ginjected0";
 /// once would prove neither, since either one alone re-runs the whole script.
 const VERSION_B: &str = "58.1.2";
 const BUILD_ID_B: &str = "58.1.2-ginjected1";
+
+/// A `DAD_RELEASE_REPO` value held constant across builds 1-3, deliberately
+/// unlike either real slug this fork cares about (`vfarcic/dot-agent-deck`,
+/// `prageethw/dot-agent-deck`), so a passing URL assertion cannot be a
+/// coincidence of matching the fork's own default.
+const RELEASE_REPO_A: &str = "injected-owner-a/injected-repo-a";
+/// Changed on its own in build 4, after `DAD_VERSION` / `DAD_BUILD_ID` are
+/// already at their "B" values — the one-at-a-time change that pins
+/// `cargo:rerun-if-env-changed=DAD_RELEASE_REPO` individually, the same
+/// argument steps 2 and 3 already make for the other two variables.
+const RELEASE_REPO_B: &str = "injected-owner-b/injected-repo-b";
 
 /// The `Cargo.toml` placeholder a source build wrongly reported before this fix.
 const PLACEHOLDER_VERSION: &str = "0.1.0";
@@ -107,17 +131,59 @@ fn capped_jobs() -> usize {
         .unwrap_or(1)
 }
 
-/// Build `dot-agent-deck` with `version` / `build_id` pre-set in the build
-/// environment, into the shared scratch target dir. Returns the path of the
-/// produced binary.
-fn build_with_injected(version: &str, build_id: &str) -> PathBuf {
+/// Build `dot-agent-deck` with `version` / `build_id` pre-set as plain OS
+/// environment variables, and `release_repo` pre-set via `--config` (see
+/// below for why), into the shared scratch target dir. Returns the path of
+/// the produced binary.
+fn build_with_injected(version: &str, build_id: &str, release_repo: &str) -> PathBuf {
     let scratch = scratch_target_dir();
     let target = host_target();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let jobs = capped_jobs().to_string();
 
+    // DAD_RELEASE_REPO cannot be injected as a plain OS environment variable
+    // the way DAD_VERSION / DAD_BUILD_ID are: this checkout's own
+    // `.cargo/config.toml` sets `force = true` on its `[env]` entry for this
+    // key (issue #398 review finding F3), and `force = true` means the
+    // config value is NOT overridable by the environment — a plain
+    // `.env("DAD_RELEASE_REPO", ...)` here would be silently discarded in
+    // favour of the fork's own default slug, and every build in this test
+    // would produce the SAME composed URL regardless of `release_repo`,
+    // defeating the point of injecting different values across steps.
+    //
+    // `--config` sidesteps this: force governs precedence between a config
+    // FILE's [env] entry and the OS environment specifically; it says
+    // nothing about precedence between two config SOURCES. Cargo's own
+    // reference is explicit that `--config` outranks every config file
+    // ("Configuration values specified this way take precedence over
+    // environment variables, which take precedence over configuration
+    // files" — doc.rust-lang.org/cargo/reference/config.html#command-line-overrides).
+    //
+    // Two things had to be true of the override's own syntax, both verified
+    // directly against this checkout's cargo (1.97.0) rather than assumed:
+    // - `--config env.DAD_RELEASE_REPO={ value = "..." }` (an inline table)
+    //   is rejected outright — "sets a value to an inline table, which is
+    //   not accepted" — cargo's CLI form does not accept inline tables.
+    // - A bare `--config env.DAD_RELEASE_REPO="..."` merges against the
+    //   project file's entry key-by-key rather than replacing it wholesale,
+    //   and errors when the shapes disagree: "failed to merge key
+    //   `DAD_RELEASE_REPO` … expected table, but found string", because the
+    //   project file's entry is itself a table (`{ value = "...", force =
+    //   true }`).
+    // The dotted-path form below sidesteps both: it sets just the `value`
+    // subkey, cargo merges it against the file's table entry field-by-field,
+    // and `force = true` carries over unmodified from the file — confirmed
+    // with `cargo --config '…DAD_RELEASE_REPO.value="X"' -Z unstable-options
+    // config get env.DAD_RELEASE_REPO`, which reported exactly
+    // `{ force = true, value = "X" }`. Nothing sets DAD_RELEASE_REPO as a
+    // plain OS env var in this function, so `force`'s OS-environment rule
+    // never has anything to act on regardless of what it resolves to.
+    let release_repo_override = format!("env.DAD_RELEASE_REPO.value=\"{release_repo}\"");
+
     let out = Command::new(&cargo)
         .args([
+            "--config",
+            &release_repo_override,
             "build",
             "--bin",
             "dot-agent-deck",
@@ -141,7 +207,8 @@ fn build_with_injected(version: &str, build_id: &str) -> PathBuf {
 
     assert!(
         out.status.success(),
-        "building with DAD_VERSION={version} / DAD_BUILD_ID={build_id} injected must succeed, \
+        "building with DAD_VERSION={version} / DAD_BUILD_ID={build_id} / \
+         DAD_RELEASE_REPO={release_repo} injected must succeed, \
          got {:?}\nstdout:\n{}\nstderr:\n{}",
         out.status.code(),
         String::from_utf8_lossy(&out.stdout),
@@ -199,6 +266,33 @@ fn run_binary(bin: &Path, args: &[&str]) -> String {
     combined
 }
 
+/// Assert that `bin`'s own bytes contain the release URL composed from
+/// `release_repo` — i.e. that the injected `DAD_RELEASE_REPO` reached
+/// `src/version.rs`'s `GITHUB_RELEASES_URL` `concat!`. Unlike `DAD_VERSION` /
+/// `DAD_BUILD_ID`, nothing on the CLI or the daemon-hello wire surfaces the
+/// composed URL, so this is the only way to observe it: `concat!` expands
+/// `env!` eagerly, which rustc const-folds into a single string literal in
+/// rodata (reviewer verified this against the produced binary), so the whole
+/// composed URL is greppable in the artifact — the same property `release.yml`
+/// relies on for its own post-build assertion. Checking the FULL URL, not the
+/// bare slug, proves the injected value reached the composition rather than
+/// merely appearing somewhere by coincidence.
+fn assert_binary_contains_composed_url(bin: &Path, step: &str, release_repo: &str) {
+    let expected = format!("https://api.github.com/repos/{release_repo}/releases/latest");
+    let bytes = std::fs::read(bin)
+        .unwrap_or_else(|e| panic!("{step}: failed to read {}: {e}", bin.display()));
+    let found = bytes
+        .windows(expected.len())
+        .any(|window| window == expected.as_bytes());
+    assert!(
+        found,
+        "{step}: the built binary must contain the composed release URL \
+         `{expected}` — DAD_RELEASE_REPO={release_repo} must have reached \
+         src/version.rs's GITHUB_RELEASES_URL const, got a binary with no \
+         occurrence of it"
+    );
+}
+
 /// Assert that `bin` reports exactly `version` / `build_id` on both surfaces
 /// that matter: `--version` (what a packager and the remote pre-flight read)
 /// and `daemon hello` (the handshake, which carries both values on the wire).
@@ -231,43 +325,68 @@ fn assert_reports(bin: &Path, step: &str, version: &str, build_id: &str) {
     );
 }
 
-/// Scenario: Rebuild the `dot-agent-deck` binary into a scratch target dir three
-/// times with different `DAD_VERSION` / `DAD_BUILD_ID` values pre-set in the
-/// build environment, and after each build run the produced binary with those
-/// vars absent from its runtime environment. The first build must report the
-/// injected `42.7.13` / `42.7.13-ginjected0` (not the `0.1.0` placeholder, not
-/// the checkout's git tag) on both `--version` and `daemon hello`; then changing
-/// only `DAD_VERSION`, and afterwards only `DAD_BUILD_ID`, must each be picked
-/// up by the next build rather than served from cache.
+/// Scenario: Rebuild the `dot-agent-deck` binary into a scratch target dir four
+/// times with different `DAD_VERSION` / `DAD_BUILD_ID` / `DAD_RELEASE_REPO`
+/// values pre-set in the build environment, and after each build check the
+/// produced binary with those vars absent from its runtime environment. The
+/// first build must report the injected `42.7.13` / `42.7.13-ginjected0` (not
+/// the `0.1.0` placeholder, not the checkout's git tag) on both `--version`
+/// and `daemon hello`, and must contain the release URL composed from the
+/// injected `DAD_RELEASE_REPO`; then changing only `DAD_VERSION`, then only
+/// `DAD_BUILD_ID`, then only `DAD_RELEASE_REPO`, must each be picked up by the
+/// next build rather than served from cache (issue #398 review finding F1
+/// widened this from two injected values to three).
 #[spec("lifecycle/version/001")]
 #[test]
 fn version_001_injected_build_env_reaches_the_binary() {
     // Step 1 — the injection is honoured at all (the cold build; see the cost
     // note at the top of this file).
-    let bin = build_with_injected(VERSION_A, BUILD_ID_A);
+    let bin = build_with_injected(VERSION_A, BUILD_ID_A, RELEASE_REPO_A);
     assert_reports(&bin, "initial injected build", VERSION_A, BUILD_ID_A);
+    assert_binary_contains_composed_url(&bin, "initial injected build", RELEASE_REPO_A);
 
     // Step 2 — change ONLY DAD_VERSION, in the SAME target dir. Without
     // `cargo:rerun-if-env-changed=DAD_VERSION` cargo has no reason to re-run the
     // build script (no source file and no watched git path moved), so the binary
     // would still report VERSION_A and this assertion fails. The unchanged build
-    // id must survive as-is.
-    let bin = build_with_injected(VERSION_B, BUILD_ID_A);
+    // id and release repo must survive as-is.
+    let bin = build_with_injected(VERSION_B, BUILD_ID_A, RELEASE_REPO_A);
     assert_reports(
         &bin,
         "after changing only DAD_VERSION",
         VERSION_B,
         BUILD_ID_A,
     );
+    assert_binary_contains_composed_url(&bin, "after changing only DAD_VERSION", RELEASE_REPO_A);
 
     // Step 3 — now change ONLY DAD_BUILD_ID, again in the same target dir. Same
-    // argument for the second rerun directive; the version must stay at
-    // VERSION_B.
-    let bin = build_with_injected(VERSION_B, BUILD_ID_B);
+    // argument for the second rerun directive; the version and release repo
+    // must stay at VERSION_B / RELEASE_REPO_A.
+    let bin = build_with_injected(VERSION_B, BUILD_ID_B, RELEASE_REPO_A);
     assert_reports(
         &bin,
         "after changing only DAD_BUILD_ID",
         VERSION_B,
         BUILD_ID_B,
+    );
+    assert_binary_contains_composed_url(&bin, "after changing only DAD_BUILD_ID", RELEASE_REPO_A);
+
+    // Step 4 — now change ONLY DAD_RELEASE_REPO, again in the same target dir.
+    // Without `cargo:rerun-if-env-changed=DAD_RELEASE_REPO` (`build.rs:33`)
+    // cargo would serve the stale binary from build 3, whose composed URL
+    // still names RELEASE_REPO_A, and this assertion fails. Version and build
+    // id must stay at VERSION_B / BUILD_ID_B, which `assert_reports` re-checks
+    // so a change here cannot be mistaken for a fully stale build.
+    let bin = build_with_injected(VERSION_B, BUILD_ID_B, RELEASE_REPO_B);
+    assert_reports(
+        &bin,
+        "after changing only DAD_RELEASE_REPO",
+        VERSION_B,
+        BUILD_ID_B,
+    );
+    assert_binary_contains_composed_url(
+        &bin,
+        "after changing only DAD_RELEASE_REPO",
+        RELEASE_REPO_B,
     );
 }
