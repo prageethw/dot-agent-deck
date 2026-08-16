@@ -4283,6 +4283,13 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** dashboard-session identity replacement (covered by `prompt/close-confirm/005`).
 - **Platform coverage:** mac+linux.
 
+##### mouse/tabstrip/004 — The active orchestration tab renders BOLD and its status colour but never underline.
+- **Layer:** L2 (real-binary PTY against the `orch-deck` fixture's single orchestration, `demo-orch`).
+- **Agent:** none (both roles run `cat`, idle).
+- **Asserts:** opening `demo-orch` leaves it the active tab, whose rendered label carries `Modifier::BOLD`, `palette::STATUS_IDLE` (vt100 `Idx(8)`, since both roles are idle), and NOT underline — issue #313's regression guard for fork issue #377's removal of the underline from the active-tab cue, since a bad upstream-sync merge resolution restoring it has no other test that would catch it.
+- **Does not assert:** padding-space or `[×]` fill colour (covered on the L1 side by `tabs/orchestration/010`); non-idle status colours (covered by `tabs/orchestration/010`/`/014`, `tabs/label/002`).
+- **Platform coverage:** mac+linux.
+
 #### mouse/dashboard
 
 ##### mouse/dashboard/001 — Single-click selects a card; double-click focuses its pane.
