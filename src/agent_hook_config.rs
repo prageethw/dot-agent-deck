@@ -24,17 +24,24 @@ use std::path::Path;
 /// executable path so a path containing whitespace or shell metacharacters still
 /// produces a valid command that the agent parses to the intended argv. A "safe"
 /// path (only path-typical characters) is emitted verbatim so the common case
-/// stays human-readable and stable; anything else is single-quoted with embedded
-/// single quotes escaped.
+/// stays human-readable and stable; anything else is quoted.
+///
+/// These hook commands are shelled through the platform's native shell, so the
+/// quoting rule differs by platform: POSIX single-quoting on Unix
+/// ([`crate::platform::paths::shell_quote_if_needed`]), `cmd.exe`-safe
+/// caret-escaping on Windows ([`crate::platform::shell::escape_cmd_exe_program`]
+/// — fork issue #238).
 ///
 /// `suffix` is the caller's `HOOK_COMMAND_SUFFIX` — the fixed
 /// `hook --agent <agent>` signature that also identifies the resulting command
 /// as deck-owned on the way back in, so the two must stay the same string.
 pub(crate) fn build_command(binary_path: &str, suffix: &str) -> String {
-    format!(
-        "{} {suffix}",
-        crate::platform::paths::shell_quote_if_needed(binary_path)
-    )
+    #[cfg(unix)]
+    let quoted = crate::platform::paths::shell_quote_if_needed(binary_path);
+    #[cfg(windows)]
+    let quoted = crate::platform::shell::escape_cmd_exe_program(binary_path);
+
+    format!("{quoted} {suffix}")
 }
 
 /// Atomically publish `bytes` to `dest` by writing a temp file in `dir` — which
