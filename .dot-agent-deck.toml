@@ -119,7 +119,7 @@ default = true
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run claude-opus-devbox --permission-mode plan"
+command = "devbox run claude-sonnet-devbox --permission-mode plan"
 # command = "devbox run pi-big"   # pi (Opus, high thinking)
 start = true
 prompt_template = """
