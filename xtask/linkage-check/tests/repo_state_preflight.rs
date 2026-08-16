@@ -11,7 +11,7 @@
 //! than some internal function in isolation.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Minimal fixture tree that satisfies checks 1-9 on its own (one catalog
@@ -81,43 +81,49 @@ fn init_committed_repo(dir: &Path) {
     git(&["commit", "-q", "-m", "fixture"], dir);
 }
 
-fn run_linkage_check(dir: &Path) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_xtask-linkage-check");
-    Command::new(bin)
-        .current_dir(dir)
-        .output()
-        .expect("run xtask-linkage-check")
+/// `git worktree add <path> -b <branch>` in `base`.
+fn add_worktree(base: &Path, path: &Path, branch: &str) {
+    git(
+        &[
+            "worktree",
+            "add",
+            path.to_str().expect("utf8 path"),
+            "-b",
+            branch,
+        ],
+        base,
+    );
 }
 
-/// A shallow clone with exactly one worktree must NOT fail — a CI runner
-/// clones fresh and shallow, and the preflight is exempt by construction in
-/// that shape (never via an `if CI` env-var check). This is the central
-/// constraint the whole design turns on.
-#[test]
-fn linkage_check_ok_on_single_worktree_even_when_shallow() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let remote = tmp.path().join("remote");
+/// Build a two-commit `remote` repo under `tmp`, shallow-clone it into
+/// `tmp/dest`, and return `dest`. `--no-local` is load-bearing: git silently
+/// ignores `--depth` for a same-filesystem local clone unless `--no-local`
+/// (or a `file://` URL) forces it through the normal fetch-negotiation path
+/// instead of the hardlink/copy fast path — without it the "shallow" clone
+/// would actually be a full, non-shallow copy and every test using this
+/// would test nothing. The second commit exists so depth-1 genuinely
+/// truncates history, rather than coinciding with "the whole repo".
+fn build_shallow_clone(tmp: &Path) -> PathBuf {
+    let remote = tmp.join("remote");
     fs::create_dir_all(&remote).expect("mkdir remote");
     init_committed_repo(&remote);
-    // A second commit so the shallow clone genuinely truncates history,
-    // rather than depth-1 coinciding with "the whole repo".
     fs::write(remote.join("README.md"), "second commit\n").expect("write README.md");
     git(&["add", "README.md"], &remote);
     git(&["commit", "-q", "-m", "second commit"], &remote);
 
-    let dest = tmp.path().join("dest");
+    let dest = tmp.join("dest");
     git(
         &[
             "clone",
+            "--no-local",
             "--depth",
             "1",
             remote.to_str().expect("utf8 path"),
             dest.to_str().expect("utf8 path"),
         ],
-        tmp.path(),
+        tmp,
     );
 
-    // Sanity: the clone really is shallow.
     let out = Command::new("git")
         .args(["rev-parse", "--is-shallow-repository"])
         .current_dir(&dest)
@@ -129,11 +135,36 @@ fn linkage_check_ok_on_single_worktree_even_when_shallow() {
         "test setup did not actually produce a shallow clone"
     );
 
-    let output = run_linkage_check(&dest);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
+    dest
+}
+
+/// Run the compiled `xtask-linkage-check` binary in `dir`, returning
+/// `(success, stdout, stderr)` as owned strings.
+fn run_linkage_check(dir: &Path) -> (bool, String, String) {
+    let bin = env!("CARGO_BIN_EXE_xtask-linkage-check");
+    let output = Command::new(bin)
+        .current_dir(dir)
+        .output()
+        .expect("run xtask-linkage-check");
+    (
         output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A shallow clone with exactly one worktree must NOT fail — a CI runner
+/// clones fresh and shallow, and the preflight is exempt by construction in
+/// that shape (never via an `if CI` env-var check). This is the central
+/// constraint the whole design turns on.
+#[test]
+fn linkage_check_ok_on_single_worktree_even_when_shallow() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = build_shallow_clone(tmp.path());
+
+    let (success, stdout, stderr) = run_linkage_check(&dest);
+    assert!(
+        success,
         "linkage-check failed on a shallow SINGLE-worktree clone, which must be exempt by \
          construction\nstdout: {stdout}\nstderr: {stderr}"
     );
@@ -148,42 +179,12 @@ fn linkage_check_ok_on_single_worktree_even_when_shallow() {
 #[test]
 fn linkage_check_fails_on_shallow_repository_in_multi_worktree_checkout() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let remote = tmp.path().join("remote");
-    fs::create_dir_all(&remote).expect("mkdir remote");
-    init_committed_repo(&remote);
-    fs::write(remote.join("README.md"), "second commit\n").expect("write README.md");
-    git(&["add", "README.md"], &remote);
-    git(&["commit", "-q", "-m", "second commit"], &remote);
+    let dest = build_shallow_clone(tmp.path());
+    add_worktree(&dest, &tmp.path().join("dest-linked"), "linked");
 
-    let dest = tmp.path().join("dest");
-    git(
-        &[
-            "clone",
-            "--depth",
-            "1",
-            remote.to_str().expect("utf8 path"),
-            dest.to_str().expect("utf8 path"),
-        ],
-        tmp.path(),
-    );
-
-    let linked = tmp.path().join("dest-linked");
-    git(
-        &[
-            "worktree",
-            "add",
-            linked.to_str().expect("utf8 path"),
-            "-b",
-            "linked",
-        ],
-        &dest,
-    );
-
-    let output = run_linkage_check(&dest);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (success, stdout, stderr) = run_linkage_check(&dest);
     assert!(
-        !output.status.success(),
+        !success,
         "linkage-check reported success on a shallow repository with a second linked worktree\n\
          stdout: {stdout}\nstderr: {stderr}"
     );
@@ -205,16 +206,7 @@ fn linkage_check_fails_on_stale_worktree_registry_entry() {
     init_committed_repo(&main);
 
     let sibling = tmp.path().join("sibling-worktree");
-    git(
-        &[
-            "worktree",
-            "add",
-            sibling.to_str().expect("utf8 path"),
-            "-b",
-            "sibling",
-        ],
-        &main,
-    );
+    add_worktree(&main, &sibling, "sibling");
 
     // Simulate a second concurrent process deleting the worktree directory
     // directly (issue #325's actual incident shape) rather than going
@@ -222,11 +214,9 @@ fn linkage_check_fails_on_stale_worktree_registry_entry() {
     // entry too.
     fs::remove_dir_all(&sibling).expect("rm -rf sibling-worktree");
 
-    let output = run_linkage_check(&main);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (success, stdout, stderr) = run_linkage_check(&main);
     assert!(
-        !output.status.success(),
+        !success,
         "linkage-check reported success with a stale worktree registry entry\nstdout: {stdout}\n\
          stderr: {stderr}"
     );
@@ -235,8 +225,12 @@ fn linkage_check_fails_on_stale_worktree_registry_entry() {
         "expected check 11 to name the stale path and the `git worktree prune` remedy\n\
          stderr: {stderr}"
     );
+    // `git worktree list --porcelain` always reports forward-slash paths,
+    // even on Windows where `sibling`'s own `Display`/`to_str()` form uses
+    // backslashes — normalize before comparing.
+    let sibling_forward_slash = sibling.to_str().expect("utf8 path").replace('\\', "/");
     assert!(
-        stderr.contains(sibling.to_str().expect("utf8 path")),
+        stderr.contains(&sibling_forward_slash),
         "expected the stale path itself to appear in the failure message\nstderr: {stderr}"
     );
     assert!(
@@ -260,22 +254,11 @@ fn linkage_check_passes_on_clean_multi_worktree_checkout() {
     init_committed_repo(&main);
 
     let sibling = tmp.path().join("sibling-worktree");
-    git(
-        &[
-            "worktree",
-            "add",
-            sibling.to_str().expect("utf8 path"),
-            "-b",
-            "sibling",
-        ],
-        &main,
-    );
+    add_worktree(&main, &sibling, "sibling");
 
-    let output = run_linkage_check(&main);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (success, stdout, stderr) = run_linkage_check(&main);
     assert!(
-        output.status.success(),
+        success,
         "linkage-check failed on a clean multi-worktree checkout\nstdout: {stdout}\n\
          stderr: {stderr}"
     );

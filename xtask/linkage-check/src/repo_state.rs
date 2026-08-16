@@ -83,6 +83,22 @@ pub fn current_worktree_missing(current: &Path) -> bool {
     !current.exists()
 }
 
+/// Whether `repo_dir` is inside a git working tree at all (`git rev-parse
+/// --is-inside-work-tree`). The preflight is entirely about git worktree
+/// registry / object-store state, so a directory that is not a git repo has
+/// nothing for it to assert — this must be "exempt", never a failure. A
+/// synthetic fixture tree with no `.git` (e.g. `tests/duplicate_catalog_id.rs`'s
+/// own fixture, which checks 1-9 exercise directly against a bare directory)
+/// is exactly this case, and treating it as `[10] could not list worktrees…`
+/// would fail every one of those fixtures for a reason unrelated to what
+/// they test.
+fn is_inside_git_work_tree(repo_dir: &Path) -> bool {
+    matches!(
+        run_git_capture(repo_dir, &["rev-parse", "--is-inside-work-tree"]).as_deref(),
+        Ok("true")
+    )
+}
+
 /// Run `git <args>` in `repo_dir`, returning trimmed stdout on success or a
 /// message built from stderr (or the spawn error) on failure.
 fn run_git_capture(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -135,6 +151,13 @@ fn default_remote(repo_dir: &Path) -> String {
 /// check in this binary already operates against.
 pub fn check(repo_dir: &Path) -> Vec<String> {
     let mut failures = Vec::new();
+
+    if !is_inside_git_work_tree(repo_dir) {
+        // Not a git checkout at all — exempt, not a failure. See
+        // `is_inside_git_work_tree`'s doc for why this must not become
+        // `[10] could not list worktrees…`.
+        return failures;
+    }
 
     let worktrees = match worktree_paths(repo_dir) {
         Ok(w) => w,
@@ -330,5 +353,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let gone = tmp.path().join("never-created");
         assert!(current_worktree_missing(&gone));
+    }
+
+    /// A bare directory with no `.git` — exactly the shape of
+    /// `tests/duplicate_catalog_id.rs`'s own fixture — must be exempt, not a
+    /// failure. Before this, `check` reported `[10] could not list
+    /// worktrees…` for every such fixture, which broke that pre-existing
+    /// test on every platform (`fatal: not a git repository`).
+    #[test]
+    fn check_is_exempt_on_a_directory_that_is_not_a_git_repository_at_all() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(!is_inside_git_work_tree(tmp.path()));
+        assert!(check(tmp.path()).is_empty());
     }
 }
