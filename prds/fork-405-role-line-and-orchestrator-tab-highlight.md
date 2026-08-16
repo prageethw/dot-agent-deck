@@ -110,6 +110,10 @@ selected   Mode / Dashboard  → BOLD, unchanged
 1. **`src/ui.rs:15334-15357`** — derive a per-tab "is orchestration" flag at the call site, the same way `closeable` is already derived from the `Tab` enum, and pass it to `render_tab_strip`. No new mechanism.
 2. **`src/ui.rs:14636-14672`** — add `REVERSED` when `i == active_index && is_orchestration[i]`. **Order matters:** it must be applied *after* the status fg overwrite, since it inverts whatever fg is present.
 
+**This requires a signature change, and that has a sequencing consequence.** `render_tab_strip` and its L1 seam `render_tab_bar_to_buffer` (`src/ui.rs:21091`) take `labels`, `closeable`, `active_index`, `width`, `tab_statuses` — and **nothing in that set distinguishes a Mode tab from an Orchestration tab**: both are `closeable = true` and both carry `Some(..)` status data. So M2 needs a new `is_orchestration: &[bool]` parameter, appended after `tab_statuses` (the same append-at-the-end convention `tab_statuses` itself followed).
+
+A missing *parameter* has no literal-substitution workaround the way a missing *constant* does, so M2's tests cannot compile before it exists — and because the `build` job runs `clippy` before `nextest`, that compile failure suppresses the **entire fast tier**, M1's tests included. The RED round therefore landed in three steps rather than two: tests → an interface-only stub adding the parameter with no behaviour → the real implementation. Recorded because the shape recurs: whenever a new test needs a new production *signature*, the RED round needs an interface stub first, or it produces no readable result at all.
+
 ### Cost, accepted
 
 An idle orchestration tab highlights as DarkGray-on-terminal-background — low contrast on a dark theme. This is the same class as, and downstream of, the fork-only maintainer decision recorded at `src/ui.rs:14653-14665` that made an idle tab paint `STATUS_IDLE` at all.
@@ -125,7 +129,9 @@ L1 only. Both milestones are pure widget/layout changes, so CLAUDE.md rule 4 req
 | Catalog ID | Covers |
 |---|---|
 | `dashboard/pane/011` | Badge ON: title carries `ClaudeCode (Opus)` and **not** the name; the first body row carries the name in `palette::ROLE_NAME`. Badge OFF: title carries neither and the body row still carries the name — the unconditional half, and the half most likely to regress. Plus fg distinctness from every status role and every registry `badge_color`, and the `id_display` fallback. Colour-aware `insta` snapshot for the on/off pair. |
-| `tabs/orchestration/015` | Unselected orchestration tab is normal. Selected orchestration tab is REVERSED with its status fg intact. A selected Mode tab and a selected Dashboard tab in the same buffer are BOLD and **not** REVERSED. |
+| `tabs/orchestration/016` | Unselected orchestration tab is normal. Selected orchestration tab is REVERSED with its status fg intact. A selected Mode tab and a selected Dashboard tab in the same buffer are BOLD and **not** REVERSED. |
+
+`/016`, not `/015`: this PRD originally named `/015`, which is **already taken** by a pre-existing L2 test in `tests/e2e_orchestration_pane_column.rs` (`orchestration_015_active_tab_bold_status_color_no_underline`, issue #313's real-terminal BOLD/no-UNDERLINED guard). Note that `/015` is itself an assertion about the active tab's modifiers, so the two are neighbours in subject as well as in ID — `/016` cross-references it.
 
 ### Existing tests that break and must be repaired
 
