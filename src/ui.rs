@@ -258,6 +258,48 @@ struct TabBarInfo {
     is_orchestration: Vec<bool>,
 }
 
+impl TabBarInfo {
+    /// Review round F3 (reviewer S10 / auditor S5): `tab_statuses` and
+    /// `is_orchestration` are documented above as index-aligned with
+    /// `labels`, but every one of the ~15 test fixtures at the time this was
+    /// added passed `is_orchestration: vec![]` against a non-empty `labels`,
+    /// making the documented invariant false on day one. An empty vector is
+    /// kept as the accepted "not tracked" sentinel — the renderer
+    /// (`render_tab_strip`'s `.get(i).unwrap_or(&false)` /
+    /// `.get(i).copied().flatten()`) already treats a missing index as
+    /// `false`/`None` and MUST keep doing so, so this only trips on a
+    /// genuinely populated but mismatched vector. `debug_assert!`, not a
+    /// hard error: the renderer stays bounds-safe and fails closed in
+    /// release regardless of whether this ever fires.
+    fn new(
+        show: bool,
+        labels: Vec<String>,
+        active_index: usize,
+        tab_statuses: Vec<Option<Vec<SessionStatus>>>,
+        is_orchestration: Vec<bool>,
+    ) -> Self {
+        debug_assert!(
+            tab_statuses.is_empty() || tab_statuses.len() == labels.len(),
+            "TabBarInfo::tab_statuses ({}) must be empty or aligned with labels ({})",
+            tab_statuses.len(),
+            labels.len(),
+        );
+        debug_assert!(
+            is_orchestration.is_empty() || is_orchestration.len() == labels.len(),
+            "TabBarInfo::is_orchestration ({}) must be empty or aligned with labels ({})",
+            is_orchestration.len(),
+            labels.len(),
+        );
+        Self {
+            show,
+            labels,
+            active_index,
+            tab_statuses,
+            is_orchestration,
+        }
+    }
+}
+
 struct DirPickerState {
     current_dir: PathBuf,
     entries: Vec<PathBuf>,
@@ -13276,13 +13318,13 @@ pub fn run_tui(
             .iter()
             .map(|tab| matches!(tab, Tab::Orchestration { .. }))
             .collect();
-        let tab_bar_info = TabBarInfo {
-            show: tab_manager.show_tab_bar(),
-            labels: tab_bar_labels,
-            active_index: tab_manager.active_index(),
-            tab_statuses: tab_bar_statuses,
-            is_orchestration: tab_bar_is_orchestration,
-        };
+        let tab_bar_info = TabBarInfo::new(
+            tab_manager.show_tab_bar(),
+            tab_bar_labels,
+            tab_manager.active_index(),
+            tab_bar_statuses,
+            tab_bar_is_orchestration,
+        );
         // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
         // compute → resize → render, all against the SAME live frame area.
         //
@@ -19544,10 +19586,14 @@ fn render_session_card(
     } else {
         title_bold.add_modifier(Modifier::DIM)
     };
+    // PRD fork#405 review round F1/N4: no leading space here — the badge-on
+    // branch below supplies its own separating space (badge-coloured segments
+    // must not absorb it), and the badge-off branch's `num_prefix` already
+    // ends in a space, so a leading space here would double it (N4).
     let liveness_marker = match writable {
         crate::event::Writable::Live => "",
-        crate::event::Writable::HistoryOnly => " history ",
-        crate::event::Writable::None => " view-only ",
+        crate::event::Writable::HistoryOnly => "history ",
+        crate::event::Writable::None => "view-only ",
     };
     // Fork #339: the agent-type badge (registry-coloured type label),
     // `370b6228`'s removal, restored behind the deck-global
@@ -19591,8 +19637,16 @@ fn render_session_card(
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (badge_text, badge_style),
         ];
-        if !is_live {
-            segs.push((liveness_marker.to_string(), text_dim()));
+        // F1: the badge text used to be followed by a `label_after_badge`
+        // segment whose trailing space separated the title from the border
+        // fill. That segment is gone (identity moved to its own body row),
+        // so restore the separating space here — as its own segment, not
+        // badge-coloured — for a live card. A non-live card gets its
+        // separator from `liveness_marker`'s trailing space instead.
+        if is_live {
+            segs.push((" ".to_string(), title_bold));
+        } else {
+            segs.push((format!(" {liveness_marker}"), text_dim()));
         }
         segs
     } else {
@@ -19746,16 +19800,35 @@ fn render_session_card(
         && let IdleArtPhase::HasArt(ref art) = entry.phase
         && !art.frames.is_empty()
     {
-        // Clear the inner area so the Dir line and other content don't bleed through
-        frame.render_widget(Clear, inner);
+        // F2 (review round, reviewer S9): the identity row (row 0, pushed
+        // above as `lines[0]`) is the only thing that identifies an idle
+        // Spacious card once the badge is off by default — losing it under
+        // the art overlay leaves the card identified by nothing but its
+        // number. Offset the cleared/painted area down one row so row 0
+        // survives untouched; the art loses one row of its canvas. Frames
+        // are plain LLM text with no layout assumptions about the full inner
+        // height (`ascii_art::validate_frame` only caps line count/width),
+        // and `Paragraph` already clips any lines past the area's height, so
+        // this is exactly the same clipping behaviour one row tighter.
+        let art_area = Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(1),
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        if art_area.height > 0 {
+            // Clear only the art area so the Dir line and other content
+            // don't bleed through, while the identity row above it stays.
+            frame.render_widget(Clear, art_area);
 
-        let frame_index = (tick / 120) as usize % art.frames.len();
-        let art_lines: Vec<Line<'_>> = art.frames[frame_index]
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), text_primary())))
-            .collect();
-        let art_widget = Paragraph::new(art_lines);
-        frame.render_widget(art_widget, inner);
+            let frame_index = (tick / 120) as usize % art.frames.len();
+            let art_lines: Vec<Line<'_>> = art.frames[frame_index]
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), text_primary())))
+                .collect();
+            let art_widget = Paragraph::new(art_lines);
+            frame.render_widget(art_widget, art_area);
+        }
     }
 }
 
@@ -21710,13 +21783,13 @@ mod tests {
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into(), "Mode".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(
+            true,
+            vec!["Dashboard".into(), "Mode".into()],
+            0,
+            vec![],
+            vec![false, false],
+        );
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
         // A 1-row bottom bar (this fixture exercises the split math, not the
         // PRD #144 wrap height — that is covered by `render/layout/004`).
@@ -21777,13 +21850,13 @@ mod tests {
             side_pane_ids: vec!["s0".to_string(), "s1".to_string()],
             focused_pane_id: None,
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into(), "demo".into()],
-            active_index: 1,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(
+            true,
+            vec!["Dashboard".into(), "demo".into()],
+            1,
+            vec![],
+            vec![false, false],
+        );
         let layout = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -21861,13 +21934,13 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["seven-roles".into()],
-            active_index: 0,
-            tab_statuses: vec![Some(vec![])],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(
+            true,
+            vec!["seven-roles".into()],
+            0,
+            vec![Some(vec![])],
+            vec![true],
+        );
 
         let mut expanded_rect: Option<Rect> = None;
         let mut panes_area: Option<Rect> = None;
@@ -23866,13 +23939,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                    is_orchestration: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -23959,13 +24027,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                    is_orchestration: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24104,13 +24167,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                    is_orchestration: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24457,13 +24515,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                    is_orchestration: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24551,13 +24604,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                    is_orchestration: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24620,13 +24668,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                    is_orchestration: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -26825,13 +26868,7 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["orch".into()],
-            active_index: 0,
-            tab_statuses: vec![Some(vec![])],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["orch".into()], 0, vec![Some(vec![])], vec![true]);
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -27685,13 +27722,7 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Orchestration".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["Orchestration".into()], 0, vec![], vec![true]);
 
         // Simulates the dispatch + render-sync (setting the thread-local
         // `compute_frame_layout` reads) that a real Ctrl+l press drives, then
@@ -27804,13 +27835,7 @@ mod tests {
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["Dashboard".into()], 0, vec![], vec![false]);
 
         let layout_for = |stage: SplitStage| {
             ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
@@ -28044,13 +28069,7 @@ mod tests {
         let orch_tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Orchestration".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["Orchestration".into()], 0, vec![], vec![true]);
         let panes_width_for = |stage: SplitStage| {
             ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
             let layout = compute_frame_layout(
@@ -28312,24 +28331,13 @@ mod tests {
         let orch_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let orch_tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Orchestration".into()],
-            active_index: 1,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let orch_tab_bar =
+            TabBarInfo::new(true, vec!["Orchestration".into()], 1, vec![], vec![true]);
         let dash_pane_ids = vec!["p0".to_string(), "p1".to_string()];
         let dash_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
         };
-        let dash_tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-            is_orchestration: vec![],
-        };
+        let dash_tab_bar = TabBarInfo::new(true, vec!["Dashboard".into()], 0, vec![], vec![false]);
         let orch_widths = || {
             let layout = compute_frame_layout(
                 frame_area,

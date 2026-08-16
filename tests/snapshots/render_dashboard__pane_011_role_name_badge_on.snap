@@ -2,7 +2,7 @@
 source: tests/render_dashboard.rs
 expression: buffer_to_color_text(&on)
 ---
-[Green/Reset]"┌" [Reset/Reset]" 1 " [LightMagenta/Reset]"ClaudeCode (Opus)" [Green/Reset]"─────────────────────────────────────────────── ● Working ┐"
+[Green/Reset]"┌" [Reset/Reset]" 1 " [LightMagenta/Reset]"ClaudeCode (Opus)" [Green/Reset]"────────────────────────────────────────────── ● Working ┐"
 [Green/Reset]"│" [Indexed(130)/Reset]"example-coder" [Green/Reset]"│"
 [Green/Reset]"│" [Reset/Reset]"Dir:  workspace                                                               " [Green/Reset]"│"
 [Green/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Green/Reset]"│"
