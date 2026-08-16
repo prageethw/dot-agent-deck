@@ -2754,6 +2754,7 @@ fn pane_014_role_name_on_its_own_body_row() {
         display_name: Some("example-coder".to_string()),
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        orchestration_orphaned: false,
         model: Some("Opus".to_string()),
     };
     let width: u16 = 80;
@@ -3839,9 +3840,9 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
 /// planted character in any cell anywhere in the deck, the over-long detail
 /// must be stored clamped, and both neighbouring cards must keep their own
 /// titles and status badges.
-#[spec("dashboard/pane/014")]
+#[spec("dashboard/pane/015")]
 #[test]
-fn pane_014_hostile_tool_text_cannot_corrupt_the_card() {
+fn pane_015_hostile_tool_text_cannot_corrupt_the_card() {
     // Issue #833 gap 2. `tool_name` / `tool_detail` arrive on the hook socket —
     // the same surface `dashboard/pane/012` covers for `display_name` — and
     // `apply_event` stored them verbatim on both the session's `active_tool`

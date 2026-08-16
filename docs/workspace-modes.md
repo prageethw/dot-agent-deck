@@ -19,6 +19,8 @@ Defined in `[[modes.panes]]`. These run immediately when the mode activates and 
 
 By default (`watch = true`), persistent pane commands are re-executed every 10 seconds via the built-in `dot-agent-deck watch` subcommand. Write plain commands without watch/follow flags — the system handles refresh automatically. Set `watch = false` for commands that stream on their own (e.g., `kubectl get pods -w`, `tail -f`).
 
+A `command` containing a raw newline or other control character behaves differently per platform when `watch = true`: on Unix it survives intact inside the single-quoted shell word, while on Windows it is replaced with a space before the command reaches `cmd.exe`, since nothing on Windows can quote a control character safely.
+
 Output appears as the command produces it, so a slow or long-running command paints progressively instead of staying blank until it finishes.
 
 ### Reactive Panes

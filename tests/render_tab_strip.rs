@@ -524,6 +524,7 @@ fn orchestration_013_dispatched_run_label_reads_name_first_under_truncation() {
         0,
         80,
         &[None, None],
+        &[false, true],
     );
     assert!(
         rendered_row(&wide).contains(RUN_LABEL),
@@ -547,6 +548,7 @@ fn orchestration_013_dispatched_run_label_reads_name_first_under_truncation() {
         0,
         33,
         &[None, None],
+        &[false, true],
     );
     let narrow_row = rendered_row(&narrow);
     assert!(
@@ -574,6 +576,7 @@ fn orchestration_013_dispatched_run_label_reads_name_first_under_truncation() {
         0,
         33,
         &[None, None],
+        &[false, true],
     );
     let inverted_row = rendered_row(&inverted);
     assert!(
