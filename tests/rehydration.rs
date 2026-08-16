@@ -648,10 +648,16 @@ async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
         "legacy daemon listing must still hydrate one pane; got {hydrated:?}"
     );
     assert_eq!(hydrated[0].agent_id, "legacy-agent");
-    // pane_id must be a parseable u64 (allocate_id output), not the agent id.
+    // PRD #365 M2: allocate_id() is retired — the fallback now mints a
+    // local placeholder with the same scheme the daemon itself uses
+    // (agent_pty::mint_pane_id, "pane-" prefixed), not the agent id.
+    assert_ne!(
+        hydrated[0].pane_id, hydrated[0].agent_id,
+        "legacy fallback must synthesize its own pane id, not reuse the agent id"
+    );
     assert!(
-        hydrated[0].pane_id.parse::<u64>().is_ok(),
-        "legacy fallback should use allocate_id() — got {:?}",
+        hydrated[0].pane_id.starts_with("pane-"),
+        "legacy fallback should mint via agent_pty::mint_pane_id() — got {:?}",
         hydrated[0].pane_id
     );
 
@@ -784,8 +790,8 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
 async fn hydrate_drops_oversize_pane_id_env_at_capture() {
     // 200-char pane id: comfortably above PANE_ID_ENV_MAX_LEN (64). The
     // daemon must store None for this agent's record, and the TUI must
-    // hydrate with a freshly-allocated numeric id rather than the poison
-    // value — otherwise a near-MAX_FRAME_LEN value could push the
+    // hydrate with a freshly-minted local placeholder id rather than the
+    // poison value — otherwise a near-MAX_FRAME_LEN value could push the
     // cumulative `list_agents` response past the frame cap and break
     // hydration for *every* agent on reconnect.
     //
@@ -828,7 +834,7 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
         record.pane_id_env
     );
 
-    // Client-side: hydrate must produce a numeric (allocate_id) pane id.
+    // Client-side: hydrate must produce a locally-minted placeholder pane id.
     let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
@@ -841,9 +847,11 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
     };
     assert_eq!(hydrated.len(), 1);
     assert_eq!(hydrated[0].agent_id, agent_id);
+    // PRD #365 M2: allocate_id() is retired — the fallback now mints via
+    // agent_pty::mint_pane_id(), the same scheme the daemon itself uses.
     assert!(
-        hydrated[0].pane_id.parse::<u64>().is_ok(),
-        "oversize pane_id_env must fall back to allocate_id() — got {:?}",
+        hydrated[0].pane_id.starts_with("pane-"),
+        "oversize pane_id_env must fall back to agent_pty::mint_pane_id() — got {:?}",
         hydrated[0].pane_id
     );
     assert_ne!(
@@ -859,8 +867,9 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
 async fn hydrate_drops_control_char_pane_id_env_at_capture() {
     // ANSI escape embedded in the pane id: anything outside [a-zA-Z0-9_-]
     // is rejected by `is_valid_pane_id_env`. The daemon stores None and
-    // the client hydrates with a fresh numeric id — keeps debug-log output
-    // free of injected color codes if anything ever prints a stored value.
+    // the client hydrates with a fresh, locally-minted placeholder id —
+    // keeps debug-log output free of injected color codes if anything ever
+    // prints a stored value.
     //
     // PRD #365 M2: spawn via `AgentPtyRegistry::spawn_agent` directly — see
     // the comment on `hydrate_drops_oversize_pane_id_env_at_capture` above
@@ -903,9 +912,11 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
             .unwrap()
     };
     assert_eq!(hydrated.len(), 1);
+    // PRD #365 M2: allocate_id() is retired — the fallback now mints via
+    // agent_pty::mint_pane_id(), the same scheme the daemon itself uses.
     assert!(
-        hydrated[0].pane_id.parse::<u64>().is_ok(),
-        "control-char pane_id_env must fall back to allocate_id() — got {:?}",
+        hydrated[0].pane_id.starts_with("pane-"),
+        "control-char pane_id_env must fall back to agent_pty::mint_pane_id() — got {:?}",
         hydrated[0].pane_id
     );
     assert_ne!(

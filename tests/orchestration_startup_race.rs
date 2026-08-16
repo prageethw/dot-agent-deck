@@ -224,20 +224,19 @@ async fn wait_for_snapshot_needle(
     }
 }
 
-/// PRD #365 M2: this test drives spawning through the real
-/// `EmbeddedPaneController`/`TabManager`, which still allocates its own
-/// LOCAL `pane_id` client-side (`allocate_id()`) — retiring that in favor of
-/// the daemon-returned `AttachResponse.pane_id` is an explicitly separate,
-/// already-queued M2 follow-up (see the M2 commit message), not yet landed.
-/// So the client's own `role_pane_ids` no longer matches what the daemon
-/// actually registered this agent under (`daemon/pane-id/001`), and looking
-/// the worker up BY that stale local pane_id (the old
-/// `wait_for_agent_id_for_pane`) times out. That mismatch does not affect
-/// the mechanism this test is actually pinning — `dot-agent-deck delegate
-/// --to coder` resolves its target entirely server-side, by ROLE
-/// (`tab_membership`/`pane_role_map`), never by the client's own pane_id —
-/// so finding the worker's real agent id by role identity instead is a
-/// faithful, non-mechanism-changing fix for this test's own observability.
+/// PRD #365 M2: at the time this test was written, the real
+/// `EmbeddedPaneController`/`TabManager` still allocated its own LOCAL
+/// `pane_id` client-side (`allocate_id()`), which no longer matched what
+/// the daemon actually registered the agent under
+/// (`daemon/pane-id/001`), so looking the worker up BY that stale local
+/// pane_id (the old `wait_for_agent_id_for_pane`) timed out. `allocate_id()`
+/// is now retired — `create_pane_with_options` adopts the daemon-returned
+/// `AttachResponse.pane_id` instead — but the role-based lookup below
+/// remains correct and is kept as-is: `dot-agent-deck delegate --to coder`
+/// resolves its target entirely server-side, by ROLE
+/// (`tab_membership`/`pane_role_map`), never by the client's own pane_id,
+/// so finding the worker's real agent id by role identity is the faithful
+/// way to observe this test's mechanism regardless of pane_id's source.
 async fn wait_for_agent_id_for_role(
     registry: &AgentPtyRegistry,
     orchestration_name: &str,
