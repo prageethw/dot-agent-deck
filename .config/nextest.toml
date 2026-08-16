@@ -124,6 +124,23 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# Issue #414 diagnostic (TEMPORARY — remove alongside the diagnostic loop in
+# `lock_017_paste_gated_by_lock_state` once the scrollback-reset hypothesis is
+# confirmed/fixed or ruled out): the test now repeats its re-lock -> scroll ->
+# deny -> check cycle 30 times in one run to raise the odds of observing a
+# ~1-in-4 recurrence within a single CI push (nextest `retries = 0`), each
+# pass carrying its own up-to-10s scroll-wait and up-to-3s denial-wait
+# budgets. Worst case that is well past the default 3 x 60s kill window; being
+# killed there would cost exactly the diagnostic evidence this loop exists to
+# capture. Scoped by name; still bounded, so a wedged run cannot hang forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(lock_017_paste_gated_by_lock_state)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # Issue #33: cap how many PTY tests run CONCURRENTLY.
 #
 # Every test in a `tests/e2e_*.rs` binary that matters here drives a real spawned
@@ -202,6 +219,14 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 [[profile.e2e.overrides]]
 filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# Same carve-out under the `e2e` profile, for runs that select it explicitly
+# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
+# override list above). See the `[[profile.default.overrides]]` entry above
+# for the full rationale.
+[[profile.e2e.overrides]]
+filter = 'test(lock_017_paste_gated_by_lock_state)'
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # Same carve-out for the issue #33 concurrency cap, for the same reason: an
 # override list is per-profile and is not inherited from `default`.

@@ -782,8 +782,24 @@ fn lock_017_paste_gated_by_lock_state() {
     const SCROLL_BOTTOM_MARKER: &str = "LOCK017_SCROLL_BOTTOM_c73e";
     const REGATED_PASTE_SENTINEL: &str = "LOCK017_REGATED_PASTE_5b18";
 
+    // Issue #414 diagnostic instrumentation (temporary — remove once the
+    // scrollback-reset defect is confirmed/fixed, or the hypothesis is ruled
+    // out). `src/ui.rs` carries edge-triggered `tracing::info!` calls tagged
+    // `target: "lock017_diag"` at every `reset_scrollback` call site and
+    // every place `ui.mode` can leave `PaneInput` with no direct user input.
+    // `RUST_LOG` enables that custom target explicitly — the TUI's own
+    // `init_logging_from_env` only turns on `dot_agent_deck=info` by
+    // default, which would silently drop a differently-targeted event.
+    let diag_log_dir = common::race_safe_tempdir();
+    let diag_log_path = diag_log_dir.path().join("deck.log");
+
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_env(
+            "DOT_AGENT_DECK_LOG",
+            diag_log_path.to_str().expect("utf8 diagnostic log path"),
+        )
+        .with_env("RUST_LOG", "lock017_diag=info")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active sessions");
@@ -849,94 +865,124 @@ fn lock_017_paste_gated_by_lock_state() {
     deck.send_keys(bracketed_bulk.as_bytes());
     deck.wait_for_string(SCROLL_BOTTOM_MARKER);
 
-    // Re-lock. The final Ctrl+d back into PaneInput is itself a fresh mode
-    // entry, which snaps scrollback to live output (mode/scroll/003) — the
-    // right starting point for what follows, since the wheel scroll below
-    // must be the ONLY thing that moves the offset off zero.
-    deck.send_bytes(b"\x04");
-    deck.send_bytes(b"\x05");
-    deck.send_bytes(b"\x04");
-
-    // Scroll the worker pane's OWN view back into its scrollback via the
-    // mouse wheel: scroll_focused_agent_pane falls through to
-    // scroll_focused_pane_scrollback whenever the child has no mouse mode
-    // enabled (true for the `cat` stub here) regardless of UiMode, so this is
-    // the one scroll door that does not itself re-enter PaneInput and reset
-    // what this is about to prove.
+    // Issue #414 diagnostic: repeat the re-lock -> scroll -> deny -> check
+    // cycle many times within this ONE test run instead of once. The
+    // tester's diagnosis pinned the underlying recurrence at roughly 1-in-4
+    // under CI load, and this repo's nextest profile runs with `retries = 0`
+    // (`.config/nextest.toml`), so a single pass through the cycle has poor
+    // odds of ever observing a real defect in one CI push. ~30 independent
+    // passes brings the odds of a genuine defect going unobserved this run
+    // below 0.1% (0.75^30). Every pass reuses the SAME scrollback content
+    // built above (nothing re-sends the bulk paste) — only the
+    // re-lock -> scroll -> deny -> check cycle repeats, each with its own
+    // sentinel so a failing assertion names exactly which pass tripped and
+    // the diagnostic log/grid dump are unambiguous about timing.
     //
-    // Polled in batches rather than one blind 60-notch burst then a single
-    // check: 60 back-to-back synthetic SGR mouse sequences is, like the bulk
-    // send above, a volume nothing else in this suite fires at once, and a
-    // fixed count plus one fire-and-forget wait cannot tell "not enough
-    // notches yet" apart from "an event got lost" from "still catching up".
-    // Each iteration sends another batch — cheap and safe well under the
-    // 10,000-line scrollback cap (`PANE_SCROLLBACK_LINES`) — so intermittent
-    // event loss self-heals instead of wedging the assertion, matching the
-    // retry-not-just-wait shape `send_keys_until_grid_string_within` already
-    // uses elsewhere in this harness.
-    let (col, row) = deck.wait_for_in_grid(SCROLL_BOTTOM_MARKER);
-    let scrolled_to_top = common::wait_until(Duration::from_secs(10), || {
-        deck.scroll_n(col, row, false, 20); // false == wheel-up, 20 notches
-        deck.wait_for_grid_string_within(SCROLL_TOP_MARKER, Duration::from_millis(200))
-    });
-    assert!(
-        scrolled_to_top,
-        "scrolling the focused worker pane's own view back via the wheel \
-         never surfaced the marker typed as the very first of 120+ lines \
-         within 10s of polled scrolling — the scrollback precondition for \
-         the next assertion was never actually established.\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // Locked again, scrolled back: a dropped paste must not touch this
-    // pane's scrollback at all.
-    //
-    // Issue #414: proving the drop happened used to rely on the ABSENCE of
-    // REGATED_PASTE_SENTINEL within a fixed 2s budget. That cannot
-    // distinguish "denied" from "delivered, but the `cat` stub's echo simply
-    // had not reached the grid yet under CI load" — a wait for a sentinel
-    // that is expected NEVER to arrive is a full-budget wait on the happy
-    // path, and a busy runner can exceed it even on a genuine drop. Wait
-    // instead for the POSITIVE, synchronous signal `gate_paste_delivery`'s
-    // `Denied` arm actually produces: `ui.status_message` is set to
-    // `ORCHESTRATION_LOCK_STATUS_MESSAGE` in the SAME event-processing turn
-    // as the deny decision, with no PTY round trip involved at all. This
-    // text is not already on screen at this point in the test — the
-    // preceding re-lock's `Ctrl+e` already overwrote it with
-    // "Pane entry: locked" (`Action::ToggleOrchestrationLock`, `src/ui.rs`)
-    // — so its (re)appearance here is unambiguous evidence that THIS paste
-    // specifically reached and was denied by the gate.
+    // TEMPORARY: once the hypothesis is confirmed/fixed or ruled out, this
+    // reverts to the single-pass form (or becomes a real regression test, if
+    // a synthetic reproduction is found — see the coder task file for #414).
+    const DIAG_ITERATIONS: usize = 30;
     const DENIAL_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
-    let regated_paste = format!("\x1b[200~{REGATED_PASTE_SENTINEL}\x1b[201~");
-    deck.send_keys(regated_paste.as_bytes());
-    let denied = deck.wait_for_grid_string_within(DENIAL_STATUS_MESSAGE, Duration::from_secs(3));
-    assert!(
-        denied,
-        "the regated paste never produced the lock's own denial status \
-         message — either the gate never ran on it at all, or it actually \
-         DELIVERED the paste instead of denying it while the chip read \
-         LOCKED (issue #414).\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
-    let leaked_again =
-        deck.wait_for_grid_string_within(REGATED_PASTE_SENTINEL, Duration::from_secs(2));
-    assert!(
-        !leaked_again,
-        "a second bracketed paste reached the relocked worker pane's PTY \
-         even though the status message above proves the gate reported \
-         denying it.\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        deck.snapshot_grid().contains(SCROLL_TOP_MARKER),
-        "the dropped paste yanked the worker pane's view back to live output \
-         — Event::Paste must not call embedded.reset_scrollback for a paste \
-         gate_pane_input_key denies, exactly as a dropped ordinary keystroke \
-         already does not. The status message above proves the gate DID \
-         deny this paste, so a failure here means some OTHER code path is \
-         resetting scrollback (issue #414).\nGrid:\n{}",
-        deck.snapshot_grid()
-    );
+    for iteration in 0..DIAG_ITERATIONS {
+        // Re-lock. The final Ctrl+d back into PaneInput is itself a fresh mode
+        // entry, which snaps scrollback to live output (mode/scroll/003) — the
+        // right starting point for what follows, since the wheel scroll below
+        // must be the ONLY thing that moves the offset off zero.
+        deck.send_bytes(b"\x04");
+        deck.send_bytes(b"\x05");
+        deck.send_bytes(b"\x04");
+
+        // Scroll the worker pane's OWN view back into its scrollback via the
+        // mouse wheel: scroll_focused_agent_pane falls through to
+        // scroll_focused_pane_scrollback whenever the child has no mouse mode
+        // enabled (true for the `cat` stub here) regardless of UiMode, so this is
+        // the one scroll door that does not itself re-enter PaneInput and reset
+        // what this is about to prove.
+        //
+        // Polled in batches rather than one blind 60-notch burst then a single
+        // check: 60 back-to-back synthetic SGR mouse sequences is, like the bulk
+        // send above, a volume nothing else in this suite fires at once, and a
+        // fixed count plus one fire-and-forget wait cannot tell "not enough
+        // notches yet" apart from "an event got lost" from "still catching up".
+        // Each iteration sends another batch — cheap and safe well under the
+        // 10,000-line scrollback cap (`PANE_SCROLLBACK_LINES`) — so intermittent
+        // event loss self-heals instead of wedging the assertion, matching the
+        // retry-not-just-wait shape `send_keys_until_grid_string_within` already
+        // uses elsewhere in this harness.
+        let (col, row) = deck.wait_for_in_grid(SCROLL_BOTTOM_MARKER);
+        let scrolled_to_top = common::wait_until(Duration::from_secs(10), || {
+            deck.scroll_n(col, row, false, 20); // false == wheel-up, 20 notches
+            deck.wait_for_grid_string_within(SCROLL_TOP_MARKER, Duration::from_millis(200))
+        });
+        assert!(
+            scrolled_to_top,
+            "[iteration {iteration}] scrolling the focused worker pane's own view \
+             back via the wheel never surfaced the marker typed as the very first \
+             of 120+ lines within 10s of polled scrolling — the scrollback \
+             precondition for the next assertion was never actually \
+             established.\nGrid:\n{}\nDiagnostic log:\n{}",
+            deck.snapshot_grid(),
+            read_lock017_diag_log(&diag_log_path)
+        );
+
+        // Locked again, scrolled back: a dropped paste must not touch this
+        // pane's scrollback at all.
+        //
+        // Issue #414: proving the drop happened used to rely on the ABSENCE of
+        // REGATED_PASTE_SENTINEL within a fixed 2s budget. That cannot
+        // distinguish "denied" from "delivered, but the `cat` stub's echo simply
+        // had not reached the grid yet under CI load" — a wait for a sentinel
+        // that is expected NEVER to arrive is a full-budget wait on the happy
+        // path, and a busy runner can exceed it even on a genuine drop. Wait
+        // instead for the POSITIVE, synchronous signal `gate_paste_delivery`'s
+        // `Denied` arm actually produces: `ui.status_message` is set to
+        // `ORCHESTRATION_LOCK_STATUS_MESSAGE` in the SAME event-processing turn
+        // as the deny decision, with no PTY round trip involved at all. This
+        // text is not already on screen at this point in the test — the
+        // preceding re-lock's `Ctrl+e` already overwrote it with
+        // "Pane entry: locked" (`Action::ToggleOrchestrationLock`, `src/ui.rs`)
+        // — so its (re)appearance here is unambiguous evidence that THIS paste
+        // specifically reached and was denied by the gate.
+        let iter_sentinel = format!("{REGATED_PASTE_SENTINEL}_{iteration:02}");
+        let regated_paste = format!("\x1b[200~{iter_sentinel}\x1b[201~");
+        deck.send_keys(regated_paste.as_bytes());
+        let denied =
+            deck.wait_for_grid_string_within(DENIAL_STATUS_MESSAGE, Duration::from_secs(3));
+        assert!(
+            denied,
+            "[iteration {iteration}] the regated paste never produced the lock's \
+             own denial status message — either the gate never ran on it at all, \
+             or it actually DELIVERED the paste instead of denying it while the \
+             chip read LOCKED (issue #414).\nGrid:\n{}\nDiagnostic log:\n{}",
+            deck.snapshot_grid(),
+            read_lock017_diag_log(&diag_log_path)
+        );
+        // Shortened from the single-pass form's 2s full-budget wait to keep
+        // 30 iterations affordable — this is a sanity check on the way to
+        // the real target assertion below, not the property under test.
+        let leaked_again =
+            deck.wait_for_grid_string_within(&iter_sentinel, Duration::from_millis(600));
+        assert!(
+            !leaked_again,
+            "[iteration {iteration}] a second bracketed paste reached the \
+             relocked worker pane's PTY even though the status message above \
+             proves the gate reported denying it.\nGrid:\n{}\nDiagnostic log:\n{}",
+            deck.snapshot_grid(),
+            read_lock017_diag_log(&diag_log_path)
+        );
+        assert!(
+            deck.snapshot_grid().contains(SCROLL_TOP_MARKER),
+            "[iteration {iteration}] the dropped paste yanked the worker pane's \
+             view back to live output — Event::Paste must not call \
+             embedded.reset_scrollback for a paste gate_pane_input_key denies, \
+             exactly as a dropped ordinary keystroke already does not. The status \
+             message above proves the gate DID deny this paste, so a failure here \
+             means some OTHER code path is resetting scrollback \
+             (issue #414).\nGrid:\n{}\nDiagnostic log:\n{}",
+            deck.snapshot_grid(),
+            read_lock017_diag_log(&diag_log_path)
+        );
+    }
 
     // Part 3 used to live here: drop a paste, then time an Enter-bearing
     // keystroke sent immediately after it against a control round trip, to
@@ -951,6 +997,36 @@ fn lock_017_paste_gated_by_lock_state() {
     // all), `lock_021` (delivered when unlocked, stamps exactly the
     // injected `now`), and `lock_022` (the `WaitingForInput` carve-out
     // reaches a paste exactly as it reaches a keystroke).
+}
+
+/// Issue #414 diagnostic helper (temporary — remove alongside the
+/// `tracing::info!` call sites in `src/ui.rs` once the scrollback-reset
+/// defect is confirmed/fixed, or ruled out). Reads back the
+/// `DOT_AGENT_DECK_LOG` file `lock_017_paste_gated_by_lock_state` points the
+/// deck at and keeps only the `lock017_diag`-tagged lines, so a failing
+/// assertion's message carries the exact trace of every scrollback reset /
+/// `PaneInput` exit leading up to the failure instead of just the final
+/// grid snapshot.
+fn read_lock017_diag_log(path: &std::path::Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let filtered: String = contents
+                .lines()
+                .filter(|line| line.contains("lock017_diag"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if filtered.is_empty() {
+                format!(
+                    "<no lock017_diag lines in {} — {} bytes total>",
+                    path.display(),
+                    contents.len()
+                )
+            } else {
+                filtered
+            }
+        }
+        Err(e) => format!("<failed to read diagnostic log at {}: {e}>", path.display()),
+    }
 }
 
 /// Poll the rendered grid for the persistent mode chip (` TYPING `, the

@@ -7018,6 +7018,16 @@ fn apply_stream_rejection_feedback(
     if focused_pane_id != Some(rejected_pane_id) || ui.mode != UiMode::PaneInput {
         return false;
     }
+    // Issue #414 diagnostic (temporary): an async daemon-side stream reject
+    // is the one mechanism that can force `PaneInput` closed with no local
+    // user input at all — worth knowing if it ever fires against the stable
+    // `cat` stub pane this test's window drives.
+    tracing::info!(
+        target: "lock017_diag",
+        rejected_pane_id,
+        reason,
+        "apply_stream_rejection_feedback: leaving PaneInput"
+    );
     ui.status_message = Some((stream_reject_message(reason), now));
     ui.mode = UiMode::Normal;
     true
@@ -7450,6 +7460,14 @@ fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) 
     // frame stores, so every later frame takes the early return until something
     // focuses a pane again.
     if ui.mode == UiMode::PaneInput && pane.focused_pane_id().is_none() {
+        // Issue #414 diagnostic (temporary, remove once the defect is
+        // confirmed/fixed): this is the one place besides the drained-event
+        // loop that can force `PaneInput` closed without the user asking, so
+        // it's worth knowing if it ever fires during the lock_017 window.
+        tracing::info!(
+            target: "lock017_diag",
+            "reconcile_pane_input_scrollback: leaving PaneInput (focused_pane_id is None)"
+        );
         ui.mode = UiMode::Normal;
     }
     let typing_into = match ui.mode {
@@ -7459,9 +7477,24 @@ fn reconcile_pane_input_scrollback(ui: &mut UiState, pane: &dyn PaneController) 
     if typing_into == ui.last_pane_input_target {
         return;
     }
+    // Issue #414 diagnostic (temporary): edge-triggered on an actual
+    // `(mode, focused_pane_id)` transition, so this cannot flood the log —
+    // it is exactly as sparse as `last_pane_input_target` changing.
+    tracing::info!(
+        target: "lock017_diag",
+        mode = ?ui.mode,
+        prev_target = ?ui.last_pane_input_target,
+        new_target = ?typing_into,
+        "reconcile_pane_input_scrollback: fresh-entry transition detected"
+    );
     if let Some(pane_id) = typing_into.as_deref()
         && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
     {
+        tracing::info!(
+            target: "lock017_diag",
+            pane_id,
+            "reconcile_pane_input_scrollback: reset_scrollback fired"
+        );
         embedded.reset_scrollback(pane_id);
     }
     ui.last_pane_input_target = typing_into;
@@ -11049,6 +11082,18 @@ fn dispatch_action(
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                 && let Some(pane_id) = embedded.focused_pane_id()
             {
+                // Issue #414 diagnostic (temporary): confirms whether a
+                // "denied" paste is actually arriving here as ordinary
+                // forwarded keystrokes (e.g. bracketed-paste markers lost
+                // under load and parsed as individual keys) rather than
+                // through the `Event::Paste` gate.
+                tracing::info!(
+                    target: "lock017_diag",
+                    pane_id = %pane_id,
+                    len = bytes.len(),
+                    bytes = ?bytes,
+                    "ForwardToPane: reset_scrollback fired (keystroke path)"
+                );
                 // Reset scrollback to live output on any keystroke.
                 embedded.reset_scrollback(&pane_id);
                 // PRD #76 M2.20: separate a CR-bearing keystroke from
@@ -13775,6 +13820,17 @@ pub fn run_tui(
                 && let Some(focused_id) = embedded.focused_pane_id()
                 && let Some(msg) = non_live_input_feedback(snapshot.pane_writable(&focused_id))
             {
+                // Issue #414 diagnostic (temporary): a plain `cat` stub never
+                // declares a `live_target`, so `pane_writable` should always
+                // read `Writable::Live` for it and this branch should never
+                // fire in the lock_017 window — this line proves it either
+                // way instead of assuming it.
+                tracing::info!(
+                    target: "lock017_diag",
+                    focused_id = %focused_id,
+                    msg,
+                    "non_live_input_feedback: leaving PaneInput and draining input burst"
+                );
                 ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
                 ui.mode = UiMode::Normal;
                 while crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -14555,6 +14611,19 @@ pub fn run_tui(
                             bytes,
                             keystroke_at,
                         } => {
+                            // Issue #414 diagnostic (temporary): if the gate
+                            // ever delivers a paste this test's setup expects
+                            // to be denied (e.g. a transient
+                            // `SessionStatus::WaitingForInput` carve-out
+                            // firing on the `cat` stub), this is the line
+                            // that proves it.
+                            tracing::info!(
+                                target: "lock017_diag",
+                                pane_id = %pane_id,
+                                len = bytes.len(),
+                                locked = ui.command_entry_locked,
+                                "Event::Paste Delivered: reset_scrollback fired"
+                            );
                             // A dropped paste must not touch the pane at all, so
                             // both the scrollback reset and the debounce
                             // timestamp move inside the delivered branch — a
@@ -14569,6 +14638,16 @@ pub fn run_tui(
                             ui.last_pane_keystroke_at = Some(keystroke_at);
                         }
                         PasteGateOutcome::Denied { status_message } => {
+                            // Issue #414 diagnostic (temporary): the
+                            // counterpart to the Delivered log above — proves
+                            // the gate correctly denied THIS paste, with no
+                            // reset_scrollback call anywhere in this arm.
+                            tracing::info!(
+                                target: "lock017_diag",
+                                pane_id = %pane_id,
+                                locked = ui.command_entry_locked,
+                                "Event::Paste Denied: no reset_scrollback (status_message set)"
+                            );
                             ui.status_message = Some(status_message);
                         }
                     }
