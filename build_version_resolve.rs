@@ -194,3 +194,51 @@ pub fn resolve_build_id(
         None => format!("{version}-unknown"),
     }
 }
+
+/// Is `segment` a valid path segment of a `DAD_RELEASE_REPO` slug — non-empty,
+/// no interior whitespace, and not a `.`/`..` traversal segment?
+fn is_valid_repo_slug_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains(char::is_whitespace)
+}
+
+/// Normalize a candidate `DAD_RELEASE_REPO` injection (issue #398) into the
+/// `owner/name` GitHub repo slug to bake in, or `None` when it does not look
+/// like one.
+///
+/// The upgrade nudge (`src/version.rs`) composes this slug directly into a
+/// `https://api.github.com/repos/<slug>/releases/latest` URL, so the shape is
+/// deliberately narrow: exactly one `/`, both segments non-empty, no
+/// whitespace, no `.`/`..` segment, single line. Anything else falls through
+/// to the caller's default — a malformed slug must degrade to "poll the
+/// known-good feed", never to a broken or attacker-influenced URL.
+pub fn normalize_release_repo(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if !is_single_line_directive_value(trimmed) {
+        return None;
+    }
+    let mut segments = trimmed.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    if !is_valid_repo_slug_segment(owner) || !is_valid_repo_slug_segment(name) {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// Resolve the `DAD_RELEASE_REPO` slug: a valid injected value wins,
+/// otherwise `default`.
+///
+/// An injection that fails [`normalize_release_repo`] falls through to
+/// `default` exactly as if it had been absent — `build.rs` warns about it
+/// separately.
+pub fn resolve_release_repo(injected: Option<&str>, default: &str) -> String {
+    injected
+        .and_then(normalize_release_repo)
+        .unwrap_or_else(|| default.to_string())
+}

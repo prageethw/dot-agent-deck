@@ -1,7 +1,16 @@
 use serde::Deserialize;
 
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/vfarcic/dot-agent-deck/releases/latest";
+/// The "owner/name" GitHub repo slug to poll for the upgrade nudge's "latest
+/// release" feed, resolved at build time by `build.rs` (issue #398). Defaults
+/// to upstream's own repo when `DAD_RELEASE_REPO` isn't injected; this fork
+/// overrides it via `.cargo/config.toml`'s `[env]` table so a fork build
+/// polls the fork's own releases rather than a lineage it doesn't ship.
+fn github_releases_url() -> String {
+    format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        env!("DAD_RELEASE_REPO")
+    )
+}
 
 #[derive(Deserialize)]
 struct GitHubRelease {
@@ -32,7 +41,7 @@ async fn fetch_latest_version() -> Option<String> {
         .ok()?;
 
     let resp = client
-        .get(GITHUB_RELEASES_URL)
+        .get(github_releases_url())
         .header(
             "User-Agent",
             concat!("dot-agent-deck/", env!("DAD_VERSION")),

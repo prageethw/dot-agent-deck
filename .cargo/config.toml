@@ -21,3 +21,14 @@ test-e2e = "nextest run --workspace --features e2e"
 # PRD #77 Decision 7: `cargo xtask linkage-check` enforces catalog↔test
 # linkage. Args after the alias pass through to the binary.
 xtask = "run --quiet --package xtask-linkage-check --"
+
+[env]
+# Issue #398: `build.rs` bakes this into `DAD_RELEASE_REPO`, which
+# `src/version.rs` polls for the upgrade nudge's "latest release" feed.
+# Upstream carries no `[env]` table at all, so `build.rs`'s own default
+# (`vfarcic/dot-agent-deck`) is what an upstream build sees; this one line is
+# the fork's entire divergence for issue #398 — no fork slug is baked into
+# any source file (CLAUDE.md rule 19). `force` is deliberately left at its
+# default `false`: an explicit `DAD_RELEASE_REPO` already present in the
+# process environment (a packager, CI) still wins over this config value.
+DAD_RELEASE_REPO = "prageethw/dot-agent-deck"

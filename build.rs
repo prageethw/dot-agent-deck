@@ -12,8 +12,17 @@ mod build_version_resolve;
 
 use build_version_resolve::{
     VersionSource, escape_for_cargo_warning, is_single_line_directive_value, normalize_build_id,
-    normalize_version, resolve_build_id, resolve_version,
+    normalize_release_repo, normalize_version, resolve_build_id, resolve_release_repo,
+    resolve_version,
 };
+
+/// The GitHub repo the upgrade nudge polls for its "latest release" feed
+/// (issue #398) when `DAD_RELEASE_REPO` is not injected. This is upstream's
+/// own repo on purpose — a source build with no fork-local config must keep
+/// polling the lineage it was actually built from. See the "fork sets it to
+/// prageethw/dot-agent-deck" note in `.cargo/config.toml`'s `[env]` table for
+/// where this fork overrides it.
+const DEFAULT_RELEASE_REPO: &str = "vfarcic/dot-agent-deck";
 
 fn main() {
     // Both values are injectable from the build environment (issue #250), so
@@ -21,9 +30,11 @@ fn main() {
     // in once and then silently go stale across rebuilds.
     println!("cargo:rerun-if-env-changed=DAD_VERSION");
     println!("cargo:rerun-if-env-changed=DAD_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=DAD_RELEASE_REPO");
 
     let injected_version = build_env("DAD_VERSION");
     let injected_build_id = build_env("DAD_BUILD_ID");
+    let injected_release_repo = build_env("DAD_RELEASE_REPO");
 
     // Resolution order (issue #250): injected env -> git tag -> CARGO_PKG_VERSION.
     // Git tags look like "v0.7.1" -> "0.7.1", "v0.25.0-alpha.0" -> "0.25.0-alpha.0";
@@ -88,6 +99,24 @@ fn main() {
         dirty,
     );
     emit_rustc_env("DAD_BUILD_ID", &build_id);
+
+    // Issue #398: the upgrade nudge's "latest release" feed is a build-time
+    // value too, resolved the same injected-env-or-default way as the two
+    // values above. Unlike DAD_VERSION/DAD_BUILD_ID there is no git-derived
+    // step — the repo a checkout was cloned from doesn't tell you which
+    // GitHub repo's releases to poll, so an unset/invalid value degrades
+    // straight to DEFAULT_RELEASE_REPO.
+    if let Some(raw) = injected_release_repo.as_deref()
+        && normalize_release_repo(raw).is_none()
+    {
+        println!(
+            "cargo:warning=DAD_RELEASE_REPO=\"{}\" is not a valid \"owner/name\" GitHub repo \
+             slug and was ignored. Falling back to {DEFAULT_RELEASE_REPO}.",
+            escape_for_cargo_warning(raw)
+        );
+    }
+    let release_repo = resolve_release_repo(injected_release_repo.as_deref(), DEFAULT_RELEASE_REPO);
+    emit_rustc_env("DAD_RELEASE_REPO", &release_repo);
 
     // Re-run if HEAD changes (new commit, branch switch, detached-HEAD move).
     // `.git/HEAD` alone is necessary but not sufficient on a normal branch —
