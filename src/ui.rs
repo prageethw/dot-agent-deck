@@ -95,18 +95,18 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Compact,  // 5 rows: 1 prompt, 1 tool
-    Normal,   // 8 rows: 1 prompt, 3 tools
-    Spacious, // 10 rows: 3 prompts, 3 tools
+    Compact,  // 6 rows: 1 prompt, 1 tool
+    Normal,   // 9 rows: 1 prompt, 3 tools
+    Spacious, // 11 rows: 3 prompts, 3 tools
 }
 
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
-    ///   rows for the top/bottom border.
+    ///   Role name (1) + Dir (1) + prompts + [non-compact: blank separator] +
+    ///   tools, plus 2 rows for the top/bottom border.
     ///
-    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    /// Resulting heights: Compact 6, Normal 9, Spacious 11.
     ///
     /// Height is a function of density ALONE — PRD #339 moved the `Last` /
     /// `Tools` counters onto the bottom border, deleting the card-width axis
@@ -121,7 +121,7 @@ impl CardDensity {
         } else {
             1
         };
-        (1 + prompts + separator + tools) + 2 // +2 top/bottom border
+        (1 + 1 + prompts + separator + tools) + 2 // role name (1) + Dir (1) + ... + top/bottom border
     }
 
     fn max_tools(self) -> usize {
@@ -14616,11 +14616,6 @@ fn render_tab_strip(
     tab_statuses: &[Option<&[SessionStatus]>],
     is_orchestration: &[bool],
 ) -> TabStripRects {
-    // PRD fork#405 M2 follow-up: not yet read here — only threaded through
-    // so the workspace compiles for the RED test run. The styling logic
-    // that scopes the REVERSED-on-active cue to `Tab::Orchestration` lands
-    // in a later M2 delegation.
-    let _ = is_orchestration;
     // PRD #13: the tab-bar row is left unpainted so the terminal's own
     // background shows through (no absolute `tab_bar_bg` fill).
 
@@ -14688,6 +14683,30 @@ fn render_tab_strip(
                 statuses,
             ))),
             _ => style,
+        };
+
+        // FORK-ONLY, PRD fork#405 M2: a deliberate, SCOPED partial reversal
+        // of issue #306, not a drift back to it. #306 removed `REVERSED`
+        // from the tab bar entirely because it would invert an absolute fg
+        // into the label's background; that reasoning still holds in
+        // general, which is why BOLD stays the cue for every tab above. Here
+        // it is reinstated for exactly one case — the ACTIVE Orchestration
+        // tab — because on a strip where several tabs already carry a status
+        // tint, BOLD alone is a weak "this one is selected" signal. Applied
+        // AFTER the status-fg overwrite above (load-bearing): REVERSED
+        // inverts whatever fg is present, so applying it before the overwrite
+        // would invert the base style and then have the status colour
+        // overwrite the foreground, which is a different rendering.
+        // `is_orchestration` distinguishes an Orchestration tab from a Mode
+        // tab — nothing else in this function's parameters does, since both
+        // are `closeable = true` and both carry `Some(..)` status data — so a
+        // future upstream sync must not silently restore the blanket
+        // removal by dropping this scoping, the same way the fork-only
+        // Idle-tint decision just above is protected.
+        let style = if i == active_index && *is_orchestration.get(i).unwrap_or(&false) {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
         };
 
         // Divider between tabs (not before the first).
@@ -19564,29 +19583,23 @@ fn render_session_card(
             Some(model) => format!("{} ({})", session.agent_type, normalize_model_label(model)),
             None => format!("{}", session.agent_type),
         };
-        let label_after_badge = display_name
-            .map(|name| format!(" · {name} "))
-            .unwrap_or_else(|| format!(" · {id_display} "));
+        // PRD fork#405 M1: identity (name/id) moved off the title and onto
+        // its own body row — see the `ROLE_NAME`-styled line pushed below.
+        // The title now carries only the shortcut prefix and the type/model
+        // badge.
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (badge_text, badge_style),
-            (label_after_badge, title_bold),
         ];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));
         }
         segs
     } else {
-        // The title shows only the friendly `display_name`, or the session
-        // id when there is none. A non-live card additionally shows a
-        // trailing `history` / `view-only` marker.
-        let identity_text = display_name
-            .map(|name| format!("{name} "))
-            .unwrap_or_else(|| format!("{id_display} "));
-        let mut segs = vec![
-            (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (identity_text, title_bold),
-        ];
+        // PRD fork#405 M1: with the badge off, the title shows only the
+        // shortcut prefix — identity moved to its own unconditional body row
+        // below, so it is no longer duplicated here.
+        let mut segs = vec![(format!(" {sel_prefix}{num_prefix}"), shortcut_style)];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));
         }
@@ -19672,6 +19685,21 @@ fn render_session_card(
         .unwrap_or_else(|| "—".into());
 
     let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // PRD fork#405 M1: identity is unconditional — it always occupies the
+    // first body row regardless of `show_agent_type_badge`, using the same
+    // display_name -> id_display ladder the title used to. Pushed
+    // unconditionally (even when both are empty, as `Line::from("")`) so the
+    // emitted line count never diverges from what `card_height()` reserves.
+    let role_name_text = display_name.map(|name| name.as_str()).unwrap_or(id_display);
+    lines.push(if role_name_text.is_empty() {
+        Line::from("")
+    } else {
+        Line::from(Span::styled(
+            truncate_with_ellipsis(role_name_text, w),
+            Style::default().fg(palette::ROLE_NAME),
+        ))
+    });
 
     // PRD #339: with the counters on the border, `Dir:` gets the whole inner
     // width at every card width — one un-branched form, always ellipsized (the
@@ -28646,21 +28674,24 @@ mod tests {
 
     #[test]
     fn test_choose_density() {
-        // Spacious=10, Normal=8, Compact=5
+        // PRD fork#405 M1: heights grew by the identity row.
+        // Spacious=11, Normal=9, Compact=6
 
         // 1 session, 1 col, plenty of height -> Spacious
         assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+        // 2 sessions, 2 cols = 1 row, height 10 -> Normal (1*11=11 no longer
+        // fits; 1*9=9 does)
+        assert_eq!(choose_density(2, 2, 10), CardDensity::Normal);
 
-        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*9=9 fits)
         assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+        // 4 sessions, 2 cols = 2 rows, height 16 -> Compact (2*9=18 no longer
+        // fits; 2*6=12 does)
+        assert_eq!(choose_density(4, 2, 16), CardDensity::Compact);
 
-        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*6=12 fits)
         assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
@@ -28673,29 +28704,30 @@ mod tests {
     #[test]
     fn test_choose_density_boundaries() {
         // Density is a function of card count, columns, and height only.
-        // Spacious=10, Normal=8, Compact=5.
+        // PRD fork#405 M1: Spacious=11, Normal=9, Compact=6.
 
-        // 1 session, height 11 -> Spacious (1*10=10)
+        // 1 session, height 11 -> Spacious (1*11=11)
         assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
 
-        // 1 session, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
+        // 1 session, height 10 -> Normal (1*11=11 no longer fits; 1*9=9 does)
+        assert_eq!(choose_density(1, 1, 10), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
+        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
         assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
+        // 2 sessions, 1 col, height 17 -> Compact (2*9=18 no longer fits;
+        // 2*6=12 does)
+        assert_eq!(choose_density(2, 1, 17), CardDensity::Compact);
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
-    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10. Locks the
+    /// so it returns exactly Compact=6 / Normal=9 / Spacious=11. Locks the
     /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
-        assert_eq!(CardDensity::Compact.card_height(), 5);
-        assert_eq!(CardDensity::Normal.card_height(), 8);
-        assert_eq!(CardDensity::Spacious.card_height(), 10);
+        assert_eq!(CardDensity::Compact.card_height(), 6);
+        assert_eq!(CardDensity::Normal.card_height(), 9);
+        assert_eq!(CardDensity::Spacious.card_height(), 11);
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset
