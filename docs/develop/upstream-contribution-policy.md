@@ -44,12 +44,15 @@ This is observed behaviour, not theory. It has happened twice:
 
 A hand-run purification pass would do by hand what the sync does for free, and would do it as one large rewrite of the branch that `main` is reset to — high blast radius — instead of letting the same outcome arrive incrementally and safely.
 
-**The two genuine exceptions** are commits that are *half* fork-only and cannot be offered as-is. These need splitting, but that is per-commit work done when you reach them, not a phase that blocks anything:
+**The genuine exceptions** are commits that are *half* fork-only and cannot be offered as-is. These need splitting, but that is per-commit work done when you reach them, not a phase that blocks anything. *(Table widened from "two" to five 2026-08-16, seventh re-curation — the count itself is not load-bearing, only the pattern is.)*
 
 | Commit | Split |
 |---|---|
 | `54066ca` | the `ps`-sampling half rides on fork-only `bf38bc1`; the hydration-race half is an upstream defect |
 | `b06b85b` | two test fixes are upstream-worthy; the Greptile note is fork-only |
+| `fd709c18` | the features-config ancestor-walk hardening (bounding a world-writable ancestor, open-then-fstat) is an upstream `resolve_features` defect; the declined-ancestor diagnostics call the fork-only `sanitize_path_for_terminal_display` and extend the fork-only `features status` subcommand |
+| `99dd8ae4` | the shallow-shared-repo detection extends fork-only `worktree_reclaim.rs`'s own CLI; the `create_worktree_sync` attach-race lock is unverified against upstream's own (differently-named) worktree-creation path in `issue_dispatch_run.rs` — not confirmed either way, see the row's own note in `fork-sync-workflow.md` |
+| `5576bde1` | the `Event::Paste` gate fix closes a defect verified identical on `upstream/main`; the new persistent LOCKED/UNLOCKED chip has no upstream equivalent at all |
 
 ## Write access is permission to merge, not to skip review
 
@@ -83,6 +86,8 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 | `87ab3b4` | Enforce `PROTOCOL_VERSION` on the local daemon attach path — an upstream protocol-gate defect |
 | `a8cbc29` | Fix the Pi start-role spawn-order race (fork #92) |
 | `20c1055` | Pass the hook socket endpoint explicitly instead of through the environment (fork #102) |
+| `f44b13c5` | Bound the shutdown grace-window's EINTR retry against the deadline, restore the ECHILD alarm, and bound the hook CLI's stdin read (fork #145, #217) |
+| `fb81d36b` | `register_orchestration_role` never removed a stale `orchestrator_pane_ids` flag when a pane_id was reused for a worker role, wrongly excluding it as a delegate candidate (fork #361) — verified identical on `upstream/main` |
 
 ### Test and CI determinism
 
