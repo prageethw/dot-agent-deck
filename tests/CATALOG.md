@@ -1293,6 +1293,15 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** anything about the TUI's reconnect/re-hydration response to this tear-down (`session/live/013`, which pins that separately and does not depend on this daemon-side reason string being exactly right); the `timeout`/`Closed` tear-down reasons on the same handler; wire-format serde round-trips (`protocol/live-target`, `protocol/send-result`).
 - **Platform coverage:** mac+linux.
 
+#### daemon/pane-id
+
+##### daemon/pane-id/001 — `StartAgent` returns a daemon-minted `pane_id`, not the client-proposed one (PRD #365 M2).
+- **Layer:** L2 (real `dot-agent-deck daemon serve` subprocess; a raw client drives `AttachRequest::StartAgent` directly over the attach socket rather than through a TUI/PTY, the same synthetic shape `dashboard/pane/001` documents).
+- **Agent:** none (synthetic — two `StartAgent` calls each spawning a `cat` stub).
+- **Asserts:** two independent `StartAgent` calls, each proposing its own `DOT_AGENT_DECK_PANE_ID` in `env`, come back with a daemon-minted `pane_id` on the `AttachResponse` that is present on both, mutually distinct, and NOT the client-proposed value either call sent — proving the daemon, not the client, is authoritative for pane identity.
+- **Does not assert:** the exact `{origin-prefix}{nonce}-{seq}` shape of the minted id (nothing beyond "present, non-empty, unique" is assumed); id stability/non-reuse across a daemon restart (M3); the `PROTOCOL_VERSION` bump or cross-version handshake behavior for an old client (`lifecycle/handshake/*`).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
