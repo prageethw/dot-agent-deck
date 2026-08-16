@@ -734,6 +734,23 @@ fn role_path_slug(role: &str) -> String {
 /// panes in one deck.
 const PANE_DIGEST_HEX: usize = 16;
 
+/// PRD #365: derive a session's `session_id` from its `pane_id`, idempotent
+/// with respect to the `"pane-"` prefix.
+///
+/// A daemon-minted `pane_id` (`mint_pane_id()`'s output, e.g.
+/// `"pane-a1b2c3d4e5f6a7b8-0"`) already carries the prefix, so it is used
+/// as-is. A legacy bare `pane_id` (a counter digit, a role index — still
+/// passed by several existing callers) gets `"pane-"` prepended, exactly as
+/// before this fix. Unconditionally prepending the prefix produced a
+/// double-prefixed `"pane-pane-…"` session_id for every real spawned pane.
+fn session_id_for_pane(pane_id: &str) -> String {
+    if pane_id.starts_with("pane-") {
+        pane_id.to_string()
+    } else {
+        format!("pane-{pane_id}")
+    }
+}
+
 /// FNV-1a over the reporting pane's `pane_id`, at the full untruncated width
 /// documented on [`PANE_DIGEST_HEX`]. Same constants and algorithm as
 /// [`role_digest_hex`] — deliberately not `DefaultHasher`, whose output is
@@ -3438,7 +3455,7 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) {
-        let session_id = format!("pane-{}", pane_id);
+        let session_id = session_id_for_pane(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.sessions.insert(
@@ -3512,7 +3529,7 @@ impl AppState {
         // fields when one is present.
         self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         if let Some(snap) = live {
-            let session_id = format!("pane-{}", pane_id);
+            let session_id = session_id_for_pane(&pane_id);
             if let Some(session) = self.sessions.get_mut(&session_id) {
                 session.status = snap.status.clone();
                 session.active_tool = snap.active_tool.clone();
@@ -3723,7 +3740,7 @@ impl AppState {
             return Some(first);
         }
 
-        let session_id = format!("pane-{}", record.pane_id_env.as_ref()?);
+        let session_id = session_id_for_pane(record.pane_id_env.as_ref()?);
         match self.sessions.get(&session_id) {
             Some(session) if session.agent_id.is_none() => Some(session_id),
             _ => None,
