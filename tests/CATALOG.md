@@ -2481,6 +2481,27 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the full fallback order *below* an injection — an absent or invalid `DAD_VERSION` falling through to git and then to the `CARGO_PKG_VERSION` placeholder — nor the build-script directive-injection rejection (both are pure-data unit tests in `tests/build_version.rs`); the `cargo:warning` text on the placeholder path; that a git-less checkout degrades correctly (would need a second cold build).
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/version/002 — The "update available" badge renders, right-aligned and styled, when `ui.update_available` is `Some` (issue #398, PR #399).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests` since `update_available` is a private `UiState` field neither existing `pub fn *_to_buffer` seam can set).
+- **Agent:** none.
+- **Asserts:** at a comfortable 120-column width, with `ui.update_available` set to a fake newer version, the badge renders flush against the terminal's right edge reading `Update available: v{latest} (current: v{DAD_VERSION})`, and every cell it occupies is styled black-on-yellow bold. Issue #398's bug was that the badge never fired at all (the nudge polled upstream's release feed, whose numbers the fork's build always runs ahead of), so proving it fires — in the right shape — when it should is the point of this test.
+- **Does not assert:** the `None` case (`lifecycle/version/003`); the narrow-terminal early return (`lifecycle/version/004`); that the badge's content tracks a REAL upstream/fork release comparison (`should_notify`'s own logic is unit-tested in `tests/build_version.rs`, unrelated to rendering).
+- **Platform coverage:** mac+linux+windows.
+
+##### lifecycle/version/003 — With `ui.update_available` at `None`, no badge renders and the bottom bar is byte-for-byte unaffected (issue #398, PR #399).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests`).
+- **Agent:** none.
+- **Asserts:** at the same 120-column width, with `ui.update_available` left at its default `None`, the rendered row contains no `Update available` text, and is byte-for-byte identical to the pre-existing `render_button_bar_to_buffer` seam (which never touches `update_available`) — proving the button bar itself is unaffected, not merely that the badge text happens to be absent. Without this, `lifecycle/version/002`'s `Some` assertion would pass against a badge that renders unconditionally.
+- **Does not assert:** the `Some` case (`lifecycle/version/002`); the narrow-terminal early return (`lifecycle/version/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### lifecycle/version/004 — The badge does not render when the post-mode-chip area is too narrow to hold it (`bw >= area.width`) (issue #398, PR #399).
+- **Layer:** L1 (in-process `render_bottom_bar` + ratatui `TestBackend`, called directly from `src/ui.rs`'s own `#[cfg(test)] mod tests`).
+- **Agent:** none.
+- **Asserts:** with `ui.update_available` set to a fake newer version, at a terminal width chosen so the area left after the mode chip is exactly as wide as the badge text itself (`bw == area.width`, the exact boundary of the `bw < area.width` guard), the badge does not render. Covers the narrow-terminal early-return branch flagged as still owed by the review that authorised this task.
+- **Does not assert:** the `Some` / comfortable-width case (`lifecycle/version/002`); the `None` case (`lifecycle/version/003`); a width narrower than the boundary (the guard is monotonic, so the boundary case is the one that matters).
+- **Platform coverage:** mac+linux+windows.
+
 #### lifecycle/handshake
 
 ##### lifecycle/handshake/001 — Build-version match on attach proceeds silently into the dashboard.
