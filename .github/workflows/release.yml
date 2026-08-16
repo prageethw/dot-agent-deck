@@ -300,6 +300,17 @@ jobs:
         # injected" and falls back to git, i.e. today's behavior.
         env:
           DAD_VERSION: ${{ needs.prepare.outputs.version }}
+          # Issue #398: the released binaries are the ones the upgrade nudge
+          # exists for, so they get the same explicit-injection treatment as
+          # DAD_VERSION rather than relying solely on `.cargo/config.toml`
+          # discovery inside the build. Whether cargo's config-file discovery
+          # reaches inside the `cross` container is plausible but was
+          # UNMEASURED before this line — this workflow's own precedent
+          # (DAD_VERSION, immediately below) is not to trust an unmeasured
+          # boundary, so this value is injected explicitly and the artifact
+          # assertion after this step measures that it actually landed,
+          # exactly as it already does for DAD_VERSION.
+          DAD_RELEASE_REPO: prageethw/dot-agent-deck
           # `cross` runs cargo inside a container and forwards only the
           # `CARGO_*` / `CROSS_*` host variables by default, so DAD_VERSION has
           # to be named explicitly. This env var is cross's equivalent of
@@ -314,21 +325,28 @@ jobs:
           # fallback is exactly issue #250's failure — a `workflow_dispatch`
           # release would publish the ARM64 artifact under the new tag while the
           # binary reported the previous one.
-          CROSS_BUILD_ENV_PASSTHROUGH: DAD_VERSION
-          # Second, independent channel for the same value, because the line
+          #
+          # DAD_RELEASE_REPO rides the same allowlist for the same reason
+          # (issue #398): without it, a fork release's ARM64 binary would fall
+          # back to whatever `.cargo/config.toml` discovery inside the
+          # container resolves to, and the artifact assertion below is what
+          # actually measures that rather than assuming it.
+          CROSS_BUILD_ENV_PASSTHROUGH: DAD_VERSION DAD_RELEASE_REPO
+          # Second, independent channel for the same values, because the line
           # above is the only thing standing between a dispatch release and a
           # mislabeled ARM64 binary, and `cargo install cross --locked` is NOT
           # version-pinned — a future cross release could rename or retire its
           # passthrough allowlist and this leg would go quiet rather than fail.
           # `CROSS_CONTAINER_OPTS` is appended to cross's `docker run` argv, so
-          # `-e DAD_VERSION` forwards the host value through docker itself,
-          # below cross's own config layer. Measured to be sufficient ON ITS OWN
-          # with the passthrough allowlist removed, and to combine with it
-          # without a duplicate-argument error. Both degrade safely: with
-          # DAD_VERSION empty or unset, `docker run -e` sets nothing (or an
-          # empty string, which `build.rs` treats as "not injected") and the
-          # build falls back to git exactly as it does today.
-          CROSS_CONTAINER_OPTS: -e DAD_VERSION
+          # `-e DAD_VERSION -e DAD_RELEASE_REPO` forwards the host values
+          # through docker itself, below cross's own config layer. Measured to
+          # be sufficient ON ITS OWN with the passthrough allowlist removed,
+          # and to combine with it without a duplicate-argument error. Both
+          # degrade safely: with a value empty or unset, `docker run -e` sets
+          # nothing (or an empty string, which `build.rs` treats as "not
+          # injected") and the build falls back to git / `.cargo/config.toml`
+          # discovery exactly as it does today.
+          CROSS_CONTAINER_OPTS: -e DAD_VERSION -e DAD_RELEASE_REPO
           # `matrix.*` values are static literals in this file, so these two are
           # defense in depth rather than a live hole — bound anyway so that every
           # `run:` script in this workflow is uniformly free of `${{ … }}` and a
@@ -342,31 +360,39 @@ jobs:
             cargo build --release --target "$MATRIX_TARGET"
           fi
       # Issue #250 is "an artifact published under one version while reporting
-      # another", so the release path asserts that it did not just do that.
+      # another", and issue #398 is the same shape one seam over — an artifact
+      # published for this fork while its upgrade nudge polls upstream — so
+      # the release path asserts that neither happened.
       #
       # WHY THIS EXISTS EVEN THOUGH THE TWO ENV CHANNELS ABOVE ARE BOTH MEASURED
-      # TO WORK: both are *preventive*, and both live on the far side of the
-      # container boundary — if forwarding ever breaks, whatever depended on
-      # forwarding breaks with it, silently. A strictness flag baked into
-      # `build.rs` would have exactly that defect: it would have to be forwarded
-      # too. This check runs on the HOST, against the finished artifact, so it
-      # cannot be defeated by the failure it is looking for.
+      # TO WORK FOR DAD_VERSION (DAD_RELEASE_REPO rides the same two channels
+      # but was, before this change, unmeasured across this boundary — see the
+      # Build step's DAD_RELEASE_REPO comment): both channels are *preventive*,
+      # and both live on the far side of the container boundary — if
+      # forwarding ever breaks, whatever depended on forwarding breaks with
+      # it, silently. A strictness flag baked into `build.rs` would have
+      # exactly that defect: it would have to be forwarded too. This check
+      # runs on the HOST, against the finished artifact, so it cannot be
+      # defeated by the failure it is looking for.
       #
-      # SCOPED TO THE CROSS LEG on purpose. The native legs get DAD_VERSION
-      # straight from this job's `env:` block with no boundary to lose it at;
-      # the container is the only place the value travels between environments.
+      # SCOPED TO THE CROSS LEG on purpose. The native legs get DAD_VERSION and
+      # DAD_RELEASE_REPO straight from this job's `env:` block with no boundary
+      # to lose them at; the container is the only place either value travels
+      # between environments.
       #
-      # `build.rs` deliberately keeps falling back (env -> git -> placeholder)
-      # rather than failing, and that stays: its audience is packagers, Nix,
-      # `cargo install --git` and dev checkouts, where no version is injected
+      # `build.rs` deliberately keeps falling back (env -> git -> placeholder
+      # for DAD_VERSION; env -> default for DAD_RELEASE_REPO) rather than
+      # failing, and that stays: its audience is packagers, Nix,
+      # `cargo install --git` and dev checkouts, where no injection happens
       # and a hard failure would break every such build. The release job is the
-      # one caller that knows exactly which version it is publishing, so it is
-      # the right place — and the only correct place — to turn a silent fallback
-      # into a failed release.
-      - name: Verify the released version is baked into the artifact
+      # one caller that knows exactly which version and release repo it is
+      # publishing, so it is the right place — and the only correct place — to
+      # turn a silent fallback into a failed release.
+      - name: Verify the released version and release repo are baked into the artifact
         if: matrix.use_cross
         env:
           DAD_VERSION: ${{ needs.prepare.outputs.version }}
+          DAD_RELEASE_REPO: prageethw/dot-agent-deck
           MATRIX_TARGET: ${{ matrix.target }}
           MATRIX_BINARY_EXT: ${{ matrix.binary_ext }}
         run: |
@@ -379,8 +405,12 @@ jobs:
             echo "::error::Refusing to publish: the prepared release version is empty, so the artifact cannot be verified."
             exit 1
           fi
+          if [ -z "$DAD_RELEASE_REPO" ]; then
+            echo "::error::Refusing to publish: DAD_RELEASE_REPO is empty, so the artifact cannot be verified."
+            exit 1
+          fi
           # Checked separately so a build that produced no binary reports that,
-          # rather than being blamed on the injection below.
+          # rather than being blamed on the injections below.
           if [ ! -f "$BIN" ]; then
             echo "::error::Refusing to publish: expected ${MATRIX_TARGET} binary at ${BIN}, but it does not exist."
             exit 1
@@ -394,7 +424,21 @@ jobs:
             echo "::error::${MATRIX_TARGET} artifact does not contain the version being released (${DAD_VERSION}). The injected DAD_VERSION did not reach the build script inside the cross container, so this binary reports a different version than the tag it would be published under (issue #250). Refusing to publish it."
             exit 1
           fi
-          echo "OK: ${MATRIX_TARGET} artifact reports ${DAD_VERSION}"
+          # Mirrors the DAD_VERSION assertion above, for the value issue #398
+          # added. `src/version.rs` composes DAD_RELEASE_REPO into the full
+          # `https://api.github.com/repos/<slug>/releases/latest` URL as a
+          # `const concat!`, which rustc folds into a single string literal
+          # landing in rodata exactly like DAD_VERSION does — so this greps for
+          # the composed URL, not the bare slug, which is what actually proves
+          # the injected value reached `src/version.rs` rather than merely
+          # appearing somewhere in the binary (the slug alone could coincide
+          # with unrelated bytes; the full URL cannot).
+          RELEASES_URL="https://api.github.com/repos/${DAD_RELEASE_REPO}/releases/latest"
+          if ! grep -a -q -F -- "$RELEASES_URL" "$BIN"; then
+            echo "::error::${MATRIX_TARGET} artifact does not contain the release-repo URL it should poll (${RELEASES_URL}). The injected DAD_RELEASE_REPO did not reach the build script inside the cross container, so this binary's upgrade nudge would silently poll a different repo's releases (issue #398). Refusing to publish it."
+            exit 1
+          fi
+          echo "OK: ${MATRIX_TARGET} artifact reports ${DAD_VERSION} and polls ${DAD_RELEASE_REPO}"
       - name: Package
         env:
           MATRIX_TARGET: ${{ matrix.target }}
