@@ -739,6 +739,12 @@ impl ModeConfig {
 /// `changelog.d/*.breaking.md` plus a version bump, which the defect does
 /// not warrant.
 ///
+/// Pinned directly by
+/// `resolve_orchestration_name_treats_whitespace_only_name_as_present` and
+/// `resolve_orchestration_name_does_not_trim_surrounding_whitespace` below;
+/// before those, the decision was pinned only by `state.rs`'s
+/// consumer-level test.
+///
 /// Centralized so the TUI's tab construction site, the TUI's hydration
 /// site, and the daemon's `handle_delegate` lookup all agree on the
 /// resolved-name string. Without this single-source contract, an
@@ -2216,8 +2222,9 @@ reactive_panes = 0
 
     /// #174: an empty name resolves to the cwd-basename fallback. A
     /// whitespace-only name is deliberately NOT treated as blank — see
-    /// `resolve_orchestration_name`'s doc comment — so it is not covered
-    /// here.
+    /// `resolve_orchestration_name`'s doc comment, and the two tests below,
+    /// which pin that decision directly rather than leaving it covered only
+    /// by `state.rs`'s consumer-level test.
     #[test]
     fn resolve_orchestration_name_treats_empty_as_unnamed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2229,6 +2236,28 @@ reactive_panes = 0
             .to_string();
 
         assert_eq!(resolve_orchestration_name("", dir.path()), expected);
+    }
+
+    /// #174: a whitespace-only name is a deliberate exception to the
+    /// "blank resolves to the basename" rule above — see
+    /// `resolve_orchestration_name`'s doc comment for why (a same-wire
+    /// semantic-break concern under CLAUDE.md rule 12, reaffirmed on review
+    /// in PR #274 round 3 after round 2 briefly added a `.trim()`). This
+    /// pins that the exception holds: the raw whitespace is returned
+    /// unchanged rather than falling back to the basename.
+    #[test]
+    fn resolve_orchestration_name_treats_whitespace_only_name_as_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolve_orchestration_name("   ", dir.path()), "   ");
+    }
+
+    /// #174: the milder form of the same question — a name with
+    /// *surrounding* whitespace, e.g. `" demo "` — is answered the same
+    /// way: returned byte-for-byte unchanged, not trimmed to `"demo"`.
+    #[test]
+    fn resolve_orchestration_name_does_not_trim_surrounding_whitespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolve_orchestration_name(" demo ", dir.path()), " demo ");
     }
 
     #[test]

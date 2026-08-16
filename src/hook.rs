@@ -151,10 +151,76 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Bound on the raw hook payload read from stdin, before it is even parsed
+/// as JSON (fork issue #145). Sized differently from
+/// [`MAX_REPLY_LINE_BYTES`] on purpose rather than reused: that constant
+/// bounds a reply that only ever carries a short seed, while a hook event's
+/// `tool_input` can legitimately carry a tool's whole argument — e.g. the
+/// full file content behind a `Write`/`Edit` call — so the 1 MiB reply cap
+/// would risk rejecting real hook traffic.
+///
+/// This bounds the hook CLI's *request* path, which never travels the framed
+/// TUI↔daemon transport [`crate::daemon_protocol::MAX_FRAME_LEN`] governs —
+/// a hook event goes out over the plain newline-delimited hook socket
+/// (`send_to_socket_at`, below), which the daemon reads with
+/// `BufReader::lines()` and no length bound at all (upstream #319, and see
+/// [`MAX_REPLY_LINE_BYTES`]'s note that the two hook-path sizes should be
+/// decided consistently — this is the second one). The value reuses
+/// [`crate::daemon_protocol::MAX_FRAME_LEN`]'s literal only because 16 MiB is
+/// already a number this codebase treats as "far above any legitimate single
+/// message" and picking a fresh one would add nothing; it is not because a
+/// framed transport imposes this bound on this path. The `const _` assertion
+/// below pins the literal, so a future change to `MAX_FRAME_LEN` — made for
+/// wire reasons that have nothing to do with hooks — cannot silently retune
+/// what an untrusted hook payload may allocate.
+const MAX_STDIN_BYTES: u64 = crate::daemon_protocol::MAX_FRAME_LEN as u64;
+
+const _: () = assert!(MAX_STDIN_BYTES == 16 * 1024 * 1024);
+
+/// Bounded stdin read for the hook payload. Applies the same reject-don't-
+/// truncate discipline as the reply path a few hundred lines below
+/// (`request_from_socket_at`/`read_reply_line`): a payload over the cap is
+/// rejected outright rather than silently truncated and handed on to the
+/// JSON parser — a truncated payload that happens to still parse would be
+/// worse than one that is cleanly rejected. An over-cap payload is dropped
+/// silently rather than reported (fork issue #145's "fail with a clear
+/// error" was considered and declined here — see the note in
+/// `changelog.d/145.bugfix.md`): every other failure on this path, malformed
+/// or absent input alike, already returns `ExitCode::SUCCESS` without a
+/// diagnostic, since this file initializes no logger and calls no
+/// `tracing`/`eprintln!` anywhere, and a single new stderr write for this
+/// one case would be a new pattern rather than an extension of the
+/// existing one.
+///
+/// Unlike the reply path's manual chunk-and-check loop, there is no deadline
+/// to re-arm per read here: this is a synchronous single-shot stdin drain
+/// from a short-lived hook CLI process, not a socket exchange with a peer
+/// that can dribble bytes to keep a read alive. `Read::take` gives the same
+/// "never allocate past the cap" guarantee without needing that loop.
 fn read_stdin() -> Option<String> {
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).ok()?;
-    Some(buf)
+    read_bounded(std::io::stdin(), MAX_STDIN_BYTES)
+}
+
+/// The cap-enforcing half of [`read_stdin`], generic over `Read` so it can
+/// be unit-tested against an in-memory byte slice instead of real stdin.
+fn read_bounded<R: std::io::Read>(mut reader: R, cap: u64) -> Option<String> {
+    let mut buf = Vec::new();
+    // Read at most `cap + 1` bytes: reading exactly `cap` would make an
+    // input of exactly `cap` bytes indistinguishable from one that has more
+    // data waiting behind it, so the buffer is deliberately allowed to grow
+    // one byte past the cap — the `+1` is what lets the length check below
+    // tell "at the cap" from "over the cap" apart. `saturating_add` rather
+    // than `+` because the only production caller passes a `const`, but a
+    // future caller passing `u64::MAX` should saturate rather than panic.
+    reader
+        .by_ref()
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > cap {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 fn map_event_type(hook_event_name: &str) -> Option<EventType> {
@@ -1137,6 +1203,36 @@ fn is_transient_read_error(err: &std::io::Error, deadline: Option<std::time::Ins
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Fork issue #145: a payload at exactly the cap is accepted, unchanged.
+    #[test]
+    fn read_bounded_accepts_payload_at_cap() {
+        let payload = "x".repeat(10);
+        assert_eq!(read_bounded(payload.as_bytes(), 10), Some(payload.clone()));
+    }
+
+    /// Fork issue #145: one byte over the cap is rejected outright, not
+    /// truncated to the cap and handed on as if it were the whole payload.
+    #[test]
+    fn read_bounded_rejects_payload_over_cap() {
+        let payload = "x".repeat(11);
+        assert_eq!(read_bounded(payload.as_bytes(), 10), None);
+    }
+
+    /// Fork issue #145: a wildly over-cap payload (the realistic "wedged
+    /// agent" scenario the issue describes) is rejected the same way a
+    /// one-byte overage is — not merely capped somewhere short of the true
+    /// size.
+    #[test]
+    fn read_bounded_rejects_payload_far_over_cap() {
+        let payload = "x".repeat(10_000);
+        assert_eq!(read_bounded(payload.as_bytes(), 10), None);
+    }
+
+    #[test]
+    fn read_bounded_empty_input_is_empty_string() {
+        assert_eq!(read_bounded(&b""[..], 10), Some(String::new()));
+    }
 
     #[test]
     fn map_session_start() {
