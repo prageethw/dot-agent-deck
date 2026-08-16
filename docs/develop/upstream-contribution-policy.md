@@ -44,12 +44,15 @@ This is observed behaviour, not theory. It has happened twice:
 
 A hand-run purification pass would do by hand what the sync does for free, and would do it as one large rewrite of the branch that `main` is reset to — high blast radius — instead of letting the same outcome arrive incrementally and safely.
 
-**The two genuine exceptions** are commits that are *half* fork-only and cannot be offered as-is. These need splitting, but that is per-commit work done when you reach them, not a phase that blocks anything:
+**The genuine exceptions** are commits that are *half* fork-only and cannot be offered as-is. These need splitting, but that is per-commit work done when you reach them, not a phase that blocks anything. *(Table widened from "two" to five 2026-08-16, seventh re-curation — the count itself is not load-bearing, only the pattern is.)* **This table is not yet a complete enumeration of `fork-sync-workflow.md`'s `MIXED` rows** — the stack table currently carries 8, this table lists 5; `b487ae1`, `107999a` and `51940a45` are outstanding and not yet split out here (the `fd709c18` row below cites `51940a45` as its classification precedent — that citation refers to the stack table's own `51940a45` row, not to a row in this table). Reconciling the remaining three is its own piece of work, not done in this pass.
 
 | Commit | Split |
 |---|---|
 | `54066ca` | the `ps`-sampling half rides on fork-only `bf38bc1`; the hydration-race half is an upstream defect |
 | `b06b85b` | two test fixes are upstream-worthy; the Greptile note is fork-only |
+| `fd709c18` | the features-config ancestor-walk hardening (bounding a world-writable ancestor, open-then-fstat) is an upstream `resolve_features` defect; the declined-ancestor diagnostics call the fork-only `sanitize_path_for_terminal_display` and extend the fork-only `features status` subcommand |
+| `99dd8ae4` | the shallow-shared-repo detection extends fork-only `worktree_reclaim.rs`'s own CLI; the `create_worktree_sync` attach-race lock closes a race verified present in upstream's own `create_worktree` (`issue_dispatch_run.rs:726`, attach form at `:756`, unserialized) |
+| `5576bde1` | the `Event::Paste` gate fix closes a defect verified identical on `upstream/main`; the new persistent LOCKED/UNLOCKED chip has no upstream equivalent at all |
 
 ## Write access is permission to merge, not to skip review
 
@@ -72,6 +75,8 @@ This ordering governs **draining the historical backlog** below. It does **not**
 
 Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s stack table, and cross-referenced against every upstream PR ever opened from this fork: these have **no upstream PR at all**. Recorded here so it does not have to be re-derived.
 
+**This document is not yet a complete enumeration of the stack table's `UPSTREAM-WORTHY` tags.** The stack table currently carries 35; after the two rows added below, 22 appear somewhere in this document (this backlog, "offered and awaiting review", or "offered but closed without merging") — `0b44349`, `185bd68`, `1c44794`, `2a7d7c6`, `407570ce`, `4252bd30`, `488b713`, `4b9d2c4e`, `87b74d7`, `91a6331`, `946bd272`, `c814220` and `f6d2b1c` (13) appear in neither this table nor either of the other two sections. A reader should not read a SHA's absence from this document as "already offered" — it may simply not have been reconciled here yet. Filing a follow-up issue to close the gap is the right next step; reconciling it in this pass is its own piece of work and out of scope for a docs-only fix round.
+
 ### Product code
 
 | Commit | What |
@@ -83,6 +88,10 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 | `87ab3b4` | Enforce `PROTOCOL_VERSION` on the local daemon attach path — an upstream protocol-gate defect |
 | `a8cbc29` | Fix the Pi start-role spawn-order race (fork #92) |
 | `20c1055` | Pass the hook socket endpoint explicitly instead of through the environment (fork #102) |
+| `bafe103` | Never derive a pgid from a reaped child in the forcing teardown paths — a pid-recycling race in `platform/proc/{mod,unix}.rs` (fork #143, #162) |
+| `4b7ee26` | Observe agent exit without reaping so shutdown cannot signal a recycled pid — same `agent_pty.rs`/`platform/proc` plumbing as `bafe103` (fork #163, #207) |
+| `f44b13c5` | Bound the shutdown grace-window's EINTR retry against the deadline, restore the ECHILD alarm, and bound the hook CLI's stdin read (fork #145, #217) — offer after `4b7ee26`/`bafe103`, whose symbols it extends |
+| `fb81d36b` | `register_orchestration_role` never removed a stale `orchestrator_pane_ids` flag when a pane_id was reused for a worker role, wrongly excluding it as a delegate candidate (fork #361) — verified identical on `upstream/main` |
 
 ### Test and CI determinism
 
