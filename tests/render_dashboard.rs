@@ -47,13 +47,15 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
 
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
-/// snapshot it. The title must carry the card number, display name, and status
-/// badge, while the compact Last/Tools counters occupy the bottom border.
+/// snapshot it. The title row must carry the card number and status badge,
+/// with the display name on its own body row directly beneath (PRD fork#405
+/// M1), while the compact Last/Tools counters occupy the bottom border.
 #[spec("dashboard/pane/004")]
 #[test]
 fn pane_004_card_title_row() {
     // PRD #77 catalog: dashboard/pane/004 — Card title row carries
-    // card number, display name, and a status badge. Snapshot a single
+    // card number and a status badge, with the display name on its own
+    // body row directly beneath (PRD fork#405 M1). Snapshot a single
     // Working session in Normal density. The session fixture is
     // inlined per M4.1 reviewer S1 (single-use test-data builder
     // doesn't need its own fn — keeping the test body
@@ -730,7 +732,7 @@ fn guard_002_no_absolute_bg_in_source() {
 }
 
 /// Scenario: Render a single dashboard card for a live `AgentType::Pi` session
-/// with NO display name (so the card title falls back to the plain
+/// with NO display name (so the card's identity falls back to the plain
 /// `<session-id>` form) into a `TestBackend` buffer, then assert the rendered
 /// card surface shows the session id but carries no agent-type badge by
 /// default — no `Pi` / `ClaudeCode` / `OpenCode` / `No agent` label text
@@ -744,7 +746,7 @@ fn guard_002_no_absolute_bg_in_source() {
 fn pane_007_pi_card_omits_agent_type_badge() {
     // Fork-only badge removal: `render_session_card` no longer emits the
     // `(agent_type_text, badge_style)` segment for any agent type, so a
-    // no-display-name Pi pane's title falls back to the bare session id
+    // no-display-name Pi pane's identity falls back to the bare session id
     // (`orch-01`), with no `Pi` text and no registry badge colour anywhere
     // on the card. This mirrors the same-shape assertions in
     // `pane_008_codex_card_omits_agent_type_badge` but pins the Pi agent
@@ -768,7 +770,7 @@ fn pane_007_pi_card_omits_agent_type_badge() {
         first_prompts: vec!["orchestrate the release".to_string()],
         pane_id: Some("pi-pane-1".to_string()),
         agent_id: Some("1".to_string()),
-        // No friendly name → the title falls back to the bare session id;
+        // No friendly name → identity falls back to the bare session id;
         // no agent-type badge form exists to fall back to instead.
         display_name: None,
         pending_permission_tool: None,
@@ -790,11 +792,11 @@ fn pane_007_pi_card_omits_agent_type_badge() {
     );
     let text = buffer_to_text(&buffer);
 
-    // The bare session id still surfaces in the card title, since there is
-    // no display name to fall back to.
+    // The bare session id still surfaces on the card's identity row, since
+    // there is no display name to fall back to.
     assert!(
         text.contains("orch-01"),
-        "a Pi pane's card title must show the session id `orch-01` once the \
+        "a Pi pane's card must show the session id `orch-01` once the \
          agent-type badge is removed:\n{text}"
     );
     // The agent-type badge is gone entirely — no type label for Pi or any

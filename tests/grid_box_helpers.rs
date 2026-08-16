@@ -232,34 +232,53 @@ fn body_row_predicate_finds_a_label_in_the_second_card_of_a_row() {
     );
 }
 
-/// Scenario: Run `label_in_box_body_row` against a two-card row where the
-/// FIRST card is drawn at THICK weight and the SECOND at PLAIN weight — the
-/// actual production shape a selected card next to an unselected one takes
-/// (`card_border_glyph` promotes only the selected card to `BorderType::Thick`).
-/// The search is weight-scoped: for each top-left corner it only matches
-/// verticals of that SAME weight, so the thick card's own `┃` cannot be
-/// mistaken for the plain card's `│` crop boundary or vice versa. Confirms
-/// each card's own label is still found under its own weight (review finding
-/// D7: the prior fixture used one weight for both cards and never exercised
-/// this).
+/// Scenario: Run `label_in_box_body_row` against two fixtures, each built to
+/// fail under exactly one prior/alternate implementation rather than pass
+/// against all of them the way a same-weight two-card grid would. The first
+/// nests a PLAIN-weight vertical inside a THICK card's own body span, so a
+/// weight-BLIND crop (one that stops at the nearest vertical glyph of any
+/// weight) truncates the label — only a search scoped to the corner's own
+/// weight reaches it. The second puts three cards, PLAIN/THICK/PLAIN, on one
+/// row and searches the THIRD card's label, which the pre-fix `position()`
+/// form (review finding: it always returned the FIRST vertical of a given
+/// weight in the WHOLE row regardless of which corner was being checked) can
+/// never reach, because it only ever finds the first PLAIN-weight span.
+/// Verified against both the pre-fix `position()` form and a corner-scoped
+/// but weight-blind form by executing each against these fixtures, not by
+/// tracing (review finding: the prior fixture in this slot passed identically
+/// against the current implementation, the pre-fix `position()` form, and a
+/// weight-blind form, so it guarded nothing — D7 was not actually closed).
 #[test]
 fn body_row_predicate_scopes_the_search_to_each_cards_own_border_weight() {
-    const MIXED_WEIGHT_GRID: &str = "\
-┏━ alpha ━┓┌─ bravo ─┐
-┃ alpha   ┃│ bravo   │";
+    // Discriminates weight-scoped from weight-blind: the nested `│` sits
+    // INSIDE the outer THICK card's own body span, so a crop that stops at
+    // any vertical glyph (not just the corner's own weight) truncates
+    // "bravo" before it is reached.
+    const NESTED_WEIGHT_GRID: &str = "\
+┏━ outer ━━━┓
+┃ a │ bravo ┃";
     assert!(
-        common::label_in_box_body_row(MIXED_WEIGHT_GRID, "alpha"),
-        "the THICK-weight first card's own body label must match:\n{MIXED_WEIGHT_GRID}"
+        common::label_in_box_body_row(NESTED_WEIGHT_GRID, "bravo"),
+        "the label beyond a NESTED plain-weight vertical must still match under the \
+         outer card's own THICK weight — a weight-blind crop would stop at the nested \
+         `│` and cut it off:\n{NESTED_WEIGHT_GRID}"
+    );
+
+    // Discriminates the fix from the pre-fix `position()` form: three cards,
+    // PLAIN/THICK/PLAIN, and the label sought is in the THIRD card. `position()`
+    // only ever finds the first PLAIN-weight vertical in the whole row, so it
+    // can only ever crop the FIRST plain card's span and never reaches this one.
+    const THREE_CARD_GRID: &str = "\
+┌─ a ─┐┏━ b ━┓┌─ c ─┐
+│  a  │┃  b  ┃│  c  │";
+    assert!(
+        common::label_in_box_body_row(THREE_CARD_GRID, "c"),
+        "the THIRD card's own body label must match — the pre-fix `position()` form \
+         can only ever find the first PLAIN-weight span in the row:\n{THREE_CARD_GRID}"
     );
     assert!(
-        common::label_in_box_body_row(MIXED_WEIGHT_GRID, "bravo"),
-        "the PLAIN-weight second card's own body label must match — the search must not let \
-         the first card's thick vertical interfere with the second card's plain-weight crop:\n\
-         {MIXED_WEIGHT_GRID}"
-    );
-    assert!(
-        !common::label_in_box_body_row(MIXED_WEIGHT_GRID, "charlie"),
-        "a label present in neither card must not match:\n{MIXED_WEIGHT_GRID}"
+        !common::label_in_box_body_row(THREE_CARD_GRID, "zzz"),
+        "a label present in no card must not match:\n{THREE_CARD_GRID}"
     );
 }
 

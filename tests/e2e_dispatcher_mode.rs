@@ -1384,9 +1384,9 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     std::fs::write(&cfg, "default_command = \"agent-wrapper\"\n").expect("write the deck config");
 
     let deck = TuiDeck::builder()
-        // Roomy: at the default width a card title is ellipsized
+        // Roomy: at the default width a card's identity is ellipsized
         // (`dispatch-clo…`), so the selection check below could never match the
-        // full name on the title row.
+        // full name on the identity row.
         .with_pty_size(200, 50)
         .with_env(
             "PATH",

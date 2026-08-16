@@ -147,19 +147,24 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     // widget (the directory picker's own row prefix) — so there is no
     // rendering mode this fallback would ever need to catch here.
     let (col, row) = deck.wait_for_in_grid("bravo");
+    // Fail AS the impossible state itself (auditor N4), not as the
+    // `wait_until_grid` timeout below it would otherwise produce: `row == 0`
+    // would mean bravo's identity row landed on the tab strip / stats bar,
+    // which never happens, but reading `row - 1` without checking first would
+    // silently read bravo's OWN body row instead — a false-positive path that
+    // would (here, harmlessly) fail the wait with no hint the row index was
+    // the actual problem. Asserting up front converts that into a loud,
+    // specific panic instead.
+    assert!(
+        row > 0,
+        "bravo's identity row landed at grid row 0 — impossible (tab strip \
+         occupies it); the wait below would time out for the wrong reason"
+    );
     deck.click(col, row);
     let bravo_selected = move |g: &str| {
         let lines: Vec<&str> = g.lines().collect();
-        // `checked_sub`, not `saturating_sub` (auditor N4): `row == 0` is an
-        // impossible state here (a card's identity row is always well below
-        // the tab strip / stats bar), and `saturating_sub` would silently
-        // read bravo's OWN body row in that case instead of failing as the
-        // impossible state it is — turning a bug into a full `wait_until_grid`
-        // timeout that reports "bravo card selected" never happened, with no
-        // hint the row index was the actual problem.
-        (row as usize)
-            .checked_sub(1)
-            .and_then(|r| lines.get(r))
+        lines
+            .get(row as usize - 1)
             .is_some_and(|title| title.chars().skip(col as usize).take(4).any(|c| c == '▸'))
     };
     deck.wait_until_grid("bravo card selected", bravo_selected);
