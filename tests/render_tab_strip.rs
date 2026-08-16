@@ -387,9 +387,9 @@ fn orchestration_010_active_status_tint_bold_and_idle_coloured() {
 /// #351 narrows this from "tabs this feature doesn't touch" now that Mode
 /// tabs also carry status data via `tab_status_data`; the Dashboard remains
 /// the deliberate scope boundary).
-#[spec("tabs/orchestration/015")]
+#[spec("tabs/orchestration/016")]
 #[test]
-fn orchestration_015_active_dashboard_tab_bold_no_reversed() {
+fn orchestration_016_active_dashboard_tab_bold_no_reversed() {
     let buf = render_tab_bar_to_buffer(&["Dashboard"], &[false], 0, 80, &[None]);
     let modifier = tab_label_modifier(&buf, "Dashboard");
     assert!(
