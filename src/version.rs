@@ -1,6 +1,30 @@
 use serde::Deserialize;
 
-use crate::repo_identity;
+/// The URL to poll for the upgrade nudge's "latest release" feed, composed
+/// at build time from `DAD_RELEASE_REPO` (issue #398). Defaults to
+/// upstream's own repo when `DAD_RELEASE_REPO` isn't injected; a downstream
+/// distribution overrides this by setting `DAD_RELEASE_REPO` in its build
+/// environment or its own `.cargo/config.toml`, so its build polls its own
+/// releases rather than a lineage it doesn't ship.
+///
+/// Deliberately NOT [`crate::repo_identity::RELEASES_API_URL`] (issue #945):
+/// that seam is a compile-time literal with no per-build injection point, so
+/// it cannot satisfy `lifecycle/version/001`'s binary-byte assertion that an
+/// arbitrary `DAD_RELEASE_REPO` injected into ONE build (with no source edit)
+/// reaches this exact URL — the whole property issue #398's review finding F1
+/// exists to pin. `src/remote.rs`'s download-base URL and the `src/ui.rs`
+/// star-prompt text have no such per-build-injection requirement, so they use
+/// the simpler `repo_identity` seam instead.
+///
+/// `concat!` rather than a `format!` call: `env!` expands to a string
+/// literal and `concat!` expands nested `env!` eagerly, so this stays a
+/// `const` with no per-call allocation — the same idiom the `User-Agent`
+/// header below already uses (`concat!("dot-agent-deck/", env!("DAD_VERSION"))`).
+const GITHUB_RELEASES_URL: &str = concat!(
+    "https://api.github.com/repos/",
+    env!("DAD_RELEASE_REPO"),
+    "/releases/latest"
+);
 
 #[derive(Deserialize)]
 struct GitHubRelease {
@@ -31,7 +55,7 @@ async fn fetch_latest_version() -> Option<String> {
         .ok()?;
 
     let resp = client
-        .get(repo_identity::RELEASES_API_URL)
+        .get(GITHUB_RELEASES_URL)
         .header(
             "User-Agent",
             concat!("dot-agent-deck/", env!("DAD_VERSION")),

@@ -61,7 +61,16 @@ macro_rules! derive_repo_identity {
 
 // ─── THE SEAM ───
 // Change this one line to point a build at a different repository.
-derive_repo_identity!("vfarcic/dot-agent-deck");
+//
+// Fork issue #398/#945: this fork's builds must download and link to its own
+// repository, not upstream's. `src/remote.rs`'s download base and the
+// `src/ui.rs` star-prompt text derive from this seam. The one exception is
+// `src/version.rs`'s upgrade-nudge poll URL, which stays on the older
+// `DAD_RELEASE_REPO` build-time injection (`.cargo/config.toml` / `build.rs`)
+// deliberately — that mechanism supports per-build injection with no source
+// edit, which `lifecycle/version/001` (issue #398 review finding F1) actually
+// exercises, and this compile-time literal cannot.
+derive_repo_identity!("prageethw/dot-agent-deck");
 
 #[cfg(test)]
 mod tests {
