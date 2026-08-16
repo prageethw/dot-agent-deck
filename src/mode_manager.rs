@@ -818,8 +818,8 @@ mod tests {
         );
     }
 
-    /// Fork issue #423 review finding B1: a real LF/CRLF in `command` used
-    /// to survive into the emitted line unescaped (neither
+    /// Fork issue #423 review findings B1 and C1: a real LF/CRLF in
+    /// `command` used to survive into the emitted line unescaped (neither
     /// `escape_cmd_exe_program` nor `quote_cmd_exe_arg` had `\r`/`\n` in
     /// their caret-escape sets), and `crt_argv_quote` wraps the resulting
     /// argument in quotes without touching the newline itself — so the raw
@@ -830,55 +830,83 @@ mod tests {
     /// delivery path this test does not exercise, a typed newline submits
     /// the current input the instant the terminal sees it, before
     /// `cmd.exe`'s own grammar is even consulted — see
-    /// `platform::shell::sanitize_cmd_exe_newlines`'s doc comment). Either
-    /// way, no caret encoding can close this off, so `watch_invocation`'s
-    /// Windows arm now replaces `\r`/`\n` with a space before either
+    /// `platform::shell::sanitize_cmd_exe_control_chars`'s doc comment,
+    /// which also covers the wider control-character class C1 found: `ESC`
+    /// clears the whole typed input buffer the same way, `BS`/`DEL` delete
+    /// backwards, and `ETX` cancels the line). Either way, no caret
+    /// encoding can close this off, so `watch_invocation`'s Windows arm now
+    /// replaces every control character but `\t` with a space before either
     /// quoting pass runs. Verified the same rigorous way as
     /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
     /// above: a benign marker-file write stands in for the payload a
-    /// surviving raw newline would otherwise let submit as its own,
+    /// surviving raw control byte would otherwise let submit as its own,
     /// separate `cmd.exe` command.
     ///
     /// This is strictly worse than `main` if left unfixed: `main`'s
-    /// `{:?}`-Debug-quoted format escaped a real newline to the two-visible-
-    /// character sequence `\n`, so content was mangled but the line stayed
-    /// one line; a raw, unescaped newline instead splits the line into two.
+    /// `{:?}`-Debug-quoted format escaped a control character to a visible
+    /// escape sequence (`\n`, `\u{1b}`, …), so content was mangled but the
+    /// line stayed intact; a raw, unescaped one instead either splits the
+    /// line (`\n`/`\r`) or, for `ESC` on the interactive-PTY delivery path
+    /// specifically, lets `cmd.exe` run an attacker-chosen program name —
+    /// see the ESC case below.
+    ///
+    /// Loops both the CR/LF shape (finding B1) and the `ESC` shape (finding
+    /// C1, auditor's worked example: `"\x1bcalc.exe x"` reduces to
+    /// `calc.exe x^"` once the console's line editor clears everything
+    /// typed before the `ESC` byte) through the same real-`cmd.exe` proof.
+    /// **Honesty caveat, same as the auditor's own finding**: `cmd.exe` here
+    /// is driven via `/C <line>` as a single process argument, which is the
+    /// `/C <string>` delivery path, not the interactive-PTY console line
+    /// editor a real watch pane types into — so this proves the emitted
+    /// line contains no raw control character and behaves safely once
+    /// passed to `cmd.exe` that way, but it cannot reproduce, and does not
+    /// prove, the console-line-editing consumption of `ESC` itself; that
+    /// remains reasoned rather than executed. The fast, deterministic
+    /// pin that the character is gone from the output regardless of
+    /// delivery path is
+    /// `platform::shell::windows_quoting_tests::quote_cmd_exe_arg_replaces_other_control_characters_with_spaces`.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_neutralizes_a_real_newline_through_real_cmd_exe() {
+    fn watch_invocation_neutralizes_control_characters_through_real_cmd_exe() {
         use std::os::windows::process::CommandExt;
 
-        let scratch = tempfile::tempdir().expect("scratch tempdir");
-        let marker = scratch.path().join("injected.marker");
+        // A real LF (finding B1), not the two-char `\n` escape sequence,
+        // and a real ESC (finding C1): if either survives into the emitted
+        // line unescaped, `cmd.exe` reads everything after it as a second,
+        // unquoted command.
+        for command in [
+            "npm run dev\ntype nul > injected.marker",
+            "\x1btype nul > injected.marker",
+        ] {
+            let scratch = tempfile::tempdir().expect("scratch tempdir");
+            let marker = scratch.path().join("injected.marker");
 
-        let exe = scratch.path().join("dot-agent-deck.exe");
-        // A real LF, not the two-char `\n` escape sequence: if it survives
-        // into the emitted line unescaped, `cmd.exe` reads everything after
-        // it as a second, unquoted command.
-        let command = "npm run dev\ntype nul > injected.marker";
-        let line = watch_invocation(&exe, 5, command);
+            let exe = scratch.path().join("dot-agent-deck.exe");
+            let line = watch_invocation(&exe, 5, command);
 
-        assert!(
-            !line.contains('\n') && !line.contains('\r'),
-            "watch_invocation must never emit a raw CR/LF into the cmd.exe \
-             command line\nline: {line:?}"
-        );
+            assert!(
+                !line.chars().any(|c| c.is_control() && c != '\t'),
+                "watch_invocation must never emit a raw control character \
+                 (other than tab) into the cmd.exe command line\n\
+                 command: {command:?}\nline: {line:?}"
+            );
 
-        let output = std::process::Command::new("cmd.exe")
-            .raw_arg("/C")
-            .raw_arg(&line)
-            .current_dir(scratch.path())
-            .output()
-            .expect("cmd.exe should run");
+            let output = std::process::Command::new("cmd.exe")
+                .raw_arg("/C")
+                .raw_arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("cmd.exe should run");
 
-        assert!(
-            !marker.exists(),
-            "a real newline in `command` escaped quoting and ran \
-             `type nul > injected.marker` as a separate cmd.exe command.\n\
-             line: {line}\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            assert!(
+                !marker.exists(),
+                "a control character in `command` escaped quoting and ran \
+                 `type nul > injected.marker` as a separate cmd.exe command.\n\
+                 command: {command:?}\nline: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// Position-aware quoting's other half: the EXECUTABLE token is located by
@@ -930,7 +958,7 @@ mod tests {
     /// Fork issue #423 review finding S2: every other real-`cmd.exe` test in
     /// this module proves either that an injected payload did NOT run
     /// (`watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`,
-    /// `watch_invocation_neutralizes_a_real_newline_through_real_cmd_exe`) or
+    /// `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`) or
     /// that a stub WAS located and run at all
     /// (`watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it`)
     /// — none of them recover the argument bytes the launched process

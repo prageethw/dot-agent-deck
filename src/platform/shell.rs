@@ -149,15 +149,16 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// risk, not an injection, but it is deliberately not left silently
 /// implied to be resolved (fork issue #283).
 ///
-/// **Caveat — a real `\r`/`\n` cannot be caret-escaped away either**, for
-/// the reasons [`sanitize_cmd_exe_newlines`]'s doc comment gives; this
-/// function replaces one with a space before doing anything else (fork
-/// issue #423 review finding B1's sibling: a newline in an
-/// executable path, reachable only via a self-controlled
-/// `std::env::current_exe()`, not user config).
+/// **Caveat — a raw control character cannot be caret-escaped away
+/// either**, for the reasons [`sanitize_cmd_exe_control_chars`]'s doc
+/// comment gives; this function replaces every one (bar `\t`) with a
+/// space before doing anything else (fork issue #423 review finding
+/// B1's sibling: a control character in an executable path, reachable
+/// only via a self-controlled `std::env::current_exe()`, not user
+/// config).
 #[cfg(windows)]
 pub fn escape_cmd_exe_program(token: &str) -> String {
-    let token = sanitize_cmd_exe_newlines(token);
+    let token = sanitize_cmd_exe_control_chars(token);
     let mut result = String::with_capacity(token.len());
     for c in token.chars() {
         if matches!(
@@ -176,8 +177,6 @@ pub fn escape_cmd_exe_program(token: &str) -> String {
                 | '='
                 | '%'
                 | '!'
-                | '\r'
-                | '\n'
         ) {
             result.push('^');
         }
@@ -244,18 +243,21 @@ pub fn escape_cmd_exe_program(token: &str) -> String {
 /// so it cannot introduce a new command — but neither is actually closed
 /// by quoting the way every other character in the caret set is.
 ///
-/// **Caveat — a real `\r`/`\n` is replaced with a space before either
-/// pass runs, not caret-escaped.** No caret encoding neutralizes a raw
-/// newline: on the persistent-watch-pane delivery path the line is typed
-/// into an already-running interactive `cmd.exe`, and the terminal
-/// submits the current input the instant it sees the byte — before
-/// `cmd.exe`'s own escaping grammar is ever consulted — and on the `/C
+/// **Caveat — a raw control character is replaced with a space before
+/// either pass runs, not caret-escaped.** No caret encoding neutralizes
+/// one: on the persistent-watch-pane delivery path the line is typed
+/// into an already-running interactive `cmd.exe`, and the console's
+/// cooked-mode line editor consumes several control bytes as *editing
+/// commands* — a newline submits the line, `ESC` clears the whole input
+/// buffer, `BS`/`DEL` delete backwards, `ETX` cancels it — before
+/// `cmd.exe`'s own escaping grammar is ever consulted; and on the `/C
 /// <string>` delivery path `cmd.exe` treats an embedded raw newline as a
 /// statement separator the same way it would inside a batch file. See
-/// [`sanitize_cmd_exe_newlines`] (fork issue #423 review finding B1).
+/// [`sanitize_cmd_exe_control_chars`] (fork issue #423 review findings
+/// B1 and C1).
 #[cfg(windows)]
 pub fn quote_cmd_exe_arg(arg: &str) -> String {
-    caret_escape_cmd_metachars(&crt_argv_quote(&sanitize_cmd_exe_newlines(arg)))
+    caret_escape_cmd_metachars(&crt_argv_quote(&sanitize_cmd_exe_control_chars(arg)))
 }
 
 /// Step 1 of [`quote_cmd_exe_arg`]: the standard CRT/`CommandLineToArgvW`
@@ -313,23 +315,22 @@ fn crt_argv_quote(arg: &str) -> String {
 /// sees an unescaped metacharacter — including the quotes [`crt_argv_quote`]
 /// added, which is what stops finding A1's quote-parity trick from working.
 ///
-/// `\r`/`\n` are included in the set as defense in depth even though
-/// [`quote_cmd_exe_arg`] already replaces them via
-/// [`sanitize_cmd_exe_newlines`] before this function ever runs, so a
-/// future direct caller of this function that skips that step still gets
-/// *some* protection: caret-escaping a newline does not make it behave
-/// like a real newline (`cmd.exe`'s interactive reader treats a trailing
-/// `^` before Enter as its own line-continuation syntax, prompting `More?`
-/// rather than submitting), but it does stop the raw byte from reaching
-/// `cmd.exe`'s scan unescaped, which is what actually lets a second
-/// command run. It is not a substitute for sanitizing at the source.
+/// No control character appears in this set: caret-escaping one would not
+/// help even in principle (see [`sanitize_cmd_exe_control_chars`]'s doc
+/// comment — none of them are `cmd.exe` metacharacters this function's own
+/// scan defends against), and this function is private to the module with
+/// exactly one caller, [`quote_cmd_exe_arg`], which already sanitizes
+/// control characters out before this ever runs (fork issue #423 review
+/// finding C4 — the prior `\r`/`\n` entries here were dead code for the
+/// same reason and are removed rather than kept as inert "defense in
+/// depth").
 #[cfg(windows)]
 fn caret_escape_cmd_metachars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(
             c,
-            '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!' | '\r' | '\n'
+            '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!'
         ) {
             result.push('^');
         }
@@ -338,37 +339,60 @@ fn caret_escape_cmd_metachars(s: &str) -> String {
     result
 }
 
-/// Replace a real `\r`/`\n` in `s` with a single space before either
-/// [`escape_cmd_exe_program`] or [`quote_cmd_exe_arg`] processes it.
+/// Replace every control character in `s` other than `\t` with a single
+/// space before either [`escape_cmd_exe_program`] or [`quote_cmd_exe_arg`]
+/// processes it. `\t` is deliberately exempt — both functions already
+/// caret-escape it deliberately (existing `a\tb` behaviour, pinned below),
+/// and it is not one of the bytes the console line editor consumes as an
+/// editing command (see below).
 ///
-/// Caret-escaping cannot neutralize a real newline the way it neutralizes
-/// every other `cmd.exe` metacharacter, because the newline is never
-/// reached by `cmd.exe`'s OWN scan in the first place. On the
-/// persistent-watch-pane delivery path (see `watch_invocation`'s doc
-/// comment in `mode_manager.rs`), the line is typed character-by-character
-/// into an already-running interactive `cmd.exe`; the terminal submits the
-/// current input line the moment it sees the raw byte, exactly as if the
-/// user had pressed Enter — nothing about `cmd.exe`'s escaping grammar is
-/// even consulted at that point. On the `%COMSPEC% /C <string>` delivery
-/// path, `cmd.exe` treats an embedded raw newline inside its `string`
-/// argument as a statement separator, the same way it treats one inside a
-/// batch file. Either way, a scheme that only defends against `cmd.exe`'s
+/// Caret-escaping cannot neutralize a raw control character the way it
+/// neutralizes every other `cmd.exe` metacharacter, because none of them
+/// are ever reached by `cmd.exe`'s OWN scan in the first place — fixed
+/// originally for `\r`/`\n` alone (fork issue #423 review finding B1),
+/// then widened to the whole class once review finding C1 established
+/// that a real `\r`/`\n` was never the only member of it:
+///
+/// - On the persistent-watch-pane delivery path (see `watch_invocation`'s
+///   doc comment in `mode_manager.rs`), the line is typed
+///   character-by-character into an already-running interactive
+///   `cmd.exe`. The Windows console's cooked-mode line editor
+///   (`ENABLE_LINE_INPUT`) consumes several bytes as *editing commands*
+///   while reading that input, before `cmd.exe`'s own grammar is ever
+///   consulted: a newline submits the current line exactly as if the user
+///   had pressed Enter; `ESC` (0x1B) clears the ENTIRE input buffer typed
+///   so far, discarding the program token, `watch --interval N`, and the
+///   opening `^"` along with it, so only what follows the `ESC` byte is
+///   left for `cmd.exe` to parse — e.g. `"\x1bcalc.exe x"` reduces to
+///   `calc.exe x^"`, i.e. arbitrary program execution, not merely content
+///   mangling; `BS`/`DEL` (0x08/0x7F) delete backwards; `ETX` (0x03,
+///   Ctrl-C) cancels the line outright and starts a fresh prompt.
+/// - On the `%COMSPEC% /C <string>` delivery path, `cmd.exe` treats an
+///   embedded raw newline inside its `string` argument as a statement
+///   separator, the same way it treats one inside a batch file.
+///
+/// Either way, a scheme that only defends against `cmd.exe`'s
 /// METACHARACTER scan cannot close this off — the character has to be
-/// gone before either quoting pass ever sees it (fork issue #423 review
-/// finding B1).
+/// gone before either quoting pass ever sees it.
 ///
 /// Replacing with a space, rather than stripping or rejecting outright, is
 /// the least-surprising per-operand choice: the value then reads exactly
 /// as if the caller had used a space there in the first place; `main`'s
-/// old `{:?}`-Debug-quoted format also mangled a real newline's content
-/// while keeping the line intact (via the two-character escape sequence
-/// `\n` rather than a space, so this is not byte-identical to `main`, but
-/// it is the same class of "content mangled, line count preserved"
-/// behavior); and stripping outright risks silently joining two words
-/// (`"foo\nbar"` -> `"foobar"`) that a space keeps apart.
+/// old `{:?}`-Debug-quoted format also mangled a control character's
+/// content while keeping the line intact (via a visible escape sequence
+/// like `\n` or `\u{1b}` rather than a space, so this is not
+/// byte-identical to `main`, but it is the same class of "content
+/// mangled, line count preserved" behavior); and stripping outright risks
+/// silently joining two words (`"foo\nbar"` -> `"foobar"`) that a space
+/// keeps apart. (Fork issue #423 review finding C2 considered rejecting
+/// the value outright instead — the strictly safer design, since it
+/// removes even the "two harmless lines merge into one harmful command"
+/// counterexample the auditor raised — but that changes user-visible
+/// behavior for callers beyond this fix's scope, so it was left as
+/// substitution; see the finding for the tradeoff.)
 #[cfg(windows)]
-fn sanitize_cmd_exe_newlines(s: &str) -> String {
-    s.replace(['\r', '\n'], " ")
+fn sanitize_cmd_exe_control_chars(s: &str) -> String {
+    s.replace(|c: char| c.is_control() && c != '\t', " ")
 }
 
 #[cfg(all(windows, test))]
@@ -445,7 +469,7 @@ mod windows_quoting_tests {
     /// before either quoting pass runs, rather than caret-escaping it,
     /// since neither `cmd.exe`'s own scan nor a typed-PTY submit can be
     /// stopped by a caret. The real-`cmd.exe` behavioral proof is
-    /// `watch_invocation_neutralizes_a_real_newline_through_real_cmd_exe`
+    /// `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
     /// in `mode_manager.rs`; this is the fast, deterministic companion pin.
     #[test]
     fn quote_cmd_exe_arg_replaces_a_real_newline_with_a_space() {
@@ -487,6 +511,34 @@ mod windows_quoting_tests {
         assert_eq!(
             escape_cmd_exe_program("C:\\a=b\\deck.exe"),
             "C:\\a^=b\\deck.exe"
+        );
+    }
+
+    /// Fork issue #423 review finding C1: `sanitize_cmd_exe_control_chars`
+    /// widened from CR/LF specifically (finding B1) to control characters
+    /// generally, because the Windows console's cooked-mode line editor
+    /// consumes `ESC` (clears the whole input buffer), `BS`/`DEL` (deletes
+    /// backwards) and `ETX` (cancels the line) as editing commands before
+    /// `cmd.exe`'s own grammar is ever consulted — the same "the character
+    /// has to be gone before either quoting pass ever sees it" argument B1
+    /// established, generalized to the whole class. `\t` is deliberately
+    /// exempt (existing `a\tb`-style behaviour is unaffected by this
+    /// change). This is the fast, deterministic string-level pin; the
+    /// real-`cmd.exe` proof — which can only exercise the `/C <string>`
+    /// delivery path, not the interactive-PTY console line editor a real
+    /// Windows console applies — is
+    /// `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
+    /// in `mode_manager.rs`.
+    #[test]
+    fn quote_cmd_exe_arg_replaces_other_control_characters_with_spaces() {
+        let quoted = quote_cmd_exe_arg("a\x1bb\x08c\x03d\te");
+        assert!(
+            !quoted.chars().any(|c| c.is_control() && c != '\t'),
+            "a control character other than tab survived quoting: {quoted:?}"
+        );
+        assert!(
+            quoted.contains('\t'),
+            "tab must survive, unlike every other control character: {quoted:?}"
         );
     }
 }
