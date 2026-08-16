@@ -2960,6 +2960,7 @@ mod tests {
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
                 shell_synthetic_working: false,
+                model: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -2995,6 +2996,7 @@ mod tests {
                 last_user_prompt: None,
                 live_target: None,
                 shell_synthetic_working: false,
+                model: None,
             }),
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
@@ -3162,6 +3164,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 

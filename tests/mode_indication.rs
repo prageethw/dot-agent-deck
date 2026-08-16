@@ -118,6 +118,7 @@ fn selected_card_fixture() -> SessionState {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     }
 }
 

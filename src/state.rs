@@ -34,6 +34,15 @@ const MAX_PENDING_KEPT_WORKTREES: usize = 64;
 /// snapshot) share this single source of truth.
 pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 
+/// PRD fork#378 reviewer/audit round 2 (MEDIUM 3 / F1 + F2): the display
+/// cap for `SessionState.model`. Mirrors `user_prompt`'s clamp at the hook
+/// seam (`src/hook.rs`'s `USER_PROMPT_MAX_LEN`) — `model` was the only
+/// free-text producer field in `build_event_typed` with no bound, and it
+/// sits BEFORE the card's own `· <id>` identity segment in
+/// `truncate_styled_segments`'s left-to-right title budget, so an unbounded
+/// model could push the identity off the title entirely.
+const MODEL_MAX_LEN: usize = 40;
+
 /// PRD #92 F9 followup-6: how long the post-respawn dispatch task
 /// waits for the freshly-spawned agent to emit a `SessionStart` hook
 /// event before falling back to writing the prompt anyway.
@@ -301,6 +310,19 @@ pub struct SessionSnapshot {
     /// "Protocol versioning" section of [`crate::daemon_protocol`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shell_synthetic_working: bool,
+    /// PRD fork#378 reviewer/audit round 2 (HIGH 1 / F8): the session's
+    /// known active model, mirroring [`SessionState::model`]. Without this
+    /// a reconnect (`dot-agent-deck connect`, or any TUI detach/reattach)
+    /// silently dropped the model — and because Claude Code posts `model`
+    /// only on `SessionStart`, `apply_event`'s `is_some()` guard never fires
+    /// again, so the badge stayed permanently degraded for the rest of that
+    /// session. Follows the `live_target` / `shell_synthetic_working`
+    /// precedent in this same struct (fork issue #21, PRD #20 blocker-4):
+    /// additive optional, so an older daemon sends nothing, which decodes to
+    /// `None` — exactly today's behavior — and needs no `PROTOCOL_VERSION`
+    /// bump. Restored by [`AppState::seed_hydrated_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +387,12 @@ pub struct SessionState {
     /// card permanently unrevertible, because the paired `ShellIdle` reads the
     /// marker, not the status.
     pub shell_synthetic_working: bool,
+    /// PRD fork#378: the agent's self-reported active model, mirrored from
+    /// [`AgentEvent::model`]. An event carrying `Some(m)` sets it (a later,
+    /// different `m` overwrites — the runtime-change path); an event
+    /// carrying `None` must NOT clear a previously-known model, since most
+    /// events don't carry one. `None` until the first event that does.
+    pub model: Option<String>,
 }
 
 impl SessionState {
@@ -397,6 +425,9 @@ impl SessionState {
             // reconnecting TUI's copy of this card stays revertible by the
             // paired `ShellIdle`.
             shell_synthetic_working: self.shell_synthetic_working,
+            // PRD fork#378 reviewer/audit round 2 (HIGH 1 / F8): carry the
+            // known model so a reconnect doesn't silently degrade the badge.
+            model: self.model.clone(),
         }
     }
 
@@ -3586,6 +3617,7 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
         agent_version: None,
         schema_version: None,
         live_target: Some(live_target),
+        model: None,
     }
 }
 
@@ -3884,6 +3916,7 @@ impl AppState {
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                model: None,
             },
         );
     }
@@ -3942,6 +3975,10 @@ impl AppState {
                 session.tool_count = snap.tool_count;
                 session.first_prompts = snap.first_prompts.clone();
                 session.last_user_prompt = snap.last_user_prompt.clone();
+                // PRD fork#378 reviewer/audit round 2 (HIGH 1 / F8): restore
+                // the known model. An older daemon's snapshot carries `None`,
+                // which is exactly today's (degraded) behavior.
+                session.model.clone_from(&snap.model);
                 // Fork issue #21: restore the PRD #370 synthetic-`Working`
                 // provenance alongside the status it qualifies. Dropping it
                 // stranded a card that reconnected mid-`ShellBusy` at
@@ -4754,6 +4791,25 @@ impl AppState {
         // the stable card id. This is the generation the daemon's send guard
         // compares against — see [`Self::pane_hook_session`].
         let incoming_session_id = event.session_id.clone();
+
+        // PRD fork#378 reviewer/audit round 2 (MEDIUM 3 / F1 + F2 + F5): sanitize
+        // and bound `model` HERE, on ingest, rather than only at the hook-binary
+        // seam (`src/hook.rs`). The daemon's hook socket also accepts a bare
+        // `AgentEvent` JSON line directly, bypassing the hook binary entirely,
+        // so a clamp there alone would not hold — this is the one path every
+        // producer (hook binary or direct socket) goes through. Sanitize
+        // (`Cf` format chars — bidi overrides, zero-width space, …; the class
+        // `src/terminal_sanitize.rs` exists for, issue #232) BEFORE truncating,
+        // so the length bound applies to what will actually render, not to
+        // hostile chars that would otherwise expand past it when escaped.
+        if let Some(model) = event.model.take() {
+            let sanitized = crate::terminal_sanitize::sanitize_for_terminal_display(&model);
+            event.model = Some(crate::prompt_delivery::truncate_on_char_boundary(
+                &sanitized,
+                MODEL_MAX_LEN,
+            ));
+        }
+
         // Only accept events from panes managed by our app.
         // Events without a pane_id (external agents) are rejected when we have
         // managed panes. Events with an unknown pane_id are rejected unless it
@@ -5321,6 +5377,7 @@ impl AppState {
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                model: event.model.clone(),
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -5370,6 +5427,13 @@ impl AppState {
 
         if event.cwd.is_some() {
             session.cwd.clone_from(&event.cwd);
+        }
+
+        // PRD fork#378: a later event's model overwrites a previously-known
+        // one; `None` (most events don't carry a model) leaves it untouched
+        // rather than clearing it — mirrored on `dashboard/agent-badge/004`.
+        if event.model.is_some() {
+            session.model.clone_from(&event.model);
         }
 
         if let Some(ref prompt) = event.user_prompt {
@@ -5630,6 +5694,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -5717,6 +5782,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -5737,6 +5803,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         // Even a report naming a DIFFERENT (stale) generation with a fresher
@@ -5796,6 +5863,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
         fn launcher(session: &str, secs: i64) -> AgentEvent {
@@ -7634,6 +7702,7 @@ clear = false
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
         for no_proof in [
@@ -7694,6 +7763,7 @@ clear = false
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -8003,6 +8073,7 @@ clear = false
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -8141,6 +8212,7 @@ clear = false
                 display_name: None,
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
+                model: None,
             },
         );
 

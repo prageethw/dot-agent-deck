@@ -1914,6 +1914,7 @@ fn surface_spawned_pane(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
 }
@@ -2248,6 +2249,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 

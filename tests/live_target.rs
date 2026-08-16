@@ -109,6 +109,7 @@ fn live_target_002_writability_survives_recent_event_eviction() {
             kind: dot_agent_deck::event::TargetKind::Process,
             writable: Writable::HistoryOnly,
         }),
+        model: None,
     });
 
     for offset in 1..=51 {
@@ -127,6 +128,7 @@ fn live_target_002_writability_survives_recent_event_eviction() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
     }
 
@@ -138,5 +140,50 @@ fn live_target_002_writability_survives_recent_event_eviction() {
         session.writable(),
         Writable::HistoryOnly,
         "evicting the declaring event from the 50-entry recent-events journal must not promote a history-only session to Live"
+    );
+}
+
+/// Scenario: PRD fork#378. Deserialize an `AgentEvent` payload lacking the
+/// `model` key and confirm it decodes as `None`; set `model` on a payload
+/// and confirm it survives a decode -> encode round trip unchanged; then
+/// confirm a `None` model is OMITTED from the wire on re-encode, never
+/// serialized as `null` — mirroring `agent_version`'s additive-field
+/// contract (src/event.rs) so an older peer decoding a newer payload, and a
+/// newer peer decoding an older one, both see exactly `None`.
+#[spec("protocol/agent-model/001")]
+#[test]
+fn agent_model_001_field_is_additive_and_round_trips() {
+    // A payload lacking `model` altogether must decode it as None.
+    let decoded: AgentEvent =
+        serde_json::from_value(event_payload()).expect("deserialize legacy AgentEvent");
+    assert!(
+        decoded.model.is_none(),
+        "a payload lacking model must decode it as None"
+    );
+
+    // A known model round-trips through decode -> encode unchanged.
+    let mut payload = event_payload();
+    payload["model"] = json!("gpt-5.1-codex-mini");
+    let decoded: AgentEvent =
+        serde_json::from_value(payload.clone()).expect("deserialize AgentEvent carrying a model");
+    assert_eq!(
+        decoded.model.as_deref(),
+        Some("gpt-5.1-codex-mini"),
+        "a payload carrying model must decode it as Some(..)"
+    );
+    let encoded = serde_json::to_value(decoded).expect("serialize AgentEvent");
+    assert_eq!(
+        encoded.get("model"),
+        payload.get("model"),
+        "a known model must survive a decode -> encode round trip"
+    );
+
+    // A None model must be OMITTED from the wire, not serialized as null.
+    let legacy: AgentEvent =
+        serde_json::from_value(event_payload()).expect("deserialize legacy AgentEvent");
+    let legacy_encoded = serde_json::to_value(legacy).expect("serialize legacy AgentEvent");
+    assert!(
+        legacy_encoded.get("model").is_none(),
+        "a None model must be omitted from the wire, not serialized as null: {legacy_encoded}"
     );
 }

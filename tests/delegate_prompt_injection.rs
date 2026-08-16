@@ -470,6 +470,7 @@ fn session_start_event(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     }
 }
 
