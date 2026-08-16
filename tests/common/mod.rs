@@ -2242,6 +2242,50 @@ pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
     })
 }
 
+/// Whether `label` appears inside the FIRST CONTENT ROW directly below one
+/// box's own top-border row — that box's first body line — cropped between
+/// that row's own vertical border glyphs of the SAME weight as the box.
+///
+/// PRD fork#405 M1 moved a session card's role-name identity off the
+/// title/border row onto its own unconditional first body row, directly
+/// beneath the title. This is the body-row sibling of
+/// [`label_in_box_top_border`]: same box-cropping technique (locate a row
+/// carrying one weight's top-left corner, require it to have a next row,
+/// crop THAT row between its own vertical glyphs of the same weight), shifted
+/// one row down instead of applied to the border row itself. Like its
+/// sibling, this does not align columns across the two rows beyond "same
+/// weight, adjacent row" — the same fidelity `label_in_box_top_border`
+/// already accepts.
+pub fn label_in_box_body_row(grid: &str, label: &str) -> bool {
+    let lines: Vec<&str> = grid.lines().collect();
+    lines.iter().enumerate().any(|(row, line)| {
+        BORDER_WEIGHTS.iter().any(|weight| {
+            if !line.chars().any(|ch| ch == weight.top_left) {
+                return false;
+            }
+            let Some(body_line) = lines.get(row + 1) else {
+                return false;
+            };
+            let body_chars: Vec<char> = body_line.chars().collect();
+            let Some(start) = body_chars.iter().position(|ch| *ch == weight.vertical) else {
+                return false;
+            };
+            let Some(end) = body_chars
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(index, ch)| (*ch == weight.vertical).then_some(index))
+            else {
+                return false;
+            };
+            body_chars[start..=end]
+                .iter()
+                .collect::<String>()
+                .contains(label)
+        })
+    })
+}
+
 /// Column of the orchestration tab's pane-column LEFT edge, in Unicode
 /// scalars, or `None` when no expanded orchestrator box is drawn.
 ///

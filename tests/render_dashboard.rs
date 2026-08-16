@@ -972,11 +972,22 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         height,
         true,
     );
-    let on_text = buffer_to_text(&on);
+    // PRD fork#405 M1: identity moved off the title row onto the first body
+    // row, so the old whole-buffer `"Codex · wrapped-01"` needle is
+    // row-scoped into two assertions — the badge in the title, the name on
+    // the body row — which is what actually pins *placement* rather than
+    // merely tolerating it.
+    let on_title = row_text(&on, 0);
+    let on_body0 = row_text(&on, 1);
     assert!(
-        on_text.contains("Codex · wrapped-01"),
-        "with the badge toggle on, a Codex card must show the \
-         `Codex · wrapped-01` identity segment:\n{on_text}"
+        on_title.contains("Codex") && !on_title.contains("wrapped-01"),
+        "with the badge toggle on, the title row must carry the `Codex` badge and NOT the \
+         identity:\n{on_title}"
+    );
+    assert!(
+        on_body0.contains("wrapped-01"),
+        "with the badge toggle on, the first body row must carry the identity \
+         `wrapped-01`:\n{on_body0}"
     );
     let on_has_bold_badge_cell = (0..on.area().height).any(|y| {
         (0..on.area().width)
@@ -1035,16 +1046,23 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         height,
         true,
     );
-    let on_model_text = buffer_to_text(&on_model);
+    // PRD fork#405 M1: row-scoped, same split as the no-model case above —
+    // the bracketed badge lives in the title, identity lives on the body row.
+    let on_model_title = row_text(&on_model, 0);
+    let on_model_body0 = row_text(&on_model, 1);
     assert!(
-        on_model_text.contains("Codex (Opus) · wrapped-01"),
+        on_model_title.contains("Codex (Opus)"),
         "with the badge toggle on, a Codex card with a known model must show \
-         `Codex (Opus) · wrapped-01`:\n{on_model_text}"
+         `Codex (Opus)` on the title row:\n{on_model_title}"
     );
     assert!(
-        !on_model_text.contains("Codex · wrapped-01"),
-        "once a model is known, the bare `Codex · wrapped-01` form must not \
-         also appear alongside the bracketed one:\n{on_model_text}"
+        !on_model_title.contains("wrapped-01"),
+        "the title row must never carry the identity, bracketed model or not:\n{on_model_title}"
+    );
+    assert!(
+        on_model_body0.contains("wrapped-01"),
+        "with the badge toggle on and a known model, the first body row must still carry the \
+         identity `wrapped-01`:\n{on_model_body0}"
     );
     let on_model_has_bold_badge_cell = (0..on_model.area().height).any(|y| {
         (0..on_model.area().width).any(|x| {
@@ -1063,11 +1081,16 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
     // from a short, stable list, everything else passes through unchanged.
     // No per-model lookup table, since vendor prefixes are stable but model
     // ids churn constantly.
-    let rendered_badge_with = |agent_type: AgentType, model: &str| -> String {
+    // PRD fork#405 M1: returns the Buffer (not pre-flattened text) so
+    // callers that need row-scoped placement checks (the empty-model loop
+    // below) can get them; callers that only care about the title's
+    // bracketed model text keep using `buffer_to_text` on the result, same
+    // as before.
+    let rendered_badge_with = |agent_type: AgentType, model: &str| -> ratatui::buffer::Buffer {
         let mut s = session.clone();
         s.agent_type = agent_type;
         s.model = Some(model.to_string());
-        let buf = render_card_for_mode_to_buffer(
+        render_card_for_mode_to_buffer(
             &s,
             None,
             Some(1),
@@ -1078,11 +1101,13 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
             width,
             height,
             true,
-        );
-        buffer_to_text(&buf)
+        )
     };
 
-    let text = rendered_badge_with(AgentType::ClaudeCode, "claude-sonnet-5");
+    let text = buffer_to_text(&rendered_badge_with(
+        AgentType::ClaudeCode,
+        "claude-sonnet-5",
+    ));
     assert!(
         text.contains("ClaudeCode (sonnet-5)"),
         "a `claude-` vendor prefix must be stripped from the displayed \
@@ -1093,27 +1118,27 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
         "the raw, unstripped model id must not also appear:\n{text}"
     );
 
-    let text = rendered_badge_with(AgentType::Codex, "gpt-5.1-codex-mini");
+    let text = buffer_to_text(&rendered_badge_with(AgentType::Codex, "gpt-5.1-codex-mini"));
     assert!(
         text.contains("Codex (5.1-codex-mini)"),
         "a `gpt-` vendor prefix must be stripped from the displayed \
          model:\n{text}"
     );
 
-    let text = rendered_badge_with(AgentType::Pi, "unknown-model-x");
+    let text = buffer_to_text(&rendered_badge_with(AgentType::Pi, "unknown-model-x"));
     assert!(
         text.contains("Pi (unknown-model-x)"),
         "a model id matching no known vendor prefix must pass through \
          unchanged:\n{text}"
     );
 
-    let text = rendered_badge_with(AgentType::ClaudeCode, "CLAUDE-Opus-4");
+    let text = buffer_to_text(&rendered_badge_with(AgentType::ClaudeCode, "CLAUDE-Opus-4"));
     assert!(
         text.contains("ClaudeCode (Opus-4)"),
         "vendor-prefix matching must be case-insensitive:\n{text}"
     );
 
-    let text = rendered_badge_with(AgentType::ClaudeCode, "claude-");
+    let text = buffer_to_text(&rendered_badge_with(AgentType::ClaudeCode, "claude-"));
     assert!(
         text.contains("ClaudeCode (claude-)"),
         "a model that is ONLY a vendor prefix must fall back to its raw \
@@ -1125,19 +1150,23 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
     );
 
     // PRD fork#378 reviewer/auditor round 2, item 2 (F4): an empty or
-    // whitespace-only model must render the bare `<Label> · <name>` form,
-    // never an empty `()` or a whitespace-padded one.
+    // whitespace-only model must render the bare `<Label>` badge with no
+    // bracket. PRD fork#405 M1: the identity half of the old
+    // `"ClaudeCode · wrapped-01"` needle is row-scoped — the bare badge
+    // stays on the title row, the identity now lives on the body row.
     for empty_model in ["", "   "] {
-        let text = rendered_badge_with(AgentType::ClaudeCode, empty_model);
+        let buf = rendered_badge_with(AgentType::ClaudeCode, empty_model);
+        let title = row_text(&buf, 0);
+        let body0 = row_text(&buf, 1);
         assert!(
-            text.contains("ClaudeCode · wrapped-01"),
-            "an empty/whitespace model {empty_model:?} must render the bare \
-             `ClaudeCode · wrapped-01` form:\n{text}"
+            title.contains("ClaudeCode") && !title.contains('('),
+            "an empty/whitespace model {empty_model:?} must render the bare `ClaudeCode` \
+             badge on the title row with no bracket:\n{title}"
         );
         assert!(
-            !text.contains('('),
-            "an empty/whitespace model {empty_model:?} must never render a \
-             bracket:\n{text}"
+            body0.contains("wrapped-01"),
+            "an empty/whitespace model {empty_model:?} must still carry the identity on the \
+             first body row:\n{body0}"
         );
     }
 
@@ -1185,12 +1214,19 @@ fn agent_badge_001_card_shows_registry_badge_only_when_enabled() {
             height,
             true,
         );
-        let on_text = buffer_to_text(&on);
-        let expected_segment = format!("{label} · {friendly_name}");
+        // PRD fork#405 M1: row-scoped — the badge label lives on the title
+        // row, the friendly name lives on the first body row.
+        let on_title = row_text(&on, 0);
+        let on_body0 = row_text(&on, 1);
         assert!(
-            on_text.contains(&expected_segment),
-            "with the toggle on, a named {agent_type:?} card must show \
-             `{expected_segment}`:\n{on_text}"
+            on_title.contains(label) && !on_title.contains(friendly_name),
+            "with the toggle on, a named {agent_type:?} card must show its `{label}` badge on \
+             the title row and NOT the friendly name there:\n{on_title}"
+        );
+        assert!(
+            on_body0.contains(friendly_name),
+            "with the toggle on, a named {agent_type:?} card must show its friendly name \
+             {friendly_name:?} on the first body row:\n{on_body0}"
         );
         let on_has_bold_badge_cell = (0..on.area().height).any(|y| {
             (0..on.area().width).any(|x| {
@@ -1351,10 +1387,17 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
         "a SessionStart carrying model:Some(\"Opus\") must set SessionState.model"
     );
     let buffer = render(&session, density, width, height);
-    let text = buffer_to_text(&buffer);
+    // PRD fork#405 M1: row-scoped — the bracketed badge lives on the title
+    // row, identity lives on the first body row.
+    let title = row_text(&buffer, 0);
+    let body0 = row_text(&buffer, 1);
     assert!(
-        text.contains("ClaudeCode (Opus) · runtime-01"),
-        "the badge must render the initial model:\n{text}"
+        title.contains("ClaudeCode (Opus)"),
+        "the badge must render the initial model on the title row:\n{title}"
+    );
+    assert!(
+        body0.contains("runtime-01"),
+        "identity must still render on the first body row:\n{body0}"
     );
 
     // A later event with a DIFFERENT model overwrites it.
@@ -1371,9 +1414,15 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
     let buffer = render(&session, density, width, height);
     let text = buffer_to_text(&buffer);
+    let title = row_text(&buffer, 0);
+    let body0 = row_text(&buffer, 1);
     assert!(
-        text.contains("ClaudeCode (Haiku) · runtime-01"),
-        "the badge must update to the new model:\n{text}"
+        title.contains("ClaudeCode (Haiku)"),
+        "the badge must update to the new model on the title row:\n{title}"
+    );
+    assert!(
+        body0.contains("runtime-01"),
+        "identity must still render on the first body row:\n{body0}"
     );
     assert!(
         !text.contains("Opus"),
@@ -1393,10 +1442,16 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
         "an event carrying no model must NOT clear a previously-known model"
     );
     let buffer = render(&session, density, width, height);
-    let text = buffer_to_text(&buffer);
+    let title = row_text(&buffer, 0);
+    let body0 = row_text(&buffer, 1);
     assert!(
-        text.contains("ClaudeCode (Haiku) · runtime-01"),
-        "the badge must keep showing the last-known model after a modelless event:\n{text}"
+        title.contains("ClaudeCode (Haiku)"),
+        "the badge must keep showing the last-known model on the title row after a modelless \
+         event:\n{title}"
+    );
+    assert!(
+        body0.contains("runtime-01"),
+        "identity must still render on the first body row:\n{body0}"
     );
 
     let has_bold_badge_cell = (0..buffer.area().height).any(|y| {
@@ -1412,22 +1467,33 @@ fn agent_badge_004_model_updates_at_runtime_and_none_does_not_clear() {
     );
 }
 
-/// Scenario: PRD fork#378 reviewer/auditor round 2 (MEDIUM 3 / F1 + F2):
-/// apply a `SessionStart` `AgentEvent` whose model is a 300-character
-/// multi-byte (CJK) string followed by a distinctive tail marker, through
-/// the real `AppState::apply_event` seam, then render the card with the
-/// badge toggle on. The badge is the only free-text producer field in
-/// `build_event_typed` with no clamp, and it sits BEFORE the `· <id>`
-/// identity segment in `truncate_styled_segments`'s left-to-right budget —
-/// so today an unbounded model consumes the whole title and pushes the
-/// identity off entirely. The raw tail marker must not survive to the
-/// render (a bounded model was truncated), and the identity segment must
-/// still be visible. The 300 chars are all 3-byte UTF-8 characters, so any
-/// truncation implemented as a byte-index slice rather than a char-boundary
-/// one panics this test rather than merely failing an assertion.
+/// Scenario: PRD fork#378 reviewer/auditor round 2 (MEDIUM 3 / F1 + F2),
+/// premise rewritten by PRD fork#405 M1. Apply a `SessionStart` `AgentEvent`
+/// whose model is a 300-character multi-byte (CJK) string followed by a
+/// distinctive tail marker, through the real `AppState::apply_event` seam,
+/// then render the card with the badge toggle on. Originally this test
+/// existed because the badge (no clamp of its own) sat BEFORE the `· <id>`
+/// identity segment in `truncate_styled_segments`'s shared left-to-right
+/// title budget, so an unbounded model could consume the whole title and
+/// push identity off it — that was the actual defect fork#378 fixed and
+/// this test pinned. PRD fork#405 M1 moves identity off the title row
+/// entirely, onto its own unconditional body row with its own width budget
+/// (the full card inner width, not a slice of the title). Identity can no
+/// longer be pushed off by ANY title content, unbounded model included — not
+/// because it survives a truncation race, but because it is no longer in
+/// that race at all. This test is rewritten to assert exactly that
+/// structural immunity, rather than re-pointing the needle at a body row
+/// and calling it done, which would keep the OLD assertion's shape
+/// (identity "survives" competition) even though there is no longer any
+/// competition to survive. The truncation cap itself — the raw tail marker
+/// must not survive to the render — is retained and asserted on the title
+/// row, since that half of fork#378's defect is unrelated to M1 and still
+/// real. The 300 chars are all 3-byte UTF-8 characters, so any truncation
+/// implemented as a byte-index slice rather than a char-boundary one panics
+/// this test rather than merely failing an assertion.
 #[spec("dashboard/agent-badge/005")]
 #[test]
-fn agent_badge_005_long_model_is_bounded_and_identity_survives() {
+fn agent_badge_005_long_model_cannot_starve_the_identity_row() {
     let mut state = AppState::default();
     state.register_pane("pane-badge-long".to_string());
     let started = chrono::Utc::now();
@@ -1472,6 +1538,8 @@ fn agent_badge_005_long_model_is_bounded_and_identity_survives() {
         true,
     );
     let text = buffer_to_text(&buffer);
+    let title = row_text(&buffer, 0);
+    let body0 = row_text(&buffer, 1);
 
     assert!(
         !text.contains("TAIL-MARKER-ZZZZ"),
@@ -1479,9 +1547,14 @@ fn agent_badge_005_long_model_is_bounded_and_identity_survives() {
          raw tail of a 300-char model must not survive to the render:\n{text}"
     );
     assert!(
-        text.contains("· long-id-01"),
-        "the card's own identity segment must survive a long model, not be \
-         pushed off the title budget by an unbounded badge segment:\n{text}"
+        !title.contains("long-id-01"),
+        "the title row must never carry identity at all, long model or not — it moved to the \
+         body row (PRD fork#405 M1):\n{title}"
+    );
+    assert!(
+        body0.contains("long-id-01"),
+        "the identity row must show the full session id regardless of how long the model \
+         badge is, since it has its own width budget and shares none with the title:\n{body0}"
     );
 }
 
@@ -2501,6 +2574,212 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
     );
 }
 
+/// Extract row `y` of `buffer` as a plain string, one visual cell per
+/// character. PRD fork#405 M1 moves the role name from the card's border
+/// title (row 0) onto the card's first BODY row — the whole point of the
+/// change is *placement*, so a whole-buffer `contains` would pass just as
+/// happily with the name still in the title. Row-scoping is what actually
+/// pins the new layout.
+fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    let area = buffer.area();
+    (0..area.width)
+        .map(|x| buffer[(x, y)].symbol().to_string())
+        .collect()
+}
+
+/// The foreground color of `needle`'s first character within row `y` of
+/// `buffer`. Panics if `needle` isn't found on that row, by design: callers
+/// assert placement (the row contains the needle) before calling this, so a
+/// panic here means that placement assertion should have already failed —
+/// this makes a missing-row bug surface as a clear panic message rather than
+/// silently reading the wrong cell.
+fn row_needle_fg(buffer: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Color {
+    let row = row_text(buffer, y);
+    let byte_start = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not found on row {y}: {row:?}"));
+    let col = row[..byte_start].chars().count() as u16;
+    buffer[(col, y)].fg
+}
+
+/// Scenario: PRD fork#405 M1. Render the same ClaudeCode/Opus session with
+/// the agent-type badge toggle ON and OFF. Badge ON: the title row (row 0)
+/// must carry `ClaudeCode (Opus)` and must NOT carry the display name; the
+/// first body row (row 1) must carry the display name in
+/// `palette::ROLE_NAME` (`Color::Indexed(130)`). Badge OFF (the default):
+/// the title row must carry neither the badge nor the name, while the body
+/// row must STILL carry the name in the same colour — the unconditional
+/// half, and the single most likely thing to regress, so it is asserted
+/// explicitly and independently of the badge-on case. Also asserts
+/// `Color::Indexed(130)` is distinct from every status role colour and every
+/// registry `badge_color`, and that a card with `display_name: None` falls
+/// back to `id_display` on the same row. Snapshots the badge-on/badge-off
+/// pair with `buffer_to_color_text` so a future colour or placement
+/// regression shows up as a snapshot diff too.
+#[spec("dashboard/pane/011")]
+#[test]
+fn pane_011_role_name_on_its_own_body_row() {
+    // PRD fork#405 M1: `palette::ROLE_NAME` does not exist yet (the coder
+    // adds `pub const ROLE_NAME: Color = Color::Indexed(130);` to
+    // src/palette.rs in the same change that moves the row). Referencing it
+    // here would stop this whole test crate compiling, which would make
+    // every other test's result unreadable rather than RED — so this test
+    // uses the literal value instead. `palette::ROLE_NAME` is the constant
+    // the coder must introduce; once it exists, this literal is what it
+    // must equal.
+    const ROLE_NAME: Color = Color::Indexed(130);
+
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "sess-role-line-01".to_string(), // >11 chars: exercises truncation elsewhere, not this fixture's own fallback path
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Working,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("pane-role-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: Some("example-coder".to_string()),
+        pending_permission_tool: None,
+        shell_synthetic_working: false,
+        model: Some("Opus".to_string()),
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    // Height comes from the density tier itself (not a hardcoded number) so
+    // this test's buffer geometry tracks `card_height()` automatically once
+    // the coder updates it — the same convention `pane_004`/`pane_006` use.
+    let height = density.rendered_height();
+
+    // --- Badge ON ---------------------------------------------------------
+    let on = render_card_for_mode_to_buffer(
+        &session,
+        Some("example-coder"),
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        true, // show_agent_type_badge
+    );
+    let on_title = row_text(&on, 0);
+    let on_body0 = row_text(&on, 1);
+    assert!(
+        on_title.contains("ClaudeCode (Opus)"),
+        "badge ON: the title row must carry the type/model badge:\n{on_title}"
+    );
+    assert!(
+        !on_title.contains("example-coder"),
+        "badge ON: the title row must NOT carry the display name — identity moved to the body \
+         row:\n{on_title}"
+    );
+    assert!(
+        on_body0.contains("example-coder"),
+        "badge ON: the first body row must carry the display name:\n{on_body0}"
+    );
+    assert_eq!(
+        row_needle_fg(&on, 1, "example-coder"),
+        ROLE_NAME,
+        "badge ON: the display name on the body row must render in palette::ROLE_NAME \
+         (Color::Indexed(130))"
+    );
+
+    // --- Badge OFF (the default) ------------------------------------------
+    // This is the unconditional half: the role row must NOT ride the same
+    // Ctrl+M toggle the model/badge segment does.
+    let off = render_card_for_mode_to_buffer(
+        &session,
+        Some("example-coder"),
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false, // show_agent_type_badge
+    );
+    let off_title = row_text(&off, 0);
+    let off_body0 = row_text(&off, 1);
+    assert!(
+        !off_title.contains("ClaudeCode") && !off_title.contains("example-coder"),
+        "badge OFF: the title row must carry neither the badge nor the name:\n{off_title}"
+    );
+    assert!(
+        off_body0.contains("example-coder"),
+        "badge OFF: the first body row must STILL carry the display name — this row is \
+         unconditional, it does not ride the badge toggle:\n{off_body0}"
+    );
+    assert_eq!(
+        row_needle_fg(&off, 1, "example-coder"),
+        ROLE_NAME,
+        "badge OFF: the display name on the body row must still render in palette::ROLE_NAME \
+         even though the title's badge is hidden"
+    );
+
+    insta::assert_snapshot!("pane_011_role_name_badge_on", buffer_to_color_text(&on));
+    insta::assert_snapshot!("pane_011_role_name_badge_off", buffer_to_color_text(&off));
+
+    // --- Colour distinctness ------------------------------------------------
+    for (status, role_color) in status_role_colors() {
+        assert_ne!(
+            ROLE_NAME, role_color,
+            "palette::ROLE_NAME must be distinct from the {status:?} status role colour \
+             {role_color:?}"
+        );
+    }
+    for agent_type in [
+        AgentType::ClaudeCode,
+        AgentType::OpenCode,
+        AgentType::Pi,
+        AgentType::Codex,
+        AgentType::Devin,
+        AgentType::None,
+    ] {
+        let badge_color = dot_agent_deck::agent_registry::spec(&agent_type).badge_color;
+        assert_ne!(
+            ROLE_NAME, badge_color,
+            "palette::ROLE_NAME must be distinct from {agent_type:?}'s registry badge_color \
+             {badge_color:?}"
+        );
+    }
+
+    // --- id_display fallback -------------------------------------------------
+    let mut unnamed = session.clone();
+    unnamed.display_name = None;
+    unnamed.session_id = "sess-role-line-01".to_string(); // 18 chars, truncates to 11
+    let unnamed_buf = render_card_for_mode_to_buffer(
+        &unnamed,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false,
+    );
+    let unnamed_body0 = row_text(&unnamed_buf, 1);
+    assert!(
+        unnamed_body0.contains("sess-role-l"), // first 11 chars of the session id
+        "a card with display_name: None must fall back to id_display on the identity row:\n\
+         {unnamed_body0}"
+    );
+    assert_eq!(
+        row_needle_fg(&unnamed_buf, 1, "sess-role-l"),
+        ROLE_NAME,
+        "the id_display fallback must still render in palette::ROLE_NAME"
+    );
+}
+
 /// Build one event-rich session fixture that fills `render_session_card`
 /// to capacity at every density tier: three user prompts (Spacious shows 3,
 /// Normal/Compact show the latest 1) and three `ToolStart` events
@@ -2683,10 +2962,14 @@ fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
 /// (`visible_rows = available / card_height`) for 7 decks; assert all 7 fit
 /// without scrolling and that the 7th deck actually renders in the visible
 /// slice, while a much larger deck count still engages scrolling. This locks in
-/// PRD #147: with the content-derived Compact height of 5, 48 / 5 = 9 rows fit
-/// so all 7 decks show. Before #147 the hardcoded Compact height of 7 fit only
-/// 48 / 7 = 6 rows, dropping the 7th deck to a scroll — the regression this
-/// test guards against.
+/// PRD #147: with the content-derived Compact height of 6 (PRD fork#405 M1
+/// added the unconditional role-name row, moving Compact height 5 → 6),
+/// 48 / 6 = 8 rows fit so all 7 decks show. Before #147 the hardcoded Compact
+/// height of 7 fit only 48 / 7 = 6 rows, dropping the 7th deck to a scroll —
+/// the regression this test guards against. PRD fork#405 M1 also spends this
+/// test's last margin: 48 / 7 = 6 < 7, so height 6 is now the LARGEST Compact
+/// height that still satisfies it — the next content row anyone adds to a
+/// card breaks this test, and there is no more slack to absorb it.
 #[spec("orchestration/layout/001")]
 #[test]
 fn layout_001_seven_decks_fit_single_column() {
