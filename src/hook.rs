@@ -33,6 +33,23 @@ struct ClaudeCodeHookInput {
     // unexpected `source` shape, not just lose the field.
     #[serde(default, deserialize_with = "lenient_string")]
     source: Option<String>,
+    // PRD fork#378: the agent's active model, posted top-level (Codex posts
+    // the same Claude-compatible stdin shape — see
+    // tests/codex_hook_ingestion.rs's schema-accurate `model` key). A NAMED
+    // field, not routed through `_extra`/`metadata` (see the constraint on
+    // that passthrough in `build_event_typed` below).
+    //
+    // Reviewer/auditor round 2 (MEDIUM 4 / F3): a strict `Option<String>`
+    // failed the WHOLE decode on a non-string `model` (object, number,
+    // bool, array) — before this field existed, any shape there landed
+    // harmlessly in `_extra` and was ignored. `handle_hook` swallows a
+    // decode error silently (`Err(_) => return ExitCode::SUCCESS`), so that
+    // was a total status blackout for the agent, not just a lost model.
+    // `lenient_model` degrades an unexpected shape to `None` instead,
+    // matching `EventType`'s `#[serde(other)]` catch-all and
+    // `codex_shell_command`'s "degrades gracefully" contract.
+    #[serde(default, deserialize_with = "lenient_model")]
+    model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
 }
@@ -54,8 +71,23 @@ struct OpenCodeHookInput {
     status: Option<String>,
     cwd: Option<String>,
     prompt: Option<String>,
+    // PRD fork#378: mirrors ClaudeCodeHookInput's `model` field, in case a
+    // future OpenCode payload carries one; `None` today. See that field's
+    // doc comment for why this is `lenient_model` rather than a strict
+    // `Option<String>`.
+    #[serde(default, deserialize_with = "lenient_model")]
+    model: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
+}
+
+/// A non-string `model` (object, number, bool, array) degrades to `None`
+/// rather than failing the whole payload decode. `null` and a missing key
+/// already decode to `None` via `#[serde(default)]`; this only widens the
+/// tolerance to non-string, non-null shapes. See the field doc comments on
+/// [`ClaudeCodeHookInput::model`] / [`OpenCodeHookInput::model`].
+fn lenient_model<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
@@ -328,6 +360,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_use_id,
         prompt,
         source,
+        model,
         _extra: extra,
     } = input;
 
@@ -466,6 +499,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model,
     })
 }
 
@@ -539,6 +573,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: input.model,
     })
 }
 
@@ -1280,6 +1315,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1301,6 +1337,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1320,6 +1357,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
@@ -1336,6 +1374,7 @@ mod tests {
             tool_use_id: None,
             prompt: Some("fix the login bug".into()),
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1355,6 +1394,7 @@ mod tests {
             tool_use_id: None,
             prompt: Some(long_prompt),
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1399,6 +1439,57 @@ mod tests {
         let hook_input: ClaudeCodeHookInput =
             serde_json::from_str(payload).expect("a null source must decode fine");
         assert!(hook_input.source.is_none());
+    }
+
+    /// Scenario: PRD fork#378 reviewer/auditor round 2 (MEDIUM 4 / F3): a
+    /// hook payload whose `model` key is a JSON object, a number, or a bool
+    /// — instead of a string — must not fail the whole decode. Before the
+    /// `model` field existed, any JSON shape there landed harmlessly in
+    /// `#[serde(flatten)] _extra` and was ignored; now it is a strictly
+    /// typed `Option<String>`, so `serde_json::from_str::<ClaudeCodeHookInput>`
+    /// errors on the whole payload, and `handle_hook` silently swallows that
+    /// error (`Err(_) => return ExitCode::SUCCESS`) with no diagnostic —
+    /// a total, silent status blackout for that agent, not just a lost
+    /// model. This is realistic: this repo's own `src/devin_hooks_manage.rs`
+    /// writes `"agent": {"model": "opus"}` (a nested shape), and OpenCode
+    /// addresses models as provider+model pairs. A non-string model must
+    /// instead degrade to `model: None` while every other field — including
+    /// `session_id`, the event type, and the tool name — survives intact.
+    /// `null` already works today (`Option` absorbs it) and must keep
+    /// working.
+    #[spec("protocol/agent-model/002")]
+    #[test]
+    fn agent_model_002_non_string_model_does_not_drop_the_event() {
+        for (label, model_json) in [
+            ("object", r#"{"provider":"anthropic","id":"opus"}"#),
+            ("number", "4"),
+            ("bool", "true"),
+            ("array", r#"["opus"]"#),
+        ] {
+            let payload = format!(
+                r#"{{"session_id":"test-123","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{{"file_path":"/src/main.rs"}},"model":{model_json}}}"#
+            );
+            let hook_input: ClaudeCodeHookInput =
+                serde_json::from_str(&payload).unwrap_or_else(|e| {
+                    panic!("a non-string ({label}) model must not fail the whole decode: {e}")
+                });
+            assert!(
+                hook_input.model.is_none(),
+                "a non-string ({label}) model must degrade to None, not a decode error"
+            );
+            let event = build_event(hook_input)
+                .expect("the rest of the event must survive a non-string model");
+            assert_eq!(event.session_id, "test-123");
+            assert_eq!(event.event_type, EventType::ToolStart);
+            assert_eq!(event.tool_name.as_deref(), Some("Read"));
+            assert!(event.model.is_none());
+        }
+
+        // `null` already works and must keep working.
+        let payload = r#"{"session_id":"test-123","hook_event_name":"SessionStart","model":null}"#;
+        let hook_input: ClaudeCodeHookInput =
+            serde_json::from_str(payload).expect("a null model must decode fine");
+        assert!(hook_input.model.is_none());
     }
 
     #[test]
@@ -2236,6 +2327,7 @@ mod tests {
             status: None,
             cwd: Some("/tmp".into()),
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();
@@ -2255,6 +2347,7 @@ mod tests {
             status: None,
             cwd: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();
@@ -2273,6 +2366,7 @@ mod tests {
             status: None,
             cwd: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         assert!(build_opencode_event(input).is_none());
@@ -2332,6 +2426,7 @@ mod tests {
                 tool_use_id: None,
                 prompt: None,
                 source: None,
+                model: None,
                 _extra: extra,
             }
         };
@@ -2373,6 +2468,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         })
         .expect("SessionStart maps to an event");
@@ -2398,6 +2494,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: source.map(str::to_string),
+            model: None,
             _extra: HashMap::new(),
         };
 
@@ -2487,6 +2584,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2515,6 +2613,7 @@ mod tests {
             tool_input: None,
             prompt: None,
             status: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();
@@ -2540,6 +2639,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2565,6 +2665,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2582,6 +2683,7 @@ mod tests {
             tool_use_id: None,
             prompt: None,
             source: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2599,6 +2701,7 @@ mod tests {
             status: None,
             cwd: None,
             prompt: None,
+            model: None,
             _extra: HashMap::new(),
         };
         let event = build_opencode_event(input).unwrap();

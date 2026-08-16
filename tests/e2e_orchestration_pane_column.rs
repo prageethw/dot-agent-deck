@@ -589,9 +589,10 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     // fails the test. Narrowing it to the border title would make it harder to
     // trip and so WEAKEN the check; a spoofed display name could only ever
     // cause a false FAILURE here, never a false pass.
-    let zoomed_in_pane_input = deck
-        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
-            find_pane_box_left_edge(grid, "orchestrator").is_some_and(|e| e <= 1) || grid.contains(ZOOM_MARKER)
+    let zoomed_in_pane_input =
+        deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            find_pane_box_left_edge(grid, "orchestrator").is_some_and(|e| e <= 1)
+                || grid.contains(ZOOM_MARKER)
         });
     assert!(
         !zoomed_in_pane_input,
@@ -608,7 +609,8 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        find_pane_box_left_edge(grid, "orchestrator") == Some(0) && role_border_title_marked(grid, "orchestrator")
+        find_pane_box_left_edge(grid, "orchestrator") == Some(0)
+            && role_border_title_marked(grid, "orchestrator")
     });
     assert!(
         zoomed,

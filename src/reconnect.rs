@@ -478,9 +478,7 @@ async fn apply_broadcast(state: &SharedState, msg: BroadcastMsg) {
         // `list_agents` at hydration and reconciled by the ordinary event
         // flow, so a message it cannot read costs it nothing it can name.
         BroadcastMsg::Unknown => {
-            tracing::debug!(
-                "subscribe_events: ignoring a broadcast kind this build does not know"
-            );
+            tracing::debug!("subscribe_events: ignoring a broadcast kind this build does not know");
         }
     }
 }

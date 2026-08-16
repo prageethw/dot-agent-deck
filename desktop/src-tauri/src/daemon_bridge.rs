@@ -2883,6 +2883,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         })
     }
 
@@ -2993,6 +2994,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }));
         let _ = snapshot_with(&endpoint, &links, Some(&mut view)).await;
 
@@ -3210,6 +3212,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         })
     }
 

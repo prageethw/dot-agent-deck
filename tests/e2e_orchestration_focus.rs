@@ -132,6 +132,7 @@ fn inject_role_status(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
     common::write_hook_line(deck.hook_socket_path(), &line)

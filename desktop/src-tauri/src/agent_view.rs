@@ -457,6 +457,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -648,6 +649,7 @@ mod tests {
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
             shell_synthetic_working: false,
+            model: None,
         });
 
         let mut view = AgentView::default();
@@ -688,6 +690,7 @@ mod tests {
             live_target: None,
             last_activity_ms: Some(1_700_000_000_000),
             shell_synthetic_working: false,
+            model: None,
         });
 
         let mut view = AgentView::default();

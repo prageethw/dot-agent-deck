@@ -67,6 +67,7 @@ fn thinking_event(pane_id: &str, agent_id: &str, user_prompt: Option<&str>) -> A
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     }
 }
 

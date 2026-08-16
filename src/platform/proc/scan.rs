@@ -605,9 +605,9 @@ pub(crate) fn invalidate_unconfirmed_session_ids(rows: &mut [ProcessInfo], confi
         }
     }
     for row in rows.iter_mut() {
-        let confirmed = identity
-            .get(&row.pid)
-            .is_some_and(|(ppid, has_tty)| *ppid == row.ppid && row.has_controlling_tty == *has_tty);
+        let confirmed = identity.get(&row.pid).is_some_and(|(ppid, has_tty)| {
+            *ppid == row.ppid && row.has_controlling_tty == *has_tty
+        });
         if !confirmed {
             row.session_id = -1;
             row.session_leader = false;

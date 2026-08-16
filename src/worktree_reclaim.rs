@@ -55,7 +55,6 @@ use crate::worktree_owner::{OWNER_MARKER_FILENAME, path_from_bytes, trim_trailin
 /// this one.
 pub const SCHEMA_VERSION: u32 = 2;
 
-
 /// Resolved PR state for a worktree's branch, or why it could not be
 /// resolved. `Unresolvable` and `NoPr` both keep — the distinction is only
 /// for the reported reason.

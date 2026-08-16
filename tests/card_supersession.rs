@@ -45,6 +45,7 @@ fn event_on_pane(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     }
 }
 

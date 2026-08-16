@@ -2085,6 +2085,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 shell_synthetic_working: false,
+                model: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is

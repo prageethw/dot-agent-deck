@@ -4443,6 +4443,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -5174,6 +5175,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -5337,6 +5339,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }
         }
 
@@ -5844,6 +5847,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 shell_synthetic_working: false,
+                model: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -5880,6 +5884,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 shell_synthetic_working: false,
+                model: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -5954,6 +5959,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             orchestration_orphaned: false,
+            model: None,
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -6537,6 +6543,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 
