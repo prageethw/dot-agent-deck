@@ -162,20 +162,7 @@ pub fn escape_cmd_exe_program(token: &str) -> String {
     for c in token.chars() {
         if matches!(
             c,
-            ' ' | '\t'
-                | '"'
-                | '^'
-                | '&'
-                | '|'
-                | '<'
-                | '>'
-                | '('
-                | ')'
-                | ','
-                | ';'
-                | '='
-                | '%'
-                | '!'
+            ' ' | '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | ';' | '=' | '%' | '!'
         ) {
             result.push('^');
         }
