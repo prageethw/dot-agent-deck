@@ -1043,4 +1043,60 @@ mod tests {
             "a newly-created destination must be owner-only, not umask-dependent"
         );
     }
+
+    /// Fork issue #238: `codex_home()` (`:122-130`) is deliberately,
+    /// documentedly reachable on Windows via `$CODEX_HOME` — unlike
+    /// `devin_hooks_manage::devin_config_dir` (`:130-142`), which is
+    /// `#[cfg(not(unix))] { None }` and so cannot resolve off Unix at all.
+    /// Codex hook installation is therefore meant to work on Windows; this
+    /// pins that `build_command`'s quoting must actually be correct there,
+    /// not merely reachable-but-broken. `build_command` still calls
+    /// `platform::paths::shell_quote_if_needed` (`:165`), which is POSIX
+    /// single-quoting with no `cmd.exe` arm at all (unlike
+    /// `hooks_manage::shell_quote_if_needed`, which gained one in fork
+    /// #229).
+    ///
+    /// Verified against a real `cmd.exe`, the same way fork #283's
+    /// `watch_invocation` tests are: a stub batch file living under a path
+    /// with `~` and a space (the exact `RUNNER~1`-style hazard #229 fixed
+    /// for `hooks_manage`) must actually be located and run by the command
+    /// `build_command` produces.
+    ///
+    /// RED today: `shell_quote_if_needed`'s safe set has no `~` and quoting
+    /// falls back to POSIX single-quotes, which `cmd.exe` treats as an
+    /// ordinary literal character rather than a quote — so `cmd.exe` looks
+    /// for a program literally named `'C:\...\RUNNER~1` (split at the space)
+    /// and the stub never runs.
+    #[cfg(windows)]
+    #[test]
+    fn build_command_quotes_a_windows_hazardous_path_so_cmd_exe_locates_it() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let hazard_dir = scratch.path().join("RUNNER~1 Deck");
+        std::fs::create_dir_all(&hazard_dir).expect("create hazardous dir");
+        let stub = hazard_dir.join("dot-agent-deck.bat");
+        std::fs::write(&stub, "@echo off\r\ntype nul > \"ran.marker\"\r\n")
+            .expect("write stub batch file");
+        let marker = scratch.path().join("ran.marker");
+
+        let command = build_command(stub.to_str().expect("utf8 stub path"));
+
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/C")
+            .raw_arg(&command)
+            .current_dir(scratch.path())
+            .output()
+            .expect("cmd.exe should run");
+
+        assert!(
+            marker.exists(),
+            "cmd.exe never located the hazardous-path stub — build_command \
+             is still using platform::paths::shell_quote_if_needed's POSIX \
+             single-quoting, which cmd.exe does not honor (issue #238).\n\
+             command: {command}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

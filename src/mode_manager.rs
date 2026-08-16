@@ -749,4 +749,99 @@ mod tests {
             format!(r"C:\deck\dot-agent-deck.exe watch --interval 5 {command:?}")
         );
     }
+
+    /// Fork issue #283's "done looks like" bar: the finding A1 exploit
+    /// round-tripped through a REAL `cmd.exe`, not merely inspected as a
+    /// generated string (which is what
+    /// `watch_invocation_reproduces_mains_a1_vulnerability_on_windows` above
+    /// deliberately pins as the still-vulnerable baseline). The command is
+    /// delivered to `cmd.exe` via `raw_arg`, which — unlike `Command::args`
+    /// (see `platform::proc::windows::tests::spawn_helper_tree`'s comment on
+    /// why individual args are used instead of one string) — adds none of
+    /// Rust's own quoting, so `cmd.exe` receives byte-for-byte what a watch
+    /// pane's typed command line would. A benign marker-file write stands in
+    /// for the exploit's `calc.exe` so a passing assertion needs no GUI
+    /// process spawned on CI.
+    ///
+    /// RED today: `{:?}` is Rust `Debug` escaping, not a `cmd.exe` grammar —
+    /// `cmd.exe` does not treat a backslash before `"` as an escape, so the
+    /// embedded `\"` still closes the quoted word early and the injected
+    /// `& type nul > injected.marker &` runs as its own, unquoted command.
+    #[cfg(windows)]
+    #[test]
+    fn watch_invocation_prevents_a1_command_injection_through_real_cmd_exe() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let marker = scratch.path().join("injected.marker");
+
+        let exe = scratch.path().join("dot-agent-deck.exe");
+        // Exactly the finding A1 exploit shape (`echo ok" & calc.exe & rem
+        // "`), with the payload swapped for a marker-file write so a passing
+        // "nothing was injected" assertion needs no GUI process.
+        let command = r#"echo ok" & type nul > injected.marker & rem ""#;
+        let line = watch_invocation(&exe, 5, command);
+
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/C")
+            .raw_arg(&line)
+            .current_dir(scratch.path())
+            .output()
+            .expect("cmd.exe should run");
+
+        assert!(
+            !marker.exists(),
+            "the A1 payload's `& type nul > injected.marker &` escaped \
+             quoting and ran as a separate cmd.exe command.\nline: {line}\n\
+             stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Position-aware quoting's other half: the EXECUTABLE token is located by
+    /// `cmd.exe`'s own quote-based space-protection at the head of the line —
+    /// a different rule from the CRT/argv-style escaping the command argument
+    /// needs (fork issue #283's "why a correct implementation is not a
+    /// mechanical change"). Verified against real `cmd.exe`: a stub batch
+    /// file living under a spaced directory must actually be located and run,
+    /// not just string-compared against an expected quoting.
+    ///
+    /// RED today: `watch_invocation`'s Windows arm emits `exe.display()` bare
+    /// (issue #157's original executable-quoting regression, still present on
+    /// Windows — `quote_shell_arg` has no `cmd.exe` arm to apply here).
+    /// `cmd.exe` takes everything up to the first unquoted space as the
+    /// program name, so it looks for a program literally named up to
+    /// `...\My` and never reaches the stub — the marker is never written.
+    #[cfg(windows)]
+    #[test]
+    fn watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let spaced_dir = scratch.path().join("My Deck");
+        std::fs::create_dir_all(&spaced_dir).expect("create spaced dir");
+        let stub = spaced_dir.join("dot-agent-deck.bat");
+        std::fs::write(&stub, "@echo off\r\ntype nul > \"ran.marker\"\r\n")
+            .expect("write stub batch file");
+        let marker = scratch.path().join("ran.marker");
+
+        let line = watch_invocation(&stub, 5, "npm run dev");
+
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/C")
+            .raw_arg(&line)
+            .current_dir(scratch.path())
+            .output()
+            .expect("cmd.exe should run");
+
+        assert!(
+            marker.exists(),
+            "cmd.exe never located the spaced-path stub, so the executable \
+             position is not correctly quoted.\nline: {line}\nstdout: {}\n\
+             stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
