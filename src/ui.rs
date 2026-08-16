@@ -37887,18 +37887,22 @@ mod tests {
     /// fake newer version, but at a terminal width chosen so the area left
     /// after the mode chip is exactly as wide as the badge text itself
     /// (`bw == area.width`) — the boundary of the `bw < area.width` guard at
-    /// `src/ui.rs:17373`. The badge must not render at or above that width,
+    /// `src/ui.rs:17376`. The badge must not render at or above that width,
     /// covering the narrow-terminal early return the previous refusal flagged
-    /// as still owed.
+    /// as still owed. Then widen by one column (`bw + 1 == area.width`) and
+    /// assert the badge DOES render there, so the guard is bracketed on both
+    /// sides rather than pinned only against the never-render side — which a
+    /// badge that never renders at any width would also pass.
     #[spec("lifecycle/version/004")]
     #[test]
     fn version_004_no_badge_when_terminal_too_narrow() {
         let latest = "9.9.9";
-        let bw = expected_update_badge(latest).chars().count() as u16;
+        let badge = expected_update_badge(latest);
+        let bw = badge.chars().count() as u16;
         // UiMode::Normal with no lock context: the chip band is constant once
         // the terminal clears `mode_chip_min_width()`, so deriving it at a
         // generously wide terminal gives the exact value that applies at the
-        // narrow width under test too.
+        // narrow widths under test too.
         let (chip_band, _) = mode_chip_bar_split(UiMode::Normal, 200, None);
         let width = bw + chip_band;
 
@@ -37907,6 +37911,16 @@ mod tests {
         assert!(
             !row.contains("Update available"),
             "badge must not render when bw >= post-chip area width (bw={bw}, width={width}), got row:\n{row:?}"
+        );
+
+        let width_plus_one = width + 1;
+        let buffer =
+            render_bottom_bar_with_update_available_to_buffer(Some(latest), width_plus_one);
+        let row = buffer_row_text(&buffer, width_plus_one);
+        assert!(
+            row.ends_with(&badge),
+            "badge must render, right-aligned, one column past the boundary \
+             (bw={bw}, width={width_plus_one}), got row:\n{row:?}"
         );
     }
 }
