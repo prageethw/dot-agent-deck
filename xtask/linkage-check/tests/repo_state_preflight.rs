@@ -225,13 +225,16 @@ fn linkage_check_fails_on_stale_worktree_registry_entry() {
         "expected check 11 to name the stale path and the `git worktree prune` remedy\n\
          stderr: {stderr}"
     );
-    // `git worktree list --porcelain` always reports forward-slash paths,
-    // even on Windows where `sibling`'s own `Display`/`to_str()` form uses
-    // backslashes — normalize before comparing.
-    let sibling_forward_slash = sibling.to_str().expect("utf8 path").replace('\\', "/");
+    // Match on the leaf directory name only, not the full path: on Windows
+    // CI runners `sibling` (built from `tmp.path()`, which can inherit the
+    // short 8.3 form of TEMP, e.g. `RUNNER~1`) and git's own
+    // `--is-shallow-repository`-adjacent path resolution (which reports the
+    // long form) can print the SAME directory two different ways, so a
+    // full-path substring match is not portable — observed live in CI.
     assert!(
-        stderr.contains(&sibling_forward_slash),
-        "expected the stale path itself to appear in the failure message\nstderr: {stderr}"
+        stderr.contains("sibling-worktree"),
+        "expected the stale worktree's own directory name to appear in the failure message\n\
+         stderr: {stderr}"
     );
     assert!(
         !stderr.contains("[10]"),
