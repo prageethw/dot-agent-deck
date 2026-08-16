@@ -131,17 +131,44 @@ fn capped_jobs() -> usize {
         .unwrap_or(1)
 }
 
-/// Build `dot-agent-deck` with `version` / `build_id` / `release_repo`
-/// pre-set in the build environment, into the shared scratch target dir.
-/// Returns the path of the produced binary.
+/// Build `dot-agent-deck` with `version` / `build_id` pre-set as plain OS
+/// environment variables, and `release_repo` pre-set via `--config` (see
+/// below for why), into the shared scratch target dir. Returns the path of
+/// the produced binary.
 fn build_with_injected(version: &str, build_id: &str, release_repo: &str) -> PathBuf {
     let scratch = scratch_target_dir();
     let target = host_target();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let jobs = capped_jobs().to_string();
 
+    // DAD_RELEASE_REPO cannot be injected as a plain OS environment variable
+    // the way DAD_VERSION / DAD_BUILD_ID are: this checkout's own
+    // `.cargo/config.toml` sets `force = true` on its `[env]` entry for this
+    // key (issue #398 review finding F3), and `force = true` means the
+    // config value is NOT overridable by the environment — a plain
+    // `.env("DAD_RELEASE_REPO", ...)` here would be silently discarded in
+    // favour of the fork's own default slug, and every build in this test
+    // would produce the SAME composed URL regardless of `release_repo`,
+    // defeating the point of injecting different values across steps.
+    //
+    // `--config` sidesteps this: force governs precedence between a config
+    // FILE's [env] entry and the OS environment specifically; it says
+    // nothing about precedence between two config SOURCES. Cargo's own
+    // reference is explicit that `--config` outranks every config file
+    // ("Configuration values specified this way take precedence over
+    // environment variables, which take precedence over configuration
+    // files" — doc.rust-lang.org/cargo/reference/config.html#command-line-overrides),
+    // so a `--config env.DAD_RELEASE_REPO="..."` here replaces the whole
+    // `[env]` entry the project file defines for this key — `force` and
+    // all — before force's OS-environment rule is ever consulted. Nothing
+    // sets DAD_RELEASE_REPO as a plain OS env var in this function, so
+    // there is no OS-env value for that rule to act on either way.
+    let release_repo_override = format!("env.DAD_RELEASE_REPO=\"{release_repo}\"");
+
     let out = Command::new(&cargo)
         .args([
+            "--config",
+            &release_repo_override,
             "build",
             "--bin",
             "dot-agent-deck",
@@ -154,7 +181,6 @@ fn build_with_injected(version: &str, build_id: &str, release_repo: &str) -> Pat
         .env("CARGO_TARGET_DIR", &scratch)
         .env("DAD_VERSION", version)
         .env("DAD_BUILD_ID", build_id)
-        .env("DAD_RELEASE_REPO", release_repo)
         // Cargo passes its jobserver to child processes through this variable;
         // handing it to a nested cargo makes it warn about an unusable
         // jobserver fd. Dropping it just costs the child its own job slots —
