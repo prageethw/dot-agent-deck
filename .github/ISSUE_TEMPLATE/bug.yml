@@ -1,0 +1,53 @@
+name: Bug report
+description: Something is broken or behaving differently than intended.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This form cannot apply a `size-*`/`priority-*` label itself — GitHub
+        issue forms can't turn a dropdown answer into a label — so your
+        answers below only land in the issue body. The filer (if you have
+        label-write access) or a maintainer still has to read them and apply
+        the matching labels by hand. Until **both** a `size-*` and a
+        `priority-*` label are applied, this repo's `issue-triage.yml`
+        workflow keeps `needs-triage` stamped on the issue — leaving one or
+        both dropdowns blank is fine and does exactly that.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect, what did you see instead, and how to reproduce it.
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: >-
+        How much work does this look like? Optional — this does not directly
+        apply the matching `size-*` GitHub label — GitHub issue forms cannot
+        do that — so a maintainer (or you, if you have label-write access)
+        applies it by hand from this answer. See CLAUDE.md rule 26.
+      options:
+        - size-high — large amount of work
+        - size-medium — moderate amount of work
+        - size-low — small amount of work
+    validations:
+      required: false
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: >-
+        How urgent is this? Optional, same caveat as Size — this records your
+        answer, it does not apply the label. Leave it blank if you are not
+        confident: a wrong priority is worse than an absent one (CLAUDE.md
+        rule 26).
+      options:
+        - priority-high
+        - priority-medium
+        - priority-low
+    validations:
+      required: false
