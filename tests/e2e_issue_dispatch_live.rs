@@ -283,8 +283,9 @@ fn run_now(deck: &TuiDeck, name: &str) {
 /// card into it. After confirming the daemon registered the dispatched agent
 /// (precondition), assert that a per-issue card surfaces LIVE on the rendered
 /// dashboard — its `Dir:` line shows the issue worktree basename `issue-7` and
-/// its title shows the schedule name `github-issues` — proving the dispatched
-/// issue is visible in the attached TUI (the showcase the demo reel narrates).
+/// its identity row shows the schedule name `github-issues` — proving the
+/// dispatched issue is visible in the attached TUI (the showcase the demo
+/// reel narrates).
 #[spec("scheduler/dispatch/011")]
 #[test]
 fn dispatch_011_card_surfaces_live_in_tui() {
@@ -361,13 +362,13 @@ fn dispatch_011_card_surfaces_live_in_tui() {
     // signal.
     deck.wait_for_string("issue-7");
 
-    // ...and the card is titled with the schedule's friendly name, confirming it
-    // is the dispatch card (the whole card — title block + Dir body — paints in
-    // one render pass, so once `issue-7` is on the grid the title is too).
+    // ...and the card shows the schedule's friendly name, confirming it
+    // is the dispatch card (the whole card — identity row + Dir body — paints
+    // in one render pass, so once `issue-7` is on the grid so is the rest).
     let grid = deck.snapshot_grid();
     assert!(
         grid.contains("github-issues"),
-        "the live-surfaced dispatch card must be titled with the schedule name \
+        "the live-surfaced dispatch card must show the schedule name \
          'github-issues'.\nGrid:\n{grid}"
     );
 
