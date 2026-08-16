@@ -7,7 +7,7 @@ This fork carries two kinds of divergence from `vfarcic/dot-agent-deck`, and the
 Ask one question about every change: **would upstream want this?**
 
 - **No — it is a preference.** It stays forked, permanently. Badge removal and the "worker-deck" rename, the role→model assignments, the devbox wrapper commands, the Telegram/Slack removal, the fork's release-CI skips, this fork's CLAUDE.md rules and PRD documents, `cleanup.sh`'s fork-specific evolution. This is the fork's identity. Upstream would reject it and should.
-- **Yes — it is an improvement that merely happens to have been written here.** It goes upstream. A bugfix, a test-determinism fix, a genuine feature, a correction to an upstream doc.
+- **Yes — it is an improvement that merely happens to have been written here.** It goes upstream. A bugfix, a test-determinism fix, a genuine feature, a correction to an upstream doc. **Then ask one more question: is the defective code itself byte-identical to upstream's?** If it is, it is filed upstream *at the point it is found* rather than fixed here and offered later — see ["An upstream-code defect is filed upstream, not offered later"](#an-upstream-code-defect-is-filed-upstream-not-offered-later) below. Everything else follows the fork-first ordering.
 
 If the honest answer is "yes, but not yet" — that is a "yes" with an unscheduled second step, and the second step is the one that historically does not happen. See the backlog below for what that cost. Under the fork-first ordering this document now prescribes, "not yet" is the *expected* state between merging here and offering upstream, which is exactly why that gap has to be closed by a tracked issue rather than by intention.
 
@@ -19,7 +19,9 @@ It also costs real, duplicated work when the offer comes late. `55021c3` (PRD #3
 
 ## The default for new work is fork-first, offer-after
 
-*(Changed 2026-08-14 by maintainer decision. This section previously mandated upstream-first — branch from `upstream/main`, open the PR upstream, and let the fix arrive here by sync. That is withdrawn: it delayed this fork's own users for a benefit they never receive. The **decision test** above is unchanged; only the **ordering** flipped. CLAUDE.md rule 19 carries the same change and is the authority.)*
+*(Changed 2026-08-14 by maintainer decision. This section previously mandated upstream-first — branch from `upstream/main`, open the PR upstream, and let the fix arrive here by sync. That is withdrawn: it delayed this fork's own users for a benefit they never receive. The **decision test** above is unchanged; only the **ordering** flipped. CLAUDE.md rule 19 is the authority for this policy, and it was narrowed again on 2026-08-16 — see the next section.)*
+
+**This section governs everything EXCEPT an upstream-code defect.** That class inverts the ordering; the section below carries it.
 
 For anything that is **not** a preference divergence:
 
@@ -29,7 +31,21 @@ For anything that is **not** a preference divergence:
 
 **This fork is never blocked on an upstream decision.** Not on a review, not on requested changes, not on a merge. An open upstream PR is a gift already given — it is not a dependency and never belongs in a status report as blocking work.
 
-**The risk moves; it does not disappear.** Under this ordering the *offer* is the step that silently does not happen — which is precisely what built the backlog below. "Offer later" depending on someone remembering is what failed before, so it must be tracked rather than remembered: **file the upstream-offer issue at merge time**, naming what to port, the matching upstream issue, and anything that makes the port non-trivial. [prageethw/dot-agent-deck#322](https://github.com/prageethw/dot-agent-deck/issues/322) is the pattern to copy. A merge that owed an offer issue and did not produce one is a defect, not a judgement call — the next session will not know the offer was ever owed.
+## An upstream-code defect is filed upstream, not offered later
+
+*(Added 2026-08-16 by maintainer decision. It narrows the fork-first ordering above; it does not reopen it. CLAUDE.md rule 19 is the authority and carries the full reasoning — this section exists so a reader who lands here first is not told the opposite.)*
+
+A defect whose **defective code is byte-identical to upstream's** is filed upstream at the point it is found, by the orchestrator, rather than fixed here and offered afterwards.
+
+The test is **at the defect, not at the file**, and it takes two commands rather than a grep alone. `git fetch upstream` first, then locate the defect with `git grep -n '<the defective expression>' upstream/main -- <path>` and confirm the fork's copy of that expression is byte-identical. File-level divergence does **not** disqualify: fork #389's `&session.session_id[..11]` is byte-identical to upstream's inside a `src/ui.rs` the fork has diverged on by 6141 insertions. What disqualifies is divergence at the defect itself — the fork's own hardening, its own helper, a fork-only call site — and that returns the change to the fork-first ordering above.
+
+Why this class and no other: the fork-first ordering protects a change the fork *wants*. Here the fork wants nothing. There is no divergence to protect, no fork user gains from the fix landing here first, and a fork-side commit in unmodified upstream code is pure rebase tax. It also closes the "yes, but not yet" gap by construction — filing *is* the offer, so there is no second step left to forget and **no offer issue is owed**.
+
+Two obligations come with it. A defect that **crosses a privilege or trust boundary** is escalated to the maintainer *before* filing, since filing is public and immediate. And **closing the fork issue is the maintainer's decision, not the finder's** — always apply `affects-upstream` and comment the upstream number, but if nobody has decided, leave the issue open. An issue left open costs a duplicate row; an issue closed wrongly costs the defect.
+
+Precedent: [vfarcic/dot-agent-deck#574](https://github.com/vfarcic/dot-agent-deck/issues/574)–[#582](https://github.com/vfarcic/dot-agent-deck/issues/582), nine defects filed upstream on 2026-08-16 and closed here on an explicit maintainer decision.
+
+**The risk moves; it does not disappear.** Under this ordering the *offer* is the step that silently does not happen — which is precisely what built the backlog below. "Offer later" depending on someone remembering is what failed before, so it must be tracked rather than remembered: **file the upstream-offer issue at merge time**, naming what to port, the matching upstream issue, and anything that makes the port non-trivial. [prageethw/dot-agent-deck#322](https://github.com/prageethw/dot-agent-deck/issues/322) is the pattern to copy. A merge that owed an offer issue and did not produce one is a defect, not a judgement call — the next session will not know the offer was ever owed. This applies to the **fork-first** path only; an upstream-code defect filed under the section above has already made its offer.
 
 Offering promptly still matters for the reason the PRD #333 failure above shows: the longer the gap, the more upstream's version and the fork's can drift apart. "After merge" means the same day, not "eventually".
 
