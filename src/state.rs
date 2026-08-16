@@ -737,18 +737,44 @@ const PANE_DIGEST_HEX: usize = 16;
 /// PRD #365: derive a session's `session_id` from its `pane_id`, idempotent
 /// with respect to the `"pane-"` prefix.
 ///
-/// A daemon-minted `pane_id` (`mint_pane_id()`'s output, e.g.
-/// `"pane-a1b2c3d4e5f6a7b8-0"`) already carries the prefix, so it is used
-/// as-is. A legacy bare `pane_id` (a counter digit, a role index — still
-/// passed by several existing callers) gets `"pane-"` prepended, exactly as
-/// before this fix. Unconditionally prepending the prefix produced a
-/// double-prefixed `"pane-pane-…"` session_id for every real spawned pane.
+/// A daemon-minted `pane_id` ([`crate::agent_pty::mint_pane_id`]'s output,
+/// e.g. `"pane-a1b2c3d4e5f6a7b8-0"`) already carries the prefix, so it is
+/// used as-is. A legacy bare `pane_id` (a counter digit, a role index —
+/// still passed by several existing callers) gets `"pane-"` prepended,
+/// exactly as before this fix. Unconditionally prepending the prefix
+/// produced a double-prefixed `"pane-pane-…"` session_id for every real
+/// spawned pane.
 fn session_id_for_pane(pane_id: &str) -> String {
-    if pane_id.starts_with("pane-") {
+    if is_minted_pane_id(pane_id) {
         pane_id.to_string()
     } else {
         format!("pane-{pane_id}")
     }
+}
+
+/// True when `pane_id` matches the exact shape
+/// [`crate::agent_pty::mint_pane_id`] produces: `"pane-"` + 16 lowercase hex
+/// digits (the nonce) + `"-"` + a decimal sequence number.
+///
+/// Deliberately narrower than a bare `starts_with("pane-")` check: several
+/// existing `pane_id`s legitimately start with the literal string
+/// `"pane-"` without being daemon-minted — human-readable test fixtures
+/// (`"pane-shell"`, `"pane-race-36"`), and `format!("pane-{n}")` counters
+/// elsewhere in the codebase — and must keep today's single-prefix
+/// behavior rather than being treated as already-prefixed.
+fn is_minted_pane_id(pane_id: &str) -> bool {
+    let Some(rest) = pane_id.strip_prefix("pane-") else {
+        return false;
+    };
+    let Some((nonce, seq)) = rest.split_once('-') else {
+        return false;
+    };
+    nonce.len() == 16
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && !seq.is_empty()
+        && seq.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// FNV-1a over the reporting pane's `pane_id`, at the full untruncated width
