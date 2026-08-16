@@ -12,6 +12,11 @@
 //!   non-focused roles' collapsed 1-row title frames must not touch agent
 //!   lifecycle. Every role's PTY stays open, keeps running, and keeps
 //!   reporting status regardless of whether its pane is currently drawn.
+//! - Issue #313 (fork issue #377): tabs/orchestration/015 pins the active
+//!   orchestration tab's BOLD/status-colour/no-underline cue at the actual
+//!   rendered terminal byte stream (deck -> PTY -> vt100); the same cue is
+//!   pinned at the ratatui buffer by the L1 specs tabs/orchestration/010,
+//!   /012 and /014 in `render_tab_strip.rs`.
 //!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
@@ -30,6 +35,7 @@ use spec::spec;
 /// orchestration hides the Command field, so a second Enter submits the form.
 fn open_orchestration(deck: &TuiDeck) {
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
     deck.send_keys(b"\x1b[C"); // Right -> [Orch: demo-orch]
@@ -320,6 +326,72 @@ fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane()
          Action::CycleSplitStage even though a role pane was focused in \
          PaneInput mode — orchestration tabs claim Ctrl+l mode-independently \
          (PRD #387 Defect 1).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Launch the deck against the `orch-deck` fixture, open its
+/// single orchestration, and assert the active tab's rendered label —
+/// `<launch-dir-basename>-orchestrator-1`, the form's suggested session
+/// name derived from `deck.workdir()` (the launch cwd here, since this test
+/// does not use `with_launch_subdir`; fork issue #303), not the
+/// orchestration's config name `demo-orch` — carries BOLD and a non-Reset
+/// status colour (`palette::STATUS_IDLE`, both roles being idle `cat`
+/// panes) but never underline. This pins fork issue #377's active-tab cue
+/// through the actual rendered terminal byte stream (deck -> PTY -> vt100);
+/// the same cue is already pinned at the ratatui buffer by the L1 specs
+/// `tabs/orchestration/010`/`012`/`014` (`render_tab_strip.rs`), which
+/// would fail first — in the blocking `build` job — if a bad upstream-sync
+/// merge resolution restored the underline.
+#[spec("tabs/orchestration/015")]
+#[test]
+fn orchestration_015_active_tab_bold_status_color_no_underline() {
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
+    let launch_dir_basename = deck
+        .workdir()
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let active_label = format!("{launch_dir_basename}-orchestrator-1");
+
+    deck.wait_for_string("No active sessions");
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab is up
+    deck.wait_for_string(&format!(" {active_label} ")); // tab strip renders the active tab's label
+
+    let styles = deck
+        .visible_text_cell_styles(&active_label)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the active orchestration tab's label {active_label:?} on the rendered \
+                 grid\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
+    assert!(
+        styles.iter().all(|style| style.bold),
+        "the active orchestration tab must carry BOLD as its active cue, got {styles:?}\nFinal \
+         grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        styles.iter().all(|style| !style.underline),
+        "the active orchestration tab must NOT carry underline — fork issue #377 dropped it as \
+         the active cue; this pins the cue at the rendered terminal byte stream, the same cue \
+         L1 specs tabs/orchestration/010, /012 and /014 already pin at the ratatui buffer, got \
+         {styles:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        styles
+            .iter()
+            .all(|style| style.fgcolor == vt100::Color::Idx(8)),
+        "the active orchestration tab's label must render palette::STATUS_IDLE (DarkGray, vt100 \
+         Idx(8)); both idle `cat` roles produce this today, though Idx(8) is also \
+         tab_status_data's no-status-data fallback, so this mainly guards against Color::Reset \
+         reaching the terminal rather than proving correct colour selection (see \
+         tabs/orchestration/010/014 for that), got {styles:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }

@@ -11,9 +11,6 @@
 //!     opens the shared confirmation, whose Close choice closes it (same outcome
 //!     as Ctrl+W). The presence/absence of `[×]`
 //!     across tab kinds is pinned by the L1 spec in `render_tab_strip.rs`.
-//!   - mouse/tabstrip/004 (issue #313) - the active orchestration tab renders
-//!     BOLD and its status colour but never underline, guarding fork issue
-//!     #377's removal of the underline from the active-tab cue.
 //!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
@@ -143,81 +140,4 @@ fn tabstrip_003_inactive_close_binds_target_and_modal_suppresses_navigation() {
             && !grid.contains("ALPHA_TAB_SENTINEL")
             && grid.matches('×').count() == 1
     });
-}
-
-/// Drive the new-pane dialog to open the `orch-deck` fixture's single
-/// orchestration (`demo-orch`), leaving it the active tab. Mirrors
-/// `e2e_orchestration_pane_column.rs::open_orchestration` — with no
-/// `[[modes]]` defined the Mode chip row is `[No mode] [Orch: demo-orch]`, so
-/// ONE Right selects the orchestration; selecting an orchestration hides the
-/// Command field, so a second Enter submits the form, accepting the Name
-/// field's suggested default unedited. The rendered tab label is therefore
-/// NOT the orchestration's config name (`demo-orch`) but the session name the
-/// form suggested — `<launch-dir-basename>-orchestrator-1` (mirrors
-/// `e2e_orchestration_identity.rs::identity_004`).
-fn open_orchestration_tab(deck: &TuiDeck) {
-    deck.send_bytes(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_bytes(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_bytes(b"\x1b[C"); // Right -> [Orch: demo-orch]
-    deck.send_bytes(b"\r"); // Mode -> Name
-    deck.send_bytes(b"\r"); // submit (Command hidden for an orchestration), unedited
-}
-
-/// Scenario: Launch the deck against the `orch-deck` fixture and open its
-/// single orchestration, which becomes the active tab labeled
-/// `<launch-dir-basename>-orchestrator-1`. Assert that label's rendered cells
-/// carry BOLD and the aggregate status colour (both roles are idle `cat`
-/// panes, so `palette::STATUS_IDLE`) but never underline — the regression
-/// guard issue #313 exists for: fork issue #377 dropped the underline from
-/// the active-tab cue, and a bad upstream-sync merge resolution that
-/// silently restores it has no other test that would catch it, since
-/// upstream carries no test for a cue it never removed.
-#[spec("mouse/tabstrip/004")]
-#[test]
-fn tabstrip_004_active_orchestration_tab_bold_status_color_no_underline() {
-    let deck = TuiDeck::launch_with_fixture("orch-deck");
-    let launch_dir_basename = deck
-        .workdir()
-        .file_name()
-        .expect("launch dir must have a basename")
-        .to_string_lossy()
-        .into_owned();
-    let active_label = format!("{launch_dir_basename}-orchestrator-1");
-
-    deck.wait_for_string("No active sessions");
-    open_orchestration_tab(&deck);
-    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab is up
-    deck.wait_for_string(&format!(" {active_label} ")); // tab strip renders the active tab's label
-
-    let styles = deck
-        .visible_text_cell_styles(&active_label)
-        .unwrap_or_else(|| {
-            panic!(
-                "expected the active orchestration tab's label {active_label:?} on the rendered \
-                 grid\nFinal grid:\n{}",
-                deck.snapshot_grid()
-            )
-        });
-    assert!(
-        styles.iter().all(|style| style.bold),
-        "the active orchestration tab must carry BOLD as its active cue, got {styles:?}\nFinal \
-         grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        styles.iter().all(|style| !style.underline),
-        "the active orchestration tab must NOT carry underline — fork issue #377 dropped it as \
-         the active cue, and a bad upstream-sync merge resolution restoring it must fail here, \
-         got {styles:?}\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-    assert!(
-        styles
-            .iter()
-            .all(|style| style.fgcolor == vt100::Color::Idx(8)),
-        "the active orchestration tab's label must render palette::STATUS_IDLE (DarkGray, vt100 \
-         Idx(8)) since both roles are idle `cat` panes, got {styles:?}\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
 }
