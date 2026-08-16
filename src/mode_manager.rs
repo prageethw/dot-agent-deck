@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError};
 #[cfg(unix)]
 use crate::platform::shell::quote_shell_arg;
+#[cfg(windows)]
+use crate::platform::shell::{escape_cmd_exe_program, quote_cmd_exe_arg};
 use crate::project_config::ModeConfig;
 
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
@@ -22,17 +24,23 @@ use crate::project_config::ModeConfig;
 /// still expand `$` and backticks inside double quotes, and Rust's escapes
 /// are not a faithful encoding for every character, e.g. a real newline).
 ///
-/// **Windows**: `quote_shell_arg` has no `cmd.exe` arm (it is POSIX-only —
-/// see its doc comment), so this reproduces the pre-#157 format exactly,
-/// position for position: `exe` bare via `Display`, `command` via `{:?}`.
-/// That is deliberately unchanged from `main` and is **not** a `cmd.exe`
-/// quoting fix — `{:?}` is Rust `Debug` escaping, not a `cmd.exe` grammar,
-/// and remains vulnerable to issue #157 finding A1 (a configured command
-/// containing `" & calc.exe & rem "` still breaks out of the quoted word).
-/// That weakness is `main`'s pre-existing behaviour, not a regression
-/// introduced here, and a real `cmd.exe`-safe fix is tracked as fork issue
-/// #283. This function's Windows arm exists only so that behaviour, known-
-/// inadequate as it is, is not made worse in the course of fixing Unix.
+/// **Windows**: position-aware `cmd.exe` quoting (fork issue #283) —
+/// `exe` and `command` sit in two different grammatical positions of a
+/// `cmd.exe` command line and need two different treatments, so each gets
+/// its own function: `exe` is the leading program-name token
+/// ([`escape_cmd_exe_program`] — caret-escapes whitespace/metacharacters
+/// rather than quoting, deliberately, so this line's first character is
+/// never `"`; see that function's doc comment for why), while `command` is
+/// an ordinary argument that must survive both `cmd.exe`'s own
+/// metacharacter scan and the launched process's
+/// `CommandLineToArgvW`-compatible `argv` parsing ([`quote_cmd_exe_arg`] —
+/// see its doc comment for why that needs two escaping passes and does use
+/// literal quotes). This replaces the pre-#157 `{:?}`-Debug-quoted format
+/// `main` still uses, which is not a `cmd.exe` quoting scheme at all and
+/// remains vulnerable to issue #157 finding A1 (a configured command
+/// containing `" & calc.exe & rem "` breaks out of the quoted word — see
+/// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`,
+/// verified against a real `cmd.exe`).
 #[cfg(unix)]
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
@@ -46,10 +54,10 @@ fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
 #[cfg(windows)]
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
-        "{} watch --interval {} {:?}",
-        exe.display(),
+        "{} watch --interval {} {}",
+        escape_cmd_exe_program(&exe.display().to_string()),
         interval_secs,
-        command
+        quote_cmd_exe_arg(command)
     )
 }
 
@@ -711,42 +719,331 @@ mod tests {
         assert_eq!(round_trip_through_posix_shell(tricky), tricky);
     }
 
-    /// Windows reproduces `main`'s pre-#157 format exactly, position for
-    /// position: the executable bare via `Display` (this is the site the
-    /// spaced-executable regression was about — `exe` still goes in bare on
-    /// Windows because `quote_shell_arg` has no `cmd.exe` arm), and the
-    /// command `{:?}`-quoted, matching `origin/main`'s
-    /// `format!("{} watch --interval {} {:?}", exe.display(), interval_secs,
-    /// command)` byte for byte. This is parity with `main`, not a fix.
+    /// Retires the two `main`-parity baseline tests this function used to
+    /// carry (`watch_invocation_matches_pre_157_main_on_windows` /
+    /// `watch_invocation_reproduces_mains_a1_vulnerability_on_windows`),
+    /// which pinned the pre-#283 `{:?}`-Debug-quoted format byte for byte.
+    /// That format is no longer emitted by either arm of `watch_invocation`
+    /// — the Windows arm now calls [`escape_cmd_exe_program`] /
+    /// [`quote_cmd_exe_arg`] unconditionally, so there is no remaining code
+    /// path that reproduces the vulnerable baseline to pin. This test
+    /// replaces them with a deterministic, non-`cmd.exe` pin of the new
+    /// format (the real-`cmd.exe` behavioural proof lives in
+    /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
+    /// and `watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it`
+    /// below).
+    ///
+    /// The executable position comes out caret-escaped (`Program^ Files`),
+    /// not `"…"`-quoted, and the line's first character is asserted to
+    /// never be a quote — see [`escape_cmd_exe_program`]'s doc comment for
+    /// why a quote-wrapped executable token is unsafe here once combined
+    /// with `quote_cmd_exe_arg`'s own necessary quoting of the command.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_matches_pre_157_main_on_windows() {
+    fn watch_invocation_quotes_the_executable_and_command_on_windows() {
         let exe = Path::new(r"C:\Program Files\My Deck\dot-agent-deck.exe");
         let line = watch_invocation(exe, 10, "npm run dev");
+        assert!(!line.starts_with('"'));
         assert_eq!(
             line,
-            r#"C:\Program Files\My Deck\dot-agent-deck.exe watch --interval 10 "npm run dev""#
+            "C:\\Program^ Files\\My^ Deck\\dot-agent-deck.exe watch --interval 10 ^\"npm run dev^\""
         );
     }
 
-    /// The finding A1 exploit, pinned against the `{:?}`-quoted format this
-    /// function reproduces from `main` — **not** proof of safety. `{:?}` is
-    /// Rust `Debug` escaping, not a `cmd.exe` quoting contract: `cmd.exe`
-    /// treats the literal backslash before the embedded `"` as not escaping
-    /// it, so the quote still closes the word and `cmd.exe` still runs
-    /// `calc.exe` from the now-unquoted tail. This is `main`'s unchanged,
-    /// still-vulnerable behaviour, carried forward deliberately so Windows
-    /// is no worse after this fix than before it; a `cmd.exe`-verified fix
-    /// is tracked as fork issue #283, not attempted here.
+    /// The finding A1 exploit shape, pinned at the string level against the
+    /// new caret-escaped format: every `cmd.exe` metacharacter in `command`
+    /// (`"`, `&`) must come out caret-escaped rather than bare, which is
+    /// what stops `cmd.exe`'s quote-parity scan from ever leaving "quoted"
+    /// mode. The end-to-end proof against a real `cmd.exe` is
+    /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
+    /// below; this is the fast, deterministic companion pin.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_reproduces_mains_a1_vulnerability_on_windows() {
+    fn watch_invocation_caret_escapes_the_a1_exploit_shape_on_windows() {
         let exe = Path::new(r"C:\deck\dot-agent-deck.exe");
         let command = r#"echo ok" & calc.exe & rem ""#;
         let line = watch_invocation(exe, 5, command);
         assert_eq!(
             line,
-            format!(r"C:\deck\dot-agent-deck.exe watch --interval 5 {command:?}")
+            r#"C:\deck\dot-agent-deck.exe watch --interval 5 ^"echo ok\^" ^& calc.exe ^& rem \^"^""#
         );
+    }
+
+    /// Fork issue #283's "done looks like" bar: the finding A1 exploit
+    /// round-tripped through a REAL `cmd.exe`, not merely inspected as a
+    /// generated string (which is what
+    /// `watch_invocation_caret_escapes_the_a1_exploit_shape_on_windows` above
+    /// pins at the string level). The command is
+    /// delivered to `cmd.exe` via `raw_arg`, which — unlike `Command::args`
+    /// (see `platform::proc::windows::tests::spawn_helper_tree`'s comment on
+    /// why individual args are used instead of one string) — adds none of
+    /// Rust's own quoting, so `cmd.exe` receives byte-for-byte what a watch
+    /// pane's typed command line would. A benign marker-file write stands in
+    /// for the exploit's `calc.exe` so a passing assertion needs no GUI
+    /// process spawned on CI.
+    ///
+    /// RED today: `{:?}` is Rust `Debug` escaping, not a `cmd.exe` grammar —
+    /// `cmd.exe` does not treat a backslash before `"` as an escape, so the
+    /// embedded `\"` still closes the quoted word early and the injected
+    /// `& type nul > injected.marker &` runs as its own, unquoted command.
+    #[cfg(windows)]
+    #[test]
+    fn watch_invocation_prevents_a1_command_injection_through_real_cmd_exe() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let marker = scratch.path().join("injected.marker");
+
+        let exe = scratch.path().join("dot-agent-deck.exe");
+        // Exactly the finding A1 exploit shape (`echo ok" & calc.exe & rem
+        // "`), with the payload swapped for a marker-file write so a passing
+        // "nothing was injected" assertion needs no GUI process.
+        let command = r#"echo ok" & type nul > injected.marker & rem ""#;
+        let line = watch_invocation(&exe, 5, command);
+
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/C")
+            .raw_arg(&line)
+            .current_dir(scratch.path())
+            .output()
+            .expect("cmd.exe should run");
+
+        assert!(
+            !marker.exists(),
+            "the A1 payload's `& type nul > injected.marker &` escaped \
+             quoting and ran as a separate cmd.exe command.\nline: {line}\n\
+             stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Fork issue #423 review findings B1 and C1: a real LF/CRLF in
+    /// `command` used to survive into the emitted line unescaped (neither
+    /// `escape_cmd_exe_program` nor `quote_cmd_exe_arg` had `\r`/`\n` in
+    /// their caret-escape sets), and `crt_argv_quote` wraps the resulting
+    /// argument in quotes without touching the newline itself — so the raw
+    /// byte sat inside the quotes exactly the way finding A1's payload used
+    /// to sit outside them. `cmd.exe` treats an embedded raw newline in a
+    /// `/C <string>` argument as a statement separator the same way it
+    /// treats one inside a batch file (and, on the persistent-watch-pane
+    /// delivery path this test does not exercise, a typed newline submits
+    /// the current input the instant the terminal sees it, before
+    /// `cmd.exe`'s own grammar is even consulted — see
+    /// `platform::shell::sanitize_cmd_exe_control_chars`'s doc comment,
+    /// which also covers the wider control-character class C1 found: `ESC`
+    /// clears the whole typed input buffer the same way, `BS`/`DEL` delete
+    /// backwards, and `ETX` cancels the line). Either way, no caret
+    /// encoding can close this off, so `watch_invocation`'s Windows arm now
+    /// replaces every control character with a space before either quoting
+    /// pass runs. Verified the same rigorous way as
+    /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
+    /// above: a benign marker-file write stands in for the payload a
+    /// surviving raw control byte would otherwise let submit as its own,
+    /// separate `cmd.exe` command.
+    ///
+    /// This is strictly worse than `main` if left unfixed: `main`'s
+    /// `{:?}`-Debug-quoted format escaped a control character to a visible
+    /// escape sequence (`\n`, `\u{1b}`, …), so content was mangled but the
+    /// line stayed intact; a raw, unescaped one instead either splits the
+    /// line (`\n`/`\r`) or, for `ESC` on the interactive-PTY delivery path
+    /// specifically, lets `cmd.exe` run an attacker-chosen program name —
+    /// see the ESC case below.
+    ///
+    /// Loops both the CR/LF shape (finding B1) and the `ESC` shape (finding
+    /// C1, auditor's worked example: `"\x1bcalc.exe x"` reduces to
+    /// `calc.exe x^"` once the console's line editor clears everything
+    /// typed before the `ESC` byte) through the same real-`cmd.exe` proof.
+    /// **Honesty caveat, same as the auditor's own finding**: `cmd.exe` here
+    /// is driven via `/C <line>` as a single process argument, which is the
+    /// `/C <string>` delivery path, not the interactive-PTY console line
+    /// editor a real watch pane types into — so this proves the emitted
+    /// line contains no raw control character and behaves safely once
+    /// passed to `cmd.exe` that way, but it cannot reproduce, and does not
+    /// prove, the console-line-editing consumption of `ESC` itself; that
+    /// remains reasoned rather than executed. The fast, deterministic
+    /// pin that the character is gone from the output regardless of
+    /// delivery path is
+    /// `platform::shell::windows_quoting_tests::quote_cmd_exe_arg_replaces_every_control_character_with_a_space`.
+    #[cfg(windows)]
+    #[test]
+    fn watch_invocation_neutralizes_control_characters_through_real_cmd_exe() {
+        use std::os::windows::process::CommandExt;
+
+        // A real LF (finding B1), not the two-char `\n` escape sequence,
+        // and a real ESC (finding C1): if either survives into the emitted
+        // line unescaped, `cmd.exe` reads everything after it as a second,
+        // unquoted command.
+        for command in [
+            "npm run dev\ntype nul > injected.marker",
+            "\x1btype nul > injected.marker",
+        ] {
+            let scratch = tempfile::tempdir().expect("scratch tempdir");
+            let marker = scratch.path().join("injected.marker");
+
+            let exe = scratch.path().join("dot-agent-deck.exe");
+            let line = watch_invocation(&exe, 5, command);
+
+            assert!(
+                !line.chars().any(|c| c.is_control()),
+                "watch_invocation must never emit a raw control character \
+                 into the cmd.exe command line\n\
+                 command: {command:?}\nline: {line:?}"
+            );
+
+            let output = std::process::Command::new("cmd.exe")
+                .raw_arg("/C")
+                .raw_arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("cmd.exe should run");
+
+            assert!(
+                !marker.exists(),
+                "a control character in `command` escaped quoting and ran \
+                 `type nul > injected.marker` as a separate cmd.exe command.\n\
+                 command: {command:?}\nline: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Position-aware quoting's other half: the EXECUTABLE token is located by
+    /// `cmd.exe`'s own quote-based space-protection at the head of the line —
+    /// a different rule from the CRT/argv-style escaping the command argument
+    /// needs (fork issue #283's "why a correct implementation is not a
+    /// mechanical change"). Verified against real `cmd.exe`: a stub batch
+    /// file living under a spaced directory must actually be located and run,
+    /// not just string-compared against an expected quoting.
+    ///
+    /// RED today: `watch_invocation`'s Windows arm emits `exe.display()` bare
+    /// (issue #157's original executable-quoting regression, still present on
+    /// Windows — `quote_shell_arg` has no `cmd.exe` arm to apply here).
+    /// `cmd.exe` takes everything up to the first unquoted space as the
+    /// program name, so it looks for a program literally named up to
+    /// `...\My` and never reaches the stub — the marker is never written.
+    #[cfg(windows)]
+    #[test]
+    fn watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let spaced_dir = scratch.path().join("My Deck");
+        std::fs::create_dir_all(&spaced_dir).expect("create spaced dir");
+        let stub = spaced_dir.join("dot-agent-deck.bat");
+        std::fs::write(&stub, "@echo off\r\ntype nul > \"ran.marker\"\r\n")
+            .expect("write stub batch file");
+        let marker = scratch.path().join("ran.marker");
+
+        let line = watch_invocation(&stub, 5, "npm run dev");
+
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/C")
+            .raw_arg(&line)
+            .current_dir(scratch.path())
+            .output()
+            .expect("cmd.exe should run");
+
+        assert!(
+            marker.exists(),
+            "cmd.exe never located the spaced-path stub, so the executable \
+             position is not correctly quoted.\nline: {line}\nstdout: {}\n\
+             stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Fork issue #423 review finding S2: every other real-`cmd.exe` test in
+    /// this module proves either that an injected payload did NOT run
+    /// (`watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`,
+    /// `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`) or
+    /// that a stub WAS located and run at all
+    /// (`watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it`)
+    /// — none of them recover the argument bytes the launched process
+    /// actually received, because that stub's `.bat` ignores its own
+    /// arguments. A quoting scheme that mangled `command`'s content instead
+    /// of breaking `cmd.exe`'s parse of it — a stray caret leaking through,
+    /// a backslash run dropped — would pass every one of those tests while
+    /// silently corrupting every watch command in production.
+    ///
+    /// This test closes that gap the way #283 asked for the POSIX side to
+    /// be closed (`quote_shell_arg_round_trips_through_posix_shell`): drive
+    /// a REAL child process's own argv recovery, not a hand-trace of the
+    /// algorithm. A `.bat` stub can't be that child — `%1`/`%~1` substitute
+    /// into the batch line as raw TEXT before `cmd.exe` re-parses it, so an
+    /// input containing `cmd.exe` metacharacters would just re-trigger the
+    /// same injection this PR exists to close, one layer down, and prove
+    /// nothing about what the eventual child process receives. A compiled
+    /// helper's `std::env::args()` is populated by the OS loader via the
+    /// same `CommandLineToArgvW`-compatible mechanism [`crt_argv_quote`]
+    /// targets, with no shell in between to reinterpret the recovered
+    /// bytes — the genuinely independent check.
+    #[cfg(windows)]
+    #[test]
+    fn quote_cmd_exe_arg_recovers_the_exact_argument_bytes_through_a_real_child_process() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let helper_src = scratch.path().join("echo_arg.rs");
+        let helper_exe = scratch.path().join("echo_arg.exe");
+        let helper_source = concat!(
+            "fn main() {\n",
+            "    let arg = std::env::args().nth(1).unwrap_or_default();\n",
+            "    std::fs::write(\"out.txt\", arg).expect(\"write out.txt\");\n",
+            "}\n",
+        );
+        std::fs::write(&helper_src, helper_source).expect("write helper source");
+
+        let compile = std::process::Command::new("rustc")
+            .arg("-o")
+            .arg(&helper_exe)
+            .arg(&helper_src)
+            .output()
+            .expect("rustc should run");
+        assert!(
+            compile.status.success(),
+            "failed to compile the argv-echo helper:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let out_file = scratch.path().join("out.txt");
+
+        // The A1 exploit shape (quote/ampersand break-out), a trailing
+        // backslash run immediately before what becomes the closing quote
+        // (the exact case `crt_argv_quote`'s backslash-doubling exists
+        // for), and the degenerate empty string (one empty `argv` element,
+        // not a dropped argument).
+        for input in [
+            r#"echo ok" & type nul > injected.marker & rem ""#,
+            r"C:\Program Files\",
+            "",
+        ] {
+            let _ = std::fs::remove_file(&out_file);
+            let line = format!(
+                "{} {}",
+                escape_cmd_exe_program(&helper_exe.display().to_string()),
+                quote_cmd_exe_arg(input)
+            );
+
+            let output = std::process::Command::new("cmd.exe")
+                .raw_arg("/C")
+                .raw_arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("cmd.exe should run");
+
+            let recovered = std::fs::read_to_string(&out_file).unwrap_or_default();
+            assert_eq!(
+                recovered,
+                input,
+                "argument bytes did not round-trip for input {input:?}\n\
+                 line: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

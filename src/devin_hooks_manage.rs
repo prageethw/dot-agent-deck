@@ -115,15 +115,20 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
 /// otherwise.
 ///
 /// **Windows: deliberately a no-op, not an oversight.** This returns `None` off
-/// Unix, so every caller degrades to a documented skip — exactly what
-/// [`crate::codex_hooks_manage`]'s `codex_home` does, and for the same reason:
-/// the path we would have to guess belongs to a *third-party* tool, and Devin —
-/// not this project — decides where its config lives on Windows. Writing hooks
-/// into a location Devin does not read would look like success while delivering
-/// nothing, and the POSIX quoting [`crate::platform::paths::shell_quote_if_needed`]
-/// applies to the hook command is not what Windows command parsing expects either. Native Windows
-/// support for the deck is itself still open (#42); today Windows users run
-/// under WSL, where the Unix branch below is the correct one.
+/// Unix, so every caller degrades to a documented skip. Unlike
+/// [`crate::codex_hooks_manage`]'s `codex_home` — which is NOT gated the
+/// same way; it carries no `#[cfg]` at all and honours `$CODEX_HOME` on
+/// every platform, including Windows (fork issue #238) — Devin gives us no
+/// equivalent override to check, so there is no way to resolve a real
+/// config directory here off Unix at all: the path we would have to guess
+/// belongs to a *third-party* tool, and Devin — not this project — decides
+/// where its config lives on Windows. Writing hooks into a location Devin
+/// does not read would look like success while delivering nothing, and the
+/// POSIX quoting [`crate::platform::paths::shell_quote_if_needed`] applies
+/// to the hook command is not what Windows command parsing expects either.
+/// Native Windows support for the deck is itself still open (#42); today
+/// Windows users run under WSL, where the Unix branch below is the correct
+/// one.
 ///
 /// Returns `None` when no real home resolves, so a guarded caller never writes
 /// into a throwaway `/tmp` config.
