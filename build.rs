@@ -18,10 +18,10 @@ use build_version_resolve::{
 
 /// The GitHub repo the upgrade nudge polls for its "latest release" feed
 /// (issue #398) when `DAD_RELEASE_REPO` is not injected. This is upstream's
-/// own repo on purpose — a source build with no fork-local config must keep
-/// polling the lineage it was actually built from. See the "fork sets it to
-/// prageethw/dot-agent-deck" note in `.cargo/config.toml`'s `[env]` table for
-/// where this fork overrides it.
+/// own repo on purpose — a source build with no downstream config must keep
+/// polling the lineage it was actually built from. A downstream distribution
+/// overrides this by setting `DAD_RELEASE_REPO` in its build environment or
+/// its own `.cargo/config.toml`.
 const DEFAULT_RELEASE_REPO: &str = "vfarcic/dot-agent-deck";
 
 fn main() {

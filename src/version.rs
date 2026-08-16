@@ -1,16 +1,21 @@
 use serde::Deserialize;
 
-/// The "owner/name" GitHub repo slug to poll for the upgrade nudge's "latest
-/// release" feed, resolved at build time by `build.rs` (issue #398). Defaults
-/// to upstream's own repo when `DAD_RELEASE_REPO` isn't injected; this fork
-/// overrides it via `.cargo/config.toml`'s `[env]` table so a fork build
-/// polls the fork's own releases rather than a lineage it doesn't ship.
-fn github_releases_url() -> String {
-    format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        env!("DAD_RELEASE_REPO")
-    )
-}
+/// The URL to poll for the upgrade nudge's "latest release" feed, composed
+/// at build time from `DAD_RELEASE_REPO` (issue #398). Defaults to
+/// upstream's own repo when `DAD_RELEASE_REPO` isn't injected; a downstream
+/// distribution overrides this by setting `DAD_RELEASE_REPO` in its build
+/// environment or its own `.cargo/config.toml`, so its build polls its own
+/// releases rather than a lineage it doesn't ship.
+///
+/// `concat!` rather than a `format!` call: `env!` expands to a string
+/// literal and `concat!` expands nested `env!` eagerly, so this stays a
+/// `const` with no per-call allocation — the same idiom the `User-Agent`
+/// header below already uses (`concat!("dot-agent-deck/", env!("DAD_VERSION"))`).
+const GITHUB_RELEASES_URL: &str = concat!(
+    "https://api.github.com/repos/",
+    env!("DAD_RELEASE_REPO"),
+    "/releases/latest"
+);
 
 #[derive(Deserialize)]
 struct GitHubRelease {
@@ -41,7 +46,7 @@ async fn fetch_latest_version() -> Option<String> {
         .ok()?;
 
     let resp = client
-        .get(github_releases_url())
+        .get(GITHUB_RELEASES_URL)
         .header(
             "User-Agent",
             concat!("dot-agent-deck/", env!("DAD_VERSION")),

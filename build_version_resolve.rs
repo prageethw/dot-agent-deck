@@ -195,13 +195,35 @@ pub fn resolve_build_id(
     }
 }
 
-/// Is `segment` a valid path segment of a `DAD_RELEASE_REPO` slug — non-empty,
-/// no interior whitespace, and not a `.`/`..` traversal segment?
-fn is_valid_repo_slug_segment(segment: &str) -> bool {
+/// Is `owner` a valid GitHub username/org segment? GitHub's own allowlist
+/// alphabet: ASCII alphanumerics and `-`.
+///
+/// An allowlist rather than the denylist this replaced: the denylist rejected
+/// `.`/`..` segments explicitly, but that rejection was bypassable by
+/// percent-encoding (`%2e%2e` and case variants decode to `..` in the `url`
+/// crate this build links, `url-2.5.8/src/parser.rs:1319`), and it left every
+/// other URL-significant character (`?`, `#`, `:`, `@`, `\`, `%`) unrejected.
+/// This alphabet excludes all of them in one predicate, which makes the
+/// `.`/`..` special-case redundant rather than incomplete, and also excludes
+/// non-ASCII codepoints the denylist let through (e.g. bidi-format
+/// characters). Uppercase is accepted deliberately — GitHub owner names are
+/// case-insensitive but may contain uppercase letters.
+fn is_valid_owner_segment(segment: &str) -> bool {
     !segment.is_empty()
-        && segment != "."
-        && segment != ".."
-        && !segment.contains(char::is_whitespace)
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Is `name` a valid GitHub repository-name segment? GitHub's own allowlist
+/// alphabet: ASCII alphanumerics plus `.`, `-`, `_`. See
+/// [`is_valid_owner_segment`] for why this is an allowlist and not the
+/// `.`/`..`-denylist it replaced.
+fn is_valid_repo_name_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Normalize a candidate `DAD_RELEASE_REPO` injection (issue #398) into the
@@ -209,11 +231,12 @@ fn is_valid_repo_slug_segment(segment: &str) -> bool {
 /// like one.
 ///
 /// The upgrade nudge (`src/version.rs`) composes this slug directly into a
-/// `https://api.github.com/repos/<slug>/releases/latest` URL, so the shape is
-/// deliberately narrow: exactly one `/`, both segments non-empty, no
-/// whitespace, no `.`/`..` segment, single line. Anything else falls through
-/// to the caller's default — a malformed slug must degrade to "poll the
-/// known-good feed", never to a broken or attacker-influenced URL.
+/// `https://api.github.com/repos/<slug>/releases/latest` URL, so the shape
+/// follows GitHub's own slug alphabet: exactly one `/`, an owner segment of
+/// ASCII alphanumerics and `-`, a name segment of ASCII alphanumerics plus
+/// `.`/`-`/`_`, single line. Anything else falls through to the caller's
+/// default — a malformed slug must degrade to "poll the known-good feed",
+/// never to a broken or attacker-influenced URL.
 pub fn normalize_release_repo(candidate: &str) -> Option<String> {
     let trimmed = candidate.trim();
     if !is_single_line_directive_value(trimmed) {
@@ -225,7 +248,7 @@ pub fn normalize_release_repo(candidate: &str) -> Option<String> {
     if segments.next().is_some() {
         return None;
     }
-    if !is_valid_repo_slug_segment(owner) || !is_valid_repo_slug_segment(name) {
+    if !is_valid_owner_segment(owner) || !is_valid_repo_name_segment(name) {
         return None;
     }
     Some(format!("{owner}/{name}"))

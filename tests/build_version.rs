@@ -338,6 +338,15 @@ fn release_repo_injection_wins_when_valid() {
         normalize_release_repo("  prageethw/dot-agent-deck  ").as_deref(),
         Some("prageethw/dot-agent-deck")
     );
+    // Uppercase and the full name-segment alphabet (`.`, `-`, `_`) stay
+    // accepted under the allowlist — GitHub itself allows them, so the
+    // allowlist must not be narrower than the denylist it replaced, only
+    // narrower where the denylist was wrong (see `malformed_release_repo_...`
+    // below for what the allowlist newly rejects).
+    assert_eq!(
+        normalize_release_repo("Some-Org42/Repo.Name_1").as_deref(),
+        Some("Some-Org42/Repo.Name_1")
+    );
 }
 
 /// A malformed slug must fall through to the default rather than being
@@ -348,6 +357,7 @@ fn release_repo_injection_wins_when_valid() {
 fn malformed_release_repo_falls_through_to_default() {
     for bad in [
         "",                       // empty
+        "   ",                    // whitespace-only (blank after trim)
         "no-slash-here",          // no slash at all
         "a/b/c",                  // two slashes
         "a b/c",                  // whitespace in the owner segment
@@ -362,6 +372,20 @@ fn malformed_release_repo_falls_through_to_default() {
         "a/b\nc/d",               // multi-line value
         "a/b\r\nrustc-env=X=y",   // multi-line, directive-injection shaped
         "owner/name\u{1b}[2Jbad", // control character, no line break
+        // Auditor Low-1 / reviewer F10: the allowlist swap. Each of these
+        // was accepted by the old denylist (it only rejected `.`/`..`
+        // segments, whitespace and multi-segment values) and must now be
+        // rejected outright, because none is in GitHub's own slug alphabet.
+        "a%2e%2e/b",     // percent-encoded traversal, owner segment
+        "%2e%2e/%2e%2e", // percent-encoded traversal, both segments — the
+        // exact bypass of the old `.`/`..` denylist: `url` (2.5.8,
+        // parser.rs:1319) decodes this to a real `..` segment.
+        "a?b/c",     // query-injection character
+        "a#b/c",     // fragment character
+        "a\\b/c",    // backslash — a path separator for special schemes
+        "a:b/c",     // colon
+        "a@b/c",     // at-sign
+        "café/repo", // non-ASCII — the denylist had no ASCII requirement
     ] {
         assert_eq!(
             normalize_release_repo(bad),

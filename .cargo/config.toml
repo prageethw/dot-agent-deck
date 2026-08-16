@@ -28,7 +28,19 @@ xtask = "run --quiet --package xtask-linkage-check --"
 # Upstream carries no `[env]` table at all, so `build.rs`'s own default
 # (`vfarcic/dot-agent-deck`) is what an upstream build sees; this one line is
 # the fork's entire divergence for issue #398 — no fork slug is baked into
-# any source file (CLAUDE.md rule 19). `force` is deliberately left at its
-# default `false`: an explicit `DAD_RELEASE_REPO` already present in the
-# process environment (a packager, CI) still wins over this config value.
-DAD_RELEASE_REPO = "prageethw/dot-agent-deck"
+# any source file (CLAUDE.md rule 19).
+#
+# `force = true`, unlike a bare string: cargo's `[env]` presence check tests
+# whether the variable is already set in the process environment, not
+# whether it is non-empty. With the default `force = false`, an exported
+# `DAD_RELEASE_REPO=""` (e.g. a `docker run -e DAD_RELEASE_REPO` on a leg
+# where the host value is unset) counts as "present" and discards this
+# config value entirely — `build.rs` then sees the blank string, treats it
+# as not injected, and silently falls back to `DEFAULT_RELEASE_REPO`
+# (upstream), reviving the exact bug this line fixes. This value is a fork
+# identity constant, not a per-build override a packager legitimately needs
+# to vary from what this checkout's own config says, so `force = true` is
+# safe: every build path that also injects `DAD_RELEASE_REPO` explicitly
+# (`release.yml`, `flake.nix`) injects this same slug, so forcing the config
+# value to win changes nothing for them and only closes the empty-string gap.
+DAD_RELEASE_REPO = { value = "prageethw/dot-agent-deck", force = true }
