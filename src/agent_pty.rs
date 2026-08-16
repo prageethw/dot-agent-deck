@@ -6755,6 +6755,55 @@ mod tests {
             assert!(is_valid_display_name(id), "token {id} must pass validation");
         }
     }
+
+    /// PRD #365 M3: two independently-attached clients whose `StartAgent`
+    /// calls race onto the daemon must never be minted the same `pane_id`.
+    /// Unlike `mint_orchestration_id_is_unique_and_wire_valid` above (which
+    /// mints sequentially, since tab creation within one orchestration is
+    /// inherently sequential), pane spawns from distinct attached clients
+    /// are genuinely concurrent, so this drives `mint_pane_id()` from real
+    /// threads to exercise the `AtomicU64` sequence counter under actual
+    /// contention rather than only proving it holds up one call at a time.
+    #[test]
+    fn mint_pane_id_is_unique_and_wire_valid_under_concurrency() {
+        use std::sync::{Arc, Mutex};
+
+        const THREADS: usize = 10;
+        const PER_THREAD: usize = 100;
+
+        let all_ids = Arc::new(Mutex::new(Vec::with_capacity(THREADS * PER_THREAD)));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let all_ids = Arc::clone(&all_ids);
+                std::thread::spawn(move || {
+                    let minted: Vec<String> = (0..PER_THREAD).map(|_| mint_pane_id()).collect();
+                    all_ids.lock().expect("mutex not poisoned").extend(minted);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("minting thread must not panic");
+        }
+
+        let all_ids = Arc::try_unwrap(all_ids)
+            .expect("all threads joined")
+            .into_inner()
+            .expect("mutex not poisoned");
+        assert_eq!(all_ids.len(), THREADS * PER_THREAD);
+
+        let unique: std::collections::HashSet<&String> = all_ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            THREADS * PER_THREAD,
+            "minted pane ids must not collide across concurrent minters"
+        );
+        for id in &all_ids {
+            assert!(
+                is_valid_pane_id_env(id),
+                "pane id {id} must pass validation"
+            );
+        }
+    }
 }
 
 // PRD #42 M8/review B1: these tests spawn real PTYs running `/bin/sh` / `sh -c`
