@@ -314,6 +314,7 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -388,6 +389,7 @@ fn make_session(
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     }
 }
 
@@ -2401,6 +2403,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_user_prompt: Some("build the feature".into()),
         live_target: None,
         shell_synthetic_working: false,
+        model: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -2441,6 +2444,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     });
 
     let sessions: Vec<&SessionState> = state
@@ -2534,6 +2538,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         )),
                         live_target: None,
                         shell_synthetic_working: false,
+                        model: None,
                     }),
                 };
                 let resp = AttachResponse {
@@ -2698,6 +2703,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         display_name: None,
         pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
@@ -2898,6 +2904,7 @@ fn live_013_rehydration_preserves_shell_synthetic_working() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -2945,6 +2952,7 @@ fn live_013_rehydration_preserves_shell_synthetic_working() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -3219,6 +3227,7 @@ async fn live_014_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             last_user_prompt: None,
             live_target: None,
             shell_synthetic_working: true,
+            model: None,
         }),
     };
     // The paired `ShellIdle`, shaped the way `run_shell_activity_monitor`
@@ -3240,6 +3249,7 @@ async fn live_014_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
 
     let (dir, path, listener) = {
@@ -3511,6 +3521,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             last_user_prompt: None,
             live_target: None,
             shell_synthetic_working: false,
+            model: None,
         }),
     }));
 
@@ -3607,6 +3618,7 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(corrected_event));
 
@@ -3679,4 +3691,100 @@ fn live_016_transport_drop_mid_session_is_also_recovered_by_reconnect_rehydratio
     rt.block_on(assert_reconnect_recovers_the_missed_status(
         ReconnectTeardown::Dropped,
     ));
+}
+
+/// Scenario: PRD fork#378 reviewer/auditor round 2 (HIGH 1 / F8): a session
+/// with a known model is snapshotted via `live_snapshot()`, crosses the wire
+/// as JSON, and is restored via `seed_hydrated_session()` on a fresh
+/// `AppState` standing in for a reconnecting TUI. The rehydrated card's
+/// `model` must still be `Some(..)` AND the card must still render it —
+/// today `SessionSnapshot` carries no `model` field at all, so a reconnect
+/// silently drops it, and because Claude Code posts `model` only on
+/// `SessionStart`, the badge stays degraded for the rest of the session.
+/// `live_target` and `shell_synthetic_working` are in this same struct for
+/// exactly this reason (fork issue #21, PRD #20 blocker-4); this follows
+/// their round-trip precedent (`session/live/010`, `session/live/011`).
+#[spec("session/live/017")]
+#[test]
+fn live_017_rehydration_preserves_model() {
+    let mut daemon = AppState::default();
+    daemon.register_pane("pane-model".to_string());
+    daemon.apply_event(AgentEvent {
+        session_id: "sess-model".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: Utc::now(),
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-model".to_string()),
+        agent_id: Some("agent-model".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: Some("Opus".to_string()),
+    });
+    assert_eq!(
+        daemon.sessions["sess-model"].model.as_deref(),
+        Some("Opus"),
+        "precondition: the daemon-side session carries the model"
+    );
+
+    // --- reconnect: the daemon's snapshot crosses the wire and seeds the TUI --
+    let snapshot = daemon.sessions["sess-model"].live_snapshot();
+    let json = serde_json::to_string(&snapshot).expect("the snapshot serializes");
+    let snapshot: SessionSnapshot = serde_json::from_str(&json).expect("the snapshot deserializes");
+
+    let mut tui = AppState::default();
+    tui.register_pane("pane-model".to_string());
+    tui.seed_hydrated_session(
+        "pane-model".to_string(),
+        None,
+        Some(AgentType::ClaudeCode),
+        Some("agent-model".to_string()),
+        Some(&snapshot),
+    );
+
+    let rehydrated = tui
+        .sessions
+        .values()
+        .find(|session| session.pane_id.as_deref() == Some("pane-model"))
+        .expect("rehydration creates one card for the pane");
+    assert_eq!(
+        rehydrated.model.as_deref(),
+        Some("Opus"),
+        "a reconnected card must retain the model it had before the \
+         detach — SessionSnapshot must carry a model field"
+    );
+
+    // The model must also still RENDER, not just survive in state.
+    let width: u16 = 80;
+    let density = dot_agent_deck::ui::CardDensityKind::Normal;
+    let height = density.rendered_height();
+    let buffer = dot_agent_deck::ui::render_card_for_mode_to_buffer(
+        rehydrated,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        dot_agent_deck::ui::UiMode::Normal,
+        width,
+        height,
+        true,
+    );
+    let text: String = (0..buffer.area().height)
+        .map(|y| {
+            (0..buffer.area().width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("ClaudeCode (Opus)"),
+        "the rehydrated card must still render its model:\n{text}"
+    );
 }

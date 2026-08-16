@@ -593,6 +593,7 @@ fn session_start_event_with_origin(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     }
 }
 

@@ -258,6 +258,7 @@ mod tests {
             last_user_prompt: None,
             live_target: None,
             shell_synthetic_working: false,
+            model: None,
         }
     }
 

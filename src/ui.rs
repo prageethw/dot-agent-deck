@@ -20225,6 +20225,32 @@ fn card_border_glyph(is_selected: bool, mode: UiMode) -> (BorderType, Modifier) 
     (BorderType::Thick, emphasis)
 }
 
+/// PRD fork#378 reviewer/audit round 2, item 1 (user decision): the badge's
+/// model label normalization. A compact heuristic — strip a leading vendor
+/// prefix from a short, stable list, case-insensitively; everything else,
+/// including a model id matching no known prefix, passes through unchanged.
+/// Deliberately NOT a per-model lookup table: vendor prefixes are stable but
+/// model ids churn constantly, and a lookup table is exactly the "hard-coded
+/// labels" the PRD rejects.
+const MODEL_VENDOR_PREFIXES: &[&str] = &["claude-", "gpt-", "gemini-", "llama-", "mistral-"];
+
+/// Strip a leading vendor prefix from `model` (see [`MODEL_VENDOR_PREFIXES`]),
+/// case-insensitively. A model that is ONLY a vendor prefix (e.g. `"claude-"`)
+/// falls back to its raw value rather than normalizing to an empty string —
+/// every matched prefix is strictly shorter than the model it is stripped
+/// from. Every prefix is pure ASCII, so slicing at its byte length always
+/// lands on a `model` char boundary regardless of what follows.
+fn normalize_model_label(model: &str) -> &str {
+    for prefix in MODEL_VENDOR_PREFIXES {
+        if model.len() > prefix.len()
+            && model.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            return &model[prefix.len()..];
+        }
+    }
+    model
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_session_card(
     frame: &mut Frame,
@@ -20320,15 +20346,32 @@ fn render_session_card(
         let badge_style = Style::default()
             .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
             .add_modifier(Modifier::BOLD);
-        // The marker is appended AFTER the `<type> · <id-or-name>` so the
-        // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
-        // stays intact — only a trailing view-only annotation is added.
+        // PRD fork#378: a known active model grows the badge text to
+        // `<type> (<model>)`, still one registry-coloured, bold segment.
+        // The marker is appended AFTER the `<type>[ (<model>)] · <id-or-name>`
+        // so the `<type> ·` shape callers match on when NO model is known
+        // (e.g. `Codex ·`, `Pi · orch-01`) stays intact — only a trailing
+        // view-only annotation is added. Once a model IS known the badge
+        // reads `<type> (<model>) · …` instead, and never the bare form.
+        //
+        // Reviewer/audit round 2 (F4): trim and treat an empty/whitespace-only
+        // model as absent, so a producer posting `Some("")` or `Some("   ")`
+        // renders the bare `<type> · …` form rather than an empty `()`.
+        let badge_text = match session
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(model) => format!("{} ({})", session.agent_type, normalize_model_label(model)),
+            None => format!("{}", session.agent_type),
+        };
         let label_after_badge = display_name
             .map(|name| format!(" · {name} "))
             .unwrap_or_else(|| format!(" · {id_display} "));
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (format!("{}", session.agent_type), badge_style),
+            (badge_text, badge_style),
             (label_after_badge, title_bold),
         ];
         if !is_live {
@@ -25216,6 +25259,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state.apply_event(event1.clone());
 
@@ -25239,6 +25283,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state.apply_event(event2);
 
@@ -25315,6 +25360,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -25335,6 +25381,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -25371,6 +25418,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state.apply_event(event.clone());
 
@@ -25741,6 +25789,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -26255,6 +26304,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
         state
@@ -26295,6 +26345,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -26322,6 +26373,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -26350,6 +26402,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -26366,6 +26419,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         let mut ui = default_ui();
@@ -26393,6 +26447,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -26409,6 +26464,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         let mut ui = default_ui();
@@ -26438,6 +26494,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         let mut ui = default_ui();
@@ -27852,6 +27909,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -29846,6 +29904,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         }
     }
 
@@ -30174,6 +30233,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         }
 
@@ -30194,6 +30254,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         // Spacious: get all 3
@@ -30230,6 +30291,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -30257,6 +30319,7 @@ mod tests {
             display_name: None,
             pending_permission_tool: None,
             shell_synthetic_working: false,
+            model: None,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -36204,6 +36267,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
     }
 
@@ -36232,6 +36296,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
     }
 
@@ -36438,6 +36503,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
@@ -37009,6 +37075,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
 
         ui.send_retry_backoff
@@ -37500,6 +37567,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         };
         synthetic(EventType::ShellBusy, false);
@@ -37522,6 +37590,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         ui.send_retry_backoff
@@ -37771,6 +37840,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
         slow_ui
@@ -37855,6 +37925,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         assert_eq!(
@@ -37985,6 +38056,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         replacement_ui
             .send_retry_backoff
@@ -38033,6 +38105,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         assert_eq!(clear_controller.writes_for("same-agent"), 1);
@@ -38052,6 +38125,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         let clear_writes = clear_controller.writes_for("same-agent");
@@ -38104,6 +38178,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
 
         // The lost-response shape: one wire request issued, no outcome learned,
@@ -38174,6 +38249,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             });
         };
         let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
@@ -38444,6 +38520,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            model: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         let captured_sessions = expected_sessions.lock().unwrap().clone();
@@ -38907,7 +38984,11 @@ mod tests {
     /// hidden -> shown -> hidden, with `ui.status_message` reporting each
     /// transition. Also confirm `handle_normal_key` resolves a bare `m` to
     /// the toggle action, and that the alias does not displace `Enter`'s
-    /// existing `Action::Focus` resolution (via `KbAction::FocusPane`).
+    /// existing `Action::Focus` resolution (via `KbAction::FocusPane`). PRD
+    /// fork#378: this toggle transition and its status messages are
+    /// deck-global `UiState`/`Action` plumbing with no `SessionState` or
+    /// model segment involved, so adding a model to the badge (`dashboard/
+    /// agent-badge/001`) must leave this test's assertions unchanged.
     #[spec("dashboard/agent-badge/002")]
     #[test]
     fn agent_badge_002_toggle_cycles_hidden_shown_hidden() {

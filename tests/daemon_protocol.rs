@@ -1255,6 +1255,7 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            model: None,
         };
         {
             let mut state = server.state.write().await;
@@ -1371,6 +1372,7 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                     kind: TargetKind::Pty,
                     writable: Writable::Live,
                 }),
+                model: None,
             });
         }
         let mut attached = connect_attach(&server, &agent_id).await;
@@ -1441,6 +1443,7 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                     kind: TargetKind::Pty,
                     writable: Writable::Live,
                 }),
+                model: None,
             });
         }
         assert_eq!(
@@ -1599,6 +1602,7 @@ fn pane_input_018_paneless_history_target_rejects_stream_input() {
                 kind: TargetKind::Process,
                 writable: Writable::HistoryOnly,
             }),
+            model: None,
         });
         let mut attached = connect_attach(&server, &agent_id).await;
         let marker = b"PANELESS-HISTORY-INPUT-LEAKED";
@@ -1655,6 +1659,7 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            model: None,
         };
         {
             let mut state = server.state.write().await;
@@ -1737,6 +1742,7 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            model: None,
         };
         {
             let mut state = server.state.write().await;
@@ -1797,6 +1803,7 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
                 kind: TargetKind::Pty,
                 writable: Writable::Live,
             }),
+            model: None,
         };
         state.apply_event(event(EventType::SessionStart, now));
         state.apply_event(event(
@@ -1868,6 +1875,7 @@ fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
                 kind: TargetKind::Process,
                 writable,
             }),
+            model: None,
         };
 
         let server = start_server().await;
@@ -2254,6 +2262,7 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
                 kind: TargetKind::Pty,
                 writable,
             }),
+            model: None,
         };
         {
             let mut state = server.state.write().await;
@@ -2351,6 +2360,7 @@ fn stream_write_revalidates_liveness_after_writer_lock() {
                 kind: TargetKind::Pty,
                 writable,
             }),
+            model: None,
         };
         {
             let mut state = server.state.write().await;
@@ -2416,6 +2426,7 @@ async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner
         agent_version: None,
         schema_version: None,
         live_target: Some(live_target),
+        model: None,
     };
     {
         let mut state = server.state.write().await;
@@ -2522,6 +2533,7 @@ fn pane_input_014_stream_liveness_race_returns_typed_rejection() {
                     kind: TargetKind::Pty,
                     writable,
                 }),
+                model: None,
             };
             {
                 let mut state = server.state.write().await;
@@ -3446,6 +3458,7 @@ fn filler_event(n: usize) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     }
 }
 
