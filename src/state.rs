@@ -7610,4 +7610,106 @@ clear = false
             "a status-less frame must not clear a mark it did not earn"
         );
     }
+
+    // ---- PRD #365 M2 regression: a daemon-minted (already "pane-"-prefixed)
+    // pane_id must not double-prefix the derived session_id. -----------------
+    //
+    // `mint_pane_id()` (the daemon-side minting PRD #365 M2 introduced) now
+    // produces ids that already carry the `"pane-"` prefix (e.g.
+    // `"pane-a1b2c3d4e5f6a7b8-0"`), but `insert_placeholder_session` /
+    // `seed_hydrated_session` still unconditionally build
+    // `session_id = format!("pane-{pane_id}")`, which was only ever correct
+    // for the pre-PRD-#365 bare ids (a counter digit, a role index). A
+    // real spawned pane's session_id therefore becomes double-prefixed
+    // (`"pane-pane-a1b2c3d4e5f6a7b8-0"`), which renders as a garbled
+    // `"pane-pane-…"` identity on the dashboard for any placeholder session
+    // with no display name.
+
+    /// A daemon-minted pane_id (already `"pane-"`-prefixed) must yield a
+    /// session_id equal to the pane_id itself — never a double `"pane-pane-"`
+    /// prefix.
+    #[test]
+    fn insert_placeholder_session_does_not_double_prefix_a_minted_pane_id() {
+        let minted_pane_id = "pane-a1b2c3d4e5f6a7b8-0";
+        let mut state = AppState::default();
+        state.register_pane(minted_pane_id.to_string());
+        state.insert_placeholder_session(minted_pane_id.to_string(), None, None, None);
+
+        let keys: Vec<_> = state.sessions.keys().cloned().collect();
+        assert!(
+            !keys.iter().any(|k| k.contains("pane-pane-")),
+            "session_id must never double-prefix an already-'pane-'-prefixed \
+             pane_id; sessions keys were: {keys:?}"
+        );
+        assert!(
+            state.sessions.contains_key(minted_pane_id),
+            "a daemon-minted pane_id must produce a session_id equal to the \
+             pane_id itself; sessions keys were: {keys:?}"
+        );
+    }
+
+    /// A legacy bare pane_id (a counter digit, still passed by several
+    /// existing callers) must keep producing today's `"pane-<id>"` — the
+    /// fix for the minted case must not regress this backward-compat shape.
+    #[test]
+    fn insert_placeholder_session_still_prefixes_a_legacy_bare_pane_id() {
+        let bare_pane_id = "1";
+        let mut state = AppState::default();
+        state.register_pane(bare_pane_id.to_string());
+        state.insert_placeholder_session(bare_pane_id.to_string(), None, None, None);
+
+        assert!(
+            state.sessions.contains_key("pane-1"),
+            "a legacy bare pane_id must still produce 'pane-<id>' for \
+             backward compatibility; sessions keys were: {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// [`AppState::seed_hydrated_session`] delegates its placeholder minting
+    /// to [`AppState::insert_placeholder_session`], but recomputes the
+    /// session_id a second time (independently) to overlay the live
+    /// snapshot fields — so the same double-prefix bug can reappear there
+    /// even if only the delegate is fixed. A daemon-minted pane_id, WITH a
+    /// live snapshot attached, must still land on a session_id equal to the
+    /// pane_id itself, and the snapshot's fields (status) must be visible on
+    /// it — proving the overlay found the right entry rather than seeding a
+    /// double-prefixed key nobody overlays.
+    #[test]
+    fn seed_hydrated_session_does_not_double_prefix_a_minted_pane_id() {
+        let minted_pane_id = "pane-a1b2c3d4e5f6a7b8-0";
+        let snap = SessionSnapshot {
+            status: SessionStatus::Working,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 3,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: false,
+            model: None,
+        };
+        let mut state = AppState::default();
+        state.register_pane(minted_pane_id.to_string());
+        state.seed_hydrated_session(minted_pane_id.to_string(), None, None, None, Some(&snap));
+
+        let keys: Vec<_> = state.sessions.keys().cloned().collect();
+        assert!(
+            !keys.iter().any(|k| k.contains("pane-pane-")),
+            "session_id must never double-prefix an already-'pane-'-prefixed \
+             pane_id; sessions keys were: {keys:?}"
+        );
+        let session = state.sessions.get(minted_pane_id).unwrap_or_else(|| {
+            panic!(
+                "a daemon-minted pane_id must produce a session_id equal to \
+                 the pane_id itself; sessions keys were: {keys:?}"
+            )
+        });
+        assert_eq!(
+            session.status,
+            SessionStatus::Working,
+            "the live snapshot's status must be overlaid onto the correctly \
+             keyed session"
+        );
+    }
 }
