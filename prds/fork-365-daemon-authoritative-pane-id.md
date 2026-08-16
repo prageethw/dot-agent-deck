@@ -179,7 +179,7 @@ No on-disk artefact needs migrating. Archived report filenames (`work-done-<role
 ### M3 — prove it
 
 - [x] A test that two independently-attached clients cannot obtain the same id — pinned, not argued.
-- [ ] A test that an id is not reissued after its pane exits.
+- [x] A test that an id is not reissued after its pane exits.
 - [ ] Rule 12 cross-version manual test run, with an isolated `DOT_AGENT_DECK_LOG`, sockets, `HOME` and state dir.
 
 ### M4 — offer upstream
