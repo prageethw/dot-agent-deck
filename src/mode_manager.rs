@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError};
 #[cfg(unix)]
 use crate::platform::shell::quote_shell_arg;
+#[cfg(windows)]
+use crate::platform::shell::{quote_cmd_exe_arg, quote_cmd_exe_program};
 use crate::project_config::ModeConfig;
 
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
@@ -22,17 +24,21 @@ use crate::project_config::ModeConfig;
 /// still expand `$` and backticks inside double quotes, and Rust's escapes
 /// are not a faithful encoding for every character, e.g. a real newline).
 ///
-/// **Windows**: `quote_shell_arg` has no `cmd.exe` arm (it is POSIX-only —
-/// see its doc comment), so this reproduces the pre-#157 format exactly,
-/// position for position: `exe` bare via `Display`, `command` via `{:?}`.
-/// That is deliberately unchanged from `main` and is **not** a `cmd.exe`
-/// quoting fix — `{:?}` is Rust `Debug` escaping, not a `cmd.exe` grammar,
-/// and remains vulnerable to issue #157 finding A1 (a configured command
-/// containing `" & calc.exe & rem "` still breaks out of the quoted word).
-/// That weakness is `main`'s pre-existing behaviour, not a regression
-/// introduced here, and a real `cmd.exe`-safe fix is tracked as fork issue
-/// #283. This function's Windows arm exists only so that behaviour, known-
-/// inadequate as it is, is not made worse in the course of fixing Unix.
+/// **Windows**: position-aware `cmd.exe` quoting (fork issue #283) —
+/// `exe` and `command` sit in two different grammatical positions of a
+/// `cmd.exe` command line and need two different quoting rules, so each is
+/// quoted with its own function: `exe` is the leading program-name token
+/// ([`quote_cmd_exe_program`], `cmd.exe`'s own space-terminated-unless-
+/// quoted lookup), while `command` is an ordinary argument that must
+/// survive both `cmd.exe`'s own metacharacter scan and the launched
+/// process's `CommandLineToArgvW`-compatible `argv` parsing
+/// ([`quote_cmd_exe_arg`] — see its doc comment for why that needs two
+/// escaping passes). This replaces the pre-#157 `{:?}`-Debug-quoted format
+/// `main` still uses, which is not a `cmd.exe` quoting scheme at all and
+/// remains vulnerable to issue #157 finding A1 (a configured command
+/// containing `" & calc.exe & rem "` breaks out of the quoted word — see
+/// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`,
+/// verified against a real `cmd.exe`).
 #[cfg(unix)]
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
@@ -46,10 +52,10 @@ fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
 #[cfg(windows)]
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
-        "{} watch --interval {} {:?}",
-        exe.display(),
+        "{} watch --interval {} {}",
+        quote_cmd_exe_program(&exe.display().to_string()),
         interval_secs,
-        command
+        quote_cmd_exe_arg(command)
     )
 }
 
@@ -711,50 +717,54 @@ mod tests {
         assert_eq!(round_trip_through_posix_shell(tricky), tricky);
     }
 
-    /// Windows reproduces `main`'s pre-#157 format exactly, position for
-    /// position: the executable bare via `Display` (this is the site the
-    /// spaced-executable regression was about — `exe` still goes in bare on
-    /// Windows because `quote_shell_arg` has no `cmd.exe` arm), and the
-    /// command `{:?}`-quoted, matching `origin/main`'s
-    /// `format!("{} watch --interval {} {:?}", exe.display(), interval_secs,
-    /// command)` byte for byte. This is parity with `main`, not a fix.
+    /// Retires the two `main`-parity baseline tests this function used to
+    /// carry (`watch_invocation_matches_pre_157_main_on_windows` /
+    /// `watch_invocation_reproduces_mains_a1_vulnerability_on_windows`),
+    /// which pinned the pre-#283 `{:?}`-Debug-quoted format byte for byte.
+    /// That format is no longer emitted by either arm of `watch_invocation`
+    /// — the Windows arm now calls [`quote_cmd_exe_program`] /
+    /// [`quote_cmd_exe_arg`] unconditionally, so there is no remaining code
+    /// path that reproduces the vulnerable baseline to pin. This test
+    /// replaces them with a deterministic, non-`cmd.exe` pin of the new
+    /// format (the real-`cmd.exe` behavioural proof lives in
+    /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
+    /// and `watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it`
+    /// below).
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_matches_pre_157_main_on_windows() {
+    fn watch_invocation_quotes_the_executable_and_command_on_windows() {
         let exe = Path::new(r"C:\Program Files\My Deck\dot-agent-deck.exe");
         let line = watch_invocation(exe, 10, "npm run dev");
         assert_eq!(
             line,
-            r#"C:\Program Files\My Deck\dot-agent-deck.exe watch --interval 10 "npm run dev""#
+            "\"C:\\Program Files\\My Deck\\dot-agent-deck.exe\" watch --interval 10 ^\"npm run dev^\""
         );
     }
 
-    /// The finding A1 exploit, pinned against the `{:?}`-quoted format this
-    /// function reproduces from `main` — **not** proof of safety. `{:?}` is
-    /// Rust `Debug` escaping, not a `cmd.exe` quoting contract: `cmd.exe`
-    /// treats the literal backslash before the embedded `"` as not escaping
-    /// it, so the quote still closes the word and `cmd.exe` still runs
-    /// `calc.exe` from the now-unquoted tail. This is `main`'s unchanged,
-    /// still-vulnerable behaviour, carried forward deliberately so Windows
-    /// is no worse after this fix than before it; a `cmd.exe`-verified fix
-    /// is tracked as fork issue #283, not attempted here.
+    /// The finding A1 exploit shape, pinned at the string level against the
+    /// new caret-escaped format: every `cmd.exe` metacharacter in `command`
+    /// (`"`, `&`) must come out caret-escaped rather than bare, which is
+    /// what stops `cmd.exe`'s quote-parity scan from ever leaving "quoted"
+    /// mode. The end-to-end proof against a real `cmd.exe` is
+    /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
+    /// below; this is the fast, deterministic companion pin.
     #[cfg(windows)]
     #[test]
-    fn watch_invocation_reproduces_mains_a1_vulnerability_on_windows() {
+    fn watch_invocation_caret_escapes_the_a1_exploit_shape_on_windows() {
         let exe = Path::new(r"C:\deck\dot-agent-deck.exe");
         let command = r#"echo ok" & calc.exe & rem ""#;
         let line = watch_invocation(exe, 5, command);
         assert_eq!(
             line,
-            format!(r"C:\deck\dot-agent-deck.exe watch --interval 5 {command:?}")
+            r#"C:\deck\dot-agent-deck.exe watch --interval 5 ^"echo ok\^" ^& calc.exe ^& rem \^"^""#
         );
     }
 
     /// Fork issue #283's "done looks like" bar: the finding A1 exploit
     /// round-tripped through a REAL `cmd.exe`, not merely inspected as a
     /// generated string (which is what
-    /// `watch_invocation_reproduces_mains_a1_vulnerability_on_windows` above
-    /// deliberately pins as the still-vulnerable baseline). The command is
+    /// `watch_invocation_caret_escapes_the_a1_exploit_shape_on_windows` above
+    /// pins at the string level). The command is
     /// delivered to `cmd.exe` via `raw_arg`, which — unlike `Command::args`
     /// (see `platform::proc::windows::tests::spawn_helper_tree`'s comment on
     /// why individual args are used instead of one string) — adds none of

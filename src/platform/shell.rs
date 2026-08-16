@@ -90,16 +90,12 @@ pub fn shell_command_flag() -> &'static str {
 /// shell-quoting contract for other interpreters. `cmd.exe` has no
 /// equivalent single-quote construct, so there is no Windows arm of this
 /// function; a caller that needs a `cmd.exe`-safe command line must build it
-/// itself (issue #157 finding A1, audit-verified — a `{:?}` Debug-escaped
+/// itself with [`quote_cmd_exe_program`] / [`quote_cmd_exe_arg`] below
+/// (issue #157 finding A1, audit-verified — a `{:?}` Debug-escaped
 /// double-quoted string is *not* `cmd.exe`-safe either, since `cmd.exe`
 /// treats a literal backslash before an embedded `"` as not escaping it, so
 /// the quote still closes the word and everything after it is parsed as a
-/// fresh command line by the outer shell). A correct `cmd.exe`-safe quoting
-/// scheme (caret-escaping metacharacters, doubling embedded quotes so
-/// `cmd.exe` never toggles out of quoted parsing) is real, easy-to-get-
-/// subtly-wrong work that this repo cannot verify from a non-Windows host,
-/// and is tracked as a follow-up (fork issue #283) rather than attempted
-/// here.
+/// fresh command line by the outer shell; fork issue #283).
 ///
 /// Single-quotes `arg` unconditionally, closing/escaping/reopening an
 /// embedded `'` as `'\''` (the standard POSIX technique) — nothing else is
@@ -109,4 +105,208 @@ pub fn shell_command_flag() -> &'static str {
 #[cfg(unix)]
 pub fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// Quote `token` as the leading (program-name) position of a `cmd.exe`
+/// command line only when it contains a character outside a conservative
+/// safe set; otherwise return it unchanged. `cmd.exe` locates the program at
+/// the head of a command line by scanning for a closing `"` when the token
+/// opens with one, or otherwise up to the first unquoted space — so a bare
+/// path containing a space (issue #157's original regression) is split and
+/// never found unless quoted.
+///
+/// Same safe set and escaping as `hooks_manage::shell_quote_if_needed`'s
+/// `#[cfg(windows)]` arm (fork #229): `~` is not special to `cmd.exe`
+/// (unlike POSIX home-directory expansion) so it needs no quoting, while `%`
+/// and `!` are `cmd.exe`-special (variable expansion) and are deliberately
+/// excluded from the safe set.
+#[cfg(windows)]
+pub fn quote_cmd_exe_program(token: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'\\' | b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b',' | b'~'
+            )
+    }
+    if !token.is_empty() && token.bytes().all(is_safe) {
+        token.to_string()
+    } else {
+        format!("\"{}\"", token.replace('"', "\\\""))
+    }
+}
+
+/// Quote `arg` as a single `cmd.exe` command-line ARGUMENT (as opposed to
+/// [`quote_cmd_exe_program`]'s leading program-name position) so that it
+/// survives BOTH of the two separate parsers that see the same text: the
+/// interpreting `cmd.exe`'s own metacharacter scan, and the CRT/
+/// `CommandLineToArgvW`-compatible `argv` parsing the launched child process
+/// applies to recover its own arguments. Fork issue #283.
+///
+/// This is genuinely two escaping passes, not one — matching the treatment
+/// at <https://qntm.org/cmd> (the definitive public writeup of this
+/// problem), which is also the algorithm Node.js's `child_process` uses to
+/// shell out through `cmd.exe` safely:
+///
+/// 1. **CRT round-trip quoting** ([`quote_shell_arg`]'s Windows analogue):
+///    wrap `arg` in `"…"`, doubling any run of backslashes that immediately
+///    precedes either an embedded `"` or the end of the string, and
+///    escaping each embedded `"` with one extra backslash. In isolation
+///    this is exactly what `std::process::Command` does to its own Windows
+///    arguments, and it guarantees a child that parses its command line via
+///    `CommandLineToArgvW` recovers `arg` byte for byte as a single `argv`
+///    element — but it does nothing about `cmd.exe`'s OWN, separate scan of
+///    the same text.
+/// 2. **Caret-escaping every `cmd.exe` metacharacter** in step 1's output,
+///    including the quotes step 1 just added. `cmd.exe` decides whether it
+///    is "inside quotes" purely by counting bare `"` characters as it scans
+///    — it does not honor a preceding backslash the way the CRT does, which
+///    is exactly issue #157 finding A1's mechanism: a `\"` produced by step
+///    1's escaping is still a bare `"` byte to `cmd.exe`, so it still flips
+///    `cmd.exe`'s quote parity and exposes whatever follows (e.g. ` &
+///    calc.exe & `) as an unquoted, separately-interpreted command.
+///    Caret-escaping every metacharacter — quotes included — means
+///    `cmd.exe`'s scan never sees a bare special character at all, so it
+///    never leaves "quoted" mode and never treats anything as a command
+///    separator. `cmd.exe` strips the carets as it forwards the line to the
+///    launched process, so the child receives exactly step 1's output.
+#[cfg(windows)]
+pub fn quote_cmd_exe_arg(arg: &str) -> String {
+    caret_escape_cmd_metachars(&crt_argv_quote(arg))
+}
+
+/// Step 1 of [`quote_cmd_exe_arg`]: the standard CRT/`CommandLineToArgvW`
+/// round-trip quoting algorithm (Microsoft-documented; identical to what
+/// `std::process::Command` applies to its own Windows arguments).
+#[cfg(windows)]
+fn crt_argv_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg
+            .chars()
+            .any(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '"'))
+    {
+        return arg.to_string();
+    }
+
+    let chars: Vec<char> = arg.chars().collect();
+    let mut result = String::with_capacity(chars.len() + 2);
+    result.push('"');
+
+    let mut i = 0;
+    while i < chars.len() {
+        let mut num_backslashes = 0;
+        while i < chars.len() && chars[i] == '\\' {
+            num_backslashes += 1;
+            i += 1;
+        }
+
+        if i == chars.len() {
+            // Trailing backslash run right before the closing quote this
+            // function is about to add: double it so the CRT parser sees an
+            // even run (literal backslashes) followed by the real delimiter.
+            result.extend(std::iter::repeat_n('\\', num_backslashes * 2));
+        } else if chars[i] == '"' {
+            // Backslash run immediately before an embedded quote: double it,
+            // then escape the quote itself with one more backslash so the
+            // CRT parser treats it as a literal `"` rather than a delimiter.
+            result.extend(std::iter::repeat_n('\\', num_backslashes * 2 + 1));
+            result.push('"');
+            i += 1;
+        } else {
+            // A backslash run not immediately before a quote is not special
+            // to the CRT parser — pass it through unchanged.
+            result.extend(std::iter::repeat_n('\\', num_backslashes));
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result.push('"');
+    result
+}
+
+/// Step 2 of [`quote_cmd_exe_arg`]: caret-escape every character `cmd.exe`
+/// treats specially during its own command-line scan, so that scan never
+/// sees an unescaped metacharacter — including the quotes [`crt_argv_quote`]
+/// added, which is what stops finding A1's quote-parity trick from working.
+#[cfg(windows)]
+fn caret_escape_cmd_metachars(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!'
+        ) {
+            result.push('^');
+        }
+        result.push(c);
+    }
+    result
+}
+
+#[cfg(all(windows, test))]
+mod windows_quoting_tests {
+    use super::*;
+
+    #[test]
+    fn quote_cmd_exe_program_leaves_a_safe_path_unquoted() {
+        assert_eq!(
+            quote_cmd_exe_program(r"C:\deck\dot-agent-deck.exe"),
+            r"C:\deck\dot-agent-deck.exe"
+        );
+    }
+
+    #[test]
+    fn quote_cmd_exe_program_quotes_a_spaced_path() {
+        assert_eq!(
+            quote_cmd_exe_program(r"C:\Program Files\My Deck\dot-agent-deck.exe"),
+            r#""C:\Program Files\My Deck\dot-agent-deck.exe""#
+        );
+    }
+
+    #[test]
+    fn quote_cmd_exe_arg_leaves_a_word_with_no_special_characters_unquoted() {
+        assert_eq!(quote_cmd_exe_arg("dev"), "dev");
+    }
+
+    #[test]
+    fn quote_cmd_exe_arg_quotes_and_caret_escapes_a_spaced_argument() {
+        assert_eq!(quote_cmd_exe_arg("npm run dev"), r#"^"npm run dev^""#);
+    }
+
+    /// The finding A1 shape: every `cmd.exe` metacharacter this function
+    /// promises to neutralize — `"`, `&`, `>` — must come out caret-escaped,
+    /// with no bare occurrence left for `cmd.exe`'s own scan to see. Checked
+    /// by walking every character rather than searching for a fixed
+    /// substring, since a *correctly* caret-escaped `&` followed by a space
+    /// (`^& `) still contains the two-byte substring `"& "` — a naive
+    /// `contains` check would flag correct output as broken.
+    #[test]
+    fn quote_cmd_exe_arg_neutralizes_every_cmd_exe_metacharacter() {
+        let quoted = quote_cmd_exe_arg(r#"echo ok" & type nul > injected.marker & rem ""#);
+        for bare in ['"', '&', '>'] {
+            let mut prev = None;
+            for c in quoted.chars() {
+                if c == bare {
+                    assert_eq!(
+                        prev,
+                        Some('^'),
+                        "every `{bare}` in {quoted:?} must be immediately preceded by `^`"
+                    );
+                }
+                prev = Some(c);
+            }
+        }
+    }
+
+    /// A run of backslashes immediately before the closing quote must be
+    /// doubled so the CRT parser sees a literal backslash run, not an
+    /// escape of the delimiter itself.
+    #[test]
+    fn quote_cmd_exe_arg_doubles_a_trailing_backslash_run_before_the_closing_quote() {
+        let quoted = quote_cmd_exe_arg(r"C:\Program Files\");
+        // Two literal backslashes (doubled from one), then the caret-escaped
+        // closing quote.
+        assert_eq!(quoted, "^\"C:\\Program Files\\\\^\"");
+    }
 }

@@ -157,13 +157,22 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
 /// executable path so a path containing whitespace or shell metacharacters still
 /// produces a valid command that Codex parses to the intended argv (finding #14 /
 /// L-1). A "safe" path (only path-typical characters) is emitted verbatim so the
-/// common case stays human-readable and stable; anything else is single-quoted
-/// with embedded single quotes escaped.
+/// common case stays human-readable and stable; anything else is quoted.
+///
+/// Codex hook commands are shelled through the platform's native shell, so the
+/// quoting rule differs by platform: POSIX single-quoting on Unix
+/// ([`crate::platform::paths::shell_quote_if_needed`]), `cmd.exe`-safe
+/// double-quoting on Windows ([`crate::platform::shell::quote_cmd_exe_program`]
+/// — `codex_home()` is documented as reachable on Windows via `$CODEX_HOME`,
+/// so this path must be genuinely correct there, not merely reachable; fork
+/// issue #238).
 fn build_command(binary_path: &str) -> String {
-    format!(
-        "{} {HOOK_COMMAND_SUFFIX}",
-        crate::platform::paths::shell_quote_if_needed(binary_path)
-    )
+    #[cfg(unix)]
+    let quoted = crate::platform::paths::shell_quote_if_needed(binary_path);
+    #[cfg(windows)]
+    let quoted = crate::platform::shell::quote_cmd_exe_program(binary_path);
+
+    format!("{quoted} {HOOK_COMMAND_SUFFIX}")
 }
 
 /// Merge the deck's command hooks for `command` into an existing `hooks.json`
