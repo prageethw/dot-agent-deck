@@ -5938,19 +5938,42 @@ impl AgentPtyRegistry {
         // made which agents got polled on a *timeout* break depend on
         // `HashMap` iteration order). That no longer has any bearing on
         // correctness now that phase 3 never skips an agent based on what
-        // phase 2 observed — it only affects how promptly the early break
-        // above can trigger — but is worth stating since the earlier,
-        // now-superseded fix changed this same loop and never recorded it
-        // anywhere a future reader would see it.
+        // phase 2 observed. It also does not affect how promptly the early
+        // break below can trigger: that break needs every agent to be
+        // individually confirmed exited within the same round, so once the
+        // last straggler is observed exited, every not-yet-confirmed
+        // sibling gets probed and (having genuinely already exited)
+        // confirmed in that same round regardless of whether earlier rounds
+        // short-circuited on it — a `.all()` iterator would have hit the
+        // same round, just later per-round, since it stops at the first
+        // still-running agent every time one remains. What actually changed
+        // is the number of `waitid` syscalls issued per round: this loop
+        // probes every not-yet-exited agent each round; `.all()` would stop
+        // at the first one still running and skip probing the rest until
+        // the next round. (Corrected here — fork issue #217 item 5 — from
+        // an earlier version of this comment that claimed the change
+        // affected break timing, which it does not.)
         let mut observed_exited = vec![false; agents.len()];
+        // fork issue #217 item 3: sibling to `observed_exited`, tracking
+        // per-agent whether `observe_exit_without_reaping` has already
+        // logged a permanent-peek-error warning this shutdown, so a
+        // permanent error (which keeps the agent classified as
+        // still-running for the rest of the grace window — see that
+        // function's doc comment) logs once per agent instead of once per
+        // ~50ms poll for the remainder of the window.
+        let mut warned_permanent_error = vec![false; agents.len()];
         let deadline = std::time::Instant::now() + grace;
         loop {
             let mut all_exited = true;
-            for (agent, exited) in agents.iter_mut().zip(observed_exited.iter_mut()) {
+            for ((agent, exited), warned) in agents
+                .iter_mut()
+                .zip(observed_exited.iter_mut())
+                .zip(warned_permanent_error.iter_mut())
+            {
                 if *exited {
                     continue;
                 }
-                if observe_exit_without_reaping(&mut agent.child) {
+                if observe_exit_without_reaping(&mut agent.child, deadline, warned) {
                     *exited = true;
                 } else {
                     all_exited = false;
@@ -5992,6 +6015,15 @@ impl AgentPtyRegistry {
 /// issue #163 is about, and phase 3 depends on nothing in the grace window
 /// having reaped anything (see that function's doc comment).
 ///
+/// `deadline` is the same grace-window deadline the caller's phase-2 poll
+/// loop already tracks, threaded through so the EINTR retry inside
+/// [`resolve_peek_outcome`] can bound itself against it (fork issue #217
+/// item 1) instead of retrying unboundedly. `warned_permanent_error` is a
+/// per-agent flag, owned by the caller across the whole poll loop, that
+/// [`resolve_peek_outcome`]'s `PermanentError` case uses to log at most once
+/// per agent per shutdown (fork issue #217 item 3) instead of once per
+/// ~50ms poll for the rest of the grace window.
+///
 /// Unix routes through [`crate::platform::proc::peek_child_exited_without_reaping`],
 /// a non-reaping `libc::waitid(WNOWAIT)` peek keyed on the real pid. There is
 /// deliberately no Windows counterpart in the `platform::proc` seam: Windows
@@ -5999,7 +6031,11 @@ impl AgentPtyRegistry {
 /// can be recycled by an intervening reap, and Windows's `try_wait` (a
 /// `GetExitCodeProcess` query) was never unsafe to call in the grace window
 /// to begin with.
-fn observe_exit_without_reaping(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> bool {
+fn observe_exit_without_reaping(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    deadline: std::time::Instant,
+    warned_permanent_error: &mut bool,
+) -> bool {
     #[cfg(unix)]
     {
         let Some(pid) = child.process_id() else {
@@ -6013,44 +6049,140 @@ fn observe_exit_without_reaping(child: &mut Box<dyn portable_pty::Child + Send +
             // window should reap.
             return false;
         };
-        loop {
-            match crate::platform::proc::peek_child_exited_without_reaping(pid) {
-                Ok(exited) => break exited,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    // Auditor F1: this comment previously read every error,
-                    // including a plain `EINTR`, as "already reaped, stop
-                    // polling". That was correct against the earlier
-                    // skip-based design (`be1fde4`), where phase 3 ran only
-                    // for agents phase 2 had *not* observed exiting, so
-                    // re-polling a genuinely-gone pid to no purpose was the
-                    // failure mode to avoid. Phase 3 is now unconditional,
-                    // which flips the calculus: continuing to poll is the
-                    // only thing preserving the grace window, so collapsing
-                    // it on a transient error throws away exactly what this
-                    // rework exists to give agents. `ECHILD` is the one
-                    // error that still means "already reaped by something
-                    // else" (see the precondition on
-                    // `peek_child_exited_without_reaping`), so it alone
-                    // stops polling here; any other error is treated as
-                    // still-running so the grace window survives it. Safety
-                    // is unaffected either way — phase 3 signals and reaps
-                    // unconditionally regardless of what phase 2 concluded.
-                    let is_echild = e.raw_os_error() == Some(libc::ECHILD);
+        match resolve_peek_outcome(deadline, || {
+            crate::platform::proc::peek_child_exited_without_reaping(pid)
+        }) {
+            PeekOutcome::Exited => true,
+            PeekOutcome::StillRunning => false,
+            // ECHILD means "already reaped by something else" — a violation
+            // of the sole-reaper precondition documented on
+            // `peek_child_exited_without_reaping` (this is exactly the
+            // recycled-pid hazard fork #163 is about, if it is ever hit for
+            // real). Still treated the same as observed-exited so phase 2
+            // stops re-polling it — that classification is correct and
+            // unchanged (phase 3 signals and reaps unconditionally either
+            // way) — but logged unconditionally, since this is the only
+            // runtime signal that the precondition was ever violated. Fires
+            // at most once per agent per shutdown by construction: this arm
+            // returns `true`, which marks the agent exited and removes it
+            // from further polling in the same round.
+            PeekOutcome::AlreadyReaped => {
+                tracing::warn!(
+                    pid,
+                    "peek_child_exited_without_reaping: ECHILD — pid was already \
+                     reaped by something else during graceful shutdown, violating \
+                     the sole-reaper precondition; treating as exited (phase 3 \
+                     still signals and reaps unconditionally)"
+                );
+                true
+            }
+            PeekOutcome::PermanentError(e) => {
+                // Auditor F1 / fork issue #217 items 2-3: after
+                // `resolve_peek_outcome`'s bounded EINTR retry, `waitid`'s
+                // documented error set (with `WNOHANG` set, as this call
+                // always sets it) has no transient member left — this arm
+                // is reachable in practice only by a permanent `EINVAL`
+                // misuse, not a transient condition to wait out. Treating it
+                // as still-running is the conservative default given the
+                // alternative (folding a genuine peek failure into
+                // "already exited") risks the recycled-pid hazard phase 3
+                // exists to prevent — not because polling further has any
+                // chance of resolving it. Logged once per agent per
+                // shutdown rather than on every ~50ms poll for the rest of
+                // the grace window, since the error is permanent and
+                // re-logging it adds no new information.
+                if !*warned_permanent_error {
+                    *warned_permanent_error = true;
                     tracing::warn!(
                         pid,
                         error = %e,
-                        echild = is_echild,
-                        "peek_child_exited_without_reaping failed during graceful shutdown"
+                        "peek_child_exited_without_reaping failed during graceful shutdown \
+                         (permanent error, treated as still-running; further occurrences for \
+                         this agent this shutdown are suppressed)"
                     );
-                    break is_echild;
                 }
+                false
             }
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = (deadline, warned_permanent_error);
         matches!(child.try_wait(), Ok(Some(_)))
+    }
+}
+
+/// Outcome of a single [`resolve_peek_outcome`] call — the classification
+/// [`observe_exit_without_reaping`] turns into a `bool` (and, for
+/// [`PeekOutcome::PermanentError`], a once-per-agent log line).
+#[cfg(unix)]
+#[derive(Debug)]
+enum PeekOutcome {
+    /// The peek observed the child has exited.
+    Exited,
+    /// The peek observed the child is still running.
+    StillRunning,
+    /// The peek failed with `ECHILD`: something else already reaped this
+    /// pid. Distinct from `StillRunning` so the caller can fold it into
+    /// "exited" without conflating "confirmed running" with "no longer
+    /// ours to observe".
+    AlreadyReaped,
+    /// The peek failed with anything other than `ECHILD`, after the bounded
+    /// EINTR retry gave up. Distinct from `StillRunning` purely so the
+    /// caller can log it (once) — the two are treated identically
+    /// otherwise, both conservatively as "still running".
+    PermanentError(std::io::Error),
+}
+
+/// Bounded, deadline-aware wrapper around a single non-reaping exit peek.
+/// Pulled out of [`observe_exit_without_reaping`] as a pure function over an
+/// injected `peek` closure so the EINTR-bounding and error-classification
+/// logic (fork issue #217 items 1/2) can be unit-tested directly, without a
+/// real `waitid` call — see `mod tests`.
+///
+/// Retries a `peek` that fails with `Interrupted`, bounded by `deadline`
+/// rather than unboundedly: `waitid(2)` documents `EINTR` only when
+/// `WNOHANG` is *unset*, and every caller here sets it, so in practice this
+/// retries zero times — but an unbounded retry around a syscall is worth
+/// bounding even when unreachable. If the deadline is reached while still
+/// retrying a transient `Interrupted`, this gives up and reports
+/// `StillRunning` rather than spinning past the grace window the caller is
+/// trying to respect.
+///
+/// Also capped at a small retry count, independent of the deadline: the
+/// deadline alone bounds how *long* a persistent `EINTR` can spin, not how
+/// hard it spins while doing so — `resolve_peek_outcome` runs inside phase
+/// 2's single-threaded per-agent loop, so an uninterrupted retry loop would
+/// burn the rest of the grace window on one agent's `waitid` call without
+/// ever polling its siblings. An `EINTR` that survives a few immediate
+/// retries is not transient, and `StillRunning` is already the right
+/// fallback for it.
+#[cfg(unix)]
+fn resolve_peek_outcome(
+    deadline: std::time::Instant,
+    mut peek: impl FnMut() -> std::io::Result<bool>,
+) -> PeekOutcome {
+    const MAX_INTERRUPTED_RETRIES: u32 = 3;
+    let mut retries = 0;
+    loop {
+        match peek() {
+            Ok(true) => return PeekOutcome::Exited,
+            Ok(false) => return PeekOutcome::StillRunning,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if std::time::Instant::now() >= deadline {
+                    return PeekOutcome::StillRunning;
+                }
+                retries += 1;
+                if retries >= MAX_INTERRUPTED_RETRIES {
+                    return PeekOutcome::StillRunning;
+                }
+                continue;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                return PeekOutcome::AlreadyReaped;
+            }
+            Err(e) => return PeekOutcome::PermanentError(e),
+        }
     }
 }
 
@@ -6066,6 +6198,118 @@ mod tests {
 
     // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
     // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
+
+    // Fork issue #217: `resolve_peek_outcome` unit tests. These inject a
+    // fake `peek` closure rather than calling the real `waitid`-backed
+    // `peek_child_exited_without_reaping`, which is what makes the bounded
+    // EINTR retry (item 1) and the error classification (item 2) reachable
+    // from a test at all — the real syscall's EINTR case is documented
+    // unreachable here (`WNOHANG` is always set), so there is no way to
+    // trigger it through a real child process.
+    #[cfg(unix)]
+    mod resolve_peek_outcome_tests {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn far_future_deadline() -> Instant {
+            Instant::now() + Duration::from_secs(60)
+        }
+
+        #[test]
+        fn reports_exited_immediately() {
+            let outcome = resolve_peek_outcome(far_future_deadline(), || Ok(true));
+            assert!(matches!(outcome, PeekOutcome::Exited));
+        }
+
+        #[test]
+        fn reports_still_running_immediately() {
+            let outcome = resolve_peek_outcome(far_future_deadline(), || Ok(false));
+            assert!(matches!(outcome, PeekOutcome::StillRunning));
+        }
+
+        /// Fork issue #217 item 2: `ECHILD` is the one error that means
+        /// "already reaped by something else", classified distinctly from
+        /// every other error rather than folded into the generic permanent-
+        /// error case.
+        #[test]
+        fn echild_is_already_reaped() {
+            let outcome = resolve_peek_outcome(far_future_deadline(), || {
+                Err(std::io::Error::from_raw_os_error(libc::ECHILD))
+            });
+            assert!(matches!(outcome, PeekOutcome::AlreadyReaped));
+        }
+
+        /// Fork issue #217 item 2: any error other than `ECHILD` — in
+        /// practice only a permanent `EINVAL` misuse, per the function's
+        /// doc comment — is classified as `PermanentError`, not silently
+        /// folded into `AlreadyReaped`/exited.
+        #[test]
+        fn non_echild_error_is_permanent_error() {
+            let outcome = resolve_peek_outcome(far_future_deadline(), || {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            });
+            assert!(matches!(outcome, PeekOutcome::PermanentError(_)));
+        }
+
+        /// Fork issue #217 item 1: a transient `Interrupted` is retried
+        /// (matching the pre-#217 behaviour) as long as the deadline has
+        /// not passed, and a peek that eventually succeeds is reported
+        /// correctly rather than being cut short by the bound.
+        #[test]
+        fn retries_eintr_and_reports_the_eventual_result() {
+            let mut calls = 0u32;
+            let outcome = resolve_peek_outcome(far_future_deadline(), || {
+                calls += 1;
+                if calls < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Ok(true)
+                }
+            });
+            assert!(matches!(outcome, PeekOutcome::Exited));
+            assert_eq!(calls, 3, "expected exactly two retries before success");
+        }
+
+        /// Fork issue #217 item 1, the actual bug: a peek that keeps
+        /// returning `Interrupted` forever must NOT retry past its
+        /// deadline. With the deadline already elapsed, the very first
+        /// `Interrupted` must be the last call — proving the retry is
+        /// bounded rather than looping unboundedly (a hang this test would
+        /// otherwise never return from).
+        #[test]
+        fn gives_up_as_still_running_once_the_deadline_has_passed() {
+            let already_past = Instant::now() - Duration::from_millis(1);
+            let mut calls = 0u32;
+            let outcome = resolve_peek_outcome(already_past, || {
+                calls += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            });
+            assert!(matches!(outcome, PeekOutcome::StillRunning));
+            assert_eq!(
+                calls, 1,
+                "an already-elapsed deadline must stop the retry after the first call"
+            );
+        }
+
+        /// Same as above, but the deadline elapses *during* retrying rather
+        /// than being already past at the start — the more realistic shape
+        /// of the bound actually firing. Bounds the test's own wall-clock
+        /// time so a regression back to unbounded retry fails this test
+        /// instead of hanging the suite.
+        #[test]
+        fn stops_retrying_once_the_deadline_elapses_mid_retry() {
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let start = Instant::now();
+            let outcome = resolve_peek_outcome(deadline, || {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            });
+            assert!(matches!(outcome, PeekOutcome::StillRunning));
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "retry must stop once the deadline elapses, not loop unboundedly"
+            );
+        }
+    }
 
     /// Issue #424 S1: the submit drain and the key forwarder must agree, and
     /// this is the seam that makes them.
@@ -9517,6 +9761,81 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
     }
 
+    // Env var carrying the readiness-marker path into the stand-in's shell
+    // script below — see `command_ignores_sigterm`'s doc comment for why
+    // this is an env var rather than a `format!`-interpolated path.
+    const READY_MARKER_ENV: &str = "DOT_AGENT_DECK_TEST_READY_MARKER";
+
+    // Builds the SIGTERM-resistant stand-in's command together with a
+    // readiness marker: the shell installs its trap, then announces that
+    // fact by creating `marker` before it execs into `sleep 300`. Without
+    // this, phase 1's SIGTERM can reach the child before `/bin/sh` has
+    // reached the `trap` builtin, killing it for real and making the whole
+    // test setup racy rather than the code under test. `tempfile::tempdir`
+    // hands back a unique directory per call, so concurrent test
+    // invocations can never see each other's marker; the `TempDir` guard is
+    // returned alongside so callers keep it alive for as long as the marker
+    // might still be read. Module-scoped (not nested inside a single test
+    // fn) so both `shutdown_graceful_001` and the regression test right
+    // below can share it.
+    //
+    // Fork issue #217 item 4: `marker`'s path is delivered to the shell via
+    // the `READY_MARKER_ENV` env var, not interpolated into the script
+    // text. `tempfile::tempdir` roots the path under `std::env::temp_dir()`,
+    // which honours `TMPDIR` on Unix — so a `$` or backtick in `TMPDIR`
+    // would previously have ended up inside the script's *double*-quoted
+    // `: > "..."` redirect, where the shell re-parses it for variable/
+    // command substitution rather than taking it literally (the mirror
+    // image of the single-quote hazard PR #206 hit in its own trigger file,
+    // fixed there the same way this fixes it here). A shell parameter
+    // expansion's result is not itself re-parsed for further expansions, so
+    // passing the path through `"$READY_MARKER_ENV"` removes the hazard
+    // outright rather than trying to escape around it with more quoting.
+    fn command_ignores_sigterm() -> (std::process::Command, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create tempdir for trap-ready marker");
+        let marker = dir.path().join("trap-ready");
+        let mut command = std::process::Command::new("sh");
+        command.env(READY_MARKER_ENV, &marker);
+        command.args([
+            "-c",
+            &format!("trap '' TERM; : > \"${READY_MARKER_ENV}\"; exec sleep 300"),
+        ]);
+        (command, dir, marker)
+    }
+
+    /// Fork issue #217 item 4: the marker path must reach the shell through
+    /// the env var, never embedded directly in the `-c` script text — that
+    /// is what makes it immune to `$`/backtick characters a `TMPDIR`-derived
+    /// path could contain, since a shell parameter expansion's result is
+    /// not re-parsed for further expansions. Uses
+    /// `Command::get_args`/`get_envs` rather than sniffing the `Debug`
+    /// output, which interleaves both and would make this fragile against
+    /// incidental formatting changes.
+    #[test]
+    fn command_ignores_sigterm_delivers_marker_via_env_not_script_interpolation() {
+        let (command, _dir, marker) = command_ignores_sigterm();
+
+        let script = command
+            .get_args()
+            .nth(1)
+            .and_then(|a| a.to_str())
+            .expect("`-c <script>` — the script is the second arg");
+        let marker_str = marker
+            .to_str()
+            .expect("tempdir-derived marker path is valid UTF-8 in the test environment");
+        assert!(
+            !script.contains(marker_str),
+            "the marker path must not be interpolated into the shell script text: {script:?}"
+        );
+
+        let marker_env = command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(READY_MARKER_ENV))
+            .and_then(|(_, v)| v)
+            .expect("marker path must be delivered via the readiness-marker env var");
+        assert_eq!(marker_env, marker.as_os_str());
+    }
+
     /// Fork issue #163, reworked contract (PR #207 review + audit both
     /// converged: the shipped fix — tracking which agents phase 2 reaped
     /// and skipping exactly those in phase 3 — is issue #163's option 1,
@@ -9691,27 +10010,6 @@ mod spawn_tests {
 
         fn command_exits_promptly() -> std::process::Command {
             std::process::Command::new("true")
-        }
-
-        // Builds the SIGTERM-resistant stand-in's command together with a
-        // readiness marker: the shell installs its trap, then announces
-        // that fact by creating `marker` before it execs into `sleep 300`.
-        // Without this, phase 1's SIGTERM can reach the child before
-        // `/bin/sh` has reached the `trap` builtin, killing it for real and
-        // making the whole test setup racy rather than the code under test.
-        // `tempfile::tempdir` hands back a unique directory per call, so
-        // concurrent test invocations can never see each other's marker;
-        // the `TempDir` guard is returned alongside so callers keep it
-        // alive for as long as the marker might still be read.
-        fn command_ignores_sigterm() -> (std::process::Command, tempfile::TempDir, PathBuf) {
-            let dir = tempfile::tempdir().expect("create tempdir for trap-ready marker");
-            let marker = dir.path().join("trap-ready");
-            let mut command = std::process::Command::new("sh");
-            command.args([
-                "-c",
-                &format!("trap '' TERM; : > \"{}\"; exec sleep 300", marker.display()),
-            ]);
-            (command, dir, marker)
         }
 
         // Blocks until the stand-in from `command_ignores_sigterm` has
