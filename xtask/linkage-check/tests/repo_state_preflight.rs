@@ -172,6 +172,14 @@ fn linkage_check_ok_on_single_worktree_even_when_shallow() {
         !stderr.contains("[10]"),
         "single-worktree shallow clone must not trip check 10\nstderr: {stderr}"
     );
+    // B2: the success line must report that checks 10-12 were exempt here,
+    // not the fixed `12 rules` it used to print on every run regardless of
+    // whether they actually executed.
+    assert!(
+        stdout.contains("9 rules") && stdout.contains("10-12 exempt"),
+        "expected the success line to name the 10-12 exemption on a single-worktree checkout\n\
+         stdout: {stdout}"
+    );
 }
 
 /// A shallow clone that also has a second, linked worktree must fail check
@@ -246,6 +254,63 @@ fn linkage_check_fails_on_stale_worktree_registry_entry() {
     );
 }
 
+/// The CURRENT worktree's own directory disappearing out from under the
+/// running process — check 12's own scenario (issue #325 B1). Before the
+/// fix this crashed `repo_root()`'s `current_dir().expect(...)` with a raw
+/// panic instead of producing check 12's diagnosis; the fix handles the
+/// `current_dir()` failure explicitly.
+///
+/// `Command::current_dir` cannot reproduce this directly: its `chdir` is
+/// validated at spawn, so pointing it at an already-removed path makes the
+/// spawn itself fail before the child ever runs. The real-world shape (a
+/// shell `cd`s into a worktree, something else removes it, then a command
+/// is run from that shell) is instead: the PARENT process's cwd breaks,
+/// and a child inherits that already-broken cwd via `fork()` with no
+/// chdir validation at all. So this test breaks the TEST PROCESS's own cwd
+/// the same way, then spawns the binary with no `.current_dir()` override
+/// so it inherits the broken cwd exactly as a shell-launched child would.
+///
+/// Relies on nextest's one-process-per-test isolation (CLAUDE.md rule 5):
+/// `std::env::set_current_dir` mutates process-global state that would
+/// race with any sibling test sharing this process under a threaded
+/// `cargo test` run.
+#[test]
+fn linkage_check_reports_check_12_when_the_current_worktree_is_gone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let doomed = tmp.path().join("doomed-worktree");
+    fs::create_dir_all(&doomed).expect("mkdir doomed-worktree");
+
+    let original_cwd = std::env::current_dir().expect("read original cwd");
+    std::env::set_current_dir(&doomed).expect("cd into doomed-worktree");
+    // Verified (auditor, macOS, git/libc getcwd): rmdir-ing a directory that
+    // happens to be the calling process's own cwd succeeds, and a later
+    // getcwd() in that process then fails with ENOENT.
+    fs::remove_dir(&doomed).expect("rmdir doomed-worktree out from under the process");
+
+    let bin = env!("CARGO_BIN_EXE_xtask-linkage-check");
+    // Deliberately no `.current_dir(...)`: this inherits the TEST process's
+    // now-broken cwd via `fork()`, which is the real-world mechanism -- not
+    // a `chdir` into a path that would fail the spawn itself.
+    let output = Command::new(bin).output();
+
+    std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+    let output = output.expect("spawn xtask-linkage-check (inherits the broken cwd via fork)");
+    assert!(
+        !output.status.success(),
+        "linkage-check must fail, not succeed, when its own cwd no longer exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[12]"),
+        "expected check 12's diagnosis for a missing current-worktree directory\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "must fail cleanly with check 12's message, not panic\nstderr: {stderr}"
+    );
+}
+
 /// Control case: a clean multi-worktree checkout — gated (more than one
 /// worktree), but neither shallow nor drifted — must still pass. Proves the
 /// gate does not false-positive merely from being active.
@@ -264,5 +329,12 @@ fn linkage_check_passes_on_clean_multi_worktree_checkout() {
         success,
         "linkage-check failed on a clean multi-worktree checkout\nstdout: {stdout}\n\
          stderr: {stderr}"
+    );
+    // B2: this is the one shape where all 12 rules genuinely ran, so the
+    // success line must say so with no exemption note.
+    assert!(
+        stdout.contains("12 rules") && !stdout.contains("exempt"),
+        "expected the success line to report all 12 rules ran, with no exemption\n\
+         stdout: {stdout}"
     );
 }

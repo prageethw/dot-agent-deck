@@ -26,18 +26,31 @@
 //! 12. The current worktree itself still exists — the degenerate case of
 //!     11, given its own message so a worker hits a clear diagnosis rather
 //!     than whatever confusing `no such file or directory` runs next.
+//!     Decided FIRST, from [`current_worktree_missing`] on the already-
+//!     resolved `repo_dir` path rather than by spawning git with
+//!     `current_dir(repo_dir)` — that spawn's own `chdir` file action fails
+//!     first when the directory is gone, which used to make [`check`]
+//!     return empty before this check was ever consulted (issue #325's
+//!     original bug). The more common real path into this same condition is
+//!     one level up, in `main.rs`'s `repo_root()`: its own
+//!     `std::env::current_dir()` call fails the same way when the process's
+//!     cwd was removed out from under it before the binary even started
+//!     (the shell-`cd`-then-someone-else-removes-it shape), and `main()`
+//!     now turns that into this same check-12 diagnosis instead of a panic.
 //!
 //! # Why this must not fire in CI (and must not use an env-var escape hatch)
 //!
-//! Every `actions/checkout` in this repo's CI defaults to depth 1 except
-//! `sonarqube`, so `if shallow { fail }` would fail nearly every job. An
-//! `if CI { skip }` escape hatch is exactly the kind of check that quietly
-//! stops running wherever it matters (CLAUDE.md's running theme on empty
-//! gates). [`is_gated`] instead keys off a structural property: a CI runner
-//! clones fresh and has exactly one, non-linked worktree, so it is exempt by
-//! construction rather than by trusting an environment variable. The damage
-//! this issue is about only exists once several worktrees share one object
-//! store.
+//! [`is_gated`] keys off a structural property rather than an environment
+//! variable: a CI runner clones fresh and has exactly one, non-linked
+//! worktree, so it is exempt by construction — an `if CI { skip }` escape
+//! hatch is exactly the kind of check that quietly stops running wherever it
+//! matters (CLAUDE.md's running theme on empty gates), and this avoids one
+//! entirely. On this fork the `build` job (the only job that runs `cargo
+//! xtask linkage-check`) also happens to check out with `fetch-depth: 0`, so
+//! it would not be shallow either way; upstream's jobs default to depth 1,
+//! which is the scenario the structural gate is actually built to survive.
+//! The damage this issue is about only exists once several worktrees share
+//! one object store.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,16 +63,49 @@ pub fn is_gated(worktree_count: usize, is_linked_worktree: bool) -> bool {
     worktree_count > 1 || is_linked_worktree
 }
 
-/// Parse `git worktree list --porcelain` output into the registered
-/// absolute worktree paths, in the order git reported them. Each entry
-/// starts with a `worktree <path>` line; the following `HEAD`/`branch`/
-/// `bare`/`detached`/blank lines are not needed here.
-pub fn parse_worktree_list_porcelain(output: &str) -> Vec<PathBuf> {
+/// Parse `git worktree list --porcelain -z` output (NUL-separated records)
+/// into the registered absolute worktree paths, in the order git reported
+/// them. Each entry is a run of NUL-terminated `key<space>value` fields
+/// (`worktree <path>`, `HEAD <sha>`, `branch <ref>`, `bare`, `detached`),
+/// with an extra empty field ending each entry (in place of the blank line
+/// the non-`-z` form uses as a separator).
+///
+/// `-z` (not the line-oriented porcelain form) is load-bearing: git does not
+/// quote paths in porcelain output at all, so a worktree path containing a
+/// raw newline is split across two porcelain *lines* and silently
+/// mis-parsed — verified: `git worktree add "$(printf '../wt\nline')"`
+/// prints the newline byte raw, and the non-`-z` parser used to read that as
+/// two separate porcelain lines. NUL-separated fields have no such
+/// ambiguity, since NUL cannot appear in a path.
+pub fn parse_worktree_list_porcelain_z(output: &[u8]) -> Vec<PathBuf> {
     output
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
+        .split(|&b| b == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        .map(path_from_bytes)
         .collect()
+}
+
+/// Build a [`PathBuf`] from raw git output bytes without assuming UTF-8.
+/// `String::from_utf8_lossy` would substitute `U+FFFD` for genuinely
+/// non-UTF-8 path bytes, producing a `PathBuf` that can never match the real
+/// on-disk path — turning check 11 permanently, unfixably red for a path
+/// `git worktree add` accepted. On Unix, `OsStrExt::from_bytes` is an exact,
+/// lossless round trip since Unix paths are just bytes. Windows paths are
+/// UTF-16 at the OS level with no equivalent raw-byte constructor, and git's
+/// porcelain output there is UTF-8 in practice, so the lossy path is kept
+/// there — it only degrades the already-pathological non-UTF-8-bytes case,
+/// not the newline case this function primarily exists to fix (that is
+/// fixed on every platform by the `-z` split above).
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Every registered worktree path, other than `current`, that no longer
@@ -83,20 +129,30 @@ pub fn current_worktree_missing(current: &Path) -> bool {
     !current.exists()
 }
 
-/// Whether `repo_dir` is inside a git working tree at all (`git rev-parse
-/// --is-inside-work-tree`). The preflight is entirely about git worktree
-/// registry / object-store state, so a directory that is not a git repo has
-/// nothing for it to assert — this must be "exempt", never a failure. A
-/// synthetic fixture tree with no `.git` (e.g. `tests/duplicate_catalog_id.rs`'s
-/// own fixture, which checks 1-9 exercise directly against a bare directory)
-/// is exactly this case, and treating it as `[10] could not list worktrees…`
-/// would fail every one of those fixtures for a reason unrelated to what
-/// they test.
-fn is_inside_git_work_tree(repo_dir: &Path) -> bool {
-    matches!(
-        run_git_capture(repo_dir, &["rev-parse", "--is-inside-work-tree"]).as_deref(),
-        Ok("true")
-    )
+/// Outcome of probing whether `repo_dir` is inside a git working tree at all
+/// (`git rev-parse --is-inside-work-tree`). Three-way rather than a bare
+/// `bool` so [`check`] can tell "genuinely not a git repo" (exempt, no
+/// output — a synthetic fixture tree with no `.git`, e.g.
+/// `tests/duplicate_catalog_id.rs`'s own fixture, which checks 1-9 exercise
+/// directly against a bare directory) apart from "git could not be run, or
+/// failed for some other reason" (git missing from `PATH`, a
+/// `safe.directory` refusal, a permission error, a corrupt admin dir) — the
+/// latter used to collapse into the same silent "exempt" outcome as the
+/// former, which let an unrelated git failure disable checks 10-12 with zero
+/// output while `main.rs` still printed a clean success line.
+enum WorkTreeProbe {
+    Inside,
+    NotAGitRepo,
+    ProbeFailed(String),
+}
+
+fn probe_work_tree(repo_dir: &Path) -> WorkTreeProbe {
+    match run_git_capture(repo_dir, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(s) if s == "true" => WorkTreeProbe::Inside,
+        Ok(_) => WorkTreeProbe::NotAGitRepo,
+        Err(e) if e.contains("not a git repository") => WorkTreeProbe::NotAGitRepo,
+        Err(e) => WorkTreeProbe::ProbeFailed(e),
+    }
 }
 
 /// Run `git <args>` in `repo_dir`, returning trimmed stdout on success or a
@@ -113,6 +169,21 @@ fn run_git_capture(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Run `git <args>` in `repo_dir`, returning raw stdout bytes on success —
+/// used only for `-z`-separated porcelain output, where the bytes must not
+/// be assumed UTF-8 before `[path_from_bytes]` gets to them.
+fn run_git_capture_bytes(repo_dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("invoke git {args:?}: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(out.stdout)
+}
+
 /// `git rev-parse --is-shallow-repository` in `repo_dir`.
 fn is_shallow_repository(repo_dir: &Path) -> Result<bool, String> {
     Ok(run_git_capture(repo_dir, &["rev-parse", "--is-shallow-repository"])?.trim() == "true")
@@ -127,57 +198,131 @@ fn is_linked_worktree(repo_dir: &Path) -> Result<bool, String> {
     Ok(run_git_capture(repo_dir, &["rev-parse", "--git-common-dir"])?.trim() != ".git")
 }
 
-/// `git worktree list --porcelain` in `repo_dir`, parsed into paths.
+/// `git worktree list --porcelain -z` in `repo_dir`, parsed into paths.
 fn worktree_paths(repo_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let out = run_git_capture(repo_dir, &["worktree", "list", "--porcelain"])?;
-    Ok(parse_worktree_list_porcelain(&out))
+    let out = run_git_capture_bytes(repo_dir, &["worktree", "list", "--porcelain", "-z"])?;
+    Ok(parse_worktree_list_porcelain_z(&out))
 }
 
-/// The remote to name in check 10's remedy message: the first line of `git
-/// remote`, or `origin` if the command fails or lists nothing (a repository
-/// with no remotes at all cannot be genuinely shallow via a normal clone,
-/// but `origin` is still the least surprising fallback name to print).
-fn default_remote(repo_dir: &Path) -> String {
-    run_git_capture(repo_dir, &["remote"])
-        .ok()
-        .and_then(|out| out.lines().next().map(str::to_string))
-        .unwrap_or_else(|| "origin".to_string())
+/// The remedy text for check 10: `git fetch --unshallow <remote>` for every
+/// configured remote, not just the first alphabetically. `git rev-parse
+/// --is-shallow-repository` is a repository-wide flag with no cheap way to
+/// attribute it to one particular remote, and naming only the
+/// alphabetically-first one (`origin` on this repo) can name the wrong
+/// remote outright — issue #325's own incident was `upstream/main` shallowed
+/// to depth 1, which `origin` would never have named. Naming every remote
+/// means a worker who runs the given command(s) verbatim actually deepens
+/// whichever remote was truncated, rather than guessing.
+fn shallow_remedy(repo_dir: &Path) -> String {
+    let remotes: Vec<String> = run_git_capture(repo_dir, &["remote"])
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    if remotes.is_empty() {
+        // A repository with no remotes at all cannot be genuinely shallow
+        // via a normal clone, but `origin` is still the least surprising
+        // fallback name to print.
+        "`git fetch --unshallow origin`".to_string()
+    } else {
+        remotes
+            .iter()
+            .map(|r| format!("`git fetch --unshallow {r}`"))
+            .collect::<Vec<_>>()
+            .join(" and ")
+    }
 }
 
-/// Checks 10-12: the repository-state preflight, returning one formatted
-/// failure string per violation (empty when everything is clean or the
-/// preflight is exempt per [`is_gated`]). `repo_dir` is the workspace root
-/// as [`crate::repo_root`] resolves it — the same directory every other
-/// check in this binary already operates against.
-pub fn check(repo_dir: &Path) -> Vec<String> {
+/// Result of [`check`]: the formatted failure strings (empty when clean or
+/// exempt), plus whether checks 10-12 actually ran at all this time.
+pub struct RepoStateResult {
+    pub failures: Vec<String>,
+    /// `None` when checks 10-12 fully executed. `Some(reason)` names why
+    /// they were structurally exempt this run — read only by `main.rs`'s
+    /// success line (issue #325 B2) so it can report the rule count that
+    /// actually ran instead of a fixed `12 rules` on every run where three
+    /// of them were skipped, which is every CI run and every single-
+    /// worktree developer checkout (`prds/fork-340-work-type-vocabulary.md`
+    /// names this exact success-line-overclaims shape as the empty-gate
+    /// pattern this repo keeps documenting).
+    pub skip_reason: Option<&'static str>,
+}
+
+/// Checks 10-12: the repository-state preflight. `repo_dir` is the
+/// workspace root as [`crate::repo_root`] resolves it — the same directory
+/// every other check in this binary already operates against.
+pub fn check(repo_dir: &Path) -> RepoStateResult {
     let mut failures = Vec::new();
 
-    if !is_inside_git_work_tree(repo_dir) {
-        // Not a git checkout at all — exempt, not a failure. See
-        // `is_inside_git_work_tree`'s doc for why this must not become
-        // `[10] could not list worktrees…`.
-        return failures;
+    // Check 12, decided FIRST and from a plain filesystem stat on the
+    // already-resolved `repo_dir` — never by spawning git with
+    // `current_dir(repo_dir)`, which fails at the `chdir` file action before
+    // git ever runs once the directory is gone. See the module doc for why
+    // this ordering is what makes the check reachable at all.
+    if current_worktree_missing(repo_dir) {
+        failures.push(format!(
+            "[12] this worktree's own directory ({}) no longer exists on disk — something \
+             removed it out from under the current process; remedy: `git worktree prune` from a \
+             working directory that still exists",
+            repo_dir.display()
+        ));
+        return RepoStateResult {
+            failures,
+            skip_reason: None,
+        };
+    }
+
+    match probe_work_tree(repo_dir) {
+        WorkTreeProbe::NotAGitRepo => {
+            // Not a git checkout at all — exempt, not a failure. See
+            // `WorkTreeProbe`'s doc for why this must not become
+            // `[preflight] could not determine…`.
+            return RepoStateResult {
+                failures,
+                skip_reason: Some("not a git work tree"),
+            };
+        }
+        WorkTreeProbe::ProbeFailed(e) => {
+            // An unexpected git failure (missing from PATH, a
+            // `safe.directory` refusal, a permission error, …) must not read
+            // as a clean pass the way "not a git repo" correctly does (S2).
+            failures.push(format!(
+                "[preflight] could not determine whether {} is inside a git work tree via `git \
+                 rev-parse --is-inside-work-tree`: {e}",
+                repo_dir.display()
+            ));
+            return RepoStateResult {
+                failures,
+                skip_reason: None,
+            };
+        }
+        WorkTreeProbe::Inside => {}
     }
 
     let worktrees = match worktree_paths(repo_dir) {
         Ok(w) => w,
         Err(e) => {
             failures.push(format!(
-                "[10] could not list worktrees via `git worktree list --porcelain` in {}: {e}",
+                "[preflight] could not list worktrees via `git worktree list --porcelain -z` in \
+                 {}: {e}",
                 repo_dir.display()
             ));
-            return failures;
+            return RepoStateResult {
+                failures,
+                skip_reason: None,
+            };
         }
     };
     let linked = match is_linked_worktree(repo_dir) {
         Ok(b) => b,
         Err(e) => {
             failures.push(format!(
-                "[10] could not determine whether {} is a linked worktree via `git rev-parse \
-                 --git-common-dir`: {e}",
+                "[preflight] could not determine whether {} is a linked worktree via `git \
+                 rev-parse --git-common-dir`: {e}",
                 repo_dir.display()
             ));
-            return failures;
+            return RepoStateResult {
+                failures,
+                skip_reason: None,
+            };
         }
     };
 
@@ -186,17 +331,20 @@ pub fn check(repo_dir: &Path) -> Vec<String> {
         // developer checkout — is exempt by construction. See the module
         // doc for why this is a structural test rather than an `if CI`
         // escape hatch.
-        return failures;
+        return RepoStateResult {
+            failures,
+            skip_reason: Some("single non-linked worktree"),
+        };
     }
 
     // Check 10: not unexpectedly shallow.
     match is_shallow_repository(repo_dir) {
         Ok(true) => {
-            let remote = default_remote(repo_dir);
+            let remedy = shallow_remedy(repo_dir);
             failures.push(format!(
                 "[10] repository at {} is unexpectedly shallow while sharing an object store \
                  with other worktrees (`git rev-parse --is-shallow-repository` = true) — remedy: \
-                 `git fetch --unshallow {remote}`",
+                 run {remedy}",
                 repo_dir.display()
             ));
         }
@@ -209,7 +357,7 @@ pub fn check(repo_dir: &Path) -> Vec<String> {
     }
 
     // Check 11: worktree registry drift (excluding the current worktree,
-    // which check 12 covers).
+    // which check 12 already covered above).
     let stale = stale_worktree_paths(&worktrees, repo_dir);
     if !stale.is_empty() {
         let paths = stale
@@ -225,17 +373,10 @@ pub fn check(repo_dir: &Path) -> Vec<String> {
         ));
     }
 
-    // Check 12: the current worktree itself — the degenerate case of 11.
-    if current_worktree_missing(repo_dir) {
-        failures.push(format!(
-            "[12] this worktree's own directory ({}) no longer exists on disk — something \
-             removed it out from under the current process; remedy: `git worktree prune` from a \
-             working directory that still exists",
-            repo_dir.display()
-        ));
+    RepoStateResult {
+        failures,
+        skip_reason: None,
     }
-
-    failures
 }
 
 #[cfg(test)]
@@ -268,12 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_worktree_list_porcelain_extracts_every_path() {
-        let out = "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n\n\
-             worktree /repo-fix160\nHEAD def456\nbranch refs/heads/fix/160\n\n\
-             worktree /repo-detached\nHEAD 789abc\ndetached\n";
+    fn parse_worktree_list_porcelain_z_extracts_every_path() {
+        let out = b"worktree /repo\0HEAD abc123\0branch refs/heads/main\0\0\
+             worktree /repo-fix160\0HEAD def456\0branch refs/heads/fix/160\0\0\
+             worktree /repo-detached\0HEAD 789abc\0detached\0";
         assert_eq!(
-            parse_worktree_list_porcelain(out),
+            parse_worktree_list_porcelain_z(out),
             vec![
                 PathBuf::from("/repo"),
                 PathBuf::from("/repo-fix160"),
@@ -283,22 +424,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_worktree_list_porcelain_handles_a_single_entry() {
-        let out = "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n";
+    fn parse_worktree_list_porcelain_z_handles_a_single_entry() {
+        let out = b"worktree /repo\0HEAD abc123\0branch refs/heads/main\0";
         assert_eq!(
-            parse_worktree_list_porcelain(out),
+            parse_worktree_list_porcelain_z(out),
             vec![PathBuf::from("/repo")]
         );
     }
 
     #[test]
-    fn parse_worktree_list_porcelain_ignores_non_worktree_lines() {
-        // Lines not prefixed with "worktree " (HEAD, branch, bare,
-        // detached, blank separators) must never be mistaken for a path.
-        let out = "bare\nworktree /only-real-entry\nHEAD abc123\ndetached\n";
+    fn parse_worktree_list_porcelain_z_ignores_non_worktree_fields() {
+        // Fields not prefixed with "worktree " (HEAD, branch, bare,
+        // detached, the blank separator field) must never be mistaken for a
+        // path.
+        let out = b"bare\0worktree /only-real-entry\0HEAD abc123\0detached\0";
         assert_eq!(
-            parse_worktree_list_porcelain(out),
+            parse_worktree_list_porcelain_z(out),
             vec![PathBuf::from("/only-real-entry")]
+        );
+    }
+
+    #[test]
+    fn parse_worktree_list_porcelain_z_handles_a_path_containing_a_raw_newline() {
+        // S1: the non-`-z` porcelain form does not quote paths at all, so a
+        // path containing a literal newline byte used to split across two
+        // porcelain lines and get mis-parsed as two separate entries. NUL
+        // separation has no such ambiguity.
+        let out = b"worktree /repo\nwith-newline\0HEAD abc123\0branch refs/heads/main\0\0";
+        assert_eq!(
+            parse_worktree_list_porcelain_z(out),
+            vec![PathBuf::from("/repo\nwith-newline")]
         );
     }
 
@@ -363,7 +518,30 @@ mod tests {
     #[test]
     fn check_is_exempt_on_a_directory_that_is_not_a_git_repository_at_all() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(!is_inside_git_work_tree(tmp.path()));
-        assert!(check(tmp.path()).is_empty());
+        assert!(matches!(
+            probe_work_tree(tmp.path()),
+            WorkTreeProbe::NotAGitRepo
+        ));
+        let result = check(tmp.path());
+        assert!(result.failures.is_empty());
+        assert_eq!(result.skip_reason, Some("not a git work tree"));
+    }
+
+    /// B1: check 12 must fire from `check()` itself when `repo_dir` no
+    /// longer exists — decided from `current_worktree_missing`, never from
+    /// spawning git in a directory that is gone. This is the case that used
+    /// to return an empty failure list (the git spawn's `chdir` fails
+    /// first), which is why `xtask/linkage-check/tests/repo_state_preflight.rs`
+    /// has an end-to-end test reproducing the real-process shape of this
+    /// same condition (a removed cwd inherited via `fork()`).
+    #[test]
+    fn check_reports_check_12_when_repo_dir_no_longer_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gone = tmp.path().join("never-created");
+        let result = check(&gone);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].starts_with("[12]"));
+        assert!(result.failures[0].contains("no longer exists on disk"));
+        assert_eq!(result.skip_reason, None);
     }
 }
