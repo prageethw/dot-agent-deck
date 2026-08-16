@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status** *(corrected 2026-08-16)*: **Merged into the fork** — [PR #271](https://github.com/prageethw/dot-agent-deck/pull/271) (issue #175 closed). The doc previously still read "Planning" despite the PRD having shipped.
+**Status**: Planning
 
 **Parent**: [fork #166](https://github.com/prageethw/dot-agent-deck/issues/166) — this is its second half, split out so the riskier first half could land alone. fork#166 is **complete and released in v0.37.0**; its own M4.0 note says CLAUDE.md rule 1's manual `git worktree add` *"is replaced by fork #175, not by this PRD."* This is that replacement.
 
