@@ -150,16 +150,7 @@ fn selection_015_tab_round_trip_clears_highlight_real_binary() {
 /// is rejected) — the exact collision the old `" worker "` needle existed
 /// to avoid.
 fn grid_has_role(grid: &str, role: &str) -> bool {
-    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-    grid.match_indices(role).any(|(start, matched)| {
-        let end = start + matched.len();
-        let before_ok = grid[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_word_char(c));
-        let after_ok = grid[end..].chars().next().is_none_or(|c| !is_word_char(c));
-        before_ok && after_ok
-    })
+    common::contains_word_token(grid, role)
 }
 
 /// Drive the new-pane dialog to open the (single) orchestration in the fixture.

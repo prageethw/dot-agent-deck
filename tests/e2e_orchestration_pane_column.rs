@@ -446,16 +446,7 @@ fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
 /// is not alphanumeric, `-`, or `_` — that covers border glyphs, whitespace,
 /// and start/end of line without assuming any specific pad character.
 fn contains_role_word(line: &str, role: &str) -> bool {
-    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-    line.match_indices(role).any(|(start, matched)| {
-        let end = start + matched.len();
-        let before_ok = line[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_word_char(c));
-        let after_ok = line[end..].chars().next().is_none_or(|c| !is_word_char(c));
-        before_ok && after_ok
-    })
+    common::contains_word_token(line, role)
 }
 
 /// Overwrite the fixture's `beta-agent.sh` placeholder with the ABSOLUTE path

@@ -505,6 +505,14 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
 /// PRD #341 M4 made the selection accent mode-dependent, so the mode is passed
 /// explicitly: `UiMode::Normal` — command mode, where the keyboard drives the deck
 /// and the accent renders at full strength.
+///
+/// PRD fork#405 auditor S2: carries a non-empty display name (a scheduled task
+/// surfacing its friendly name before an agent's `SessionStart` hook fires is a
+/// real production case) so the identity body row actually renders — an empty
+/// `display_name`/`session_id` pair falls to the `Line::from("")` branch and
+/// `palette::ROLE_NAME` never appears in the buffer this fixture feeds to
+/// `theme/guard/001`. `is_placeholder`'s "No agent" status label reads only
+/// `agent_type`, so this does not change that assertion.
 fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     let now = chrono::Utc::now();
     let placeholder = SessionState {
@@ -521,7 +529,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         first_prompts: Vec::new(),
         pane_id: None,
         agent_id: None,
-        display_name: None,
+        display_name: Some("placeholder-agent".to_string()),
         pending_permission_tool: None,
         shell_synthetic_working: false,
         model: None,
@@ -531,7 +539,7 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
     let height = density.rendered_height();
     render_card_for_mode_to_buffer(
         &placeholder,
-        None,
+        Some("placeholder-agent"),
         None,
         density,
         0,
@@ -567,7 +575,7 @@ fn contrast_001_overlays_reference_frame() {
 
 /// Scenario: Render the five overlay seams plus a session card in both the
 /// unselected and SELECTED states, in **command mode** (`UiMode::Normal`, where
-/// the keyboard drives the deck), then assert two terminal-relative
+/// the keyboard drives the deck), then assert three terminal-relative
 /// properties. (a) NO rendered cell across any surface has a `Color::Rgb(..)`
 /// background — backgrounds must be `Color::Reset` so the terminal's own
 /// background shows through. (b) Selection is cued by a `▸ ` title prefix, a
@@ -576,7 +584,11 @@ fn contrast_001_overlays_reference_frame() {
 /// and never a DIM. A regression that filled any surface with an absolute
 /// background, or that let the selected border fall back to a fixed White/Black
 /// or a low-contrast status colour, would fail one of these assertions (issue
-/// #442).
+/// #442). (c) PRD fork#405 auditor S2: on the card surfaces, no cell foreground
+/// is `Color::Rgb(..)` either, and `palette::ROLE_NAME` is the ONLY non-`Reset`,
+/// non-named-ANSI foreground that appears — converting the palette module's
+/// documented WCAG exception (one deliberate `Color::Indexed` constant, and
+/// only one) from prose into an assertion a future diff has to argue with.
 #[spec("theme/guard/001")]
 #[test]
 fn guard_001_no_absolute_backgrounds() {
@@ -643,6 +655,50 @@ fn guard_001_no_absolute_backgrounds() {
         !buffer_to_text(&unselected).contains('▸'),
         "unselected card must NOT carry the `▸ ` selection prefix"
     );
+
+    // (c) The palette's one deliberate non-named exception, `palette::ROLE_NAME`,
+    //     is the ONLY non-Reset, non-named-ANSI foreground allowed on a card —
+    //     and in particular no cell foreground is an absolute `Color::Rgb(..)`.
+    //     `placeholder_card` now carries a non-empty display name (see its doc
+    //     comment) specifically so the identity row renders into this buffer.
+    let role_name = dot_agent_deck::palette::ROLE_NAME;
+    let named_ansi = [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ];
+    for (label, buf) in [("card", &unselected), ("card_selected", &selected)] {
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                let fg = buf[(x, y)].fg;
+                if fg == Color::Reset || named_ansi.contains(&fg) {
+                    continue;
+                }
+                assert_eq!(
+                    fg,
+                    role_name,
+                    "surface `{label}` has a non-Reset, non-named-ANSI foreground \
+                     {fg:?} at ({x},{y}) that is not palette::ROLE_NAME — the \
+                     palette's WCAG rationale claims ROLE_NAME is the only \
+                     deliberate exception:\n{}",
+                    buffer_to_color_text(buf)
+                );
+            }
+        }
+    }
 }
 
 /// Scenario: Read `src/ui.rs` from disk and assert it contains none of the
@@ -2324,12 +2380,18 @@ fn fn_region_handles_nested_and_restricted_visibility_boundaries() {
 /// embedded-pane render path (`src/terminal_widget.rs`): both must reference the
 /// centralized `palette`, the deck-card status mapping (`status_style`) and
 /// border resolver (`render_session_card`) must carry no inline status/accent
-/// `Color::Green/Blue/Yellow/Red/Cyan` literals, the pane path must carry no
-/// inline status `Color::Green/Blue/Yellow/Red` literal, and the stats bar
-/// (`render_stats_bar`) must carry no inline status `Color::Green/Blue/Yellow/Red`
-/// literal — its non-status `Cyan` (active-count) and `LightMagenta` (mode-label)
-/// accents stay legal. This is the M4 tightening: the palette is the single
-/// source of truth for every status color across all render paths.
+/// `Color::Green/Blue/Yellow/Red/Cyan` literals, and — since PRD fork#405 M1
+/// added the palette's one deliberate non-named exception, `palette::ROLE_NAME
+/// = Color::Indexed(130)` — no inline `Color::Indexed` literal either: an
+/// inline 256-cube index in the card path would be exactly as much of a
+/// single-source-of-truth violation as an inline `Color::Green`, since the
+/// palette is supposed to be the only place that constant is spelled out. The
+/// pane path must carry no inline status `Color::Green/Blue/Yellow/Red`
+/// literal, and the stats bar (`render_stats_bar`) must carry no inline status
+/// `Color::Green/Blue/Yellow/Red` literal — its non-status `Cyan`
+/// (active-count) and `LightMagenta` (mode-label) accents stay legal. This is
+/// the M4 tightening: the palette is the single source of truth for every
+/// status color across all render paths.
 #[spec("theme/guard/003")]
 #[test]
 fn guard_003_render_paths_use_palette_roles() {
@@ -2367,7 +2429,11 @@ fn guard_003_render_paths_use_palette_roles() {
     }
 
     // (3) The deck-card border resolver carries no inline accent/status literal
-    //     (notably the selection accent, formerly `Color::Cyan`).
+    //     (notably the selection accent, formerly `Color::Cyan`), and no inline
+    //     `Color::Indexed` either — the palette now owns one non-named colour
+    //     (`palette::ROLE_NAME`, PRD fork#405 M1), so an inline 256-cube index
+    //     in this path would be exactly as much of a single-source-of-truth
+    //     violation as an inline `Color::Green`.
     let card = fn_region(&ui, "fn render_session_card");
     for lit in [
         "Color::Cyan",
@@ -2376,6 +2442,7 @@ fn guard_003_render_paths_use_palette_roles() {
         "Color::Yellow",
         "Color::Red",
         "Color::Magenta",
+        "Color::Indexed",
     ] {
         assert!(
             !card.contains(lit),
@@ -2593,6 +2660,16 @@ fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
 /// panic here means that placement assertion should have already failed —
 /// this makes a missing-row bug surface as a clear panic message rather than
 /// silently reading the wrong cell.
+///
+/// ASCII rows only — see the wide-glyph caveat: `row_text` maps one buffer
+/// CELL to one `char`/string, but ratatui stores a wide (2-cell) glyph's
+/// symbol in cell `x` and an empty symbol in `x+1`. So `row[..byte_start]
+/// .chars().count()` undercounts the column for any needle that appears
+/// after a wide glyph on the row (each wide glyph consumes one cell of
+/// column but only one `char` of the count). Every current caller matches
+/// ASCII on a row with no wide glyphs, so this is latent, not live — but
+/// this helper sits next to `agent_badge_005`, whose whole fixture is CJK,
+/// so a future caller reaching for it there would get a wrong column.
 fn row_needle_fg(buffer: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Color {
     let row = row_text(buffer, y);
     let byte_start = row
@@ -2615,19 +2692,20 @@ fn row_needle_fg(buffer: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Colo
 /// registry `badge_color`, and that a card with `display_name: None` falls
 /// back to `id_display` on the same row. Snapshots the badge-on/badge-off
 /// pair with `buffer_to_color_text` so a future colour or placement
-/// regression shows up as a snapshot diff too.
+/// regression shows up as a snapshot diff too. Finally, a card with BOTH
+/// `display_name: None` and an empty `session_id` renders a blank identity
+/// row (`Line::from("")`) that still occupies exactly one row — the `Dir:`
+/// row directly below it lands on row 2 either way — pinning the height
+/// guarantee the PRD names for the both-empty branch.
 #[spec("dashboard/pane/011")]
 #[test]
 fn pane_011_role_name_on_its_own_body_row() {
-    // PRD fork#405 M1: `palette::ROLE_NAME` does not exist yet (the coder
-    // adds `pub const ROLE_NAME: Color = Color::Indexed(130);` to
-    // src/palette.rs in the same change that moves the row). Referencing it
-    // here would stop this whole test crate compiling, which would make
-    // every other test's result unreadable rather than RED — so this test
-    // uses the literal value instead. `palette::ROLE_NAME` is the constant
-    // the coder must introduce; once it exists, this literal is what it
-    // must equal.
-    const ROLE_NAME: Color = Color::Indexed(130);
+    let role_name = dot_agent_deck::palette::ROLE_NAME;
+    assert_eq!(
+        role_name,
+        Color::Indexed(130),
+        "PRD fork#405 M1 chose Indexed(130) on measured contrast — see src/palette.rs"
+    );
 
     let now = chrono::Utc::now();
     let session = SessionState {
@@ -2686,7 +2764,7 @@ fn pane_011_role_name_on_its_own_body_row() {
     );
     assert_eq!(
         row_needle_fg(&on, 1, "example-coder"),
-        ROLE_NAME,
+        role_name,
         "badge ON: the display name on the body row must render in palette::ROLE_NAME \
          (Color::Indexed(130))"
     );
@@ -2719,7 +2797,7 @@ fn pane_011_role_name_on_its_own_body_row() {
     );
     assert_eq!(
         row_needle_fg(&off, 1, "example-coder"),
-        ROLE_NAME,
+        role_name,
         "badge OFF: the display name on the body row must still render in palette::ROLE_NAME \
          even though the title's badge is hidden"
     );
@@ -2730,7 +2808,7 @@ fn pane_011_role_name_on_its_own_body_row() {
     // --- Colour distinctness ------------------------------------------------
     for (status, role_color) in status_role_colors() {
         assert_ne!(
-            ROLE_NAME, role_color,
+            role_name, role_color,
             "palette::ROLE_NAME must be distinct from the {status:?} status role colour \
              {role_color:?}"
         );
@@ -2745,16 +2823,18 @@ fn pane_011_role_name_on_its_own_body_row() {
     ] {
         let badge_color = dot_agent_deck::agent_registry::spec(&agent_type).badge_color;
         assert_ne!(
-            ROLE_NAME, badge_color,
+            role_name, badge_color,
             "palette::ROLE_NAME must be distinct from {agent_type:?}'s registry badge_color \
              {badge_color:?}"
         );
     }
 
     // --- id_display fallback -------------------------------------------------
+    // `session_id` is already "sess-role-line-01" (17 chars) from the clone —
+    // no reassignment needed, and it's already >11 chars, so id_display's
+    // truncation to the first 11 ("sess-role-l") is exercised below.
     let mut unnamed = session.clone();
     unnamed.display_name = None;
-    unnamed.session_id = "sess-role-line-01".to_string(); // 18 chars, truncates to 11
     let unnamed_buf = render_card_for_mode_to_buffer(
         &unnamed,
         None,
@@ -2775,8 +2855,44 @@ fn pane_011_role_name_on_its_own_body_row() {
     );
     assert_eq!(
         row_needle_fg(&unnamed_buf, 1, "sess-role-l"),
-        ROLE_NAME,
+        role_name,
         "the id_display fallback must still render in palette::ROLE_NAME"
+    );
+
+    // --- Empty identity: the height guarantee --------------------------------
+    // PRD fork#405 M1 pushes the identity row UNCONDITIONALLY, emitting
+    // `Line::from("")` when both `display_name` and `session_id` are empty, so
+    // the emitted line count never diverges from what `card_height()` reserves.
+    // Untested until now (auditor N2). Close to unreachable in production —
+    // `insert_placeholder_session` always synthesizes `pane-{pane_id}` as the
+    // session id — but the branch is real code with no other coverage.
+    let mut empty_identity = session.clone();
+    empty_identity.session_id = String::new();
+    empty_identity.display_name = None;
+    let empty_buf = render_card_for_mode_to_buffer(
+        &empty_identity,
+        None,
+        Some(1),
+        density,
+        0,
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false,
+    );
+    let empty_body0 = row_text(&empty_buf, 1);
+    assert!(
+        empty_body0.trim().is_empty(),
+        "the identity row must render blank (`Line::from(\"\")`) when both display_name and \
+         session_id are empty:\n{empty_body0}"
+    );
+    let empty_dir_row = row_text(&empty_buf, 2);
+    assert!(
+        empty_dir_row.contains("Dir:"),
+        "the blank identity row must still occupy exactly ONE row — with the height guarantee \
+         intact, `Dir:` lands on row 2 whether or not identity has any text to show:\n\
+         {empty_dir_row}"
     );
 }
 

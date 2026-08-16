@@ -127,14 +127,32 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     // card's title row) for the selection prefix — mirroring the
     // adjacent-row scoping `has_role_status` uses in
     // `e2e_orchestration_pane_column.rs` for the identical layout change.
+    //
+    // Reviewer S7 + auditor S4: at this PTY's 200-col width `grid_columns`
+    // returns 3, so alpha and bravo sit side by side and SHARE both their
+    // title row and their body row. Checking only "is there a `▸` ANYWHERE
+    // on the line above bravo's" cannot tell alpha's marker from bravo's —
+    // and the default selection is card 0 (alpha), so that predicate held
+    // even BEFORE the click. Scope the marker check horizontally to bravo's
+    // own column band: `▸` renders at the card's `inner.x + 1` (the title
+    // segment starts with a literal space, then the marker), and bravo's
+    // body text starts at the same card's `inner.x` (`col`), so a `▸` within
+    // a few columns of `col` on the row above can only belong to bravo's own
+    // card.
+    //
+    // The old same-line form also had `|| l.contains("> ")` as an ASCII
+    // fallback. Not restored: the deck hardcodes the selection prefix to
+    // `"▸ "` (`src/ui.rs`'s `sel_prefix`) with no ASCII/legacy-terminal
+    // branch for card selection — the `"> "` form belongs to a different
+    // widget (the directory picker's own row prefix) — so there is no
+    // rendering mode this fallback would ever need to catch here.
     let (col, row) = deck.wait_for_in_grid("bravo");
     deck.click(col, row);
-    let bravo_selected = |g: &str| {
+    let bravo_selected = move |g: &str| {
         let lines: Vec<&str> = g.lines().collect();
         lines
-            .iter()
-            .enumerate()
-            .any(|(i, l)| l.contains("bravo") && i > 0 && lines[i - 1].contains('▸'))
+            .get((row as usize).saturating_sub(1))
+            .is_some_and(|title| title.chars().skip(col as usize).take(4).any(|c| c == '▸'))
     };
     deck.wait_until_grid("bravo card selected", bravo_selected);
 

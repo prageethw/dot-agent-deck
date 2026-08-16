@@ -953,9 +953,11 @@ fn card_label(role: &str) -> String {
 /// could be satisfied by the agent's own output echoing the text back.
 /// Cropping to the span between one weight's matching verticals on the row
 /// directly below the box's top-left corner is what makes this specific to
-/// a card's own identity row. `tests/grid_box_helpers.rs` guards the
-/// sibling top-border helper in the fast tier; this one is new with M1 and
-/// currently has no such unit-level guard.
+/// a card's own identity row. `label_in_box_body_row` now mirrors
+/// `label_in_box_top_border`'s per-box scoping — it used to take only the
+/// FIRST box on the row via `position()` (review finding) — and
+/// `tests/grid_box_helpers.rs`'s `body_row_predicate_finds_a_label_in_the_second_card_of_a_row`
+/// guards that in the fast tier.
 fn card_titled(grid: &str, role: &str) -> bool {
     common::label_in_box_body_row(grid, &card_label(role))
 }

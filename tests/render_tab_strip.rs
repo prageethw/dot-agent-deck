@@ -32,6 +32,17 @@ fn close_glyph_count(buffer: &ratatui::buffer::Buffer) -> usize {
 /// `render_tab_strip` writes for every tab and samples the cell right after
 /// the leading pad space, so it survives label reordering / width changes as
 /// long as the label text itself is unique in the row.
+///
+/// PRD fork#405 auditor S3: on the active Orchestration tab, `Modifier::REVERSED`
+/// (M2) is applied on top of this same logical `fg` — the terminal paints a
+/// filled block of that colour and swaps which side is text vs. ground, which
+/// this buffer-level `cell.fg` read cannot see (`cell.bg` also can't: REVERSED
+/// is a modifier, not an absolute background fill). So a `tab_label_fg`
+/// assertion on a REVERSED tab pins the underlying palette-role colour that
+/// still drives the fill, not the colour a user's eye reads on screen. Callers
+/// that need to know the cell IS reversed pair this with a modifier check
+/// (e.g. `tab_label_modifier(..).contains(Modifier::REVERSED)`) rather than
+/// relying on `fg` alone.
 fn tab_label_fg(buffer: &ratatui::buffer::Buffer, label: &str) -> Color {
     let area = buffer.area();
     let row: String = (0..area.width)

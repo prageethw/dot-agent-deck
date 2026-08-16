@@ -202,3 +202,57 @@ fn orchestration_pane_crop_drops_the_sidebar_and_reports_a_missing_anchor() {
         "no anchor means no crop:\n{COLLAPSED_GRID}"
     );
 }
+
+/// Scenario: Run `label_in_box_body_row` against a two-card row where the
+/// SECOND card carries the searched label. Before the fix (review finding)
+/// this helper used `position()`, which always returns the FIRST vertical
+/// glyph in the whole body row regardless of which card's top-left corner is
+/// being checked — so it only ever cropped the leftmost card's own body span,
+/// and a label sitting in the second (or third) card of a multi-column row
+/// could never be found. The fixed version mirrors
+/// `label_in_box_top_border`: it iterates EVERY top-left corner on the row
+/// and starts each crop's vertical search at that corner's own column.
+#[test]
+fn body_row_predicate_finds_a_label_in_the_second_card_of_a_row() {
+    const TWO_CARD_GRID: &str = "\
+┌─ alpha ─┐┌─ bravo ─┐
+│ alpha   ││ bravo   │";
+    assert!(
+        common::label_in_box_body_row(TWO_CARD_GRID, "alpha"),
+        "the FIRST card's own body label must still match:\n{TWO_CARD_GRID}"
+    );
+    assert!(
+        common::label_in_box_body_row(TWO_CARD_GRID, "bravo"),
+        "a label in the SECOND card's body row must match — this is the exact case the \
+         `position()`-based implementation could never find:\n{TWO_CARD_GRID}"
+    );
+    assert!(
+        !common::label_in_box_body_row(TWO_CARD_GRID, "charlie"),
+        "a label present in neither card must not match:\n{TWO_CARD_GRID}"
+    );
+}
+
+/// Scenario: Run the shared word-boundary predicate (`common::contains_word_token`,
+/// PRD fork#405 review round — consolidated out of three byte-identical e2e-local
+/// copies) against the three cases those e2e callers actually depend on: a role
+/// name must not match as a substring of a longer, hyphenated identifier
+/// (`worker` inside this deck's own `worker-deck` chrome title), must still match
+/// when abutted by a card's own border glyph rather than whitespace (`│worker`,
+/// the PRD fork#405 M1 body-row shape with no leading pad), and must not match a
+/// different role name that happens to share a prefix (`beta` inside
+/// `beta-agent`).
+#[test]
+fn word_token_predicate_respects_identifier_boundaries() {
+    assert!(
+        !common::contains_word_token("worker-deck — 1/2 session(s)", "worker"),
+        "`worker` must not match as a substring of the hyphenated `worker-deck` chrome title"
+    );
+    assert!(
+        common::contains_word_token("│worker", "worker"),
+        "`worker` must match when abutted by a card border glyph instead of whitespace"
+    );
+    assert!(
+        !common::contains_word_token("│beta-agent│", "beta"),
+        "`beta` must not match as a substring of the longer identifier `beta-agent`"
+    );
+}

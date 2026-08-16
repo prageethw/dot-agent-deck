@@ -30,16 +30,7 @@ use spec::spec;
 /// space). Mirrors `grid_has_role` in `e2e_dashboard_selection.rs`, which
 /// hit the identical breakage.
 fn grid_has_role(grid: &str, role: &str) -> bool {
-    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
-    grid.match_indices(role).any(|(start, matched)| {
-        let end = start + matched.len();
-        let before_ok = grid[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_word_char(c));
-        let after_ok = grid[end..].chars().next().is_none_or(|c| !is_word_char(c));
-        before_ok && after_ok
-    })
+    common::contains_word_token(grid, role)
 }
 
 /// Drive the new-pane dialog to open the fixture's one orchestration,
