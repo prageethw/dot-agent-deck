@@ -22,7 +22,9 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
           EVENT_ACTION: ${{ github.event.action }}
-          ADDED_LABEL: ${{ github.event.label.name }}
+          # The added label on `labeled`, the removed label on `unlabeled` — read
+          # only when EVENT_ACTION = labeled, the one case where it names an add.
+          EVENT_LABEL: ${{ github.event.label.name }}
         run: |
           set -euo pipefail
 
@@ -64,7 +66,7 @@ jobs:
               else
                 if [ "$has_needs_triage" = "false" ]; then
                   echo "#$ISSUE_NUMBER already has priority-*/size-* — nothing to do"
-                elif [ "$EVENT_ACTION" = "labeled" ] && [ "$ADDED_LABEL" = "needs-triage" ]; then
+                elif [ "$EVENT_ACTION" = "labeled" ] && [ "$EVENT_LABEL" = "needs-triage" ]; then
                   echo "needs-triage manually re-added to fully labelled #$ISSUE_NUMBER — honoring the re-triage request"
                 else
                   echo "priority-*/size-* now both present on #$ISSUE_NUMBER — removing needs-triage"
