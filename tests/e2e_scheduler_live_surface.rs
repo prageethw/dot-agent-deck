@@ -494,27 +494,27 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
 
     let grid = deck.snapshot_grid();
 
-    // The pin (title parity with a reconnect, which reads the friendly name from
-    // the daemon registry's `display_name`): the superseding live card's TITLE
-    // STILL shows `morning-digest`. Because the cwd basename is `runbox`, the only
-    // way `morning-digest` reaches the grid is via the card header. If this fails,
-    // the retire path dropped the display_name again and the title reverted to
-    // the session-id hash — the pre-`ccadbbc` behaviour.
+    // The pin (identity parity with a reconnect, which reads the friendly name
+    // from the daemon registry's `display_name`): the superseding live card
+    // STILL shows `morning-digest`. Because the cwd basename is `runbox`, the
+    // only way `morning-digest` reaches the grid is via the card's identity
+    // row. If this fails, the retire path dropped the display_name again and
+    // identity reverted to the session-id hash — the pre-`ccadbbc` behaviour.
     assert!(
         grid.contains("morning-digest"),
         "after a real SessionStart hook supersedes the synthetic placeholder, the \
-         card TITLE must STILL show the friendly name 'morning-digest' (a reconnect \
+         card must STILL show the friendly name 'morning-digest' (a reconnect \
          keeps it), but it reverted to the session-id hash.\nGrid:\n{grid}"
     );
 
     // ...and must NOT fall back to the session-id hash form. `9f8e7d6c-5b` is the
     // session id's 11-char `id_display` prefix — it reaches the grid ONLY through
-    // the reverted `ClaudeCode · 9f8e7d6c-5b` title, so its presence is the
+    // the reverted `9f8e7d6c-5b` identity row, so its presence is the
     // load-bearing pin that the friendly name was lost on supersession.
     assert!(
         !grid.contains("9f8e7d6c-5b"),
-        "after supersession the card TITLE must NOT revert to the session-id hash \
-         ('… · 9f8e7d6c-5b…') — it should keep the schedule name.\nGrid:\n{grid}"
+        "after supersession the card must NOT revert to the session-id hash \
+         ('9f8e7d6c-5b…') — it should keep the schedule name.\nGrid:\n{grid}"
     );
 
     drop(scratch);

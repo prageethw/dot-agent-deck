@@ -232,6 +232,37 @@ fn body_row_predicate_finds_a_label_in_the_second_card_of_a_row() {
     );
 }
 
+/// Scenario: Run `label_in_box_body_row` against a two-card row where the
+/// FIRST card is drawn at THICK weight and the SECOND at PLAIN weight — the
+/// actual production shape a selected card next to an unselected one takes
+/// (`card_border_glyph` promotes only the selected card to `BorderType::Thick`).
+/// The search is weight-scoped: for each top-left corner it only matches
+/// verticals of that SAME weight, so the thick card's own `┃` cannot be
+/// mistaken for the plain card's `│` crop boundary or vice versa. Confirms
+/// each card's own label is still found under its own weight (review finding
+/// D7: the prior fixture used one weight for both cards and never exercised
+/// this).
+#[test]
+fn body_row_predicate_scopes_the_search_to_each_cards_own_border_weight() {
+    const MIXED_WEIGHT_GRID: &str = "\
+┏━ alpha ━┓┌─ bravo ─┐
+┃ alpha   ┃│ bravo   │";
+    assert!(
+        common::label_in_box_body_row(MIXED_WEIGHT_GRID, "alpha"),
+        "the THICK-weight first card's own body label must match:\n{MIXED_WEIGHT_GRID}"
+    );
+    assert!(
+        common::label_in_box_body_row(MIXED_WEIGHT_GRID, "bravo"),
+        "the PLAIN-weight second card's own body label must match — the search must not let \
+         the first card's thick vertical interfere with the second card's plain-weight crop:\n\
+         {MIXED_WEIGHT_GRID}"
+    );
+    assert!(
+        !common::label_in_box_body_row(MIXED_WEIGHT_GRID, "charlie"),
+        "a label present in neither card must not match:\n{MIXED_WEIGHT_GRID}"
+    );
+}
+
 /// Scenario: Run the shared word-boundary predicate (`common::contains_word_token`,
 /// PRD fork#405 review round — consolidated out of three byte-identical e2e-local
 /// copies) against the three cases those e2e callers actually depend on: a role

@@ -97,6 +97,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the model/badge segment's own content or toggle wiring (covered by `dashboard/agent-badge/001`/`004`); the embedded terminal pane, which keeps its single-line role title and is out of scope for this PRD; `card_height()`'s exact per-density values (covered by `card_height_001_content_derived_values` in `src/ui.rs`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/012 — The idle-art overlay offsets its cleared/painted area down one row so the identity row survives; the art itself still renders on the rows below it (PRD fork#405 delta-review, reviewer D2, fix F2).
+- **Layer:** L1 (ratatui `TestBackend` buffer text assertion via `render_card_for_mode_with_idle_art_to_buffer`, the sibling L1 seam that exposes `idle_art`).
+- **Agent:** none (a synthetic Spacious ClaudeCode fixture with a friendly display name and a three-line idle-art frame made of a distinctive filler string, `##ART-FILL##`).
+- **Asserts:** with the idle-art overlay active, the identity row (body row 0) still carries the display name styled `palette::ROLE_NAME`, AND the art frame's own filler text lands on each of the rows below it (`##ART-FILL##` on frame rows 2–4) while the `Dir:` row it overlays no longer shows `Dir:`. Both halves are required — pinning only the identity row's survival would also pass if the overlay silently stopped rendering altogether, which is the tautology `preserve_002` already hit once this PRD.
+- **Does not assert:** `update_idle_art`'s own gating of the idle-art cache on `CardDensity::Spacious` (that's a cache-population concern, not a render-path one); frame cycling across `tick` (covered implicitly — this fixture supplies a single frame); the LLM art-generation or validation path (`src/ascii_art.rs`'s own unit tests).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -5220,10 +5227,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the surfacing path itself (covered by `scheduler/live/001`); focus survival (covered by `scheduler/live/002`); the title after a reconnect (which already masks the bug via startup hydration); the card's status badge / body layout.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/live/004 — A live-surfaced scheduled card's friendly TITLE SURVIVES being superseded by the agent's real `SessionStart` hook — it does not revert to the session-id hash (PRD #127 finding #2, hook-supersession gap).
+##### scheduler/live/004 — A live-surfaced scheduled card's friendly name SURVIVES being superseded by the agent's real `SessionStart` hook — it does not revert to the session-id hash (PRD #127 finding #2, hook-supersession gap).
 - **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES`; fired with `RunNow`. The schedule's `working_dir` basename (`runbox`) is deliberately unrelated to its name (`morning-digest`) so the friendly name can only reach the grid through the card header — not the Dir line. (PRD fork#405 M1 moved identity off the title onto its own body row; this test's needle is a whole-grid match and does not pin which row.) After the synthetic placeholder surfaces, a real `SessionStart` hook is injected carrying the spawned pane's pane id AND its spawn-injected registry agent id (both read back from the registry) and NO display_name metadata — faithfully reproducing what a hook-emitting claude/opencode agent emits.
 - **Agent:** none (a plain `cat` command; the synthetic placeholder surfaces via the new-agent broadcast as in `scheduler/live/001`, then the harness injects the agent's real `SessionStart` hook — a `Some(agent_id)` distinct from the placeholder's `None` — to drive the supersession the primary hook-emitting scheduler case hits).
-- **Asserts:** after the placeholder surfaces with the friendly title `morning-digest` and the real hook supersedes it (the "No agent" placeholder becomes a live ClaudeCode card), the card TITLE STILL shows `morning-digest` (matching a reconnect) and has NOT reverted to the session-id hash form (`… · 9f8e7d6c-5b…`).
+- **Asserts:** after the placeholder surfaces with the friendly title `morning-digest` and the real hook supersedes it (the "No agent" placeholder becomes a live ClaudeCode card), the card STILL shows `morning-digest` (matching a reconnect) and has NOT reverted to the session-id hash form (`9f8e7d6c-5b…`).
 - **Does not assert:** the surfacing path itself (covered by `scheduler/live/001`); focus survival (covered by `scheduler/live/002`); the no-hook title case (covered by `scheduler/live/003`); the title after a reconnect (which already masks the bug via startup hydration); the card's status badge / body layout.
 - **Platform coverage:** mac+linux.
 

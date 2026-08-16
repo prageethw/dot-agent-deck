@@ -9,13 +9,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use dot_agent_deck::ascii_art::AsciiArtResult;
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
-    render_card_to_buffer, render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
+    render_card_for_mode_with_idle_art_to_buffer, render_card_to_buffer,
+    render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
     render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
     render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
@@ -2768,6 +2770,18 @@ fn pane_011_role_name_on_its_own_body_row() {
         "badge ON: the display name on the body row must render in palette::ROLE_NAME \
          (Color::Indexed(130))"
     );
+    // PRD fork#405 delta-review (reviewer D4): F1's separating space between
+    // the badge text and the border fill is a `Reset/Reset`-styled
+    // whitespace run, which `buffer_to_color_text` elides on flush — so the
+    // snapshots above cannot pin it; the only trace there is the fill
+    // losing one dash. Assert the raw cell directly so a regression that
+    // drops the space again fails loudly instead of as a one-character
+    // snapshot diff.
+    assert!(
+        on_title.contains("ClaudeCode (Opus) \u{2500}"),
+        "badge ON (live): the badge text must be followed by a separating space \
+         before the border fill begins:\n{on_title}"
+    );
 
     // --- Badge OFF (the default) ------------------------------------------
     // This is the unconditional half: the role row must NOT ride the same
@@ -2904,6 +2918,96 @@ fn pane_011_role_name_on_its_own_body_row() {
         "the blank identity row must still occupy exactly ONE row — with the height guarantee \
          intact, `Dir:` lands on row 2 whether or not identity has any text to show:\n\
          {empty_dir_row}"
+    );
+}
+
+/// Scenario: Render a Spacious session card with the idle-art overlay active
+/// (a three-line frame made of a distinctive filler string) and pin both
+/// halves of F2 (PRD fork#405 delta-review, reviewer D2): the identity row
+/// (body row 0) still carries the display name in `palette::ROLE_NAME`, and
+/// the art frame's own text genuinely lands on the rows below it — not just
+/// that `Dir:` disappeared, which would also be true if the overlay silently
+/// stopped rendering altogether (the `preserve_002` tautology trap this PRD
+/// already hit once).
+#[spec("dashboard/pane/012")]
+#[test]
+fn pane_012_idle_art_overlay_preserves_identity_row() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "sess-idle-art-01".to_string(),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("pane-idle-art-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: Some("art-coder".to_string()),
+        pending_permission_tool: None,
+        shell_synthetic_working: false,
+        model: Some("Opus".to_string()),
+    };
+    let width: u16 = 80;
+    // `update_idle_art` gates the idle-art cache on `CardDensity::Spacious`
+    // (src/ui.rs) — Spacious is the only density a production card ever
+    // actually shows idle art at, so it's the density this test uses.
+    let density = CardDensityKind::Spacious;
+    let height = density.rendered_height();
+
+    const ART_LINE: &str = "##ART-FILL##";
+    let art = AsciiArtResult {
+        frames: vec![[ART_LINE, ART_LINE, ART_LINE].join("\n")],
+    };
+
+    let buf = render_card_for_mode_with_idle_art_to_buffer(
+        &session,
+        Some("art-coder"),
+        Some(1),
+        density,
+        0, // tick 0 -> frame_index 0, the fixture's only frame
+        false,
+        UiMode::Normal,
+        width,
+        height,
+        false, // show_agent_type_badge
+        Some(&art),
+    );
+
+    // --- Half 1: the identity row survives the overlay ---------------------
+    let identity_row = row_text(&buf, 1);
+    assert!(
+        identity_row.contains("art-coder"),
+        "F2: the identity row (body row 0) must survive the idle-art overlay:\n{identity_row}"
+    );
+    assert_eq!(
+        row_needle_fg(&buf, 1, "art-coder"),
+        dot_agent_deck::palette::ROLE_NAME,
+        "F2: the surviving identity row must still render in palette::ROLE_NAME"
+    );
+
+    // --- Half 2: the art is genuinely rendering, and covers what's below ---
+    // The art_area starts at inner.y + 1 (frame row 2, immediately below the
+    // identity row at frame row 1) with height inner.height - 1, so all three
+    // lines of the fixture's frame land inside it. Assert the frame's own
+    // text is on each of those rows AND that the `Dir:` content it painted
+    // over is gone — either half alone would also pass if the overlay just
+    // silently no-opped.
+    for row in 2..=4 {
+        let text = row_text(&buf, row);
+        assert!(
+            text.contains(ART_LINE),
+            "F2: idle-art row {row} must carry the art frame's own content:\n{text}"
+        );
+    }
+    let dir_row = row_text(&buf, 2);
+    assert!(
+        !dir_row.contains("Dir:"),
+        "F2: the art overlay must paint over the row that would otherwise show `Dir:`:\n{dir_row}"
     );
 }
 

@@ -150,8 +150,16 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
     deck.click(col, row);
     let bravo_selected = move |g: &str| {
         let lines: Vec<&str> = g.lines().collect();
-        lines
-            .get((row as usize).saturating_sub(1))
+        // `checked_sub`, not `saturating_sub` (auditor N4): `row == 0` is an
+        // impossible state here (a card's identity row is always well below
+        // the tab strip / stats bar), and `saturating_sub` would silently
+        // read bravo's OWN body row in that case instead of failing as the
+        // impossible state it is — turning a bug into a full `wait_until_grid`
+        // timeout that reports "bravo card selected" never happened, with no
+        // hint the row index was the actual problem.
+        (row as usize)
+            .checked_sub(1)
+            .and_then(|r| lines.get(r))
             .is_some_and(|title| title.chars().skip(col as usize).take(4).any(|c| c == '▸'))
     };
     deck.wait_until_grid("bravo card selected", bravo_selected);
