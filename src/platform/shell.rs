@@ -134,17 +134,50 @@ pub fn quote_shell_arg(arg: &str) -> String {
 /// has to work under both: never let the token start with `"` at all, and
 /// this preprocessing pass — which activates ONLY "if the first character
 /// is a quote character" — never triggers, in either context. Caret-
-/// escaping the token's OWN metacharacters (`&|<>()^%!,`) alongside
+/// escaping the token's OWN metacharacters (`&|<>()^%!,;=`) alongside
 /// whitespace is the same defense [`quote_cmd_exe_arg`] applies to the
 /// command position, just without the quote-wrap that position needs and
 /// this one must avoid.
+///
+/// **Caveat — `%` and `!` are not actually neutralized, only incidentally
+/// inert.** See [`quote_cmd_exe_arg`]'s doc comment for the mechanism and
+/// its failure cases (delayed expansion for `!`, batch-file rules for
+/// `%`); the same caveat applies here since this function shares the same
+/// caret-escape strategy. Neither case lets a value break out of the
+/// program-name position — both operate a parse phase later than the
+/// metacharacter scan this function defends — so it is a content-mangling
+/// risk, not an injection, but it is deliberately not left silently
+/// implied to be resolved (fork issue #283).
+///
+/// **Caveat — a real `\r`/`\n` cannot be caret-escaped away either**, for
+/// the reasons [`sanitize_cmd_exe_newlines`]'s doc comment gives; this
+/// function replaces one with a space before doing anything else (fork
+/// issue #423 review finding B1's sibling: a newline in an
+/// executable path, reachable only via a self-controlled
+/// `std::env::current_exe()`, not user config).
 #[cfg(windows)]
 pub fn escape_cmd_exe_program(token: &str) -> String {
+    let token = sanitize_cmd_exe_newlines(token);
     let mut result = String::with_capacity(token.len());
     for c in token.chars() {
         if matches!(
             c,
-            ' ' | '\t' | '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!'
+            ' ' | '\t'
+                | '"'
+                | '^'
+                | '&'
+                | '|'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | ','
+                | ';'
+                | '='
+                | '%'
+                | '!'
+                | '\r'
+                | '\n'
         ) {
             result.push('^');
         }
@@ -188,9 +221,41 @@ pub fn escape_cmd_exe_program(token: &str) -> String {
 ///    never leaves "quoted" mode and never treats anything as a command
 ///    separator. `cmd.exe` strips the carets as it forwards the line to the
 ///    launched process, so the child receives exactly step 1's output.
+///
+/// **Caveat — `%` and `!` are in the caret set but are NOT actually
+/// neutralized, only incidentally inert.** Issue #283 requires this to be
+/// stated plainly rather than implied away by the "never sees a bare
+/// special character" claim above:
+/// - **`%`**: percent expansion is `cmd.exe`'s phase-1 parse, which runs
+///   *before* phase 2 strips carets — `^` cannot suppress it. `^%VAR^%`
+///   happens to come out right only because the inserted caret corrupts
+///   the variable name, the lookup fails, and an undefined reference is
+///   left verbatim under command-line rules; under batch-file rules an
+///   undefined reference is *deleted* instead, so the same input mangles.
+/// - **`!`**: delayed expansion (`cmd /V:ON`, or the
+///   `HKCU\Software\Microsoft\Command Processor\DelayedExpansion`
+///   registry default) is `cmd.exe`'s phase 3, after caret-stripping. A
+///   single `^!` reduces to a bare `!` before phase 3 runs, so `!VAR!`
+///   still expands; the canonical escape there is `^^!`, which this
+///   function does not emit.
+///
+/// Both are content-mangling/disclosure risks, not injection — the
+/// expansion happens after the metacharacter scan this function defends,
+/// so it cannot introduce a new command — but neither is actually closed
+/// by quoting the way every other character in the caret set is.
+///
+/// **Caveat — a real `\r`/`\n` is replaced with a space before either
+/// pass runs, not caret-escaped.** No caret encoding neutralizes a raw
+/// newline: on the persistent-watch-pane delivery path the line is typed
+/// into an already-running interactive `cmd.exe`, and the terminal
+/// submits the current input the instant it sees the byte — before
+/// `cmd.exe`'s own escaping grammar is ever consulted — and on the `/C
+/// <string>` delivery path `cmd.exe` treats an embedded raw newline as a
+/// statement separator the same way it would inside a batch file. See
+/// [`sanitize_cmd_exe_newlines`] (fork issue #423 review finding B1).
 #[cfg(windows)]
 pub fn quote_cmd_exe_arg(arg: &str) -> String {
-    caret_escape_cmd_metachars(&crt_argv_quote(arg))
+    caret_escape_cmd_metachars(&crt_argv_quote(&sanitize_cmd_exe_newlines(arg)))
 }
 
 /// Step 1 of [`quote_cmd_exe_arg`]: the standard CRT/`CommandLineToArgvW`
@@ -247,19 +312,63 @@ fn crt_argv_quote(arg: &str) -> String {
 /// treats specially during its own command-line scan, so that scan never
 /// sees an unescaped metacharacter — including the quotes [`crt_argv_quote`]
 /// added, which is what stops finding A1's quote-parity trick from working.
+///
+/// `\r`/`\n` are included in the set as defense in depth even though
+/// [`quote_cmd_exe_arg`] already replaces them via
+/// [`sanitize_cmd_exe_newlines`] before this function ever runs, so a
+/// future direct caller of this function that skips that step still gets
+/// *some* protection: caret-escaping a newline does not make it behave
+/// like a real newline (`cmd.exe`'s interactive reader treats a trailing
+/// `^` before Enter as its own line-continuation syntax, prompting `More?`
+/// rather than submitting), but it does stop the raw byte from reaching
+/// `cmd.exe`'s scan unescaped, which is what actually lets a second
+/// command run. It is not a substitute for sanitizing at the source.
 #[cfg(windows)]
 fn caret_escape_cmd_metachars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(
             c,
-            '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!'
+            '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!' | '\r' | '\n'
         ) {
             result.push('^');
         }
         result.push(c);
     }
     result
+}
+
+/// Replace a real `\r`/`\n` in `s` with a single space before either
+/// [`escape_cmd_exe_program`] or [`quote_cmd_exe_arg`] processes it.
+///
+/// Caret-escaping cannot neutralize a real newline the way it neutralizes
+/// every other `cmd.exe` metacharacter, because the newline is never
+/// reached by `cmd.exe`'s OWN scan in the first place. On the
+/// persistent-watch-pane delivery path (see `watch_invocation`'s doc
+/// comment in `mode_manager.rs`), the line is typed character-by-character
+/// into an already-running interactive `cmd.exe`; the terminal submits the
+/// current input line the moment it sees the raw byte, exactly as if the
+/// user had pressed Enter — nothing about `cmd.exe`'s escaping grammar is
+/// even consulted at that point. On the `%COMSPEC% /C <string>` delivery
+/// path, `cmd.exe` treats an embedded raw newline inside its `string`
+/// argument as a statement separator, the same way it treats one inside a
+/// batch file. Either way, a scheme that only defends against `cmd.exe`'s
+/// METACHARACTER scan cannot close this off — the character has to be
+/// gone before either quoting pass ever sees it (fork issue #423 review
+/// finding B1).
+///
+/// Replacing with a space, rather than stripping or rejecting outright, is
+/// the least-surprising per-operand choice: the value then reads exactly
+/// as if the caller had used a space there in the first place; `main`'s
+/// old `{:?}`-Debug-quoted format also mangled a real newline's content
+/// while keeping the line intact (via the two-character escape sequence
+/// `\n` rather than a space, so this is not byte-identical to `main`, but
+/// it is the same class of "content mangled, line count preserved"
+/// behavior); and stripping outright risks silently joining two words
+/// (`"foo\nbar"` -> `"foobar"`) that a space keeps apart.
+#[cfg(windows)]
+fn sanitize_cmd_exe_newlines(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
 }
 
 #[cfg(all(windows, test))]
@@ -329,5 +438,55 @@ mod windows_quoting_tests {
         // Two literal backslashes (doubled from one), then the caret-escaped
         // closing quote.
         assert_eq!(quoted, "^\"C:\\Program Files\\\\^\"");
+    }
+
+    /// Fork issue #423 review finding B1: a real LF must never survive into
+    /// the emitted line — `quote_cmd_exe_arg` replaces it with a space
+    /// before either quoting pass runs, rather than caret-escaping it,
+    /// since neither `cmd.exe`'s own scan nor a typed-PTY submit can be
+    /// stopped by a caret. The real-`cmd.exe` behavioral proof is
+    /// `watch_invocation_neutralizes_a_real_newline_through_real_cmd_exe`
+    /// in `mode_manager.rs`; this is the fast, deterministic companion pin.
+    #[test]
+    fn quote_cmd_exe_arg_replaces_a_real_newline_with_a_space() {
+        let quoted = quote_cmd_exe_arg("line one\nline two");
+        assert!(!quoted.contains('\n') && !quoted.contains('\r'));
+        assert_eq!(quoted, r#"^"line one line two^""#);
+    }
+
+    /// Same fix, the `\r\n` shape — each of the two bytes is independently
+    /// replaced with a space, so the pair becomes two spaces rather than
+    /// one.
+    #[test]
+    fn quote_cmd_exe_arg_replaces_a_crlf_pair_with_two_spaces() {
+        let quoted = quote_cmd_exe_arg("line one\r\nline two");
+        assert!(!quoted.contains('\n') && !quoted.contains('\r'));
+        assert_eq!(quoted, r#"^"line one  line two^""#);
+    }
+
+    /// The program-name position carries the same hazard (a `current_exe()`
+    /// path containing a raw newline, low-reachability but still a
+    /// documented sibling of B1) and the same fix.
+    #[test]
+    fn escape_cmd_exe_program_replaces_a_real_newline_with_a_space() {
+        let escaped = escape_cmd_exe_program("C:\\a\nb\\deck.exe");
+        assert!(!escaped.contains('\n') && !escaped.contains('\r'));
+        assert_eq!(escaped, "C:\\a^ b\\deck.exe");
+    }
+
+    /// N2 / S4: `;` and `=` are `cmd.exe` command-line delimiters exactly
+    /// like `,` (already escaped) and are legal in NTFS path components, so
+    /// leaving them bare would split the program token the same way an
+    /// unescaped space did in #157.
+    #[test]
+    fn escape_cmd_exe_program_escapes_semicolon_and_equals() {
+        assert_eq!(
+            escape_cmd_exe_program("C:\\a;b\\deck.exe"),
+            "C:\\a^;b\\deck.exe"
+        );
+        assert_eq!(
+            escape_cmd_exe_program("C:\\a=b\\deck.exe"),
+            "C:\\a^=b\\deck.exe"
+        );
     }
 }

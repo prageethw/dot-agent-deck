@@ -818,6 +818,69 @@ mod tests {
         );
     }
 
+    /// Fork issue #423 review finding B1: a real LF/CRLF in `command` used
+    /// to survive into the emitted line unescaped (neither
+    /// `escape_cmd_exe_program` nor `quote_cmd_exe_arg` had `\r`/`\n` in
+    /// their caret-escape sets), and `crt_argv_quote` wraps the resulting
+    /// argument in quotes without touching the newline itself — so the raw
+    /// byte sat inside the quotes exactly the way finding A1's payload used
+    /// to sit outside them. `cmd.exe` treats an embedded raw newline in a
+    /// `/C <string>` argument as a statement separator the same way it
+    /// treats one inside a batch file (and, on the persistent-watch-pane
+    /// delivery path this test does not exercise, a typed newline submits
+    /// the current input the instant the terminal sees it, before
+    /// `cmd.exe`'s own grammar is even consulted — see
+    /// `platform::shell::sanitize_cmd_exe_newlines`'s doc comment). Either
+    /// way, no caret encoding can close this off, so `watch_invocation`'s
+    /// Windows arm now replaces `\r`/`\n` with a space before either
+    /// quoting pass runs. Verified the same rigorous way as
+    /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
+    /// above: a benign marker-file write stands in for the payload a
+    /// surviving raw newline would otherwise let submit as its own,
+    /// separate `cmd.exe` command.
+    ///
+    /// This is strictly worse than `main` if left unfixed: `main`'s
+    /// `{:?}`-Debug-quoted format escaped a real newline to the two-visible-
+    /// character sequence `\n`, so content was mangled but the line stayed
+    /// one line; a raw, unescaped newline instead splits the line into two.
+    #[cfg(windows)]
+    #[test]
+    fn watch_invocation_neutralizes_a_real_newline_through_real_cmd_exe() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let marker = scratch.path().join("injected.marker");
+
+        let exe = scratch.path().join("dot-agent-deck.exe");
+        // A real LF, not the two-char `\n` escape sequence: if it survives
+        // into the emitted line unescaped, `cmd.exe` reads everything after
+        // it as a second, unquoted command.
+        let command = "npm run dev\ntype nul > injected.marker";
+        let line = watch_invocation(&exe, 5, command);
+
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "watch_invocation must never emit a raw CR/LF into the cmd.exe \
+             command line\nline: {line:?}"
+        );
+
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/C")
+            .raw_arg(&line)
+            .current_dir(scratch.path())
+            .output()
+            .expect("cmd.exe should run");
+
+        assert!(
+            !marker.exists(),
+            "a real newline in `command` escaped quoting and ran \
+             `type nul > injected.marker` as a separate cmd.exe command.\n\
+             line: {line}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Position-aware quoting's other half: the EXECUTABLE token is located by
     /// `cmd.exe`'s own quote-based space-protection at the head of the line —
     /// a different rule from the CRT/argv-style escaping the command argument
@@ -862,5 +925,97 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Fork issue #423 review finding S2: every other real-`cmd.exe` test in
+    /// this module proves either that an injected payload did NOT run
+    /// (`watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`,
+    /// `watch_invocation_neutralizes_a_real_newline_through_real_cmd_exe`) or
+    /// that a stub WAS located and run at all
+    /// (`watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it`)
+    /// — none of them recover the argument bytes the launched process
+    /// actually received, because that stub's `.bat` ignores its own
+    /// arguments. A quoting scheme that mangled `command`'s content instead
+    /// of breaking `cmd.exe`'s parse of it — a stray caret leaking through,
+    /// a backslash run dropped — would pass every one of those tests while
+    /// silently corrupting every watch command in production.
+    ///
+    /// This test closes that gap the way #283 asked for the POSIX side to
+    /// be closed (`quote_shell_arg_round_trips_through_posix_shell`): drive
+    /// a REAL child process's own argv recovery, not a hand-trace of the
+    /// algorithm. A `.bat` stub can't be that child — `%1`/`%~1` substitute
+    /// into the batch line as raw TEXT before `cmd.exe` re-parses it, so an
+    /// input containing `cmd.exe` metacharacters would just re-trigger the
+    /// same injection this PR exists to close, one layer down, and prove
+    /// nothing about what the eventual child process receives. A compiled
+    /// helper's `std::env::args()` is populated by the OS loader via the
+    /// same `CommandLineToArgvW`-compatible mechanism [`crt_argv_quote`]
+    /// targets, with no shell in between to reinterpret the recovered
+    /// bytes — the genuinely independent check.
+    #[cfg(windows)]
+    #[test]
+    fn quote_cmd_exe_arg_recovers_the_exact_argument_bytes_through_a_real_child_process() {
+        use std::os::windows::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let helper_src = scratch.path().join("echo_arg.rs");
+        let helper_exe = scratch.path().join("echo_arg.exe");
+        let helper_source = concat!(
+            "fn main() {\n",
+            "    let arg = std::env::args().nth(1).unwrap_or_default();\n",
+            "    std::fs::write(\"out.txt\", arg).expect(\"write out.txt\");\n",
+            "}\n",
+        );
+        std::fs::write(&helper_src, helper_source).expect("write helper source");
+
+        let compile = std::process::Command::new("rustc")
+            .arg("-o")
+            .arg(&helper_exe)
+            .arg(&helper_src)
+            .output()
+            .expect("rustc should run");
+        assert!(
+            compile.status.success(),
+            "failed to compile the argv-echo helper:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let out_file = scratch.path().join("out.txt");
+
+        // The A1 exploit shape (quote/ampersand break-out), a trailing
+        // backslash run immediately before what becomes the closing quote
+        // (the exact case `crt_argv_quote`'s backslash-doubling exists
+        // for), and the degenerate empty string (one empty `argv` element,
+        // not a dropped argument).
+        for input in [
+            r#"echo ok" & type nul > injected.marker & rem ""#,
+            r"C:\Program Files\",
+            "",
+        ] {
+            let _ = std::fs::remove_file(&out_file);
+            let line = format!(
+                "{} {}",
+                escape_cmd_exe_program(&helper_exe.display().to_string()),
+                quote_cmd_exe_arg(input)
+            );
+
+            let output = std::process::Command::new("cmd.exe")
+                .raw_arg("/C")
+                .raw_arg(&line)
+                .current_dir(scratch.path())
+                .output()
+                .expect("cmd.exe should run");
+
+            let recovered = std::fs::read_to_string(&out_file).unwrap_or_default();
+            assert_eq!(
+                recovered,
+                input,
+                "argument bytes did not round-trip for input {input:?}\n\
+                 line: {line}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
