@@ -5794,10 +5794,28 @@ fn observe_exit_without_reaping(
         }) {
             PeekOutcome::Exited => true,
             PeekOutcome::StillRunning => false,
-            // ECHILD means "already reaped by something else" (see the
-            // precondition on `peek_child_exited_without_reaping`) — treated
-            // the same as observed-exited so phase 2 stops re-polling it.
-            PeekOutcome::AlreadyReaped => true,
+            // ECHILD means "already reaped by something else" — a violation
+            // of the sole-reaper precondition documented on
+            // `peek_child_exited_without_reaping` (this is exactly the
+            // recycled-pid hazard fork #163 is about, if it is ever hit for
+            // real). Still treated the same as observed-exited so phase 2
+            // stops re-polling it — that classification is correct and
+            // unchanged (phase 3 signals and reaps unconditionally either
+            // way) — but logged unconditionally, since this is the only
+            // runtime signal that the precondition was ever violated. Fires
+            // at most once per agent per shutdown by construction: this arm
+            // returns `true`, which marks the agent exited and removes it
+            // from further polling in the same round.
+            PeekOutcome::AlreadyReaped => {
+                tracing::warn!(
+                    pid,
+                    "peek_child_exited_without_reaping: ECHILD — pid was already \
+                     reaped by something else during graceful shutdown, violating \
+                     the sole-reaper precondition; treating as exited (phase 3 \
+                     still signals and reaps unconditionally)"
+                );
+                true
+            }
             PeekOutcome::PermanentError(e) => {
                 // Auditor F1 / fork issue #217 items 2-3: after
                 // `resolve_peek_outcome`'s bounded EINTR retry, `waitid`'s
@@ -5870,17 +5888,32 @@ enum PeekOutcome {
 /// retrying a transient `Interrupted`, this gives up and reports
 /// `StillRunning` rather than spinning past the grace window the caller is
 /// trying to respect.
+///
+/// Also capped at a small retry count, independent of the deadline: the
+/// deadline alone bounds how *long* a persistent `EINTR` can spin, not how
+/// hard it spins while doing so — `resolve_peek_outcome` runs inside phase
+/// 2's single-threaded per-agent loop, so an uninterrupted retry loop would
+/// burn the rest of the grace window on one agent's `waitid` call without
+/// ever polling its siblings. An `EINTR` that survives a few immediate
+/// retries is not transient, and `StillRunning` is already the right
+/// fallback for it.
 #[cfg(unix)]
 fn resolve_peek_outcome(
     deadline: std::time::Instant,
     mut peek: impl FnMut() -> std::io::Result<bool>,
 ) -> PeekOutcome {
+    const MAX_INTERRUPTED_RETRIES: u32 = 3;
+    let mut retries = 0;
     loop {
         match peek() {
             Ok(true) => return PeekOutcome::Exited,
             Ok(false) => return PeekOutcome::StillRunning,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 if std::time::Instant::now() >= deadline {
+                    return PeekOutcome::StillRunning;
+                }
+                retries += 1;
+                if retries >= MAX_INTERRUPTED_RETRIES {
                     return PeekOutcome::StillRunning;
                 }
                 continue;
@@ -9354,7 +9387,6 @@ mod spawn_tests {
     // Env var carrying the readiness-marker path into the stand-in's shell
     // script below — see `command_ignores_sigterm`'s doc comment for why
     // this is an env var rather than a `format!`-interpolated path.
-    #[cfg(unix)]
     const READY_MARKER_ENV: &str = "DOT_AGENT_DECK_TEST_READY_MARKER";
 
     // Builds the SIGTERM-resistant stand-in's command together with a
@@ -9382,7 +9414,6 @@ mod spawn_tests {
     // expansion's result is not itself re-parsed for further expansions, so
     // passing the path through `"$READY_MARKER_ENV"` removes the hazard
     // outright rather than trying to escape around it with more quoting.
-    #[cfg(unix)]
     fn command_ignores_sigterm() -> (std::process::Command, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("create tempdir for trap-ready marker");
         let marker = dir.path().join("trap-ready");
@@ -9403,7 +9434,6 @@ mod spawn_tests {
     /// `Command::get_args`/`get_envs` rather than sniffing the `Debug`
     /// output, which interleaves both and would make this fragile against
     /// incidental formatting changes.
-    #[cfg(unix)]
     #[test]
     fn command_ignores_sigterm_delivers_marker_via_env_not_script_interpolation() {
         let (command, _dir, marker) = command_ignores_sigterm();

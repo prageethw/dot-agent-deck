@@ -104,18 +104,40 @@ pub fn handle_hook(agent: &str) -> ExitCode {
 /// bounds a reply that only ever carries a short seed, while a hook event's
 /// `tool_input` can legitimately carry a tool's whole argument — e.g. the
 /// full file content behind a `Write`/`Edit` call — so the 1 MiB reply cap
-/// would risk rejecting real hook traffic. Reusing
-/// [`crate::daemon_protocol::MAX_FRAME_LEN`] instead of picking a fresh
-/// number means this introduces no new order of magnitude to reason about:
-/// it is already the ceiling this codebase applies to any single message.
+/// would risk rejecting real hook traffic.
+///
+/// This bounds the hook CLI's *request* path, which never travels the framed
+/// TUI↔daemon transport [`crate::daemon_protocol::MAX_FRAME_LEN`] governs —
+/// a hook event goes out over the plain newline-delimited hook socket
+/// (`send_to_socket_at`, below), which the daemon reads with
+/// `BufReader::lines()` and no length bound at all (upstream #319, and see
+/// [`MAX_REPLY_LINE_BYTES`]'s note that the two hook-path sizes should be
+/// decided consistently — this is the second one). The value reuses
+/// [`crate::daemon_protocol::MAX_FRAME_LEN`]'s literal only because 16 MiB is
+/// already a number this codebase treats as "far above any legitimate single
+/// message" and picking a fresh one would add nothing; it is not because a
+/// framed transport imposes this bound on this path. The `const _` assertion
+/// below pins the literal, so a future change to `MAX_FRAME_LEN` — made for
+/// wire reasons that have nothing to do with hooks — cannot silently retune
+/// what an untrusted hook payload may allocate.
 const MAX_STDIN_BYTES: u64 = crate::daemon_protocol::MAX_FRAME_LEN as u64;
 
-/// Bounded stdin read for the hook payload. Mirrors how the reply path a few
-/// hundred lines below (`request_from_socket_at`/`read_reply_line`) is
-/// bounded: a cap enforced before the buffer is allowed to grow past it, and
-/// a payload over the cap is rejected outright rather than silently
-/// truncated and handed on to the JSON parser — a truncated payload that
-/// happens to still parse would be worse than one that is cleanly rejected.
+const _: () = assert!(MAX_STDIN_BYTES == 16 * 1024 * 1024);
+
+/// Bounded stdin read for the hook payload. Applies the same reject-don't-
+/// truncate discipline as the reply path a few hundred lines below
+/// (`request_from_socket_at`/`read_reply_line`): a payload over the cap is
+/// rejected outright rather than silently truncated and handed on to the
+/// JSON parser — a truncated payload that happens to still parse would be
+/// worse than one that is cleanly rejected. An over-cap payload is dropped
+/// silently rather than reported (fork issue #145's "fail with a clear
+/// error" was considered and declined here — see the note in
+/// `changelog.d/145.bugfix.md`): every other failure on this path, malformed
+/// or absent input alike, already returns `ExitCode::SUCCESS` without a
+/// diagnostic, since this file initializes no logger and calls no
+/// `tracing`/`eprintln!` anywhere, and a single new stderr write for this
+/// one case would be a new pattern rather than an extension of the
+/// existing one.
 ///
 /// Unlike the reply path's manual chunk-and-check loop, there is no deadline
 /// to re-arm per read here: this is a synchronous single-shot stdin drain
@@ -132,9 +154,16 @@ fn read_bounded<R: std::io::Read>(mut reader: R, cap: u64) -> Option<String> {
     let mut buf = Vec::new();
     // Read at most `cap + 1` bytes: reading exactly `cap` would make an
     // input of exactly `cap` bytes indistinguishable from one that has more
-    // data waiting behind it, so the `+1` is what lets the length check
-    // below tell "at the cap" from "over the cap" apart.
-    reader.by_ref().take(cap + 1).read_to_end(&mut buf).ok()?;
+    // data waiting behind it, so the buffer is deliberately allowed to grow
+    // one byte past the cap — the `+1` is what lets the length check below
+    // tell "at the cap" from "over the cap" apart. `saturating_add` rather
+    // than `+` because the only production caller passes a `const`, but a
+    // future caller passing `u64::MAX` should saturate rather than panic.
+    reader
+        .by_ref()
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
     if buf.len() as u64 > cap {
         return None;
     }

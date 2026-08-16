@@ -242,16 +242,11 @@ fn default_clear() -> bool {
 /// `changelog.d/*.breaking.md` plus a version bump, which the defect does
 /// not warrant.
 ///
-/// Re-examined, not re-decided, while fixing the unrelated #145/#217 guard
-/// defects in the same batch: #174 asked both "fix the guard" and "should
-/// the resolved name also be trimmed" — this function already answers both
-/// "no", on the record above, and that record predates this batch (PR #274
-/// round 3, reverting round 2's `.trim()` after review). Nothing here
-/// changed; `resolve_orchestration_name_treats_whitespace_only_name_as_present`
-/// and `resolve_orchestration_name_does_not_trim_surrounding_whitespace`
-/// below close the regression-coverage gap the round-3 revert left (the
-/// decision was previously pinned only at `state.rs`'s consumer-level test,
-/// not here).
+/// Pinned directly by
+/// `resolve_orchestration_name_treats_whitespace_only_name_as_present` and
+/// `resolve_orchestration_name_does_not_trim_surrounding_whitespace` below;
+/// before those, the decision was pinned only by `state.rs`'s
+/// consumer-level test.
 ///
 /// Centralized so the TUI's tab construction site, the TUI's hydration
 /// site, and the daemon's `handle_delegate` lookup all agree on the
