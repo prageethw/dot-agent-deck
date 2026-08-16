@@ -54,10 +54,11 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'test(orchestration_dispatch_002_every_real_agent_role_comes_alive)'
 slow-timeout = { period = "60s", terminate-after = 7 }
 
-# Issue #250: `lifecycle/version/001` is the only test that has to `cargo build`
-# the binary itself (with DAD_VERSION / DAD_BUILD_ID pre-set in the build env),
-# so its wall clock is a compile, not a run. It runs three builds — one cold,
-# then one per changed variable, which is what pins the two
+# Issue #250 (widened by issue #398 review finding F1): `lifecycle/version/001`
+# is the only test that has to `cargo build` the binary itself (with
+# DAD_VERSION / DAD_BUILD_ID / DAD_RELEASE_REPO pre-set in the build env), so
+# its wall clock is a compile, not a run. It runs four builds — one cold, then
+# one per changed variable, which is what pins the three
 # `cargo:rerun-if-env-changed` directives individually — all into its own
 # `target/version-injection-e2e` CARGO_TARGET_DIR. That isolation is required so
 # it cannot clobber the `target/debug` binary the rest of the suite spawns, and
