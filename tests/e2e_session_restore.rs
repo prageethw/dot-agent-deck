@@ -888,12 +888,26 @@ fn restore_014_recognized_agent_is_idle_before_first_hook() {
     // the status label — a recognized agent renders its real status (`Idle`
     // here), while an unrecognized one renders the `No agent` placeholder
     // (`is_placeholder` in `render_session_card`). Match a truncation-safe
-    // prefix of the display name (the dashboard truncates to card width) on the
-    // same line as `Idle`, and confirm the placeholder label is absent.
+    // prefix of the display name (the dashboard truncates to card width),
+    // and confirm the placeholder label is absent.
+    //
+    // PRD fork#405 M1 moved the role/session identity text off the card's
+    // title row onto its own unconditional body row directly beneath it —
+    // the title row carries the status (`Idle` / `No agent`), the body row
+    // carries the identity, and they are no longer the SAME rendered line
+    // (`render_session_card`, `src/ui.rs`). So the check is now "the
+    // identity's own body row is the line directly below its card's title
+    // row, and THAT title row carries the status" — an adjacent-row check
+    // rather than a same-row one, mirroring `has_role_status` in
+    // `e2e_orchestration_pane_column.rs`, which hit the identical breakage.
     let idle = common::wait_until(Duration::from_secs(10), || {
         let grid = deck.snapshot_grid();
-        grid.lines().any(|line| {
-            line.contains("restored-op") && line.contains("Idle") && !line.contains("No agent")
+        let lines: Vec<&str> = grid.lines().collect();
+        lines.iter().enumerate().any(|(i, line)| {
+            i > 0
+                && line.contains("restored-op")
+                && lines[i - 1].contains("Idle")
+                && !lines[i - 1].contains("No agent")
         })
     });
     assert!(

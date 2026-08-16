@@ -2,7 +2,8 @@
 source: tests/render_dashboard.rs
 expression: buffer_to_color_text(&buffer)
 ---
-[Blue/Reset]"┌" [Reset/Reset]" 1 wrapped-01 " [Blue/Reset]"──────────────────────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"┌" [Reset/Reset]" 1 " [Blue/Reset]"─────────────────────────────────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"│" [Indexed(130)/Reset]"wrapped-01" [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                                               " [Blue/Reset]"│"
 [Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
 [Blue/Reset]"│" [Blue/Reset]"│"

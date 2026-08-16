@@ -51,11 +51,11 @@
 //!     arrived LATER, in `f1e9f82`, which replaced the downcast (untestable —
 //!     it silently no-ops for every controller but the concrete production one)
 //!     and extended the same retry to `Action::Focus`.
-//!   - `live/003`: the live-surfaced card's TITLE shows the schedule's friendly
+//!   - `live/003`: the live-surfaced card shows the schedule's friendly
 //!     name, not the truncated spawn pane id. Was RED; closed by `b0bdc4b`,
 //!     which threads the task name onto the synthetic `SessionStart` as
 //!     `metadata["display_name"]` and onto `SessionState.display_name`.
-//!   - `live/004`: that friendly title SURVIVES the agent's real `SessionStart`
+//!   - `live/004`: that friendly name SURVIVES the agent's real `SessionStart`
 //!     hook superseding the placeholder. Was RED; closed by `ccadbbc`, which
 //!     captures the retired session's `display_name` (keyed by the stable pane
 //!     id) and seeds the replacement session with it. Shipped green in v0.35.0.
@@ -152,7 +152,7 @@ fn write_fifo_rendezvous(path: &std::path::Path, content: &'static str, what: &s
 fn live_001_scheduled_card_surfaces_to_attached_tui() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
     // working_dir basename == task name, so the card renders "livecard" whether
-    // its title comes from the display name or the cwd basename.
+    // its identity comes from the display name or the cwd basename.
     let work = scratch.path().join("livecard");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -283,9 +283,9 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
 /// deliberately UNRELATED to the schedule name, then fire it via `RunNow`
 /// WITHOUT detaching. After confirming the daemon registered the spawned agent
 /// under its friendly name (precondition) and the card surfaced live (its Dir
-/// line shows `runbox`), assert the card's TITLE shows the friendly schedule
+/// line shows `runbox`), assert the card shows the friendly schedule
 /// name `morning-digest` — matching what a disconnect/reconnect already renders
-/// — and is NOT the truncated pane-id form (`… · sched-morni…`). Pins title
+/// — and is NOT the truncated pane-id form (`… sched-morni…`). Pins identity
 /// parity between the live path and a reconnect: green since `b0bdc4b` threads
 /// the task name onto the synthetic `SessionStart` as `metadata["display_name"]`.
 /// When written this was RED — the live-surfacing path titled the card from the
@@ -296,8 +296,8 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
     // The working-dir basename (`runbox`) is deliberately UNRELATED to the
     // schedule name. That is the whole point: the friendly name `morning-digest`
-    // can then reach the rendered grid ONLY through the card TITLE — never via
-    // the Dir line's cwd basename (the trap `scheduler/live/001`'s
+    // can then reach the rendered grid ONLY through the card's identity row —
+    // never via the Dir line's cwd basename (the trap `scheduler/live/001`'s
     // name==basename fixture sidesteps, letting a stray substring match pass).
     let work = scratch.path().join("runbox");
     std::fs::create_dir_all(&work).expect("create work dir");
@@ -324,9 +324,9 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
 
     // Precondition: the daemon registers the spawned agent under the schedule's
     // FRIENDLY name. So the friendly name IS available daemon-side — the bug is
-    // isolated to how the already-attached TUI titles the live-surfaced card
-    // (a reconnect reads this same name back via startup hydration and titles
-    // the card correctly).
+    // isolated to how the already-attached TUI shows identity on the
+    // live-surfaced card (a reconnect reads this same name back via startup
+    // hydration and shows it correctly).
     assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
@@ -337,36 +337,36 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
         "the daemon must spawn the scheduled agent under its friendly name (precondition)"
     );
 
-    // Title-independent surfacing signal: the card's Dir line renders the cwd
+    // Identity-independent surfacing signal: the card's Dir line renders the cwd
     // basename (`runbox`) in BOTH the broken and fixed states, so this waits for
-    // the card to paint live without depending on the (buggy) title. The whole
-    // card — title block + body — is drawn in one render pass, so once `runbox`
-    // is on the grid the title is too.
+    // the card to paint live without depending on the (buggy) identity. The
+    // whole card — identity row + body — is drawn in one render pass, so once
+    // `runbox` is on the grid so is the rest of the card.
     deck.wait_for_string("runbox");
 
     let grid = deck.snapshot_grid();
 
-    // The pin (title parity with a reconnect, which reads the friendly name from
-    // the daemon registry's `display_name`): the live-surfaced card's TITLE shows
+    // The pin (identity parity with a reconnect, which reads the friendly name
+    // from the daemon registry's `display_name`): the live-surfaced card shows
     // the friendly schedule name. Because the cwd basename is `runbox` and the
     // placeholder card renders no prompt, `morning-digest` can ONLY appear on
-    // the grid via the card header — so this is a title assertion, not a stray
-    // substring match.
+    // the grid via the card's identity row — so this is an identity assertion,
+    // not a stray substring match.
     assert!(
         grid.contains("morning-digest"),
-        "live-surfaced scheduled card TITLE must show the friendly name \
-         'morning-digest' (a disconnect/reconnect already titles it so).\nGrid:\n{grid}"
+        "live-surfaced scheduled card must show the friendly name \
+         'morning-digest' (a disconnect/reconnect already shows it so).\nGrid:\n{grid}"
     );
 
     // ...and must NOT fall back to the truncated pane id (`sched-morning-digest-0`
     // → its 11-char `id_display` prefix `sched-morni`). This is the load-bearing
-    // pin: `sched-morni` reaches the grid ONLY through the broken title's
-    // pane-id `id_display`, so its presence means the header is showing the
-    // pane id instead of the schedule name.
+    // pin: `sched-morni` reaches the grid ONLY through the fallback pane-id
+    // `id_display`, so its presence means the card is showing the pane id
+    // instead of the schedule name.
     assert!(
         !grid.contains("sched-morni"),
-        "live-surfaced scheduled card TITLE must NOT show the truncated pane-id \
-         form ('… · sched-morni…') — it should show the schedule name.\nGrid:\n{grid}"
+        "live-surfaced scheduled card must NOT show the truncated pane-id \
+         form ('… sched-morni…') — it should show the schedule name.\nGrid:\n{grid}"
     );
 
     drop(scratch);
@@ -375,7 +375,7 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
 /// Scenario: Launch the deck attached to a daemon with one enabled schedule
 /// `morning-digest` (working_dir basename `runbox`, deliberately unrelated),
 /// fire it via `RunNow`, and wait for the synthetic placeholder card to surface
-/// LIVE with the friendly title `morning-digest` (the "name shows briefly"
+/// LIVE showing `morning-digest` (the "name shows briefly"
 /// state). THEN — mirroring what a real hook-emitting agent (claude/opencode,
 /// the primary scheduler case) does — inject the agent's REAL `SessionStart`
 /// hook for that pane carrying BOTH the daemon-spawned pane id AND its
@@ -384,12 +384,13 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
 /// metadata. That mismatched agent id supersedes the placeholder (it is retired
 /// and a fresh live card replaces it). After the supersession lands (the card
 /// turns from a "No agent" placeholder into a live ClaudeCode agent), assert the
-/// card TITLE STILL shows `morning-digest` and has NOT reverted to the
-/// session-id hash form. Pins the friendly title across supersession: green
+/// card STILL shows `morning-digest` and has NOT reverted to the
+/// session-id hash form. Pins the friendly name across supersession: green
 /// since `ccadbbc` carries the retired placeholder's `display_name` onto the
 /// replacement session, and SHIPPED GREEN in v0.35.0. When written this was RED
 /// — the superseding session was created with display_name=None, so its title
-/// fell back to the session id. This test is also one of the two guards the
+/// fell back to the session id (identity was still on the title row before
+/// PRD fork#405 M1). This test is also one of the two guards the
 /// reverted `78f92b6` broke, so treat a failure here as a real regression at the
 /// retire predicate (issue #284), never as a known-RED expectation.
 #[spec("scheduler/live/004")]
@@ -398,8 +399,8 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
     let scratch = common::harness_tempdir().expect("scratch tempdir");
     // Same trap as `scheduler/live/003`: the working-dir basename (`runbox`) is
     // deliberately UNRELATED to the schedule name, so `morning-digest` can reach
-    // the rendered grid ONLY through the card TITLE — never via the Dir line's
-    // cwd basename.
+    // the rendered grid ONLY through the card's identity row — never via the
+    // Dir line's cwd basename.
     let work = scratch.path().join("runbox");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -435,7 +436,7 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
         "the daemon must spawn the scheduled agent under its friendly name (precondition)"
     );
 
-    // The synthetic placeholder card surfaces LIVE with the friendly title —
+    // The synthetic placeholder card surfaces LIVE showing the friendly name —
     // the same state `scheduler/live/003` pins. This is the starting point this
     // test then supersedes: the friendly name is present *before* the real hook.
     deck.wait_for_string("morning-digest");
@@ -468,7 +469,7 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
     // metadata. The agent-id mismatch supersedes the placeholder: it is retired
     // and a fresh session is created from this hook. The session id is a
     // hash-like value DELIBERATELY unrelated to the schedule name, so its 11-char
-    // `id_display` title-fallback prefix (`9f8e7d6c-5b`) can be asserted-absent
+    // `id_display` identity-fallback prefix (`9f8e7d6c-5b`) can be asserted-absent
     // without colliding with `morning-digest`, `runbox`, or `sched-`.
     let real_session_id = "9f8e7d6c-5b4a-4321-aaaa-bbbbccccdddd";
     let event = serde_json::json!({
@@ -489,32 +490,32 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
     // by a live ClaudeCode card (its status becomes "Idle"), so "No agent"
     // disappears from the grid. This present→absent transition happens in BOTH
     // the broken and fixed states — it confirms the real hook was applied and the
-    // card re-rendered before we snapshot the title.
+    // card re-rendered before we snapshot its identity.
     deck.wait_for_absence("No agent");
 
     let grid = deck.snapshot_grid();
 
-    // The pin (title parity with a reconnect, which reads the friendly name from
-    // the daemon registry's `display_name`): the superseding live card's TITLE
-    // STILL shows `morning-digest`. Because the cwd basename is `runbox`, the only
-    // way `morning-digest` reaches the grid is via the card header. If this fails,
-    // the retire path dropped the display_name again and the title reverted to
-    // the session-id hash — the pre-`ccadbbc` behaviour.
+    // The pin (identity parity with a reconnect, which reads the friendly name
+    // from the daemon registry's `display_name`): the superseding live card
+    // STILL shows `morning-digest`. Because the cwd basename is `runbox`, the
+    // only way `morning-digest` reaches the grid is via the card's identity
+    // row. If this fails, the retire path dropped the display_name again and
+    // identity reverted to the session-id hash — the pre-`ccadbbc` behaviour.
     assert!(
         grid.contains("morning-digest"),
         "after a real SessionStart hook supersedes the synthetic placeholder, the \
-         card TITLE must STILL show the friendly name 'morning-digest' (a reconnect \
+         card must STILL show the friendly name 'morning-digest' (a reconnect \
          keeps it), but it reverted to the session-id hash.\nGrid:\n{grid}"
     );
 
     // ...and must NOT fall back to the session-id hash form. `9f8e7d6c-5b` is the
     // session id's 11-char `id_display` prefix — it reaches the grid ONLY through
-    // the reverted `ClaudeCode · 9f8e7d6c-5b` title, so its presence is the
+    // the reverted `9f8e7d6c-5b` identity row, so its presence is the
     // load-bearing pin that the friendly name was lost on supersession.
     assert!(
         !grid.contains("9f8e7d6c-5b"),
-        "after supersession the card TITLE must NOT revert to the session-id hash \
-         ('… · 9f8e7d6c-5b…') — it should keep the schedule name.\nGrid:\n{grid}"
+        "after supersession the card must NOT revert to the session-id hash \
+         ('9f8e7d6c-5b…') — it should keep the schedule name.\nGrid:\n{grid}"
     );
 
     drop(scratch);
