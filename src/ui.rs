@@ -95,18 +95,18 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
-    Compact,  // 5 rows: 1 prompt, 1 tool
-    Normal,   // 8 rows: 1 prompt, 3 tools
-    Spacious, // 10 rows: 3 prompts, 3 tools
+    Compact,  // 6 rows: 1 prompt, 1 tool
+    Normal,   // 9 rows: 1 prompt, 3 tools
+    Spacious, // 11 rows: 3 prompts, 3 tools
 }
 
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
-    ///   rows for the top/bottom border.
+    ///   Role name (1) + Dir (1) + prompts + [non-compact: blank separator] +
+    ///   tools, plus 2 rows for the top/bottom border.
     ///
-    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    /// Resulting heights: Compact 6, Normal 9, Spacious 11.
     ///
     /// Height is a function of density ALONE — PRD #339 moved the `Last` /
     /// `Tools` counters onto the bottom border, deleting the card-width axis
@@ -121,7 +121,7 @@ impl CardDensity {
         } else {
             1
         };
-        (1 + prompts + separator + tools) + 2 // +2 top/bottom border
+        (1 + 1 + prompts + separator + tools) + 2 // role name (1) + Dir (1) + ... + top/bottom border
     }
 
     fn max_tools(self) -> usize {
@@ -251,6 +251,66 @@ struct TabBarInfo {
     /// `labels` — `Some` for an Orchestration or Mode tab (used to color its
     /// label), `None` for the Dashboard.
     tab_statuses: Vec<Option<Vec<SessionStatus>>>,
+    /// PRD fork#405 M2: per-tab `Tab::Orchestration` marker, aligned with
+    /// `labels` — distinguishes an Orchestration tab from a Mode tab, since
+    /// `closeable`/`tab_statuses` alone can't (both are `true`/`Some(..)`
+    /// for either).
+    is_orchestration: Vec<bool>,
+}
+
+impl TabBarInfo {
+    /// Review round F3 (reviewer S10 / auditor S5): `tab_statuses` and
+    /// `is_orchestration` are documented above as index-aligned with
+    /// `labels`, but every one of the ~15 test fixtures at the time this was
+    /// added passed `is_orchestration: vec![]` against a non-empty `labels`,
+    /// making the documented invariant false on day one. An empty vector is
+    /// kept as the accepted "not tracked" sentinel — the renderer
+    /// (`render_tab_strip`'s `.get(i).unwrap_or(&false)` /
+    /// `.get(i).copied().flatten()`) already treats a missing index as
+    /// `false`/`None` and MUST keep doing so, so this only trips on a
+    /// genuinely populated but mismatched vector. `debug_assert!`, not a
+    /// hard error: the renderer stays bounds-safe and fails closed in
+    /// release regardless of whether this ever fires.
+    fn new(
+        show: bool,
+        labels: Vec<String>,
+        active_index: usize,
+        tab_statuses: Vec<Option<Vec<SessionStatus>>>,
+        is_orchestration: Vec<bool>,
+    ) -> Self {
+        debug_assert!(
+            tab_statuses.is_empty() || tab_statuses.len() == labels.len(),
+            "TabBarInfo::tab_statuses ({}) must be empty or aligned with labels ({})",
+            tab_statuses.len(),
+            labels.len(),
+        );
+        debug_assert!(
+            is_orchestration.is_empty() || is_orchestration.len() == labels.len(),
+            "TabBarInfo::is_orchestration ({}) must be empty or aligned with labels ({})",
+            is_orchestration.len(),
+            labels.len(),
+        );
+        // Delta-review round (reviewer D5 / auditor S6): the constructor
+        // otherwise asserts the two vectors that are never used as indices
+        // and says nothing about `active_index`, the one whose name is one.
+        // Every read site compares `i == active_index` rather than indexing
+        // `labels[active_index]`, so an out-of-range value degrades to "no
+        // tab is styled active" in both debug and release — this assert
+        // exists to keep that the deliberate outcome of an empty/unset
+        // state, not of a fixture nobody meant to leave out of range.
+        debug_assert!(
+            labels.is_empty() || active_index < labels.len(),
+            "TabBarInfo::active_index ({active_index}) must be within labels ({})",
+            labels.len(),
+        );
+        Self {
+            show,
+            labels,
+            active_index,
+            tab_statuses,
+            is_orchestration,
+        }
+    }
 }
 
 struct DirPickerState {
@@ -13321,12 +13381,20 @@ pub fn run_tui(
         let pane_status_for_tabs: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
         let tab_bar_statuses: Vec<Option<Vec<SessionStatus>>> =
             tab_status_data(tab_manager.tabs(), &pane_status_for_tabs);
-        let tab_bar_info = TabBarInfo {
-            show: tab_manager.show_tab_bar(),
-            labels: tab_bar_labels,
-            active_index: tab_manager.active_index(),
-            tab_statuses: tab_bar_statuses,
-        };
+        // PRD fork#405 M2: aligned index-for-index with `tab_bar_labels`,
+        // the same way `tab_bar_statuses` is above.
+        let tab_bar_is_orchestration: Vec<bool> = tab_manager
+            .tabs()
+            .iter()
+            .map(|tab| matches!(tab, Tab::Orchestration { .. }))
+            .collect();
+        let tab_bar_info = TabBarInfo::new(
+            tab_manager.show_tab_bar(),
+            tab_bar_labels,
+            tab_manager.active_index(),
+            tab_bar_statuses,
+            tab_bar_is_orchestration,
+        );
         // PRD #84 M4 (invariants 1, 2 & 4) — ONE layout pass per frame, then
         // compute → resize → render, all against the SAME live frame area.
         //
@@ -14656,6 +14724,7 @@ fn render_tab_strip(
     closeable: &[bool],
     active_index: usize,
     tab_statuses: &[Option<&[SessionStatus]>],
+    is_orchestration: &[bool],
 ) -> TabStripRects {
     // PRD #13: the tab-bar row is left unpainted so the terminal's own
     // background shows through (no absolute `tab_bar_bg` fill).
@@ -14724,6 +14793,30 @@ fn render_tab_strip(
                 statuses,
             ))),
             _ => style,
+        };
+
+        // FORK-ONLY, PRD fork#405 M2: a deliberate, SCOPED partial reversal
+        // of issue #306, not a drift back to it. #306 removed `REVERSED`
+        // from the tab bar entirely because it would invert an absolute fg
+        // into the label's background; that reasoning still holds in
+        // general, which is why BOLD stays the cue for every tab above. Here
+        // it is reinstated for exactly one case — the ACTIVE Orchestration
+        // tab — because on a strip where several tabs already carry a status
+        // tint, BOLD alone is a weak "this one is selected" signal. Applied
+        // AFTER the status-fg overwrite above (load-bearing): REVERSED
+        // inverts whatever fg is present, so applying it before the overwrite
+        // would invert the base style and then have the status colour
+        // overwrite the foreground, which is a different rendering.
+        // `is_orchestration` distinguishes an Orchestration tab from a Mode
+        // tab — nothing else in this function's parameters does, since both
+        // are `closeable = true` and both carry `Some(..)` status data — so a
+        // future upstream sync must not silently restore the blanket
+        // removal by dropping this scoping, the same way the fork-only
+        // Idle-tint decision just above is protected.
+        let style = if i == active_index && *is_orchestration.get(i).unwrap_or(&false) {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
         };
 
         // Divider between tabs (not before the first).
@@ -15407,6 +15500,7 @@ fn render_frame(
             &closeable,
             tab_bar.active_index,
             &tab_statuses,
+            &tab_bar.is_orchestration,
         );
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
@@ -19560,10 +19654,14 @@ fn render_session_card(
     } else {
         title_bold.add_modifier(Modifier::DIM)
     };
+    // PRD fork#405 review round F1/N4: no leading space here — the badge-on
+    // branch below supplies its own separating space (badge-coloured segments
+    // must not absorb it), and the badge-off branch's `num_prefix` already
+    // ends in a space, so a leading space here would double it (N4).
     let liveness_marker = match writable {
         crate::event::Writable::Live => "",
-        crate::event::Writable::HistoryOnly => " history ",
-        crate::event::Writable::None => " view-only ",
+        crate::event::Writable::HistoryOnly => "history ",
+        crate::event::Writable::None => "view-only ",
     };
     // Fork #339: the agent-type badge (registry-coloured type label),
     // `370b6228`'s removal, restored behind the deck-global
@@ -19599,29 +19697,31 @@ fn render_session_card(
             Some(model) => format!("{} ({})", session.agent_type, normalize_model_label(model)),
             None => format!("{}", session.agent_type),
         };
-        let label_after_badge = display_name
-            .map(|name| format!(" · {name} "))
-            .unwrap_or_else(|| format!(" · {id_display} "));
+        // PRD fork#405 M1: identity (name/id) moved off the title and onto
+        // its own body row — see the `ROLE_NAME`-styled line pushed below.
+        // The title now carries only the shortcut prefix and the type/model
+        // badge.
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (badge_text, badge_style),
-            (label_after_badge, title_bold),
         ];
-        if !is_live {
-            segs.push((liveness_marker.to_string(), text_dim()));
+        // F1: the badge text used to be followed by a `label_after_badge`
+        // segment whose trailing space separated the title from the border
+        // fill. That segment is gone (identity moved to its own body row),
+        // so restore the separating space here — as its own segment, not
+        // badge-coloured — for a live card. A non-live card gets its
+        // separator from `liveness_marker`'s trailing space instead.
+        if is_live {
+            segs.push((" ".to_string(), title_bold));
+        } else {
+            segs.push((format!(" {liveness_marker}"), text_dim()));
         }
         segs
     } else {
-        // The title shows only the friendly `display_name`, or the session
-        // id when there is none. A non-live card additionally shows a
-        // trailing `history` / `view-only` marker.
-        let identity_text = display_name
-            .map(|name| format!("{name} "))
-            .unwrap_or_else(|| format!("{id_display} "));
-        let mut segs = vec![
-            (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (identity_text, title_bold),
-        ];
+        // PRD fork#405 M1: with the badge off, the title shows only the
+        // shortcut prefix — identity moved to its own unconditional body row
+        // below, so it is no longer duplicated here.
+        let mut segs = vec![(format!(" {sel_prefix}{num_prefix}"), shortcut_style)];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));
         }
@@ -19708,6 +19808,21 @@ fn render_session_card(
 
     let mut lines: Vec<Line<'_>> = Vec::new();
 
+    // PRD fork#405 M1: identity is unconditional — it always occupies the
+    // first body row regardless of `show_agent_type_badge`, using the same
+    // display_name -> id_display ladder the title used to. Pushed
+    // unconditionally (even when both are empty, as `Line::from("")`) so the
+    // emitted line count never diverges from what `card_height()` reserves.
+    let role_name_text = display_name.map(|name| name.as_str()).unwrap_or(id_display);
+    lines.push(if role_name_text.is_empty() {
+        Line::from("")
+    } else {
+        Line::from(Span::styled(
+            truncate_with_ellipsis(role_name_text, w),
+            Style::default().fg(palette::ROLE_NAME),
+        ))
+    });
+
     // PRD #339: with the counters on the border, `Dir:` gets the whole inner
     // width at every card width — one un-branched form, always ellipsized (the
     // old narrow branch bare-clipped the path with no `…`).
@@ -19753,16 +19868,35 @@ fn render_session_card(
         && let IdleArtPhase::HasArt(ref art) = entry.phase
         && !art.frames.is_empty()
     {
-        // Clear the inner area so the Dir line and other content don't bleed through
-        frame.render_widget(Clear, inner);
+        // F2 (review round, reviewer S9): the identity row (row 0, pushed
+        // above as `lines[0]`) is the only thing that identifies an idle
+        // Spacious card once the badge is off by default — losing it under
+        // the art overlay leaves the card identified by nothing but its
+        // number. Offset the cleared/painted area down one row so row 0
+        // survives untouched; the art loses one row of its canvas. Frames
+        // are plain LLM text with no layout assumptions about the full inner
+        // height (`ascii_art::validate_frame` only caps line count/width),
+        // and `Paragraph` already clips any lines past the area's height, so
+        // this is exactly the same clipping behaviour one row tighter.
+        let art_area = Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(1),
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        if art_area.height > 0 {
+            // Clear only the art area so the Dir line and other content
+            // don't bleed through, while the identity row above it stays.
+            frame.render_widget(Clear, art_area);
 
-        let frame_index = (tick / 120) as usize % art.frames.len();
-        let art_lines: Vec<Line<'_>> = art.frames[frame_index]
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), text_primary())))
-            .collect();
-        let art_widget = Paragraph::new(art_lines);
-        frame.render_widget(art_widget, inner);
+            let frame_index = (tick / 120) as usize % art.frames.len();
+            let art_lines: Vec<Line<'_>> = art.frames[frame_index]
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), text_primary())))
+                .collect();
+            let art_widget = Paragraph::new(art_lines);
+            frame.render_widget(art_widget, art_area);
+        }
     }
 }
 
@@ -20272,6 +20406,11 @@ pub fn render_card_to_buffer(
 /// assertion about what the user actually sees. `mode` is the ONLY input
 /// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
 /// `UiMode::Normal`.
+///
+/// PRD fork#405 delta-review (reviewer D2): this seam always renders with no
+/// idle art (`idle_art: None` below), unchanged. A caller that needs to pin
+/// the idle-art overlay's row-0 offset (F2) uses the sibling seam
+/// [`render_card_for_mode_with_idle_art_to_buffer`] instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_for_mode_to_buffer(
@@ -20289,12 +20428,55 @@ pub fn render_card_for_mode_to_buffer(
     // Dashboard renders (see the fn doc above).
     show_agent_type_badge: bool,
 ) -> ratatui::buffer::Buffer {
+    render_card_for_mode_with_idle_art_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        mode,
+        width,
+        height,
+        show_agent_type_badge,
+        None,
+    )
+}
+
+/// PRD fork#405 delta-review L1 seam (reviewer D2): same as
+/// [`render_card_for_mode_to_buffer`], plus an `idle_art` input so a test can
+/// render a card with the idle-art overlay active and pin F2 — that the
+/// identity row (body row 0) survives the overlay while the rows below it are
+/// painted over. `idle_art: None` is exactly [`render_card_for_mode_to_buffer`]'s
+/// path; passing `Some` is the only behavioural difference this seam adds.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_for_mode_with_idle_art_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
+    width: u16,
+    height: u16,
+    show_agent_type_badge: bool,
+    idle_art: Option<&AsciiArtResult>,
+) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     let display_name_owned = display_name.map(str::to_string);
+    // `idle_since` is never read by the render path (only `dismissed` and
+    // `phase` are), so any value is safe here.
+    let idle_art_entry = idle_art.map(|art| IdleArtEntry {
+        phase: IdleArtPhase::HasArt(art.clone()),
+        idle_since: Utc::now(),
+        dismissed: false,
+    });
     terminal
         .draw(|frame| {
             let area = Rect {
@@ -20312,7 +20494,7 @@ pub fn render_card_for_mode_to_buffer(
                 display_name_owned.as_ref(),
                 card_number,
                 density.into(),
-                None,
+                idle_art_entry.as_ref(),
                 mode,
                 show_agent_type_badge,
             );
@@ -21149,6 +21331,7 @@ pub fn render_tab_bar_to_buffer(
     active_index: usize,
     width: u16,
     tab_statuses: &[Option<&[SessionStatus]>],
+    is_orchestration: &[bool],
 ) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -21164,7 +21347,15 @@ pub fn render_tab_bar_to_buffer(
                 width,
                 height: 1,
             };
-            render_tab_strip(frame, area, &owned, closeable, active_index, tab_statuses);
+            render_tab_strip(
+                frame,
+                area,
+                &owned,
+                closeable,
+                active_index,
+                tab_statuses,
+                is_orchestration,
+            );
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
@@ -21708,12 +21899,13 @@ mod tests {
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into(), "Mode".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-        };
+        let tab_bar = TabBarInfo::new(
+            true,
+            vec!["Dashboard".into(), "Mode".into()],
+            0,
+            vec![],
+            vec![false, false],
+        );
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
         // A 1-row bottom bar (this fixture exercises the split math, not the
         // PRD #144 wrap height — that is covered by `render/layout/004`).
@@ -21774,12 +21966,13 @@ mod tests {
             side_pane_ids: vec!["s0".to_string(), "s1".to_string()],
             focused_pane_id: None,
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into(), "demo".into()],
-            active_index: 1,
-            tab_statuses: vec![],
-        };
+        let tab_bar = TabBarInfo::new(
+            true,
+            vec!["Dashboard".into(), "demo".into()],
+            1,
+            vec![],
+            vec![false, false],
+        );
         let layout = compute_frame_layout(
             frame_area,
             &tab_view,
@@ -21857,12 +22050,13 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["seven-roles".into()],
-            active_index: 0,
-            tab_statuses: vec![Some(vec![])],
-        };
+        let tab_bar = TabBarInfo::new(
+            true,
+            vec!["seven-roles".into()],
+            0,
+            vec![Some(vec![])],
+            vec![true],
+        );
 
         let mut expanded_rect: Option<Rect> = None;
         let mut panes_area: Option<Rect> = None;
@@ -23861,12 +24055,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -23953,12 +24143,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24097,12 +24283,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24449,12 +24631,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24542,12 +24720,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -24610,12 +24784,8 @@ mod tests {
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
                 };
-                let tab_bar = TabBarInfo {
-                    show: false,
-                    labels: vec!["Dashboard".into()],
-                    active_index: 0,
-                    tab_statuses: vec![],
-                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
                 let layout = compute_frame_layout(
                     frame.area(),
                     &tab_view,
@@ -26814,12 +26984,7 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["orch".into()],
-            active_index: 0,
-            tab_statuses: vec![Some(vec![])],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["orch".into()], 0, vec![Some(vec![])], vec![true]);
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -27673,12 +27838,7 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Orchestration".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["Orchestration".into()], 0, vec![], vec![true]);
 
         // Simulates the dispatch + render-sync (setting the thread-local
         // `compute_frame_layout` reads) that a real Ctrl+l press drives, then
@@ -27791,12 +27951,7 @@ mod tests {
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["Dashboard".into()], 0, vec![], vec![false]);
 
         let layout_for = |stage: SplitStage| {
             ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
@@ -28030,12 +28185,7 @@ mod tests {
         let orch_tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Orchestration".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-        };
+        let tab_bar = TabBarInfo::new(true, vec!["Orchestration".into()], 0, vec![], vec![true]);
         let panes_width_for = |stage: SplitStage| {
             ACTIVE_SPLIT_STAGE.with(|c| c.set(stage));
             let layout = compute_frame_layout(
@@ -28297,22 +28447,13 @@ mod tests {
         let orch_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.clone(),
         };
-        let orch_tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Orchestration".into()],
-            active_index: 1,
-            tab_statuses: vec![],
-        };
+        let orch_tab_bar =
+            TabBarInfo::new(true, vec!["Orchestration".into()], 0, vec![], vec![true]);
         let dash_pane_ids = vec!["p0".to_string(), "p1".to_string()];
         let dash_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
         };
-        let dash_tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["Dashboard".into()],
-            active_index: 0,
-            tab_statuses: vec![],
-        };
+        let dash_tab_bar = TabBarInfo::new(true, vec!["Dashboard".into()], 0, vec![], vec![false]);
         let orch_widths = || {
             let layout = compute_frame_layout(
                 frame_area,
@@ -28657,21 +28798,24 @@ mod tests {
 
     #[test]
     fn test_choose_density() {
-        // Spacious=10, Normal=8, Compact=5
+        // PRD fork#405 M1: heights grew by the identity row.
+        // Spacious=11, Normal=9, Compact=6
 
         // 1 session, 1 col, plenty of height -> Spacious
         assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+        // 2 sessions, 2 cols = 1 row, height 10 -> Normal (1*11=11 no longer
+        // fits; 1*9=9 does)
+        assert_eq!(choose_density(2, 2, 10), CardDensity::Normal);
 
-        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*9=9 fits)
         assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
 
-        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+        // 4 sessions, 2 cols = 2 rows, height 16 -> Compact (2*9=18 no longer
+        // fits; 2*6=12 does)
+        assert_eq!(choose_density(4, 2, 16), CardDensity::Compact);
 
-        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*6=12 fits)
         assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
 
         // Many sessions, small screen -> Compact
@@ -28684,29 +28828,30 @@ mod tests {
     #[test]
     fn test_choose_density_boundaries() {
         // Density is a function of card count, columns, and height only.
-        // Spacious=10, Normal=8, Compact=5.
+        // PRD fork#405 M1: Spacious=11, Normal=9, Compact=6.
 
-        // 1 session, height 11 -> Spacious (1*10=10)
+        // 1 session, height 11 -> Spacious (1*11=11)
         assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
 
-        // 1 session, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
+        // 1 session, height 10 -> Normal (1*11=11 no longer fits; 1*9=9 does)
+        assert_eq!(choose_density(1, 1, 10), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
+        // 2 sessions, 1 col, height 18 -> Normal (2*9=18)
         assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
+        // 2 sessions, 1 col, height 17 -> Compact (2*9=18 no longer fits;
+        // 2*6=12 does)
+        assert_eq!(choose_density(2, 1, 17), CardDensity::Compact);
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
-    /// so it returns exactly Compact=5 / Normal=8 / Spacious=10. Locks the
+    /// so it returns exactly Compact=6 / Normal=9 / Spacious=11. Locks the
     /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
-        assert_eq!(CardDensity::Compact.card_height(), 5);
-        assert_eq!(CardDensity::Normal.card_height(), 8);
-        assert_eq!(CardDensity::Spacious.card_height(), 10);
+        assert_eq!(CardDensity::Compact.card_height(), 6);
+        assert_eq!(CardDensity::Normal.card_height(), 9);
+        assert_eq!(CardDensity::Spacious.card_height(), 11);
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset

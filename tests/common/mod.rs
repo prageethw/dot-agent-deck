@@ -2242,6 +2242,97 @@ pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
     })
 }
 
+/// Whether `label` appears inside the FIRST CONTENT ROW directly below one
+/// box's own top-border row — that box's first body line — cropped between
+/// that row's own vertical border glyphs of the SAME weight as the box.
+///
+/// PRD fork#405 M1 moved a session card's role-name identity off the
+/// title/border row onto its own unconditional first body row, directly
+/// beneath the title. This is the body-row sibling of
+/// [`label_in_box_top_border`]: same box-cropping technique — iterate EVERY
+/// top-left corner of a given weight on a row (not just the first), require
+/// a next row, and crop that row between the vertical glyphs of the same
+/// weight starting at the corner's own column, so a multi-column row's
+/// second or third card is found too, not just the leftmost one (review
+/// finding: the original used `position()`, which always returned the
+/// FIRST vertical in the whole body row regardless of which card's corner
+/// was being checked). Like its sibling, this does not align columns across
+/// the two rows beyond "same weight, adjacent row, corner's own column" — the
+/// same fidelity `label_in_box_top_border` already accepts.
+pub fn label_in_box_body_row(grid: &str, label: &str) -> bool {
+    let lines: Vec<&str> = grid.lines().collect();
+    lines.iter().enumerate().any(|(row, line)| {
+        let chars: Vec<char> = line.chars().collect();
+        let Some(body_line) = lines.get(row + 1) else {
+            return false;
+        };
+        let body_chars: Vec<char> = body_line.chars().collect();
+        BORDER_WEIGHTS.iter().any(|weight| {
+            chars
+                .iter()
+                .enumerate()
+                .filter(|(_, ch)| **ch == weight.top_left)
+                .any(|(col, _)| {
+                    let Some(start) = body_chars
+                        .iter()
+                        .enumerate()
+                        .skip(col)
+                        .find_map(|(index, ch)| (*ch == weight.vertical).then_some(index))
+                    else {
+                        return false;
+                    };
+                    let Some(end) = body_chars
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find_map(|(index, ch)| (*ch == weight.vertical).then_some(index))
+                    else {
+                        return false;
+                    };
+                    body_chars[start..=end]
+                        .iter()
+                        .collect::<String>()
+                        .contains(label)
+                })
+        })
+    })
+}
+
+/// Whether `needle` appears in `haystack` as its own token — bounded on both
+/// sides by anything that is NOT an identifier character (alphanumeric, `-`,
+/// or `_`) rather than specifically by whitespace. Catches a needle abutted
+/// by a card border glyph, a differently-padded neighbour, or the start/end
+/// of the haystack, while still rejecting a needle that is only a substring
+/// of a longer identifier (`"beta"` must not match inside `"beta-agent"`,
+/// `"worker"` must not match inside `"worker-deck"`).
+///
+/// PRD fork#405 M1 moved a session card's role-name identity off the
+/// title/border row onto its own unconditional body row directly beneath it,
+/// pushed with no leading or trailing pad — so a `" {needle} "`-style
+/// space-bounded needle can never match post-M1 (the character immediately
+/// beside the role name is the card's own border glyph, not a space). This
+/// was three byte-identical (module-name aside) copies across
+/// `e2e_dashboard_selection.rs`, `e2e_orchestration_identity.rs` and
+/// `e2e_orchestration_pane_column.rs` before being consolidated here so the
+/// fast-tier `tests/grid_box_helpers.rs` can guard the boundary logic — an
+/// e2e-local copy is guarded by nothing that can block anything, since this
+/// fork's e2e tier is `continue-on-error`.
+pub fn contains_word_token(haystack: &str, needle: &str) -> bool {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    haystack.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word_char(c));
+        before_ok && after_ok
+    })
+}
+
 /// Column of the orchestration tab's pane-column LEFT edge, in Unicode
 /// scalars, or `None` when no expanded orchestrator box is drawn.
 ///
