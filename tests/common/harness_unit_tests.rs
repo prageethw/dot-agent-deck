@@ -4995,3 +4995,43 @@ fn measured_load_still_widens_between_one_and_the_cap() {
         "load_scaled must be exactly load_factor applied to the base"
     );
 }
+
+// -----------------------------------------------------------------------
+// Issue #313 — GridCellStyle underline capture
+// -----------------------------------------------------------------------
+
+/// Positive control for the `underline` field added to `GridCellStyle`
+/// (issue #313): a negative L2 assertion that a surface carries no
+/// underline is meaningless if the harness can't see an underline at
+/// all, since it would pass vacuously against a field hardwired to
+/// `false`. Drives a raw `vt100::Parser` with an SGR underline sequence
+/// (`\x1b[4m`) directly, with no app involved, and confirms
+/// `GridCellStyle::from` reports `true` for the underlined cell and
+/// `false` for a cell written after `\x1b[24m` turns it back off.
+#[test]
+fn grid_cell_style_reports_underline_when_present() {
+    let mut parser = vt100::Parser::new(1, 2, 0);
+    parser.process(b"\x1b[4mU");
+    parser.process(b"\x1b[24mN");
+    let screen = parser.screen();
+
+    let underlined = screen
+        .cell(0, 0)
+        .map(GridCellStyle::from)
+        .expect("underlined cell must be in bounds");
+    let plain = screen
+        .cell(0, 1)
+        .map(GridCellStyle::from)
+        .expect("plain cell must be in bounds");
+
+    assert!(
+        underlined.underline,
+        "a cell written under SGR 4 must report GridCellStyle::underline == true, got \
+         {underlined:?}"
+    );
+    assert!(
+        !plain.underline,
+        "a cell written after SGR 24 (underline off) must report GridCellStyle::underline == \
+         false, got {plain:?}"
+    );
+}

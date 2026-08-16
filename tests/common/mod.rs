@@ -611,6 +611,7 @@ pub struct GridCellStyle {
     pub bold: bool,
     pub dim: bool,
     pub inverse: bool,
+    pub underline: bool,
 }
 
 impl From<&vt100::Cell> for GridCellStyle {
@@ -621,6 +622,7 @@ impl From<&vt100::Cell> for GridCellStyle {
             bold: cell.bold(),
             dim: cell.dim(),
             inverse: cell.inverse(),
+            underline: cell.underline(),
         }
     }
 }

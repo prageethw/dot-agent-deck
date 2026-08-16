@@ -12,6 +12,9 @@
 //!   non-focused roles' collapsed 1-row title frames must not touch agent
 //!   lifecycle. Every role's PTY stays open, keeps running, and keeps
 //!   reporting status regardless of whether its pane is currently drawn.
+//! - Issue #313: tabs/orchestration/015 pins the active tab's rendered
+//!   underline/BOLD/colour cue through a real PTY; see the CATALOG entry
+//!   for how that relates to the L1 coverage in `render_tab_strip.rs`.
 //!
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
@@ -30,6 +33,7 @@ use spec::spec;
 /// orchestration hides the Command field, so a second Enter submits the form.
 fn open_orchestration(deck: &TuiDeck) {
     deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
     deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
     deck.send_keys(b"\x1b[C"); // Right -> [Orch: demo-orch]
@@ -320,6 +324,67 @@ fn orchestration_024_ctrl_l_forwards_to_pty_on_focused_orchestration_role_pane()
          Action::CycleSplitStage even though a role pane was focused in \
          PaneInput mode — orchestration tabs claim Ctrl+l mode-independently \
          (PRD #387 Defect 1).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Launch the deck against the `orch-deck` fixture, open its
+/// single orchestration, and assert the active tab's rendered label —
+/// `<launch-dir-basename>-orchestrator-1`, the form's suggested session
+/// name derived from `deck.workdir()` (the launch cwd here, since this test
+/// does not use `with_launch_subdir`; fork issue #303), not the
+/// orchestration's config name `demo-orch` — carries BOLD and a status
+/// colour but never underline (fork issue #377's active-tab cue), through
+/// the real rendered terminal output rather than the ratatui buffer. See
+/// the `tabs/orchestration/015` CATALOG entry for what that adds over the
+/// L1 coverage in `render_tab_strip.rs`.
+#[spec("tabs/orchestration/015")]
+#[test]
+fn orchestration_015_active_tab_bold_status_color_no_underline() {
+    let deck = TuiDeck::launch_with_fixture("orch-deck");
+    let launch_dir_basename = deck
+        .workdir()
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let active_label = format!("{launch_dir_basename}-orchestrator-1");
+
+    deck.wait_for_string("No active sessions");
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // new-pane form closed -> tab is up
+    deck.wait_for_string(&format!(" {active_label} ")); // tab strip renders the active tab's label
+
+    let styles = deck
+        .visible_text_cell_styles(&active_label)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the active orchestration tab's label {active_label:?} on the rendered \
+                 grid\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
+    assert!(
+        styles.iter().all(|style| style.bold),
+        "the active orchestration tab must carry BOLD as its active cue, got {styles:?}\nFinal \
+         grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        styles.iter().all(|style| !style.underline),
+        "the active orchestration tab must NOT carry underline — fork issue #377 dropped it as \
+         the active cue, got {styles:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        styles
+            .iter()
+            .all(|style| style.fgcolor == vt100::Color::Idx(8)),
+        "the active orchestration tab's label must render a non-Reset foreground matching \
+         palette::STATUS_IDLE (DarkGray, vt100 Idx(8)) — this rules out Color::Reset reaching \
+         the terminal; it does not by itself prove correct colour selection, since Idx(8) is \
+         also tab_status_data's no-status-data fallback (see the CATALOG entry), got \
+         {styles:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
