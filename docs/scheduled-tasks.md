@@ -132,9 +132,11 @@ max_per_run = 5                       # hard cap on how many issues a single fir
 # triage = true                       # optional: opt in to per-issue triage — see "Opt-in triage" below
 ```
 
-> **`command` is not used here**
+> **`command` is optional to load, and only matters for orchestration-less clones**
 >
-> Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
+> Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command` to load — the loader returns before reaching the command check for any task carrying an `issue_dispatch` sub-table, unlike the required-field #127 single-spawn path. If you set one anyway it is not inert: it becomes the resolved `default_command` and wins over the global [`default_command`](configuration.md#default-command) for any dispatched clone whose `.dot-agent-deck.toml` defines no `[[orchestrations]]` block. A clone that does define one ignores it entirely — the orchestration's role commands win regardless.
+>
+> **`new_tab_per_fire` has no effect here either, for an unrelated reason.** The `issue_dispatch` callback returns before reaching the `new_tab_per_fire`/tab-reuse branch further down the same function — each dispatched issue already gets its own worktree and card keyed by issue number, so the field is never read for this task type. Setting it is a no-op dressed up as a decision.
 
 **This is the one place on this page where you may have to run a command yourself.** The guided authoring option for issue-dispatch tasks (the `schedule: issues` entry in the new-pane cycler) sits behind the `experimental` flag, so with the flag off there is no agent-driven door for this task type — only the sub-table above, hand-written, or the CLI below. It takes `--repo` plus the optional `--max-per-run` / `--label` / `--query` / `--triage`, and needs no `--command`:
 
