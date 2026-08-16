@@ -191,9 +191,9 @@ async fn start_agent(server: &Server, command: &str) -> String {
 // registered; these helpers now return the DAEMON-MINTED value alongside the
 // agent id, and every call site must key its later routing/state assertions
 // off that returned value rather than the literal it proposed. The literal
-// argument still exists (as `_proposed_pane_id`, unused past the request
-// payload) purely to keep call sites self-documenting about what a caller
-// historically asked for.
+// argument still exists (as `proposed_pane_id`, used only in the request
+// payload's `env`, which the daemon strips and ignores) purely to keep call
+// sites self-documenting about what a caller historically asked for.
 async fn start_agent_for_pane(
     server: &Server,
     command: &str,

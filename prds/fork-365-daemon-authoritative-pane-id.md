@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Not started — PRD written 2026-08-15, no implementation. Filed out of [fork #358](https://github.com/prageethw/dot-agent-deck/issues/358), whose first fix attempt was withdrawn after review; see "What has already been tried" for why that attempt is the argument for this one.
+**Status**: M1/M2/M3 implemented and landed on [PR #424](https://github.com/prageethw/dot-agent-deck/pull/424); M4 (offer upstream) not yet done. Filed out of [fork #358](https://github.com/prageethw/dot-agent-deck/issues/358), whose first fix attempt was withdrawn after review; see "What has already been tried" for why that attempt is the argument for this one.
 
 **This PRD does not close #358.** #358's two halves are this work (identifier reuse) and [upstream #524](https://github.com/vfarcic/dot-agent-deck/issues/524) (stale entries surviving pane death). Both must land before #358 is answered.
 
@@ -172,9 +172,9 @@ No on-disk artefact needs migrating. Archived report filenames (`work-done-<role
 
 ### M2 — daemon allocates
 
-- [ ] Daemon assigns `pane_id` on the spawn path and returns it.
-- [ ] `EmbeddedPaneController::allocate_id`, `next_id` and the hydration bump removed.
-- [ ] `PROTOCOL_VERSION` bumped; cross-version behaviour implemented as decided in M1.
+- [x] Daemon assigns `pane_id` on the spawn path and returns it.
+- [x] `EmbeddedPaneController::allocate_id`, `next_id` and the hydration bump removed.
+- [x] `PROTOCOL_VERSION` bumped; cross-version behaviour implemented as decided in M1.
 
 ### M3 — prove it
 
@@ -190,7 +190,7 @@ No on-disk artefact needs migrating. Archived report filenames (`work-done-<role
 
 - A `pane_id` is unique across every pane the daemon has seen for its lifetime, regardless of how many clients attach or how many panes have exited.
 - Two independently-attached TUI clients provably cannot mint the same id, demonstrated by a test.
-- `work_done_file_name` can no longer point two unrelated panes at one report path.
+- `work_done_file_name` can no longer point two unrelated panes at one report path, for `pane-`-origin (TUI-attach) panes. This is **not** true for `sched-`-origin (scheduler) panes: `spawn.rs`'s `next_pane_id`/`PANE_COUNTER` was deliberately left unchanged by this PR (out of M2 Scope) and still resets on daemon restart, so two scheduled fires of the same task name across a restart can still mint the identical `sched-<task>-0` id and collide on the same report path. Tracked as follow-up [#430](https://github.com/prageethw/dot-agent-deck/issues/430).
 - The protocol change is versioned and its cross-version behaviour is tested, not assumed.
 
 **A criterion deliberately not used:** "no collisions observed in practice." The #358 collisions were invisible for six days and 18 report generations while every gate stayed green. Absence of an observed collision is not evidence, and a criterion that could be satisfied by not looking is worse than none. Each criterion above names an artefact someone can check.

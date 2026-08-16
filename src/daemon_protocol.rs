@@ -383,13 +383,17 @@ pub enum AttachRequest {
     /// **Trust boundary.** The attach socket is bound at mode `0o600` and
     /// only accepts connections from the same OS user as the daemon, so
     /// any peer reaching this request can already exec arbitrary code as
-    /// that user. We deliberately do **not** sandbox `command`, `cwd`, or
-    /// `env`: there is no allowlist, no policy layer, no shell-quoting
+    /// that user. We deliberately do **not** sandbox `command` or `cwd`:
+    /// there is no allowlist, no policy layer, no shell-quoting
     /// validation. Adding any of those here would be security theater —
     /// the same user has equivalent local-exec capability via `sh -c`,
     /// and the daemon's job is to expose PTY plumbing, not to be a
     /// privilege boundary. Multi-tenant or remote scenarios must be
     /// handled at a different layer (separate UID, container, SSH).
+    /// `env` is the one exception (PRD #365 M2): any client-proposed
+    /// `DOT_AGENT_DECK_PANE_ID` entry is stripped and replaced with the
+    /// daemon-minted `pane_id` before the spawn path sees it, so `env` is
+    /// not forwarded verbatim for that one key.
     StartAgent {
         #[serde(default)]
         command: Option<String>,
@@ -1335,13 +1339,15 @@ async fn handle_connection(
                 return Ok(());
             }
             // Trust boundary: same OS user, same exec capability — see the
-            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
-            // `env` to the spawn path verbatim. The only check here is a
-            // sanity guard against an empty/whitespace-only `command`,
-            // which is almost certainly a client bug rather than an
-            // attack: it would otherwise resolve to a binary named "" or
-            // " " and fail with a confusing OS error. This is *not* an
-            // allowlist.
+            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`
+            // to the spawn path verbatim; `env` is forwarded verbatim
+            // except for `DOT_AGENT_DECK_PANE_ID`, which is stripped and
+            // re-stamped with the daemon-minted `pane_id` below (PRD #365
+            // M2). The only check here is a sanity guard against an
+            // empty/whitespace-only `command`, which is almost certainly a
+            // client bug rather than an attack: it would otherwise resolve
+            // to a binary named "" or " " and fail with a confusing OS
+            // error. This is *not* an allowlist.
             if let Some(c) = command.as_deref()
                 && c.trim().is_empty()
             {

@@ -744,6 +744,15 @@ const PANE_DIGEST_HEX: usize = 16;
 /// exactly as before this fix. Unconditionally prepending the prefix
 /// produced a double-prefixed `"pane-pane-…"` session_id for every real
 /// spawned pane.
+///
+/// **Invariant this relies on (auditor A4):** this mapping is injective
+/// only because no `pane_id` source in the tree emits a bare (unprefixed)
+/// id matching [`is_minted_pane_id`]'s post-prefix shape (16 lowercase hex
+/// digits, `-`, decimal sequence). If one ever did, that bare id and its
+/// already-`"pane-"`-prefixed minted counterpart would collapse onto the
+/// same `session_id`, silently merging two panes' sessions. Nothing in the
+/// type system enforces this today — it holds only because every current
+/// `pane_id` source was checked by hand.
 fn session_id_for_pane(pane_id: &str) -> String {
     if is_minted_pane_id(pane_id) {
         pane_id.to_string()
@@ -3790,8 +3799,8 @@ impl AppState {
     ///
     /// A pane can carry more than one session at a time. The close path removes
     /// the session its CARD was built from, which is not necessarily all of them:
-    /// a pane also gets a placeholder session (`pane-<pane_id>`, minted by
-    /// [`Self::insert_placeholder_session`] on registration / hydration), and when
+    /// a pane also gets a placeholder session (id derived by [`session_id_for_pane`],
+    /// minted by [`Self::insert_placeholder_session`] on registration / hydration), and when
     /// the agent's own `SessionStart` cannot reuse it, both live on. That happens
     /// whenever the pane's command is one the deck cannot infer an agent type from
     /// — a `devbox run agent-coder` style launcher — because such a command is not

@@ -922,21 +922,37 @@ impl EmbeddedPaneController {
                 {
                     Ok(Ok((id, Some(pane_id)))) => (id, pane_id),
                     Ok(Ok((id, None))) => {
-                        // PRD #365 M2: the version handshake refuses to
-                        // pair with a daemon that predates daemon-minted
-                        // pane_id, so a `StartAgent` success carrying no
-                        // `pane_id` here means the daemon accepted the
-                        // connection while not actually being
-                        // protocol-compatible. Clean up the now-orphaned
-                        // agent rather than leak it, then surface a clear
-                        // error instead of silently falling back to a
-                        // client-proposed id.
-                        if let Err(stop_err) = client_for_calls.stop_agent(&id).await {
-                            tracing::warn!(
+                        // PRD #365 M2: `ensure_compatible_daemon_or_die`
+                        // checks the protocol version once at TUI startup,
+                        // not per-connection (`DaemonClient::connect` does a
+                        // bare `IpcStream::connect` with no per-call `Hello`
+                        // exchange), so a same-UID daemon that later wedges
+                        // or is swapped mid-session can still reach this
+                        // branch even though it passed the startup
+                        // handshake. Clean up the now-orphaned agent rather
+                        // than leak it, then surface a clear error instead
+                        // of silently falling back to a client-proposed id.
+                        //
+                        // Bounded the same way as the two cleanup paths
+                        // below (reviewer P2 / auditor A1): an unresponsive
+                        // daemon must not pin this `block_on` forever.
+                        match tokio::time::timeout(
+                            CREATE_PANE_STOP_TIMEOUT,
+                            client_for_calls.stop_agent(&id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(stop_err)) => tracing::warn!(
                                 agent_id = %id,
                                 error = %stop_err,
                                 "create_stream_pane: stop_agent after missing pane_id failed; daemon-side agent may be leaked"
-                            );
+                            ),
+                            Err(_) => tracing::warn!(
+                                agent_id = %id,
+                                timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                                "create_stream_pane: stop_agent after missing pane_id timed out; daemon-side agent may be leaked"
+                            ),
                         }
                         return Err(ClientError::Malformed(
                             "start-agent ok but no pane_id in response".into(),
