@@ -203,11 +203,15 @@ pub fn resolve_build_id(
 /// percent-encoding (`%2e%2e` and case variants decode to `..` in the `url`
 /// crate this build links, `url-2.5.8/src/parser.rs:1319`), and it left every
 /// other URL-significant character (`?`, `#`, `:`, `@`, `\`, `%`) unrejected.
-/// This alphabet excludes all of them in one predicate, which makes the
-/// `.`/`..` special-case redundant rather than incomplete, and also excludes
+/// This alphabet excludes all of them in one predicate, and also excludes
 /// non-ASCII codepoints the denylist let through (e.g. bidi-format
 /// characters). Uppercase is accepted deliberately — GitHub owner names are
 /// case-insensitive but may contain uppercase letters.
+///
+/// The old `.`/`..` whole-segment check is genuinely redundant here, unlike
+/// for [`is_valid_repo_name_segment`]: `.` is not in this alphabet at all, so
+/// no sequence of only `.` characters can pass the `chars().all(..)` check
+/// below regardless.
 fn is_valid_owner_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -216,14 +220,26 @@ fn is_valid_owner_segment(segment: &str) -> bool {
 }
 
 /// Is `name` a valid GitHub repository-name segment? GitHub's own allowlist
-/// alphabet: ASCII alphanumerics plus `.`, `-`, `_`. See
-/// [`is_valid_owner_segment`] for why this is an allowlist and not the
-/// `.`/`..`-denylist it replaced.
+/// alphabet: ASCII alphanumerics plus `.`, `-`, `_`.
+///
+/// Unlike [`is_valid_owner_segment`], the character-class swap alone does
+/// **not** make the old `.`/`..` whole-segment check redundant here: `.` is
+/// itself in this alphabet (real repo names contain dots, e.g.
+/// `dot-agent-deck` doesn't but plenty of real repos do), so a segment of
+/// *only* dots — `.` or `..` — passes `chars().all(..)` and would silently
+/// reintroduce the traversal segment the old denylist rejected explicitly
+/// (caught by `malformed_release_repo_falls_through_to_default`'s
+/// `"owner/.."` case going green under an earlier, character-only-allowlist
+/// version of this function). GitHub itself forbids a repository literally
+/// named `.` or `..`, so this keeps rejecting exactly those two, on top of
+/// the character allowlist.
 fn is_valid_repo_name_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return false;
+    }
+    segment
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Normalize a candidate `DAD_RELEASE_REPO` injection (issue #398) into the
