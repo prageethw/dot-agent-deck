@@ -274,6 +274,17 @@ fn linkage_check_fails_on_stale_worktree_registry_entry() {
 /// `std::env::set_current_dir` mutates process-global state that would
 /// race with any sibling test sharing this process under a threaded
 /// `cargo test` run.
+///
+/// Unix-only: Windows refuses to remove a directory that is any process's
+/// current working directory (`ERROR_SHARING_VIOLATION` — "the process
+/// cannot access the file because it is being used by another process"),
+/// confirmed live in this repo's own `build-windows` CI job. The scenario
+/// this test reproduces — a directory disappearing out from under a
+/// process's cwd — is a POSIX-specific failure mode; check 12's fix itself
+/// (handling `current_dir()` erroring cleanly rather than panicking) is
+/// still exercised on every platform, just not by this particular
+/// mechanism.
+#[cfg(unix)]
 #[test]
 fn linkage_check_reports_check_12_when_the_current_worktree_is_gone() {
     let tmp = tempfile::tempdir().expect("tempdir");
