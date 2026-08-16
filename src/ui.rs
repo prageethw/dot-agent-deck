@@ -37716,6 +37716,236 @@ mod tests {
         }
     }
 
+    /// Scenario: `gate_paste_delivery` is the deterministic replacement for
+    /// `lock_017`'s Part 3 PTY stopwatch (issue #390,
+    /// `tests/e2e_orchestration_lock.rs`). On a real locked orchestration
+    /// with the non-orchestrator worker pane focused and no `WaitingForInput`
+    /// status recorded — the same baseline `lock_006` uses — gating a paste's
+    /// payload must deny it, returning `PasteGateOutcome::Denied` carrying
+    /// the same `ORCHESTRATION_LOCK_STATUS_MESSAGE` a denied keystroke shows.
+    /// `Denied` has no `keystroke_at` field at all, so the property Part 3
+    /// measured with a stopwatch — a denied paste must not stamp
+    /// `last_pane_keystroke_at` — is now partly enforced by the enum's own
+    /// shape rather than only by an assertion here; a future change that
+    /// reintroduces a timestamp on this variant would still need this test
+    /// (and `lock_021` below) to notice the stamped/unstamped split moved.
+    #[spec("orchestration/lock/020")]
+    #[test]
+    fn lock_020_gate_paste_delivery_denies_when_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-paste-denied",
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+        let now = std::time::Instant::now();
+        let outcome = gate_paste_delivery(vec![b'x', b'y'], now, &ui, &tm, pc.as_ref(), &no_status);
+        match outcome {
+            PasteGateOutcome::Denied { status_message } => {
+                assert_eq!(
+                    status_message.0, ORCHESTRATION_LOCK_STATUS_MESSAGE,
+                    "a denied paste must carry the same lock status message a \
+                     denied keystroke does"
+                );
+            }
+            PasteGateOutcome::Delivered { .. } => panic!(
+                "expected a locked worker pane with no WaitingForInput status \
+                 to deny the paste, got Delivered instead"
+            ),
+        }
+    }
+
+    /// Scenario: The pass-through half of `lock_020` — without it, a
+    /// `gate_paste_delivery` that always returns `Denied` would still make
+    /// `lock_020` pass, so this is what stops that pair being vacuous. On
+    /// the same real orchestration, once the deck-global lock is OFF, gating
+    /// a paste at the (still nominally) focused worker pane must deliver it:
+    /// `PasteGateOutcome::Delivered` carrying the exact payload bytes
+    /// unchanged and a `keystroke_at` equal to the injected `now` — not a
+    /// wall-clock read, confirming the caller's clock is what gets stamped.
+    #[spec("orchestration/lock/021")]
+    #[test]
+    fn lock_021_gate_paste_delivery_delivers_with_injected_now_when_unlocked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-paste-delivered",
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // The strongest counter-case for a false Denied: unlock the deck
+        // entirely, same as the tail of lock_006.
+        ui.command_entry_locked = false;
+
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+        let payload = vec![b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        let now = std::time::Instant::now();
+        let outcome = gate_paste_delivery(payload.clone(), now, &ui, &tm, pc.as_ref(), &no_status);
+        match outcome {
+            PasteGateOutcome::Delivered {
+                bytes,
+                keystroke_at,
+            } => {
+                assert_eq!(
+                    bytes, payload,
+                    "a delivered paste's bytes must reach the caller unchanged \
+                     from the payload gate_paste_delivery was given"
+                );
+                assert_eq!(
+                    keystroke_at, now,
+                    "a delivered paste's keystroke_at must be exactly the \
+                     injected `now`, not a fresh wall-clock read"
+                );
+            }
+            PasteGateOutcome::Denied { .. } => panic!(
+                "expected an unlocked deck to deliver the paste, got Denied \
+                 instead"
+            ),
+        }
+    }
+
+    /// Scenario: The `WaitingForInput` carve-out (`lock_006`,
+    /// `lock_007`/`013`'s provenance guard) is exercised by
+    /// `gate_pane_input_key` on every path `gate_paste_delivery` calls, so it
+    /// reaches a paste exactly as it reaches a keystroke. On a real LOCKED
+    /// orchestration with the focused worker pane's status resolved to
+    /// `WaitingForInput`, a paste must still be delivered — the agent has
+    /// stopped and asked, so a pasted answer is a response, not an intrusion.
+    #[spec("orchestration/lock/022")]
+    #[test]
+    fn lock_022_gate_paste_delivery_waiting_for_input_carve_out() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-paste-waiting",
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        let mut waiting_status: HashMap<&str, SessionStatus> = HashMap::new();
+        waiting_status.insert(worker_id.as_str(), SessionStatus::WaitingForInput);
+
+        let payload = vec![b'a', b'n', b's', b'w', b'e', b'r'];
+        let now = std::time::Instant::now();
+        let outcome =
+            gate_paste_delivery(payload.clone(), now, &ui, &tm, pc.as_ref(), &waiting_status);
+        match outcome {
+            PasteGateOutcome::Delivered {
+                bytes,
+                keystroke_at,
+            } => {
+                assert_eq!(
+                    bytes, payload,
+                    "a WaitingForInput carve-out delivery must carry the \
+                     payload through unchanged"
+                );
+                assert_eq!(
+                    keystroke_at, now,
+                    "a WaitingForInput carve-out delivery must stamp the \
+                     injected now, exactly like any other delivered paste"
+                );
+            }
+            PasteGateOutcome::Denied { .. } => panic!(
+                "expected the WaitingForInput carve-out to deliver a paste \
+                 at a locked worker pane exactly as it does a keystroke, got \
+                 Denied instead"
+            ),
+        }
+    }
+
     /// Issue #478: the synchronous client's response read is bounded by the
     /// SAME `MAX_FRAME_LEN` the async `read_frame` enforces. A forged 5-byte
     /// header is all a peer needs — the allocation used to happen before
