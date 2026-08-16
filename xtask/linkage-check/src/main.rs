@@ -31,6 +31,16 @@
 //!      rather than deduplicating into a set, so a repeat is
 //!      representable instead of silently collapsing to whichever
 //!      heading was parsed last.
+//!   10. The repository is not unexpectedly shallow (issue #325). Only
+//!       asserted in a multi-worktree checkout — see [`repo_state`].
+//!   11. The worktree registry (`git worktree list`) has no drift: no
+//!       entry points at a path that no longer exists on disk (issue #325).
+//!   12. The current worktree's own directory still exists (issue #325,
+//!       the degenerate case of check 11). Reachable from two places: a
+//!       stat inside [`repo_state::check`] on the already-resolved repo
+//!       root, and — the more common real path in — [`repo_root`] itself
+//!       producing this same diagnosis instead of panicking when
+//!       `std::env::current_dir()` fails.
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -65,6 +75,7 @@
 
 mod clean_tmp;
 mod list_tests;
+mod repo_state;
 mod work_type;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -221,17 +232,33 @@ fn main() -> ExitCode {
         return work_type::run(&args[1..]);
     }
 
-    let root = repo_root();
+    let root = match repo_root() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("linkage-check: 1 failure(s):");
+            eprintln!("  {}", current_dir_missing_message(&e));
+            return ExitCode::from(2);
+        }
+    };
     let catalog_path = root.join(CATALOG_PATH);
     let allowlist_path = root.join(ALLOWLIST_PATH);
     let tests_dir = root.join(TESTS_DIR);
 
     let mut failures: Vec<String> = Vec::new();
 
+    // Checks 10-12 (issue #325): repository-state preflight. Runs before
+    // the catalog is even parsed — a corrupted repository state is a more
+    // fundamental problem than a catalog mismatch, and should never be
+    // masked by an unrelated early return below. See [`repo_state`].
+    let repo_state = repo_state::check(&root);
+    let repo_state_skip_reason = repo_state.skip_reason;
+    failures.extend(repo_state.failures);
+
     let catalog_ids = match parse_catalog_ids(&catalog_path) {
         Ok(ids) => ids,
         Err(e) => {
             eprintln!("failed to parse catalog at {}: {e}", catalog_path.display());
+            print_preflight_failures(&failures);
             return ExitCode::from(2);
         }
     };
@@ -242,6 +269,7 @@ fn main() -> ExitCode {
                 "failed to read allowlist at {}: {e}",
                 allowlist_path.display()
             );
+            print_preflight_failures(&failures);
             return ExitCode::from(2);
         }
     };
@@ -388,6 +416,7 @@ fn main() -> ExitCode {
         Ok(tests) => tests,
         Err(e) => {
             eprintln!("failed to parse #[spec] test sources: {e}");
+            print_preflight_failures(&failures);
             return ExitCode::from(2);
         }
     };
@@ -488,8 +517,20 @@ fn main() -> ExitCode {
     }
 
     if failures.is_empty() {
+        // B2: report the rule count that actually ran, not a fixed
+        // constant — checks 10-12 are structurally skipped on every CI run
+        // and every single-worktree developer checkout (see
+        // `repo_state::RepoStateResult::skip_reason`), and a success line
+        // claiming `12 rules` there overclaims exactly the way
+        // `prds/fork-340-work-type-vocabulary.md` names as the empty-gate
+        // pattern this repo keeps documenting.
+        let (rule_count, exemption_note) = match repo_state_skip_reason {
+            None => (12, String::new()),
+            Some(reason) => (9, format!("; 10-12 exempt: {reason}")),
+        };
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 9 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, {rule_count} \
+             rules{exemption_note})",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -501,6 +542,23 @@ fn main() -> ExitCode {
             eprintln!("  {f}");
         }
         ExitCode::FAILURE
+    }
+}
+
+/// Print any repository-state preflight failures (checks 10-12) accumulated
+/// before an early, unrelated `return` (a missing/malformed catalog or
+/// allowlist) — otherwise a genuinely shallow or drifted repository would
+/// be silently dropped by whichever early return happened to fire first.
+fn print_preflight_failures(failures: &[String]) {
+    if failures.is_empty() {
+        return;
+    }
+    eprintln!(
+        "additionally, linkage-check: {} repository-state failure(s):",
+        failures.len()
+    );
+    for f in failures {
+        eprintln!("  {f}");
     }
 }
 
@@ -522,7 +580,13 @@ fn run_docs(args: &[String]) -> ExitCode {
             }
         }
     }
-    let root = repo_root();
+    let root = match repo_root() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("xtask docs: {}", current_dir_missing_message(&e));
+            return ExitCode::from(2);
+        }
+    };
     let config = xtask_docs::DocsConfig::from_workspace(root.clone());
     let generated = match xtask_docs::generate_all(&config) {
         Ok(g) => g,
@@ -567,7 +631,13 @@ fn run_list_tests(args: &[String]) -> ExitCode {
             }
         }
     }
-    let root = repo_root();
+    let root = match repo_root() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("xtask list-tests: {}", current_dir_missing_message(&e));
+            return ExitCode::from(2);
+        }
+    };
     match list_tests::run(&root) {
         Ok(report) => {
             print!("{report}");
@@ -670,19 +740,47 @@ fn unattached_annotation_failures(
 /// Locate the workspace root by walking up from the binary's
 /// `current_dir()` until we see the workspace `Cargo.toml` (which has
 /// a `[workspace]` block).
-fn repo_root() -> PathBuf {
-    let mut dir = std::env::current_dir().expect("current_dir is readable");
+///
+/// `Err` only when `std::env::current_dir()` itself fails — in practice this
+/// means the directory the process was started in has since been removed
+/// (issue #325 check 12's own scenario: `cd worktree; <something removes
+/// it>; cargo xtask linkage-check` — the shell's cwd reference is inherited
+/// broken via `fork()`, so `getcwd()` fails with `ENOENT` in the child
+/// before this function's first line runs). This used to be a bare
+/// `.expect("current_dir is readable")`, which panicked instead of
+/// producing check 12's own diagnosis — exactly the confusing failure that
+/// check exists to replace. A workspace `Cargo.toml` genuinely not being
+/// findable from a valid starting directory remains a `panic!`: that is a
+/// real misconfiguration, not a runtime condition this tool should try to
+/// name a remedy for.
+fn repo_root() -> Result<PathBuf, std::io::Error> {
+    let mut dir = std::env::current_dir()?;
     loop {
         let candidate = dir.join("Cargo.toml");
         if let Ok(s) = std::fs::read_to_string(&candidate)
             && s.contains("[workspace]")
         {
-            return dir;
+            return Ok(dir);
         }
         if !dir.pop() {
             panic!("could not locate workspace root from {dir:?}");
         }
     }
+}
+
+/// Check 12's diagnosis for the case where `repo_root()` itself could not
+/// even establish a starting directory — the more common real path into
+/// "the current worktree's own directory is gone" (see `repo_root`'s doc).
+/// No path can be named here (that is exactly the information `current_dir`
+/// failing costs us), so the message is necessarily less specific than the
+/// one `repo_state::check` prints when it detects the same condition from an
+/// already-resolved path.
+fn current_dir_missing_message(e: &std::io::Error) -> String {
+    format!(
+        "[12] this process's current working directory no longer exists on disk — something \
+         removed it out from under the current process (`std::env::current_dir()`: {e}); \
+         remedy: `cd` into a working directory that still exists and retry"
+    )
 }
 
 /// Parse `## Test Case Catalog` out of the PRD: extract every
