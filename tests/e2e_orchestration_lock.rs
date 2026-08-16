@@ -763,12 +763,16 @@ fn lock_016_ctrl_e_resolves_with_no_project_config_present() {
 /// that survives a `PaneInput` re-entry, since keyboard PageUp/PageDown is
 /// command-mode only and re-entering `PaneInput` itself snaps scrollback to
 /// live output), and confirm a further dropped paste does not yank the view
-/// back to live output. The third property this test used to pin here —
-/// that the drop must not stamp `last_pane_keystroke_at`, so a genuinely
-/// forwarded keystroke right after it is not needlessly debounced — moved to
-/// deterministic unit tests on `gate_paste_delivery` (`src/ui.rs`:
-/// `lock_020`, `lock_021`, `lock_022`); see the comment at the end of this
-/// test for why.
+/// back to live output. Issue #414: denial of that second paste is proven by
+/// a POSITIVE, synchronous signal — the lock's own denial status message
+/// appearing on the bottom bar — rather than by the ABSENCE of the paste's
+/// sentinel within a fixed budget, which cannot tell "denied" apart from
+/// "delivered but not yet echoed back by the `cat` stub under CI load". The
+/// third property this test used to pin here — that the drop must not stamp
+/// `last_pane_keystroke_at`, so a genuinely forwarded keystroke right after
+/// it is not needlessly debounced — moved to deterministic unit tests on
+/// `gate_paste_delivery` (`src/ui.rs`: `lock_020`, `lock_021`, `lock_022`);
+/// see the comment at the end of this test for why.
 #[spec("orchestration/lock/017")]
 #[test]
 fn lock_017_paste_gated_by_lock_state() {
@@ -886,14 +890,41 @@ fn lock_017_paste_gated_by_lock_state() {
 
     // Locked again, scrolled back: a dropped paste must not touch this
     // pane's scrollback at all.
+    //
+    // Issue #414: proving the drop happened used to rely on the ABSENCE of
+    // REGATED_PASTE_SENTINEL within a fixed 2s budget. That cannot
+    // distinguish "denied" from "delivered, but the `cat` stub's echo simply
+    // had not reached the grid yet under CI load" — a wait for a sentinel
+    // that is expected NEVER to arrive is a full-budget wait on the happy
+    // path, and a busy runner can exceed it even on a genuine drop. Wait
+    // instead for the POSITIVE, synchronous signal `gate_paste_delivery`'s
+    // `Denied` arm actually produces: `ui.status_message` is set to
+    // `ORCHESTRATION_LOCK_STATUS_MESSAGE` in the SAME event-processing turn
+    // as the deny decision, with no PTY round trip involved at all. This
+    // text is not already on screen at this point in the test — the
+    // preceding re-lock's `Ctrl+e` already overwrote it with
+    // "Pane entry: locked" (`Action::ToggleOrchestrationLock`, `src/ui.rs`)
+    // — so its (re)appearance here is unambiguous evidence that THIS paste
+    // specifically reached and was denied by the gate.
+    const DENIAL_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
     let regated_paste = format!("\x1b[200~{REGATED_PASTE_SENTINEL}\x1b[201~");
     deck.send_keys(regated_paste.as_bytes());
+    let denied = deck.wait_for_grid_string_within(DENIAL_STATUS_MESSAGE, Duration::from_secs(3));
+    assert!(
+        denied,
+        "the regated paste never produced the lock's own denial status \
+         message — either the gate never ran on it at all, or it actually \
+         DELIVERED the paste instead of denying it while the chip read \
+         LOCKED (issue #414).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
     let leaked_again =
         deck.wait_for_grid_string_within(REGATED_PASTE_SENTINEL, Duration::from_secs(2));
     assert!(
         !leaked_again,
-        "a second bracketed paste reached the relocked worker pane's PTY.\n\
-         Grid:\n{}",
+        "a second bracketed paste reached the relocked worker pane's PTY \
+         even though the status message above proves the gate reported \
+         denying it.\nGrid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
@@ -901,7 +932,9 @@ fn lock_017_paste_gated_by_lock_state() {
         "the dropped paste yanked the worker pane's view back to live output \
          — Event::Paste must not call embedded.reset_scrollback for a paste \
          gate_pane_input_key denies, exactly as a dropped ordinary keystroke \
-         already does not.\nGrid:\n{}",
+         already does not. The status message above proves the gate DID \
+         deny this paste, so a failure here means some OTHER code path is \
+         resetting scrollback (issue #414).\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
