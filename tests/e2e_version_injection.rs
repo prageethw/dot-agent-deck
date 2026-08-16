@@ -157,13 +157,28 @@ fn build_with_injected(version: &str, build_id: &str, release_repo: &str) -> Pat
     // reference is explicit that `--config` outranks every config file
     // ("Configuration values specified this way take precedence over
     // environment variables, which take precedence over configuration
-    // files" — doc.rust-lang.org/cargo/reference/config.html#command-line-overrides),
-    // so a `--config env.DAD_RELEASE_REPO="..."` here replaces the whole
-    // `[env]` entry the project file defines for this key — `force` and
-    // all — before force's OS-environment rule is ever consulted. Nothing
-    // sets DAD_RELEASE_REPO as a plain OS env var in this function, so
-    // there is no OS-env value for that rule to act on either way.
-    let release_repo_override = format!("env.DAD_RELEASE_REPO=\"{release_repo}\"");
+    // files" — doc.rust-lang.org/cargo/reference/config.html#command-line-overrides).
+    //
+    // Two things had to be true of the override's own syntax, both verified
+    // directly against this checkout's cargo (1.97.0) rather than assumed:
+    // - `--config env.DAD_RELEASE_REPO={ value = "..." }` (an inline table)
+    //   is rejected outright — "sets a value to an inline table, which is
+    //   not accepted" — cargo's CLI form does not accept inline tables.
+    // - A bare `--config env.DAD_RELEASE_REPO="..."` merges against the
+    //   project file's entry key-by-key rather than replacing it wholesale,
+    //   and errors when the shapes disagree: "failed to merge key
+    //   `DAD_RELEASE_REPO` … expected table, but found string", because the
+    //   project file's entry is itself a table (`{ value = "...", force =
+    //   true }`).
+    // The dotted-path form below sidesteps both: it sets just the `value`
+    // subkey, cargo merges it against the file's table entry field-by-field,
+    // and `force = true` carries over unmodified from the file — confirmed
+    // with `cargo --config '…DAD_RELEASE_REPO.value="X"' -Z unstable-options
+    // config get env.DAD_RELEASE_REPO`, which reported exactly
+    // `{ force = true, value = "X" }`. Nothing sets DAD_RELEASE_REPO as a
+    // plain OS env var in this function, so `force`'s OS-environment rule
+    // never has anything to act on regardless of what it resolves to.
+    let release_repo_override = format!("env.DAD_RELEASE_REPO.value=\"{release_repo}\"");
 
     let out = Command::new(&cargo)
         .args([
