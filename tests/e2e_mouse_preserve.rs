@@ -115,11 +115,26 @@ fn preserve_002_button_short_circuits_miss_falls_through() {
 
     // (1) Miss-falls-through: clicking the bravo card selects it (▸ marker
     // on bravo's row). The deterministic wait IS the assertion.
+    //
+    // PRD fork#405 M1 moved the role/session identity text off the card's
+    // title row onto its own unconditional body row directly beneath it —
+    // the title row now carries ONLY the `▸ ` selection prefix (plus the
+    // type/model badge and status), never the identity text alongside it
+    // (`src/ui.rs`, `render_session_card`'s `title_segments` construction).
+    // So "bravo" and "▸" no longer land on the SAME rendered line; checking
+    // one line for both (as this used to) can never match post-M1. Instead,
+    // find "bravo"'s own body row and check the line directly ABOVE it (its
+    // card's title row) for the selection prefix — mirroring the
+    // adjacent-row scoping `has_role_status` uses in
+    // `e2e_orchestration_pane_column.rs` for the identical layout change.
     let (col, row) = deck.wait_for_in_grid("bravo");
     deck.click(col, row);
     let bravo_selected = |g: &str| {
-        g.lines()
-            .any(|l| l.contains("bravo") && (l.contains('▸') || l.contains("> ")))
+        let lines: Vec<&str> = g.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .any(|(i, l)| l.contains("bravo") && i > 0 && lines[i - 1].contains('▸'))
     };
     deck.wait_until_grid("bravo card selected", bravo_selected);
 

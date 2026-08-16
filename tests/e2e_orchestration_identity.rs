@@ -18,6 +18,30 @@ mod common;
 use common::TuiDeck;
 use spec::spec;
 
+/// `role` appears somewhere on the settled grid as its own token — bounded
+/// on both sides by anything that is NOT an identifier character (a card
+/// border glyph, whitespace, a newline, or start/end of the grid) rather
+/// than specifically a space. PRD fork#405 M1 moved the role name off the
+/// card's title/border row onto its own unconditional body row directly
+/// beneath it, and `render_session_card` (`src/ui.rs`) pushes that row's
+/// text with NO leading or trailing pad — so a `" {role} "`-style
+/// space-bounded needle can never match post-M1 (the character immediately
+/// to the left of the role name is the card's own border glyph, not a
+/// space). Mirrors `grid_has_role` in `e2e_dashboard_selection.rs`, which
+/// hit the identical breakage.
+fn grid_has_role(grid: &str, role: &str) -> bool {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    grid.match_indices(role).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_ok = grid[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = grid[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        before_ok && after_ok
+    })
+}
+
 /// Drive the new-pane dialog to open the fixture's one orchestration,
 /// accepting the form's Name-field suggestion with a single Enter — no
 /// character typed. Mirrors `e2e_orchestration_focus.rs::open_orchestration`'s
@@ -55,7 +79,9 @@ fn identity_004_two_orchestration_opens_land_as_distinctly_named_tabs() {
     let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
 
     open_orchestration(&deck);
-    deck.wait_for_string(" worker "); // first orchestration deck is up
+    // PRD fork#405 M1: " worker " (space-bounded) can never match the role's
+    // own body row post-M1 — see `grid_has_role`.
+    deck.wait_until_grid("worker role card rendered", |g| grid_has_role(g, "worker")); // first orchestration deck is up
 
     // Back to the Dashboard to open a second orchestration in the same dir.
     deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)

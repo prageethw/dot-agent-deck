@@ -417,20 +417,45 @@ fn has_collapsed_frame(grid: &str, role: &str) -> bool {
 /// carries `status`" — an adjacent-row check rather than a same-row one, but
 /// still scoped to `role`'s own card, not any occurrence of `status`
 /// anywhere on the settled grid (e.g. another role's card, or pane content).
-/// The identity segment still always carries a space immediately before AND
-/// after the role name (the numeric/selection prefix ends in one on the old
-/// title row; the new body row's own leading pad ends in one too), so
-/// `" {role} "` remains a safe bounded needle for locating it. This relies
-/// on the role row being the unconditional FIRST body row directly beneath
-/// the title (the M1 design guarantee) — if that ever changes, this helper
-/// needs to change with it.
+/// Unlike the old title row, the new body row carries NO leading pad —
+/// `render_session_card` (`src/ui.rs`) pushes the bare
+/// `Span::styled(role_name_text, ...)` with nothing before it, so the
+/// rendered cell immediately to the left of the role name is the card's own
+/// border glyph (`│` unselected, `┃` selected), not a space. `" {role} "`
+/// therefore never matches. Instead of assuming a fixed left/right pad,
+/// `contains_role_word` looks for `role` as its own token: bounded on both
+/// sides by anything that is NOT an identifier character (border glyph,
+/// whitespace, or line start/end) rather than specifically a space — this
+/// is what keeps `"beta"` from matching inside `"beta-agent"` while still
+/// matching regardless of which border glyph or how much padding precedes
+/// it. This relies on the role row being the unconditional FIRST body row
+/// directly beneath the title (the M1 design guarantee) — if that ever
+/// changes, this helper needs to change with it.
 fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
-    let role_needle = format!(" {role} ");
     let lines: Vec<&str> = grid.lines().collect();
     lines
         .iter()
         .enumerate()
-        .any(|(i, line)| line.contains(&role_needle) && i > 0 && lines[i - 1].contains(status))
+        .any(|(i, line)| i > 0 && lines[i - 1].contains(status) && contains_role_word(line, role))
+}
+
+/// `role` matches only as its own token, never as a substring of a longer
+/// identifier — e.g. `"beta"` must not match inside `"beta-agent"`, and must
+/// not match a stray occurrence of a DIFFERENT role's name that happens to
+/// contain `role` as a prefix/suffix. A character is "boundary" here when it
+/// is not alphanumeric, `-`, or `_` — that covers border glyphs, whitespace,
+/// and start/end of line without assuming any specific pad character.
+fn contains_role_word(line: &str, role: &str) -> bool {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    line.match_indices(role).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = line[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        before_ok && after_ok
+    })
 }
 
 /// Overwrite the fixture's `beta-agent.sh` placeholder with the ABSOLUTE path
