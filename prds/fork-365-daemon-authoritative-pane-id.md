@@ -180,7 +180,7 @@ No on-disk artefact needs migrating. Archived report filenames (`work-done-<role
 
 - [x] A test that two independently-attached clients cannot obtain the same id — pinned, not argued.
 - [x] A test that an id is not reissued after its pane exits.
-- [ ] Rule 12 cross-version manual test run, with an isolated `DOT_AGENT_DECK_LOG`, sockets, `HOME` and state dir.
+- [x] Rule 12 cross-version manual test run, with an isolated `DOT_AGENT_DECK_LOG`, sockets, `HOME` and state dir.
 
 ### M4 — offer upstream
 
@@ -215,6 +215,8 @@ This moves `pane_id` from client-chosen to daemon-returned, so the **wire shape 
 Isolate `DOT_AGENT_DECK_LOG` along with the sockets, `HOME` and state dir. The log path resolves separately, so a sandbox daemon otherwise correctly isolated still appends into the real `~/.local/state/dot-agent-deck/deck.log` — and two interleaved daemons in one log file is genuinely hard to read afterwards.
 
 Bump policy while `0.x`: breaking → minor.
+
+**Manual run recorded (2026-08-17).** Built this branch (PROTOCOL_VERSION 9) against a clean pre-#365 build at `v0.38.3-3-g4e84eb8b` (PROTOCOL_VERSION 8, confirmed an ancestor of this branch's base), fully isolated (`DOT_AGENT_DECK_LOG`, sockets, `HOME`, state dir all pointed at a scratch dir). Started the old daemon with a live stand-in agent under it, then attached the new TUI: the handshake refused unconditionally with `error: local daemon speaks attach protocol v8 but this binary speaks v9`, exit non-zero — confirmed at the source (`build_version_handshake.rs:242`) that the `PROTOCOL_VERSION` check runs before any build-id/TTY branching, so this refusal is unconditional regardless of TTY state, unlike the softer same-protocol build-id skew that does get an interactive consent-restart. Ran the printed recovery (`dot-agent-deck daemon stop --force`, then relaunch), which lazily spawned a fresh matched-version (9) daemon; the new TUI then attached cleanly. On that reconciled daemon, set up a two-role orchestration (`orchestrator` + `coder`, stand-in `cat` commands) and confirmed end-to-end: `delegate --to coder` wrote `worker-task-coder.md` and injected the prompt into the coder pane (daemon log: `Received delegate signal ... targets=["coder"]`), and `work-done` from the coder pane delivered its summary back into the orchestrator's pane (daemon log: `Received work-done signal ...` / `work-done: wrote worker summary ...`; visible in the orchestrator's scrollback: "Worker coder has completed their task"). No deviation from decision 3's expectation — refuse then recover, not silently degraded.
 
 ## Risks and Mitigations
 
