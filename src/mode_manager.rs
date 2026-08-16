@@ -835,8 +835,8 @@ mod tests {
     /// clears the whole typed input buffer the same way, `BS`/`DEL` delete
     /// backwards, and `ETX` cancels the line). Either way, no caret
     /// encoding can close this off, so `watch_invocation`'s Windows arm now
-    /// replaces every control character but `\t` with a space before either
-    /// quoting pass runs. Verified the same rigorous way as
+    /// replaces every control character with a space before either quoting
+    /// pass runs. Verified the same rigorous way as
     /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
     /// above: a benign marker-file write stands in for the payload a
     /// surviving raw control byte would otherwise let submit as its own,
@@ -864,7 +864,7 @@ mod tests {
     /// remains reasoned rather than executed. The fast, deterministic
     /// pin that the character is gone from the output regardless of
     /// delivery path is
-    /// `platform::shell::windows_quoting_tests::quote_cmd_exe_arg_replaces_other_control_characters_with_spaces`.
+    /// `platform::shell::windows_quoting_tests::quote_cmd_exe_arg_replaces_every_control_character_with_a_space`.
     #[cfg(windows)]
     #[test]
     fn watch_invocation_neutralizes_control_characters_through_real_cmd_exe() {
@@ -885,9 +885,9 @@ mod tests {
             let line = watch_invocation(&exe, 5, command);
 
             assert!(
-                !line.chars().any(|c| c.is_control() && c != '\t'),
+                !line.chars().any(|c| c.is_control()),
                 "watch_invocation must never emit a raw control character \
-                 (other than tab) into the cmd.exe command line\n\
+                 into the cmd.exe command line\n\
                  command: {command:?}\nline: {line:?}"
             );
 

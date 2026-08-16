@@ -151,11 +151,10 @@ pub fn quote_shell_arg(arg: &str) -> String {
 ///
 /// **Caveat — a raw control character cannot be caret-escaped away
 /// either**, for the reasons [`sanitize_cmd_exe_control_chars`]'s doc
-/// comment gives; this function replaces every one (bar `\t`) with a
-/// space before doing anything else (fork issue #423 review finding
-/// B1's sibling: a control character in an executable path, reachable
-/// only via a self-controlled `std::env::current_exe()`, not user
-/// config).
+/// comment gives; this function replaces every one with a space before
+/// doing anything else (fork issue #423 review finding B1's sibling: a
+/// control character in an executable path, reachable only via a
+/// self-controlled `std::env::current_exe()`, not user config).
 #[cfg(windows)]
 pub fn escape_cmd_exe_program(token: &str) -> String {
     let token = sanitize_cmd_exe_control_chars(token);
@@ -339,12 +338,8 @@ fn caret_escape_cmd_metachars(s: &str) -> String {
     result
 }
 
-/// Replace every control character in `s` other than `\t` with a single
-/// space before either [`escape_cmd_exe_program`] or [`quote_cmd_exe_arg`]
-/// processes it. `\t` is deliberately exempt — both functions already
-/// caret-escape it deliberately (existing `a\tb` behaviour, pinned below),
-/// and it is not one of the bytes the console line editor consumes as an
-/// editing command (see below).
+/// Replace every control character in `s` with a single space before either
+/// [`escape_cmd_exe_program`] or [`quote_cmd_exe_arg`] processes it.
 ///
 /// Caret-escaping cannot neutralize a raw control character the way it
 /// neutralizes every other `cmd.exe` metacharacter, because none of them
@@ -392,7 +387,7 @@ fn caret_escape_cmd_metachars(s: &str) -> String {
 /// substitution; see the finding for the tradeoff.)
 #[cfg(windows)]
 fn sanitize_cmd_exe_control_chars(s: &str) -> String {
-    s.replace(|c: char| c.is_control() && c != '\t', " ")
+    s.replace(char::is_control, " ")
 }
 
 #[cfg(all(windows, test))]
@@ -521,24 +516,18 @@ mod windows_quoting_tests {
     /// backwards) and `ETX` (cancels the line) as editing commands before
     /// `cmd.exe`'s own grammar is ever consulted — the same "the character
     /// has to be gone before either quoting pass ever sees it" argument B1
-    /// established, generalized to the whole class. `\t` is deliberately
-    /// exempt (existing `a\tb`-style behaviour is unaffected by this
-    /// change). This is the fast, deterministic string-level pin; the
-    /// real-`cmd.exe` proof — which can only exercise the `/C <string>`
-    /// delivery path, not the interactive-PTY console line editor a real
-    /// Windows console applies — is
-    /// `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
+    /// established, generalized to the whole class. This is the fast,
+    /// deterministic string-level pin; the real-`cmd.exe` proof — which can
+    /// only exercise the `/C <string>` delivery path, not the
+    /// interactive-PTY console line editor a real Windows console applies —
+    /// is `watch_invocation_neutralizes_control_characters_through_real_cmd_exe`
     /// in `mode_manager.rs`.
     #[test]
-    fn quote_cmd_exe_arg_replaces_other_control_characters_with_spaces() {
+    fn quote_cmd_exe_arg_replaces_every_control_character_with_a_space() {
         let quoted = quote_cmd_exe_arg("a\x1bb\x08c\x03d\te");
         assert!(
-            !quoted.chars().any(|c| c.is_control() && c != '\t'),
-            "a control character other than tab survived quoting: {quoted:?}"
-        );
-        assert!(
-            quoted.contains('\t'),
-            "tab must survive, unlike every other control character: {quoted:?}"
+            !quoted.chars().any(|c| c.is_control()),
+            "a control character survived quoting: {quoted:?}"
         );
     }
 }
