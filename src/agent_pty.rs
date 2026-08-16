@@ -439,6 +439,44 @@ pub fn mint_orchestration_id() -> String {
     format!("orch-{nonce:016x}-{seq}")
 }
 
+/// PRD #365 M2: mint a fresh daemon-authoritative `pane_id` for a
+/// TUI-attached `StartAgent` spawn. Same recipe as [`mint_orchestration_id`]
+/// (a per-process nonce hashed from PID + epoch nanos, combined with a
+/// monotonic per-process sequence) — chosen over a bare counter because
+/// `spawn.rs`'s `next_pane_id` already demonstrates that shape's failure
+/// mode: its `PANE_COUNTER` resets to 0 on every daemon restart, which is
+/// exactly the recycling CLAUDE.md rule 23 named as unsafe to anchor
+/// identity on. The nonce makes two daemon processes — including two runs
+/// of the same daemon across a restart — astronomically unlikely to mint
+/// the same value, while the sequence guarantees no two mints within one
+/// daemon process collide.
+///
+/// Uses its own `NONCE`/`SEQ` statics rather than sharing
+/// [`mint_orchestration_id`]'s — the two id spaces (`orch-*` orchestration
+/// instance tokens, `pane-*` pane ids) are unrelated and mixing their
+/// sequences would buy nothing.
+///
+/// The `pane-` prefix keeps the value legible in logs, filenames and
+/// `DOT_AGENT_DECK_PANE_ID` (mirroring `spawn.rs`'s existing `sched-`
+/// prefix for scheduler-origin spawns, which this function does not touch)
+/// while staying well inside [`is_valid_pane_id_env`]'s charset and
+/// [`PANE_ID_ENV_MAX_LEN`] cap.
+pub fn mint_pane_id() -> String {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("pane-{nonce:016x}-{seq}")
+}
+
 impl TabMembership {
     /// Borrow the tab name (mode or orchestration) so callers don't have
     /// to match on the variant for the common "extract name for validation
