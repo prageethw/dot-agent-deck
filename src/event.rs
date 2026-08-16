@@ -693,6 +693,12 @@ pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
 ///   live PTY), else `process`/`history-only` for a standalone wrap. Native
 ///   PTY panes (Claude/OpenCode/Pi) omit it, which the UI reads as the
 ///   historical `live`/writable default. Absence never fails the decode.
+/// - **`model`** · string · optional (**PRD fork#378**, added additively) ·
+///   the agent's self-reported active model (e.g. `"Opus"`,
+///   `"gpt-5.1-codex-mini"`), posted top-level by the hook exactly as
+///   `agent_version` is. `None` (the default, omitted from the wire) means
+///   "model not reported"; a later event carrying a different model
+///   overwrites a previously-known one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -757,6 +763,15 @@ pub struct AgentEvent {
     /// it `None`, which the UI reads as the historical live/writable default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+    /// PRD fork#378: the agent's self-reported active model (e.g. `"Opus"`,
+    /// `"gpt-5.1-codex-mini"`), for the agent-type badge's model segment.
+    /// Optional and additive for the same reasons as `agent_version`:
+    /// `#[serde(default)]` lets older payloads that lack the field
+    /// deserialize to `None`, and `skip_serializing_if` omits it from the
+    /// wire when unset — so existing producers emit byte-identical JSON and
+    /// old/new peers stay compatible. `None` means "model not reported".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl AgentEvent {
@@ -1357,6 +1372,7 @@ mod tests {
             agent_version: Some("codex-1.2.3".into()),
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
             live_target: None,
+            model: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // Both fields must appear on the wire when set…
@@ -1391,6 +1407,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(

@@ -24,6 +24,7 @@ fn event(event_type: EventType, tool_name: Option<&str>) -> AgentEvent {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     }
 }
 

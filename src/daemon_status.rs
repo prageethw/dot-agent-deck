@@ -260,6 +260,7 @@ mod tests {
             live_target: None,
             last_activity_ms: None,
             shell_synthetic_working: false,
+            model: None,
         }
     }
 

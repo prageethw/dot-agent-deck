@@ -169,6 +169,7 @@ fn session_start(pane_id: &str, agent_id: &str) -> String {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        model: None,
     };
     serde_json::to_string(&event).expect("serialize synthetic SessionStart")
 }

@@ -466,26 +466,47 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### dashboard/agent-badge
 
-##### dashboard/agent-badge/001 — A session card shows the agent-type badge only when the deck-global toggle is on (fork #339 — restores `370b6228`'s removal behind an off-by-default toggle).
+##### dashboard/agent-badge/001 — A session card shows the agent-type badge only when the deck-global toggle is on (fork #339 — restores `370b6228`'s removal behind an off-by-default toggle), and PRD fork#378 grows the badge a bracketed model segment when the session's model is known, normalized by stripping a known vendor prefix.
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
 - **Agent:** none (a live Codex fixture rendered through `render_card_for_mode_to_buffer`, plus named ClaudeCode / OpenCode / Pi / Codex / Devin fixtures).
-- **Asserts:** with the toggle off, no card shows its agent-type label and no cell carries that agent's registry `badge_color`; with the toggle on, the card shows `<Label> · <name>` and a cell carries `badge_color` **and** `Modifier::BOLD`, repeated across all five shipped agent types. Also pins D4: a placeholder (`AgentType::None`) card shows `No agent` exactly once (its unrelated status text) even with the toggle on, never a second occurrence from a restored identity segment.
-- **Does not assert:** the toggle's keybinding resolution (`keybindings/safety/005`); the deck-global state transition itself (`dashboard/agent-badge/002`); the real binary's default-hidden render path (`dashboard/agent-badge/003`); no hints-bar test (the bar already omits `Ctrl+L`/`Ctrl+E`); no button-bar test (D7 — the feature has no button).
+- **Asserts:** with the toggle off, no card shows its agent-type label and no cell carries that agent's registry `badge_color`; with the toggle on, the card shows `<Label> · <name>` and a cell carries `badge_color` **and** `Modifier::BOLD`, repeated across all five shipped agent types. Also pins D4: a placeholder (`AgentType::None`) card shows `No agent` exactly once (its unrelated status text) even with the toggle on, never a second occurrence from a restored identity segment. PRD fork#378: a session carrying a known `model` renders `<Label> (<Model>) · <name>` (e.g. `Codex (Opus) · wrapped-01`) inside the SAME registry-coloured bold cell when the toggle is on, with no bare `<Label> · <name>` form also present; with the toggle off, neither the label nor the model leaks onto the card. Reviewer/auditor round 2: model-label normalization strips a leading vendor prefix (`claude-`, `gpt-`, …) case-insensitively (`claude-sonnet-5` -> `ClaudeCode (sonnet-5)`, `gpt-5.1-codex-mini` -> `Codex (5.1-codex-mini)`) and passes an id matching no known prefix through unchanged (`unknown-model-x` -> `Pi (unknown-model-x)`); a model that is ONLY a vendor prefix (`claude-`) falls back to its raw value rather than normalizing to empty; an empty or whitespace-only model (F4) renders the bare `<Label> · <name>` form, never an empty `()` or a whitespace-padded one.
+- **Does not assert:** the toggle's keybinding resolution (`keybindings/safety/005`); the deck-global state transition itself (`dashboard/agent-badge/002`); the real binary's default-hidden render path (`dashboard/agent-badge/003`); a model arriving/changing at runtime through `AppState::apply_event` (`dashboard/agent-badge/004`); an unbounded or `Cf`-hostile model (`dashboard/agent-badge/005`, `dashboard/agent-badge/006`); no hints-bar test (the bar already omits `Ctrl+L`/`Ctrl+E`); no button-bar test (D7 — the feature has no button).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/agent-badge/002 — `Action::ToggleAgentTypeBadge` cycles the deck-global toggle hidden -> shown -> hidden, and a bare `m` resolves to the same action without displacing `Enter`'s `Focus` resolution.
 - **Layer:** L1 (in-process `dispatch_action` / `handle_normal_key`, in-crate — `handle_normal_key` is private).
 - **Agent:** none.
-- **Asserts:** a fresh `UiState` starts with the badge hidden; dispatching the toggle once shows it and sets `ui.status_message` to `"Agent badge: shown"`; dispatching again hides it and sets `"Agent badge: hidden"`; `handle_normal_key` resolves a bare `m` (no modifiers) to `Action::ToggleAgentTypeBadge`; `handle_normal_key` still resolves `Enter` to `Action::Focus`.
+- **Asserts:** a fresh `UiState` starts with the badge hidden; dispatching the toggle once shows it and sets `ui.status_message` to `"Agent badge: shown"`; dispatching again hides it and sets `"Agent badge: hidden"`; `handle_normal_key` resolves a bare `m` (no modifiers) to `Action::ToggleAgentTypeBadge`; `handle_normal_key` still resolves `Enter` to `Action::Focus`. This is deck-global `UiState`/`Action` plumbing with no `SessionState` or model segment involved, so PRD fork#378's model badge does not change these assertions.
 - **Does not assert:** the rendered card difference (`dashboard/agent-badge/001`); the real binary's key dispatch (`dashboard/agent-badge/003`); no `keybindings/help/002` (the help overlay's rendering of `toggle_agent_type_badge` is unpinned — `keybindings/help/001`'s remapped-config snapshot remaps `toggle_layout` and `help`, not this binding, so it proves nothing about it).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/agent-badge/003 — Pressing `m` toggles the agent-type badge on every card through the real binary, proving both the deck-global reach and the bare-`m` alias as the door that works everywhere.
+##### dashboard/agent-badge/003 — Pressing `m` toggles the agent-type badge on every card through the real binary, proving both the deck-global reach and the bare-`m` alias as the door that works everywhere; PRD fork#378 extends this to a card whose session carries a model.
 - **Layer:** L2 (PTY end-to-end).
-- **Agent:** none (synthetic Claude Code + Codex `SessionStart` hooks).
-- **Asserts:** both cards' agent-type labels are absent at rest (default hidden — the only coverage of default-hidden through the real `render_frame`, which no L1 seam reaches); pressing `m` shows `"Agent badge: shown"` in the status bar and both labels appear; pressing `m` again shows `"Agent badge: hidden"` and both labels disappear. Presses only `m`, never `\x0d` — under a legacy PTY `Ctrl+M` decodes as Enter and `FocusPane` wins first (by design).
-- **Does not assert:** the enhanced-terminal `Ctrl+M` chord path (covered by `keybindings/safety/005`'s key-mapper assertion — no PTY harness here emulates the kitty keyboard protocol); real-agent execution.
+- **Agent:** none (synthetic Claude Code `SessionStart` carrying `model: "Opus"` + Codex `SessionStart` carrying `model: "gpt-5.1-codex-mini"` hooks).
+- **Asserts:** both cards' agent-type labels and models are absent at rest (default hidden — the only coverage of default-hidden through the real `render_frame`, which no L1 seam reaches); pressing `m` shows `"Agent badge: shown"` in the status bar and both cards show `ClaudeCode (Opus)` / `Codex (gpt-5.1-codex-mini)`; pressing `m` again shows `"Agent badge: hidden"` and both the labels and models disappear. Presses only `m`, never `\x0d` — under a legacy PTY `Ctrl+M` decodes as Enter and `FocusPane` wins first (by design).
+- **Does not assert:** the enhanced-terminal `Ctrl+M` chord path (covered by `keybindings/safety/005`'s key-mapper assertion — no PTY harness here emulates the kitty keyboard protocol); real-agent execution; a model changing mid-session (`dashboard/agent-badge/004`).
 - **Platform coverage:** mac+linux.
+
+##### dashboard/agent-badge/004 — A session's badge tracks its model at runtime: a later event's model overwrites an earlier one, and an event carrying no model leaves the previously-known model intact (PRD fork#378).
+- **Layer:** L1 (in-process `AppState::apply_event` seam feeding `render_card_for_mode_to_buffer`, mirroring `status/agent-event/004`'s in-process event-application style; no PTY, no subprocess).
+- **Agent:** none (synthetic `AgentEvent`s applied directly, ClaudeCode identity).
+- **Asserts:** a `SessionStart` carrying `model: Some("Opus")` sets `SessionState.model` and the rendered badge (toggle on) shows `ClaudeCode (Opus) · runtime-model`; a later event carrying `model: Some("Haiku")` overwrites the stored model and the badge updates to `ClaudeCode (Haiku) · runtime-model` with no trace of `Opus`; a further event carrying `model: None` (most events don't report one) leaves `SessionState.model` and the rendered badge at `Haiku`, unchanged. Also pins the badge-color + `Modifier::BOLD` cell on the final render.
+- **Does not assert:** the toggle's own hidden/shown mechanics (`dashboard/agent-badge/002`); the real binary's hook-socket ingestion path (`dashboard/agent-badge/003`); the JSON wire contract for `AgentEvent.model` (`protocol/agent-model/001`); an unbounded or `Cf`-hostile model (`dashboard/agent-badge/005`, `dashboard/agent-badge/006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/005 — An unbounded model is truncated to a sane display cap and the card's own identity segment survives it, rather than being pushed off the title budget (PRD fork#378 reviewer/auditor round 2, MEDIUM 3 / F1+F2).
+- **Layer:** L1 (in-process `AppState::apply_event` seam feeding `render_card_for_mode_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (a synthetic `SessionStart` carrying a 300-character, all-multi-byte (CJK) model plus a distinctive ASCII tail marker).
+- **Asserts:** the raw tail marker of the 300-char model does not survive to the rendered card (proving truncation happened, without pinning the exact cap value — a coder decision agreed at ≈40 chars); the card's `· <session-id>` identity segment is still present in the render, which today it is not — `truncate_styled_segments` walks the badge segment first and an unbounded model exhausts the whole title budget before the identity segment is ever reached. Because every character in the fixture is 3 bytes wide, a truncation implemented as a byte-index slice rather than a char-boundary one panics this test outright rather than merely failing an assertion.
+- **Does not assert:** the exact truncation cap chosen; `Cf` format-character sanitization (`dashboard/agent-badge/006`); model-label normalization (`dashboard/agent-badge/001`); a byte-slice panic elsewhere on the card (the pre-existing `id_display` 11-byte cap, filed separately per the auditor's F7).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/agent-badge/006 — A `Cf` Unicode format character embedded in the model (e.g. a bidi override) does not reach the rendered card title unsanitized (PRD fork#378 reviewer/auditor round 2, LOW / F5).
+- **Layer:** L1 (in-process `AppState::apply_event` seam feeding `render_card_for_mode_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (a synthetic `SessionStart` carrying a model embedding U+202E RIGHT-TO-LEFT OVERRIDE).
+- **Asserts:** the raw U+202E character does not appear anywhere in the rendered card, and the rendered badge instead contains the model run through `crate::terminal_sanitize::sanitize_for_terminal_display` — the same module the CLI print paths already use for this exact class (issue #232). This test does NOT re-litigate whether ANSI/control (`Cc`) bytes reach the terminal: the auditor verified independently, from the `ratatui` dependency source, that `Span::styled_graphemes` and `Buffer::set_stringn` already filter `char::is_control` at two layers before anything is cellled, so that class is out of scope here — `Cf` (format characters: bidi controls, zero-width space, word joiner, …) is the real gap, because it passes both of those filters unchanged.
+- **Does not assert:** `Cc`/ANSI control-byte filtering (verified pre-existing, via the ratatui dependency source, not this repo's code); the truncation cap (`dashboard/agent-badge/005`); model-label normalization (`dashboard/agent-badge/001`).
+- **Platform coverage:** mac+linux+windows.
 
 ### Statuses
 
@@ -762,6 +783,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** synthetic Codex events.
 - **Asserts:** after a history-only `SessionStart` and 51 later events omitting `live_target`, the session remains `Writable::HistoryOnly` rather than falling back to Live when the first event leaves the 50-entry journal.
 - **Does not assert:** reconnect serialization (covered by `session/live/010`) or card rendering (`dashboard/pane/009`).
+- **Platform coverage:** mac+linux+windows.
+
+#### protocol/agent-model
+
+##### protocol/agent-model/001 — `AgentEvent.model` is additive: a legacy payload lacking it decodes as `None`, a known value round-trips through decode -> encode, and `None` is omitted from the wire rather than serialized as `null` (PRD fork#378).
+- **Layer:** L1 (pure serde wire contract, mirroring `agent_version`'s additive-field tests at `src/event.rs:1097-1180`).
+- **Agent:** none (JSON fixtures).
+- **Asserts:** a payload with no `model` key deserializes `AgentEvent.model` as `None`; a payload carrying `"model": "gpt-5.1-codex-mini"` decodes to `Some("gpt-5.1-codex-mini")` and re-encodes with the identical `model` value; re-encoding a legacy (no-model) event omits the `model` key entirely rather than writing `"model":null` — so an older peer decoding a newer payload, and a newer peer decoding an older one, both see exactly `None`.
+- **Does not assert:** how the hook layer (`ClaudeCodeHookInput`) captures the top-level `model` key off a real agent payload (covered by the hook-ingestion tests, e.g. `tests/codex_hook_ingestion.rs`, and by the hook layer's own non-string-model robustness, `protocol/agent-model/002`); state propagation into `SessionState.model` or badge rendering (`dashboard/agent-badge/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/agent-model/002 — A hook payload whose `model` key is a non-string JSON value (object, number, bool, array) degrades to `model: None` instead of failing the whole decode and silently dropping the entire event (PRD fork#378 reviewer/auditor round 2, MEDIUM 4 / F3).
+- **Layer:** L1 (pure serde/decode unit test, in-source `src/hook.rs::tests`, exercising the private `ClaudeCodeHookInput` and `build_event`).
+- **Agent:** none (hand-built JSON payloads).
+- **Asserts:** for `model` values of type object, number, bool, and array, `serde_json::from_str::<ClaudeCodeHookInput>` succeeds (does NOT error) and `model` decodes to `None`; `build_event` on that input still returns `Some(AgentEvent)` with `session_id`, `event_type`, and `tool_name` all intact. Before this, `model: Option<String>`'s strict typing failed the WHOLE decode on a non-string value, and `handle_hook` swallowed that error silently (`Err(_) => return ExitCode::SUCCESS`) — a total status blackout for that agent, not merely a lost model. Also re-confirms `"model": null` keeps decoding to `None` (already worked; `Option` absorbs `null`).
+- **Does not assert:** the additive-field wire contract for `AgentEvent.model` itself (`protocol/agent-model/001`); state propagation or badge rendering (`dashboard/agent-badge/004`); the OpenCode hook path's `model` field (currently unexercised — see the reviewer's NIT on `OpenCodeHookInput.model`).
 - **Platform coverage:** mac+linux+windows.
 
 #### protocol/send-result
@@ -4321,6 +4358,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Asserts:** identical setup and outage-window construction to `session/live/017`, except the mock daemon's forced tear-down sends no `KIND_STREAM_END` frame at all — it just drops the connection (EOF), the shape the approved design ("always re-hydrate on reconnect", not just on `lagged`) exists to cover. The reconnected card must still converge on `Idle` off a fresh `list_agents` snapshot.
 - **Does not assert:** the `lagged`-reason shape of the same hazard (`session/live/017`); the BOOTSTRAP snapshot/subscribe window (`session/live/016`); which client-side mechanism recovers the snapshot (only the observable end state — the status the TUI holds for the card — not internal call counts).
 - **Platform coverage:** mac+linux.
+
+##### session/live/019 — Rehydration preserves a session's known model across a detach/reconnect, and the reconnected card still renders it (PRD fork#378 reviewer/auditor round 2, HIGH 1 / F8).
+- **Layer:** L1 state/wire integration (two `AppState`s modelling daemon and TUI, joined by a real `live_snapshot()` → JSON → `seed_hydrated_session` round-trip, mirroring `session/live/010`/`011`), plus a render check through `render_card_for_mode_to_buffer`.
+- **Agent:** none (a synthetic `SessionStart` carrying `model: Some("Opus")`).
+- **Asserts:** after a `SessionStart` sets the daemon-side session's model, the reconnecting TUI's `AppState` — seeded purely from the JSON-round-tripped `SessionSnapshot` — has a rehydrated card whose `model` is still `Some("Opus")`, and that card's badge (toggle on) still renders `ClaudeCode (Opus)`. Today `SessionSnapshot` carries no `model` field at all, so a reconnect drops it silently and, because Claude Code posts `model` only on `SessionStart`, the badge stays degraded for the rest of that session — the same class of loss `live_target` (PRD #20 blocker-4) and `shell_synthetic_working` (fork issue #21) were each added to this same struct to fix.
+- **Does not assert:** the wire-boundary scrub/clamp (`session/live/007`); a real socket reconnect (`session/live/006`); the synthetic-`Working` provenance story (`session/live/011`); model-label normalization, truncation, or `Cf` sanitization at render time (`dashboard/agent-badge/001`, `/005`, `/006`).
+- **Platform coverage:** mac+linux (file is `#![cfg(unix)]` throughout — see the file's own doc comment).
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
