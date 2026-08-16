@@ -9,7 +9,7 @@ use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError}
 #[cfg(unix)]
 use crate::platform::shell::quote_shell_arg;
 #[cfg(windows)]
-use crate::platform::shell::{quote_cmd_exe_arg, quote_cmd_exe_program};
+use crate::platform::shell::{escape_cmd_exe_program, quote_cmd_exe_arg};
 use crate::project_config::ModeConfig;
 
 /// Build the outer-shell command line for `dot-agent-deck watch --interval N
@@ -26,14 +26,16 @@ use crate::project_config::ModeConfig;
 ///
 /// **Windows**: position-aware `cmd.exe` quoting (fork issue #283) —
 /// `exe` and `command` sit in two different grammatical positions of a
-/// `cmd.exe` command line and need two different quoting rules, so each is
-/// quoted with its own function: `exe` is the leading program-name token
-/// ([`quote_cmd_exe_program`], `cmd.exe`'s own space-terminated-unless-
-/// quoted lookup), while `command` is an ordinary argument that must
-/// survive both `cmd.exe`'s own metacharacter scan and the launched
-/// process's `CommandLineToArgvW`-compatible `argv` parsing
-/// ([`quote_cmd_exe_arg`] — see its doc comment for why that needs two
-/// escaping passes). This replaces the pre-#157 `{:?}`-Debug-quoted format
+/// `cmd.exe` command line and need two different treatments, so each gets
+/// its own function: `exe` is the leading program-name token
+/// ([`escape_cmd_exe_program`] — caret-escapes whitespace/metacharacters
+/// rather than quoting, deliberately, so this line's first character is
+/// never `"`; see that function's doc comment for why), while `command` is
+/// an ordinary argument that must survive both `cmd.exe`'s own
+/// metacharacter scan and the launched process's
+/// `CommandLineToArgvW`-compatible `argv` parsing ([`quote_cmd_exe_arg`] —
+/// see its doc comment for why that needs two escaping passes and does use
+/// literal quotes). This replaces the pre-#157 `{:?}`-Debug-quoted format
 /// `main` still uses, which is not a `cmd.exe` quoting scheme at all and
 /// remains vulnerable to issue #157 finding A1 (a configured command
 /// containing `" & calc.exe & rem "` breaks out of the quoted word — see
@@ -53,7 +55,7 @@ fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
 fn watch_invocation(exe: &Path, interval_secs: u64, command: &str) -> String {
     format!(
         "{} watch --interval {} {}",
-        quote_cmd_exe_program(&exe.display().to_string()),
+        escape_cmd_exe_program(&exe.display().to_string()),
         interval_secs,
         quote_cmd_exe_arg(command)
     )
@@ -722,7 +724,7 @@ mod tests {
     /// `watch_invocation_reproduces_mains_a1_vulnerability_on_windows`),
     /// which pinned the pre-#283 `{:?}`-Debug-quoted format byte for byte.
     /// That format is no longer emitted by either arm of `watch_invocation`
-    /// — the Windows arm now calls [`quote_cmd_exe_program`] /
+    /// — the Windows arm now calls [`escape_cmd_exe_program`] /
     /// [`quote_cmd_exe_arg`] unconditionally, so there is no remaining code
     /// path that reproduces the vulnerable baseline to pin. This test
     /// replaces them with a deterministic, non-`cmd.exe` pin of the new
@@ -730,14 +732,21 @@ mod tests {
     /// `watch_invocation_prevents_a1_command_injection_through_real_cmd_exe`
     /// and `watch_invocation_quotes_a_spaced_executable_so_cmd_exe_locates_it`
     /// below).
+    ///
+    /// The executable position comes out caret-escaped (`Program^ Files`),
+    /// not `"…"`-quoted, and the line's first character is asserted to
+    /// never be a quote — see [`escape_cmd_exe_program`]'s doc comment for
+    /// why a quote-wrapped executable token is unsafe here once combined
+    /// with `quote_cmd_exe_arg`'s own necessary quoting of the command.
     #[cfg(windows)]
     #[test]
     fn watch_invocation_quotes_the_executable_and_command_on_windows() {
         let exe = Path::new(r"C:\Program Files\My Deck\dot-agent-deck.exe");
         let line = watch_invocation(exe, 10, "npm run dev");
+        assert!(!line.starts_with('"'));
         assert_eq!(
             line,
-            "\"C:\\Program Files\\My Deck\\dot-agent-deck.exe\" watch --interval 10 ^\"npm run dev^\""
+            "C:\\Program^ Files\\My^ Deck\\dot-agent-deck.exe watch --interval 10 ^\"npm run dev^\""
         );
     }
 

@@ -90,7 +90,7 @@ pub fn shell_command_flag() -> &'static str {
 /// shell-quoting contract for other interpreters. `cmd.exe` has no
 /// equivalent single-quote construct, so there is no Windows arm of this
 /// function; a caller that needs a `cmd.exe`-safe command line must build it
-/// itself with [`quote_cmd_exe_program`] / [`quote_cmd_exe_arg`] below
+/// itself with [`escape_cmd_exe_program`] / [`quote_cmd_exe_arg`] below
 /// (issue #157 finding A1, audit-verified — a `{:?}` Debug-escaped
 /// double-quoted string is *not* `cmd.exe`-safe either, since `cmd.exe`
 /// treats a literal backslash before an embedded `"` as not escaping it, so
@@ -107,37 +107,55 @@ pub fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
-/// Quote `token` as the leading (program-name) position of a `cmd.exe`
-/// command line only when it contains a character outside a conservative
-/// safe set; otherwise return it unchanged. `cmd.exe` locates the program at
-/// the head of a command line by scanning for a closing `"` when the token
-/// opens with one, or otherwise up to the first unquoted space — so a bare
-/// path containing a space (issue #157's original regression) is split and
-/// never found unless quoted.
-///
-/// Same safe set and escaping as `hooks_manage::shell_quote_if_needed`'s
-/// `#[cfg(windows)]` arm (fork #229): `~` is not special to `cmd.exe`
-/// (unlike POSIX home-directory expansion) so it needs no quoting, while `%`
-/// and `!` are `cmd.exe`-special (variable expansion) and are deliberately
-/// excluded from the safe set.
+/// Escape `token` for the leading (program-name) position of a `cmd.exe`
+/// command line by caret-escaping whitespace and every `cmd.exe`
+/// metacharacter, rather than wrapping it in `"…"`. `cmd.exe` locates the
+/// program at the head of a command line by scanning up to the first
+/// unescaped space — so a bare path containing a space (issue #157's
+/// original regression) is split and never found unless that space is
+/// protected. Caret-escaping the space (`^ `), rather than quoting the whole
+/// token, is deliberate, not merely an alternative notation: `"` is not a
+/// legal character in a Windows path, so a program-name token this function
+/// produces never contains one, and never needs to. That matters because
+/// `cmd.exe /C <string>` applies a SEPARATE, one-time preprocessing pass to
+/// its `string` argument before normal parsing ever sees it (`cmd /?`'s
+/// documented `/C` quoting rules): quotes are preserved as typed only if
+/// the ENTIRE argument contains exactly two quote characters naming a
+/// single existing executable with nothing special between them; otherwise,
+/// if the argument's first character happens to be a quote, `cmd.exe`
+/// unconditionally strips that leading quote AND the LAST quote character
+/// anywhere in the argument — not necessarily the same pair — corrupting a
+/// correctly `"…"`-quoted program token the moment [`quote_cmd_exe_arg`]'s
+/// own necessary quoting of the trailing command pushes the total past two.
+/// A caller can't know in advance whether the returned line will be handed
+/// to `cmd.exe /C` (this quirk) or typed into an already-running
+/// interactive `cmd.exe` (no such quirk — see `watch_invocation`'s Windows
+/// arm, whose output is typed into a pane's shell either way), so the fix
+/// has to work under both: never let the token start with `"` at all, and
+/// this preprocessing pass — which activates ONLY "if the first character
+/// is a quote character" — never triggers, in either context. Caret-
+/// escaping the token's OWN metacharacters (`&|<>()^%!,`) alongside
+/// whitespace is the same defense [`quote_cmd_exe_arg`] applies to the
+/// command position, just without the quote-wrap that position needs and
+/// this one must avoid.
 #[cfg(windows)]
-pub fn quote_cmd_exe_program(token: &str) -> String {
-    fn is_safe(b: u8) -> bool {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'\\' | b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b',' | b'~'
-            )
+pub fn escape_cmd_exe_program(token: &str) -> String {
+    let mut result = String::with_capacity(token.len());
+    for c in token.chars() {
+        if matches!(
+            c,
+            ' ' | '\t' | '"' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | ',' | '%' | '!'
+        ) {
+            result.push('^');
+        }
+        result.push(c);
     }
-    if !token.is_empty() && token.bytes().all(is_safe) {
-        token.to_string()
-    } else {
-        format!("\"{}\"", token.replace('"', "\\\""))
-    }
+    result
 }
 
 /// Quote `arg` as a single `cmd.exe` command-line ARGUMENT (as opposed to
-/// [`quote_cmd_exe_program`]'s leading program-name position) so that it
+/// [`escape_cmd_exe_program`]'s leading program-name position, which
+/// deliberately avoids literal quotes — see its doc comment) so that it
 /// survives BOTH of the two separate parsers that see the same text: the
 /// interpreting `cmd.exe`'s own metacharacter scan, and the CRT/
 /// `CommandLineToArgvW`-compatible `argv` parsing the launched child process
@@ -249,19 +267,22 @@ mod windows_quoting_tests {
     use super::*;
 
     #[test]
-    fn quote_cmd_exe_program_leaves_a_safe_path_unquoted() {
+    fn escape_cmd_exe_program_leaves_a_safe_path_unchanged() {
         assert_eq!(
-            quote_cmd_exe_program(r"C:\deck\dot-agent-deck.exe"),
+            escape_cmd_exe_program(r"C:\deck\dot-agent-deck.exe"),
             r"C:\deck\dot-agent-deck.exe"
         );
     }
 
+    /// Caret-escapes each space rather than wrapping the whole token in
+    /// `"…"` — see the function's doc comment for why a literal-quote-based
+    /// wrap here is unsafe once combined with `quote_cmd_exe_arg`'s own
+    /// necessary quoting of the trailing command.
     #[test]
-    fn quote_cmd_exe_program_quotes_a_spaced_path() {
-        assert_eq!(
-            quote_cmd_exe_program(r"C:\Program Files\My Deck\dot-agent-deck.exe"),
-            r#""C:\Program Files\My Deck\dot-agent-deck.exe""#
-        );
+    fn escape_cmd_exe_program_never_produces_a_leading_quote() {
+        let escaped = escape_cmd_exe_program(r"C:\Program Files\My Deck\dot-agent-deck.exe");
+        assert_eq!(escaped, r"C:\Program^ Files\My^ Deck\dot-agent-deck.exe");
+        assert!(!escaped.starts_with('"'));
     }
 
     #[test]

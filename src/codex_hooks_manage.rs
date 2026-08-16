@@ -162,7 +162,7 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
 /// Codex hook commands are shelled through the platform's native shell, so the
 /// quoting rule differs by platform: POSIX single-quoting on Unix
 /// ([`crate::platform::paths::shell_quote_if_needed`]), `cmd.exe`-safe
-/// double-quoting on Windows ([`crate::platform::shell::quote_cmd_exe_program`]
+/// caret-escaping on Windows ([`crate::platform::shell::escape_cmd_exe_program`]
 /// — `codex_home()` is documented as reachable on Windows via `$CODEX_HOME`,
 /// so this path must be genuinely correct there, not merely reachable; fork
 /// issue #238).
@@ -170,7 +170,7 @@ fn build_command(binary_path: &str) -> String {
     #[cfg(unix)]
     let quoted = crate::platform::paths::shell_quote_if_needed(binary_path);
     #[cfg(windows)]
-    let quoted = crate::platform::shell::quote_cmd_exe_program(binary_path);
+    let quoted = crate::platform::shell::escape_cmd_exe_program(binary_path);
 
     format!("{quoted} {HOOK_COMMAND_SUFFIX}")
 }
