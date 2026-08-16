@@ -37781,6 +37781,11 @@ mod tests {
                     "a denied paste must carry the same lock status message a \
                      denied keystroke does"
                 );
+                assert_eq!(
+                    status_message.1, now,
+                    "a denied paste's status timestamp must be the injected \
+                     `now`, not a fresh wall-clock read"
+                );
             }
             PasteGateOutcome::Delivered { .. } => panic!(
                 "expected a locked worker pane with no WaitingForInput status \
