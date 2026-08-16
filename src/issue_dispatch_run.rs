@@ -3456,6 +3456,203 @@ exit 0
         );
     }
 
+    /// Scenario: fork issue #282, async twin of `worktree/create/001`. The
+    /// `issue_dispatch` scheduler's own `create_worktree` (not the TUI's
+    /// `create_worktree_sync`, which PR #331 already locked) races two
+    /// concurrent attaches to the SAME already-existing branch at the SAME
+    /// target path, across many trials -- a single trial proves nothing,
+    /// since the issue's own sync-path measurement found only ~8%
+    /// corruption for one 2-way race. Asserts, for every trial, that at
+    /// most one caller reports `Created`, that `git worktree list` shows
+    /// the target path exactly once, and that `.git/worktrees/` holds
+    /// exactly one admin entry for it. `create_worktree` holds no lock
+    /// today, so this pins the same corruption `worktree/create/001` closed
+    /// on the sync path, on the async path PR #331 explicitly left open.
+    //
+    // Written as a sync `#[test]` driving an explicit multi-thread runtime
+    // rather than `#[tokio::test]`: the linkage-check (PRD #77 Decision 17)
+    // ties each `#[spec(...)]` to the next plain `fn` definition and does
+    // not recognize a `#[tokio::test] async fn` -- see
+    // `issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee` above
+    // for the same pattern. Multi-thread (not current-thread) so the two
+    // racers' `tokio::spawn`ed tasks can genuinely run in parallel at the
+    // Rust level too, matching how the real daemon's `#[tokio::main]`
+    // (multi-thread by default) schedules `create_worktree` callers.
+    #[cfg(unix)]
+    #[spec("worktree/create/003")]
+    #[test]
+    fn create_003_concurrent_async_attach_never_double_creates() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn canonical_for_compare(path: &Path) -> PathBuf {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        }
+
+        fn count_admin_entries_for(clone_dir: &Path, worktree_dir: &Path) -> usize {
+            let worktrees_dir = clone_dir.join(".git").join("worktrees");
+            let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+                return 0;
+            };
+            let target = canonical_for_compare(&worktree_dir.join(".git"));
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter(|e| {
+                    std::fs::read_to_string(e.path().join("gitdir"))
+                        .map(|s| canonical_for_compare(Path::new(s.trim())) == target)
+                        .unwrap_or(false)
+                })
+                .count()
+        }
+
+        fn count_worktree_list_entries(clone_dir: &Path, worktree_dir: &Path) -> usize {
+            let out = std::process::Command::new("git")
+                .current_dir(clone_dir)
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .expect("git worktree list must spawn");
+            assert!(
+                out.status.success(),
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let wanted = canonical_for_compare(worktree_dir);
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| {
+                    l.strip_prefix("worktree ")
+                        .map(|p| canonical_for_compare(Path::new(p)) == wanted)
+                        .unwrap_or(false)
+                })
+                .count()
+        }
+
+        const TRIALS: usize = 60;
+
+        let ws = tempfile::tempdir().unwrap();
+        let ws_root = ws.path().to_path_buf();
+        let clone_dir = ws_root.join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let mut branches = Vec::with_capacity(TRIALS);
+        let mut worktree_dirs = Vec::with_capacity(TRIALS);
+        for i in 0..TRIALS {
+            let branch = format!("async-race-{i}");
+            git(&clone_dir, &["branch", &branch]);
+            branches.push(branch);
+            worktree_dirs.push(ws_root.join(format!("wt-{i}")));
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("build multi-thread runtime");
+
+        // Every trial's pair races concurrently with every other trial's
+        // pair too (not sequentially) -- mirrors `worktree/create/001`'s own
+        // reasoning: real concurrent orchestrations hit the shared
+        // repository this way, and it keeps the whole test's wall-clock
+        // close to a single `git worktree add`'s rather than TRIALS times
+        // that.
+        let results: Vec<[Result<WorktreeCreation, String>; 2]> = rt.block_on(async {
+            let mut handles = Vec::with_capacity(TRIALS);
+            for i in 0..TRIALS {
+                let barrier = Arc::new(tokio::sync::Barrier::new(2));
+                let clone_dir_a = clone_dir.clone();
+                let clone_dir_b = clone_dir.clone();
+                let worktree_dir_a = worktree_dirs[i].clone();
+                let worktree_dir_b = worktree_dirs[i].clone();
+                let branch_a = branches[i].clone();
+                let branch_b = branches[i].clone();
+                let barrier_a = barrier.clone();
+                let barrier_b = barrier;
+                let h_a = tokio::spawn(async move {
+                    barrier_a.wait().await;
+                    create_worktree(&clone_dir_a, &worktree_dir_a, &branch_a, true, "racer-a").await
+                });
+                let h_b = tokio::spawn(async move {
+                    barrier_b.wait().await;
+                    create_worktree(&clone_dir_b, &worktree_dir_b, &branch_b, true, "racer-b").await
+                });
+                handles.push((h_a, h_b));
+            }
+            let mut results = Vec::with_capacity(TRIALS);
+            for (h_a, h_b) in handles {
+                let a = h_a.await.expect("racer-a task must not panic");
+                let b = h_b.await.expect("racer-b task must not panic");
+                results.push([a, b]);
+            }
+            results
+        });
+
+        let mut failures: Vec<String> = Vec::new();
+        let mut double_created = 0usize;
+        let mut duplicate_admin = 0usize;
+        let mut duplicate_listed = 0usize;
+
+        for (i, pair) in results.iter().enumerate() {
+            let created_count = pair
+                .iter()
+                .filter(|r| matches!(r, Ok(WorktreeCreation::Created { .. })))
+                .count();
+            if created_count != 1 {
+                double_created += 1;
+                failures.push(format!(
+                    "trial {i}: expected exactly one Created, got a={:?} b={:?}",
+                    pair[0], pair[1]
+                ));
+            }
+
+            let admin_count = count_admin_entries_for(&clone_dir, &worktree_dirs[i]);
+            if admin_count != 1 {
+                duplicate_admin += 1;
+                failures.push(format!(
+                    "trial {i}: expected exactly one .git/worktrees admin entry for {:?}, found {admin_count}",
+                    worktree_dirs[i]
+                ));
+            }
+
+            let listed_count = count_worktree_list_entries(&clone_dir, &worktree_dirs[i]);
+            if listed_count != 1 {
+                duplicate_listed += 1;
+                failures.push(format!(
+                    "trial {i}: expected `git worktree list` to show {:?} exactly once, found {listed_count}",
+                    worktree_dirs[i]
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "fork issue #282: the async create_worktree has no attach-path lock and failed to \
+             serialize concurrent callers -- \
+             {double_created}/{TRIALS} trials produced more than one `Created`, \
+             {duplicate_admin}/{TRIALS} trials left more than one `.git/worktrees` admin entry, \
+             {duplicate_listed}/{TRIALS} trials showed the path more than once in `git worktree \
+             list`. Failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
     // --- .worktrees/ git-status hygiene via .git/info/exclude ---
 
     // PRD #120 — provisioning keeps `.worktrees/` out of the clone's `git status`
