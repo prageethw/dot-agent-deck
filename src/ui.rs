@@ -290,6 +290,19 @@ impl TabBarInfo {
             is_orchestration.len(),
             labels.len(),
         );
+        // Delta-review round (reviewer D5 / auditor S6): the constructor
+        // otherwise asserts the two vectors that are never used as indices
+        // and says nothing about `active_index`, the one whose name is one.
+        // Every read site compares `i == active_index` rather than indexing
+        // `labels[active_index]`, so an out-of-range value degrades to "no
+        // tab is styled active" in both debug and release — this assert
+        // exists to keep that the deliberate outcome of an empty/unset
+        // state, not of a fixture nobody meant to leave out of range.
+        debug_assert!(
+            labels.is_empty() || active_index < labels.len(),
+            "TabBarInfo::active_index ({active_index}) must be within labels ({})",
+            labels.len(),
+        );
         Self {
             show,
             labels,
@@ -20338,6 +20351,11 @@ pub fn render_card_to_buffer(
 /// assertion about what the user actually sees. `mode` is the ONLY input
 /// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
 /// `UiMode::Normal`.
+///
+/// PRD fork#405 delta-review (reviewer D2): this seam always renders with no
+/// idle art (`idle_art: None` below), unchanged. A caller that needs to pin
+/// the idle-art overlay's row-0 offset (F2) uses the sibling seam
+/// [`render_card_for_mode_with_idle_art_to_buffer`] instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_for_mode_to_buffer(
@@ -20355,12 +20373,55 @@ pub fn render_card_for_mode_to_buffer(
     // Dashboard renders (see the fn doc above).
     show_agent_type_badge: bool,
 ) -> ratatui::buffer::Buffer {
+    render_card_for_mode_with_idle_art_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        mode,
+        width,
+        height,
+        show_agent_type_badge,
+        None,
+    )
+}
+
+/// PRD fork#405 delta-review L1 seam (reviewer D2): same as
+/// [`render_card_for_mode_to_buffer`], plus an `idle_art` input so a test can
+/// render a card with the idle-art overlay active and pin F2 — that the
+/// identity row (body row 0) survives the overlay while the rows below it are
+/// painted over. `idle_art: None` is exactly [`render_card_for_mode_to_buffer`]'s
+/// path; passing `Some` is the only behavioural difference this seam adds.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_for_mode_with_idle_art_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
+    width: u16,
+    height: u16,
+    show_agent_type_badge: bool,
+    idle_art: Option<&AsciiArtResult>,
+) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     let display_name_owned = display_name.map(str::to_string);
+    // `idle_since` is never read by the render path (only `dismissed` and
+    // `phase` are), so any value is safe here.
+    let idle_art_entry = idle_art.map(|art| IdleArtEntry {
+        phase: IdleArtPhase::HasArt(art.clone()),
+        idle_since: Utc::now(),
+        dismissed: false,
+    });
     terminal
         .draw(|frame| {
             let area = Rect {
@@ -20378,7 +20439,7 @@ pub fn render_card_for_mode_to_buffer(
                 display_name_owned.as_ref(),
                 card_number,
                 density.into(),
-                None,
+                idle_art_entry.as_ref(),
                 mode,
                 show_agent_type_badge,
             );
@@ -28332,7 +28393,7 @@ mod tests {
             role_pane_ids: role_pane_ids.clone(),
         };
         let orch_tab_bar =
-            TabBarInfo::new(true, vec!["Orchestration".into()], 1, vec![], vec![true]);
+            TabBarInfo::new(true, vec!["Orchestration".into()], 0, vec![], vec![true]);
         let dash_pane_ids = vec!["p0".to_string(), "p1".to_string()];
         let dash_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],

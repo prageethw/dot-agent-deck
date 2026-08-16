@@ -2887,7 +2887,11 @@ fn pane_011_role_name_on_its_own_body_row() {
     // checking blankness, or this can never pass regardless of content.
     let empty_body0_inner: String = {
         let chars: Vec<char> = empty_body0.chars().collect();
-        chars[1..chars.len().saturating_sub(1)].iter().collect()
+        chars
+            .get(1..chars.len().saturating_sub(1))
+            .unwrap_or_default()
+            .iter()
+            .collect()
     };
     assert!(
         empty_body0_inner.trim().is_empty(),
