@@ -2084,6 +2084,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the non-Idle active-tint case (covered by `tabs/orchestration/010`); the inactive Idle case (also covered by `tabs/orchestration/010`).
 - **Platform coverage:** mac+linux+windows.
 
+##### tabs/orchestration/015 — The active orchestration tab renders BOLD and its status colour but never underline, pinned at the actual rendered terminal byte stream (issue #313).
+- **Layer:** L2 (real-binary PTY against the `orch-deck` fixture's single orchestration, `demo-orch`).
+- **Agent:** none (both roles run `cat`, idle).
+- **Asserts:** opening the fixture's orchestration leaves it the active tab, labeled `<launch-dir-basename>-orchestrator-1` (the form's suggested session name, not the config name `demo-orch`), whose rendered label carries `Modifier::BOLD`, a non-`Color::Reset` foreground matching `palette::STATUS_IDLE` (vt100 `Idx(8)`, since both roles are idle), and NOT underline — issue #313's regression guard for fork issue #377's removal of the underline from the active-tab cue. The L1 specs `tabs/orchestration/010`/`012`/`014` (`render_tab_strip.rs`) already pin the same BOLD/no-UNDERLINED cue at the ratatui buffer and would fail first, in the blocking `build` job, if a bad upstream-sync merge resolution restored `Modifier::UNDERLINED`; this L2 test's distinct value is pinning the same cue through the actual terminal byte stream (deck → crossterm → PTY → vt100), the one link those L1 assertions cannot observe.
+- **Does not assert:** padding-space or `[×]` fill colour (covered on the L1 side by `tabs/orchestration/010`); that the `STATUS_IDLE` colour is correctly *chosen* rather than merely non-`Reset` — `Idx(8)` is also what an orchestration tab renders when no pane-status data joins at all (`tab_status_data` returns `Some(vec![])`), so this only rules out `Color::Reset` reaching the terminal; correct colour selection for non-idle statuses is covered by `tabs/orchestration/010`/`/014`, `tabs/label/002`.
+- **Platform coverage:** mac+linux.
+
 ##### tabs/orchestration/024 — `Ctrl+l` must forward to a focused orchestration role pane's PTY, not be claimed as the split-cycle action, while the deck is in `PaneInput` mode (PRD #387 Defect 1 / M1b — the reported bug, in a real pane).
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
 - **Agent:** none (`orch-bash-role` fixture — a single orchestrator role running a real interactive `bash --noprofile --norc -i`, no LLM tokens spent).
