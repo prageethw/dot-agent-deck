@@ -202,3 +202,107 @@ fn orchestration_pane_crop_drops_the_sidebar_and_reports_a_missing_anchor() {
         "no anchor means no crop:\n{COLLAPSED_GRID}"
     );
 }
+
+/// Scenario: Run `label_in_box_body_row` against a two-card row where the
+/// SECOND card carries the searched label. Before the fix (review finding)
+/// this helper used `position()`, which always returns the FIRST vertical
+/// glyph in the whole body row regardless of which card's top-left corner is
+/// being checked — so it only ever cropped the leftmost card's own body span,
+/// and a label sitting in the second (or third) card of a multi-column row
+/// could never be found. The fixed version mirrors
+/// `label_in_box_top_border`: it iterates EVERY top-left corner on the row
+/// and starts each crop's vertical search at that corner's own column.
+#[test]
+fn body_row_predicate_finds_a_label_in_the_second_card_of_a_row() {
+    const TWO_CARD_GRID: &str = "\
+┌─ alpha ─┐┌─ bravo ─┐
+│ alpha   ││ bravo   │";
+    assert!(
+        common::label_in_box_body_row(TWO_CARD_GRID, "alpha"),
+        "the FIRST card's own body label must still match:\n{TWO_CARD_GRID}"
+    );
+    assert!(
+        common::label_in_box_body_row(TWO_CARD_GRID, "bravo"),
+        "a label in the SECOND card's body row must match — this is the exact case the \
+         `position()`-based implementation could never find:\n{TWO_CARD_GRID}"
+    );
+    assert!(
+        !common::label_in_box_body_row(TWO_CARD_GRID, "charlie"),
+        "a label present in neither card must not match:\n{TWO_CARD_GRID}"
+    );
+}
+
+/// Scenario: Run `label_in_box_body_row` against two fixtures, each built to
+/// fail under exactly one prior/alternate implementation rather than pass
+/// against all of them the way a same-weight two-card grid would. The first
+/// nests a PLAIN-weight vertical inside a THICK card's own body span, so a
+/// weight-BLIND crop (one that stops at the nearest vertical glyph of any
+/// weight) truncates the label — only a search scoped to the corner's own
+/// weight reaches it. The second puts three cards, PLAIN/THICK/PLAIN, on one
+/// row and searches the THIRD card's label, which the pre-fix `position()`
+/// form (review finding: it always returned the FIRST vertical of a given
+/// weight in the WHOLE row regardless of which corner was being checked) can
+/// never reach, because it only ever finds the first PLAIN-weight span.
+/// Verified against both the pre-fix `position()` form and a corner-scoped
+/// but weight-blind form by executing each against these fixtures, not by
+/// tracing (review finding: the prior fixture in this slot passed identically
+/// against the current implementation, the pre-fix `position()` form, and a
+/// weight-blind form, so it guarded nothing — D7 was not actually closed).
+#[test]
+fn body_row_predicate_scopes_the_search_to_each_cards_own_border_weight() {
+    // Discriminates weight-scoped from weight-blind: the nested `│` sits
+    // INSIDE the outer THICK card's own body span, so a crop that stops at
+    // any vertical glyph (not just the corner's own weight) truncates
+    // "bravo" before it is reached.
+    const NESTED_WEIGHT_GRID: &str = "\
+┏━ outer ━━━┓
+┃ a │ bravo ┃";
+    assert!(
+        common::label_in_box_body_row(NESTED_WEIGHT_GRID, "bravo"),
+        "the label beyond a NESTED plain-weight vertical must still match under the \
+         outer card's own THICK weight — a weight-blind crop would stop at the nested \
+         `│` and cut it off:\n{NESTED_WEIGHT_GRID}"
+    );
+
+    // Discriminates the fix from the pre-fix `position()` form: three cards,
+    // PLAIN/THICK/PLAIN, and the label sought is in the THIRD card. `position()`
+    // only ever finds the first PLAIN-weight vertical in the whole row, so it
+    // can only ever crop the FIRST plain card's span and never reaches this one.
+    const THREE_CARD_GRID: &str = "\
+┌─ a ─┐┏━ b ━┓┌─ c ─┐
+│  a  │┃  b  ┃│  c  │";
+    assert!(
+        common::label_in_box_body_row(THREE_CARD_GRID, "c"),
+        "the THIRD card's own body label must match — the pre-fix `position()` form \
+         can only ever find the first PLAIN-weight span in the row:\n{THREE_CARD_GRID}"
+    );
+    assert!(
+        !common::label_in_box_body_row(THREE_CARD_GRID, "zzz"),
+        "a label present in no card must not match:\n{THREE_CARD_GRID}"
+    );
+}
+
+/// Scenario: Run the shared word-boundary predicate (`common::contains_word_token`,
+/// PRD fork#405 review round — consolidated out of three byte-identical e2e-local
+/// copies) against the three cases those e2e callers actually depend on: a role
+/// name must not match as a substring of a longer, hyphenated identifier
+/// (`worker` inside this deck's own `worker-deck` chrome title), must still match
+/// when abutted by a card's own border glyph rather than whitespace (`│worker`,
+/// the PRD fork#405 M1 body-row shape with no leading pad), and must not match a
+/// different role name that happens to share a prefix (`beta` inside
+/// `beta-agent`).
+#[test]
+fn word_token_predicate_respects_identifier_boundaries() {
+    assert!(
+        !common::contains_word_token("worker-deck — 1/2 session(s)", "worker"),
+        "`worker` must not match as a substring of the hyphenated `worker-deck` chrome title"
+    );
+    assert!(
+        common::contains_word_token("│worker", "worker"),
+        "`worker` must match when abutted by a card border glyph instead of whitespace"
+    );
+    assert!(
+        !common::contains_word_token("│beta-agent│", "beta"),
+        "`beta` must not match as a substring of the longer identifier `beta-agent`"
+    );
+}
