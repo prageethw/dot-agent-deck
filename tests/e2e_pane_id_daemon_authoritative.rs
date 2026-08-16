@@ -19,7 +19,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use common::spawn_daemon_serve;
+use common::{attach_request_on, spawn_daemon_serve};
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
 use dot_agent_deck::daemon_protocol::{AttachRequest, KIND_REQ, KIND_RESP};
 use spec::spec;
@@ -146,5 +146,60 @@ fn pane_id_001_start_agent_mints_distinct_daemon_pane_ids() {
         "the daemon must not simply echo back the client-proposed \
          DOT_AGENT_DECK_PANE_ID; it must mint its own — got the client's \
          own value back unchanged"
+    );
+}
+
+/// Scenario: Start a real `dot-agent-deck daemon serve` subprocess, spawn a
+/// `cat` stub via `StartAgent` and note its daemon-minted `pane_id`, close
+/// that pane via `StopAgent`, then spawn a second `cat` stub via a fresh
+/// `StartAgent` call. Assert the second call's daemon-minted `pane_id` is
+/// different from the first's, proving `mint_pane_id`'s sequence counter is
+/// never reissued once a pane has exited.
+#[spec("daemon/pane-id/002")]
+#[test]
+fn pane_id_002_id_not_reissued_after_pane_exits() {
+    let daemon = spawn_daemon_serve(None, "0");
+
+    let resp_a = attach_request_on(
+        &daemon.attach_socket,
+        &start_agent_request("client-chosen-alpha"),
+    )
+    .expect("send first StartAgent request");
+    assert!(resp_a.ok, "first StartAgent call failed: {resp_a:?}");
+    let registry_id_a = resp_a
+        .id
+        .clone()
+        .expect("first StartAgent response carried no registry id");
+    let pane_id_a = resp_a
+        .pane_id
+        .clone()
+        .expect("first StartAgent response carried no daemon-minted pane_id");
+
+    let stop_resp = attach_request_on(
+        &daemon.attach_socket,
+        &AttachRequest::StopAgent { id: registry_id_a },
+    )
+    .expect("send StopAgent request");
+    assert!(
+        stop_resp.ok,
+        "StopAgent for the first pane failed: {stop_resp:?}"
+    );
+
+    let resp_b = attach_request_on(
+        &daemon.attach_socket,
+        &start_agent_request("client-chosen-beta"),
+    )
+    .expect("send second StartAgent request");
+    assert!(resp_b.ok, "second StartAgent call failed: {resp_b:?}");
+    let pane_id_b = resp_b
+        .pane_id
+        .clone()
+        .expect("second StartAgent response carried no daemon-minted pane_id");
+
+    assert_ne!(
+        pane_id_a, pane_id_b,
+        "a pane_id must not be reissued after its pane exits — got the \
+         same value {pane_id_a:?} both before and after StopAgent closed \
+         the first pane"
     );
 }
