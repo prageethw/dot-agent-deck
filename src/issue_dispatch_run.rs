@@ -1376,6 +1376,11 @@ fn classify_worktree_add_result(
 /// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
+///
+/// Fork #282 (async half): the whole probe→add sequence runs under the same
+/// [`worktree_attach_lock_path`] exclusive lock [`create_worktree_sync`]
+/// already holds for its own attach race — see the lock acquisition inside
+/// this function for why an unbounded `flock` wait is not safe here.
 pub(crate) async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -1384,6 +1389,49 @@ pub(crate) async fn create_worktree(
     creator: &str,
 ) -> Result<WorktreeCreation, String> {
     ensure_worktree_parent_dir(worktree_dir)?;
+
+    // Fork #282 (async half): the same attach-race fix `create_worktree_sync`
+    // already carries, ported to the async path. Locking on
+    // `worktree_attach_lock_path` (the same lock key the sync path uses) is
+    // what makes a scheduled dispatch and an interactive attach actually
+    // contend with each other, not just two calls of this same function.
+    // `acquire_spawn_lock` has no timeout of its own, unlike the sync path's
+    // `acquire_worktree_lock_sync`, so it is bounded here with the same
+    // `WORKTREE_GIT_TIMEOUT` the `git` calls below already use — an
+    // unbounded wait would let one wedged racer block every other caller of
+    // this function indefinitely. On timeout the underlying `flock` attempt
+    // keeps running to completion on its `spawn_blocking` thread (blocking
+    // threads cannot be cancelled), but since nothing is left awaiting it by
+    // then, the `SpawnLock` it eventually returns is immediately dropped and
+    // released — it never accumulates as a leaked hold.
+    let lock_path = worktree_attach_lock_path(clone_dir, worktree_dir)
+        .map_err(|e| format!("failed to resolve worktree lock path: {e}"))?;
+    if let Some(parent) = lock_path.parent() {
+        crate::platform::fsperm::ensure_owner_only_dir(parent).map_err(|e| {
+            format!(
+                "failed to prepare worktree lock directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let _attach_lock = tokio::time::timeout(
+        WORKTREE_GIT_TIMEOUT,
+        crate::platform::lock::acquire_spawn_lock(&lock_path),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "timed out after {WORKTREE_GIT_TIMEOUT:?} waiting for the worktree attach lock {}",
+            lock_path.display()
+        )
+    })?
+    .map_err(|e| {
+        format!(
+            "failed to acquire worktree attach lock {}: {e}",
+            lock_path.display()
+        )
+    })?;
+
     let branch_exists = run_status_args(
         "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
