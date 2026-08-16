@@ -1321,6 +1321,7 @@ fn install_delivery_notice_sink(
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             };
             let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
             guard.apply_daemon_report_event(event);
@@ -1942,6 +1943,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             };
 
             // One ordered ingestion step (broadcast + apply under a single
@@ -2379,6 +2381,7 @@ mod ingest_event_ordering_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         }
     }
 
@@ -2555,6 +2558,7 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                model: None,
             }))
             .expect("surface broadcast-only card");
         let BroadcastMsg::Event(surface) = attached_rx.recv().await.expect("surface event") else {
@@ -2764,6 +2768,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         assert_eq!(
             state.read().await.sessions["sess-370"].status,
@@ -2893,6 +2898,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
 
         // Generation 1, then the same-agent restart that rolls the generation
@@ -3087,6 +3093,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         // `SessionStart` creates the card (and the `pane_hook_session_id`
         // correlation the monitor needs); `ShellBusy` promotes it to `Working`,
@@ -3210,6 +3217,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         assert_eq!(
             state.read().await.sessions[SESSION].status,
@@ -3340,6 +3348,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         };
         state
             .write()
