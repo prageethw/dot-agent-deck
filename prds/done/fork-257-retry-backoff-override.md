@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status** *(2026-08-14)*: **Merged into the fork** — [PR #268](https://github.com/prageethw/dot-agent-deck/pull/268) (`eecb8576`); on `main` but not yet in a release tag. M1 and M2 complete, reviewed and mutation-proven. **M3 (offer upstream) remains open** — rule 19 debt, not unfinished code.
+**Status** *(2026-08-14)*: **Merged into the fork** — [PR #268](https://github.com/prageethw/dot-agent-deck/pull/268) (`eecb8576`); on `main` but not yet in a release tag. M1 and M2 complete, reviewed and mutation-proven. **M3 (offer upstream) is discharged as [fork #419](https://github.com/prageethw/dot-agent-deck/issues/419)** *(filed 2026-08-16, at archive time)* — rule 19 debt, not unfinished code.
 
 **M1 — the override seam.** `send_retry_base()` extracted as a directly-callable accessor with the `cfg(any(test, debug_assertions))` pair, clamped to `SEND_RETRY_BACKOFF_CAP`, warn-once. The extraction and that ceiling were **decisions taken mid-flight**, not the PRD's original wording — see the Decision subsection under M1. A shared un-gated `SEND_RETRY_BASE_MS` keeps the release floor and the test fallback from drifting.
 

@@ -1,5 +1,6 @@
 # PRD fork#378 — Show the active model alongside the agent-type badge
 
+**Status** *(added 2026-08-16)*: **Merged into the fork** — [PR #379](https://github.com/prageethw/dot-agent-deck/pull/379) (`41e42a9c`), first released in **v0.38.3**. Issue #378 closed. The doc previously had no Status line despite the PRD having shipped.
 **Issue:** [prageethw/dot-agent-deck#378](https://github.com/prageethw/dot-agent-deck/issues/378)
 **Predecessor:** fork #339 (agent-type badge toggle) — this extends it; it does not replace it.
 **Experimental flag:** No (CLAUDE.md rule 9 — extends an existing surface, and stays hidden by default behind the existing toggle).
