@@ -31,6 +31,12 @@
 //!      rather than deduplicating into a set, so a repeat is
 //!      representable instead of silently collapsing to whichever
 //!      heading was parsed last.
+//!   10. The repository is not unexpectedly shallow (issue #325). Only
+//!       asserted in a multi-worktree checkout — see [`repo_state`].
+//!   11. The worktree registry (`git worktree list`) has no drift: no
+//!       entry points at a path that no longer exists on disk (issue #325).
+//!   12. The current worktree's own directory still exists (issue #325,
+//!       the degenerate case of check 11).
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -65,6 +71,7 @@
 
 mod clean_tmp;
 mod list_tests;
+mod repo_state;
 mod work_type;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -228,10 +235,17 @@ fn main() -> ExitCode {
 
     let mut failures: Vec<String> = Vec::new();
 
+    // Checks 10-12 (issue #325): repository-state preflight. Runs before
+    // the catalog is even parsed — a corrupted repository state is a more
+    // fundamental problem than a catalog mismatch, and should never be
+    // masked by an unrelated early return below. See [`repo_state`].
+    failures.extend(repo_state::check(&root));
+
     let catalog_ids = match parse_catalog_ids(&catalog_path) {
         Ok(ids) => ids,
         Err(e) => {
             eprintln!("failed to parse catalog at {}: {e}", catalog_path.display());
+            print_preflight_failures(&failures);
             return ExitCode::from(2);
         }
     };
@@ -242,6 +256,7 @@ fn main() -> ExitCode {
                 "failed to read allowlist at {}: {e}",
                 allowlist_path.display()
             );
+            print_preflight_failures(&failures);
             return ExitCode::from(2);
         }
     };
@@ -489,7 +504,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 9 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 12 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -501,6 +516,23 @@ fn main() -> ExitCode {
             eprintln!("  {f}");
         }
         ExitCode::FAILURE
+    }
+}
+
+/// Print any repository-state preflight failures (checks 10-12) accumulated
+/// before an early, unrelated `return` (a missing/malformed catalog or
+/// allowlist) — otherwise a genuinely shallow or drifted repository would
+/// be silently dropped by whichever early return happened to fire first.
+fn print_preflight_failures(failures: &[String]) {
+    if failures.is_empty() {
+        return;
+    }
+    eprintln!(
+        "additionally, linkage-check: {} repository-state failure(s):",
+        failures.len()
+    );
+    for f in failures {
+        eprintln!("  {f}");
     }
 }
 
