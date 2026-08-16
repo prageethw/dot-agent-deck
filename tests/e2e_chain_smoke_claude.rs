@@ -66,7 +66,7 @@ fn claude_001_thinking_working_idle() {
 
     // The pane card appears as soon as the deck restores the saved
     // session — the agent's name `claude-smoke` is what's shown on
-    // the card title row, so its presence is a reliable starting
+    // the card's identity row, so its presence is a reliable starting
     // anchor and uses no LLM tokens.
     deck.wait_for_string("claude-smoke");
 

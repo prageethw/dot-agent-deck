@@ -19,7 +19,7 @@ use spec::spec;
 /// pane-m2-001`, `session_id = m2demo`, `agent_type = claude_code`)
 /// directly to the per-test hook socket. The deck's daemon auto-
 /// registers the unknown pane on its first `SessionStart` event,
-/// so a card titled `m2demo` should appear on the dashboard within
+/// so a card showing `m2demo` should appear on the dashboard within
 /// the test budget. No real LLM tokens are spent — the harness
 /// injects the event in-process.
 #[spec("hooks/delivery/001")]

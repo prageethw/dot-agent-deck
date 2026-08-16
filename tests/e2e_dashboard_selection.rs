@@ -134,6 +134,25 @@ fn selection_015_tab_round_trip_clears_highlight_real_binary() {
     deck.wait_for_absence("\u{25b8}");
 }
 
+/// `role` appears somewhere on the settled grid as its own token — bounded
+/// on both sides by anything that is NOT an identifier character (a card
+/// border glyph, whitespace, a newline, or start/end of the grid) rather
+/// than specifically a space. PRD fork#405 M1 moved the role name off the
+/// card's title/border row onto its own unconditional body row directly
+/// beneath it, and `render_session_card` (`src/ui.rs`) pushes that row's
+/// text with NO leading or trailing pad — so a `" {role} "`-style
+/// space-bounded needle can never match post-M1 (the character immediately
+/// to the left of the role name is the card's own border glyph, not a
+/// space). Word-boundary matching finds the role regardless of which
+/// border glyph or how much padding surrounds it, while still ruling out
+/// `"worker"` matching inside this deck's own `"worker-deck"` chrome title
+/// (the char right after "worker" there is `-`, a word char, so the match
+/// is rejected) — the exact collision the old `" worker "` needle existed
+/// to avoid.
+fn grid_has_role(grid: &str, role: &str) -> bool {
+    common::contains_word_token(grid, role)
+}
+
 /// Drive the new-pane dialog to open the (single) orchestration in the fixture.
 /// With no `[[modes]]` defined the Mode chip row is `[No mode] [Orch: …]
 /// [schedule]`, so ONE Right selects the orchestration; selecting an
@@ -172,11 +191,13 @@ fn selection_019_enter_paints_highlight_on_orchestration_real_binary() {
     // round-trip needs). Its two `cat` role panes render as deck cards.
     // Fork-only (`349e895`): the dashboard title bar itself now reads
     // `worker-deck`, so a bare "worker" needle would match the chrome from
-    // frame one — bound it with spaces (` worker `, the "worker" role card's
-    // own title, not "worker-deck ") so this genuinely waits for the 2nd
-    // role card to render.
+    // frame one — `grid_has_role` bounds the match to the "worker" role
+    // card's own identity text (word-boundary, not `-deck`) so this
+    // genuinely waits for the 2nd role card to render.
     open_orchestration(&deck);
-    deck.wait_for_string(" worker "); // the 2nd role card → orchestration deck is up
+    deck.wait_until_grid("2nd role card (worker) rendered", |g| {
+        grid_has_role(g, "worker")
+    }); // the 2nd role card → orchestration deck is up
 
     // Detach to Normal mode on the Orchestration tab so `j` / Enter drive the
     // deck (Enter would otherwise type into the focused role pane).
@@ -188,17 +209,17 @@ fn selection_019_enter_paints_highlight_on_orchestration_real_binary() {
     // Round-trip: Orchestration → Dashboard → Orchestration. The highlight
     // clears on the tab switch (SC1 / orchestration_003).
     deck.send_bytes(b"\x1b[D"); // Left → previous tab → Dashboard
-    // `wait_for_absence("worker")` can never succeed post-`349e895`: the
+    // A bare "worker" needle can never succeed post-`349e895`: the
     // Dashboard's own title bar reads `worker-deck — N/M session(s)`, so a
-    // bare "worker" needle is permanently present in the deck's own chrome
-    // regardless of whether role cards are showing. Bound the needle to the
-    // role card's own title (` worker `) — the title bar's `worker-deck `
-    // has no space after "worker" (a hyphen follows instead), so it can't
-    // satisfy this needle.
-    deck.wait_for_absence(" worker "); // left the orchestration (role cards gone; role panes are excluded from the Dashboard)
+    // bare "worker" substring is permanently present in the deck's own
+    // chrome regardless of whether role cards are showing. `grid_has_role`
+    // bounds the match to the role card's own identity text — the title
+    // bar's `worker-deck` has a hyphen (a word char) right after "worker",
+    // so it can never satisfy the word-boundary check.
+    deck.wait_until_grid("worker role card gone", |g| !grid_has_role(g, "worker")); // left the orchestration (role cards gone; role panes are excluded from the Dashboard)
     deck.wait_for_absence("\u{25b8}"); // highlight cleared
     deck.send_bytes(b"\x1b[C"); // Right → next tab → Orchestration
-    deck.wait_for_string(" worker "); // back on the Orchestration deck
+    deck.wait_until_grid("worker role card rendered", |g| grid_has_role(g, "worker")); // back on the Orchestration deck
 
     // THE REGRESSION: Enter on the Orchestration deck must RESTORE the previous
     // role AND paint its highlight. Pre-fix the role pane is already focused, so

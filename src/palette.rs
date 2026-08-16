@@ -74,18 +74,40 @@
 //! the thicker glyph costs no layout: the pane's inner area, its PTY size, the
 //! card's inner area, and the PRD #84 invariant-3 contract are all unaffected.
 //!
-//! All roles are **named ANSI** colors (or `Color::Reset`) only — no absolute
-//! `Color::Rgb`, which the theme guards (`theme/contrast/001`) forbid so
-//! terminal themes can remap them. Note that a *named* colour is not
-//! automatically safe either: `Color::White` would be as invisible on a light
-//! theme as `Color::DarkGray` is on a dark one. Where a role must contrast on
-//! BOTH *and* may carry no hue, `Color::Reset` is the only correct answer,
-//! because the terminal resolves it against its own background.
+//! Roles are **named ANSI** colors (or `Color::Reset`) wherever one exists —
+//! no absolute `Color::Rgb`, which the theme guards (`theme/contrast/001`)
+//! forbid so terminal themes can remap them. Note that a *named* colour is
+//! not automatically safe either: `Color::White` would be as invisible on a
+//! light theme as `Color::DarkGray` is on a dark one. Where a role must
+//! contrast on BOTH *and* may carry no hue, `Color::Reset` is the only
+//! correct answer, because the terminal resolves it against its own
+//! background.
 //!
 //! A role that must keep a hue has no such escape, so it is chosen by
 //! measurement instead: see [`STATUS_WAITING`] for the luminance ceiling every
 //! such colour is up against (issue #579), and `theme/contrast/002` for the
 //! guard that recomputes it.
+//!
+//! [`ROLE_NAME`] is the one deliberate exception: named ANSI has no orange,
+//! and the role-name row (PRD #405 M1) needs a hue distinct from every status
+//! colour that still reads on both a dark and a light background. Measured
+//! contrast (WCAG relative luminance ratio):
+//!
+//! | Colour | vs black | vs white |
+//! |---|---|---|
+//! | `Indexed(208)` `#ff8700` | 8.72:1 | 2.41:1 |
+//! | `Indexed(166)` `#d75f00` | 5.53:1 | 3.80:1 |
+//! | **`Indexed(130)` `#af5f00`** | **4.46:1** | **4.71:1** |
+//!
+//! `Indexed(130)` is the only candidate balanced on both themes; `Indexed(166)`
+//! fails WCAG AA (4.5:1) on light terminals, which would add a second instance
+//! of the bug class issue #312 is already open about. `Color::Yellow` and
+//! `Color::LightRed` are unavailable — they already mean [`STATUS_WAITING`]
+//! and [`STATUS_ERROR`], and a card cannot have one hue meaning two things. A
+//! 256-cube index is nominally remappable but effectively fixed on most
+//! terminals — one tier weaker than the `Color::Rgb` ban, and accepted
+//! deliberately here rather than drifted into. **The `Color::Rgb` ban itself
+//! is unchanged**; `ROLE_NAME` is still not an absolute RGB colour.
 
 use ratatui::style::Color;
 
@@ -196,6 +218,12 @@ pub const FOCUSED: Color = Color::Cyan;
 /// The cost, accepted knowingly: a selected card's BORDER no longer reports
 /// status. Its status badge still does, at full colour, in the top-right corner.
 pub const SELECTED: Color = Color::Reset;
+
+/// The role-name row on a deck card (PRD #405 M1) — e.g. `Orchestrator`,
+/// beneath the type/model title row. See the module doc above for why this
+/// is the palette's one deliberate non-named-ANSI exception and how
+/// `Indexed(130)` was chosen over `Indexed(166)`/`Indexed(208)`.
+pub const ROLE_NAME: Color = Color::Indexed(130);
 
 /// Resolve a session status to its centralized border/badge role color. This
 /// is the single source of truth shared by the deck-card render path
