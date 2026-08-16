@@ -896,7 +896,14 @@ fn lock_017_paste_gated_by_lock_state() {
     // TEMPORARY: once the hypothesis is confirmed/fixed or ruled out, this
     // reverts to the single-pass form (or becomes a real regression test, if
     // a synthetic reproduction is found — see the coder task file for #414).
-    const DIAG_ITERATIONS: usize = 30;
+    //
+    // Raised from 30 to 300 after a first (bug-free, post-toggle-fix) 30-pass
+    // run completed clean in 49s with no recurrence: the tester's "roughly
+    // 1-in-4" estimate came from scattered historical CI observations, not a
+    // measured per-cycle rate, and a clean 30-pass run does not rule out a
+    // materially rarer recurrence. At ~1.2s/iteration observed, 300 passes
+    // costs low-single-digit minutes — cheap against another whole CI push.
+    const DIAG_ITERATIONS: usize = 300;
     const DENIAL_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
     for iteration in 0..DIAG_ITERATIONS {
         // A plain Ctrl+d / Ctrl+d round trip (PaneInput -> Normal ->

@@ -126,20 +126,24 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Issue #414 diagnostic (TEMPORARY — remove alongside the diagnostic loop in
 # `lock_017_paste_gated_by_lock_state` once the scrollback-reset hypothesis is
-# confirmed/fixed or ruled out): the test now repeats its re-lock -> scroll ->
-# deny -> check cycle 30 times in one run to raise the odds of observing a
-# ~1-in-4 recurrence within a single CI push (nextest `retries = 0`), each
-# pass carrying its own up-to-10s scroll-wait and up-to-3s denial-wait
-# budgets. Worst case that is well past the default 3 x 60s kill window; being
-# killed there would cost exactly the diagnostic evidence this loop exists to
-# capture. Scoped by name; still bounded, so a wedged run cannot hang forever.
+# confirmed/fixed or ruled out): the test now repeats its scroll -> deny ->
+# check cycle 300 times in one run (raised from 30 after a clean 30-pass run
+# was inconclusive — the tester's "roughly 1-in-4" was a scattered historical
+# impression, not a measured per-cycle rate), each pass carrying its own
+# up-to-10s scroll-wait and up-to-3s denial-wait budgets. Worst case that is
+# well past the default 3 x 60s kill window; being killed there would cost
+# exactly the diagnostic evidence this loop exists to capture. Measured
+# typical cost ~1.2s/iteration (a clean 30-pass run completed in 49s
+# end-to-end), so 300 passes is low-single-digit minutes in the common case —
+# this override covers the uncommon case. Scoped by name; still bounded, so a
+# wedged run cannot hang forever.
 #
 # The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
 # be updated in lockstep with any rename — a stale filter matches nothing and
 # silently drops this test back to the 3 x 60s default, killing it mid-wait.
 [[profile.default.overrides]]
 filter = 'test(lock_017_paste_gated_by_lock_state)'
-slow-timeout = { period = "60s", terminate-after = 10 }
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 # Issue #33: cap how many PTY tests run CONCURRENTLY.
 #
@@ -226,7 +230,7 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # for the full rationale.
 [[profile.e2e.overrides]]
 filter = 'test(lock_017_paste_gated_by_lock_state)'
-slow-timeout = { period = "60s", terminate-after = 10 }
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 # Same carve-out for the issue #33 concurrency cap, for the same reason: an
 # override list is per-profile and is not inherited from `default`.
