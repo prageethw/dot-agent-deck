@@ -904,8 +904,11 @@ fn lock_017_paste_gated_by_lock_state() {
     // text is not already on screen at this point in the test — the
     // preceding re-lock's `Ctrl+e` already overwrote it with
     // "Pane entry: locked" (`Action::ToggleOrchestrationLock`, `src/ui.rs`)
-    // — so its (re)appearance here is unambiguous evidence that THIS paste
-    // specifically reached and was denied by the gate.
+    // — so its (re)appearance here is unambiguous evidence that the gate
+    // ran on this input and denied it in this turn. It does not by itself
+    // distinguish a paste denial from a keystroke denial (both gates write
+    // the same status message), but combined with the sentinel-absence and
+    // scrollback checks below, that is all this test needs to prove.
     const DENIAL_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d, Ctrl+e, Ctrl+d to type here";
     let regated_paste = format!("\x1b[200~{REGATED_PASTE_SENTINEL}\x1b[201~");
     deck.send_keys(regated_paste.as_bytes());
