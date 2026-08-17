@@ -3942,6 +3942,27 @@ mod tests {
         }
     }
 
+    /// Scenario: call `pane_env` with `registration_generation` set to
+    /// `Some(3)` (an orchestration-role pane, the branch every production
+    /// spawn call site actually exercises) and assert the returned env vec
+    /// carries `(DOT_AGENT_DECK_REGISTRATION_GENERATION, "3")` alongside the
+    /// pane-id tag. Fork #358 M4 finding 2 (reviewer F1 / auditor B3): every
+    /// existing `pane_env` test only ever passed `None`, so the `Some`
+    /// branch that injects the generation into a real worker's environment
+    /// was never exercised by any test.
+    #[test]
+    fn pane_env_injects_the_registration_generation_when_present() {
+        let env = pane_env("sched-x-2", false, None, Some(3));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == DOT_AGENT_DECK_REGISTRATION_GENERATION && v == "3"),
+            "pane_env(.., Some(3)) must inject \
+             (DOT_AGENT_DECK_REGISTRATION_GENERATION, \"3\") into the child's \
+             env so the work-done CLI can report the generation it was \
+             actually spawned under; got {env:?}"
+        );
+    }
+
     // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a
     // SessionStart for the spawned pane, rooted at the spawn cwd, with
     // `agent_id == None` so a later real hook supersedes (not duplicates) it,

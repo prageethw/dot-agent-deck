@@ -7056,6 +7056,153 @@ clear = false
         );
     }
 
+    /// Scenario: model a daemon restart as two SEPARATE `AppState` instances
+    /// (a restart is a fresh process with fresh in-memory state, not one
+    /// state reused twice). Register pane "P" for orchestration A in
+    /// `state_before` via the real reserve→confirm path production spawn
+    /// uses, capture the generation A's worker would carry, then build a
+    /// brand-new `state_after` — nothing carries over, exactly like
+    /// `PANE_COUNTER` resetting on a real restart — and register the SAME
+    /// pane_id "P" there for a different orchestration B, simulating the
+    /// post-restart tenant that reused it. Deliver A's pre-restart signal to
+    /// `state_after` and assert it is refused: nothing may be written into
+    /// B's worktree under B's role.
+    ///
+    /// Fork #358 M4 finding 1 (reviewer + auditor, independently): this is
+    /// the RED M1/M2 does not close — both independently-started
+    /// `AppState`s assign pane "P" the same first generation, so the
+    /// in-memory counter alone cannot tell a pre-restart registration from a
+    /// post-restart one that happens to reuse the pane_id.
+    #[tokio::test]
+    async fn handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart() {
+        let cwd_before = tempfile::tempdir().expect("tempdir");
+        let cwd_after = tempfile::tempdir().expect("tempdir");
+        let identity_before = instance("orch-before-restart");
+        let identity_after = instance("orch-after-restart");
+
+        // Pre-restart daemon: register "P" the way production spawn does —
+        // reserve the generation (so it can be injected into the child's
+        // env BEFORE spawn), then confirm once "spawn" has succeeded.
+        let mut state_before = AppState::default();
+        let generation_before = state_before.reserve_registration_generation("P");
+        state_before.confirm_orchestration_role(
+            "P",
+            "coder",
+            false,
+            identity_before,
+            Some(cwd_before.path().to_str().expect("utf8 cwd")),
+            generation_before,
+        );
+
+        // The signal a real worker spawned under state_before would have
+        // sent — stamped with the generation it was actually spawned under,
+        // read back rather than hand-typed.
+        let stale_signal = WorkDoneSignal {
+            pane_id: "P".to_string(),
+            task: "pre-restart report — must never land in the post-restart \
+                   tenant's worktree"
+                .to_string(),
+            done: false,
+            timestamp: Utc::now(),
+            generation: generation_before,
+        };
+
+        // Post-restart daemon: a FRESH AppState — nothing carries over,
+        // exactly like a real process restart. Pane "P" is reused (small
+        // daemon-scoped integers recycle, #358's motivating scenario) for a
+        // different orchestration.
+        let mut state_after = AppState::default();
+        let generation_after = state_after.reserve_registration_generation("P");
+        state_after.confirm_orchestration_role(
+            "P",
+            "coder",
+            false,
+            identity_after,
+            Some(cwd_after.path().to_str().expect("utf8 cwd")),
+            generation_after,
+        );
+
+        // Sanity: this collision is exactly M4 finding 1 — two
+        // independently-started AppState instances (simulating a daemon
+        // restart) both assign pane "P" the SAME first generation, because
+        // the counter is in-memory and resets to empty on restart.
+        assert_eq!(
+            generation_before, generation_after,
+            "sanity: two independent AppState instances (simulating a \
+             daemon restart) must both start pane P's generation at the \
+             same value — closing that collision is exactly what M4 must do"
+        );
+
+        let registry = AgentPtyRegistry::new();
+        state_after.handle_work_done(stale_signal, &registry).await;
+
+        let file_name = work_done_file_name("coder", "P");
+        let misdelivered_path = cwd_after.path().join(".dot-agent-deck").join(&file_name);
+        assert!(
+            !misdelivered_path.exists(),
+            "a work-done signal produced BEFORE a daemon restart (generation \
+             {generation_before}) must be refused by the post-restart daemon \
+             rather than written into the post-restart tenant's worktree at \
+             {}: an in-memory generation counter alone cannot distinguish a \
+             pre-restart registration from a post-restart one that happens \
+             to reuse the same pane_id (fork #358 M4)",
+            misdelivered_path.display()
+        );
+    }
+
+    /// Scenario: reserve a registration generation for pane "P", confirm the
+    /// registration with that SAME reserved value (read back, never
+    /// retyped), build a `WorkDoneSignal` carrying that same reserved value,
+    /// call `handle_work_done`, and assert delivery SUCCEEDS.
+    ///
+    /// Fork #358 M4 finding 2 (reviewer F1 / auditor B3): every existing
+    /// `handle_work_done` test hand-writes the SAME literal generation on
+    /// both the registration side and the signal side, so they pass whether
+    /// or not `reserve_registration_generation` → `confirm_orchestration_role`
+    /// → `WorkDoneSignal.generation` → `handle_work_done`'s comparison are
+    /// actually wired together correctly. This test proves the chain agrees
+    /// by construction rather than by three independent literals happening
+    /// to match.
+    #[tokio::test]
+    async fn handle_work_done_delivers_when_signal_carries_the_reserved_generation() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let identity = instance("orch-chain");
+
+        let mut state = AppState::default();
+        let reserved = state.reserve_registration_generation("P");
+        state.confirm_orchestration_role(
+            "P",
+            "coder",
+            false,
+            identity,
+            Some(cwd.path().to_str().expect("utf8 cwd")),
+            reserved,
+        );
+
+        let signal = WorkDoneSignal {
+            pane_id: "P".to_string(),
+            task: "report carrying the reserved generation".to_string(),
+            done: false,
+            timestamp: Utc::now(),
+            generation: reserved,
+        };
+
+        let registry = AgentPtyRegistry::new();
+        state.handle_work_done(signal, &registry).await;
+
+        let file_name = work_done_file_name("coder", "P");
+        let delivered_path = cwd.path().join(".dot-agent-deck").join(&file_name);
+        assert!(
+            delivered_path.exists(),
+            "a work-done signal carrying the SAME generation \
+             reserve_registration_generation returned (read back, not \
+             retyped) must be delivered, proving the reserve→confirm→signal→\
+             handle_work_done chain is genuinely wired end to end; expected \
+             a file at {}",
+            delivered_path.display()
+        );
+    }
+
     /// PRD #249 M1: the readiness buffer's env seam. `0` must stay reachable —
     /// it is the toggle test's control arm and the e2e harness's opt-out — while
     /// an absurd value is capped so a mistyped pin cannot hang every delegate,
