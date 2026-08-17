@@ -24818,9 +24818,9 @@ mod tests {
     }
 
     /// Scenario: Render the same narrow, short 7-role dashboard and check
-    /// that `ui.columns` — the value the main loop derives independently for
-    /// keyboard navigation — agrees with the column count the render path
-    /// actually fitted.
+    /// that `ui.columns` is kept in sync with the render path's actual
+    /// fitted column count, rather than left stale or independently
+    /// computed.
     #[spec("dashboard/grid/002")]
     #[test]
     fn grid_002_narrow_short_dashboard_sets_ui_columns_to_fitted_cols() {
@@ -24849,7 +24849,7 @@ mod tests {
         // defect), height 8 -> dashboard_area.height=7 ->
         // available_for_density=5. cols=1, density=Compact (card_height=6),
         // visible_rows=(5/6=0).max(1)=1 -> only 1 of 50 single-card rows is
-        // on screen, 49 hidden. Today the title reads a plain "— 50
+        // on screen, 49 hidden. Before this fix the title read a plain "— 50
         // session(s)" with nothing indicating 49 of them didn't fit — the
         // same silent-drop defect the filter-based "X/Y session(s)" text
         // solves for *filtering* has no equivalent for *viewport overflow*.
@@ -29103,6 +29103,15 @@ mod tests {
         // fit_grid must return the documented fallback rather than panicking
         // or returning cols=0.
         assert_eq!(fit_grid(50, 40, 5), (1, CardDensity::Compact));
+    }
+
+    #[test]
+    fn fit_grid_prefers_grid_columns_start_on_wide_terminals() {
+        // 6 cards, width 200 (grid_columns(200)=3, max_cols_for_width(200)=5),
+        // height 38: cols=3 already fits at Spacious (2 rows * 11 = 22 <= 38), so
+        // the search must not settle for cols=1 (6 rows * 6 = 36 <= 38 also
+        // "fits", but wastes width and gives strictly less content per card).
+        assert_eq!(fit_grid(6, 200, 38), (3, CardDensity::Spacious));
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,

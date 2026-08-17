@@ -192,7 +192,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/grid/002 — `ui.columns` matches the render path's actual fitted column count (issue #437).
 - **Layer:** L1 (in-process `TestBackend` render).
 - **Agent:** none.
-- **Asserts:** for the same narrow, short 7-role scenario, `ui.columns` — computed independently in the main loop for keyboard navigation — equals the 2 columns the render path actually fitted, not a value that could disagree.
+- **Asserts:** for the same narrow, short 7-role scenario, `ui.columns` is kept in sync with the 2 columns the render path actually fitted, rather than left stale or independently computed.
 - **Does not assert:** the rendered card content itself (covered by `dashboard/grid/001`).
 - **Platform coverage:** mac+linux+windows.
 
