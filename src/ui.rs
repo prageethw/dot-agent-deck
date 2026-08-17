@@ -15624,12 +15624,13 @@ fn render_frame(
     let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
     let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
 
-    let cols = grid_columns(dashboard_area.width);
-
-    // Choose card density based on available vertical space
+    // Jointly fit column count and card density to the available space (fork
+    // issue #437, upstream #588) — computed before the title so the
+    // viewport-hidden indicator below can use it.
     // 1 row for title + 1 row for stats bar at bottom of dashboard
     let available_for_density = dashboard_area.height.saturating_sub(2);
-    let density = choose_density(sessions.len(), cols, available_for_density);
+    let (cols, density) = fit_grid(sessions.len(), dashboard_area.width, available_for_density);
+    ui.columns = cols;
     let card_height = density.card_height();
 
     // Update idle art state machine
@@ -15640,14 +15641,34 @@ fn render_frame(
         density,
     );
 
+    // Row-count math, also moved up so the title can report cards that don't
+    // fit in the viewport even at the fitted (cols, density) — not only cards
+    // dropped by filtering. Reused unchanged by the row-slicing below.
+    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let total_rows = all_rows.len();
+    let visible_rows = (available_for_density / card_height).max(1) as usize;
+
     // Title bar
     let total_sessions = state.sessions.len();
     let showing = sessions.len();
-    let title_text = if showing < total_sessions {
+    let mut title_text = if showing < total_sessions {
         format!("— {}/{} session(s)", showing, total_sessions)
     } else {
         format!("— {} session(s)", total_sessions)
     };
+    // Cards that fit within the filter but not within the viewport itself —
+    // distinct from the filter-based "X/Y session(s)" text above, so a user
+    // can tell "filtered out" apart from "didn't fit".
+    let displayed_cards: usize = all_rows
+        .iter()
+        .take(visible_rows.min(total_rows))
+        .map(|row| row.len())
+        .sum();
+    let hidden = showing.saturating_sub(displayed_cards);
+    if hidden > 0 {
+        title_text.push_str(&format!(" ({hidden} hidden — window too small)"));
+    }
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " worker-deck ",
@@ -15706,13 +15727,6 @@ fn render_frame(
         render_overlays(frame, ui, active_mode_name);
         return;
     }
-
-    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
-    let total_rows = all_rows.len();
-
-    // Calculate how many rows fit in the available area
-    let visible_rows = (available_for_density / card_height).max(1) as usize;
 
     // Adjust scroll offset to keep selected row visible. PRD #113: only when a
     // card is actively highlighted — an inactive selection (`None`) leaves the
@@ -19519,6 +19533,35 @@ fn grid_columns(width: u16) -> usize {
     } else {
         1
     }
+}
+
+/// Minimum readable card content width, in columns.
+const MIN_CARD_W: u16 = 40;
+
+/// Widest column count `MIN_CARD_W`-wide cards can fit into `width`.
+fn max_cols_for_width(width: u16) -> usize {
+    (width / MIN_CARD_W).max(1) as usize
+}
+
+/// Jointly fit column count and card density to the available space (fork
+/// issue #437, upstream #588). `grid_columns` picks columns from width alone
+/// and `choose_density` picks density from height alone at a *given* column
+/// count, so neither axis can compensate for the other — each can only
+/// refuse to fit, never negotiate. `fit_grid` searches both together, so a
+/// narrow-AND-short terminal where 1 column never fits at any density but 2
+/// narrower columns fit at `Compact` is actually found instead of silently
+/// truncating the grid. `grid_columns` and `choose_density` are left
+/// unchanged; this composes them rather than replacing their logic.
+fn fit_grid(total_cards: usize, width: u16, available_height: u16) -> (usize, CardDensity) {
+    let max_cols = max_cols_for_width(width);
+    for cols in 1..=max_cols {
+        let density = choose_density(total_cards, cols, available_height);
+        let rows = total_cards.max(1).div_ceil(cols) as u16;
+        if rows * density.card_height() <= available_height {
+            return (cols, density);
+        }
+    }
+    (max_cols, CardDensity::Compact) // nothing fits even at max cols/Compact
 }
 
 /// Issue #442 — the *glyph and emphasis* half of how a deck card's border
