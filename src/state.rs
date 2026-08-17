@@ -577,14 +577,21 @@ pub struct AppState {
     /// worktree reusing both the same pane_id and the same
     /// [`OrchestrationIdentity`], still advances this).
     ///
-    /// A [`crate::event::WorkDoneSignal`] carries the generation it was
-    /// produced under (`work-done` reads it fresh from the daemon via
-    /// [`crate::event::DaemonMessage::GetRegistrationGeneration`] right
-    /// before sending); [`Self::handle_work_done`] compares that carried
-    /// value against the CURRENT entry here and refuses delivery on a
-    /// mismatch — see
+    /// A [`crate::event::WorkDoneSignal`] carries the generation the worker
+    /// was actually SPAWNED under — reserved via
+    /// [`Self::reserve_registration_generation`] before spawn and injected
+    /// into the child's environment (`DOT_AGENT_DECK_REGISTRATION_GENERATION`,
+    /// sibling to `DOT_AGENT_DECK_PANE_ID`), not re-derived from live daemon
+    /// state at `work-done` invocation time. [`Self::handle_work_done`]
+    /// compares that carried value against the CURRENT entry here and
+    /// refuses delivery on a mismatch — see
     /// `handle_work_done_refuses_a_stale_cross_orchestration_signal_after_pane_reuse`
-    /// below for the test pinning this.
+    /// below for the test pinning this, and fork issue #358 for why reading
+    /// the generation fresh at send time (an earlier version of this fix)
+    /// could not actually catch a re-registered pane: by send time the CLI
+    /// would ask the daemon what the pane's CURRENT generation is, which is
+    /// by construction whatever a stale signal's delivery is trying to
+    /// detect.
     pub pane_registration_generation: HashMap<String, u64>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
@@ -3661,18 +3668,81 @@ impl AppState {
         identity: OrchestrationIdentity,
         cwd: Option<&str>,
     ) {
+        // Fork #358 M1 scaffold, M2 note: advance on every call, same-identity
+        // re-register included — see the field doc on
+        // `pane_registration_generation` for why. `reserve_registration_generation`
+        // performs the exact same `.or_insert(0) += 1` arithmetic; factored out
+        // so a production spawn call site can reserve the SAME value before
+        // spawn (to inject it into the child's env) and hand it to
+        // `confirm_orchestration_role` afterward without a second increment
+        // desynchronizing the two.
+        let generation = self.reserve_registration_generation(pane_id);
+        self.confirm_orchestration_role(
+            pane_id,
+            role_name,
+            is_start_role,
+            identity,
+            cwd,
+            generation,
+        );
+    }
+
+    /// Fork #358 M2: reserve the next `pane_registration_generation` value for
+    /// `pane_id` WITHOUT touching any of the other role/cwd/identity maps —
+    /// callers that need to inject this value into a worker's spawn-time
+    /// environment (before the child process exists, and therefore before
+    /// [`Self::confirm_orchestration_role`] can run) call this first, then
+    /// pass the SAME returned value to `confirm_orchestration_role` once the
+    /// spawn has succeeded. This is what lets the generation the worker
+    /// carries answer "what registration was I spawned under" rather than
+    /// "what registration currently holds this pane_id" — see
+    /// `handle_work_done`'s generation check for what that distinction
+    /// closes (fork issue #358).
+    ///
+    /// Uses the identical `.or_insert(0) += 1` arithmetic
+    /// `register_orchestration_role` used to perform inline, so reserving
+    /// here and confirming later can never compute a different value than a
+    /// direct `register_orchestration_role` call would have.
+    ///
+    /// If the spawn this was reserved for ultimately fails and
+    /// `confirm_orchestration_role` is never called, the reserved value is
+    /// simply never assigned to any pane — a harmless gap in an otherwise
+    /// monotonic counter, not a correctness issue (nothing requires the
+    /// sequence to be contiguous).
+    pub fn reserve_registration_generation(&mut self, pane_id: &str) -> u64 {
+        let entry = self
+            .pane_registration_generation
+            .entry(pane_id.to_string())
+            .or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Fork #358 M2: the post-spawn counterpart of
+    /// [`Self::reserve_registration_generation`] — sets
+    /// `pane_registration_generation` to the caller-supplied
+    /// `reserved_generation` directly (never incrementing again), and
+    /// populates every other map `register_orchestration_role` always did.
+    /// Called by production spawn sites that reserved the generation before
+    /// spawn to inject it into the child's environment; `generation` must be
+    /// the exact value `reserve_registration_generation` returned for this
+    /// `pane_id`, so the map ends up holding what the child's env carries.
+    pub fn confirm_orchestration_role(
+        &mut self,
+        pane_id: &str,
+        role_name: &str,
+        is_start_role: bool,
+        identity: OrchestrationIdentity,
+        cwd: Option<&str>,
+        reserved_generation: u64,
+    ) {
         self.register_pane(pane_id.to_string());
         self.pane_role_map
             .insert(pane_id.to_string(), role_name.to_string());
         self.pane_orchestration_map
             .insert(pane_id.to_string(), identity);
-        // Fork #358 M1 scaffold: advance on every call, same-identity
-        // re-register included — see the field doc on
-        // `pane_registration_generation` for why.
-        *self
-            .pane_registration_generation
-            .entry(pane_id.to_string())
-            .or_insert(0) += 1;
+        self.pane_registration_generation
+            .insert(pane_id.to_string(), reserved_generation);
         if let Some(cwd) = cwd {
             self.pane_cwd_map
                 .insert(pane_id.to_string(), cwd.to_string());
@@ -3810,6 +3880,14 @@ impl AppState {
     /// PRD #140 M2.3: `pane_orchestration_map`'s value type changed but the
     /// cleanup is keyed on `pane_id`, so removal is unaffected — every routing
     /// identity for the pane goes with the entry regardless of variant.
+    ///
+    /// Fork #358: deliberately does NOT remove `pane_registration_generation`.
+    /// That counter's whole guarantee is monotonicity — clearing it here would
+    /// let a pane_id reused after this unregister start back at generation
+    /// `1`, which could match a still-in-flight stale signal from the
+    /// tenant that just left and let it misdeliver into the new tenant's
+    /// worktree, reopening the exact bug this field exists to close. Do not
+    /// "fix" this as apparent map-cleanup symmetry.
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
         self.pane_role_map.remove(pane_id);
@@ -6849,6 +6927,47 @@ clear = false
             !state.orchestrator_pane_ids.contains("19"),
             "a pane_id reused for a non-start role must no longer be flagged \
              as an orchestrator"
+        );
+    }
+
+    /// Scenario: register pane `"7"`, unregister it, then register it again
+    /// under the same pane_id and assert the generation strictly increased
+    /// past its pre-unregister value — pinning that `unregister_pane`
+    /// deliberately leaves `pane_registration_generation` untouched (fork
+    /// #358). A prior doc comment on the now-removed
+    /// `GetRegistrationGenerationResponse` type stated the opposite —
+    /// that a `0` reading could mean "it was cleared by `unregister_pane`"
+    /// — which was simply false and, if ever acted on as a "cleanup",
+    /// would let a re-registered pane restart at generation `1` and match a
+    /// stale in-flight signal from the tenant that just left.
+    #[test]
+    fn unregister_pane_does_not_reset_the_registration_generation() {
+        let mut state = AppState::default();
+        let orch = instance("orch-y");
+
+        state.register_orchestration_role("7", "coder", false, orch.clone(), None);
+        let generation_before_unregister = *state
+            .pane_registration_generation
+            .get("7")
+            .expect("registered pane must have a generation entry");
+
+        state.unregister_pane("7");
+        assert_eq!(
+            state.pane_registration_generation.get("7").copied(),
+            Some(generation_before_unregister),
+            "unregister_pane must not clear or reset pane_registration_generation"
+        );
+
+        state.register_orchestration_role("7", "coder", false, orch, None);
+        let generation_after_reregister = *state
+            .pane_registration_generation
+            .get("7")
+            .expect("re-registered pane must have a generation entry");
+        assert!(
+            generation_after_reregister > generation_before_unregister,
+            "a pane_id re-registered after unregister must never return to a \
+             previously-issued generation value (got {generation_after_reregister}, \
+             previously {generation_before_unregister})"
         );
     }
 

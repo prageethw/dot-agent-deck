@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Not started.
+**Status**: M1 and M2 done. M3 (close honestly) is the remaining step.
 
 ## Problem Statement
 
@@ -64,21 +64,21 @@ Concretely:
 
 ### M1 — generation token and refusal gate
 
-- [ ] `pane_registration_generation: HashMap<String, u64>` added alongside the other pane-scoped maps in `AppState`, incremented in `register_orchestration_role`.
-- [ ] The generation is captured and threaded through to `WorkDoneSignal` (exact mechanism — at spawn, at delegate, or read fresh by the worker CLI at `work-done` invocation time — is a design decision for the implementing worker to make and document, since it depends on how `worker-agent-deck work-done` currently learns its own pane_id).
-- [ ] `handle_work_done` compares signal generation to current generation before resolving `pane_cwd_map`/`pane_role_map`, and refuses on mismatch per the Solution Overview.
-- [ ] New regression test reproducing the pane-reuse-across-orchestrations race (see In Scope), asserting refusal.
+- [x] `pane_registration_generation: HashMap<String, u64>` added alongside the other pane-scoped maps in `AppState`, incremented in `register_orchestration_role` (via the `reserve_registration_generation`/`confirm_orchestration_role` split — see M2 below — which performs the identical `.or_insert(0) += 1` arithmetic the original inline version did).
+- [x] The generation is captured and threaded through to `WorkDoneSignal`. Redesigned mid-implementation (see M2): the first cut had the `work-done` CLI ask the daemon for the pane's *current* generation immediately before sending (`DaemonMessage::GetRegistrationGeneration`), which by construction could never disagree with itself and so never actually caught a re-registered pane. The generation is now reserved **before spawn** and injected into the worker's environment (`DOT_AGENT_DECK_REGISTRATION_GENERATION`, sibling to `DOT_AGENT_DECK_PANE_ID`), so the CLI reports the registration it was genuinely spawned under.
+- [x] `handle_work_done` compares signal generation to current generation before resolving `pane_cwd_map`/`pane_role_map`, and refuses on mismatch per the Solution Overview (`src/state.rs` ~4334, unchanged by the M2 redesign).
+- [x] New regression test reproducing the pane-reuse-across-orchestrations race (see In Scope), asserting refusal — `handle_work_done_refuses_a_stale_cross_orchestration_signal_after_pane_reuse` in `src/state.rs`.
 
 ### M2 — observability and existing-test parity
 
-- [ ] Stale-refusal logging in place and manually verified to carry enough context to triage.
-- [ ] `tests/e2e_orchestration_route_isolation.rs` and the `state.rs` #140/#361-era unit tests pass unmodified.
-- [ ] Changelog fragment describing the behavior change (a stale cross-tenant work-done report is now refused rather than silently delivered).
+- [x] Stale-refusal logging in place (see `handle_work_done`'s refusal branch, `src/state.rs` ~4334-4360) and carries pane_id, role, and expected-vs-actual generation for triage. Mechanism redesigned to spawn-time capture (see M1) once the original read-at-send-time approach was found not to close the actual race: `state.rs` gained `reserve_registration_generation`/`confirm_orchestration_role` (split out of `register_orchestration_role`), `agent_pty.rs` gained `DOT_AGENT_DECK_REGISTRATION_GENERATION`, `main.rs`'s `work-done` CLI now reads that env var directly instead of round-tripping to the daemon, and `spawn.rs`/`daemon_protocol.rs` reserve the generation before spawn and inject it into the child's env at both production spawn call sites. The now-unused `DaemonMessage::GetRegistrationGeneration` variant and its request/response types were removed from `event.rs`, and the dead handler removed from `daemon.rs`.
+- [x] `tests/e2e_orchestration_route_isolation.rs` and the `state.rs` #140/#361-era unit tests pass unmodified — no changes made to that test area; the redesign only touched the generation-carrying mechanism, not the routing maps PRD #140/#361 scoped.
+- [x] Changelog fragment describing the behavior change: `changelog.d/358.breaking.md` (the original `358.bugfix.md` was folded into it as one combined narrative — see M3 for why this is `.breaking.md` rather than `.bugfix.md`).
 
 ### M3 — close honestly
 
 - [ ] Issue #358 closes with the actual mechanism fixed, not a rescope.
-- [ ] Rule 12 cross-version question answered explicitly: this changes daemon-internal state only (no wire/frame shape change), but changes *behavior* on a hook-adjacent path (a report that used to arrive now doesn't, for the stale case) — record whether a `.breaking.md` fragment is warranted or whether "adds a refusal for cases that were previously silent misdelivery, never previously-correct delivery" is sufficient justification for none.
+- [x] Rule 12 cross-version question answered explicitly: **no wire/frame shape change** — this rides the existing unversioned hook socket, and no `PROTOCOL_VERSION` bump is needed. It **is** a real behavioral break, though, which is why `changelog.d/358.breaking.md` exists rather than a `.bugfix.md`: a `work-done` CLI built before this change has no code path that populates a registration generation at all, so `WorkDoneSignal::generation` decodes via `#[serde(default)]` as `0` — and `0` never matches a live pane's real registration (those start at `1`, per `reserve_registration_generation`'s `.or_insert(0) += 1`). Concretely, this means **every** report from an old CLI is refused as stale by a new daemon, not only genuinely stale ones: the fail-closed design cannot distinguish "old binary, no field" from "delayed report from a torn-down orchestration" — both look identical on the wire (`generation: 0`). That is a real compatibility break for a mixed old-CLI/new-daemon pairing (silently drops every worker completion report), even though no field or frame shape moved, which is exactly the "same-wire, different-meaning" semantic-break case CLAUDE.md rule 12 calls out as `.breaking.md`-worthy on its own.
 
 ## Key Files
 

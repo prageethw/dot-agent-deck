@@ -46,8 +46,9 @@ use tokio::sync::broadcast;
 use chrono::{DateTime, Utc};
 
 use crate::agent_pty::{
-    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DeliveryNotice, GuardedSend,
-    GuardedSendDetail, SpawnOptions, TabMembership, command_needs_shell_wrap,
+    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID,
+    DOT_AGENT_DECK_REGISTRATION_GENERATION, DeliveryNotice, GuardedSend, GuardedSendDetail,
+    SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
@@ -469,6 +470,10 @@ pub async fn spawn(
                 None,
                 pin_sh,
                 req.owner.as_deref(),
+                // A single-agent spawn is never registered as an
+                // orchestration role (see the block below `state` gates on),
+                // so it never needs a registration generation.
+                None,
                 notifier,
             )?;
             // PRD #127 finding #2: surface this single-agent card LIVE to any
@@ -527,6 +532,15 @@ pub async fn spawn(
             // orchestration in the same working dir are then two distinct
             // routing groups instead of one ambiguous `(name, cwd)` identity.
             let orchestration_id = crate::agent_pty::mint_orchestration_id();
+            // Fork #358 M2: one reserved registration generation per role,
+            // parallel to `agents` below — reserved BEFORE that role's
+            // spawn (so it can be injected into the child's env) and reused
+            // verbatim by `confirm_orchestration_role` in the registration
+            // loop after every spawn has succeeded, so the two can never
+            // diverge. `None` when `state` is absent, matching the gate the
+            // registration loop below already uses (no `AppState`, no
+            // registration, no generation needed).
+            let mut reserved_generations: Vec<Option<u64>> = Vec::with_capacity(roles.len());
             for role in &roles {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
@@ -537,6 +551,15 @@ pub async fn spawn(
                     orchestration_cwd: Some(req.working_dir.clone()),
                     display_title: None,
                     orchestration_id: Some(orchestration_id.clone()),
+                };
+                let reserved_generation = match state {
+                    Some(state) => Some(
+                        state
+                            .write()
+                            .await
+                            .reserve_registration_generation(&pane_id),
+                    ),
+                    None => None,
                 };
                 let id = spawn_one(
                     registry,
@@ -553,6 +576,7 @@ pub async fn spawn(
                     Some(role.role_name.as_str()),
                     false,
                     req.owner.as_deref(),
+                    reserved_generation,
                     notifier,
                 )?;
                 agents.push(SpawnedAgent {
@@ -560,6 +584,7 @@ pub async fn spawn(
                     pane_id,
                     role_name: Some(role.role_name.clone()),
                 });
+                reserved_generations.push(reserved_generation);
             }
             // Tell the DAEMON's AppState who these panes are, so the orchestrator
             // we are about to hand a delegation protocol to can actually use it.
@@ -587,7 +612,16 @@ pub async fn spawn(
                 };
                 let mut st = state.write().await;
                 for (idx, (role, agent)) in roles.iter().zip(agents.iter()).enumerate() {
-                    st.register_orchestration_role(
+                    let reserved_generation = reserved_generations[idx].expect(
+                        "reserved_generations[idx] is Some whenever `state` was Some at \
+                         reservation time, which this branch requires (same `state` binding)",
+                    );
+                    // Fork #358 M2: confirm the generation reserved BEFORE
+                    // this role's spawn (and already injected into its
+                    // env) rather than calling `register_orchestration_role`,
+                    // which would increment a second time and desynchronize
+                    // the map from what the child actually carries.
+                    st.confirm_orchestration_role(
                         &agent.pane_id,
                         &role.role_name,
                         // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
@@ -622,6 +656,7 @@ pub async fn spawn(
                         idx == orch_idx,
                         identity.clone(),
                         Some(req.working_dir.as_str()),
+                        reserved_generation,
                     );
                 }
             }
@@ -733,6 +768,13 @@ fn spawn_one(
     display_name: Option<&str>,
     pin_sh: bool,
     owner: Option<&str>,
+    // Fork #358 M2: this pane's registration generation, reserved by the
+    // caller (via `AppState::reserve_registration_generation`) BEFORE this
+    // spawn — `None` for a pane that will never be registered as an
+    // orchestration role (e.g. `SpawnTarget::SingleAgent`), `Some` for every
+    // role of an orchestration. Injected into the child's env so the
+    // `work-done` CLI can report it without asking the daemon.
+    registration_generation: Option<u64>,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let opts = SpawnOptions {
@@ -741,7 +783,7 @@ fn spawn_one(
         display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
-        env: pane_env(pane_id, pin_sh, owner),
+        env: pane_env(pane_id, pin_sh, owner, registration_generation),
         tab_membership: membership,
         // PRD #127 finding #4: tag the daemon-side registry entry with the
         // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
@@ -772,7 +814,12 @@ fn spawn_one(
 /// [`crate::platform::shell::fixed_command_shell`] — still `/bin/sh` on Unix,
 /// but `%COMSPEC%` on Windows, where pinning a POSIX path would hand
 /// `agent_pty::spawn` a shell that does not exist.
-fn pane_env(pane_id: &str, pin_sh: bool, owner: Option<&str>) -> Vec<(String, String)> {
+fn pane_env(
+    pane_id: &str,
+    pin_sh: bool,
+    owner: Option<&str>,
+    registration_generation: Option<u64>,
+) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
         env.push((
@@ -787,6 +834,16 @@ fn pane_env(pane_id: &str, pin_sh: bool, owner: Option<&str>) -> Vec<(String, St
         env.push((
             crate::agent_pty::DOT_AGENT_DECK_WORKTREE_OWNER.to_string(),
             owner.to_string(),
+        ));
+    }
+    // Fork #358 M2: the generation this pane was reserved under, sibling to
+    // `DOT_AGENT_DECK_PANE_ID` — the `work-done` CLI reads this directly
+    // instead of asking the daemon at send time. Absent for a pane that
+    // will never be registered as an orchestration role.
+    if let Some(generation) = registration_generation {
+        env.push((
+            DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+            generation.to_string(),
         ));
     }
     env
@@ -3855,7 +3912,7 @@ mod tests {
         assert!(command_needs_shell_wrap("touch x; sleep 30"));
 
         // pane_env: single-word (pin_sh=false) → only the pane-id tag.
-        let env = pane_env("sched-x-0", false, None);
+        let env = pane_env("sched-x-0", false, None, None);
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, DOT_AGENT_DECK_PANE_ID);
         assert!(!env.iter().any(|(k, _)| k == "SHELL"));
@@ -3866,7 +3923,7 @@ mod tests {
         // resolves `%COMSPEC%` (else `cmd.exe`) instead. Asserting the real value
         // on each platform rather than skipping the Windows half — the expectation
         // is restated here independently, not read back out of the seam.
-        let env = pane_env("sched-x-1", true, None);
+        let env = pane_env("sched-x-1", true, None, None);
         assert_eq!(env.len(), 2);
         let shell = env
             .iter()

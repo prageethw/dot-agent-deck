@@ -40,6 +40,19 @@ pub const DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS: &str = "DOT_AGENT_DECK_IDLE_SHUTDOW
 /// scrub site below can reference it by name.
 pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 
+/// Fork #358 M2: the pane's `AppState::pane_registration_generation` value,
+/// reserved and injected into the worker's spawn-time environment sibling to
+/// [`DOT_AGENT_DECK_PANE_ID`] — see
+/// [`crate::state::AppState::reserve_registration_generation`]. The
+/// `work-done` CLI reads this directly instead of asking the live daemon at
+/// send time, so the value it reports is the registration this worker was
+/// actually spawned under, not whatever registration currently holds the
+/// pane_id. Same drift-safety pattern as `DOT_AGENT_DECK_PANE_ID` and
+/// `DOT_AGENT_DECK_AGENT_ID`: define the constant once and let the
+/// spawn-side injector and the CLI reader in `main.rs` reference the same
+/// symbol.
+pub const DOT_AGENT_DECK_REGISTRATION_GENERATION: &str = "DOT_AGENT_DECK_REGISTRATION_GENERATION";
+
 /// PRD #92 F9 followup-7: per-spawn daemon-side agent id the daemon
 /// injects into every spawned agent's environment. The agent's hook
 /// script reads this and attaches it to each emitted `AgentEvent` as

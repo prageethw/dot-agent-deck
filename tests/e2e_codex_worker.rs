@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use dot_agent_deck::agent_pty::{
+    DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_REGISTRATION_GENERATION, SpawnOptions,
+};
 use dot_agent_deck::event::DelegateSignal;
 use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
@@ -99,6 +101,14 @@ async fn codex_worker_001_inner() {
                         .expect("Codex test HOME is UTF-8")
                         .to_string(),
                 ),
+                // Fork #358 M2: the real `work-done` CLI the worker runs now
+                // reads its generation from THIS env var instead of asking
+                // the daemon — must match the `1` inserted into
+                // `pane_registration_generation` below.
+                (
+                    DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                    "1".to_string(),
+                ),
             ],
             ..SpawnOptions::default()
         })
@@ -129,6 +139,13 @@ async fn codex_worker_001_inner() {
         state
             .pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        // Fork #358 M2: must match the `DOT_AGENT_DECK_REGISTRATION_GENERATION`
+        // baked into the worker's env above — the real worker's `work-done`
+        // CLI reads that env var, and `handle_work_done` refuses delivery
+        // on any mismatch against this map entry.
+        state
+            .pane_registration_generation
+            .insert(WORKER_PANE.to_string(), 1);
     }
 
     common::wait_until_agent_output_settled(

@@ -40,7 +40,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_REGISTRATION_GENERATION, SpawnOptions,
+};
 use dot_agent_deck::event::DelegateSignal;
 use dot_agent_deck::state::work_done_file_name;
 use spec::spec;
@@ -140,6 +142,15 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
             daemon.hook_path.display().to_string(),
         ),
         ("PATH".to_string(), path_env),
+        // Fork #358 M2: the real `work-done` CLI the worker runs from its
+        // task-file footer now reads its generation from THIS env var
+        // instead of asking the daemon — must match the `1` inserted into
+        // `pane_registration_generation` below, the same way a production
+        // spawn's reservation and confirmation always agree.
+        (
+            DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+            "1".to_string(),
+        ),
     ];
 
     // For Claude: point the worker at an isolated HOME that pre-trusts the
@@ -188,6 +199,12 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
             .insert(WORKER_PANE.to_string(), orch);
         st.pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        // Fork #358 M2: must match the `DOT_AGENT_DECK_REGISTRATION_GENERATION`
+        // baked into `worker_env` above — the real worker's `work-done` CLI
+        // reads that env var, and `handle_work_done` refuses delivery on
+        // any mismatch against this map entry.
+        st.pane_registration_generation
+            .insert(WORKER_PANE.to_string(), 1);
     }
 
     // Let the interactive agent reach input-readiness before delegating.
@@ -434,6 +451,12 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
             .insert(WORKER_PANE.to_string(), orch);
         st.pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        // Fork #358 M2: this test only exercises `handle_delegate` (never
+        // `handle_work_done`, so the generation gate is never consulted
+        // here), but registering it anyway keeps this fixture shaped like a
+        // real registration — see `AppState::register_orchestration_role`.
+        st.pane_registration_generation
+            .insert(WORKER_PANE.to_string(), 1);
     }
 
     let signal = DelegateSignal {

@@ -1359,36 +1359,33 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // Fork #358: ask the daemon for this pane's CURRENT registration
-            // generation, as close to send time as the round trip allows,
-            // and echo it back on the signal below. `handle_work_done`
-            // compares this against the pane's generation again at delivery
-            // time — a mismatch there means the pane was re-registered
-            // (worktree torn down and its pane_id reused) since this
-            // request, and the report is refused rather than misdelivered
-            // to whichever tenant now holds the pane_id. A missing/older
-            // daemon, or any failure of this lookup, degrades to `0`, which
-            // never matches a real registration (those start at `1`) — so a
-            // failed lookup here means this report is refused at delivery,
-            // not silently delivered unchecked. See
+            // Fork #358 (M2 redesign): read the registration generation THIS
+            // WORKER WAS SPAWNED UNDER from its own environment — injected
+            // at spawn time, sibling to `DOT_AGENT_DECK_PANE_ID` — rather
+            // than asking the live daemon what the pane's generation is
+            // right now. Asking the daemon at send time answers "what
+            // generation does this pane currently hold", which is the SAME
+            // question `handle_work_done` asks again microseconds later at
+            // delivery — a signal produced that way can never disagree with
+            // itself, so a worker that outlives its own orchestration's
+            // teardown (the actual #358 repro) would ask the *new* tenant's
+            // daemon state and get delivered into the *new* tenant's
+            // worktree unchanged. Reading it from the env instead means the
+            // value genuinely travels with the worker process from spawn,
+            // so a mismatch at delivery means what it's supposed to mean:
+            // the pane was re-registered since THIS worker began. Missing
+            // or unparseable (an old CLI predating this variable, or a
+            // caller that didn't go through a dot-agent-deck-managed spawn)
+            // degrades to `0`, which never matches a real registration
+            // (those start at `1`) — so this report is refused at delivery
+            // rather than silently delivered unchecked. See
             // `WorkDoneSignal::generation`'s doc for the cross-version cost
             // of that choice.
-            let generation_req = dot_agent_deck::event::DaemonMessage::GetRegistrationGeneration(
-                dot_agent_deck::event::GetRegistrationGenerationRequest {
-                    pane_id: pane_id.clone(),
-                },
-            );
-            let generation = match serde_json::to_string(&generation_req) {
-                Ok(json) => match dot_agent_deck::hook::request_from_socket(&json) {
-                    Some(line) if !line.trim().is_empty() => serde_json::from_str::<
-                        dot_agent_deck::event::GetRegistrationGenerationResponse,
-                    >(&line)
-                    .map(|resp| resp.generation)
-                    .unwrap_or(0),
-                    _ => 0,
-                },
-                Err(_) => 0,
-            };
+            let generation: u64 =
+                std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             let signal = dot_agent_deck::event::WorkDoneSignal {
                 pane_id,
                 task,
