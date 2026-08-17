@@ -656,6 +656,17 @@ impl std::fmt::Debug for AgentOwnershipOracle {
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// PRD #254: pane ids whose Codex native hook install/trust
+    /// (`codex_spawn_prep` in `src/wrap.rs`) is KNOWN to have failed for that
+    /// specific pane. Populated in [`Self::apply_event`] from the wrapper-fork
+    /// `SessionStart`'s real outcome
+    /// (`AgentEvent::codex_hook_trust_outcome`), and cleared on a later
+    /// successful respawn on the same (reused) pane id rather than latching a
+    /// failure forever. `crate::ui::delivery_capability` consults this to
+    /// downgrade a Codex pane's capability from `Reports` to `Unknown`
+    /// until the hook is known-successful for that pane, instead of resolving
+    /// capability from agent type alone.
+    pub codex_hook_trust_failed: HashSet<String>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Set by the background version-check task when a newer release exists.
@@ -4856,6 +4867,7 @@ impl AppState {
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
+        self.codex_hook_trust_failed.remove(pane_id);
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.
@@ -5643,6 +5655,23 @@ impl AppState {
             }
         } else if !self.admits_paneless_event(event.agent_id.as_deref()) {
             return;
+        }
+        // PRD #254: record the wrapper's REAL Codex native hook install/trust
+        // outcome, when this `SessionStart` reports one
+        // (`AgentEvent::codex_hook_trust_outcome`). Independent of the
+        // generation/session bookkeeping below — this is a fact about the
+        // pane's most recent spawn, not about which conversation currently
+        // owns it. A later successful respawn on a reused pane id (a `/clear`
+        // restart, since the managed pane id is stable across one) clears a
+        // stale failure rather than latching it forever.
+        if let Some(ref pane_id) = event.pane_id
+            && let Some(known_successful) = event.codex_hook_trust_outcome()
+        {
+            if known_successful {
+                self.codex_hook_trust_failed.remove(pane_id);
+            } else {
+                self.codex_hook_trust_failed.insert(pane_id.clone());
+            }
         }
         // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
         // is not evidence of a takeover and may retire nothing. Hoisted above
@@ -10229,6 +10258,73 @@ clear = false
         assert!(
             !is_minted_pane_id("1"),
             "a legacy bare pane_id must never match the minted shape"
+        );
+    }
+
+    /// Scenario: PRD #254's `apply_event` records a Codex pane's
+    /// wrapper-fork `SessionStart` hook-trust outcome
+    /// (`AgentEvent::codex_hook_trust_outcome`) into
+    /// `AppState::codex_hook_trust_failed`. A reported `false` outcome (hook
+    /// install/trust known to have failed) inserts the pane id; a later
+    /// reported `true` outcome on the same pane id (a successful respawn,
+    /// e.g. `/clear`) clears it -- per the field's own doc comment, a stale
+    /// failure must not latch forever. This closes the "zero coverage" half
+    /// of T1 for the last link in the chain; `apply_event`'s placement here
+    /// is not itself in question (auditor found it correct), only that
+    /// nothing exercised it.
+    #[test]
+    fn apply_event_records_and_clears_codex_hook_trust_failed() {
+        fn codex_session_start_with_trust_outcome(
+            pane_id: &str,
+            session_id: &str,
+            outcome: &str,
+        ) -> AgentEvent {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                crate::event::CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+                outcome.to_string(),
+            );
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some("codex-hook-trust-agent".into()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut state = AppState::default();
+        state.register_pane("pane".to_string());
+        assert!(
+            !state.codex_hook_trust_failed.contains("pane"),
+            "sanity: a fresh pane must not start out recorded as failed"
+        );
+
+        state.apply_event(codex_session_start_with_trust_outcome(
+            "pane", "gen-1", "false",
+        ));
+        assert!(
+            state.codex_hook_trust_failed.contains("pane"),
+            "a reported hook-trust FAILURE must be recorded"
+        );
+
+        state.apply_event(codex_session_start_with_trust_outcome(
+            "pane", "gen-2", "true",
+        ));
+        assert!(
+            !state.codex_hook_trust_failed.contains("pane"),
+            "a later successful respawn on the same pane id must clear a \
+             stale recorded failure rather than latching it forever"
         );
     }
 }
