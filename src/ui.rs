@@ -19584,6 +19584,30 @@ fn fit_grid(total_cards: usize, width: u16, available_height: u16) -> (usize, Ca
     (max_cols, CardDensity::Compact) // nothing fits even at max cols/Compact
 }
 
+/// Row heights dividing `available_height` across `total_rows` as evenly as
+/// possible — the first `available_height % total_rows` rows get one extra
+/// row, so the heights sum to exactly `available_height` and leave no blank
+/// tail. `None` only when `available_height < total_rows`, i.e. there is not
+/// even one row per card and no layout can show them all.
+///
+/// `#[allow(dead_code)]`: only the unit tests below call this so far — the
+/// render-site "fit-all mode" wiring (rest of PRD fork#446 M1) and the M2
+/// height-tiered `render_session_card` branches are separate, not-yet-landed
+/// work. Remove this attribute once that wiring lands and calls it for real.
+#[allow(dead_code)]
+fn even_row_heights(total_rows: usize, available_height: u16) -> Option<Vec<u16>> {
+    if total_rows == 0 || (available_height as usize) < total_rows {
+        return None;
+    }
+    let base = available_height / total_rows as u16;
+    let remainder = (available_height % total_rows as u16) as usize;
+    Some(
+        (0..total_rows)
+            .map(|i| if i < remainder { base + 1 } else { base })
+            .collect(),
+    )
+}
+
 /// Issue #442 — the *glyph and emphasis* half of how a deck card's border
 /// encodes selection. The colour half lives in [`render_session_card`], which
 /// pairs every state below with [`palette::SELECTED`] when selected and the
