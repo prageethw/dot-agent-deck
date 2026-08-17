@@ -10355,9 +10355,9 @@ fn dispatch_action(
                                 // command rather than falling back to the
                                 // deck's cwd.
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
-                                    cleaned_up,
+                                    cleaned_up_by,
                                 }) => {
-                                    let detail = if cleaned_up {
+                                    let detail = if cleaned_up_by.is_some() {
                                         "the half-created directory was removed automatically — try again".to_string()
                                     } else {
                                         format!(

@@ -408,6 +408,14 @@ pub struct WorktreeReport {
     /// happens to resolve to a different registered (or symlinked) worktree.
     #[serde(skip)]
     pub real_path: PathBuf,
+    /// Who/what triggered this worktree's removal (issue #325) — the
+    /// caller-supplied `remover` identity string, following the exact
+    /// `owner`/`owner_kind` pattern above. `Some(_)` only for a report
+    /// [`run_reclaim`] actually pushed into [`ReclaimOutcome::removed`];
+    /// `None` for `pending`/`kept` — nothing was removed, so there is
+    /// nothing to attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_by: Option<String>,
 }
 
 /// Reports where the on-disk marker names `owner`, but the independent
@@ -1411,6 +1419,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             owner_kind,
             owner_reason,
             real_path,
+            removed_by: None,
         });
     }
     Ok(reports)
@@ -1489,13 +1498,15 @@ pub fn format_list_error_for_cli(e: &str) -> String {
 /// its source instead of defending against it downstream. [`WorktreeReport`]
 /// still carries a lossy `path: String` for the report/JSON document; only
 /// this call site needs the exact bytes.
-fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path) -> Result<(), String> {
+fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> Result<(), String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
         .args(["worktree", "remove", "--"])
         .arg(worktree_path)
         .output()
-        .map_err(|e| format!("failed to spawn `git worktree remove`: {e}"))?;
+        .map_err(|e| {
+            format!("failed to spawn `git worktree remove` (requested by {remover}): {e}")
+        })?;
     if out.status.success() {
         Ok(())
     } else {
@@ -1516,7 +1527,7 @@ pub struct ReclaimOutcome {
 /// unconditionally (ownership already proves it's safe); `Ask`-verdict
 /// worktrees are removed only when `yes` is true, otherwise added to
 /// `pending`; `Keep`-verdict worktrees are left untouched.
-pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String> {
+pub fn run_reclaim(repo_dir: &Path, yes: bool, remover: &str) -> Result<ReclaimOutcome, String> {
     let reports = examine_worktrees(repo_dir)?;
     let mut removed = Vec::new();
     let mut pending = Vec::new();
@@ -1524,16 +1535,24 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String>
 
     for r in reports {
         match r.verdict.as_str() {
-            "remove" => match remove_worktree_dir(repo_dir, &r.real_path) {
-                Ok(()) => removed.push(r),
+            "remove" => match remove_worktree_dir(repo_dir, &r.real_path, remover) {
+                Ok(()) => {
+                    let mut r = r;
+                    r.removed_by = Some(remover.to_string());
+                    removed.push(r);
+                }
                 Err(e) => {
                     let mut r = r;
                     r.reason = Some(format!("removal failed: {e}"));
                     kept.push(r);
                 }
             },
-            "ask" if yes => match remove_worktree_dir(repo_dir, &r.real_path) {
-                Ok(()) => removed.push(r),
+            "ask" if yes => match remove_worktree_dir(repo_dir, &r.real_path, remover) {
+                Ok(()) => {
+                    let mut r = r;
+                    r.removed_by = Some(remover.to_string());
+                    removed.push(r);
+                }
                 Err(e) => {
                     let mut r = r;
                     r.reason = Some(format!("removal failed: {e}"));
@@ -1773,6 +1792,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-a"),
+            removed_by: None,
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1945,8 +1965,8 @@ mod tests {
             "create_worktree_sync reported Created but the worktree directory is missing"
         );
 
-        let outcome =
-            run_reclaim(&repo, false).expect("run_reclaim must succeed against a real git repo");
+        let outcome = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
         assert_eq!(
             outcome.removed.len(),
             1,
@@ -2630,6 +2650,7 @@ mod tests {
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
                 real_path: PathBuf::from("/repo/wt-owned"),
+                removed_by: None,
             },
             WorktreeReport {
                 path: PathBuf::from("/repo/wt-legacy"),
@@ -2643,6 +2664,7 @@ mod tests {
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
                 real_path: PathBuf::from("/repo/wt-legacy"),
+                removed_by: None,
             },
         ];
 
@@ -2712,6 +2734,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-disagree"),
+            removed_by: None,
         };
         let genuinely_owned = WorktreeReport {
             path: PathBuf::from("/repo/wt-owned"),
@@ -2725,6 +2748,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: PathBuf::from("/repo/wt-owned"),
+            removed_by: None,
         };
         let different_owner = WorktreeReport {
             path: PathBuf::from("/repo/wt-other"),
@@ -2738,6 +2762,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: PathBuf::from("/repo/wt-other"),
+            removed_by: None,
         };
         // P2-1: without these two, an owner-blind `owner_disagreements` --
         // e.g. `filter(|r| !r.owned)` -- would still pass this test, because
@@ -2757,6 +2782,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-foreign-marked"),
+            removed_by: None,
         };
         let owned_false_no_owner = WorktreeReport {
             path: PathBuf::from("/repo/wt-unmarked"),
@@ -2770,6 +2796,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-unmarked"),
+            removed_by: None,
         };
         let reports = vec![
             disagreeing.clone(),
@@ -2946,6 +2973,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -2994,6 +3022,7 @@ mod tests {
                     .to_string(),
             ),
             real_path: path,
+            removed_by: None,
         };
         let outcome = ReclaimOutcome {
             removed: Vec::new(),
@@ -3037,6 +3066,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: None,
             real_path: path,
+            removed_by: None,
         };
         let outcome = ReclaimOutcome {
             removed: vec![report],
@@ -3081,6 +3111,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
             real_path: path,
+            removed_by: None,
         };
         let outcome = ReclaimOutcome {
             removed: Vec::new(),
@@ -3132,6 +3163,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: None,
             real_path: path.clone(),
+            removed_by: None,
         }];
 
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
@@ -3270,6 +3302,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3318,6 +3351,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: Some(reason),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3388,6 +3422,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3580,7 +3615,7 @@ mod tests {
         let repo_dir = scratch.path().join("wherever");
         std::fs::create_dir_all(&repo_dir).unwrap();
 
-        let err = match run_reclaim(&repo_dir, false) {
+        let err = match run_reclaim(&repo_dir, false, "test-remover") {
             Err(e) => e,
             // `ReclaimOutcome` derives no `Debug`, so this cannot print what it
             // got -- the arm is unreachable anyway, since the mocked `git`

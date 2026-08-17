@@ -151,7 +151,14 @@ pub fn decide_claim(
 /// Falling back to `human` here would collapse every agent on one deck to
 /// the SAME identity and the lock would wave them all through while
 /// appearing to work.
-fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
+///
+/// `pub`, not `pub(crate)`: issue #325's `worktree_reclaim` CLI wrapper
+/// (`main.rs`'s `run_worktree_reclaim_cli`) needs this same resolution to
+/// attribute `dot-agent-deck worktree reclaim`'s own removals, and `main.rs`
+/// is a separate crate from this library — `pub(crate)` would not reach it.
+/// Reusing this rather than duplicating the resolution logic is the whole
+/// point (CLAUDE.md rule 19's "fix once, share" spirit).
+pub fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
     match std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID) {
         Err(_) => {
             // No pane env: a human terminal. The login IS part of the

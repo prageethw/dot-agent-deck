@@ -2376,6 +2376,7 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
 /// worktree; only a failure to enumerate worktrees at all (e.g. not a git
 /// repo) is reported as failure.
 fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::issue_claim::resolve_caller_identity;
     use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
     use dot_agent_deck::worktree_reclaim::{
         format_reclaim_error_for_cli, format_reclaim_human, run_reclaim,
@@ -2391,7 +2392,17 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run_reclaim(&cwd, yes) {
+    // issue #325: attribute this reclaim's own removals to whoever is
+    // actually running it, using the same local-signal resolution
+    // `issue_claim`'s claim lock already uses (CLAUDE.md rule 23) rather
+    // than duplicating it. A resolution failure here (e.g. `gh api user`
+    // unauthenticated) must not block the reclaim itself -- it only means
+    // the removed reports carry a best-effort "unknown" attribution instead
+    // of a real identity.
+    let remover = resolve_caller_identity(&cwd)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    match run_reclaim(&cwd, yes, &remover) {
         Ok(outcome) => {
             print!("{}", format_reclaim_human(&outcome));
             ExitCode::SUCCESS
