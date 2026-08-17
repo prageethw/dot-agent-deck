@@ -1147,6 +1147,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a `WorktreeKept(WorktreeKeptNotice { reason: KeptReason::Dirty, error: None })` serializes with `"kind":"worktree_kept"` and the expected `path`/`reason` fields, omits `error` from the wire entirely (`skip_serializing_if`) rather than sending `null`, and deserializes back to an equal value; a second message with `reason: KeptReason::RemovalFailed, error: Some(..)` also round-trips, including the error string.
 - **Does not assert:** that the daemon's close handler (`daemon_protocol.rs`) actually sends this broadcast, or that `apply_broadcast`/`queue_kept_worktree` (`reconnect.rs`/`state.rs`) route it into `AppState` — those remain covered only by `dispatch/close/002`'s last-hop test and by reading the source, not by an automated test on this branch.
 - **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/048 — When `run_reclaim`'s own `remove_worktree_dir` call site removes a deck-created, MERGED, clean worktree, the caller-supplied remover identity is recorded on the removed worktree's own report, not silently dropped on the floor (issue #325).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — same fixture shape as `worktree/reclaim/008`, plus a caller-supplied `remover` string threaded through `run_reclaim`.
+- **Agent:** none.
+- **Asserts:** a worktree created through the production `create_worktree_sync` path and reclaimed by a bare `run_reclaim(repo, yes=false, remover)` reports exactly one `removed` entry, and that entry's `removed_by` equals the exact `remover` string the caller passed in.
+- **Does not assert:** that the identity is ever surfaced anywhere outside the in-memory `WorktreeReport` — that is pinned separately by `format_reclaim_human_escapes_hostile_content_in_removed_by` and the module's other `format_reclaim_human` tests; the `pending`/`kept` paths, where `removed_by` stays `None` (covered by the pre-existing `008`/`011` fixtures, unchanged by this test).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other creator-identity tests).
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

@@ -193,6 +193,44 @@ pub fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
     }
 }
 
+/// Diagnostic-only identity resolution for issue #325's `worktree reclaim`
+/// attribution (reviewer P2-1 / auditor F2's disposition) — deliberately
+/// NOT [`resolve_caller_identity`], and never call sites of the two
+/// interchangeably. That function is a LOCK identity: refusing (rather than
+/// guessing) when a pane-shaped caller's `cwd` is not a linked worktree is
+/// the whole point, because a `human:<login>` fallback there would collapse
+/// every agent on the deck onto one identity and wave them all through
+/// `issue_claim`'s claim check. `worktree reclaim` has no such lock to
+/// protect, and the refused case is its DOMINANT one — `run_reclaim`
+/// enumerates the whole repo's worktrees, so the natural place to run it is
+/// the root checkout, which is never itself a linked worktree. Recording
+/// `"unknown"` for exactly that case would degrade the one scenario issue
+/// #325 was filed over back to the status quo it exists to fix.
+///
+/// So this always returns something, never fails: on [`resolve_caller_identity`]'s
+/// `Err`, it falls back to whatever local signal IS available rather than a
+/// bare constant — `DOT_AGENT_DECK_PANE_ID` plus the hostname and `cwd`
+/// (an agent-shaped caller outside a linked worktree, the refused case
+/// above) if a pane id is set, or the bare `"unknown"` sentinel only when
+/// even that is absent (a human caller whose `gh api user` lookup failed —
+/// there is no local signal left to name them by). This is diagnostic data
+/// for a human reading `DOT_AGENT_DECK_LOG` after the fact, not a value
+/// anything gates on, so collapsing two distinct agents onto the same
+/// `pane:<id>@<host>` string costs nothing here the way it would for the
+/// lock.
+pub fn resolve_remover_identity(cwd: &Path) -> String {
+    match resolve_caller_identity(cwd) {
+        Ok(identity) => identity.to_string(),
+        Err(_) => match std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID) {
+            Ok(pane_id) => {
+                let host = crate::issue_dispatch_run::local_hostname();
+                format!("pane:{pane_id}@{host} (cwd {})", cwd.display())
+            }
+            Err(_) => "unknown".to_string(),
+        },
+    }
+}
+
 /// Resolve `cwd`'s worktree ROOT via `git rev-parse --show-toplevel` — the
 /// other half of round 3's identity anchor alongside [`resolve_branch`].
 /// Works identically from the worktree root or any subdirectory of it (git

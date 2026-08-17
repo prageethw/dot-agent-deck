@@ -1508,6 +1508,18 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
             format!("failed to spawn `git worktree remove` (requested by {remover}): {e}")
         })?;
     if out.status.success() {
+        // Issue #325 / reviewer B1 / auditor F2: the ONLY durable trace of a
+        // confirmed removal, so a post-incident reader has something to grep
+        // `DOT_AGENT_DECK_LOG` for even if `format_reclaim_human`'s printed
+        // report is long gone. `remover` is an unauthenticated,
+        // caller-supplied string (auditor F3) -- sanitize it here exactly as
+        // `format_reclaim_human` sanitizes it for the terminal, since a log
+        // file gets `cat`/`tail`ed to a terminal too.
+        tracing::info!(
+            path = %sanitize_path_for_terminal_display(worktree_path),
+            remover = %sanitize_for_terminal_display(remover),
+            "worktree removed"
+        );
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
@@ -1613,10 +1625,25 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     if !outcome.removed.is_empty() {
         out.push_str("Removed:\n");
         for r in &outcome.removed {
-            out.push_str(&format!(
-                "  - {}\n",
-                sanitize_path_for_terminal_display(&r.path)
-            ));
+            // Issue #325 / reviewer B1 / auditor F2: this is the ONLY
+            // user-facing surface for `removed_by` -- there is no `worktree
+            // reclaim --json`, so an operator reading this line is the
+            // whole delivered feature. `removed_by` is `Some` for every
+            // report actually pushed into `removed` (see the field's own
+            // doc), but match rather than assume, so a future construction
+            // site that leaves it `None` degrades to the plain path instead
+            // of printing a misleading "(removed by )".
+            match &r.removed_by {
+                Some(remover) => out.push_str(&format!(
+                    "  - {} (removed by {})\n",
+                    sanitize_path_for_terminal_display(&r.path),
+                    sanitize_for_terminal_display(remover)
+                )),
+                None => out.push_str(&format!(
+                    "  - {}\n",
+                    sanitize_path_for_terminal_display(&r.path)
+                )),
+            }
         }
     } else {
         out.push_str("Removed: none\n");
@@ -1993,10 +2020,10 @@ mod tests {
     /// `remove_worktree_dir` call site does the removing, the identity/context
     /// the caller supplied is recorded on the removed worktree's own report,
     /// not silently dropped on the floor.
-    #[spec("worktree/reclaim/037")]
+    #[spec("worktree/reclaim/048")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_037_removal_records_remover_identity() {
+    fn worktree_reclaim_048_removal_records_remover_identity() {
         use std::os::unix::fs::PermissionsExt;
 
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3088,6 +3115,57 @@ mod tests {
         let cell = bullet
             .strip_prefix("  - ")
             .expect("removed bullet must start with the literal '  - ' prefix");
+        assert_hostile_content_is_sanitized(cell);
+    }
+
+    /// Scenario: `format_reclaim_human` renders a `Removed:` entry whose
+    /// `removed_by` (issue #325's whole reason to exist -- reviewer B1 /
+    /// auditor F2/F3) embeds the hostile mix. Unlike `owner`, `removed_by`
+    /// is never routed through `sanitize_marker_creator` on the way in --
+    /// it is an unauthenticated, caller-supplied identity string -- so it
+    /// must be sanitized at THIS render site rather than assumed safe
+    /// because `path` already is.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_content_in_removed_by() {
+        let path = PathBuf::from("/repo/wt-normal");
+        let remover = hostile_string_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile-remover".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
+            owner_reason: None,
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: None,
+            real_path: path,
+            removed_by: Some(remover),
+        };
+        let outcome = ReclaimOutcome {
+            removed: vec![report],
+            pending: Vec::new(),
+            kept: Vec::new(),
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in removed_by must not corrupt the line count (`Removed:` \
+             header, bullet), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(1)
+            .expect("format_reclaim_human must emit a removed bullet as the second line");
+        let cell = bullet
+            .strip_prefix("  - /repo/wt-normal (removed by ")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or_else(|| {
+                panic!("removed bullet must be `<path> (removed by <remover>)`, got {bullet:?}")
+            });
         assert_hostile_content_is_sanitized(cell);
     }
 
