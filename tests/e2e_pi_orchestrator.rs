@@ -70,10 +70,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use dot_agent_deck::agent_pty::{
-    DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_REGISTRATION_GENERATION,
-    SpawnOptions,
-};
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{AgentType, EventType};
 use dot_agent_deck::state::work_done_file_name;
 
@@ -263,14 +260,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
                 .expect("claude home UTF-8")
                 .to_string(),
         ),
-        // Fork #358 M2: the real `work-done` CLI the worker runs from its
-        // task-file footer now reads its generation from THIS env var
-        // instead of asking the daemon — must match the `1` inserted into
-        // `pane_registration_generation` below.
-        (
-            DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
-            "1".to_string(),
-        ),
+        common::registration_generation_env_tuple(),
     ];
     let worker_agent_id = daemon
         .registry
@@ -307,12 +297,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
         st.pane_cwd_map
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
-        // Fork #358 M2: must match the `DOT_AGENT_DECK_REGISTRATION_GENERATION`
-        // baked into `worker_env` above — the real worker's `work-done` CLI
-        // reads that env var, and `handle_work_done` refuses delivery on
-        // any mismatch against this map entry.
-        st.pane_registration_generation
-            .insert(WORKER_PANE.to_string(), 1);
+        common::insert_pane_registration_generation(&mut st, WORKER_PANE);
     }
 
     common::wait_until_agent_output_settled(

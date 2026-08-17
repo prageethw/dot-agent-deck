@@ -4126,6 +4126,34 @@ pub fn assert_login_shell_keeps_dir_first(shell: &Path, keep: &str) {
     );
 }
 
+/// Fork #358 M2: the `DOT_AGENT_DECK_REGISTRATION_GENERATION` env tuple a
+/// worker-spawn fixture bakes into the spawned agent's environment, paired
+/// with [`insert_pane_registration_generation`] below.
+///
+/// The real `work-done` CLI the worker runs reads its generation from this
+/// env var instead of asking the daemon, and `AppState::handle_work_done`
+/// refuses delivery on any mismatch against the `pane_registration_generation`
+/// map entry — so the two must always be seeded with the same value, the way
+/// a production spawn's reservation and confirmation always agree.
+pub fn registration_generation_env_tuple() -> (String, String) {
+    (
+        dot_agent_deck::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+        "1".to_string(),
+    )
+}
+
+/// Fork #358 M2: inserts the `pane_registration_generation` entry that
+/// matches [`registration_generation_env_tuple`]'s baked-in env value — see
+/// that function's doc for why the two must agree.
+pub fn insert_pane_registration_generation(
+    state: &mut dot_agent_deck::state::AppState,
+    pane_id: &str,
+) {
+    state
+        .pane_registration_generation
+        .insert(pane_id.to_string(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Legacy test helpers
 // ---------------------------------------------------------------------------
