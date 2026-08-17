@@ -3279,9 +3279,15 @@ fn host_home() -> PathBuf {
 /// imported `settings.json` (the deck auto-installs its own hooks
 /// pointing at the per-test socket — leaving the host's hook entries
 /// in place would invoke the developer's real hook commands inside
-/// the test). M3.1 auditor S2 + S3: write the destination with mode
+/// the test). `pub` so tests that build their own credential HOME outside
+/// [`TuiDeckBuilder`] — `e2e_delegate_work_done_chain.rs::prepare_claude_home`
+/// — can call the same keychain-aware importer instead of a second
+/// hand-rolled file-only copy (#358: the hand-rolled copy panicked with
+/// `NotFound` on a host where Claude Code 2.x keeps credentials in the
+/// macOS Keychain instead of `~/.claude/.credentials.json`). M3.1 auditor
+/// S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
-fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
+pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     let src_root = host_home().join(".claude");
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;
@@ -4124,6 +4130,55 @@ pub fn assert_login_shell_keeps_dir_first(shell: &Path, keep: &str) {
         status = out.status,
         stderr = String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Fork #358 M2: the `DOT_AGENT_DECK_REGISTRATION_GENERATION` env tuple a
+/// worker-spawn fixture bakes into the spawned agent's environment, paired
+/// with [`insert_pane_registration_generation`] below.
+///
+/// The real `work-done` CLI the worker runs reads its generation from this
+/// env var instead of asking the daemon, and `AppState::handle_work_done`
+/// refuses delivery on any mismatch against the `pane_registration_generation`
+/// map entry — so the two must always be seeded with the same value, the way
+/// a production spawn's reservation and confirmation always agree.
+pub fn registration_generation_env_tuple() -> (String, String) {
+    (
+        dot_agent_deck::agent_pty::DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+        "1".to_string(),
+    )
+}
+
+/// Fork #358 M4: the `DOT_AGENT_DECK_DAEMON_BOOT_ID` env tuple a worker-spawn
+/// fixture bakes into the spawned agent's environment, sibling to
+/// [`registration_generation_env_tuple`] above.
+///
+/// Unlike the generation half, this one cannot be a baked literal: the boot
+/// id is minted fresh per `AppState` (`AppState::daemon_boot_id`), so a
+/// hand-typed `"boot-…"` string would never match the harness's real daemon
+/// and `AppState::handle_work_done`'s compound-key check would refuse every
+/// delivery — which is exactly the bug this helper exists to prevent. Callers
+/// must read it from the same `SharedState` the harness's daemon runs on,
+/// before spawning the worker.
+pub async fn daemon_boot_id_env_tuple(
+    state: &dot_agent_deck::state::SharedState,
+) -> (String, String) {
+    let boot_id = state.read().await.daemon_boot_id().to_string();
+    (
+        dot_agent_deck::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(),
+        boot_id,
+    )
+}
+
+/// Fork #358 M2: inserts the `pane_registration_generation` entry that
+/// matches [`registration_generation_env_tuple`]'s baked-in env value — see
+/// that function's doc for why the two must agree.
+pub fn insert_pane_registration_generation(
+    state: &mut dot_agent_deck::state::AppState,
+    pane_id: &str,
+) {
+    state
+        .pane_registration_generation
+        .insert(pane_id.to_string(), 1);
 }
 
 // ---------------------------------------------------------------------------
