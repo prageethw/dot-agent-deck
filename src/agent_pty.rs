@@ -440,6 +440,44 @@ pub fn mint_orchestration_id() -> String {
     format!("orch-{nonce:016x}-{seq}")
 }
 
+/// PRD #365 M2: mint a fresh daemon-authoritative `pane_id` for a
+/// TUI-attached `StartAgent` spawn. Same recipe as [`mint_orchestration_id`]
+/// (a per-process nonce hashed from PID + epoch nanos, combined with a
+/// monotonic per-process sequence) — chosen over a bare counter because
+/// `spawn.rs`'s `next_pane_id` already demonstrates that shape's failure
+/// mode: its `PANE_COUNTER` resets to 0 on every daemon restart, which is
+/// exactly the recycling CLAUDE.md rule 23 named as unsafe to anchor
+/// identity on. The nonce makes two daemon processes — including two runs
+/// of the same daemon across a restart — astronomically unlikely to mint
+/// the same value, while the sequence guarantees no two mints within one
+/// daemon process collide.
+///
+/// Uses its own `NONCE`/`SEQ` statics rather than sharing
+/// [`mint_orchestration_id`]'s — the two id spaces (`orch-*` orchestration
+/// instance tokens, `pane-*` pane ids) are unrelated and mixing their
+/// sequences would buy nothing.
+///
+/// The `pane-` prefix keeps the value legible in logs, filenames and
+/// `DOT_AGENT_DECK_PANE_ID` (mirroring `spawn.rs`'s existing `sched-`
+/// prefix for scheduler-origin spawns, which this function does not touch)
+/// while staying well inside [`is_valid_pane_id_env`]'s charset and
+/// [`PANE_ID_ENV_MAX_LEN`] cap.
+pub fn mint_pane_id() -> String {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("pane-{nonce:016x}-{seq}")
+}
+
 impl TabMembership {
     /// Borrow the tab name (mode or orchestration) so callers don't have
     /// to match on the variant for the common "extract name for validation
@@ -8326,6 +8364,55 @@ mod tests {
         assert_eq!(ids.len(), 1000, "minted tokens must not collide");
         for id in &ids {
             assert!(is_valid_display_name(id), "token {id} must pass validation");
+        }
+    }
+
+    /// PRD #365 M3: two independently-attached clients whose `StartAgent`
+    /// calls race onto the daemon must never be minted the same `pane_id`.
+    /// Unlike `mint_orchestration_id_is_unique_and_wire_valid` above (which
+    /// mints sequentially, since tab creation within one orchestration is
+    /// inherently sequential), pane spawns from distinct attached clients
+    /// are genuinely concurrent, so this drives `mint_pane_id()` from real
+    /// threads to exercise the `AtomicU64` sequence counter under actual
+    /// contention rather than only proving it holds up one call at a time.
+    #[test]
+    fn mint_pane_id_is_unique_and_wire_valid_under_concurrency() {
+        use std::sync::{Arc, Mutex};
+
+        const THREADS: usize = 10;
+        const PER_THREAD: usize = 100;
+
+        let all_ids = Arc::new(Mutex::new(Vec::with_capacity(THREADS * PER_THREAD)));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let all_ids = Arc::clone(&all_ids);
+                std::thread::spawn(move || {
+                    let minted: Vec<String> = (0..PER_THREAD).map(|_| mint_pane_id()).collect();
+                    all_ids.lock().expect("mutex not poisoned").extend(minted);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("minting thread must not panic");
+        }
+
+        let all_ids = Arc::try_unwrap(all_ids)
+            .expect("all threads joined")
+            .into_inner()
+            .expect("mutex not poisoned");
+        assert_eq!(all_ids.len(), THREADS * PER_THREAD);
+
+        let unique: std::collections::HashSet<&String> = all_ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            THREADS * PER_THREAD,
+            "minted pane ids must not collide across concurrent minters"
+        );
+        for id in &all_ids {
+            assert!(
+                is_valid_pane_id_env(id),
+                "pane id {id} must pass validation"
+            );
         }
     }
 }

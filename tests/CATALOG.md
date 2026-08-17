@@ -1330,6 +1330,22 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** anything about the TUI's reconnect/re-hydration response to this tear-down (`session/live/013`, which pins that separately and does not depend on this daemon-side reason string being exactly right); the `timeout`/`Closed` tear-down reasons on the same handler; wire-format serde round-trips (`protocol/live-target`, `protocol/send-result`).
 - **Platform coverage:** mac+linux.
 
+#### daemon/pane-id
+
+##### daemon/pane-id/001 — `StartAgent` returns a daemon-minted `pane_id`, not the client-proposed one (PRD #365 M2).
+- **Layer:** L2 (real `dot-agent-deck daemon serve` subprocess; a raw client drives `AttachRequest::StartAgent` directly over the attach socket rather than through a TUI/PTY, the same synthetic shape `dashboard/pane/001` documents).
+- **Agent:** none (synthetic — two `StartAgent` calls each spawning a `cat` stub).
+- **Asserts:** two independent `StartAgent` calls, each proposing its own `DOT_AGENT_DECK_PANE_ID` in `env`, come back with a daemon-minted `pane_id` on the `AttachResponse` that is present on both, mutually distinct, and NOT the client-proposed value either call sent — proving the daemon, not the client, is authoritative for pane identity. Also calls `ListAgents` and asserts the registry's `pane_id_env` for the first call's agent equals the returned minted `pane_id`, not the client-proposed value (auditor A2) — the response field alone does not prove the env-strip security control ran, since the registry mirror is captured independently.
+- **Does not assert:** the exact `{origin-prefix}{nonce}-{seq}` shape of the minted id (nothing beyond "present, non-empty, unique" is assumed); id stability/non-reuse across a daemon restart (M3); the `PROTOCOL_VERSION` bump or cross-version handshake behavior for an old client (`lifecycle/handshake/*`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/pane-id/002 — a `pane_id` is not reissued after its pane exits (PRD #365 M3).
+- **Layer:** L2 (real `dot-agent-deck daemon serve` subprocess; a raw client drives `AttachRequest::StartAgent`/`StopAgent` directly over the attach socket, same synthetic shape as `daemon/pane-id/001`).
+- **Agent:** none (synthetic — two `StartAgent` calls each spawning a `cat` stub, with a `StopAgent` closing the first pane in between).
+- **Asserts:** after a `StartAgent`-spawned pane is closed via `StopAgent`, a subsequent `StartAgent` call mints a `pane_id` that is different from the closed pane's — the sequence counter behind `mint_pane_id` is never rewound or reused by an exit.
+- **Does not assert:** non-reuse across a daemon restart (`mint_pane_id`'s nonce is per-process, not persisted — a restart gets a fresh nonce so collision with a pre-restart id is astronomically unlikely rather than structurally impossible; PRD #365's M3 checklist has exactly three items, all of which land here or in the rule-12 manual record, and none of them is restart non-reuse); the exact `{nonce}-{seq}` id shape (`daemon/pane-id/001` already covers "present, non-empty, unique").
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission

@@ -33,7 +33,7 @@ mod test_temp;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
+use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use dot_agent_deck::build_id::local_build_id;
 use dot_agent_deck::build_version_handshake::ensure_compatible_daemon_or_die;
 use dot_agent_deck::daemon_protocol::{
@@ -185,7 +185,20 @@ async fn start_agent(server: &Server, command: &str) -> String {
     resp.id.expect("start-agent response missing id")
 }
 
-async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
+// PRD #365 M2: the daemon mints its own `pane_id` on every `StartAgent` call
+// and ignores whatever a client proposes in `env` — see `daemon/pane-id/001`.
+// So the caller-proposed `pane_id` argument below is no longer what ends up
+// registered; these helpers now return the DAEMON-MINTED value alongside the
+// agent id, and every call site must key its later routing/state assertions
+// off that returned value rather than the literal it proposed. The literal
+// argument still exists (as `proposed_pane_id`, used only in the request
+// payload's `env`, which the daemon strips and ignores) purely to keep call
+// sites self-documenting about what a caller historically asked for.
+async fn start_agent_for_pane(
+    server: &Server,
+    command: &str,
+    proposed_pane_id: &str,
+) -> (String, String) {
     let mut s = UnixStream::connect(&server.path).await.unwrap();
     write_request(
         &mut s,
@@ -195,7 +208,7 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             display_name: None,
             rows: 24,
             cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into())],
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), proposed_pane_id.into())],
             tab_membership: None,
             agent_type: Some(AgentType::Codex),
             seed: None,
@@ -204,10 +217,18 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
     .await;
     let resp = read_response(&mut s).await;
     assert!(resp.ok, "start-agent failed: {:?}", resp.error);
-    resp.id.expect("start-agent response missing id")
+    let id = resp.id.expect("start-agent response missing id");
+    let pane_id = resp
+        .pane_id
+        .expect("start-agent response missing daemon-minted pane_id");
+    (id, pane_id)
 }
 
-async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
+async fn start_plain_agent_for_pane(
+    server: &Server,
+    command: &str,
+    proposed_pane_id: &str,
+) -> (String, String) {
     let mut stream = UnixStream::connect(&server.path).await.unwrap();
     write_request(
         &mut stream,
@@ -217,7 +238,7 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             display_name: None,
             rows: 24,
             cols: 80,
-            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into())],
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), proposed_pane_id.into())],
             tab_membership: None,
             agent_type: None,
             seed: None,
@@ -226,7 +247,53 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
     .await;
     let response = read_response(&mut stream).await;
     assert!(response.ok, "start-agent failed: {:?}", response.error);
-    response.id.expect("start-agent response missing id")
+    let id = response.id.expect("start-agent response missing id");
+    let pane_id = response
+        .pane_id
+        .expect("start-agent response missing daemon-minted pane_id");
+    (id, pane_id)
+}
+
+/// PRD #365 M2: bypasses the wire `StartAgent` handler (which now always
+/// mints its own `pane_id` and strips whatever a client proposes) by calling
+/// `AgentPtyRegistry::spawn_agent` directly, in-process. This is not a test
+/// fabrication — `spawn.rs`'s headless fire path and
+/// `AgentPtyRegistry::respawn_agent_for_pane` are both real, still-live
+/// production callers of exactly this entry point, and `spawn_agent`'s own
+/// `pane_id_env` extraction/validation (`is_valid_pane_id_env`, and the
+/// duplicate-`pane_id_env` rejection) is untouched by PRD #365 — the M1
+/// decision doc calls it out by name as a backstop that stays. A test that
+/// needs a specific, client-chosen `pane_id_env` — to pin that backstop, or
+/// to reconstruct the pre-#365 "same pane, new agent" respawn scenario —
+/// still can, just not by going through the wire, since the wire path no
+/// longer honors a client-proposed value at all (`daemon/pane-id/001`).
+fn spawn_agent_direct_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
+    server
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some(command),
+            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_id.to_string())],
+            agent_type: Some(AgentType::Codex),
+            ..SpawnOptions::default()
+        })
+        .expect("direct registry spawn_agent failed")
+}
+
+/// Same bypass as [`spawn_agent_direct_for_pane`], but with no
+/// `DOT_AGENT_DECK_PANE_ID` in `env` at all — a genuinely paneless
+/// `pane_id_env: None` agent. As of PRD #365 M2 this is no longer
+/// constructible via the wire `StartAgent` path (`daemon_protocol.rs`
+/// unconditionally injects a minted id into every spawn's `env` before
+/// calling `spawn_agent`), so a direct registry call is the only way left to
+/// exercise the `is_paneless` / `agent_writable` fallback this pins.
+fn spawn_agent_direct_paneless(server: &Server, command: &str) -> String {
+    server
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some(command),
+            ..SpawnOptions::default()
+        })
+        .expect("direct registry spawn_agent failed")
 }
 
 async fn connect_attach(server: &Server, id: &str) -> UnixStream {
@@ -1187,11 +1254,21 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
         .build()
         .expect("build stale-delivery runtime");
     runtime.block_on(async {
+        // PRD #365 M2: the wire `StartAgent` path can no longer produce two
+        // agents sharing one `pane_id_env` — the daemon always mints its own,
+        // distinct every time (`daemon/pane-id/001`). This scenario's premise
+        // — a NEW agent taking over the SAME pane after the old one closed —
+        // still needs to exist for the guard below to mean anything, and it
+        // still does in production (`AgentPtyRegistry::respawn_agent_for_pane`
+        // is exactly this: a crashed pane's respawn reuses its `pane_id_env`
+        // so the TUI's existing pane box keeps pointing at the right agent).
+        // Reconstruct it the same way: bypass the wire and spawn both agents
+        // directly against the registry with the identical `pane_id_env`.
         let server = start_server().await;
         let pane_id = "pane-rebound-before-delivery";
-        let original_id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let original_id = spawn_agent_direct_for_pane(&server, "/bin/sh", pane_id);
         server.registry.close_agent(&original_id).unwrap();
-        let replacement_id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let replacement_id = spawn_agent_direct_for_pane(&server, "/bin/sh", pane_id);
         let mut replacement = connect_attach(&server, &replacement_id).await;
         let marker = b"STALE-PROMPT-REACHED-REPLACEMENT";
 
@@ -1222,8 +1299,10 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
         server.registry.close_agent(&replacement_id).unwrap();
 
         let server = start_server().await;
-        let pane_id = "pane-same-agent-new-session";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let proposed_pane_id = "pane-same-agent-new-session";
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", proposed_pane_id).await;
+        let pane_id = pane_id.as_str();
         let event = |session_id: &str, timestamp| AgentEvent {
             session_id: session_id.to_string(),
             agent_type: AgentType::Codex,
@@ -1283,8 +1362,9 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
-        let pane_id = "pane-missing-current-session";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-missing-current-session").await;
+        let pane_id = pane_id.as_str();
         let mut attached = connect_attach(&server, &agent_id).await;
         let response = issue_json_request(
             &server,
@@ -1313,7 +1393,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
 
         let server = start_server().await;
         let pane_id = "pane-missing-expected-agent";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let pane_id = pane_id.as_str();
         server.state.write().await.register_pane(pane_id.to_string());
         let mut attached = connect_attach(&server, &agent_id).await;
         let response = issue_json_request(
@@ -1337,7 +1418,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
 
         let server = start_server().await;
         let pane_id = "pane-current-session-requires-expected-session";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let pane_id = pane_id.as_str();
         {
             let mut state = server.state.write().await;
             state.register_pane(pane_id.to_string());
@@ -1408,7 +1490,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
 
         let server = start_server().await;
         let pane_id = "pane-unattached-current-session-requires-expected-session";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let pane_id = pane_id.as_str();
         {
             let mut state = server.state.write().await;
             state.register_pane(pane_id.to_string());
@@ -1462,7 +1545,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
 
         let server = start_server().await;
         let pane_id = "pane-legitimately-sessionless";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let pane_id = pane_id.as_str();
         server.state.write().await.register_pane(pane_id.to_string());
         let mut attached = connect_attach(&server, &agent_id).await;
         let response = issue_json_request(
@@ -1524,8 +1608,9 @@ fn pane_input_017_malformed_guard_identity_fails_closed() {
 
         for (field, malformed_value) in malformed_fields {
             let server = start_server().await;
-            let pane_id = format!("pane-malformed-{field}");
-            let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", &pane_id).await;
+            let proposed_pane_id = format!("pane-malformed-{field}");
+            let (agent_id, pane_id) =
+                start_plain_agent_for_pane(&server, "/bin/sh", &proposed_pane_id).await;
             let mut attached = connect_attach(&server, &agent_id).await;
             let marker = format!("MALFORMED-{}-LEAKED", field.to_ascii_uppercase());
             let mut request = serde_json::json!({
@@ -1570,7 +1655,16 @@ fn pane_input_018_paneless_history_target_rejects_stream_input() {
         .expect("build pane-less stream runtime");
     runtime.block_on(async {
         let server = start_server().await;
-        let agent_id = start_agent(&server, "/bin/sh").await;
+        // PRD #365 M2: the wire `StartAgent` path now unconditionally mints
+        // and injects a `pane_id_env`, so it can no longer produce a
+        // genuinely paneless (`pane_id_env: None`) agent — the very case
+        // this test needs to exercise the `is_paneless` / `agent_writable`
+        // fallback in the KIND_STREAM_IN input loop
+        // (`daemon_protocol.rs`'s `handle_connection`). Bypass the wire and
+        // spawn directly against the registry, which still extracts
+        // `pane_id_env` from `env` as before and leaves it `None` when the
+        // key is absent.
+        let agent_id = spawn_agent_direct_paneless(&server, "/bin/sh");
         server.state.write().await.apply_event(AgentEvent {
             session_id: "paneless-history-session".to_string(),
             agent_type: AgentType::Codex,
@@ -1625,8 +1719,9 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
         .expect("build monotonic-generation runtime");
     runtime.block_on(async {
         let server = start_server().await;
-        let pane_id = "pane-late-prior-activity";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-late-prior-activity").await;
+        let pane_id = pane_id.as_str();
         let now = chrono::Utc::now();
         let event = |session_id: &str, event_type, timestamp| AgentEvent {
             session_id: session_id.to_string(),
@@ -1709,8 +1804,9 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
-        let pane_id = "pane-late-prior-end";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-late-prior-end").await;
+        let pane_id = pane_id.as_str();
         let event = |session_id: &str, event_type, timestamp| AgentEvent {
             session_id: session_id.to_string(),
             agent_type: AgentType::Codex,
@@ -2035,8 +2131,9 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         .expect("build idempotency runtime");
     runtime.block_on(async {
         let server = start_server().await;
-        let pane_id = "pane-idempotent-delivery";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-idempotent-delivery").await;
+        let pane_id = pane_id.as_str();
         let counter_path = server._dir.path().join("delivery-count");
         let request = serde_json::json!({
             "op": "write-and-submit",
@@ -2074,8 +2171,10 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
-        let pane_id = "pane-concurrent-idempotent-delivery";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-concurrent-idempotent-delivery")
+                .await;
+        let pane_id = pane_id.as_str();
         let counter_path = server._dir.path().join("concurrent-delivery-count");
         let request = serde_json::json!({
             "op": "write-and-submit",
@@ -2130,8 +2229,9 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
-        let pane_id = "pane-payload-fingerprint";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-payload-fingerprint").await;
+        let pane_id = pane_id.as_str();
         let fingerprint_path = server._dir.path().join("payload-fingerprint");
         let first = issue_json_request(
             &server,
@@ -2164,10 +2264,12 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
-        let first_pane = "pane-target-fingerprint-a";
-        let second_pane = "pane-target-fingerprint-b";
-        let first_agent = start_plain_agent_for_pane(&server, "/bin/sh", first_pane).await;
-        let second_agent = start_plain_agent_for_pane(&server, "/bin/sh", second_pane).await;
+        let (first_agent, first_pane) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-target-fingerprint-a").await;
+        let (second_agent, second_pane) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-target-fingerprint-b").await;
+        let first_pane = first_pane.as_str();
+        let second_pane = second_pane.as_str();
         let first_path = server._dir.path().join("target-a");
         let second_path = server._dir.path().join("target-b");
         let _ = issue_json_request(
@@ -2228,8 +2330,8 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
         .expect("build liveness barrier runtime");
     runtime.block_on(async {
         let server = start_server().await;
-        let pane_id = "pane-liveness-barrier";
-        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (agent_id, pane_id) =
+            start_plain_agent_for_pane(&server, "/bin/sh", "pane-liveness-barrier").await;
         let now = chrono::Utc::now();
         let event = |event_type, writable| AgentEvent {
             session_id: "liveness-barrier-session".to_string(),
@@ -2241,7 +2343,7 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
             timestamp: now,
             user_prompt: None,
             metadata: Default::default(),
-            pane_id: Some(pane_id.to_string()),
+            pane_id: Some(pane_id.clone()),
             agent_id: Some(agent_id.clone()),
             agent_version: None,
             schema_version: None,
@@ -2253,7 +2355,7 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
         };
         {
             let mut state = server.state.write().await;
-            state.register_pane(pane_id.to_string());
+            state.register_pane(pane_id.clone());
             state.apply_event(event(EventType::SessionStart, Writable::Live));
         }
 
@@ -2262,11 +2364,12 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
         let writer_guard = writer.lock().await;
         let path = server.path.clone();
         let request_agent_id = agent_id.clone();
+        let request_pane_id = pane_id.clone();
         let mut request_task = tokio::spawn(async move {
             let mut stream = UnixStream::connect(path).await.unwrap();
             let payload = serde_json::to_vec(&serde_json::json!({
                 "op": "write-and-submit",
-                "pane_id": pane_id,
+                "pane_id": request_pane_id,
                 "text": "printf 'STALE-LIVENESS-WRITE\\n'",
                 "expected_agent_id": request_agent_id,
                 "expected_session_id": "liveness-barrier-session",
@@ -2326,8 +2429,8 @@ fn stream_write_revalidates_liveness_after_writer_lock() {
         .expect("build stream post-lock barrier runtime");
     runtime.block_on(async {
         let server = start_server().await;
-        let pane_id = "pane-stream-postlock";
-        let id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let (id, pane_id) = start_agent_for_pane(&server, "/bin/sh", "pane-stream-postlock").await;
+        let pane_id = pane_id.as_str();
         let now = chrono::Utc::now();
         let event = |event_type, writable| AgentEvent {
             session_id: "stream-postlock-session".to_string(),
@@ -2395,8 +2498,8 @@ fn stream_write_revalidates_liveness_after_writer_lock() {
 
 async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner() {
     let server = start_server().await;
-    let pane_id = "pane-live-transition";
-    let id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+    let (id, pane_id) = start_agent_for_pane(&server, "/bin/sh", "pane-live-transition").await;
+    let pane_id = pane_id.as_str();
     let now = chrono::Utc::now();
     let event = |event_type, live_target| AgentEvent {
         session_id: "stream-live-session".to_string(),
@@ -2500,8 +2603,9 @@ fn pane_input_014_stream_liveness_race_returns_typed_rejection() {
             ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
         ] {
             let server = start_server().await;
-            let pane_id = format!("pane-typed-stream-rejection-{input_kind}");
-            let id = start_agent_for_pane(&server, "/bin/sh", &pane_id).await;
+            let proposed_pane_id = format!("pane-typed-stream-rejection-{input_kind}");
+            let (id, pane_id) =
+                start_agent_for_pane(&server, "/bin/sh", &proposed_pane_id).await;
             let event = |writable| AgentEvent {
                 session_id: format!("typed-stream-rejection-{input_kind}"),
                 agent_type: AgentType::Codex,
