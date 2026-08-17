@@ -78,11 +78,13 @@ const RULE_COUNT: usize = 5;
 
 /// The one changelog suffix that maps to [`WorkType::Prd`] via
 /// [`suffix_to_work_type`] but is a severity axis, not a work type of its
-/// own (fork#451) — the single fact [`derive_work_type`]'s branch-aware
-/// carve-out and [`collect_bug_diff`]'s `No-Test:` filter both key off. One
-/// literal for one fact ([`RULE_COUNT`]'s shape), so the frozen five-suffix
-/// set gaining another `Prd`-mapping severity suffix cannot silently miss
-/// one of the sites that must agree on it.
+/// own (fork#451) — the single fact four sites must agree on:
+/// [`suffix_to_work_type`]'s match arm, [`derive_work_type`]'s
+/// `fragment_all_breaking` tracking and its `named_path` selection, and
+/// [`collect_bug_diff`]'s `No-Test:` filter. One literal for one fact
+/// ([`RULE_COUNT`]'s shape), so the frozen five-suffix set gaining another
+/// `Prd`-mapping severity suffix cannot silently miss one of the sites that
+/// must agree on it.
 const BREAKING_SUFFIX: &str = "breaking";
 
 /// `git merge-base HEAD <base>` target when `--base` is not given.
@@ -364,9 +366,13 @@ pub fn derive_work_type(
                 // `fragment_supply` — a `.breaking.md` sorting first would
                 // otherwise get blamed for a suffix this very carve-out
                 // makes legal, pointing the author at the wrong file. Falls
-                // back to `path` when every Prd-mapping fragment actually
-                // is `breaking` (shouldn't reach this arm per F2, but kept
-                // as a defensive fallback rather than an unreachable panic).
+                // back to `path` when no non-`breaking` Prd fragment exists
+                // — the breaking-only case, which reaches this arm whenever
+                // the branch is `docs/`/`chore/` rather than `fix/` (the
+                // `fix/` case is taken by the carve-out above). Naming the
+                // `.breaking.md` is correct there: it is the actual
+                // offender. Pinned by
+                // `breaking_fragment_on_docs_branch_still_disagrees`.
                 let named_path = if fragment_type == WorkType::Prd {
                     fragments
                         .iter()
