@@ -38716,15 +38716,12 @@ mod tests {
 
     /// Reviewer P2 (fork#257): serializes `orchestration/seed/017` and any
     /// future test mutating the same process-global
-    /// `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, against EACH OTHER. Each
-    /// test previously declared its own function-local `static Mutex`
-    /// (mirroring `spawn_readiness_buffer_parses_env_override_default_and_
-    /// invalid`, whose var is different and so needs no sharing) — two
-    /// distinct mutexes guarding one process-global var let parallel
-    /// unit-test threads interleave their set/read/restore sequences.
-    /// Mirrors the split lock/guard idiom `CONFIG_GEN_STATE_ENV_LOCK` /
-    /// `ConfigGenStateEnvGuard` already use in `src/config.rs` for the same
-    /// job over a different var.
+    /// `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`, against EACH OTHER — a
+    /// dedicated mutex per process-global var, not a single shared one,
+    /// since two unrelated vars sharing a lock would serialize tests that
+    /// have no actual interference between them. Mirrors the split
+    /// lock/guard idiom `CONFIG_GEN_STATE_ENV_LOCK` / `ConfigGenStateEnvGuard`
+    /// already use in `src/config.rs` for the same job over a different var.
     static SEND_RETRY_BASE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII guard for `DOT_AGENT_DECK_TEST_SEND_RETRY_BASE_MS`: captures
@@ -38773,9 +38770,13 @@ mod tests {
     /// `send_retry_delay`, whose trailing `.min(SEND_RETRY_BACKOFF_CAP)`
     /// reapplies the same 2s ceiling downstream and so cannot tell a broken
     /// clamp from a correct one — while the `send_retry_delay` assertion is
-    /// kept alongside it as the sane-schedule pin. PRD fork#257 M1/M2:
-    /// mirrors `confirmation_grace_period()`'s existing override idiom
-    /// (`src/ui.rs:2239-2270`) line for line. Expected RED (original round):
+    /// kept alongside it as the sane-schedule pin. PRD fork#257 M1/M2: this
+    /// is `src/ui.rs`'s sole surviving instance of the
+    /// `cfg(any(test, debug_assertions))` override idiom — the sibling it
+    /// originally mirrored, `confirmation_grace_period()`, was removed by
+    /// the issue #424 rewrite; `src/config.rs`'s `CONFIG_GEN_STATE_ENV_LOCK`
+    /// / `ConfigGenStateEnvGuard` is the one still-live instance of the same
+    /// pattern elsewhere in the repo. Expected RED (original round):
     /// `send_retry_delay` did not read this env var at all, so every
     /// overridden assertion observed the unchanged 500ms floor.
     #[spec("orchestration/seed/017")]
@@ -38853,9 +38854,10 @@ mod tests {
              not panic"
         );
 
-        // Out-of-range: past AUTOMATIC_PROMPT_DEADLINE, mirroring
-        // CONFIRMATION_GRACE_PERIOD_MAX's own ceiling (pinned 1ms below the
-        // deadline) — past that point the override is not a longer backoff,
+        // Out-of-range: the override's ceiling is SEND_RETRY_BACKOFF_CAP
+        // (2s), not AUTOMATIC_PROMPT_DEADLINE and not
+        // CONFIRMATION_GRACE_PERIOD_MAX (removed by the issue #424
+        // rewrite) — past that point the override is not a longer backoff,
         // it is a silently disabled retry.
         // SAFETY: same lock.
         unsafe {

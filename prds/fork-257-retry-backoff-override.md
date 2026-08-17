@@ -4,7 +4,7 @@
 
 **Priority**: Medium
 
-**Status** *(2026-08-13, restored narrowed 2026-08-17)*: **M1 and M2 complete, reviewed and mutation-proven.** M3 (offer upstream) is in flight as a separate branch.
+**Status** *(2026-08-13, restored narrowed 2026-08-17)*: **M1 and M2 complete, reviewed and mutation-proven.** **M3 (offer upstream) is discharged as [fork #419](https://github.com/prageethw/dot-agent-deck/issues/419)** *(filed 2026-08-16)* — rule 19 debt, not unfinished code. Issue #257 stays open to track the narrowed-restoration gap described below.
 
 **Restoration note (2026-08-17):** this PRD's fix (PR #268) was silently dropped by the 2026-08-15 upstream sync — found during #443's audit. It has been restored, but **narrowed**: only `orchestration/seed/017` (the M1 override-seam unit test) and its production mechanism, `send_retry_base()`, are restored. `orchestration/seed/018` (the L1 test proving the confirmation-retry fires deterministically) and the "real-agent proof" half of M2 (`orchestration/seed/015`/`016` and the CR-suppressing relay) are **deliberately not restored here**. Investigation found the retry path `seed/018` targeted — `ui.orchestration_awaiting_confirmation` / `confirmation_grace_period()` — no longer exists; that gate is now `unconfirmed_retry_delay` in `src/prompt_delivery.rs`, part of the issue #424 rewrite, and this fix does not touch it. Redesigning `seed/018`'s proof against `unconfirmed_retry_delay` is left as a separate, future decision — issue #257 stays open to track it. Treat everything below this note as the **original, pre-drop** PRD content, describing the fuller scope that was implemented in PR #268; it is retained for history and is no longer fully accurate to what exists on `main` today.
 
