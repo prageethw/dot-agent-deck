@@ -67,6 +67,11 @@ mod common;
 
 const START_ROLE: &str = "orchestrator";
 const WORKER_ROLE: &str = "coder";
+const ORCHESTRATION_NAME: &str = "startup-race";
+/// The worker role's index in `OrchestrationConfig.roles` below — start role
+/// first, worker second, matching the pre-fix-hostile declaration order this
+/// test exists to pin.
+const WORKER_ROLE_INDEX: usize = 1;
 const SEED_TEXT: &str = "orchestration-startup-race-seed";
 const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
@@ -219,22 +224,44 @@ async fn wait_for_snapshot_needle(
     }
 }
 
-async fn wait_for_agent_id_for_pane(
+/// PRD #365 M2: at the time this test was written, the real
+/// `EmbeddedPaneController`/`TabManager` still allocated its own LOCAL
+/// `pane_id` client-side (`allocate_id()`), which no longer matched what
+/// the daemon actually registered the agent under
+/// (`daemon/pane-id/001`), so looking the worker up BY that stale local
+/// pane_id (the old `wait_for_agent_id_for_pane`) timed out. `allocate_id()`
+/// is now retired — `create_pane_with_options` adopts the daemon-returned
+/// `AttachResponse.pane_id` instead — but the role-based lookup below
+/// remains correct and is kept as-is: `dot-agent-deck delegate --to coder`
+/// resolves its target entirely server-side, by ROLE
+/// (`tab_membership`/`pane_role_map`), never by the client's own pane_id,
+/// so finding the worker's real agent id by role identity is the faithful
+/// way to observe this test's mechanism regardless of pane_id's source.
+async fn wait_for_agent_id_for_role(
     registry: &AgentPtyRegistry,
-    pane_id: &str,
+    orchestration_name: &str,
+    role_index: usize,
     timeout: Duration,
 ) -> String {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let records = registry.agent_records();
-        if let Some(rec) = records
-            .iter()
-            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
-        {
+        if let Some(rec) = records.iter().find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(dot_agent_deck::agent_pty::TabMembership::Orchestration {
+                    name,
+                    role_index: idx,
+                    ..
+                }) if name == orchestration_name && *idx == role_index
+            )
+        }) {
             return rec.id.clone();
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("daemon registry never surfaced an agent for pane_id {pane_id}");
+            panic!(
+                "daemon registry never surfaced an agent for orchestration {orchestration_name:?} role_index {role_index}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -319,7 +346,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
     ));
 
     let config = OrchestrationConfig {
-        name: "startup-race".to_string(),
+        name: ORCHESTRATION_NAME.to_string(),
         roles: vec![
             // Declared FIRST — the pre-fix-hostile order the design calls
             // out explicitly. `command = "pi"` is what makes
@@ -437,7 +464,6 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
         2,
         "one pane per declared role; got {role_pane_ids:?}"
     );
-    let worker_pane_id = &role_pane_ids[1];
 
     // Outcome 1: native seed consumption. The marker must now exist AND
     // hold the exact seed text — proof `get-seed` genuinely returned the
@@ -470,9 +496,13 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
     // retry-on-failure "fix" could reintroduce. Waited with real settle
     // time after the first sighting so a stray SECOND delivery (e.g. a
     // buggy fallback re-arm) has a chance to land before the count is read.
-    let worker_agent_id =
-        wait_for_agent_id_for_pane(&daemon.pty_registry, worker_pane_id, Duration::from_secs(5))
-            .await;
+    let worker_agent_id = wait_for_agent_id_for_role(
+        &daemon.pty_registry,
+        ORCHESTRATION_NAME,
+        WORKER_ROLE_INDEX,
+        Duration::from_secs(5),
+    )
+    .await;
     let first_sighting = wait_for_snapshot_needle(
         &daemon.pty_registry,
         &worker_agent_id,

@@ -1264,6 +1264,58 @@ fn role_path_slug(role: &str) -> String {
 /// panes in one deck.
 const PANE_DIGEST_HEX: usize = 16;
 
+/// PRD #365: derive a session's `session_id` from its `pane_id`, idempotent
+/// with respect to the `"pane-"` prefix.
+///
+/// A daemon-minted `pane_id` ([`crate::agent_pty::mint_pane_id`]'s output,
+/// e.g. `"pane-a1b2c3d4e5f6a7b8-0"`) already carries the prefix, so it is
+/// used as-is. A legacy bare `pane_id` (a counter digit, a role index —
+/// still passed by several existing callers) gets `"pane-"` prepended,
+/// exactly as before this fix. Unconditionally prepending the prefix
+/// produced a double-prefixed `"pane-pane-…"` session_id for every real
+/// spawned pane.
+///
+/// **Invariant this relies on (auditor A4):** this mapping is injective
+/// only because no `pane_id` source in the tree emits a bare (unprefixed)
+/// id matching [`is_minted_pane_id`]'s post-prefix shape (16 lowercase hex
+/// digits, `-`, decimal sequence). If one ever did, that bare id and its
+/// already-`"pane-"`-prefixed minted counterpart would collapse onto the
+/// same `session_id`, silently merging two panes' sessions. Nothing in the
+/// type system enforces this today — it holds only because every current
+/// `pane_id` source was checked by hand.
+fn session_id_for_pane(pane_id: &str) -> String {
+    if is_minted_pane_id(pane_id) {
+        pane_id.to_string()
+    } else {
+        format!("pane-{pane_id}")
+    }
+}
+
+/// True when `pane_id` matches the exact shape
+/// [`crate::agent_pty::mint_pane_id`] produces: `"pane-"` + 16 lowercase hex
+/// digits (the nonce) + `"-"` + a decimal sequence number.
+///
+/// Deliberately narrower than a bare `starts_with("pane-")` check: several
+/// existing `pane_id`s legitimately start with the literal string
+/// `"pane-"` without being daemon-minted — human-readable test fixtures
+/// (`"pane-shell"`, `"pane-race-36"`), and `format!("pane-{n}")` counters
+/// elsewhere in the codebase — and must keep today's single-prefix
+/// behavior rather than being treated as already-prefixed.
+fn is_minted_pane_id(pane_id: &str) -> bool {
+    let Some(rest) = pane_id.strip_prefix("pane-") else {
+        return false;
+    };
+    let Some((nonce, seq)) = rest.split_once('-') else {
+        return false;
+    };
+    nonce.len() == 16
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && !seq.is_empty()
+        && seq.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// FNV-1a over the reporting pane's `pane_id`, at the full untruncated width
 /// documented on [`PANE_DIGEST_HEX`]. Same constants and algorithm as
 /// [`role_digest_hex`] — deliberately not `DefaultHasher`, whose output is
@@ -5945,7 +5997,7 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) -> String {
-        let session_id = format!("pane-{}", pane_id);
+        let session_id = session_id_for_pane(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.sessions.insert(
@@ -6020,7 +6072,7 @@ impl AppState {
         // fields when one is present.
         self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         if let Some(snap) = live {
-            let session_id = format!("pane-{}", pane_id);
+            let session_id = session_id_for_pane(&pane_id);
             if let Some(session) = self.sessions.get_mut(&session_id) {
                 session.status = snap.status.clone();
                 session.active_tool = snap.active_tool.clone();
@@ -6231,7 +6283,7 @@ impl AppState {
             return Some(first);
         }
 
-        let session_id = format!("pane-{}", record.pane_id_env.as_ref()?);
+        let session_id = session_id_for_pane(record.pane_id_env.as_ref()?);
         match self.sessions.get(&session_id) {
             Some(session) if session.agent_id.is_none() => Some(session_id),
             _ => None,
@@ -6255,8 +6307,8 @@ impl AppState {
     ///
     /// A pane can carry more than one session at a time. The close path removes
     /// the session its CARD was built from, which is not necessarily all of them:
-    /// a pane also gets a placeholder session (`pane-<pane_id>`, minted by
-    /// [`Self::insert_placeholder_session`] on registration / hydration), and when
+    /// a pane also gets a placeholder session (id derived by [`session_id_for_pane`],
+    /// minted by [`Self::insert_placeholder_session`] on registration / hydration), and when
     /// the agent's own `SessionStart` cannot reuse it, both live on. That happens
     /// whenever the pane's command is one the deck cannot infer an agent type from
     /// — a `devbox run agent-coder` style launcher — because such a command is not
@@ -12116,6 +12168,136 @@ clear = false
             "…and the pane's writability must be the LIVE generation's \
              declaration: a dead predecessor pinning this open is input reaching \
              a target that asked for it to be closed"
+        );
+    }
+
+    // ---- PRD #365 M2 regression: a daemon-minted (already "pane-"-prefixed)
+    // pane_id must not double-prefix the derived session_id. -----------------
+    //
+    // `mint_pane_id()` (the daemon-side minting PRD #365 M2 introduced) now
+    // produces ids that already carry the `"pane-"` prefix (e.g.
+    // `"pane-a1b2c3d4e5f6a7b8-0"`), but `insert_placeholder_session` /
+    // `seed_hydrated_session` still unconditionally build
+    // `session_id = format!("pane-{pane_id}")`, which was only ever correct
+    // for the pre-PRD-#365 bare ids (a counter digit, a role index). A
+    // real spawned pane's session_id therefore becomes double-prefixed
+    // (`"pane-pane-a1b2c3d4e5f6a7b8-0"`), which renders as a garbled
+    // `"pane-pane-…"` identity on the dashboard for any placeholder session
+    // with no display name.
+
+    /// A daemon-minted pane_id (already `"pane-"`-prefixed) must yield a
+    /// session_id equal to the pane_id itself — never a double `"pane-pane-"`
+    /// prefix.
+    #[test]
+    fn insert_placeholder_session_does_not_double_prefix_a_minted_pane_id() {
+        let minted_pane_id = "pane-a1b2c3d4e5f6a7b8-0";
+        let mut state = AppState::default();
+        state.register_pane(minted_pane_id.to_string());
+        state.insert_placeholder_session(minted_pane_id.to_string(), None, None, None);
+
+        let keys: Vec<_> = state.sessions.keys().cloned().collect();
+        assert!(
+            !keys.iter().any(|k| k.contains("pane-pane-")),
+            "session_id must never double-prefix an already-'pane-'-prefixed \
+             pane_id; sessions keys were: {keys:?}"
+        );
+        assert!(
+            state.sessions.contains_key(minted_pane_id),
+            "a daemon-minted pane_id must produce a session_id equal to the \
+             pane_id itself; sessions keys were: {keys:?}"
+        );
+    }
+
+    /// A legacy bare pane_id (a counter digit, still passed by several
+    /// existing callers) must keep producing today's `"pane-<id>"` — the
+    /// fix for the minted case must not regress this backward-compat shape.
+    #[test]
+    fn insert_placeholder_session_still_prefixes_a_legacy_bare_pane_id() {
+        let bare_pane_id = "1";
+        let mut state = AppState::default();
+        state.register_pane(bare_pane_id.to_string());
+        state.insert_placeholder_session(bare_pane_id.to_string(), None, None, None);
+
+        assert!(
+            state.sessions.contains_key("pane-1"),
+            "a legacy bare pane_id must still produce 'pane-<id>' for \
+             backward compatibility; sessions keys were: {:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// [`AppState::seed_hydrated_session`] delegates its placeholder minting
+    /// to [`AppState::insert_placeholder_session`], but recomputes the
+    /// session_id a second time (independently) to overlay the live
+    /// snapshot fields — so the same double-prefix bug can reappear there
+    /// even if only the delegate is fixed. A daemon-minted pane_id, WITH a
+    /// live snapshot attached, must still land on a session_id equal to the
+    /// pane_id itself, and the snapshot's fields (status) must be visible on
+    /// it — proving the overlay found the right entry rather than seeding a
+    /// double-prefixed key nobody overlays.
+    #[test]
+    fn seed_hydrated_session_does_not_double_prefix_a_minted_pane_id() {
+        let minted_pane_id = "pane-a1b2c3d4e5f6a7b8-0";
+        let snap = SessionSnapshot {
+            status: SessionStatus::Working,
+            agent_type: Some(AgentType::ClaudeCode),
+            active_tool: None,
+            tool_count: 3,
+            first_prompts: Vec::new(),
+            last_user_prompt: None,
+            live_target: None,
+            shell_synthetic_working: false,
+            model: None,
+        };
+        let mut state = AppState::default();
+        state.register_pane(minted_pane_id.to_string());
+        state.seed_hydrated_session(minted_pane_id.to_string(), None, None, None, Some(&snap));
+
+        let keys: Vec<_> = state.sessions.keys().cloned().collect();
+        assert!(
+            !keys.iter().any(|k| k.contains("pane-pane-")),
+            "session_id must never double-prefix an already-'pane-'-prefixed \
+             pane_id; sessions keys were: {keys:?}"
+        );
+        let session = state.sessions.get(minted_pane_id).unwrap_or_else(|| {
+            panic!(
+                "a daemon-minted pane_id must produce a session_id equal to \
+                 the pane_id itself; sessions keys were: {keys:?}"
+            )
+        });
+        assert_eq!(
+            session.status,
+            SessionStatus::Working,
+            "the live snapshot's status must be overlaid onto the correctly \
+             keyed session"
+        );
+    }
+
+    /// [`is_minted_pane_id`] hand-reimplements [`crate::agent_pty::mint_pane_id`]'s
+    /// output shape in a different module with no shared constant (reviewer
+    /// P2). Every other test above pins that shape with hardcoded literals,
+    /// which stays green even if the two functions drift apart. This is a
+    /// live cross-check between the real minter and the real matcher, so a
+    /// future format change in either one shows up here first.
+    #[test]
+    fn is_minted_pane_id_matches_mint_pane_ids_real_output() {
+        assert!(
+            is_minted_pane_id(&crate::agent_pty::mint_pane_id()),
+            "is_minted_pane_id must recognize every id mint_pane_id actually \
+             produces, or session_id_for_pane silently starts double-prefixing \
+             real spawned panes again"
+        );
+    }
+
+    /// The converse of the above: a value `mint_pane_id` would never produce
+    /// (here, a legacy bare counter id) must not be mistaken for a minted
+    /// one, or a pre-#365 caller's pane_id would stop getting its `"pane-"`
+    /// prefix.
+    #[test]
+    fn is_minted_pane_id_rejects_a_value_mint_pane_id_would_not_produce() {
+        assert!(
+            !is_minted_pane_id("1"),
+            "a legacy bare pane_id must never match the minted shape"
         );
     }
 }

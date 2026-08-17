@@ -202,13 +202,25 @@ async fn handle_connection(
         serde_json::from_slice(&payload).expect("decode synthetic daemon request");
 
     match request {
-        AttachRequest::StartAgent { env, .. } => {
-            *pane_id_env.lock().unwrap() = env
-                .into_iter()
-                .find_map(|(key, value)| (key == "DOT_AGENT_DECK_PANE_ID").then_some(value));
-            write_resp(&mut stream, &AttachResponse::with_id("agent-1".to_string()))
-                .await
-                .expect("reply to StartAgent");
+        AttachRequest::StartAgent { .. } => {
+            // PRD #365 M2: the real daemon mints `pane_id` itself now and
+            // returns it on `AttachResponse::pane_id` — the client no
+            // longer proposes one via `DOT_AGENT_DECK_PANE_ID` in `env`, so
+            // this synthetic daemon mints its own to match the real
+            // contract `EmbeddedPaneController::create_stream_pane` now
+            // requires (a `StartAgent` success with no `pane_id` is
+            // treated as a protocol error).
+            let minted_pane_id = "pane-synthetic-1".to_string();
+            *pane_id_env.lock().unwrap() = Some(minted_pane_id.clone());
+            write_resp(
+                &mut stream,
+                &AttachResponse {
+                    pane_id: Some(minted_pane_id),
+                    ..AttachResponse::with_id("agent-1".to_string())
+                },
+            )
+            .await
+            .expect("reply to StartAgent");
         }
         AttachRequest::AttachStream { .. } => {
             write_resp(&mut stream, &AttachResponse::ok())
