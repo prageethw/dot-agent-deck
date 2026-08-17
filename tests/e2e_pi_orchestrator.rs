@@ -261,6 +261,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
                 .to_string(),
         ),
         common::registration_generation_env_tuple(),
+        common::daemon_boot_id_env_tuple(&daemon.state).await,
     ];
     let worker_agent_id = daemon
         .registry

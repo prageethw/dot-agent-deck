@@ -1174,6 +1174,20 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // every agent a DIFFERENT nested orchestration spawns from it — the same
     // class of bug the two scrubs above already exist to prevent.
     cmd.env_remove(DOT_AGENT_DECK_WORKTREE_OWNER);
+    // Fork #358 M4 round-2 review (reviewer P2 / auditor P2): same
+    // scrub-then-overlay rule for the registration generation and daemon
+    // boot id — the two halves of `handle_work_done`'s compound staleness
+    // key. Without this, a daemon launched from inside an existing deck
+    // pane would leak that pane's inherited generation/boot id into every
+    // child it spawns that does NOT get them injected explicitly (a
+    // non-orchestration pane, or any `state == None` spawn path), the same
+    // class of cross-deck leak `PANE_ID`/`AGENT_ID` above exist to prevent.
+    // Fail-closed today regardless (such a pane has no
+    // `pane_registration_generation` entry, so `handle_work_done` refuses
+    // it anyway) — this closes the leak itself, and keeps this scrub list
+    // matching what both constants' own doc comments already claim.
+    cmd.env_remove(DOT_AGENT_DECK_REGISTRATION_GENERATION);
+    cmd.env_remove(DOT_AGENT_DECK_DAEMON_BOOT_ID);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.

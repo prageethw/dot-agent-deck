@@ -3765,9 +3765,13 @@ impl AppState {
     ///
     /// If the spawn this was reserved for ultimately fails and
     /// `confirm_orchestration_role` is never called, the reserved value is
-    /// simply never assigned to any pane — a harmless gap in an otherwise
-    /// monotonic counter, not a correctness issue (nothing requires the
-    /// sequence to be contiguous).
+    /// still written into `pane_registration_generation` immediately below —
+    /// this function does not defer that write until confirmation — it is
+    /// only the other role/cwd/identity maps that stay unset. A harmless
+    /// gap in an otherwise monotonic counter, not a correctness issue
+    /// (nothing requires the sequence to be contiguous), but a later
+    /// `work-done` for that same pane_id would then compare against this
+    /// orphaned entry rather than against nothing.
     pub fn reserve_registration_generation(&mut self, pane_id: &str) -> u64 {
         let entry = self
             .pane_registration_generation
@@ -3953,12 +3957,21 @@ impl AppState {
     /// identity for the pane goes with the entry regardless of variant.
     ///
     /// Fork #358: deliberately does NOT remove `pane_registration_generation`.
-    /// That counter's whole guarantee is monotonicity — clearing it here would
-    /// let a pane_id reused after this unregister start back at generation
-    /// `1`, which could match a still-in-flight stale signal from the
-    /// tenant that just left and let it misdeliver into the new tenant's
-    /// worktree, reopening the exact bug this field exists to close. Do not
-    /// "fix" this as apparent map-cleanup symmetry.
+    /// Pre-M4, that counter's whole guarantee was monotonicity — clearing it
+    /// here would let a pane_id reused after this unregister start back at
+    /// generation `1`, which could match a still-in-flight stale signal from
+    /// the tenant that just left and misdeliver into the new tenant's
+    /// worktree. M4 round-2 review (auditor §6): that specific reopening no
+    /// longer applies post-M4 — within one daemon boot a pane_id is never
+    /// reused at all (`next_pane_id`'s counter and `mint_pane_id`'s
+    /// nonce+seq are both process-unique), and across a boot
+    /// `handle_work_done`'s `daemon_boot_id` half refuses the stale signal
+    /// regardless of what the generation says. Still do not "fix" this as
+    /// apparent map-cleanup symmetry — the field remains the only place a
+    /// late signal's generation can be compared against pane P's last-known
+    /// value once `unregister_pane` has run — the reason has just narrowed
+    /// from "reopens the exact bug" to "loses a comparison the compound key
+    /// no longer strictly needs, but still uses".
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
         self.pane_role_map.remove(pane_id);
@@ -4348,13 +4361,25 @@ impl AppState {
         //
         // This narrows fork issue #444 to the specific case M4's own
         // fail-closed design makes guaranteed (a KNOWN pane with a
-        // mismatched generation/boot id); it deliberately leaves retiring
-        // BEFORE the "unknown pane" check below unchanged, matching PRD
-        // #126's original reasoning for that case (a pane already
-        // unregistered but whose generation didn't change — e.g. a pending
-        // teardown racing a late, still-valid report — should still have
-        // its bookkeeping cleaned up). #444 stays open for that residual,
-        // narrower slice.
+        // mismatched generation/boot id). M4 round-2 review (reviewer P2):
+        // an earlier version of this comment claimed retiring BEFORE the
+        // "unknown pane" check below is unchanged in general — that is only
+        // true for a pane `unregister_pane` tore down, whose generation
+        // entry deliberately survives (see that function's doc), so it
+        // still reaches the retire calls below and then hits the
+        // `pane_role_map` miss, matching PRD #126's original reasoning (a
+        // pending teardown racing a late, still-valid report should still
+        // have its bookkeeping cleaned up). It is NOT true for a pane that
+        // was NEVER registered at all — no `pane_registration_generation`
+        // entry was ever written for it — which now ALSO returns here,
+        // before the retire calls, a genuine behavioural change from
+        // before M4. Auditor's review found no production path this loses
+        // anything on: `handle_delegate` only arms a watch/delegation
+        // through `confirm_orchestration_role`, which always writes the
+        // generation entry first, so any pane with an armed watch already
+        // has one. #444 stays open for its own narrower, still-accurate
+        // slice: a pane already unregistered but whose generation is
+        // unchanged.
         let current_generation = self
             .pane_registration_generation
             .get(&signal.pane_id)
@@ -4448,13 +4473,18 @@ impl AppState {
         // BEFORE the retire calls above (see the comment there) — this is
         // purely the "do we know this pane_id at all" check, unrelated to
         // whether ITS registration is current. `pane_role_map` and
-        // `pane_registration_generation` are always written together by
-        // `register_orchestration_role`, so having survived the compound
-        // check above (which requires a `pane_registration_generation`
-        // entry) and still lacking a `pane_role_map` entry here means a
-        // caller that skipped proper registration entirely — refused the
-        // same way, per the PRD's "missing entry, treat conservatively"
-        // design.
+        // `pane_registration_generation` are written together by
+        // `register_orchestration_role` — but NOT always: production spawns
+        // use the `reserve_registration_generation` / `confirm_orchestration_role`
+        // split instead (see the former's doc), and `reserve_*` writes the
+        // generation entry ALONE, before the spawn it is for has even
+        // started. So there is a real window — and, if that spawn then
+        // fails, a permanent state — where a `pane_registration_generation`
+        // entry exists with no `pane_role_map` entry yet. That window
+        // survives the compound check above (which only requires the
+        // generation entry) exactly as a caller that skipped registration
+        // entirely would, so this fall-through refuses both the same way,
+        // per the PRD's "missing entry, treat conservatively" design.
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
@@ -7329,6 +7359,89 @@ clear = false
              handle_work_done chain is genuinely wired end to end; expected \
              a file at {}",
             delivered_path.display()
+        );
+    }
+
+    /// Fork #358 M4 round-2 review (reviewer B2 / auditor B2): pin the
+    /// ordering fix at the top of `handle_work_done` — the compound
+    /// generation/boot-id check must run BEFORE `retire_silence_watch` /
+    /// `retire_outstanding_delegation` — with a mutation-provable test.
+    /// Without this test, reverting that ordering (moving the compound
+    /// check back below the two retire calls) leaves every existing test
+    /// green: the test above, and `delegate_021_...` in
+    /// `delegate_prompt_injection.rs`, both send signals whose
+    /// generation/boot-id MATCH the current registration, so neither ever
+    /// reaches the refusal branch at all.
+    ///
+    /// Arms a silence watch AND an outstanding delegation for a registered
+    /// pane, delivers a signal shaped like a pre-M4 CLI's report
+    /// (`generation: 0`, `daemon_boot_id: ""` — the old-CLI shape the
+    /// changelog documents, which can never match a live registration),
+    /// and asserts BOTH that nothing was written AND that the watch and
+    /// the delegation are STILL ARMED afterward. Asserting delivery alone
+    /// would not prove the ordering — only that the watch/delegation
+    /// survive the refusal proves the compound check ran first.
+    #[tokio::test]
+    async fn handle_work_done_leaves_watch_and_delegation_armed_on_a_refused_signal() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let identity = instance("orch-ordering");
+
+        let mut state = AppState::default();
+        let reserved = state.reserve_registration_generation("P");
+        state.confirm_orchestration_role(
+            "P",
+            "coder",
+            false,
+            identity,
+            Some(cwd.path().to_str().expect("utf8 cwd")),
+            reserved,
+        );
+
+        let registry = AgentPtyRegistry::new();
+        let armed_watch = registry
+            .arm_silence_watch("P", "orchestrator-pane")
+            .expect("pane P is not mid-close, arming must succeed");
+        let armed_delegation = registry
+            .arm_outstanding_delegation("P", "coder", "orchestrator-pane", "orch-agent", None)
+            .expect("pane P is not mid-close, arming must succeed");
+
+        // Old-CLI shape: neither field can ever match a live registration,
+        // so the compound check refuses this regardless of `reserved` /
+        // `state.daemon_boot_id()` set up above.
+        let mismatched_signal = WorkDoneSignal {
+            pane_id: "P".to_string(),
+            task: "must never be delivered, and must never disarm P's bookkeeping".to_string(),
+            done: false,
+            timestamp: Utc::now(),
+            generation: 0,
+            daemon_boot_id: String::new(),
+        };
+
+        state.handle_work_done(mismatched_signal, &registry).await;
+
+        let file_name = work_done_file_name("coder", "P");
+        let misdelivered_path = cwd.path().join(".dot-agent-deck").join(&file_name);
+        assert!(
+            !misdelivered_path.exists(),
+            "a mismatched generation/boot-id signal must be refused, not \
+             delivered; found a file at {}",
+            misdelivered_path.display()
+        );
+
+        assert!(
+            registry.cancel_silence_watch_if("P", armed_watch.seq),
+            "the refused signal must not have retired P's silence watch — if \
+             the compound-key check ran AFTER the retire calls (the ordering \
+             bug this test pins), the watch would already be gone here"
+        );
+        assert!(
+            registry
+                .take_outstanding_delegation_if("P", armed_delegation.seq)
+                .is_some(),
+            "the refused signal must not have retired P's outstanding \
+             delegation — if the compound-key check ran AFTER the retire \
+             calls (the ordering bug this test pins), the delegation record \
+             would already be gone here"
         );
     }
 

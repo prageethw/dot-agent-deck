@@ -141,6 +141,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
         ),
         ("PATH".to_string(), path_env),
         common::registration_generation_env_tuple(),
+        common::daemon_boot_id_env_tuple(&daemon.state).await,
     ];
 
     // For Claude: point the worker at an isolated HOME that pre-trusts the

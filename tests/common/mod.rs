@@ -4142,6 +4142,27 @@ pub fn registration_generation_env_tuple() -> (String, String) {
     )
 }
 
+/// Fork #358 M4: the `DOT_AGENT_DECK_DAEMON_BOOT_ID` env tuple a worker-spawn
+/// fixture bakes into the spawned agent's environment, sibling to
+/// [`registration_generation_env_tuple`] above.
+///
+/// Unlike the generation half, this one cannot be a baked literal: the boot
+/// id is minted fresh per `AppState` (`AppState::daemon_boot_id`), so a
+/// hand-typed `"boot-…"` string would never match the harness's real daemon
+/// and `AppState::handle_work_done`'s compound-key check would refuse every
+/// delivery — which is exactly the bug this helper exists to prevent. Callers
+/// must read it from the same `SharedState` the harness's daemon runs on,
+/// before spawning the worker.
+pub async fn daemon_boot_id_env_tuple(
+    state: &dot_agent_deck::state::SharedState,
+) -> (String, String) {
+    let boot_id = state.read().await.daemon_boot_id().to_string();
+    (
+        dot_agent_deck::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(),
+        boot_id,
+    )
+}
+
 /// Fork #358 M2: inserts the `pane_registration_generation` entry that
 /// matches [`registration_generation_env_tuple`]'s baked-in env value — see
 /// that function's doc for why the two must agree.

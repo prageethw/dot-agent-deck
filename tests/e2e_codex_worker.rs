@@ -78,6 +78,7 @@ async fn codex_worker_001_inner() {
     let codex_home = cwd.path().join("codex-home");
     common::import_codex_credentials(&codex_home)
         .expect("copy Codex credentials and trust worker cwd");
+    let boot_id_tuple = common::daemon_boot_id_env_tuple(&daemon.state).await;
     let worker_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
@@ -100,6 +101,7 @@ async fn codex_worker_001_inner() {
                         .to_string(),
                 ),
                 common::registration_generation_env_tuple(),
+                boot_id_tuple,
             ],
             ..SpawnOptions::default()
         })

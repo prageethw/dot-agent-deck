@@ -1081,7 +1081,11 @@ pub struct WorkDoneSignal {
     /// refuses delivery when this no longer matches the pane's CURRENT
     /// generation: the pane was re-registered (worktree teardown + reuse)
     /// since this worker was spawned, so `pane_cwd_map`/`pane_role_map` now
-    /// point at a different tenant. `#[serde(default)]` so an older CLI
+    /// point at a different tenant. Fork #358 M4: this is only HALF of the
+    /// refusal check — see [`Self::daemon_boot_id`] below for the other
+    /// half, added because a bare daemon restart can reset this counter to
+    /// the same value a pre-restart worker already carried, which this
+    /// field alone cannot distinguish. `#[serde(default)]` so an older CLI
     /// build that doesn't send this field still parses (defaulting to `0`,
     /// which never matches a real registration's generation — those start
     /// at `1` — so an old CLI talking to a post-#358 daemon has its reports

@@ -274,10 +274,11 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
             pi_home.path().to_str().expect("pi home UTF-8").to_string(),
         ),
         ("OPENROUTER_API_KEY".to_string(), openrouter_key),
-        // Fork #358 M2: `respawn_agent_for_pane` replays this captured env
-        // verbatim into the real pi worker, so the generation tuple below
-        // carries forward to it too.
+        // Fork #358 M2/M4: `respawn_agent_for_pane` replays this captured env
+        // verbatim into the real pi worker, so the generation and boot-id
+        // tuples below carry forward to it too.
         common::registration_generation_env_tuple(),
+        common::daemon_boot_id_env_tuple(&daemon.state).await,
     ];
 
     // Spawn a cheap placeholder (`cat`, blocks on stdin) as the worker pane, NOT
