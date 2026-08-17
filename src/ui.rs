@@ -29072,11 +29072,13 @@ mod tests {
 
     #[test]
     fn fit_grid_keeps_single_col_when_it_already_fits() {
-        // 2 cards, width 99 (max_cols_for_width(99)=2), height 20: cols=1
-        // already fits at Spacious (1 row * 11 = 11 <= 20), so the joint
-        // search must not spend an extra column the richer single-column
-        // layout doesn't need.
-        assert_eq!(fit_grid(2, 99, 20), (1, CardDensity::Spacious));
+        // 2 cards, width 99 (max_cols_for_width(99)=2), height 20: at cols=1
+        // there are 2 rows (one card per row when there's only 1 column,
+        // rows=ceil(2/1)=2), so Spacious (2*11=22>20) does not fit but
+        // Normal (2*9=18<=20) does. cols=1 already fits at Normal, so the
+        // joint search must not spend an extra column the richer
+        // single-column layout doesn't need.
+        assert_eq!(fit_grid(2, 99, 20), (1, CardDensity::Normal));
     }
 
     #[test]
