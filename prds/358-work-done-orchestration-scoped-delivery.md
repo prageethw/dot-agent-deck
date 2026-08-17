@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: M1 and M2 done. M4's implementation is complete (compound generation/boot-id key, real-wiring test, B2 ordering fix — see M4 below); pending CI confirmation that the previously-RED cross-restart test now passes before M3's "close honestly" box is checked.
+**Status**: M1, M2 and M4 done — CI-confirmed on commit `93e983d2` (PR #440): `handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart` now passes (`build` job, `cargo nextest run --workspace`, `3382 tests run: 3382 passed, 0 skipped`), and the informational `e2e` job is also green (`9624 tests run: 9624 passed, 0 skipped`). M3 (close honestly) is done — see below.
 
 ## Problem Statement
 
@@ -77,7 +77,7 @@ Concretely:
 
 ### M3 — close honestly
 
-- [ ] Issue #358 closes with the actual mechanism fixed, not a rescope. **M4's implementation is done (see below)** — the compound generation/boot-id key, the cross-restart test, and the B2 ordering fix are all in place. Left unchecked here pending CI confirmation that the previously-RED `handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart` now passes (this fork's CLAUDE.md rule 5 routes all test runs through CI, never locally) — check this box once that's confirmed green.
+- [x] Issue #358 closes with the actual mechanism fixed, not a rescope. M4's compound generation/boot-id key, the cross-restart test, and the B2 ordering fix are all in place and merged into this branch. **CI-confirmed on commit `93e983d2` (PR #440):** the previously-RED `handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart` passes (`build` job's `cargo nextest run --workspace`: `3382 tests run: 3382 passed, 0 skipped`); the informational `e2e` job is also green (`9624 tests run: 9624 passed, 0 skipped`). Read from the CI log's literal `Summary [...] N tests run: ...` line, not from the run's `conclusion` field (CLAUDE.md rule 8).
 - [x] Rule 12 cross-version question answered explicitly: **no wire/frame shape change** — this rides the existing unversioned hook socket, and no `PROTOCOL_VERSION` bump is needed. It **is** a real behavioral break, though, which is why `changelog.d/358.breaking.md` exists rather than a `.bugfix.md`: a `work-done` CLI built before this change has no code path that populates a registration generation at all, so `WorkDoneSignal::generation` decodes via `#[serde(default)]` as `0` — and `0` never matches a live pane's real registration (those start at `1`, per `reserve_registration_generation`'s `.or_insert(0) += 1`). Concretely, this means **every** report from an old CLI is refused as stale by a new daemon, not only genuinely stale ones: the fail-closed design cannot distinguish "old binary, no field" from "delayed report from a torn-down orchestration" — both look identical on the wire (`generation: 0`). That is a real compatibility break for a mixed old-CLI/new-daemon pairing (silently drops every worker completion report), even though no field or frame shape moved, which is exactly the "same-wire, different-meaning" semantic-break case CLAUDE.md rule 12 calls out as `.breaking.md`-worthy on its own.
 
 ### M4 — redesign for cross-restart survival, and prove the real wiring in CI (added after independent reviewer + auditor findings on M1/M2, 2026-08-17)
