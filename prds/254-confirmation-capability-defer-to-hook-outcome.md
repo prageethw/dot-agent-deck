@@ -4,7 +4,7 @@
 
 **Priority**: High
 
-**Status**: Not started. **Third attempt on this issue — the first two targeted a defect that no longer exists (see the issue's rescoping comment).**
+**Status**: Implemented and merged (PR #441) for the TUI-attached `delivery_capability` path. **Third attempt on this issue — the first two targeted a defect that no longer exists (see the issue's rescoping comment).** Issue #254 stays open: the dispatch/scheduler path (`drain_pre_write_events`, `src/spawn.rs`) still classifies from agent type alone and carries the same symptom — tracked separately as [#459](https://github.com/prageethw/dot-agent-deck/issues/459).
 
 ## Problem Statement
 
@@ -57,20 +57,20 @@ Concretely:
 
 ### M1 — thread the real outcome
 
-- [ ] `codex_spawn_prep`'s install/trust result is surfaced to whatever state `delivery_capability` reads, not only logged.
-- [ ] `delivery_capability`/`ConfirmationCapability` resolution for `Codex` requires a known-successful hook outcome for `Reports`, resolving to `Unknown` otherwise.
-- [ ] RED test: forced hook-install failure → capability is not `Reports` → deadline path finalizes honestly.
+- [x] `codex_spawn_prep`'s install/trust result is surfaced to whatever state `delivery_capability` reads, not only logged (`AppState::codex_hook_trust_failed`).
+- [x] `delivery_capability`/`ConfirmationCapability` resolution for `Codex` requires a known-successful hook outcome for `Reports`, resolving to `Unknown` otherwise — for the **TUI-attached path** (`delivery_capability`, `src/ui.rs`). The dispatch/scheduler path (`drain_pre_write_events`, `src/spawn.rs`) still classifies from agent type alone — tracked as [#459](https://github.com/prageethw/dot-agent-deck/issues/459), out of this PRD's scope.
+- [x] RED test: forced hook-install failure → capability is not `Reports` → deadline path finalizes honestly (`codex_spawn_prep_ok_zero_hooks_is_not_confirmed` and the full plumbing-chain coverage added during review).
 
 ### M2 — no regression on the healthy path
 
-- [ ] GREEN test: successful hook install/trust → capability resolves `Reports` exactly as today.
-- [ ] `pane_input_023`/`026`/`033` pass unmodified.
+- [x] GREEN test: successful hook install/trust → capability resolves `Reports` exactly as today (`delivery_capability_still_reports_a_codex_pane_with_no_recorded_hook_failure`).
+- [x] `pane_input_023`/`026`/`033` pass unmodified.
 
 ### M3 — close honestly
 
-- [ ] Issue #254 closes with the actual mechanism fixed — reference the rescoping comment and this PRD explicitly so the history reads coherently (two failed attempts on a defect that turned out not to exist, then this).
-- [ ] Changelog fragment.
-- [ ] Rule 12: this changes when a tab's remit gets permanently abandoned vs. honestly finalized — a genuine behavior change on a hook-adjacent path, no wire/frame shape change expected. Answer explicitly whether a `.breaking.md` fragment is warranted (likely: this makes a previously-broken case *better*, i.e. previously-abandoned remits may now finalize instead — probably not "breaking" in the sense that term is used here, but the manual cross-version run should still confirm nothing depends on the old abandon behavior).
+- [ ] Issue #254 does **not** close — the TUI-attached path is fixed, but the dispatch/scheduler path ([#459](https://github.com/prageethw/dot-agent-deck/issues/459)) still carries the symptom. Issue #254 stays open until that lands too.
+- [x] Changelog fragment (`changelog.d/254.bugfix.md`).
+- [x] Rule 12: answered during review — no `.breaking.md` needed. This is internal Codex-pane classification logic within a single build (no `PROTOCOL_VERSION` change, no wire/frame shape change, and the new state key is not on `main` in any released build yet, so no released peer's values can be reinterpreted).
 
 ## Key Files
 
