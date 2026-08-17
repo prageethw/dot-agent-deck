@@ -15649,7 +15649,10 @@ fn render_frame(
     let total_rows = all_rows.len();
     let visible_rows = (available_for_density / card_height).max(1) as usize;
 
-    // Title bar
+    // Title bar. The hidden-card count is appended below once the actual
+    // scroll-offset..end window is known (review finding S3), so it can't
+    // disagree with what the render loop paints — see `build_title` and its
+    // second use after the scroll-offset clamp.
     let total_sessions = state.sessions.len();
     let showing = sessions.len();
     let mut title_text = if showing < total_sessions {
@@ -15657,37 +15660,28 @@ fn render_frame(
     } else {
         format!("— {} session(s)", total_sessions)
     };
-    // Cards that fit within the filter but not within the viewport itself —
-    // distinct from the filter-based "X/Y session(s)" text above, so a user
-    // can tell "filtered out" apart from "didn't fit".
-    let displayed_cards: usize = all_rows
-        .iter()
-        .take(visible_rows.min(total_rows))
-        .map(|row| row.len())
-        .sum();
-    let hidden = showing.saturating_sub(displayed_cards);
-    if hidden > 0 {
-        title_text.push_str(&format!(" ({hidden} hidden — window too small)"));
-    }
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " worker-deck ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(title_text, text_primary()),
-    ]));
+    let build_title = |title_text: String| {
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " worker-deck ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title_text, text_primary()),
+        ]))
+    };
 
     if sessions.is_empty() {
-        // All filtered out
+        // All filtered out. No rows exist to hide, so the plain
+        // "X/Y session(s)" text above is already complete.
         let vertical = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .split(dashboard_area);
-        frame.render_widget(title, vertical[0]);
+        frame.render_widget(build_title(title_text), vertical[0]);
 
         let msg = Paragraph::new("No sessions match filter.")
             .style(text_primary())
@@ -15749,6 +15743,19 @@ fn render_frame(
     let end = (ui.scroll_offset + visible_rows).min(total_rows);
     let rows = &all_rows[ui.scroll_offset..end];
     let row_ids = &all_row_ids[ui.scroll_offset..end];
+
+    // Cards that fit within the filter but not within the viewport itself —
+    // distinct from the filter-based "X/Y session(s)" text above, so a user
+    // can tell "filtered out" apart from "scrolled out of view". Computed
+    // from the same scroll_offset..end window (`rows`, and the render loop
+    // below) actually paints, not a separate 0..visible_rows guess that
+    // could disagree once scrolled (review finding S3).
+    let displayed_cards: usize = rows.iter().map(|row| row.len()).sum();
+    let hidden = showing.saturating_sub(displayed_cards);
+    if hidden > 0 {
+        title_text.push_str(&format!(" ({hidden} more — scroll to see)"));
+    }
+    let title = build_title(title_text);
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
     for _ in rows {
@@ -19535,7 +19542,15 @@ fn grid_columns(width: u16) -> usize {
     }
 }
 
-/// Minimum readable card content width, in columns.
+/// Minimum readable card content width, in columns. The old `grid_columns`
+/// thresholds implied roughly 50 columns/card at the 1↔2 boundary and 60 at
+/// the 2↔3 boundary; 40 is narrower, but card content stays legible down to
+/// ~20 columns (see `dashboard/card-stats/002`'s snapshot test), so it's a
+/// defensible floor. It's now the sole width policy: `fit_grid` (issue #437)
+/// uses it only as the joint search's upper bound (`max_cols_for_width`),
+/// not as the starting column count — the search still starts from
+/// `grid_columns`'s pick, so a wide terminal keeps the same column count it
+/// had before.
 const MIN_CARD_W: u16 = 40;
 
 /// Widest column count `MIN_CARD_W`-wide cards can fit into `width`.
@@ -19550,14 +19565,19 @@ fn max_cols_for_width(width: u16) -> usize {
 /// refuse to fit, never negotiate. `fit_grid` searches both together, so a
 /// narrow-AND-short terminal where 1 column never fits at any density but 2
 /// narrower columns fit at `Compact` is actually found instead of silently
-/// truncating the grid. `grid_columns` and `choose_density` are left
-/// unchanged; this composes them rather than replacing their logic.
+/// truncating the grid. The search starts from `grid_columns`'s own pick
+/// (clamped into range) rather than always from 1, so an ordinary wide
+/// terminal keeps exactly the layout `grid_columns` would have chosen
+/// instead of collapsing to 1 column merely because 1 column also happens to
+/// fit. `grid_columns` and `choose_density` are left unchanged; this
+/// composes them rather than replacing their logic.
 fn fit_grid(total_cards: usize, width: u16, available_height: u16) -> (usize, CardDensity) {
     let max_cols = max_cols_for_width(width);
-    for cols in 1..=max_cols {
+    let start = grid_columns(width).clamp(1, max_cols);
+    for cols in start..=max_cols {
         let density = choose_density(total_cards, cols, available_height);
-        let rows = total_cards.max(1).div_ceil(cols) as u16;
-        if rows * density.card_height() <= available_height {
+        let rows = total_cards.div_ceil(cols) as u32;
+        if rows * density.card_height() as u32 <= available_height as u32 {
             return (cols, density);
         }
     }
