@@ -25001,14 +25001,24 @@ mod tests {
     #[test]
     fn grid_005_working_card_paints_status_at_every_height_tier() {
         const N: usize = 5;
+        // The Working override targets the LAST role (role{N}), not role1:
+        // under today's pre-M1/M2 scroll-based slicing, role1 is always the
+        // single visible row regardless of `tier` (visible_rows tops out at
+        // 2 across tier in [1, 2, 3] here, using the fixed Compact
+        // card_height of 6), so a Working override on role1 would paint —
+        // and this test would pass — even without either milestone. role{N}
+        // sits outside every one of those pre-fix visible windows and is
+        // only painted once fit-all mode divides the column evenly and M2's
+        // height tiers render it, which is what this test must actually pin.
         for tier in [1u16, 2, 3] {
             let available_for_density = N as u16 * tier;
             let height = available_for_density + 3;
             let (rendered, _ui) =
-                render_dashboard_grid_with_statuses(N, 39, height, &[(1, SessionStatus::Working)]);
+                render_dashboard_grid_with_statuses(N, 39, height, &[(N, SessionStatus::Working)]);
+            let role = format!("role{N}");
             assert!(
-                rendered.contains("role1"),
-                "tier {tier}: expected role1 in rendered output; got:\n{rendered}"
+                rendered.contains(&role),
+                "tier {tier}: expected {role} in rendered output; got:\n{rendered}"
             );
             assert!(
                 rendered.contains("Working"),
