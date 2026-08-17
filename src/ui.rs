@@ -15629,7 +15629,7 @@ fn render_frame(
     // viewport-hidden indicator below can use it.
     // 1 row for title + 1 row for stats bar at bottom of dashboard
     let available_for_density = dashboard_area.height.saturating_sub(2);
-    let (cols, density) = fit_grid(sessions.len(), dashboard_area.width, available_for_density);
+    let (mut cols, density) = fit_grid(sessions.len(), dashboard_area.width, available_for_density);
     ui.columns = cols;
     let card_height = density.card_height();
 
@@ -15644,10 +15644,37 @@ fn render_frame(
     // Row-count math, also moved up so the title can report cards that don't
     // fit in the viewport even at the fitted (cols, density) — not only cards
     // dropped by filtering. Reused unchanged by the row-slicing below.
-    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
-    let total_rows = all_rows.len();
-    let visible_rows = (available_for_density / card_height).max(1) as usize;
+    let mut all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let mut all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let mut total_rows = all_rows.len();
+
+    // PRD fork#446 M1: `fit_grid` only returns without a fit (its
+    // `(max_cols, Compact)` fallback) when its own loop never finds a
+    // `(cols, density)` combination that fits — a successful loop return
+    // always satisfies `rows * card_height <= available_height` for the
+    // returned `cols`, so this condition can only trip on that fallback.
+    // Rather than silently truncating to a scrolled window (the pre-fix
+    // behaviour), maximise columns first — fewer, taller rows — then divide
+    // the column height evenly so every row still paints.
+    let mut row_heights: Option<Vec<u16>> = None;
+    if (total_rows as u32) * (card_height as u32) > available_for_density as u32 {
+        cols = max_cols_for_width(dashboard_area.width);
+        ui.columns = cols;
+        all_rows = sessions.chunks(cols).collect();
+        all_row_ids = session_ids.chunks(cols).collect();
+        total_rows = all_rows.len();
+        row_heights = even_row_heights(total_rows, available_for_density);
+        if row_heights.is_some() {
+            // Fewer rows fit doesn't mean the old scroll offset applies to
+            // this row count — fit-all mode shows every row unconditionally.
+            ui.scroll_offset = 0;
+        }
+    }
+    let visible_rows = if row_heights.is_some() {
+        total_rows
+    } else {
+        (available_for_density / card_height).max(1) as usize
+    };
 
     // Title bar. The hidden-card count is appended below once the actual
     // scroll-offset..end window is known (review finding S3), so it can't
@@ -15758,8 +15785,18 @@ fn render_frame(
     let title = build_title(title_text);
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in rows {
-        constraints.push(Constraint::Length(card_height));
+    if let Some(heights) = &row_heights {
+        // Fit-all mode: `rows` is the full `0..total_rows` slice (scroll_offset
+        // forced to 0, visible_rows == total_rows above), so it lines up 1:1
+        // with `heights` — one evenly-divided `Constraint::Length` per row
+        // instead of `total_rows` copies of the fixed `card_height`.
+        for h in heights {
+            constraints.push(Constraint::Length(*h));
+        }
+    } else {
+        for _ in rows {
+            constraints.push(Constraint::Length(card_height));
+        }
     }
     constraints.push(Constraint::Min(0)); // filler
     constraints.push(Constraint::Length(1)); // stats bar
@@ -19589,12 +19626,6 @@ fn fit_grid(total_cards: usize, width: u16, available_height: u16) -> (usize, Ca
 /// row, so the heights sum to exactly `available_height` and leave no blank
 /// tail. `None` only when `available_height < total_rows`, i.e. there is not
 /// even one row per card and no layout can show them all.
-///
-/// `#[allow(dead_code)]`: only the unit tests below call this so far — the
-/// render-site "fit-all mode" wiring (rest of PRD fork#446 M1) and the M2
-/// height-tiered `render_session_card` branches are separate, not-yet-landed
-/// work. Remove this attribute once that wiring lands and calls it for real.
-#[allow(dead_code)]
 fn even_row_heights(total_rows: usize, available_height: u16) -> Option<Vec<u16>> {
     if total_rows == 0 || (available_height as usize) < total_rows {
         return None;
@@ -19720,6 +19751,10 @@ fn render_session_card(
     } else {
         &session.session_id
     };
+    // PRD fork#446 M2: hoisted above the tier branches below — the role name
+    // is one of the two survivors (with status) at every height tier, not
+    // only the `>= 3` full-card body.
+    let role_name_text = display_name.map(|name| name.as_str()).unwrap_or(id_display);
 
     let num_prefix = match card_number {
         Some(n) => format!("{n} "),
@@ -19843,6 +19878,62 @@ fn render_session_card(
     let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
     let border_style = base_border_style.add_modifier(border_emphasis);
 
+    // PRD fork#446 M2: height-tiered rendering. Fit-all mode (M1) can squeeze
+    // a row to 1 or 2 lines tall — below that, `Borders::ALL` alone spends
+    // every available row on border with no content left, so the card must
+    // shed its border before it sheds the two things it exists to answer:
+    // which role, and what it's doing. `>= 3` rows needs no branch at all —
+    // the body `Paragraph` below clips naturally via ratatui (the idle-art
+    // comment further down already depends on the same clipping), and
+    // content priority already puts role name first, so nothing changes here.
+    if area.height == 1 {
+        // No block at all: one line straight into `area` carrying only the
+        // two survivors — role name (left, with the selection/number prefix)
+        // and status (right-aligned), the same two pieces the bordered card's
+        // title carries, just without the badge/liveness decoration a single
+        // row has no room for.
+        let left = format!("{sel_prefix}{num_prefix}{role_name_text}");
+        let width = area.width as usize;
+        let status_len = status_text.chars().count();
+        let left_trunc = truncate_with_ellipsis(&left, width.saturating_sub(status_len));
+        let pad = width.saturating_sub(left_trunc.chars().count() + status_len);
+        let line = Line::from(vec![
+            Span::styled(left_trunc, title_bold),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(status_text, status_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    } else if area.height == 2 {
+        // `Borders::TOP` only: the top border line already carries the
+        // shortcut/badge title and the right-aligned status (same
+        // `title_spans` / `status_text` the full card uses), so the single
+        // remaining inner row goes to the role name — the other survivor.
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_type(border_type)
+            .border_style(border_style)
+            .title(Line::from(title_spans))
+            .title_alignment(ratatui::layout::Alignment::Left)
+            .title(
+                Line::from(Span::styled(status_text, status_style))
+                    .alignment(ratatui::layout::Alignment::Right),
+            );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let w = inner.width as usize;
+        let line = if role_name_text.is_empty() {
+            Line::from("")
+        } else {
+            Line::from(Span::styled(
+                truncate_with_ellipsis(role_name_text, w),
+                Style::default().fg(palette::ROLE_NAME),
+            ))
+        };
+        frame.render_widget(Paragraph::new(line), inner);
+        return;
+    }
+
     // PRD #339: `Last` / `Tools` ride the bottom border instead of a content
     // row. Border cells are paid for by `Borders::ALL` either way, so the
     // counters cost zero rows and card height stops depending on card width.
@@ -19900,7 +19991,6 @@ fn render_session_card(
     // display_name -> id_display ladder the title used to. Pushed
     // unconditionally (even when both are empty, as `Line::from("")`) so the
     // emitted line count never diverges from what `card_height()` reserves.
-    let role_name_text = display_name.map(|name| name.as_str()).unwrap_or(id_display);
     lines.push(if role_name_text.is_empty() {
         Line::from("")
     } else {
