@@ -469,6 +469,21 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 
+/// `AgentEvent.metadata` key carrying `codex_spawn_prep`'s (`src/wrap.rs`) REAL
+/// native hook install/trust outcome for the invocation that produced this
+/// `SessionStart` (PRD #254). Only the wrapper sets it, and only on a
+/// Codex-identity event — every other producer and agent type omit it. Value
+/// is the `bool`'s `Display` form (`"true"`/`"false"`); an absent key means
+/// "no outcome reported" (an old wrapper build, a non-Codex identity, or a
+/// non-wrapper producer), which consumers must read as unknown, not as
+/// success — see [`AgentEvent::codex_hook_trust_outcome`].
+///
+/// Additive on the wire in both directions, same as
+/// [`SESSION_START_ORIGIN_METADATA_KEY`]: an old wrapper omits the key and a
+/// new daemon reads `None`; a new wrapper's key is ignored by an old daemon.
+/// Not a [`crate::daemon_protocol::PROTOCOL_VERSION`] bump.
+pub const CODEX_HOOK_TRUST_METADATA_KEY: &str = "codex_hook_trust_confirmed";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -646,6 +661,23 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
+
+    /// PRD #254: this event's stamped Codex native-hook install/trust outcome
+    /// (see [`CODEX_HOOK_TRUST_METADATA_KEY`]), if any. `None` when the key is
+    /// absent — an old wrapper build, a non-Codex-identity spawn, or any
+    /// non-wrapper producer, none of which report anything about hook trust,
+    /// and none of which should be read as either a success or a failure.
+    pub fn codex_hook_trust_outcome(&self) -> Option<bool> {
+        match self
+            .metadata
+            .get(CODEX_HOOK_TRUST_METADATA_KEY)
+            .map(String::as_str)
+        {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        }
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than

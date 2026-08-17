@@ -514,19 +514,16 @@ impl OrchestrationIdentity {
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
-    /// PRD #254 M1 scaffold: pane ids whose Codex native hook install/trust
+    /// PRD #254: pane ids whose Codex native hook install/trust
     /// (`codex_spawn_prep` in `src/wrap.rs`) is KNOWN to have failed for that
-    /// specific pane. `codex_spawn_prep`'s outcome is currently only
-    /// `tracing::warn!`'d and discarded (`CodexSpawnPrep` carries just the
-    /// pinned `CODEX_HOME`, not a trust-success flag) — nothing today
-    /// populates this from a real spawn, and `delivery_capability` does not
-    /// consult it either. It exists purely so
-    /// `delivery_capability_does_not_defer_codex_reports_to_hook_outcome`
-    /// below can express "the hook is known to have failed for this pane"
-    /// without driving an actual `codex` process through `codex_spawn_prep`.
-    /// Threading the real outcome here (or wherever else `delivery_capability`
-    /// ends up reading it) and gating `Reports` on it is PRD #254's actual
-    /// fix, not this field.
+    /// specific pane. Populated in [`Self::apply_event`] from the wrapper-fork
+    /// `SessionStart`'s real outcome
+    /// (`AgentEvent::codex_hook_trust_outcome`), and cleared on a later
+    /// successful respawn on the same (reused) pane id rather than latching a
+    /// failure forever. `crate::ui::delivery_capability` consults this to
+    /// downgrade a Codex pane's capability from `Reports` to `CannotReport`
+    /// until the hook is known-successful for that pane, instead of resolving
+    /// capability from agent type alone.
     pub codex_hook_trust_failed: HashSet<String>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
@@ -4449,6 +4446,23 @@ impl AppState {
             }
         } else if !self.managed_pane_ids.is_empty() {
             return;
+        }
+        // PRD #254: record the wrapper's REAL Codex native hook install/trust
+        // outcome, when this `SessionStart` reports one
+        // (`AgentEvent::codex_hook_trust_outcome`). Independent of the
+        // generation/session bookkeeping below — this is a fact about the
+        // pane's most recent spawn, not about which conversation currently
+        // owns it. A later successful respawn on a reused pane id (a `/clear`
+        // restart, since the managed pane id is stable across one) clears a
+        // stale failure rather than latching it forever.
+        if let Some(ref pane_id) = event.pane_id
+            && let Some(known_successful) = event.codex_hook_trust_outcome()
+        {
+            if known_successful {
+                self.codex_hook_trust_failed.remove(pane_id);
+            } else {
+                self.codex_hook_trust_failed.insert(pane_id.clone());
+            }
         }
         // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
         // is not evidence of a takeover and may retire nothing. Hoisted above

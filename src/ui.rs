@@ -4297,13 +4297,8 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
         delivery.observed_generation = Some(announced);
     }
     if !delivery.can_report_prompts {
-        delivery.can_report_prompts = pane_confirmation_capability(
-            snapshot
-                .sessions
-                .values()
-                .filter(|session| session.pane_id.as_deref() == Some(pane_id))
-                .map(|session| &session.agent_type),
-        ) == ConfirmationCapability::Reports;
+        delivery.can_report_prompts =
+            pane_confirmation_capability_for(snapshot, pane_id) == ConfirmationCapability::Reports;
     }
 }
 
@@ -4452,7 +4447,39 @@ fn delivery_capability(
             ConfirmationCapability::Unknown
         };
     }
-    pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type))
+    pane_confirmation_capability_for(snapshot, pane_id)
+}
+
+/// PRD #254: [`pane_confirmation_capability`] over one pane's sessions, but
+/// downgraded from `Reports` to `CannotReport` when the pane is Codex-typed
+/// AND its native hook install/trust is known to have failed
+/// (`AppState::codex_hook_trust_failed`). A pane whose hook genuinely failed to
+/// install/trust can never produce TEXT confirmation — the wrapper hardcodes
+/// `user_prompt: None` on that degraded path — so classifying it `Reports`
+/// burns the full retry cycle against a live interactive Codex TUI and then
+/// permanently abandons the tab's remit at the deadline.
+///
+/// Every call site that would otherwise resolve capability from a pane's
+/// sessions directly must go through this instead of
+/// [`pane_confirmation_capability`], or the sticky `can_report_prompts` latch
+/// can still be set `true` from the un-downgraded path (see
+/// `bind_delivery_generation`).
+fn pane_confirmation_capability_for(snapshot: &AppState, pane_id: &str) -> ConfirmationCapability {
+    let pane_sessions = || {
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    };
+    let capability =
+        pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type));
+    if capability == ConfirmationCapability::Reports
+        && snapshot.codex_hook_trust_failed.contains(pane_id)
+        && pane_sessions().any(|session| session.agent_type == AgentType::Codex)
+    {
+        return ConfirmationCapability::CannotReport;
+    }
+    capability
 }
 
 /// Issue #424 (reviewer MEDIUM, C6): has this pane produced evidence since our
