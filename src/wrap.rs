@@ -2000,4 +2000,141 @@ mod tests {
             "termios restored to the original on drop"
         );
     }
+
+    // -------------------------------------------------------------------
+    // PRD #254 T1: `codex_spawn_prep`'s hook-trust outcome -- where H1 lives.
+    // `trust_deck_hooks_in` (`src/codex_hooks_manage.rs`) drives Codex's real
+    // `codex app-server` JSON-RPC protocol via `Command::new("codex")`, so
+    // exercising it deterministically means standing a fake `codex` in front
+    // of that call and mutating this process's `PATH`/`CODEX_HOME` directly
+    // to reach it -- an in-process unit test has no per-subprocess
+    // environment boundary. Same pattern and same soundness caveat as
+    // `worktree_reclaim.rs`'s `PathEnvGuard`/`GH_PATH_ENV_LOCK` (sound only
+    // because `cargo nextest` gives each test its own process); the fake
+    // script itself is a self-contained, smaller stand-in for
+    // `tests/fixtures/codex-synthetic/codex` so this unit test carries no
+    // cross-directory fixture dependency.
+    // -------------------------------------------------------------------
+
+    /// Serializes tests in this module that mutate the process-global `PATH`
+    /// and `CODEX_HOME` to stand a fake `codex` in front of
+    /// `codex_spawn_prep`'s real `trust_deck_hooks_in` -> `Command::new("codex")`
+    /// call. Only this module's tests spawn a fake `codex` at all, so this
+    /// only ever needs to serialize against itself.
+    static CODEX_SPAWN_PREP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: prepends `bindir` to `PATH` and points `CODEX_HOME` at
+    /// `home`, restoring both on drop even on panic. Callers must hold
+    /// `CODEX_SPAWN_PREP_ENV_LOCK` for this guard's entire lifetime.
+    struct CodexSpawnPrepEnvGuard {
+        prev_path: Option<String>,
+        prev_codex_home: Option<String>,
+    }
+
+    impl CodexSpawnPrepEnvGuard {
+        fn set(bindir: &std::path::Path, home: &std::path::Path) -> Self {
+            let prev_path = std::env::var("PATH").ok();
+            let new_path = match &prev_path {
+                Some(p) => format!("{}:{p}", bindir.display()),
+                None => bindir.display().to_string(),
+            };
+            let prev_codex_home = std::env::var("CODEX_HOME").ok();
+            // SAFETY: sound only because `cargo nextest` gives each test its
+            // own process (see `worktree_reclaim.rs`'s `PathEnvGuard` for the
+            // full caveat this crate already records) -- with one test per
+            // process there is no second thread in this process to race the
+            // read side. `CODEX_SPAWN_PREP_ENV_LOCK` only serializes this
+            // module's own tests against each other.
+            unsafe {
+                std::env::set_var("PATH", new_path);
+                std::env::set_var("CODEX_HOME", home);
+            }
+            Self {
+                prev_path,
+                prev_codex_home,
+            }
+        }
+    }
+
+    impl Drop for CodexSpawnPrepEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see CodexSpawnPrepEnvGuard::set.
+            unsafe {
+                match self.prev_path.take() {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+                match self.prev_codex_home.take() {
+                    Some(h) => std::env::set_var("CODEX_HOME", h),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+        }
+    }
+
+    /// Writes a synthetic `codex` executable into `bindir` that answers
+    /// `codex app-server`'s two-request handshake (`initialize` then
+    /// `hooks/list`) the way `list_hooks_in` (`src/codex_hooks_manage.rs`)
+    /// expects, reporting exactly `hooks_json` (a JSON array of
+    /// `CodexHookEntry`-shaped objects) for the `hooks/list` call. An empty
+    /// array is how a genuinely healthy `codex` reports "the deck's hooks
+    /// aren't in this home" -- the exact shape `trust_deck_hooks_in` turns
+    /// into `Ok(0)`.
+    #[cfg(unix)]
+    fn write_fake_codex_app_server(bindir: &std::path::Path, hooks_json: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n  IFS= read -r _initialize\n  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\",\"codexHome\":\"test\"}}}}'\n  IFS= read -r _list\n  printf '%s\\n' '{{\"id\":2,\"result\":{{\"data\":[{{\"cwd\":\"/workspace\",\"hooks\":{hooks_json},\"warnings\":[],\"errors\":[]}}]}}}}'\nfi\n"
+        );
+        let codex_path = bindir.join("codex");
+        std::fs::write(&codex_path, script).expect("write fake codex script");
+        std::fs::set_permissions(&codex_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake codex script");
+    }
+
+    /// Scenario: PRD #254 H1 (auditor blocker on PR #441). `codex_spawn_prep`
+    /// resolves a pinned Codex home, then calls `trust_deck_hooks_in`, which
+    /// returns `Ok(0)` when Codex reports ZERO deck-owned hook entries for
+    /// that home -- the genuine "the hook failed to install/trust" case (an
+    /// unwritable `CODEX_HOME`, a full disk, a partial write; `auto_install()`
+    /// swallows every one of those behind a `tracing::warn!`, so no error
+    /// reaches this point). Today `codex_spawn_prep` sets
+    /// `hook_trust_confirmed = true` for ANY `Ok(_)` -- `count` is bound in
+    /// the match arm and passed to `tracing::debug!`, but never compared --
+    /// so this exact failure is recorded as success. This is the RED half of
+    /// the pin: it must fail against current code (asserting the fix,
+    /// `count > 0`, not yet applied), confirming this is a genuine
+    /// regression test and not a tautology.
+    #[test]
+    #[cfg(unix)]
+    fn codex_spawn_prep_ok_zero_hooks_is_not_confirmed() {
+        let _lock = CODEX_SPAWN_PREP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).expect("create bindir");
+        write_fake_codex_app_server(&bindir, "[]");
+
+        let codex_home = scratch.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let _env_guard = CodexSpawnPrepEnvGuard::set(&bindir, &codex_home);
+
+        let prep = codex_spawn_prep("codex", &AgentType::Codex, None);
+
+        assert!(
+            prep.pinned_home.is_some(),
+            "sanity: a Codex program with CODEX_HOME resolvable must resolve a \
+             pinned home before hook trust is even attempted"
+        );
+        assert!(
+            !prep.hook_trust_confirmed,
+            "H1: trust_deck_hooks_in returning Ok(0) -- zero deck-owned hook \
+             entries found, the genuine 'hook failed to install/trust' case \
+             -- must be recorded as NOT confirmed, not confirmed"
+        );
+    }
 }

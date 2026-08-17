@@ -36562,12 +36562,12 @@ mod tests {
     /// burns the full 60s escalating retry cycle against a live interactive
     /// Codex TUI and then permanently abandons the tab's remit at the deadline.
     ///
-    /// PRD #254: today `delivery_capability` resolves capability from agent
-    /// TYPE alone (`pane_confirmation_capability` over `session.agent_type`) —
-    /// nothing reads `codex_hook_trust_failed`, so this is RED until the hook
-    /// outcome is threaded into resolution.
+    /// PRD #254: `delivery_capability` now defers to
+    /// `pane_confirmation_capability_for`, which reads `codex_hook_trust_failed`
+    /// and downgrades the resolution away from `Reports` for exactly this
+    /// pane, instead of resolving capability from agent TYPE alone.
     #[test]
-    fn delivery_capability_does_not_yet_defer_codex_reports_to_hook_outcome() {
+    fn delivery_capability_defers_codex_reports_to_hook_outcome() {
         const PANE_ID: &str = "codex-hook-failed-pane";
         const AGENT_ID: &str = "codex-hook-failed-agent";
 
@@ -36591,9 +36591,10 @@ mod tests {
             delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
             ConfirmationCapability::Reports,
             "PRD #254: a Codex pane whose native hook install/trust is known \
-             to have failed must not be classified Reports — it is resolved \
-             from agent type alone today, so this is expected to fail until \
-             the hook outcome is threaded into capability resolution"
+             to have failed must not be classified Reports — classifying it \
+             Reports would burn the full 60s escalating retry cycle against a \
+             live interactive Codex TUI and then permanently abandon the \
+             tab's remit at the deadline"
         );
     }
 
