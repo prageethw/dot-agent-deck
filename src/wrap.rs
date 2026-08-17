@@ -52,8 +52,9 @@ use chrono::Utc;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
-    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, CODEX_HOOK_TRUST_METADATA_KEY, EventType,
+    LiveTarget, SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN,
+    Writable,
 };
 
 /// A coarse activity state detected from a single line of wrapped output.
@@ -283,12 +284,26 @@ impl Emitter {
     /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets readiness
     /// gates tell this apart from a genuine "the session is up and accepting
     /// input" signal; see [`crate::state::wait_for_session_start`].
-    fn emit_fork_session_start(&self) {
+    ///
+    /// PRD #254: for a Codex-identity pane, also stamps
+    /// [`crate::event::CODEX_HOOK_TRUST_METADATA_KEY`] with `codex_spawn_prep`'s
+    /// REAL install/trust outcome — known by this point, since it runs before
+    /// spawn — so the daemon can defer `ConfirmationCapability::Reports` until
+    /// the hook is known-successful for this specific pane rather than
+    /// resolving it from agent type alone. Omitted for every other agent type:
+    /// the field is Codex-specific and stamping it elsewhere would be noise.
+    fn emit_fork_session_start(&self, codex_hook_trust_confirmed: bool) {
         let mut metadata = HashMap::new();
         metadata.insert(
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
         );
+        if self.agent_type == AgentType::Codex {
+            metadata.insert(
+                CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+                codex_hook_trust_confirmed.to_string(),
+            );
+        }
         self.emit_with_metadata(EventType::SessionStart, metadata);
     }
 
@@ -648,6 +663,17 @@ struct CodexSpawnPrep {
     /// `CODEX_HOME` to set explicitly on the spawned child's environment (finding
     /// #2). `None` when this invocation installs no Codex hooks / resolves no home.
     pinned_home: Option<std::path::PathBuf>,
+    /// PRD #254: whether this invocation's native hook install/trust is KNOWN
+    /// to have succeeded — a pinned home resolved AND
+    /// [`crate::codex_hooks_manage::trust_deck_hooks_in`] returned `Ok`.
+    /// `false` covers every other case (no hooks installed for this
+    /// invocation, no home resolved, or trust recording returned `Err`) —
+    /// previously discarded after a `tracing::warn!` and unobservable outside
+    /// the log. Stamped onto the wrapper-fork `SessionStart`
+    /// ([`Emitter::emit_fork_session_start`]) so the daemon can defer
+    /// `ConfirmationCapability::Reports` until the outcome is actually
+    /// known-successful for this specific pane.
+    hook_trust_confirmed: bool,
 }
 
 /// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to install
@@ -676,7 +702,12 @@ struct CodexSpawnPrep {
 ///   `./launcher.sh`, `devbox run codex-big` all behave identically) and strictly
 ///   narrower than the old bypass: a third-party hook in the same `hooks.json`
 ///   stays untrusted. Any failure is warned and the spawn continues — Codex then
-///   won't run the hooks and events degrade to stdout classification (fail-closed).
+///   won't run the hooks and events degrade to stdout classification
+///   (fail-closed). PRD #254: this outcome is no longer just a log line —
+///   [`CodexSpawnPrep::hook_trust_confirmed`] carries it back to the caller,
+///   which stamps it on the wrapper-fork `SessionStart` so the daemon can
+///   defer `ConfirmationCapability::Reports` on this pane until the hook is
+///   actually known-successful.
 fn codex_spawn_prep(
     program: &str,
     agent_type: &AgentType,
@@ -696,10 +727,14 @@ fn codex_spawn_prep(
 
     // Scoped trust for the hooks just installed, in the SAME pinned home. The
     // child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
+    let mut hook_trust_confirmed = false;
     if let Some(home) = pinned_home.as_deref() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
         match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd) {
-            Ok(count) => tracing::debug!(count, "codex: recorded scoped trust for deck hooks"),
+            Ok(count) => {
+                tracing::debug!(count, "codex: recorded scoped trust for deck hooks");
+                hook_trust_confirmed = count > 0;
+            }
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
                  classification"
@@ -707,7 +742,10 @@ fn codex_spawn_prep(
         }
     }
 
-    CodexSpawnPrep { pinned_home }
+    CodexSpawnPrep {
+        pinned_home,
+        hook_trust_confirmed,
+    }
 }
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the
@@ -1094,8 +1132,10 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // PRD #20 Greptile finding #2: the returned `pinned_home` is set explicitly
     // on the spawned child so the home the deck installed into and trusted is
     // exactly the home Codex loads.
-    let CodexSpawnPrep { pinned_home } =
-        codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+    let CodexSpawnPrep {
+        pinned_home,
+        hook_trust_confirmed,
+    } = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
     // tty-or-redirected nature of EACH standard descriptor independently. If any
@@ -1111,9 +1151,22 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     ];
 
     if tty.iter().any(|&t| t) {
-        run_wrap_pty(program, args, &emitter, pinned_home.as_deref(), tty)
+        run_wrap_pty(
+            program,
+            args,
+            &emitter,
+            pinned_home.as_deref(),
+            hook_trust_confirmed,
+            tty,
+        )
     } else {
-        run_wrap_pipe(program, args, &emitter, pinned_home.as_deref())
+        run_wrap_pipe(
+            program,
+            args,
+            &emitter,
+            pinned_home.as_deref(),
+            hook_trust_confirmed,
+        )
     }
 }
 
@@ -1133,6 +1186,7 @@ fn run_wrap_pty(
     args: &[String],
     emitter: &Arc<Emitter>,
     pinned_codex_home: Option<&std::path::Path>,
+    codex_hook_trust_confirmed: bool,
     tty: [bool; 3],
 ) -> ExitCode {
     let [stdin_tty, stdout_tty, stderr_tty] = tty;
@@ -1238,8 +1292,10 @@ fn run_wrap_pty(
     // The session has begun — surface the card immediately. PRD #225 M3: this is
     // a CARD-SURFACING signal, not a readiness signal (the child may still be
     // `devbox`/a shell for seconds before the agent TUI exists), so it carries
-    // the wrapper-fork origin marker.
-    emitter.emit_fork_session_start();
+    // the wrapper-fork origin marker. PRD #254: it also carries the real Codex
+    // hook install/trust outcome, since `codex_spawn_prep` has already run by
+    // this point.
+    emitter.emit_fork_session_start(codex_hook_trust_confirmed);
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
     // keystrokes (incl. Ctrl+C and CR) reach the inner PTY unmodified; restored
@@ -1436,6 +1492,7 @@ fn run_wrap_pipe(
     args: &[String],
     emitter: &Arc<Emitter>,
     pinned_codex_home: Option<&std::path::Path>,
+    codex_hook_trust_confirmed: bool,
 ) -> ExitCode {
     let mut cmd = StdCommand::new(program);
     cmd.args(args);
@@ -1473,8 +1530,9 @@ fn run_wrap_pipe(
     let child_pid = child.id() as libc::pid_t;
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
-    // same marker — it says "a session exists", not "the agent is ready".
-    emitter.emit_fork_session_start();
+    // same marker — it says "a session exists", not "the agent is ready". PRD
+    // #254: same hook-trust outcome as the PTY path too.
+    emitter.emit_fork_session_start(codex_hook_trust_confirmed);
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
     let child_stderr = child.stderr.take().expect("piped child stderr");
@@ -1940,6 +1998,142 @@ mod tests {
             read_lflag(),
             before,
             "termios restored to the original on drop"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // PRD #254 T1: `codex_spawn_prep`'s hook-trust outcome -- where H1 lives.
+    // `trust_deck_hooks_in` (`src/codex_hooks_manage.rs`) drives Codex's real
+    // `codex app-server` JSON-RPC protocol via `Command::new("codex")`, so
+    // exercising it deterministically means standing a fake `codex` in front
+    // of that call and mutating this process's `PATH`/`CODEX_HOME` directly
+    // to reach it -- an in-process unit test has no per-subprocess
+    // environment boundary. Same pattern and same soundness caveat as
+    // `worktree_reclaim.rs`'s `PathEnvGuard`/`GH_PATH_ENV_LOCK` (sound only
+    // because `cargo nextest` gives each test its own process); the fake
+    // script itself is a self-contained, smaller stand-in for
+    // `tests/fixtures/codex-synthetic/codex` so this unit test carries no
+    // cross-directory fixture dependency.
+    // -------------------------------------------------------------------
+
+    /// Serializes tests in this module that mutate the process-global `PATH`
+    /// and `CODEX_HOME` to stand a fake `codex` in front of
+    /// `codex_spawn_prep`'s real `trust_deck_hooks_in` -> `Command::new("codex")`
+    /// call. Only this module's tests spawn a fake `codex` at all, so this
+    /// only ever needs to serialize against itself.
+    static CODEX_SPAWN_PREP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: prepends `bindir` to `PATH` and points `CODEX_HOME` at
+    /// `home`, restoring both on drop even on panic. Callers must hold
+    /// `CODEX_SPAWN_PREP_ENV_LOCK` for this guard's entire lifetime.
+    struct CodexSpawnPrepEnvGuard {
+        prev_path: Option<String>,
+        prev_codex_home: Option<String>,
+    }
+
+    impl CodexSpawnPrepEnvGuard {
+        fn set(bindir: &std::path::Path, home: &std::path::Path) -> Self {
+            let prev_path = std::env::var("PATH").ok();
+            let new_path = match &prev_path {
+                Some(p) => format!("{}:{p}", bindir.display()),
+                None => bindir.display().to_string(),
+            };
+            let prev_codex_home = std::env::var("CODEX_HOME").ok();
+            // SAFETY: sound only because `cargo nextest` gives each test its
+            // own process (see `worktree_reclaim.rs`'s `PathEnvGuard` for the
+            // full caveat this crate already records) -- with one test per
+            // process there is no second thread in this process to race the
+            // read side. `CODEX_SPAWN_PREP_ENV_LOCK` only serializes this
+            // module's own tests against each other.
+            unsafe {
+                std::env::set_var("PATH", new_path);
+                std::env::set_var("CODEX_HOME", home);
+            }
+            Self {
+                prev_path,
+                prev_codex_home,
+            }
+        }
+    }
+
+    impl Drop for CodexSpawnPrepEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see CodexSpawnPrepEnvGuard::set.
+            unsafe {
+                match self.prev_path.take() {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+                match self.prev_codex_home.take() {
+                    Some(h) => std::env::set_var("CODEX_HOME", h),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+        }
+    }
+
+    /// Writes a synthetic `codex` executable into `bindir` that answers
+    /// `codex app-server`'s two-request handshake (`initialize` then
+    /// `hooks/list`) the way `list_hooks_in` (`src/codex_hooks_manage.rs`)
+    /// expects, reporting exactly `hooks_json` (a JSON array of
+    /// `CodexHookEntry`-shaped objects) for the `hooks/list` call. An empty
+    /// array is how a genuinely healthy `codex` reports "the deck's hooks
+    /// aren't in this home" -- the exact shape `trust_deck_hooks_in` turns
+    /// into `Ok(0)`.
+    #[cfg(unix)]
+    fn write_fake_codex_app_server(bindir: &std::path::Path, hooks_json: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n  IFS= read -r _initialize\n  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\",\"codexHome\":\"test\"}}}}'\n  IFS= read -r _list\n  printf '%s\\n' '{{\"id\":2,\"result\":{{\"data\":[{{\"cwd\":\"/workspace\",\"hooks\":{hooks_json},\"warnings\":[],\"errors\":[]}}]}}}}'\nfi\n"
+        );
+        let codex_path = bindir.join("codex");
+        std::fs::write(&codex_path, script).expect("write fake codex script");
+        std::fs::set_permissions(&codex_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake codex script");
+    }
+
+    /// Scenario: PRD #254 H1 (auditor blocker on PR #441). `codex_spawn_prep`
+    /// resolves a pinned Codex home, then calls `trust_deck_hooks_in`, which
+    /// returns `Ok(0)` when Codex reports ZERO deck-owned hook entries for
+    /// that home -- the genuine "the hook failed to install/trust" case (an
+    /// unwritable `CODEX_HOME`, a full disk, a partial write; `auto_install()`
+    /// swallows every one of those behind a `tracing::warn!`, so no error
+    /// reaches this point). `codex_spawn_prep` now sets `hook_trust_confirmed
+    /// = count > 0` in the `Ok(count)` arm, so this exact failure is recorded
+    /// as unconfirmed rather than as success. This pins that fix: it was
+    /// proven RED against the pre-fix `hook_trust_confirmed = true` for ANY
+    /// `Ok(_)`, confirming this is a genuine regression test and not a
+    /// tautology.
+    #[test]
+    #[cfg(unix)]
+    fn codex_spawn_prep_ok_zero_hooks_is_not_confirmed() {
+        let _lock = CODEX_SPAWN_PREP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).expect("create bindir");
+        write_fake_codex_app_server(&bindir, "[]");
+
+        let codex_home = scratch.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let _env_guard = CodexSpawnPrepEnvGuard::set(&bindir, &codex_home);
+
+        let prep = codex_spawn_prep("codex", &AgentType::Codex, None);
+
+        assert!(
+            prep.pinned_home.is_some(),
+            "sanity: a Codex program with CODEX_HOME resolvable must resolve a \
+             pinned home before hook trust is even attempted"
+        );
+        assert!(
+            !prep.hook_trust_confirmed,
+            "H1: trust_deck_hooks_in returning Ok(0) -- zero deck-owned hook \
+             entries found, the genuine 'hook failed to install/trust' case \
+             -- must be recorded as NOT confirmed, not confirmed"
         );
     }
 }
