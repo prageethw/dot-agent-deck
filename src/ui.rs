@@ -16722,18 +16722,45 @@ fn render_card_grid(
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
-    let GridLayout { cols, density } =
+    let GridLayout { mut cols, density } =
         choose_grid_layout(sessions.len(), area.width, available_for_cards);
     let card_height = density.card_height();
     // Single writer — see this function's docs.
     ui.columns = cols;
 
-    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
-    let total_rows = all_rows.len();
+    let mut all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let mut all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let mut total_rows = all_rows.len();
+
+    // PRD fork#446 M1: `choose_grid_layout` only returns without a fit (its
+    // `(preferred_cols, Compact)` fallback) when its own loop never finds a
+    // `(cols, density)` combination that fits — a successful loop return
+    // always satisfies `rows * card_height <= available_height` for the
+    // returned `cols`, so this condition can only trip on that fallback.
+    // Rather than silently truncating to a scrolled window (the pre-fix
+    // behaviour), maximise columns first — fewer, taller rows — then divide
+    // the column height evenly so every row still paints.
+    let mut row_heights: Option<Vec<u16>> = None;
+    if (total_rows as u32) * (card_height as u32) > available_for_cards as u32 {
+        cols = max_columns_for_width(area.width);
+        ui.columns = cols;
+        all_rows = sessions.chunks(cols).collect();
+        all_row_ids = session_ids.chunks(cols).collect();
+        total_rows = all_rows.len();
+        row_heights = even_row_heights(total_rows, available_for_cards);
+        if row_heights.is_some() {
+            // Fewer rows fit doesn't mean the old scroll offset applies to
+            // this row count — fit-all mode shows every row unconditionally.
+            ui.scroll_offset = 0;
+        }
+    }
 
     // Calculate how many rows fit in the available area
-    let visible_rows = (available_for_cards / card_height).max(1) as usize;
+    let visible_rows = if row_heights.is_some() {
+        total_rows
+    } else {
+        (available_for_cards / card_height).max(1) as usize
+    };
 
     // Adjust scroll offset to keep selected row visible. PRD #113: only when a
     // card is actively highlighted — an inactive selection (`None`) leaves the
@@ -16772,8 +16799,18 @@ fn render_card_grid(
     ));
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in rows {
-        constraints.push(Constraint::Length(card_height));
+    if let Some(heights) = &row_heights {
+        // Fit-all mode: `rows` is the full `0..total_rows` slice (scroll_offset
+        // forced to 0, visible_rows == total_rows above), so it lines up 1:1
+        // with `heights` — one evenly-divided `Constraint::Length` per row
+        // instead of `total_rows` copies of the fixed `card_height`.
+        for h in heights {
+            constraints.push(Constraint::Length(*h));
+        }
+    } else {
+        for _ in rows {
+            constraints.push(Constraint::Length(card_height));
+        }
     }
     constraints.push(Constraint::Min(0)); // filler
     constraints.push(Constraint::Length(1)); // stats bar
@@ -21170,6 +21207,24 @@ fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rec
     }
 }
 
+/// Row heights dividing `available_height` across `total_rows` as evenly as
+/// possible — the first `available_height % total_rows` rows get one extra
+/// row, so the heights sum to exactly `available_height` and leave no blank
+/// tail. `None` only when `available_height < total_rows`, i.e. there is not
+/// even one row per card and no layout can show them all.
+fn even_row_heights(total_rows: usize, available_height: u16) -> Option<Vec<u16>> {
+    if total_rows == 0 || (available_height as usize) < total_rows {
+        return None;
+    }
+    let base = available_height / total_rows as u16;
+    let remainder = (available_height % total_rows as u16) as usize;
+    Some(
+        (0..total_rows)
+            .map(|i| if i < remainder { base + 1 } else { base })
+            .collect(),
+    )
+}
+
 /// Issue #442 — the *glyph and emphasis* half of how a deck card's border
 /// encodes selection. The colour half lives in [`render_session_card`], which
 /// pairs every state below with [`palette::SELECTED`] when selected and the
@@ -21307,6 +21362,12 @@ fn render_session_card(
     // and the whole deck went down with the one bad card. Same truncator the
     // hook binary already uses on prompts, for the same reason.
     let id_display = crate::prompt_delivery::truncate_on_char_boundary(&session.session_id, 11);
+    // PRD fork#446 M2: hoisted above the tier branches below — the role name
+    // is one of the two survivors (with status) at every height tier, not
+    // only the `>= 3` full-card body.
+    let role_name_text = display_name
+        .map(|name| name.as_str())
+        .unwrap_or(&id_display);
 
     let num_prefix = match card_number {
         Some(n) => format!("{n} "),
@@ -21429,6 +21490,93 @@ fn render_session_card(
     // cues rather than one. See `card_border_glyph`.
     let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
     let border_style = base_border_style.add_modifier(border_emphasis);
+
+    // PRD fork#446 M2: height-tiered rendering. Fit-all mode (M1) can squeeze
+    // a row to 1 or 2 lines tall — below that, `Borders::ALL` alone spends
+    // every available row on border with no content left, so the card must
+    // shed its border before it sheds the two things it exists to answer:
+    // which role, and what it's doing. `>= 3` rows needs no branch at all —
+    // the body `Paragraph` below clips naturally via ratatui (the idle-art
+    // comment further down already depends on the same clipping), and
+    // content priority already puts role name first, so nothing changes here.
+    if area.height == 1 {
+        // No block at all: one line straight into `area` carrying the two
+        // survivors — role name (left, with the selection/number prefix) and
+        // status (right-aligned), the same two pieces the bordered card's
+        // title carries — plus, at zero extra rows, the cues that would
+        // otherwise be lost entirely at this tier:
+        //   - PRD #20 M4's liveness cues: `shortcut_style` dims the whole
+        //     left span for a non-live card, and `liveness_marker` is folded
+        //     into the text so it competes with the role name for space
+        //     rather than being unconditionally dropped (R3).
+        //   - A one-column leading gutter, matching the leading space every
+        //     other tier's title starts with and the PRD's own mock-up (R8).
+        //
+        // No distinct colour cue is available at this tier: there is no
+        // border to carry `border_style`'s selection thickening/BOLD the way
+        // the taller tiers do, and `palette::SELECTED` is `Color::Reset` —
+        // identical to `title_bold`'s own foreground — so a selected/
+        // unselected branch here would be a no-op. The `▸ ` selection prefix
+        // (`sel_prefix`, folded into `left` below) is this tier's only
+        // selection indicator, matching the PRD's own mock-up.
+        use unicode_width::UnicodeWidthStr;
+
+        let left_style = title_bold;
+        let left_style = if is_live {
+            left_style
+        } else {
+            left_style.add_modifier(Modifier::DIM)
+        };
+        let left = format!(" {sel_prefix}{num_prefix}{liveness_marker}{role_name_text}");
+        let width = area.width as usize;
+        let status_len = status_text.chars().count();
+        let left_trunc = truncate_with_ellipsis(&left, width.saturating_sub(status_len));
+        // R2: `truncate_with_ellipsis` budgets display cells, not `char`s —
+        // measure the truncated string the same way so a wide-character role
+        // name can't over-pad the line and push `status_text` off-screen.
+        let pad = width.saturating_sub(UnicodeWidthStr::width(left_trunc.as_str()) + status_len);
+        let line = Line::from(vec![
+            Span::styled(left_trunc, left_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(status_text, status_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    } else if area.height == 2 {
+        // `Borders::TOP` only: the top border line already carries the
+        // shortcut/badge title and the right-aligned status (same
+        // `title_spans` / `status_text` the full card uses), so the single
+        // remaining inner row goes to the role name — the other survivor.
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_type(border_type)
+            .border_style(border_style)
+            .title(Line::from(title_spans))
+            .title_alignment(ratatui::layout::Alignment::Left)
+            .title(
+                Line::from(Span::styled(status_text, status_style))
+                    .alignment(ratatui::layout::Alignment::Right),
+            );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        // R8: `Borders::TOP` leaves `inner.width == area.width` — no side
+        // border to inset the role-name row the way the `>= 3` tier gets for
+        // free, so add the same one-column leading gutter by hand.
+        let w = inner.width.saturating_sub(1) as usize;
+        let line = if role_name_text.is_empty() {
+            Line::from("")
+        } else {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    truncate_with_ellipsis(role_name_text, w),
+                    Style::default().fg(palette::ROLE_NAME),
+                ),
+            ])
+        };
+        frame.render_widget(Paragraph::new(line), inner);
+        return;
+    }
 
     // PRD #339: `Last` / `Tools` ride the bottom border instead of a content
     // row. Border cells are paid for by `Borders::ALL` either way, so the
@@ -28290,6 +28438,21 @@ mod tests {
     /// `test_render_wide_grid_layout` above. Returns the rendered buffer
     /// content and the post-render `UiState` so callers can assert on either.
     fn render_dashboard_grid(n: usize, width: u16, height: u16) -> (String, UiState) {
+        render_dashboard_grid_with_statuses(n, width, height, &[])
+    }
+
+    /// Same construction as [`render_dashboard_grid`], but lets a caller stamp
+    /// specific sessions with a non-default `SessionStatus` before rendering
+    /// (PRD fork#446: a `Working` card must paint its status at every height
+    /// tier, and `SessionStart` alone always leaves a session `Idle`).
+    /// `overrides` is `(1-based role index, status)` pairs, matching the
+    /// `role{i}` ids minted above.
+    fn render_dashboard_grid_with_statuses(
+        n: usize,
+        width: u16,
+        height: u16,
+        overrides: &[(usize, SessionStatus)],
+    ) -> (String, UiState) {
         let mut state = AppState::default();
         for i in 1..=n {
             state.apply_event(AgentEvent {
@@ -28309,6 +28472,13 @@ mod tests {
                 live_target: None,
                 model: None,
             });
+        }
+        for (i, status) in overrides {
+            state
+                .sessions
+                .get_mut(&format!("role{i}"))
+                .unwrap_or_else(|| panic!("role{i} must exist (n={n})"))
+                .status = status.clone();
         }
 
         let mut ui = default_ui();
@@ -28393,6 +28563,19 @@ mod tests {
         // must read 2, not the 1 that `grid_columns(99)` alone would produce.
         let (_rendered, ui) = render_dashboard_grid(7, 99, 33);
         assert_eq!(ui.columns, 2);
+
+        // PRD fork#446 M1: the same agreement must hold in the FIT-ALL
+        // recomputation path, not only the ordinary choose_grid_layout branch
+        // above. At 16 roles in the same narrow+short shape,
+        // choose_grid_layout's own joint search can't make anything fit
+        // (cols=2, rows=8, 8*6=48 > available 30) and falls back to
+        // `GridLayout { cols: preferred_cols, density: Compact }` — the
+        // render site then enters fit-all mode and recomputes columns as
+        // `max_columns_for_width(99)` separately, which is the code path
+        // that must also write `ui.columns` rather than leaving the
+        // pre-fallback value in place.
+        let (_rendered16, ui16) = render_dashboard_grid(16, 99, 33);
+        assert_eq!(ui16.columns, 2);
     }
 
     /// Scenario: Render a dashboard with 50 sessions in a viewport so small
@@ -28430,6 +28613,234 @@ mod tests {
             title_line.contains("49"),
             "viewport-hidden indicator must show the count of cards that \
              didn't fit (49 of 50 here); got title line {title_line:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD fork#446 (even card division): M1 (`even_row_heights`) + M2
+    // (height-tiered `render_session_card`) painted-output tests. Both are
+    // implemented — `even_row_heights` lives beside `fit_grid` below, and
+    // `render_session_card`'s 1/2/`>= 3`-row tiers are what these tests
+    // exercise.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: Render narrow (1-column), 5-role dashboards sized so every
+    /// card lands at exactly 1, 2, and 3 rows tall, and check both the role
+    /// name and the "Idle" status text survive at each tier — the squeeze
+    /// order the PRD requires (`Prmt:`/tool lines/`Dir:` give way; role name
+    /// and status never do).
+    #[spec("dashboard/grid/009")]
+    #[test]
+    fn grid_009_painted_output_survives_at_every_height_tier() {
+        // width=39 keeps max_columns_for_width(39)=1 so every role lands in its
+        // own row (total_rows == N), and available_for_density = N * tier
+        // divides evenly so fit-all mode (once M1 lands) gives every row
+        // exactly `tier` rows with none left over.
+        const N: usize = 5;
+        for tier in [1u16, 2, 3] {
+            let available_for_density = N as u16 * tier;
+            let height = available_for_density + 3; // hints bar (1) + title/stats bar (2)
+            let (rendered, _ui) = render_dashboard_grid(N, 39, height);
+            for i in 1..=N {
+                let role = format!("role{i}");
+                assert!(
+                    rendered.contains(&role),
+                    "tier {tier}: expected role name {role} in rendered output; \
+                     got:\n{rendered}"
+                );
+            }
+            assert!(
+                rendered.contains("Idle"),
+                "tier {tier}: expected the status text \"Idle\" to survive \
+                 squeezing; got:\n{rendered}"
+            );
+        }
+    }
+
+    /// Scenario: Same tiered squeeze as above, but with one card `Working` —
+    /// checks the tab's aggregated "working" status always has a visibly
+    /// attributable owner, at every height tier, not just at comfortable
+    /// heights.
+    #[spec("dashboard/grid/010")]
+    #[test]
+    fn grid_010_working_card_paints_status_at_every_height_tier() {
+        const N: usize = 5;
+        // The Working override targets the LAST role (role{N}), not role1:
+        // under today's pre-M1/M2 scroll-based slicing, role1 is always the
+        // single visible row regardless of `tier` (visible_rows tops out at
+        // 2 across tier in [1, 2, 3] here, using the fixed Compact
+        // card_height of 6), so a Working override on role1 would paint —
+        // and this test would pass — even without either milestone. role{N}
+        // sits outside every one of those pre-fix visible windows and is
+        // only painted once fit-all mode divides the column evenly and M2's
+        // height tiers render it, which is what this test must actually pin.
+        for tier in [1u16, 2, 3] {
+            let available_for_density = N as u16 * tier;
+            let height = available_for_density + 3;
+            let (rendered, _ui) =
+                render_dashboard_grid_with_statuses(N, 39, height, &[(N, SessionStatus::Working)]);
+            let role = format!("role{N}");
+            assert!(
+                rendered.contains(&role),
+                "tier {tier}: expected {role} in rendered output; got:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Working"),
+                "tier {tier}: expected the Working status text to survive \
+                 squeezing so the tab's \"working\" claim always has a \
+                 visible owner; got:\n{rendered}"
+            );
+        }
+    }
+
+    /// Scenario: Render the fork#437 narrow-and-short shape (width 99,
+    /// height 33) at role counts on both sides of the M1 boundary — 7 and 10
+    /// already fit today's joint (cols, density) search; 16 needs even
+    /// division for every card to paint (the PRD's own "12 roles show 5"
+    /// diagnosis) — and check every role name is painted with no
+    /// "more — scroll to see" suffix left on the title.
+    #[spec("dashboard/grid/011")]
+    #[test]
+    fn grid_011_all_roles_painted_across_role_counts_no_scroll_suffix() {
+        for n in [7usize, 10, 16] {
+            let (rendered, _ui) = render_dashboard_grid(n, 99, 33);
+            for i in 1..=n {
+                let role = format!("role{i}");
+                assert!(
+                    rendered.contains(&role),
+                    "n={n}: expected role name {role} in rendered output; \
+                     got:\n{rendered}"
+                );
+            }
+            let title_line = rendered.lines().next().unwrap_or_default();
+            assert!(
+                !title_line.contains("more") && !title_line.contains("scroll to see"),
+                "n={n}: title must carry no \"more — scroll to see\" suffix \
+                 once every card fits via even division; got title line \
+                 {title_line:?}"
+            );
+        }
+    }
+
+    /// Scenario: Render the same 6-role session set into two different
+    /// dashboard heights and check each re-division fills the column
+    /// completely (no blank row between the last card and the stats bar)
+    /// while still painting every role — the per-frame, nothing-persisted
+    /// redivision the PRD requires so a resize re-fits on the very next
+    /// frame with no restart and no stale cache.
+    #[spec("dashboard/grid/012")]
+    #[test]
+    fn grid_012_dynamic_redivision_fills_completely_at_two_heights() {
+        const N: usize = 6;
+        // width=39 keeps cols=1 (total_rows == N) so the row-height math
+        // below is exact: available_for_density = N * tier divides with no
+        // remainder.
+        for tier in [2u16, 3] {
+            let available_for_density = N as u16 * tier;
+            let height = available_for_density + 3;
+            let (rendered, _ui) = render_dashboard_grid(N, 39, height);
+            let lines: Vec<&str> = rendered.lines().collect();
+
+            for i in 1..=N {
+                let role = format!("role{i}");
+                assert!(
+                    lines.iter().any(|l| l.contains(&role)),
+                    "tier {tier}: expected role name {role} in rendered \
+                     output; got:\n{rendered}"
+                );
+            }
+
+            // The row directly above the stats bar (the last row of the
+            // dashboard column) must be genuine card content, not the blank
+            // `Constraint::Min(0)` filler row — a gap there means the row
+            // heights didn't sum to `available_for_density`.
+            let stats_bar_row = height as usize - 2; // last row of dashboard_area
+            let last_card_row = lines
+                .get(stats_bar_row.saturating_sub(1))
+                .copied()
+                .unwrap_or_default();
+            assert!(
+                !last_card_row.trim().is_empty(),
+                "tier {tier}: expected the row above the stats bar to be \
+                 filled with card content, not blank filler; got line \
+                 {last_card_row:?} in:\n{rendered}"
+            );
+        }
+    }
+
+    /// Scenario: Render the PRD's own headline repro case verbatim — 7
+    /// roles, one column, ~32 available rows — and check the fit-all
+    /// row-height split painted on screen is genuinely `[5, 5, 5, 5, 4, 4,
+    /// 4]` (four 5-row cards, then three 4-row cards), not merely some
+    /// other split that happens to fit every role. `grid_011`'s 7-role case
+    /// looks like it already covers this but takes the ordinary
+    /// two-column fit path, never the fit-all fallback this exact shape
+    /// forces — so the 5-row card tier specifically was pinned by no test.
+    #[spec("dashboard/grid/013")]
+    #[test]
+    fn grid_013_prd_headline_seven_roles_five_and_four_row_split() {
+        const N: usize = 7;
+        // width=39 keeps max_columns_for_width(39)=1, so cols stays 1 and
+        // total_rows == N; available_for_density=32 is the PRD's own
+        // "Outcome" example (4 rows of 5, 3 rows of 4, summing to 32).
+        let available_for_density = 32u16;
+        let height = available_for_density + 3; // hints bar (1) + title/stats bar (2)
+        let (rendered, _ui) = render_dashboard_grid(N, 39, height);
+
+        for i in 1..=N {
+            let role = format!("role{i}");
+            assert!(
+                rendered.contains(&role),
+                "expected role name {role} in rendered output; got:\n{rendered}"
+            );
+        }
+        let title_line = rendered.lines().next().unwrap_or_default();
+        assert!(
+            !title_line.contains("more") && !title_line.contains("scroll to see"),
+            "title must carry no \"more — scroll to see\" suffix once every \
+             card fits via even division; got title line {title_line:?}"
+        );
+
+        // Distinguish the actual painted split from "some split that also
+        // fits everything" by measuring the real card boundaries in the
+        // buffer, not by re-deriving `even_row_heights` — that function is
+        // already unit-tested in isolation
+        // (`even_row_heights_seven_rows_thirty_two_matches_expected_split`);
+        // this test's job is to pin that the same split reaches the actual
+        // render path. `UiState::default()` selects index 0 (card 1), so
+        // that row paints the Thick top-left corner "┏" (`card_border_glyph`)
+        // while the remaining unselected cards paint the Plain "┌" — match
+        // both so the selected card's row counts too. Fit-all mode packs
+        // rows back to back with no gap (grid_012), so the distance between
+        // consecutive top borders is exactly that row's painted height.
+        let lines: Vec<&str> = rendered.lines().collect();
+        let top_border_rows: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with('┌') || l.starts_with('┏'))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(
+            top_border_rows.len(),
+            N,
+            "expected {N} painted card top borders (one per role); got top \
+             borders at rows {top_border_rows:?} in:\n{rendered}"
+        );
+
+        let first_top = top_border_rows[0];
+        let mut heights: Vec<u16> = top_border_rows
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as u16)
+            .collect();
+        let consumed: u16 = heights.iter().sum();
+        heights.push(available_for_density - consumed);
+
+        assert_eq!(
+            heights,
+            vec![5u16, 5, 5, 5, 4, 4, 4],
+            "expected the PRD's exact split [5,5,5,5,4,4,4]; got painted \
+             row heights {heights:?} from top borders at rows \
+             {top_border_rows:?} (first at row {first_top}) in:\n{rendered}"
         );
     }
 
@@ -32852,6 +33263,70 @@ mod tests {
                 density: CardDensity::Spacious
             }
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // even_row_heights tests (PRD fork#446 M1). `even_row_heights` is defined
+    // beside `fit_grid` above; the tests below pin its arithmetic directly.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn even_row_heights_sums_to_available_height_exactly() {
+        for (total_rows, available) in [(7usize, 32u16), (5, 17), (3, 10), (6, 6), (4, 4)] {
+            let heights = even_row_heights(total_rows, available)
+                .unwrap_or_else(|| panic!("expected Some for ({total_rows}, {available})"));
+            assert_eq!(heights.len(), total_rows);
+            let sum: u16 = heights.iter().sum();
+            assert_eq!(
+                sum, available,
+                "heights {heights:?} must sum to exactly {available}"
+            );
+        }
+    }
+
+    #[test]
+    fn even_row_heights_differ_by_at_most_one_row() {
+        for (total_rows, available) in [(7usize, 32u16), (5, 17), (3, 10), (9, 100)] {
+            let heights = even_row_heights(total_rows, available).unwrap();
+            let max = *heights.iter().max().unwrap();
+            let min = *heights.iter().min().unwrap();
+            assert!(
+                max - min <= 1,
+                "heights {heights:?} for ({total_rows}, {available}) must differ \
+                 by at most 1 row across rows"
+            );
+        }
+    }
+
+    #[test]
+    fn even_row_heights_seven_rows_thirty_two_matches_expected_split() {
+        // The PRD's own worked example: the first `32 % 7 = 4` rows get one
+        // extra row over the floor of `32 / 7 = 4`.
+        assert_eq!(even_row_heights(7, 32), Some(vec![5, 5, 5, 5, 4, 4, 4]));
+    }
+
+    #[test]
+    fn even_row_heights_floor_case_one_row_per_card() {
+        for n in [1usize, 5, 20] {
+            assert_eq!(
+                even_row_heights(n, n as u16),
+                Some(vec![1; n]),
+                "n={n}: available_height == total_rows must give exactly 1 \
+                 row per card"
+            );
+        }
+    }
+
+    #[test]
+    fn even_row_heights_none_when_fewer_rows_than_cards() {
+        for n in [1usize, 5, 20] {
+            assert_eq!(
+                even_row_heights(n, (n as u16) - 1),
+                None,
+                "n={n}: fewer available rows than cards must return None — no \
+                 layout can show them all"
+            );
+        }
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
