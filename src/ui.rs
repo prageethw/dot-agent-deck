@@ -24675,6 +24675,149 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Grid-fit render tests (fork issue #437, upstream #588): pin the ACTUAL
+    // painted output for the narrow-AND-short case the `fit_grid_*` tests
+    // above prove algorithmically — that all cards get drawn, that
+    // `ui.columns` matches what was actually drawn (no navigation desync),
+    // and that a genuine viewport overflow is indicated rather than silently
+    // dropped.
+    // -----------------------------------------------------------------------
+
+    /// Render `n` ClaudeCode sessions ("role1".."role{n}") into a
+    /// `width`x`height` dashboard `TestBackend`, following the same
+    /// `compute_frame_layout` + `render_frame` construction as
+    /// `test_render_wide_grid_layout` above. Returns the rendered buffer
+    /// content and the post-render `UiState` so callers can assert on either.
+    fn render_dashboard_grid(n: usize, width: u16, height: u16) -> (String, UiState) {
+        let mut state = AppState::default();
+        for i in 1..=n {
+            state.apply_event(AgentEvent {
+                session_id: format!("role{i}"),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp".to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            });
+        }
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+
+        (buffer_to_string(terminal.backend().buffer()), ui)
+    }
+
+    #[test]
+    fn render_narrow_short_dashboard_paints_all_cards() {
+        // fork issue #437's reported shape: 7 roles, width 99, height 33 ->
+        // dashboard_area.height=32 (frame height minus the 1-row hints bar)
+        // -> available_for_density=30 — the exact numbers
+        // `fit_grid_narrow_short_reported_case_uses_two_cols_compact` pins.
+        // Before the fix, grid_columns(99)=1 col with visible_rows=30/6=5
+        // painted only 5 of the 7 cards below, with nothing on screen
+        // indicating the other 2 were dropped.
+        let (rendered, _ui) = render_dashboard_grid(7, 99, 33);
+        for i in 1..=7 {
+            let id = format!("role{i}");
+            assert!(
+                rendered.contains(&id),
+                "expected card {id} to be painted at the fitted (2-col) \
+                 layout; got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_narrow_short_dashboard_sets_ui_columns_to_fitted_cols() {
+        // Regression test for the desync risk upstream #588 flags explicitly:
+        // the OTHER `grid_columns` caller (the main-loop `ui.columns =
+        // grid_columns(dashboard_width)` call, src/ui.rs:13271) must not
+        // disagree with what the render path actually drew, or left/right
+        // card navigation moves through a different column count than what's
+        // on screen. Same 7-role narrow+short scenario as above:
+        // `fit_grid(7, 99, 30) == (2, _)`, so `ui.columns` must read 2, not
+        // the 1 that `grid_columns(99)` alone would produce.
+        let (_rendered, ui) = render_dashboard_grid(7, 99, 33);
+        assert_eq!(ui.columns, 2);
+    }
+
+    #[test]
+    fn render_dashboard_title_indicates_viewport_hidden_cards() {
+        // Reuses `fit_grid_falls_back_to_max_cols_compact_when_nothing_fits`'s
+        // shape: 50 sessions, width 40 (max_cols_for_width=1 either way, so
+        // this isolates the missing-indicator defect from the column-fit
+        // defect), height 8 -> dashboard_area.height=7 ->
+        // available_for_density=5. cols=1, density=Compact (card_height=6),
+        // visible_rows=(5/6=0).max(1)=1 -> only 1 of 50 single-card rows is
+        // on screen, 49 hidden. Today the title reads a plain "— 50
+        // session(s)" with nothing indicating 49 of them didn't fit — the
+        // same silent-drop defect the filter-based "X/Y session(s)" text
+        // solves for *filtering* has no equivalent for *viewport overflow*.
+        let (rendered, _ui) = render_dashboard_grid(50, 40, 8);
+        let title_line = rendered.lines().next().unwrap_or_default();
+
+        let after_session_count = title_line
+            .find("session(s)")
+            .map(|i| title_line[i + "session(s)".len()..].trim())
+            .unwrap_or("");
+        assert!(
+            !after_session_count.is_empty(),
+            "title must append a viewport-hidden indicator (distinct from \
+             the filter-based \"X/Y session(s)\" text) when cards exist but \
+             didn't fit even at max_cols_for_width/Compact; got title line \
+             {title_line:?}"
+        );
+        assert!(
+            title_line.contains("49"),
+            "viewport-hidden indicator must show the count of cards that \
+             didn't fit (49 of 50 here); got title line {title_line:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // PRD #76 M2.13: dashboard placeholder render-decision tests.
     //
     // `render_session_card` flips a single gate on `session.agent_type ==
@@ -28842,6 +28985,65 @@ mod tests {
         // 2 sessions, 1 col, height 17 -> Compact (2*9=18 no longer fits;
         // 2*6=12 does)
         assert_eq!(choose_density(2, 1, 17), CardDensity::Compact);
+    }
+
+    // ---------------------------------------------------------------------------
+    // fit_grid / max_cols_for_width tests (fork issue #437, upstream #588).
+    //
+    // `grid_columns` picks columns from width ALONE and `choose_density` picks
+    // density from height alone at a GIVEN column count, so neither axis can
+    // compensate for the other — a narrow-AND-short terminal can get stuck on
+    // 1 column even though 2 narrower-but-shorter columns would let everything
+    // fit. `fit_grid` jointly searches (cols, density) instead.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn max_cols_for_width_boundaries() {
+        // MIN_CARD_W = 40; max_cols_for_width(width) = (width / 40).max(1).
+        assert_eq!(max_cols_for_width(1), 1); // 1/40=0, clamped to 1
+        assert_eq!(max_cols_for_width(39), 1); // 39/40=0, clamped to 1
+        assert_eq!(max_cols_for_width(40), 1); // 40/40=1
+        assert_eq!(max_cols_for_width(79), 1); // 79/40=1
+        assert_eq!(max_cols_for_width(80), 2); // 80/40=2
+        assert_eq!(max_cols_for_width(119), 2); // 119/40=2
+        assert_eq!(max_cols_for_width(120), 3); // 120/40=3
+        assert_eq!(max_cols_for_width(200), 5); // 200/40=5
+    }
+
+    #[test]
+    fn fit_grid_narrow_short_reported_case_uses_two_cols_compact() {
+        // fork issue #437's reported shape: 7 roles, width 99 (<100, so the
+        // old width-only grid_columns locked this to 1 column), height giving
+        // available_for_density=30.
+        //
+        // max_cols_for_width(99) = 99/40 = 2.
+        //
+        // cols=1 rejected: choose_density(7,1,30) falls back to Compact
+        // (7*11=77, 7*9=63, 7*6=42 all >30), and even Compact's 7*6=42>30, so
+        // cols=1 never fits at any density.
+        //
+        // cols=2 accepted: choose_density(7,2,30) -> rows=ceil(7/2)=4,
+        // 4*11=44>30, 4*9=36>30, 4*6=24<=30 -> Compact, and 4*6=24<=30 fits.
+        assert_eq!(fit_grid(7, 99, 30), (2, CardDensity::Compact));
+    }
+
+    #[test]
+    fn fit_grid_keeps_single_col_when_it_already_fits() {
+        // 2 cards, width 99 (max_cols_for_width(99)=2), height 20: cols=1
+        // already fits at Spacious (1 row * 11 = 11 <= 20), so the joint
+        // search must not spend an extra column the richer single-column
+        // layout doesn't need.
+        assert_eq!(fit_grid(2, 99, 20), (1, CardDensity::Spacious));
+    }
+
+    #[test]
+    fn fit_grid_falls_back_to_max_cols_compact_when_nothing_fits() {
+        // width 40 -> max_cols_for_width(40) = 1 (no column count can do
+        // better). 50 cards in 1 column need 50 rows; even Compact (6 rows)
+        // needs 300, nowhere near height 5. No (cols, density) fits, so
+        // fit_grid must return the documented fallback rather than panicking
+        // or returning cols=0.
+        assert_eq!(fit_grid(50, 40, 5), (1, CardDensity::Compact));
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
