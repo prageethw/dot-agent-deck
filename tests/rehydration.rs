@@ -633,18 +633,41 @@ async fn hydrate_preserves_pane_id_from_agent_env() {
     // in its env) were silently dropped by `AppState::apply_event`. The fix
     // captures the spawn-time env on the daemon side and threads it through
     // `AttachResponse::agent_records`; rehydration must reuse that exact id.
+    //
+    // PRD #365 M2: the daemon now mints `pane_id` itself and ignores
+    // whatever a client proposes, so the value this test asserts survives
+    // hydration is no longer the client's literal proposal — it's whatever
+    // the daemon actually recorded for the spawn (`daemon/pane-id/001`).
+    // The property under test is unchanged (hydration must reuse the
+    // daemon's real record, not a fresh `allocate_id()`); only how the test
+    // discovers "the daemon's real record" changes — via `list_agents()`
+    // after spawning, instead of assuming the proposed literal round-trips.
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
 
-    let pane_env = "pane-from-env-7";
     let agent_id = client
         .start_agent(StartAgentOptions {
             command: Some("sh -c 'sleep 30'".into()),
-            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), pane_env.to_string())],
+            env: vec![(
+                "DOT_AGENT_DECK_PANE_ID".to_string(),
+                "pane-from-env-7".to_string(),
+            )],
             ..Default::default()
         })
         .await
         .expect("start_agent should succeed");
+
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let daemon_pane_id = records
+        .iter()
+        .find(|r| r.id == agent_id)
+        .expect("just-spawned agent should be in list")
+        .pane_id_env
+        .clone()
+        .expect("daemon must have minted a pane_id_env for this spawn");
 
     let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
@@ -660,8 +683,8 @@ async fn hydrate_preserves_pane_id_from_agent_env() {
 
     assert_eq!(hydrated.len(), 1, "single agent should hydrate as one pane");
     assert_eq!(
-        hydrated[0].pane_id, pane_env,
-        "hydrated pane must reuse the spawn-time DOT_AGENT_DECK_PANE_ID, not allocate_id()"
+        hydrated[0].pane_id, daemon_pane_id,
+        "hydrated pane must reuse the daemon's recorded pane_id, not allocate_id()"
     );
     assert_eq!(hydrated[0].agent_id, agent_id);
 
@@ -759,10 +782,16 @@ async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
         "legacy daemon listing must still hydrate one pane; got {hydrated:?}"
     );
     assert_eq!(hydrated[0].agent_id, "legacy-agent");
-    // pane_id must be a parseable u64 (allocate_id output), not the agent id.
+    // PRD #365 M2: allocate_id() is retired — the fallback now mints a
+    // local placeholder with the same scheme the daemon itself uses
+    // (agent_pty::mint_pane_id, "pane-" prefixed), not the agent id.
+    assert_ne!(
+        hydrated[0].pane_id, hydrated[0].agent_id,
+        "legacy fallback must synthesize its own pane id, not reuse the agent id"
+    );
     assert!(
-        hydrated[0].pane_id.parse::<u64>().is_ok(),
-        "legacy fallback should use allocate_id() — got {:?}",
+        hydrated[0].pane_id.starts_with("pane-"),
+        "legacy fallback should mint via agent_pty::mint_pane_id() — got {:?}",
         hydrated[0].pane_id
     );
 
@@ -895,22 +924,34 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
 async fn hydrate_drops_oversize_pane_id_env_at_capture() {
     // 200-char pane id: comfortably above PANE_ID_ENV_MAX_LEN (64). The
     // daemon must store None for this agent's record, and the TUI must
-    // hydrate with a freshly-allocated numeric id rather than the poison
-    // value — otherwise a near-MAX_FRAME_LEN value could push the
+    // hydrate with a freshly-minted local placeholder id rather than the
+    // poison value — otherwise a near-MAX_FRAME_LEN value could push the
     // cumulative `list_agents` response past the frame cap and break
     // hydration for *every* agent on reconnect.
+    //
+    // PRD #365 M2: spawn via `AgentPtyRegistry::spawn_agent` directly rather
+    // than the wire `StartAgent` path (`client.start_agent`). The daemon's
+    // `StartAgent` handler now unconditionally strips whatever
+    // `DOT_AGENT_DECK_PANE_ID` a client proposes and injects its own minted
+    // value, so a wire-proposed oversize value never reaches
+    // `spawn_agent`'s own scrub (`is_valid_pane_id_env`) at all anymore —
+    // that scrub is the thing this test pins, and it is still live,
+    // reachable production code (`spawn.rs`'s headless fire path and
+    // `respawn_agent_for_pane` both call `spawn_agent` directly), just not
+    // through the wire. `list_agents()` below still goes over the wire —
+    // only the spawn is bypassed.
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
 
     let oversize: String = "a".repeat(200);
-    let agent_id = client
-        .start_agent(StartAgentOptions {
-            command: Some("sh -c 'sleep 30'".into()),
-            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), oversize.clone())],
-            ..Default::default()
+    let agent_id = server
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sh -c 'sleep 30'"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), oversize.clone())],
+            ..SpawnOptions::default()
         })
-        .await
-        .expect("start_agent should succeed");
+        .expect("direct registry spawn_agent should succeed");
 
     // Daemon-side: list_agents must report pane_id_env = None for this id.
     let records = client
@@ -927,7 +968,7 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
         record.pane_id_env
     );
 
-    // Client-side: hydrate must produce a numeric (allocate_id) pane id.
+    // Client-side: hydrate must produce a locally-minted placeholder pane id.
     let ctrl = Arc::new(EmbeddedPaneController::new(
         server.path.clone(),
         tokio::runtime::Handle::current(),
@@ -940,9 +981,11 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
     };
     assert_eq!(hydrated.len(), 1);
     assert_eq!(hydrated[0].agent_id, agent_id);
+    // PRD #365 M2: allocate_id() is retired — the fallback now mints via
+    // agent_pty::mint_pane_id(), the same scheme the daemon itself uses.
     assert!(
-        hydrated[0].pane_id.parse::<u64>().is_ok(),
-        "oversize pane_id_env must fall back to allocate_id() — got {:?}",
+        hydrated[0].pane_id.starts_with("pane-"),
+        "oversize pane_id_env must fall back to agent_pty::mint_pane_id() — got {:?}",
         hydrated[0].pane_id
     );
     assert_ne!(
@@ -958,20 +1001,25 @@ async fn hydrate_drops_oversize_pane_id_env_at_capture() {
 async fn hydrate_drops_control_char_pane_id_env_at_capture() {
     // ANSI escape embedded in the pane id: anything outside [a-zA-Z0-9_-]
     // is rejected by `is_valid_pane_id_env`. The daemon stores None and
-    // the client hydrates with a fresh numeric id — keeps debug-log output
-    // free of injected color codes if anything ever prints a stored value.
+    // the client hydrates with a fresh, locally-minted placeholder id —
+    // keeps debug-log output free of injected color codes if anything ever
+    // prints a stored value.
+    //
+    // PRD #365 M2: spawn via `AgentPtyRegistry::spawn_agent` directly — see
+    // the comment on `hydrate_drops_oversize_pane_id_env_at_capture` above
+    // for why the wire `StartAgent` path can no longer reach this scrub.
     let server = start_real_server().await;
     let client = DaemonClient::new(server.path.clone());
 
     let poison = "pane\x1b[31mctl";
-    let agent_id = client
-        .start_agent(StartAgentOptions {
-            command: Some("sh -c 'sleep 30'".into()),
-            env: vec![("DOT_AGENT_DECK_PANE_ID".to_string(), poison.to_string())],
-            ..Default::default()
+    let agent_id = server
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("sh -c 'sleep 30'"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), poison.to_string())],
+            ..SpawnOptions::default()
         })
-        .await
-        .expect("start_agent should succeed");
+        .expect("direct registry spawn_agent should succeed");
 
     let records = client
         .list_agents()
@@ -998,9 +1046,11 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
             .unwrap()
     };
     assert_eq!(hydrated.len(), 1);
+    // PRD #365 M2: allocate_id() is retired — the fallback now mints via
+    // agent_pty::mint_pane_id(), the same scheme the daemon itself uses.
     assert!(
-        hydrated[0].pane_id.parse::<u64>().is_ok(),
-        "control-char pane_id_env must fall back to allocate_id() — got {:?}",
+        hydrated[0].pane_id.starts_with("pane-"),
+        "control-char pane_id_env must fall back to agent_pty::mint_pane_id() — got {:?}",
         hydrated[0].pane_id
     );
     assert_ne!(
@@ -1012,64 +1062,37 @@ async fn hydrate_drops_control_char_pane_id_env_at_capture() {
     let _ = server.registry.close_agent(&agent_id);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_pane_id_env_is_rejected_at_spawn_time() {
-    // CodeRabbit MAJOR (PRD #93 round-9): two agents must never share a
-    // `pane_id_env`. `write_to_pane_and_submit` keys off that string when routing
-    // delegate/work-done writes, so a second spawn with the same id
-    // would silently misroute every write to whichever `values().find`
-    // entry the HashMap iterator happened to visit first.
-    //
-    // The pre-round-9 contract was looser: the daemon stored both, and
-    // the client's `hydrate_from_daemon` deduped by keeping the first
-    // reuse and falling the second back to `allocate_id()`. That
-    // protected only the hydration HashMap-collision case in
-    // `wire_stream_pane`; the delegate/work-done routing remained
-    // broken because the daemon had no consistent winner. The new
-    // contract: reject at spawn time, where the bad request originates.
-    let server = start_real_server().await;
-    let client = DaemonClient::new(server.path.clone());
-
-    let shared_pane_env = "shared-pane-id";
-    let agent_a = client
-        .start_agent(StartAgentOptions {
-            command: Some("sh -c 'sleep 30'".into()),
-            env: vec![(
-                "DOT_AGENT_DECK_PANE_ID".to_string(),
-                shared_pane_env.to_string(),
-            )],
-            ..Default::default()
-        })
-        .await
-        .expect("start_agent A should succeed");
-
-    let err = client
-        .start_agent(StartAgentOptions {
-            command: Some("sh -c 'sleep 30'".into()),
-            env: vec![(
-                "DOT_AGENT_DECK_PANE_ID".to_string(),
-                shared_pane_env.to_string(),
-            )],
-            ..Default::default()
-        })
-        .await
-        .expect_err("duplicate pane_id_env spawn must fail");
-    let msg = format!("{err}");
-    assert!(
-        msg.to_lowercase().contains("duplicate"),
-        "expected a duplicate-pane-id error, got: {msg}"
-    );
-
-    // First agent must survive the rejected duplicate spawn.
-    let records = server.registry.agent_records();
-    assert_eq!(
-        records.iter().filter(|r| r.id == agent_a).count(),
-        1,
-        "first agent must survive the rejected duplicate spawn"
-    );
-
-    let _ = server.registry.close_agent(&agent_a);
-}
+// `duplicate_pane_id_env_is_rejected_at_spawn_time` was retired here on
+// PRD #365 M2. It used to spawn two agents over the WIRE `StartAgent` path
+// with the identical client-proposed `DOT_AGENT_DECK_PANE_ID` and assert the
+// second was rejected as a duplicate. That premise is now categorically
+// impossible: the daemon mints its own `pane_id` on every `StartAgent` call
+// and ignores whatever the client proposes (`src/daemon_protocol.rs`'s
+// `handle_connection`), so two wire spawns can never even attempt to share
+// one — they always get distinct daemon-minted ids, which is exactly what
+// `daemon/pane-id/001` (`tests/e2e_pane_id_daemon_authoritative.rs`) now
+// pins at the same wire-protocol layer this test used to operate at.
+//
+// `spawn_agent`'s own duplicate-`pane_id_env` rejection (`agent_pty.rs`,
+// `AgentPtyError::DuplicatePaneId`) is explicitly kept as a backstop per the
+// PRD's M1 Decisions ("now defends against a daemon-minting bug instead of
+// a client-minting race") — it is NOT dead code, and IS still reachable by
+// bypassing the wire and calling `AgentPtyRegistry::spawn_agent` directly
+// (a real, still-live production entry point: `spawn.rs`'s headless fire
+// path and `respawn_agent_for_pane` both go through it). But that exact
+// construction and assertion already exist, byte-for-byte, as
+// `registry_rejects_duplicate_pane_id_env` in `src/agent_pty.rs`'s own test
+// module — which predates this PRD and was written specifically to pin
+// `spawn_agent`'s guard directly. Reconstructing the same scenario here via
+// the same bypass would be pure duplication of that unit test with zero
+// additional coverage, just at a less natural layer (this file's harness is
+// built around `DaemonClient`/the wire protocol, not raw registry access).
+//
+// So: no wire-level construction exists anymore (the invariant it pinned is
+// gone, replaced by `daemon/pane-id/001`'s uniqueness guarantee), and no
+// bypass-level construction is needed (already covered by
+// `registry_rejects_duplicate_pane_id_env`). Retiring beats keeping a
+// redundant regression pin.
 
 // ---------------------------------------------------------------------------
 // PRD #76 M2.13 fixup F2 — full hydration-path agent_type plumbing.
@@ -1454,7 +1477,17 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
         ("legacy", None),
     ];
 
+    // PRD #365 M2: the daemon now mints `pane_id` itself and ignores
+    // whatever a client proposes, so `DOT_AGENT_DECK_PANE_ID` below is no
+    // longer what ends up registered — it exists only to give
+    // `display_name` a matching label. Every assertion in this test that
+    // used to identify a pane by its proposed literal (`pane-a-coder`, the
+    // `starts_with("pane-a-")` checks, ...) now looks the real
+    // daemon-minted value up in `pane_id_of` (keyed by `"{tab_tag}-{role}"`,
+    // populated via `list_agents()` once every agent has spawned) instead
+    // of assuming the literal round-trips.
     let mut spawned_ids: Vec<String> = Vec::new();
+    let mut agent_id_of: HashMap<String, String> = HashMap::new();
     for (tab_tag, orchestration_id) in tabs {
         for (role_index, role_name) in role_names.iter().enumerate() {
             let id = client
@@ -1479,9 +1512,30 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                 })
                 .await
                 .expect("start_agent should succeed");
+            agent_id_of.insert(format!("{tab_tag}-{role_name}"), id.clone());
             spawned_ids.push(id);
         }
     }
+    let records = client
+        .list_agents()
+        .await
+        .expect("list_agents should succeed");
+    let pane_id_of: HashMap<String, String> = agent_id_of
+        .iter()
+        .map(|(key, agent_id)| {
+            let pane_id = records
+                .iter()
+                .find(|r| &r.id == agent_id)
+                .and_then(|r| r.pane_id_env.clone())
+                .unwrap_or_else(|| panic!("agent {agent_id} ({key}) missing a daemon pane_id_env"));
+            (key.clone(), pane_id)
+        })
+        .collect();
+    let pane_id_for = |tab_tag: &str, role_name: &str| -> &str {
+        pane_id_of
+            .get(&format!("{tab_tag}-{role_name}"))
+            .unwrap_or_else(|| panic!("no daemon pane_id recorded for {tab_tag}-{role_name}"))
+    };
 
     // ---- Detach + reattach: a FRESH controller hydrating from the warm daemon.
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -1509,9 +1563,13 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
         else {
             panic!("hydrated pane lost its Orchestration tab membership: {h:?}");
         };
-        let expected = if h.pane_id.starts_with("pane-a-") {
+        let expected = if [pane_id_for("a", "coder"), pane_id_for("a", "orchestrator")]
+            .contains(&h.pane_id.as_str())
+        {
             Some("orch-inst-aaaa1111".to_string())
-        } else if h.pane_id.starts_with("pane-b-") {
+        } else if [pane_id_for("b", "coder"), pane_id_for("b", "orchestrator")]
+            .contains(&h.pane_id.as_str())
+        {
             Some("orch-inst-bbbb2222".to_string())
         } else {
             None
@@ -1577,27 +1635,17 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
         ids.sort();
         ids
     };
-    assert_eq!(
-        panes_of(bucket_a),
-        vec![
-            "pane-a-coder".to_string(),
-            "pane-a-orchestrator".to_string()
-        ]
-    );
-    assert_eq!(
-        panes_of(bucket_b),
-        vec![
-            "pane-b-coder".to_string(),
-            "pane-b-orchestrator".to_string()
-        ]
-    );
-    assert_eq!(
-        panes_of(bucket_legacy),
-        vec![
-            "pane-legacy-coder".to_string(),
-            "pane-legacy-orchestrator".to_string(),
-        ]
-    );
+    let expected_panes_of = |tab_tag: &str| {
+        let mut ids = vec![
+            pane_id_for(tab_tag, "coder").to_string(),
+            pane_id_for(tab_tag, "orchestrator").to_string(),
+        ];
+        ids.sort();
+        ids
+    };
+    assert_eq!(panes_of(bucket_a), expected_panes_of("a"));
+    assert_eq!(panes_of(bucket_b), expected_panes_of("b"));
+    assert_eq!(panes_of(bucket_legacy), expected_panes_of("legacy"));
 
     // The routing group each rebuilt tab retains: distinct for the two tokened
     // tabs, the legacy `(name, cwd)` fallback for the token-less one.
@@ -1653,12 +1701,12 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
         "reattach must rebuild three distinct orchestration tabs"
     );
     for pane_id in [
-        "pane-a-orchestrator",
-        "pane-a-coder",
-        "pane-b-orchestrator",
-        "pane-b-coder",
-        "pane-legacy-orchestrator",
-        "pane-legacy-coder",
+        pane_id_for("a", "orchestrator"),
+        pane_id_for("a", "coder"),
+        pane_id_for("b", "orchestrator"),
+        pane_id_for("b", "coder"),
+        pane_id_for("legacy", "orchestrator"),
+        pane_id_for("legacy", "coder"),
     ] {
         let owning: Vec<usize> = tab_manager
             .tabs()
@@ -2186,35 +2234,58 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
 
     // Agent A: spawn-time agent_type None — the "No agent" case. It WILL get a
     // live event-derived session below, which the snapshot must surface.
-    let pane_a = "pane-live-a";
+    //
+    // PRD #365 M2: the daemon mints `pane_id` itself now and ignores what a
+    // client proposes, so `DOT_AGENT_DECK_PANE_ID` below no longer becomes
+    // the agent's real `pane_id_env` — look the actual minted value up via
+    // the registry (in-process here, so no wire round trip needed) and use
+    // THAT everywhere a pane_id has to match what `hydrate_from_daemon`
+    // will report back (`h.pane_id`), instead of the proposed literal.
     let agent_a = client
         .start_agent(StartAgentOptions {
             command: Some("sh -c 'sleep 30'".into()),
             agent_type: None,
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_a.to_string())],
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "pane-live-a".to_string(),
+            )],
             ..Default::default()
         })
         .await
         .expect("start_agent A should succeed");
+    let pane_a = registry
+        .agent_records()
+        .iter()
+        .find(|r| r.id == agent_a)
+        .and_then(|r| r.pane_id_env.clone())
+        .expect("agent A must have a daemon-minted pane_id_env");
 
     // Agent B: spawn-time agent_type OpenCode but NO live session → live None.
     // The fallback must seed the bare placeholder from this spawn-time value.
-    let pane_b = "pane-bare-b";
     let agent_b = client
         .start_agent(StartAgentOptions {
             command: Some("sh -c 'sleep 30'".into()),
             agent_type: Some(AgentType::OpenCode),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_b.to_string())],
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "pane-bare-b".to_string(),
+            )],
             ..Default::default()
         })
         .await
         .expect("start_agent B should succeed");
+    let pane_b = registry
+        .agent_records()
+        .iter()
+        .find(|r| r.id == agent_b)
+        .and_then(|r| r.pane_id_env.clone())
+        .expect("agent B must have a daemon-minted pane_id_env");
 
     // Drive ONLY agent A's session to Working (same apply_event flow the daemon
     // uses for hook events).
     {
         let mut guard = state.write().await;
-        drive_session_to_working(&mut guard, "sess-a", pane_a, &agent_a);
+        drive_session_to_working(&mut guard, "sess-a", &pane_a, &agent_a);
     }
 
     // Hydrate a fresh controller from the warm daemon.
@@ -2298,7 +2369,7 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
     let a_sessions: Vec<&SessionState> = tui_state
         .sessions
         .values()
-        .filter(|s| s.pane_id.as_deref() == Some(pane_a))
+        .filter(|s| s.pane_id.as_deref() == Some(pane_a.as_str()))
         .collect();
     assert_eq!(
         a_sessions.len(),
@@ -2348,7 +2419,7 @@ async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner(
     let b_sessions: Vec<&SessionState> = tui_state
         .sessions
         .values()
-        .filter(|s| s.pane_id.as_deref() == Some(pane_b))
+        .filter(|s| s.pane_id.as_deref() == Some(pane_b.as_str()))
         .collect();
     assert_eq!(
         b_sessions.len(),

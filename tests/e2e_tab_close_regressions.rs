@@ -189,19 +189,23 @@ async fn handle_connection(
             display_name,
             rows,
             cols,
-            env,
             tab_membership,
             agent_type,
             ..
         } => {
             let ordinal = next_spawn.fetch_add(1, Ordering::SeqCst);
             let id = format!("spawned-{ordinal}");
-            let pane_id_env = env
-                .into_iter()
-                .find_map(|(key, value)| (key == "DOT_AGENT_DECK_PANE_ID").then_some(value));
+            // PRD #365 M2: the real daemon mints `pane_id` itself now and
+            // returns it on `AttachResponse::pane_id` — the client no
+            // longer proposes one via `DOT_AGENT_DECK_PANE_ID` in `env`, so
+            // this synthetic daemon mints its own to match the real
+            // contract `EmbeddedPaneController::create_stream_pane` now
+            // requires (a `StartAgent` success with no `pane_id` is
+            // treated as a protocol error).
+            let pane_id_env = format!("pane-spawned-{ordinal}");
             records.lock().unwrap().push(AgentRecord {
                 id: id.clone(),
-                pane_id_env,
+                pane_id_env: Some(pane_id_env.clone()),
                 display_name,
                 cwd,
                 tab_membership,
@@ -211,9 +215,15 @@ async fn handle_connection(
                 live: None,
                 spawned_at_ms: None,
             });
-            write_resp(&mut stream, &AttachResponse::with_id(id))
-                .await
-                .expect("reply to StartAgent");
+            write_resp(
+                &mut stream,
+                &AttachResponse {
+                    pane_id: Some(pane_id_env),
+                    ..AttachResponse::with_id(id)
+                },
+            )
+            .await
+            .expect("reply to StartAgent");
         }
         AttachRequest::AttachStream { id } => {
             let present = records.lock().unwrap().iter().any(|record| record.id == id);

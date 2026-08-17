@@ -404,6 +404,21 @@ impl DaemonClient {
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
+        self.start_agent_with_pane_id(opts).await.map(|(id, _)| id)
+    }
+
+    /// PRD #365 M2 consumer: like [`Self::start_agent`], but also surfaces
+    /// the daemon-minted `pane_id` (`AttachResponse::pane_id`) the plain
+    /// `start_agent` discards. Callers that must adopt the daemon's pane id
+    /// — rather than propose their own — use this instead; see
+    /// `EmbeddedPaneController::create_stream_pane`. `None` only when
+    /// talking to a pre-#365 daemon, which the `PROTOCOL_VERSION` handshake
+    /// already refuses to pair with, so a caller reaching this method
+    /// should treat `None` as a protocol error, not a legacy fallback.
+    pub async fn start_agent_with_pane_id(
+        &self,
+        opts: StartAgentOptions,
+    ) -> Result<(String, Option<String>), ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
         let req = AttachRequest::StartAgent {
@@ -423,8 +438,10 @@ impl DaemonClient {
                 resp.error.unwrap_or_else(|| "start-agent failed".into()),
             ));
         }
-        resp.id
-            .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))
+        let id = resp
+            .id
+            .ok_or_else(|| ClientError::Malformed("start-agent ok but no id in response".into()))?;
+        Ok((id, resp.pane_id))
     }
 
     /// PRD #100: route a pane write through the daemon's atomic

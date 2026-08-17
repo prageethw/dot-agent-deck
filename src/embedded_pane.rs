@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use std::any::Any;
 
-use crate::agent_pty::{self, DOT_AGENT_DECK_PANE_ID, PTY_RESIZE_DIM_MAX, TabMembership};
+use crate::agent_pty::{self, PTY_RESIZE_DIM_MAX, TabMembership};
 use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions};
 use crate::event::AgentType;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
@@ -451,7 +451,6 @@ fn render_only_runtime() -> tokio::runtime::Handle {
 /// single attach-protocol path — every pane is daemon-backed.
 pub struct EmbeddedPaneController {
     panes: PaneRegistry,
-    next_id: Arc<Mutex<u64>>,
     /// Daemon RPC client used by `create_pane`, `close_pane`,
     /// `hydrate_from_daemon`, and `rename_pane`. Carrying it on the
     /// controller (rather than reconstructing per call) lets the
@@ -506,7 +505,6 @@ impl EmbeddedPaneController {
     pub fn new(socket_path: PathBuf, runtime: tokio::runtime::Handle) -> Self {
         Self {
             panes: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(Mutex::new(1)),
             client: DaemonClient::new(socket_path),
             runtime,
             stream_rejections: Arc::new(Mutex::new(Vec::new())),
@@ -994,13 +992,6 @@ impl EmbeddedPaneController {
         self.write_raw_bytes(pane_id, seq.as_bytes())
     }
 
-    fn allocate_id(&self) -> String {
-        let mut id = self.next_id.lock().unwrap();
-        let current = *id;
-        *id += 1;
-        current.to_string()
-    }
-
     /// Enqueue `payload` for the pane's I/O task to forward as one
     /// `KIND_STREAM_IN` frame. Held under the `panes` mutex only long
     /// enough to look up the sender — the actual write happens on the
@@ -1025,7 +1016,6 @@ impl EmbeddedPaneController {
     #[allow(clippy::too_many_arguments)]
     fn create_stream_pane(
         &self,
-        pane_id: String,
         command: Option<&str>,
         cwd: Option<&str>,
         display_name: &str,
@@ -1042,10 +1032,12 @@ impl EmbeddedPaneController {
         // outside a worktree-owning orchestration.
         owner: Option<String>,
     ) -> Result<String, PaneError> {
-        // Tag the spawned process so daemon-spawned agents see
-        // DOT_AGENT_DECK_PANE_ID and can emit hook events back to this
-        // UI's pane.
-        let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.clone())];
+        // PRD #365 M2: the daemon mints `pane_id` now and returns it on
+        // `AttachResponse::pane_id` (see `start_agent_with_pane_id` below)
+        // — the client no longer proposes one via
+        // `DOT_AGENT_DECK_PANE_ID`, so there's nothing pane-id-shaped to
+        // stamp into `env` up front.
+        let mut env = Vec::new();
         if let Some(owner) = owner {
             env.push((
                 crate::agent_pty::DOT_AGENT_DECK_WORKTREE_OWNER.to_string(),
@@ -1103,17 +1095,54 @@ impl EmbeddedPaneController {
         // and bounded by `CREATE_PANE_STOP_TIMEOUT`; the original attach
         // error (or synthesized timeout error) is what propagates.
         let client_for_calls = client.clone();
-        let (agent_id, conn) = runtime
+        let (agent_id, pane_id, conn) = runtime
             .block_on(async move {
                 use crate::daemon_client::ClientError;
 
-                let id = match tokio::time::timeout(
+                let (id, pane_id) = match tokio::time::timeout(
                     CREATE_PANE_START_TIMEOUT,
-                    client_for_calls.start_agent(opts),
+                    client_for_calls.start_agent_with_pane_id(opts),
                 )
                 .await
                 {
-                    Ok(Ok(id)) => id,
+                    Ok(Ok((id, Some(pane_id)))) => (id, pane_id),
+                    Ok(Ok((id, None))) => {
+                        // PRD #365 M2: `ensure_compatible_daemon_or_die`
+                        // checks the protocol version once at TUI startup,
+                        // not per-connection (`DaemonClient::connect` does a
+                        // bare `IpcStream::connect` with no per-call `Hello`
+                        // exchange), so a same-UID daemon that later wedges
+                        // or is swapped mid-session can still reach this
+                        // branch even though it passed the startup
+                        // handshake. Clean up the now-orphaned agent rather
+                        // than leak it, then surface a clear error instead
+                        // of silently falling back to a client-proposed id.
+                        //
+                        // Bounded the same way as the two cleanup paths
+                        // below (reviewer P2 / auditor A1): an unresponsive
+                        // daemon must not pin this `block_on` forever.
+                        match tokio::time::timeout(
+                            CREATE_PANE_STOP_TIMEOUT,
+                            client_for_calls.stop_agent(&id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(stop_err)) => tracing::warn!(
+                                agent_id = %id,
+                                error = %stop_err,
+                                "create_stream_pane: stop_agent after missing pane_id failed; daemon-side agent may be leaked"
+                            ),
+                            Err(_) => tracing::warn!(
+                                agent_id = %id,
+                                timeout_ms = CREATE_PANE_STOP_TIMEOUT.as_millis() as u64,
+                                "create_stream_pane: stop_agent after missing pane_id timed out; daemon-side agent may be leaked"
+                            ),
+                        }
+                        return Err(ClientError::Malformed(
+                            "start-agent ok but no pane_id in response".into(),
+                        ));
+                    }
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
                         return Err(ClientError::Io(std::io::Error::new(
@@ -1135,7 +1164,7 @@ impl EmbeddedPaneController {
                 )
                 .await
                 {
-                    Ok(Ok(conn)) => return Ok::<_, ClientError>((id, conn)),
+                    Ok(Ok(conn)) => return Ok::<_, ClientError>((id, pane_id, conn)),
                     Ok(Err(e)) => e,
                     Err(_) => ClientError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
@@ -1428,10 +1457,9 @@ impl EmbeddedPaneController {
 
         let mut hydrated = Vec::new();
         // Dedup pane ids within this batch (PRD #76 M2.x audit follow-up).
-        // Tracks both reused-from-`pane_id_env` *and* fresh `allocate_id`
-        // outputs so a duplicate `DOT_AGENT_DECK_PANE_ID` from a stale or
-        // hostile daemon (or a value that happens to collide with an id
-        // we already allocated this pass) cannot HashMap::insert-overwrite
+        // Tracks both reused-from-`pane_id_env` *and* freshly-minted
+        // placeholder ids (below) so a duplicate `DOT_AGENT_DECK_PANE_ID`
+        // from a stale or hostile daemon cannot HashMap::insert-overwrite
         // an earlier pane in `wire_stream_pane`.
         let mut used_ids: HashSet<String> = HashSet::new();
         for record in records {
@@ -1477,40 +1505,40 @@ impl EmbeddedPaneController {
             // what lets hook events (delegate / work-done / status)
             // emitted by the agent route correctly after a reconnect —
             // see `state::AppState::apply_event`'s managed-pane check.
-            // Older daemons omit this field (`pane_id_env: None`), so we
-            // fall back to allocating a fresh id; that path keeps the
-            // pane visible and the byte stream rendered, but hook
-            // routing won't survive reconnect — same behavior as before
-            // this fix.
+            // A record with no valid `pane_id_env` — the daemon never
+            // captured one for this agent (e.g. a headless spawn.rs
+            // origin whose env value was scrubbed for being invalid; a
+            // pre-#365 daemon never reaches here at all, since the
+            // version handshake refuses to pair with one) — still needs
+            // *some* locally-unique key for this controller's pane map;
+            // that path keeps the pane visible and the byte stream
+            // rendered, but hook routing won't survive reconnect — same
+            // behavior as before this fix.
             //
             // Defense in depth (audit follow-up): re-validate the
             // daemon-supplied value here too, so an older daemon that
             // doesn't yet scrub at capture can't poison this client's
             // pane registry. Same grammar as the daemon-side check.
+            //
+            // PRD #365 M2: the client mints no pane ids of its own any
+            // more, so there is no `next_id` counter to keep ahead of a
+            // reused value. The fallback below mints with the exact same
+            // collision-resistant scheme the daemon uses
+            // (`agent_pty::mint_pane_id`) rather than a stateful counter —
+            // its own per-process nonce + monotonic sequence already
+            // guarantees no collision within this pass, so no bump logic
+            // is needed.
             let pane_id = match record.pane_id_env.clone() {
-                Some(id) if agent_pty::is_valid_pane_id_env(&id) && !used_ids.contains(&id) => {
-                    // Bump `next_id` past any reused pane id so a later
-                    // `allocate_id` for a freshly-created pane can't
-                    // collide with one we just rehydrated. Without this,
-                    // the new pane's `insert` would silently replace the
-                    // hydrated one in the HashMap.
-                    if let Ok(parsed) = id.parse::<u64>() {
-                        let mut nxt = self.next_id.lock().unwrap();
-                        if parsed >= *nxt {
-                            *nxt = parsed + 1;
-                        }
-                    }
-                    id
-                }
+                Some(id) if agent_pty::is_valid_pane_id_env(&id) && !used_ids.contains(&id) => id,
                 Some(id) => {
                     tracing::debug!(
                         agent_id = %agent_id,
                         pane_id_env_len = id.len(),
-                        "hydrate_from_daemon: pane_id_env invalid or duplicate, falling back to allocate_id"
+                        "hydrate_from_daemon: pane_id_env invalid or duplicate, minting a local placeholder"
                     );
-                    self.allocate_id()
+                    agent_pty::mint_pane_id()
                 }
-                None => self.allocate_id(),
+                None => agent_pty::mint_pane_id(),
             };
             used_ids.insert(pane_id.clone());
             // M2.11: prefer the daemon-stored display_name when present,
@@ -3547,12 +3575,11 @@ impl PaneController for EmbeddedPaneController {
         cwd: Option<&str>,
         opts: AgentSpawnOptions<'_>,
     ) -> Result<(String, String), PaneError> {
-        // The pane ID is allocated up front because it has to be injected into
-        // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
-        // below fails, the ID is intentionally consumed (a gap in the
-        // sequence is harmless and avoids racing concurrent `create_pane`
-        // calls to revert the counter).
-        let pane_id = self.allocate_id();
+        // PRD #365 M2: the daemon, not the client, mints `pane_id` now —
+        // `create_stream_pane` issues `StartAgent` first and adopts
+        // whatever id comes back on `AttachResponse::pane_id`, so there is
+        // no client-side id to allocate up front any more.
+        //
         // Single source of truth for the in-session label, local Pane.name,
         // and the daemon's StartAgent.display_name. `resolve_display_name`
         // applies trim + `is_valid_display_name` + shell fallback, so all
@@ -3563,7 +3590,6 @@ impl PaneController for EmbeddedPaneController {
         let resolved = agent_pty::resolve_display_name(opts.display_name, command);
 
         let result = self.create_stream_pane(
-            pane_id,
             command,
             cwd,
             &resolved,

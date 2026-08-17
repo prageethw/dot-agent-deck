@@ -95,7 +95,7 @@ use crate::platform::ipc::{IpcListener, IpcStream};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
+use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, mint_pane_id};
 use crate::event::{AgentType, BroadcastMsg};
 use crate::pane_input::escape_bytes_for_log;
 use crate::state::SharedState;
@@ -321,7 +321,17 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// PRD #120's `OrchestrationSurface` bump above: an older client receiving
 /// the new tag would fail to deserialize the frame, so this is a
 /// non-forward-compatible payload-schema change, not an additive field.
-pub const PROTOCOL_VERSION: u32 = 8;
+///
+/// PRD #365 M2 bumped 8 → 9: `AttachRequest::StartAgent` no longer trusts a
+/// client-proposed `DOT_AGENT_DECK_PANE_ID` in `env` — the daemon mints its
+/// own `pane_id` (see [`crate::agent_pty::mint_pane_id`]) and returns it on
+/// the new [`AttachResponse::pane_id`] field. The new field is technically
+/// wire-additive, but this is a same-wire/different-*meaning* semantic
+/// break per CLAUDE.md rule 12, not a forward-compatible add: an old client
+/// keeps minting a client-side id the new daemon never asked for and does
+/// not recognize as authoritative, which is exactly the ambiguity this PRD
+/// exists to close. See `changelog.d/365.breaking.md`.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -447,13 +457,17 @@ pub enum AttachRequest {
     /// **Trust boundary.** The attach socket is bound at mode `0o600` and
     /// only accepts connections from the same OS user as the daemon, so
     /// any peer reaching this request can already exec arbitrary code as
-    /// that user. We deliberately do **not** sandbox `command`, `cwd`, or
-    /// `env`: there is no allowlist, no policy layer, no shell-quoting
+    /// that user. We deliberately do **not** sandbox `command` or `cwd`:
+    /// there is no allowlist, no policy layer, no shell-quoting
     /// validation. Adding any of those here would be security theater —
     /// the same user has equivalent local-exec capability via `sh -c`,
     /// and the daemon's job is to expose PTY plumbing, not to be a
     /// privilege boundary. Multi-tenant or remote scenarios must be
     /// handled at a different layer (separate UID, container, SSH).
+    /// `env` is the one exception (PRD #365 M2): any client-proposed
+    /// `DOT_AGENT_DECK_PANE_ID` entry is stripped and replaced with the
+    /// daemon-minted `pane_id` before the spawn path sees it, so `env` is
+    /// not forwarded verbatim for that one key.
     StartAgent {
         #[serde(default)]
         command: Option<String>,
@@ -797,6 +811,18 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// PRD #365 M2: the daemon-minted `pane_id` for a `StartAgent` spawn.
+    /// The daemon, not the client, is now authoritative for this value —
+    /// see [`crate::agent_pty::mint_pane_id`]. Wire-additive
+    /// (`#[serde(default, skip_serializing_if)]`), but this is the
+    /// same-wire/different-*meaning* semantic break CLAUDE.md rule 12 calls
+    /// out by name: an old client that doesn't know to read this field
+    /// keeps client-side-minting an id the new daemon never asked for and
+    /// no longer treats as authoritative, which is why `PROTOCOL_VERSION`
+    /// bumps alongside this field rather than shipping it as a silent
+    /// additive-only change. `None` on every response but `StartAgent`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
 }
 
 impl AttachResponse {
@@ -1600,7 +1626,7 @@ async fn handle_connection(
             cwd,
             rows,
             cols,
-            env,
+            mut env,
             display_name,
             tab_membership,
             agent_type,
@@ -1622,13 +1648,15 @@ async fn handle_connection(
                 return Ok(());
             }
             // Trust boundary: same OS user, same exec capability — see the
-            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
-            // `env` to the spawn path verbatim. The only check here is a
-            // sanity guard against an empty/whitespace-only `command`,
-            // which is almost certainly a client bug rather than an
-            // attack: it would otherwise resolve to a binary named "" or
-            // " " and fail with a confusing OS error. This is *not* an
-            // allowlist.
+            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`
+            // to the spawn path verbatim; `env` is forwarded verbatim
+            // except for `DOT_AGENT_DECK_PANE_ID`, which is stripped and
+            // re-stamped with the daemon-minted `pane_id` below (PRD #365
+            // M2). The only check here is a sanity guard against an
+            // empty/whitespace-only `command`, which is almost certainly a
+            // client bug rather than an attack: it would otherwise resolve
+            // to a binary named "" or " " and fail with a confusing OS
+            // error. This is *not* an allowlist.
             if let Some(c) = command.as_deref()
                 && c.trim().is_empty()
             {
@@ -1640,16 +1668,28 @@ async fn handle_connection(
                 return Ok(());
             }
 
+            // PRD #365 M2: the daemon, not the client, is authoritative for
+            // `pane_id`. Strip whatever the client proposed (or omitted)
+            // under `DOT_AGENT_DECK_PANE_ID` — the pre-M2 shape — and stamp
+            // a freshly-minted, collision-resistant id into the same `env`
+            // vec that reaches `spawn_agent`/`SpawnOptions.env` below, so
+            // the child process's own `DOT_AGENT_DECK_PANE_ID` is the
+            // minted value. `spawn_agent`'s own `pane_id_env` extraction
+            // (`agent_pty.rs`) reads this same env vec, so its
+            // duplicate-pane-id rejection and registry mirror pick up the
+            // minted value automatically — no separate plumbing needed
+            // there; it now defends against a daemon-minting bug instead
+            // of a client-minting race, a strictly smaller threat surface.
+            env.retain(|(k, _)| k != DOT_AGENT_DECK_PANE_ID);
+            let minted_pane_id = mint_pane_id();
+            env.push((DOT_AGENT_DECK_PANE_ID.to_string(), minted_pane_id.clone()));
+
             // PRD #93 round-5: capture the bits we need to populate the
             // daemon's `AppState` role map BEFORE the spawn (we'll need
             // the pane id from env and the orchestration metadata from
             // tab_membership). The spawn moves `opts`, so we clone what
             // we need first.
-            let pane_id_env: Option<String> = env
-                .iter()
-                .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
-                .map(|(_, v)| v.clone())
-                .filter(|v| is_valid_pane_id_env(v));
+            let pane_id_env: Option<String> = Some(minted_pane_id.clone());
             // Round-11 auditor #C: also pull `orchestration_cwd` out of
             // the membership so the daemon can use it (not StartAgent.cwd)
             // as the disambiguator in `pane_orchestration_map`. This keeps
@@ -1869,7 +1909,17 @@ async fn handle_connection(
                             crate::agent_pty::seed_fallback_grace(),
                         );
                     }
-                    write_resp(&mut stream, &AttachResponse::with_id(id)).await?
+                    // PRD #365 M2: return the daemon-minted pane_id
+                    // alongside the existing `id` field so the client can
+                    // adopt it instead of proposing its own.
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse {
+                            pane_id: Some(minted_pane_id),
+                            ..AttachResponse::with_id(id)
+                        },
+                    )
+                    .await?
                 }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
