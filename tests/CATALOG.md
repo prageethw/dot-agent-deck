@@ -792,7 +792,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** across 60 independently-raced trials (a single trial only corrupts ~8% of the time per the issue's own measurement on the sync path), that at most one of the two concurrent callers reports `WorktreeCreation::Created`, that `git worktree list --porcelain` shows the target path exactly once, and that `.git/worktrees/` holds exactly one admin entry (by `gitdir` back-pointer) for it.
 - **Does not assert:** the CREATE case (no pre-existing branch, `reuse_existing_branch=false`); the sync path (`worktree/create/001`).
-- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `worktree/create/001`'s own reasoning — many trials of real `git worktree add` calls starved `build-windows`'s shared CI runner; the race it measures is the Unix `flock` path anyway).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `worktree/create/001`'s own reasoning — many trials of real `git worktree add` calls starved `build-windows`'s shared CI runner). Unlike `worktree/create/001`, this is not merely "the same test, skipped for cost": the async lock uses a structurally DIFFERENT primitive on Windows (a named mutex plus a dedicated owner thread, `platform/lock/windows.rs`) than the `flock` this test exercises on Unix, so the Windows path is genuinely unexercised here, not just untested-for-runner-budget. Risk is low — `acquire_spawn_lock`/`acquire_spawn_lock_bounded` are already exercised on Windows by daemon start/attach — but this test does not cover it.
 
 #### worktree/reclaim
 
