@@ -3279,9 +3279,15 @@ fn host_home() -> PathBuf {
 /// imported `settings.json` (the deck auto-installs its own hooks
 /// pointing at the per-test socket — leaving the host's hook entries
 /// in place would invoke the developer's real hook commands inside
-/// the test). M3.1 auditor S2 + S3: write the destination with mode
+/// the test). `pub` so tests that build their own credential HOME outside
+/// [`TuiDeckBuilder`] — `e2e_delegate_work_done_chain.rs::prepare_claude_home`
+/// — can call the same keychain-aware importer instead of a second
+/// hand-rolled file-only copy (#358: the hand-rolled copy panicked with
+/// `NotFound` on a host where Claude Code 2.x keeps credentials in the
+/// macOS Keychain instead of `~/.claude/.credentials.json`). M3.1 auditor
+/// S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
-fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
+pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     let src_root = host_home().join(".claude");
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;

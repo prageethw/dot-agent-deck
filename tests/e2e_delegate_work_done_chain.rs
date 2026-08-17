@@ -72,15 +72,13 @@ fn prepare_claude_home(worker_cwd: &str) -> TempDir {
     let home = common::race_safe_tempdir();
 
     // Carry the host credentials so the worker authenticates as the host
-    // user (mirrors the harness's `with_imported_claude_credentials`).
-    std::fs::create_dir_all(home.path().join(".claude")).expect("mk .claude");
-    std::fs::copy(
-        Path::new(&host_home)
-            .join(".claude")
-            .join(".credentials.json"),
-        home.path().join(".claude").join(".credentials.json"),
-    )
-    .expect("copy claude credentials");
+    // user (mirrors the harness's `with_imported_claude_credentials`). #358:
+    // this used to be a hand-rolled file-only copy of
+    // `~/.claude/.credentials.json`, which panics with `NotFound` on a host
+    // where Claude Code 2.x keeps credentials in the macOS login Keychain
+    // instead of that file (PRD #386). Reuse the shared, keychain-aware
+    // importer rather than a second copy of the same bug.
+    common::import_claude_credentials(home.path()).expect("import claude credentials");
 
     // Start from the host's global config (preserves oauthAccount +
     // hasCompletedOnboarding so the worker skips the global onboarding
