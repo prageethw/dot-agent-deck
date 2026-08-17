@@ -261,6 +261,22 @@ pub fn branch_prefix_to_work_type(branch: &str) -> Option<WorkType> {
 /// branch name, following the two-tier order documented on the module.
 /// Never guesses — every path that cannot cleanly resolve to exactly one
 /// work type is an `Err`.
+///
+/// `breaking` is a severity axis, not a work type
+/// (`docs/develop/work-types.md`): a `.breaking.md` fragment maps to
+/// [`WorkType::Prd`] via [`suffix_to_work_type`] only as its
+/// no-branch-signal fallback. When the branch supplies a signal too, this
+/// function — not `suffix_to_work_type`, which has no branch to consult —
+/// resolves a `.breaking.md`-only fragment supply against the branch:
+/// `fix/` re-resolves it to [`WorkType::Bug`] rather than erroring, while
+/// `docs/`/`chore/` still disagree and error as before. This stays
+/// deliberately narrow to "every added Prd-mapping fragment is
+/// specifically `breaking`" (tracked below as `fragment_all_breaking`) —
+/// a genuine `.feature.md` fragment (alone, or alongside a `.breaking.md`
+/// with no [`WorkTypeError::ConflictingFragments`] between them, since both
+/// map to `Prd`) must still disagree with a `fix/` branch exactly as
+/// today, because that combination is a real feature, not a breaking bug
+/// fix.
 pub fn derive_work_type(
     fragments: &[AddedFragment],
     branch: &str,
@@ -270,12 +286,16 @@ pub fn derive_work_type(
     // through to tier 2), and a disagreement between two fragments fails
     // before tier 2 is even consulted.
     let mut fragment_supply: Option<(String, WorkType)> = None;
+    let mut fragment_all_breaking = true;
     for fragment in fragments {
         let work_type =
             suffix_to_work_type(&fragment.suffix).ok_or_else(|| WorkTypeError::UnknownSuffix {
                 path: fragment.path.clone(),
                 suffix: fragment.suffix.clone(),
             })?;
+        if fragment.suffix != "breaking" {
+            fragment_all_breaking = false;
+        }
         match &fragment_supply {
             None => fragment_supply = Some((fragment.path.clone(), work_type)),
             Some((first_path, first_type)) if *first_type != work_type => {
@@ -295,6 +315,18 @@ pub fn derive_work_type(
             if fragment_type == branch_type {
                 Ok(Derivation {
                     work_type: fragment_type,
+                    supplier: Supplier::Fragment,
+                })
+            } else if fragment_type == WorkType::Prd
+                && fragment_all_breaking
+                && branch_type == WorkType::Bug
+            {
+                // Every Prd-mapping fragment here is `.breaking.md`, none is
+                // `.feature.md`, and the branch says `fix/` — the fragment's
+                // Prd mapping was only ever the no-branch-signal fallback,
+                // so the branch's Bug signal wins instead of disagreeing.
+                Ok(Derivation {
+                    work_type: WorkType::Bug,
                     supplier: Supplier::Fragment,
                 })
             } else {
@@ -1866,6 +1898,85 @@ mod tests {
                     ("changelog.d/202.feature.md".to_string(), WorkType::Prd)
                 );
                 assert_eq!(branch, ("fix/202-thing".to_string(), WorkType::Bug));
+            }
+            other => panic!("expected FragmentBranchDisagree, got {other:?}"),
+        }
+    }
+
+    // -- `.breaking.md` is a severity axis, not a work type (fork#451) ------
+
+    #[test]
+    fn breaking_fragment_on_fix_branch_resolves_to_bug() {
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let derivation = derive_work_type(&fragments, "fix/451-thing")
+            .expect("a breaking bugfix on a fix/ branch must not disagree");
+        assert_eq!(
+            derivation,
+            Derivation {
+                work_type: WorkType::Bug,
+                supplier: Supplier::Fragment,
+            }
+        );
+    }
+
+    #[test]
+    fn breaking_fragment_on_feat_branch_still_resolves_to_prd() {
+        // Regression coverage: unchanged from today — both tiers already
+        // agree on Prd, so this never reaches the branch-aware fallback.
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let derivation = derive_work_type(&fragments, "feat/451-thing")
+            .expect("a breaking feature on a feat/ branch must resolve");
+        assert_eq!(
+            derivation,
+            Derivation {
+                work_type: WorkType::Prd,
+                supplier: Supplier::Fragment,
+            }
+        );
+    }
+
+    #[test]
+    fn breaking_fragment_with_no_branch_signal_still_falls_back_to_prd() {
+        // Regression coverage: preserve today's existing
+        // single-fragment-wins behavior when the branch supplies nothing.
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let derivation = derive_work_type(&fragments, "spike/451-thing")
+            .expect("a breaking fragment with no branch signal must fall back to Prd");
+        assert_eq!(
+            derivation,
+            Derivation {
+                work_type: WorkType::Prd,
+                supplier: Supplier::Fragment,
+            }
+        );
+    }
+
+    #[test]
+    fn breaking_fragment_on_docs_branch_still_disagrees() {
+        // A breaking change on a docs/ branch is a genuine mismatch, not a
+        // case the fix/ carve-out should silence.
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let err = derive_work_type(&fragments, "docs/451-thing")
+            .expect_err("a breaking fragment on a docs/ branch must still disagree");
+        match err {
+            WorkTypeError::FragmentBranchDisagree { fragment, branch } => {
+                assert_eq!(
+                    fragment,
+                    ("changelog.d/451.breaking.md".to_string(), WorkType::Prd)
+                );
+                assert_eq!(branch, ("docs/451-thing".to_string(), WorkType::Doc));
             }
             other => panic!("expected FragmentBranchDisagree, got {other:?}"),
         }
