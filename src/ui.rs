@@ -36657,6 +36657,52 @@ mod tests {
         );
     }
 
+    /// PRD #254 M1 (auditor) + H2: the codex hook-trust downgrade must run
+    /// AHEAD of the sticky `can_report_prompts` latch, and the target it
+    /// downgrades to must be exactly `Unknown`, never `CannotReport`. This is
+    /// the one fixture the two tests above do not cover: both set
+    /// `can_report_prompts: false`, so neither ever reaches the latch
+    /// short-circuit at `delivery_capability`'s `if
+    /// delivery.is_some_and(|d| d.can_report_prompts)` check — meaning
+    /// deleting the pre-latch downgrade block entirely would still leave both
+    /// green. Here `can_report_prompts: true`, so if the downgrade were
+    /// missing or ordered after the latch, this would resolve `Reports`
+    /// instead. And `assert_eq!` against `Unknown` specifically (not
+    /// `assert_ne!(.., Reports)`) means reverting the downgrade target back to
+    /// `CannotReport` fails this test too, closing both gaps with one
+    /// fixture.
+    #[test]
+    fn delivery_capability_downgrade_outranks_the_can_report_prompts_latch() {
+        const PANE_ID: &str = "codex-hook-failed-latched-pane";
+        const AGENT_ID: &str = "codex-hook-failed-latched-agent";
+
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.codex_hook_trust_failed.insert(PANE_ID.to_string());
+
+        let delivery = PromptDelivery {
+            expected_agent_id: Some(AGENT_ID.to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "codex-hook-failed-latched-1".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: true,
+            epoch: 0,
+            wire_issued: false,
+        };
+
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Unknown,
+            "PRD #254 / auditor M1: the hook-trust downgrade must outrank the \
+             sticky can_report_prompts latch and must resolve to Unknown, not \
+             CannotReport — CannotReport would finalize this pane's prompt at \
+             the very first write instead of holding it provisional to the \
+             60s deadline"
+        );
+    }
+
     /// Issue #424 (tester's finding / C2, coder-authored): which seed-path
     /// outcomes are terminal, and why "already written" is part of the answer.
     #[test]

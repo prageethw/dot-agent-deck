@@ -1747,8 +1747,8 @@ mod tests {
     /// non-wrapper producer -- must resolve `None` ("no outcome reported"),
     /// never read as either a success or a failure. This is the deliberate
     /// backward-compatibility default the function's own doc comment
-    /// describes, and it must stay `None` even after I2 (below) changes how
-    /// a PRESENT-but-garbled value resolves -- an absent key and a garbled
+    /// describes, and it stays `None` even though I2 (below) changed how a
+    /// PRESENT-but-garbled value resolves -- an absent key and a garbled
     /// value are different facts and must not collapse to the same outcome.
     #[test]
     fn codex_hook_trust_outcome_absent_key_is_none() {
@@ -1760,19 +1760,18 @@ mod tests {
 
     /// Scenario: PRD #254 auditor I2. A stamped-but-UNRECOGNISED value --
     /// neither the literal `"true"` nor `"false"` any current wrapper writes
-    /// (a future format, a typo, a corrupted write) -- falls into today's
-    /// same `_ => None` arm as an ABSENT key. Downstream, `None` reads as "no
-    /// outcome reported" and resolves the pane back to `Reports` -- the exact
+    /// (a future format, a typo, a corrupted write) -- must NOT fall into the
+    /// same arm as an ABSENT key, which would read as "no outcome reported"
+    /// and resolve the pane back to `Reports` -- the exact
     /// silently-healthy-looking failure shape H1 is about (see
     /// `codex_spawn_prep_ok_zero_hooks_is_not_confirmed` in `wrap.rs`), just
     /// reached through a garbled value instead of a missing one. A key that
     /// IS present but unparseable is evidence something went wrong and must
-    /// not be indistinguishable from "nothing was reported": it must resolve
-    /// to `Some(false)` (not confirmed), the same fail-safe direction as
-    /// every other unresolvable outcome in this chain. This is the RED half
-    /// of this pin -- it fails against current code, confirming the fix
-    /// round needs to split the `Some(_)` and `None` arms rather than
-    /// collapsing both into the wildcard.
+    /// not be indistinguishable from "nothing was reported": it resolves to
+    /// `Some(false)` (not confirmed), the same fail-safe direction as every
+    /// other unresolvable outcome in this chain. This pins that fix: it was
+    /// proven RED against the pre-fix code, where the `Some(_)` and `None`
+    /// arms both collapsed into one wildcard.
     #[test]
     fn codex_hook_trust_outcome_unrecognized_present_value_is_not_confirmed() {
         assert_eq!(

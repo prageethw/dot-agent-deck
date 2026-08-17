@@ -2099,13 +2099,12 @@ mod tests {
     /// that home -- the genuine "the hook failed to install/trust" case (an
     /// unwritable `CODEX_HOME`, a full disk, a partial write; `auto_install()`
     /// swallows every one of those behind a `tracing::warn!`, so no error
-    /// reaches this point). Today `codex_spawn_prep` sets
-    /// `hook_trust_confirmed = true` for ANY `Ok(_)` -- `count` is bound in
-    /// the match arm and passed to `tracing::debug!`, but never compared --
-    /// so this exact failure is recorded as success. This is the RED half of
-    /// the pin: it must fail against current code (asserting the fix,
-    /// `count > 0`, not yet applied), confirming this is a genuine
-    /// regression test and not a tautology.
+    /// reaches this point). `codex_spawn_prep` now sets `hook_trust_confirmed
+    /// = count > 0` in the `Ok(count)` arm, so this exact failure is recorded
+    /// as unconfirmed rather than as success. This pins that fix: it was
+    /// proven RED against the pre-fix `hook_trust_confirmed = true` for ANY
+    /// `Ok(_)`, confirming this is a genuine regression test and not a
+    /// tautology.
     #[test]
     #[cfg(unix)]
     fn codex_spawn_prep_ok_zero_hooks_is_not_confirmed() {

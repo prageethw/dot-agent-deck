@@ -521,7 +521,7 @@ pub struct AppState {
     /// (`AgentEvent::codex_hook_trust_outcome`), and cleared on a later
     /// successful respawn on the same (reused) pane id rather than latching a
     /// failure forever. `crate::ui::delivery_capability` consults this to
-    /// downgrade a Codex pane's capability from `Reports` to `CannotReport`
+    /// downgrade a Codex pane's capability from `Reports` to `Unknown`
     /// until the hook is known-successful for that pane, instead of resolving
     /// capability from agent type alone.
     pub codex_hook_trust_failed: HashSet<String>,
