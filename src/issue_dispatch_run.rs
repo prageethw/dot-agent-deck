@@ -1709,7 +1709,11 @@ pub async fn create_worktree(
     // leaving the slug wedged.
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
-            let marker_warning = mark_worktree_owned_best_effort(worktree_dir, creator);
+            let creator_str = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+                "{}:{}",
+                creator.kind, creator.subject
+            ));
+            let marker_warning = mark_worktree_owned_best_effort(worktree_dir, &creator_str);
             WorktreeCreation::Created { marker_warning }
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
@@ -4867,11 +4871,25 @@ exit 0
                 let barrier_b = barrier;
                 let h_a = tokio::spawn(async move {
                     barrier_a.wait().await;
-                    create_worktree(&clone_dir_a, &worktree_dir_a, &branch_a, true, "racer-a").await
+                    create_worktree(
+                        &clone_dir_a,
+                        &worktree_dir_a,
+                        &branch_a,
+                        true,
+                        Creator::dispatch("racer-a"),
+                    )
+                    .await
                 });
                 let h_b = tokio::spawn(async move {
                     barrier_b.wait().await;
-                    create_worktree(&clone_dir_b, &worktree_dir_b, &branch_b, true, "racer-b").await
+                    create_worktree(
+                        &clone_dir_b,
+                        &worktree_dir_b,
+                        &branch_b,
+                        true,
+                        Creator::dispatch("racer-b"),
+                    )
+                    .await
                 });
                 handles.push((h_a, h_b));
             }

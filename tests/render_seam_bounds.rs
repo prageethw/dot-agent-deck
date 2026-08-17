@@ -153,6 +153,7 @@ fn bounded_seams() -> Vec<Seam> {
                 false,
                 UiMode::Normal,
                 None,
+                false,
                 w,
                 h,
             );

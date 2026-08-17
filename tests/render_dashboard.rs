@@ -3698,6 +3698,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
             false,
             UiMode::Normal,
             declared_agent_type,
+            true,
             80,
             density.rendered_height(),
         ))
