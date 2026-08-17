@@ -1,6 +1,6 @@
-# PRD fork#TBD — Divide the dashboard grid evenly so every card is visible
+# PRD fork#446 — Divide the dashboard grid evenly so every card is visible
 
-**Issue:** _not yet filed_ — file against `prageethw/dot-agent-deck`, then rename this file to `prds/fork-<issue>-even-card-division.md` and fill this link.
+**Issue:** [prageethw/dot-agent-deck#446](https://github.com/prageethw/dot-agent-deck/issues/446)
 **Predecessors:** fork [#437](https://github.com/prageethw/dot-agent-deck/issues/437) / upstream [#588](https://github.com/vfarcic/dot-agent-deck/issues/588) (joint `(cols, density)` fit-seeking) — this is its direct follow-on. PRD #147 set the original "7 decks fit without scrolling" goal; PRD #339 and fork#405 each spent part of the margin that goal depended on.
 **Experimental flag:** No (CLAUDE.md rule 9 — this changes how an existing surface lays itself out rather than adding one, and gating it would make card height flag-dependent, exactly the coupling fork#405 avoided when it made the role row unconditional).
 
