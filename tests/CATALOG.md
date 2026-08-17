@@ -226,6 +226,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** exact Claude prose beyond the discovered sentinel filename; exact elapsed-time text; multiple cards or density changes caused by terminal height.
 - **Platform coverage:** mac+linux.
 
+#### dashboard/grid
+
+##### dashboard/grid/004 — All 7 role cards paint on a narrow, short 99×33 terminal (issue #437).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** every one of 7 role cards is present in the rendered buffer at the fitted (2-col) layout for the exact fork issue #437 reported shape; before the fix the width-only/height-only column decision painted only 5.
+- **Does not assert:** the specific card ordering or position within the grid; density selection details (covered by `dashboard/density`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/005 — `ui.columns` matches the render path's actual fitted column count (issue #437).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** for the same narrow, short 7-role scenario, `ui.columns` is kept in sync with the 2 columns the render path actually fitted, rather than left stale or independently computed.
+- **Does not assert:** the rendered card content itself (covered by `dashboard/grid/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/006 — Dashboard title shows an explicit hidden-card count when even the fitted layout can't show everything (issue #437).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** with 50 sessions in a viewport so small only 1 card fits even at the fitted layout's Compact density, the title line appends a nonempty indicator naming the 49 hidden cards, distinct from the filter-based "X/Y session(s)" text.
+- **Does not assert:** the exact wording of the indicator, only that it is present and names the correct count.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
