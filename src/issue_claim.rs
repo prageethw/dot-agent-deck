@@ -152,13 +152,17 @@ pub fn decide_claim(
 /// the SAME identity and the lock would wave them all through while
 /// appearing to work.
 ///
-/// `pub`, not `pub(crate)`: issue #325's `worktree_reclaim` CLI wrapper
-/// (`main.rs`'s `run_worktree_reclaim_cli`) needs this same resolution to
-/// attribute `dot-agent-deck worktree reclaim`'s own removals, and `main.rs`
-/// is a separate crate from this library — `pub(crate)` would not reach it.
-/// Reusing this rather than duplicating the resolution logic is the whole
-/// point (CLAUDE.md rule 19's "fix once, share" spirit).
-pub fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
+/// `pub(crate)`: the only callers are [`resolve_remover_identity`] (same
+/// module) and `issue_claim`'s own claim-lock entry point. `main.rs`'s
+/// `run_worktree_reclaim_cli` calls `resolve_remover_identity` instead
+/// (issue #325 / reviewer NEW-3 / auditor), which stays `pub` because it —
+/// not this function — is the one crossing the binary/library crate
+/// boundary; `pub(crate)` here would not reach `main.rs` either, but nothing
+/// there needs it to. Keeping the lock resolver un-exported is also the
+/// cheapest way to enforce the warning below: a function nothing outside
+/// this module can even name is a function nothing outside this module can
+/// misuse.
+pub(crate) fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
     match std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID) {
         Err(_) => {
             // No pane env: a human terminal. The login IS part of the
@@ -633,5 +637,48 @@ mod tests {
             }
             other => panic!("expected RefuseHeldByOther, got {other:?}"),
         }
+    }
+
+    // --- issue #325 / reviewer NEW-2 / auditor: pin resolve_remover_identity's
+    // fallback branch, so reverting main.rs's call site back to the bare
+    // resolve_caller_identity().unwrap_or_else(|_| "unknown") cannot pass
+    // silently. `std::env::set_var`/`remove_var` are process-global, so
+    // serialize against PANE_ID_ENV_LOCK the same way agent_pty.rs's
+    // ENV_TEST_LOCK does.
+    static PANE_ID_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_remover_identity_falls_back_to_pane_id_outside_a_worktree() {
+        let _g = PANE_ID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by PANE_ID_ENV_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID).ok();
+        unsafe {
+            std::env::set_var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID, "7");
+        }
+
+        // A bare tempdir is not a linked worktree, so `owned_git_dir` returns
+        // `None` and `resolve_caller_identity` takes its `Err(_)` branch —
+        // exactly the root-checkout shape issue #325 was filed over.
+        let scratch = tempfile::tempdir().unwrap();
+        let result = resolve_remover_identity(scratch.path());
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID, v),
+                None => std::env::remove_var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID),
+            }
+        }
+
+        assert!(
+            result.starts_with("pane:7@"),
+            "expected the pane-id fallback (not the bare \"unknown\" degradation this test \
+             exists to catch a regression to), got {result:?}"
+        );
+        assert!(
+            result.contains(&scratch.path().display().to_string()),
+            "fallback string should carry cwd for post-incident diagnosis, got {result:?}"
+        );
     }
 }

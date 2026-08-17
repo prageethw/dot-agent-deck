@@ -2382,6 +2382,14 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
         format_reclaim_error_for_cli, format_reclaim_human, run_reclaim,
     };
 
+    // issue #325 / reviewer NEW-1 / auditor P1: without this, the
+    // `tracing::info!("worktree removed")` in `remove_worktree_dir` is
+    // silently dropped -- `run_worktree_reclaim_cli` is a distinct top-level
+    // `Commands::Worktree` arm, mutually exclusive with `Commands::Daemon`'s
+    // `Serve` arm and `run_dashboard()` (the two existing call sites), so
+    // this can never double-install a subscriber and panic on `.init()`.
+    init_logging_from_env();
+
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {

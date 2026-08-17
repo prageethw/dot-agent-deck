@@ -10367,7 +10367,7 @@ fn dispatch_action(
                                         // grepping DOT_AGENT_DECK_LOG, and it
                                         // was previously discarded entirely.
                                         tracing::info!(
-                                            path = %worktree_path.display(),
+                                            path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
                                             remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                                             "worktree add timed out; half-created directory removed automatically"
                                         );
