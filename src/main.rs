@@ -755,18 +755,6 @@ fn resolve_work_done_candidate(path: &std::path::Path) -> (std::path::PathBuf, b
     (path.to_path_buf(), false)
 }
 
-/// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
-fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
-    if path == "-" {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut stdin, &mut buf)
-            .map_err(|e| format!("failed to read task from stdin: {e}"))?;
-        Ok(buf)
-    } else {
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read task file '{path}': {e}"))
-    }
-}
-
 /// What `dot-agent-deck delegate` should print and exit with, for one daemon
 /// reply. See [`delegate_verdict`].
 #[derive(Debug, PartialEq, Eq)]

@@ -347,6 +347,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
 
     let config = OrchestrationConfig {
         name: ORCHESTRATION_NAME.to_string(),
+        default: false,
         roles: vec![
             // Declared FIRST — the pre-fix-hostile order the design calls
             // out explicitly. `command = "pi"` is what makes
@@ -355,6 +356,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
             OrchestrationRoleConfig {
                 name: START_ROLE.to_string(),
                 command: "pi".to_string(),
+                agent: None,
                 start: true,
                 description: None,
                 prompt_template: None,
@@ -382,6 +384,7 @@ async fn delegate_036_pi_start_role_delegate_survives_worker_registration_race_i
             OrchestrationRoleConfig {
                 name: WORKER_ROLE.to_string(),
                 command: "stty -echo -icanon -icrnl -opost min 1 time 0 && exec cat -u".to_string(),
+                agent: None,
                 start: false,
                 description: None,
                 prompt_template: None,

@@ -60,7 +60,7 @@ use dot_agent_deck::issue_dispatch::{
     Identity, claim_comment_body, derive_issue_paths, parse_claim_fields,
 };
 #[cfg(unix)]
-use dot_agent_deck::worktree_reclaim::OWNER_MARKER_FILENAME;
+use dot_agent_deck::worktree_owner::OWNER_MARKER_FILENAME;
 use spec::spec;
 
 #[path = "../src/test_temp.rs"]

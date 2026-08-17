@@ -1574,7 +1574,11 @@ pub async fn create_worktree(
     // leaving the slug wedged.
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
-            let marker_warning = mark_worktree_owned_best_effort(worktree_dir, creator);
+            let creator_str = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+                "{}:{}",
+                creator.kind, creator.subject
+            ));
+            let marker_warning = mark_worktree_owned_best_effort(worktree_dir, &creator_str);
             WorktreeCreation::Created { marker_warning }
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
@@ -3364,7 +3368,7 @@ exit 0
             &worktree_dir,
             "agent/issue-77",
             true,
-            "issue-dispatch:my-task#77",
+            Creator::issue_dispatch("my-task", 77),
         )
         .await
         .expect("create_worktree must succeed against a real git repo");
@@ -3390,7 +3394,7 @@ exit 0
             worktree_dir.join(git_dir_raw)
         };
         let content =
-            std::fs::read_to_string(git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME))
+            std::fs::read_to_string(git_dir.join(crate::worktree_owner::OWNER_MARKER_FILENAME))
                 .expect("marker file must exist and be readable");
         assert!(
             content.contains("created-by: issue-dispatch:my-task#77"),
@@ -3849,7 +3853,7 @@ exit 0
         } else {
             worktree_dir.join(git_dir_raw)
         };
-        let marker_path = git_dir.join(crate::worktree_reclaim::OWNER_MARKER_FILENAME);
+        let marker_path = git_dir.join(crate::worktree_owner::OWNER_MARKER_FILENAME);
         std::fs::remove_file(&marker_path)
             .expect("the marker file must exist after a successful mark");
         std::fs::create_dir(&marker_path)
@@ -4422,11 +4426,25 @@ exit 0
                 let barrier_b = barrier;
                 let h_a = tokio::spawn(async move {
                     barrier_a.wait().await;
-                    create_worktree(&clone_dir_a, &worktree_dir_a, &branch_a, true, "racer-a").await
+                    create_worktree(
+                        &clone_dir_a,
+                        &worktree_dir_a,
+                        &branch_a,
+                        true,
+                        Creator::dispatch("racer-a"),
+                    )
+                    .await
                 });
                 let h_b = tokio::spawn(async move {
                     barrier_b.wait().await;
-                    create_worktree(&clone_dir_b, &worktree_dir_b, &branch_b, true, "racer-b").await
+                    create_worktree(
+                        &clone_dir_b,
+                        &worktree_dir_b,
+                        &branch_b,
+                        true,
+                        Creator::dispatch("racer-b"),
+                    )
+                    .await
                 });
                 handles.push((h_a, h_b));
             }

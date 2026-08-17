@@ -3550,6 +3550,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            model: None,
         });
         state
             .sessions
@@ -3681,7 +3682,9 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         pane_id: Some("pane-declared-agent".to_string()),
         agent_id: Some("agent-declared-agent".to_string()),
         display_name: Some("reviewer".to_string()),
+        pending_permission_tool: None,
         shell_synthetic_working: false,
+        model: None,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -3694,6 +3697,7 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
             false,
             UiMode::Normal,
             declared_agent_type,
+            true,
             80,
             density.rendered_height(),
         ))

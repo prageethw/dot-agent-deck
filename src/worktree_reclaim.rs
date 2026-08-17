@@ -36,7 +36,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_terminal_display};
-use crate::worktree_owner::{OWNER_MARKER_FILENAME, path_from_bytes};
+use crate::worktree_owner::{OWNER_MARKER_FILENAME, path_from_bytes, trim_trailing_newline};
 
 /// Version of the `--json` document shape. Bump on a field removal or a
 /// meaning change; additive fields don't need a bump.
@@ -1794,6 +1794,7 @@ mod tests {
     #[cfg(unix)]
     fn pending_report(path: PathBuf) -> WorktreeReport {
         WorktreeReport {
+            real_path: path.clone(),
             path,
             branch: Some("feat/x".to_string()),
             clean: true,
@@ -1801,6 +1802,9 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "ask".to_string(),
             reason: Some("reclaimable".to_string()),
+            owner: None,
+            owner_kind: "unknown".to_string(),
+            owner_reason: None,
         }
     }
 

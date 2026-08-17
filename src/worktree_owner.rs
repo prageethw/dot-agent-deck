@@ -83,7 +83,7 @@ pub(crate) fn path_from_bytes(field: &[u8]) -> PathBuf {
 /// Strip a single trailing `\n` (or `\r\n`) from a `git` command's raw
 /// stdout, at the byte level — no UTF-8 round-trip, so the bytes that
 /// precede the line ending survive untouched regardless of what they are.
-fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
     bytes
         .strip_suffix(b"\n")
         .map(|b| b.strip_suffix(b"\r").unwrap_or(b))

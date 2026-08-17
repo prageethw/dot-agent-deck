@@ -1608,6 +1608,7 @@ impl EventCollector {
                         sink.lock().unwrap_or_else(|e| e.into_inner()).push(event);
                     }
                     Ok(BroadcastMsg::OrchestrationSurface(_)) => {}
+                    Ok(BroadcastMsg::WorktreeKept(_)) => {}
                     // A lagged receiver has lost events it will never see again;
                     // the queries below report an empty result rather than
                     // asserting, so the caller fails with its own message.
