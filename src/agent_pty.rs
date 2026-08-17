@@ -41,6 +41,33 @@ pub const DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS: &str = "DOT_AGENT_DECK_IDLE_SHUTDOW
 /// scrub site below can reference it by name.
 pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 
+/// Fork #358 M2: the pane's `AppState::pane_registration_generation` value,
+/// reserved and injected into the worker's spawn-time environment sibling to
+/// [`DOT_AGENT_DECK_PANE_ID`] — see
+/// [`crate::state::AppState::reserve_registration_generation`]. The
+/// `work-done` CLI reads this directly instead of asking the live daemon at
+/// send time, so the value it reports is the registration this worker was
+/// actually spawned under, not whatever registration currently holds the
+/// pane_id. Same drift-safety pattern as `DOT_AGENT_DECK_PANE_ID` and
+/// `DOT_AGENT_DECK_AGENT_ID`: define the constant once and let the
+/// spawn-side injector and the CLI reader in `main.rs` reference the same
+/// symbol.
+pub const DOT_AGENT_DECK_REGISTRATION_GENERATION: &str = "DOT_AGENT_DECK_REGISTRATION_GENERATION";
+
+/// Fork #358 M4: the daemon's `AppState::daemon_boot_id` in effect when the
+/// generation above was reserved, injected alongside it into the worker's
+/// spawn-time environment — sibling to [`DOT_AGENT_DECK_PANE_ID`] and
+/// [`DOT_AGENT_DECK_REGISTRATION_GENERATION`], same drift-safety reasoning.
+/// `pane_registration_generation` alone cannot tell a pre-restart
+/// registration from a post-restart one that reuses the same pane_id — both
+/// start the pane at generation `1`, since the map is in-memory and resets
+/// on restart exactly like the counter it guards. Pairing it with a value
+/// that is ALSO fresh per daemon boot (see
+/// [`crate::state::AppState::daemon_boot_id`]) closes that: a pre-restart
+/// worker's env can never carry the post-restart daemon's boot id, whatever
+/// the generation says.
+pub const DOT_AGENT_DECK_DAEMON_BOOT_ID: &str = "DOT_AGENT_DECK_DAEMON_BOOT_ID";
+
 /// PRD #92 F9 followup-7: per-spawn daemon-side agent id the daemon
 /// injects into every spawned agent's environment. The agent's hook
 /// script reads this and attaches it to each emitted `AgentEvent` as
@@ -1148,6 +1175,20 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // every agent a DIFFERENT nested orchestration spawns from it — the same
     // class of bug the two scrubs above already exist to prevent.
     cmd.env_remove(DOT_AGENT_DECK_WORKTREE_OWNER);
+    // Fork #358 M4 round-2 review (reviewer P2 / auditor P2): same
+    // scrub-then-overlay rule for the registration generation and daemon
+    // boot id — the two halves of `handle_work_done`'s compound staleness
+    // key. Without this, a daemon launched from inside an existing deck
+    // pane would leak that pane's inherited generation/boot id into every
+    // child it spawns that does NOT get them injected explicitly (a
+    // non-orchestration pane, or any `state == None` spawn path), the same
+    // class of cross-deck leak `PANE_ID`/`AGENT_ID` above exist to prevent.
+    // Fail-closed today regardless (such a pane has no
+    // `pane_registration_generation` entry, so `handle_work_done` refuses
+    // it anyway) — this closes the leak itself, and keeps this scrub list
+    // matching what both constants' own doc comments already claim.
+    cmd.env_remove(DOT_AGENT_DECK_REGISTRATION_GENERATION);
+    cmd.env_remove(DOT_AGENT_DECK_DAEMON_BOOT_ID);
     // PRD #93 tuning env var: same scrub rationale — a deck launched
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.

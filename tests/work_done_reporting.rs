@@ -96,6 +96,14 @@ struct WorkDoneHarness {
     state: AppState,
     event_tx: broadcast::Sender<BroadcastMsg>,
     orchestrator_agent_id: String,
+    /// Fork #358 M2/M4: `handle_work_done` refuses a signal whose
+    /// `(generation, daemon_boot_id)` doesn't match the pane's CURRENT
+    /// registration — the same compound key the real worker-side CLI reads
+    /// from its own env at spawn time. Reserved during setup below and
+    /// replayed verbatim by `work_done()`, so this harness's signals are
+    /// never refused as stale.
+    worker_generation: u64,
+    daemon_boot_id: String,
 }
 
 impl WorkDoneHarness {
@@ -157,6 +165,7 @@ impl WorkDoneHarness {
             name: ORCHESTRATION.to_string(),
         };
         let mut state = AppState::default();
+        let mut worker_generation = 0;
         for (pane_id, role, is_orchestrator) in [
             (ORCH_PANE, ORCH_ROLE, true),
             (WORKER_PANE, WORKER_ROLE, false),
@@ -174,7 +183,15 @@ impl WorkDoneHarness {
             if is_orchestrator {
                 state.orchestrator_pane_ids.insert(pane_id.to_string());
             }
+            // Fork #358 M2: reserve this pane's registration generation, the
+            // same way `confirm_orchestration_role` would — WORKER_PANE's is
+            // what `work_done()` replays back to `handle_work_done`.
+            let generation = state.reserve_registration_generation(pane_id);
+            if pane_id == WORKER_PANE {
+                worker_generation = generation;
+            }
         }
+        let daemon_boot_id = state.daemon_boot_id().to_string();
 
         let (event_tx, _event_rx) = broadcast::channel(64);
         let harness = Self {
@@ -183,6 +200,8 @@ impl WorkDoneHarness {
             state,
             event_tx,
             orchestrator_agent_id,
+            worker_generation,
+            daemon_boot_id,
         };
         let ready = harness
             .wait_for_orchestrator(
@@ -225,6 +244,8 @@ impl WorkDoneHarness {
                     task: summary.to_string(),
                     done: false,
                     timestamp: chrono::Utc::now(),
+                    generation: self.worker_generation,
+                    daemon_boot_id: self.daemon_boot_id.clone(),
                 },
                 &self.registry,
             )
