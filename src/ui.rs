@@ -25264,16 +25264,17 @@ mod tests {
         // already unit-tested in isolation
         // (`even_row_heights_seven_rows_thirty_two_matches_expected_split`);
         // this test's job is to pin that the same split reaches the actual
-        // render path. Every card is unselected (Plain border), so each
-        // row's top border paints the box-drawing top-left corner "┌" at
-        // the start of its line; fit-all mode packs rows back to back with
-        // no gap (grid_007), so the distance between consecutive top
-        // borders is exactly that row's painted height.
+        // render path. `UiState::default()` selects index 0 (card 1), so
+        // that row paints the Thick top-left corner "┏" (`card_border_glyph`)
+        // while the remaining unselected cards paint the Plain "┌" — match
+        // both so the selected card's row counts too. Fit-all mode packs
+        // rows back to back with no gap (grid_007), so the distance between
+        // consecutive top borders is exactly that row's painted height.
         let lines: Vec<&str> = rendered.lines().collect();
         let top_border_rows: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.starts_with('┌'))
+            .filter(|(_, l)| l.starts_with('┌') || l.starts_with('┏'))
             .map(|(y, _)| y)
             .collect();
         assert_eq!(
