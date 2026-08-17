@@ -81,6 +81,7 @@ async fn codex_worker_001_inner() {
     // `TuiDeck` to hold a recording set — which it has none of, and never will.
     let _codex_redactions = common::import_codex_credentials(&codex_home)
         .expect("copy Codex credentials and trust worker cwd");
+    let boot_id_tuple = common::daemon_boot_id_env_tuple(&daemon.state).await;
     let worker_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
@@ -102,6 +103,8 @@ async fn codex_worker_001_inner() {
                         .expect("Codex test HOME is UTF-8")
                         .to_string(),
                 ),
+                common::registration_generation_env_tuple(),
+                boot_id_tuple,
             ],
             ..SpawnOptions::default()
         })
@@ -132,6 +135,7 @@ async fn codex_worker_001_inner() {
         state
             .pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        common::insert_pane_registration_generation(&mut state, WORKER_PANE);
     }
 
     common::wait_until_agent_output_settled(

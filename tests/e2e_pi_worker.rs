@@ -283,6 +283,11 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
             pi_home.path().to_str().expect("pi home UTF-8").to_string(),
         ),
         ("ANTHROPIC_API_KEY".to_string(), anthropic_key),
+        // Fork #358 M2/M4: `respawn_agent_for_pane` replays this captured env
+        // verbatim into the real pi worker, so the generation and boot-id
+        // tuples below carry forward to it too.
+        common::registration_generation_env_tuple(),
+        common::daemon_boot_id_env_tuple(&daemon.state).await,
     ];
 
     // Spawn a cheap placeholder (`cat`, blocks on stdin) as the worker pane, NOT
@@ -331,6 +336,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
         st.pane_cwd_map
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
+        common::insert_pane_registration_generation(&mut st, WORKER_PANE);
     }
 
     // No readiness wait: the `cat` placeholder is a live registry entry the

@@ -245,6 +245,8 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
                 .expect("claude home UTF-8")
                 .to_string(),
         ),
+        common::registration_generation_env_tuple(),
+        common::daemon_boot_id_env_tuple(&daemon.state).await,
     ];
     let worker_agent_id = daemon
         .registry
@@ -281,6 +283,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
         st.pane_cwd_map
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
+        common::insert_pane_registration_generation(&mut st, WORKER_PANE);
     }
 
     common::wait_until_agent_output_settled(

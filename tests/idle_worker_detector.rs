@@ -265,6 +265,13 @@ impl IdleHarness {
         state
             .pane_cwd_map
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
+        // Fork #358: matches what `register_orchestration_role` would
+        // record for a first registration — without it, `handle_work_done`'s
+        // stale-signal gate sees "no registration on file" for every pane
+        // here and refuses every `work_done()` call this harness makes.
+        state
+            .pane_registration_generation
+            .insert(ORCH_PANE.to_string(), 1);
 
         let mut worker_agent_ids = HashMap::new();
         for (role, command) in workers {
@@ -286,6 +293,9 @@ impl IdleHarness {
             state
                 .pane_orchestration_map
                 .insert(pane_id.clone(), orchestration.clone());
+            state
+                .pane_registration_generation
+                .insert(pane_id.clone(), 1);
             state.pane_cwd_map.insert(pane_id, cwd_str.clone());
             worker_agent_ids.insert((*role).to_string(), agent_id);
         }
@@ -341,6 +351,9 @@ impl IdleHarness {
     }
 
     async fn work_done(&self, role: &str) {
+        // Fork #358 M4: read the harness's own daemon_boot_id so the signal
+        // below matches, same reasoning as `generation`.
+        let daemon_boot_id = self.state.read().await.daemon_boot_id().to_string();
         self.state
             .read()
             .await
@@ -350,6 +363,11 @@ impl IdleHarness {
                     task: "The delegated test task is complete.".to_string(),
                     done: false,
                     timestamp: chrono::Utc::now(),
+                    // Matches the generation the harness records at setup
+                    // for every worker pane (fork #358); these panes are
+                    // never re-registered mid-test.
+                    generation: 1,
+                    daemon_boot_id,
                 },
                 &self.registry,
             )
