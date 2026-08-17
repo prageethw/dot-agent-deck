@@ -24793,8 +24793,12 @@ mod tests {
         (buffer_to_string(terminal.backend().buffer()), ui)
     }
 
+    /// Scenario: Render a dashboard with 7 role cards on a narrow, short
+    /// 99x33 terminal — the exact fork issue #437 shape — and check every
+    /// card actually painted on screen.
+    #[spec("dashboard/grid/001")]
     #[test]
-    fn render_narrow_short_dashboard_paints_all_cards() {
+    fn grid_001_narrow_short_dashboard_paints_all_cards() {
         // fork issue #437's reported shape: 7 roles, width 99, height 33 ->
         // dashboard_area.height=32 (frame height minus the 1-row hints bar)
         // -> available_for_density=30 — the exact numbers
@@ -24813,8 +24817,13 @@ mod tests {
         }
     }
 
+    /// Scenario: Render the same narrow, short 7-role dashboard and check
+    /// that `ui.columns` — the value the main loop derives independently for
+    /// keyboard navigation — agrees with the column count the render path
+    /// actually fitted.
+    #[spec("dashboard/grid/002")]
     #[test]
-    fn render_narrow_short_dashboard_sets_ui_columns_to_fitted_cols() {
+    fn grid_002_narrow_short_dashboard_sets_ui_columns_to_fitted_cols() {
         // Regression test for the desync risk upstream #588 flags explicitly:
         // the OTHER `grid_columns` caller (the main-loop `ui.columns =
         // grid_columns(dashboard_width)` call, src/ui.rs:13271) must not
@@ -24827,8 +24836,13 @@ mod tests {
         assert_eq!(ui.columns, 2);
     }
 
+    /// Scenario: Render a dashboard with 50 sessions in a viewport so small
+    /// that only 1 card fits even at the fitted layout's Compact density,
+    /// and check the title line shows an explicit count of the cards that
+    /// didn't fit rather than staying silent about the drop.
+    #[spec("dashboard/grid/003")]
     #[test]
-    fn render_dashboard_title_indicates_viewport_hidden_cards() {
+    fn grid_003_dashboard_title_indicates_viewport_hidden_cards() {
         // Reuses `fit_grid_falls_back_to_max_cols_compact_when_nothing_fits`'s
         // shape: 50 sessions, width 40 (max_cols_for_width=1 either way, so
         // this isolates the missing-indicator defect from the column-fit
