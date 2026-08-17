@@ -19887,18 +19887,44 @@ fn render_session_card(
     // comment further down already depends on the same clipping), and
     // content priority already puts role name first, so nothing changes here.
     if area.height == 1 {
-        // No block at all: one line straight into `area` carrying only the
-        // two survivors — role name (left, with the selection/number prefix)
-        // and status (right-aligned), the same two pieces the bordered card's
-        // title carries, just without the badge/liveness decoration a single
-        // row has no room for.
-        let left = format!("{sel_prefix}{num_prefix}{role_name_text}");
+        // No block at all: one line straight into `area` carrying the two
+        // survivors — role name (left, with the selection/number prefix) and
+        // status (right-aligned), the same two pieces the bordered card's
+        // title carries — plus, at zero extra rows, the cues that would
+        // otherwise be lost entirely at this tier:
+        //   - PRD #20 M4's liveness cues: `shortcut_style` dims the whole
+        //     left span for a non-live card, and `liveness_marker` is folded
+        //     into the text so it competes with the role name for space
+        //     rather than being unconditionally dropped (R3).
+        //   - Issue #442's selection colour cue, on the left span itself
+        //     since there is no border here to carry it via `border_style`
+        //     the way the taller tiers do (R4).
+        //   - A one-column leading gutter, matching the leading space every
+        //     other tier's title starts with and the PRD's own mock-up (R8).
+        use unicode_width::UnicodeWidthStr;
+
+        let left_style = if is_selected {
+            Style::default()
+                .fg(palette::SELECTED)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            title_bold
+        };
+        let left_style = if is_live {
+            left_style
+        } else {
+            left_style.add_modifier(Modifier::DIM)
+        };
+        let left = format!(" {sel_prefix}{num_prefix}{liveness_marker}{role_name_text}");
         let width = area.width as usize;
         let status_len = status_text.chars().count();
         let left_trunc = truncate_with_ellipsis(&left, width.saturating_sub(status_len));
-        let pad = width.saturating_sub(left_trunc.chars().count() + status_len);
+        // R2: `truncate_with_ellipsis` budgets display cells, not `char`s —
+        // measure the truncated string the same way so a wide-character role
+        // name can't over-pad the line and push `status_text` off-screen.
+        let pad = width.saturating_sub(UnicodeWidthStr::width(left_trunc.as_str()) + status_len);
         let line = Line::from(vec![
-            Span::styled(left_trunc, title_bold),
+            Span::styled(left_trunc, left_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(status_text, status_style),
         ]);
@@ -19921,14 +19947,20 @@ fn render_session_card(
             );
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let w = inner.width as usize;
+        // R8: `Borders::TOP` leaves `inner.width == area.width` — no side
+        // border to inset the role-name row the way the `>= 3` tier gets for
+        // free, so add the same one-column leading gutter by hand.
+        let w = inner.width.saturating_sub(1) as usize;
         let line = if role_name_text.is_empty() {
             Line::from("")
         } else {
-            Line::from(Span::styled(
-                truncate_with_ellipsis(role_name_text, w),
-                Style::default().fg(palette::ROLE_NAME),
-            ))
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    truncate_with_ellipsis(role_name_text, w),
+                    Style::default().fg(palette::ROLE_NAME),
+                ),
+            ])
         };
         frame.render_widget(Paragraph::new(line), inner);
         return;
@@ -25043,11 +25075,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // PRD fork#446 (even card division): M1 (`even_row_heights`) + M2
-    // (height-tiered `render_session_card`) painted-output tests. RED phase —
-    // neither is implemented yet, so `even_row_heights` (defined in the
-    // `fit_grid` test section above) doesn't exist and every test in this
-    // file fails to compile until coder adds it; that compile failure is the
-    // expected RED shape for the whole crate, not a defect in these tests.
+    // (height-tiered `render_session_card`) painted-output tests. Both are
+    // implemented — `even_row_heights` lives beside `fit_grid` below, and
+    // `render_session_card`'s 1/2/`>= 3`-row tiers are what these tests
+    // exercise.
     // -----------------------------------------------------------------------
 
     /// Scenario: Render narrow (1-column), 5-role dashboards sized so every
@@ -29510,11 +29541,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // even_row_heights tests (PRD fork#446 M1). `even_row_heights` does not
-    // exist yet — referencing it here is expected to fail to compile until
-    // coder adds it beside `fit_grid`; that compile failure IS the RED for
-    // this test (and, transitively, for every other test in this file, since
-    // they share one compilation unit).
+    // even_row_heights tests (PRD fork#446 M1). `even_row_heights` is defined
+    // beside `fit_grid` above; the tests below pin its arithmetic directly.
     // ---------------------------------------------------------------------------
 
     #[test]
