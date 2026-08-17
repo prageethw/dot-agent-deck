@@ -188,7 +188,7 @@ struct MarkerDocument<'a> {
 ///
 /// Returns the path written on success; an `Err` carries a message for the
 /// caller to log. Every caller treats this as best-effort — see
-/// [`write_marker_best_effort`], which is what production code uses.
+/// [`write_marker_best_effort`], the async wrapper.
 pub fn write_marker(
     worktree_path: &Path,
     branch: &str,
