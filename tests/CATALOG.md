@@ -203,6 +203,34 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact wording of the indicator, only that it is present and names the correct count.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/grid/004 — Role name and status text survive at every M2 card-height tier (1, 2, 3 rows) (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a narrow, single-column, 5-role dashboard sized so every card lands at exactly 1, 2, and 3 rows tall — both the role name and the "Idle" status text remain in the rendered output at each tier, the squeeze order (`Prmt:`/tool lines/`Dir:` give way first) the PRD requires.
+- **Does not assert:** which specific body line (`Dir:`, prompts, tools) is dropped at each tier, only that role name and status never are.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/005 — A `Working` card paints its status at every M2 card-height tier (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** same tiered squeeze as `dashboard/grid/004`, with one card's status set to `Working` — the status text survives at every tier, so the tab's aggregated "working" claim always has a visibly attributable owner even at the shortest card height.
+- **Does not assert:** aggregation logic itself (covered by PRD #78's own tests), only that the per-card status text is not dropped.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/006 — Every role name paints, with no scroll-suffix left on the title, across role counts on both sides of the M1 even-division boundary (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** in the fork#437 narrow-and-short shape (width 99, height 33), 7, 10, and 16 roles all paint every role name with no `" (N more — scroll to see)"` suffix on the title — 7 and 10 already fit today's joint (cols, density) search, 16 needs even division.
+- **Does not assert:** the exact per-card height chosen at 16 roles (covered by `dashboard/grid/004`'s tier tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/007 — Re-rendering the same roles at a different area height re-divides completely, with no blank tail and no hidden role (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a 6-role, single-column dashboard rendered at two different heights each paints every role name, and the row directly above the stats bar is genuine card content rather than blank `Constraint::Min(0)` filler — confirming the per-frame, nothing-persisted redivision the PRD requires (a resize re-fits on the very next frame, no restart, no stale cache).
+- **Does not assert:** behavior across an actual resize event mid-session (this renders two independent frames at two heights, not a live resize).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
