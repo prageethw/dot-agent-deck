@@ -113,6 +113,8 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
             daemon.hook_path.display().to_string(),
         ),
         ("PATH".to_string(), path_env),
+        common::registration_generation_env_tuple(),
+        common::daemon_boot_id_env_tuple(&daemon.state).await,
     ];
 
     // For Claude: point the worker at an isolated HOME that pre-trusts the
@@ -161,6 +163,7 @@ async fn run_delegate_work_done_loop(worker_command: &str, seed_claude_trust: bo
             .insert(WORKER_PANE.to_string(), orch);
         st.pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        common::insert_pane_registration_generation(&mut st, WORKER_PANE);
     }
 
     // Let the interactive agent reach input-readiness before delegating.
@@ -416,6 +419,11 @@ async fn delegate_020_bare_name_reaches_the_worker_task_file_on_a_real_path_inne
             .insert(WORKER_PANE.to_string(), orch);
         st.pane_cwd_map
             .insert(WORKER_PANE.to_string(), cwd_str.clone());
+        // Fork #358 M2: this test only exercises `handle_delegate` (never
+        // `handle_work_done`, so the generation gate is never consulted
+        // here), but registering it anyway keeps this fixture shaped like a
+        // real registration — see `AppState::register_orchestration_role`.
+        common::insert_pane_registration_generation(&mut st, WORKER_PANE);
     }
 
     let signal = DelegateSignal {

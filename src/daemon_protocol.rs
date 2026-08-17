@@ -95,7 +95,10 @@ use crate::platform::ipc::{IpcListener, IpcStream};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, mint_pane_id};
+use crate::agent_pty::{
+    DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_REGISTRATION_GENERATION,
+    mint_pane_id,
+};
 use crate::event::{AgentType, BroadcastMsg};
 use crate::pane_input::escape_bytes_for_log;
 use crate::state::SharedState;
@@ -1719,6 +1722,36 @@ async fn handle_connection(
                 });
             let cwd_for_state = cwd.clone();
 
+            // Fork #358 M2: reserve this pane's registration generation
+            // BEFORE spawn — only for orchestration panes, matching the
+            // registration gate below — and inject it into the child's env,
+            // sibling to `DOT_AGENT_DECK_PANE_ID`. This is what lets the
+            // `work-done` CLI report the generation it was actually spawned
+            // under instead of re-deriving one from live daemon state at
+            // send time (see `AppState::reserve_registration_generation`'s
+            // doc, and the `WorkDoneSignal::generation` field doc, for why
+            // that distinction is the whole fix for fork issue #358).
+            // Fork #358 M4: the daemon's boot id, read in the SAME write
+            // guard as the generation reservation above (so both come from
+            // the exact same `AppState` instance) and injected alongside
+            // it. See `DOT_AGENT_DECK_DAEMON_BOOT_ID`'s doc for why the
+            // generation alone cannot tell a pre-restart registration from
+            // a post-restart one that reuses the same pane_id.
+            let reserved_generation = if orchestration_meta.is_some() {
+                let mut st = state.write().await;
+                let generation = st.reserve_registration_generation(&minted_pane_id);
+                let boot_id = st.daemon_boot_id().to_string();
+                drop(st);
+                env.push((
+                    DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
+                    generation.to_string(),
+                ));
+                env.push((DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(), boot_id));
+                Some(generation)
+            } else {
+                None
+            };
+
             let opts = SpawnOptions {
                 command: command.as_deref(),
                 cwd: cwd.as_deref(),
@@ -1877,16 +1910,27 @@ async fn handle_connection(
                                 cwd: orch_cwd,
                             },
                         };
+                        // Fork #358 M2: confirm the generation reserved
+                        // BEFORE spawn (and already injected into the
+                        // child's env above) rather than calling
+                        // `register_orchestration_role`, which would
+                        // increment a second time and desynchronize the map
+                        // from what the child actually carries.
+                        //
                         // Shared with the daemon-internal spawn path
                         // (`crate::spawn::spawn`) — see
-                        // [`crate::state::AppState::register_orchestration_role`]
+                        // [`crate::state::AppState::confirm_orchestration_role`]
                         // for why this must not be inlined again.
-                        state.write().await.register_orchestration_role(
+                        state.write().await.confirm_orchestration_role(
                             pane_id,
                             &role_name,
                             is_start_role,
                             identity,
                             cwd_for_state.as_deref(),
+                            reserved_generation.expect(
+                                "reserved_generation is Some whenever orchestration_meta \
+                                 was Some, which this branch requires",
+                            ),
                         );
                     }
                     // PRD #201 native prompt delivery: if the spawn carried a
