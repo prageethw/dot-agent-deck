@@ -64,6 +64,26 @@ pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
         .map_err(std::io::Error::other)?
 }
 
+/// Asynchronous, bounded counterpart to [`acquire_spawn_lock`] (fork #282
+/// audit B1) — see that name's doc comment in `platform/lock/mod.rs` for why
+/// this exists instead of `tokio::time::timeout(_, acquire_spawn_lock(path))`.
+///
+/// Runs the ALREADY-bounded [`acquire_spawn_lock_sync_bounded`] inside
+/// `spawn_blocking`, rather than the unbounded [`acquire_spawn_lock_sync`]:
+/// the sync primitive itself returns on expiry (it polls `LOCK_EX | LOCK_NB`
+/// against a deadline), so the `spawn_blocking` task completes and its
+/// thread is released back to the pool on timeout — not left parked in a
+/// blocking `flock(LOCK_EX)` forever.
+pub async fn acquire_spawn_lock_bounded(
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<SpawnLock> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_spawn_lock_sync_bounded(&path, timeout))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Bounded counterpart to [`acquire_spawn_lock_sync`] (fork #331 audit S1):
 /// open or create `path` and acquire an exclusive `flock(2)` on it, refusing
 /// with an `ErrorKind::TimedOut` error rather than blocking the calling

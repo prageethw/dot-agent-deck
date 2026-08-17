@@ -278,7 +278,7 @@ fn classify_write_failure(path: &Path, message: String) -> MarkerWriteError {
 /// Returns the path written on success; an `Err` carries a message for the
 /// caller to log, plus whether anything the ownership gate reads as a claim
 /// was left behind. Every caller treats this as best-effort — see
-/// [`write_marker_best_effort`], which is what production code uses.
+/// [`write_marker_best_effort`], the async wrapper production code uses.
 pub fn write_marker(
     worktree_path: &Path,
     branch: &str,

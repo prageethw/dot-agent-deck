@@ -116,6 +116,43 @@ impl Drop for SpawnLock {
 /// that died mid-spawn, but we do not fail: refusing here would wedge the deck
 /// permanently after any hard kill.
 pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
+    acquire_spawn_lock_with_timeout_ms(path, INFINITE).await
+}
+
+/// Asynchronous, bounded counterpart to [`acquire_spawn_lock`] (fork #282
+/// audit B1) — see that name's doc comment in `platform/lock/mod.rs` for the
+/// full reasoning and why an external `tokio::time::timeout` around
+/// [`acquire_spawn_lock`] is the wrong shape.
+///
+/// Trivial here, unlike the Unix backend: [`create_and_acquire`] already
+/// takes a `timeout_ms`, so bounding this is only a matter of passing the
+/// real value instead of [`INFINITE`]. On expiry `WaitForSingleObject`
+/// itself returns `WAIT_TIMEOUT` — the owner thread reports the error
+/// through `ready_tx` and returns without ever parking, so nothing is
+/// retained past the bound (contrast the unbounded path, where the thread
+/// parks in `release_rx.recv()` for the guard's entire lifetime).
+pub async fn acquire_spawn_lock_bounded(
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<SpawnLock> {
+    // `u32::MAX` IS `INFINITE` (fork #331 audit F4) — saturating a huge
+    // timeout onto it would silently turn a bounded wait unbounded, the
+    // opposite of this function's contract. Clamp one below it instead, the
+    // same trap `acquire_path_lock_sync_bounded` below already guards
+    // against.
+    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    acquire_spawn_lock_with_timeout_ms(path, timeout_ms).await
+}
+
+/// Shared body for [`acquire_spawn_lock`] (`timeout_ms = INFINITE`) and
+/// [`acquire_spawn_lock_bounded`] (a real bound): spawn the dedicated owner
+/// thread [`create_and_acquire`] must run on (see the module docs on thread
+/// affinity), and hand the caller back an RAII guard once acquisition
+/// succeeds.
+async fn acquire_spawn_lock_with_timeout_ms(
+    path: &Path,
+    timeout_ms: u32,
+) -> std::io::Result<SpawnLock> {
     // One source of truth for "which user is this": the same cached, validated
     // token the named-pipe endpoints are namespaced by, which on Windows *is* the
     // current user's SID string — so the mutex name, its DACL, and the endpoint it
@@ -136,10 +173,13 @@ pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     let owner = std::thread::Builder::new()
         .name("spawn-lock".to_string())
         .spawn(move || {
-            let held = match create_and_acquire(&thread_name, &user, INFINITE) {
+            let held = match create_and_acquire(&thread_name, &user, timeout_ms) {
                 Ok(held) => held,
                 Err(err) => {
                     // Receiver gone (caller cancelled) → nothing to report to.
+                    // Also reached on WAIT_TIMEOUT: nothing was acquired, so
+                    // there is nothing to release and this thread simply
+                    // exits, released back to the OS rather than parked.
                     let _ = ready_tx.send(Err(err));
                     return;
                 }
