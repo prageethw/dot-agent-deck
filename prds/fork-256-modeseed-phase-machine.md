@@ -4,9 +4,9 @@
 
 **Priority**: High
 
-**Status** *(corrected 2026-08-14)*: **M1 complete and verified in source; M2, M3 and M4 are genuinely open.** M1 delivered in two rounds on PR [#270](https://github.com/prageethw/dot-agent-deck/pull/270), final commit `436b745f`. `"landed"` now lives as `PromptDelivery::landed: bool`, a **single pane-keyed field on a struct both delivery paths already populate and clear**; the separate `HashSet` is gone (`git grep seed_delivery_landed\|seed_prompt_landed src/` returns only comments describing why round 1's rename was rejected) and `process_pending_seed_prompts` now classifies through `delivery_phase()` (`src/ui.rs:3980`). CI fully green — fast tier 3098/3098, e2e 9114/9114, `prompt/pane-input/024` passing unmodified. Reviewer confirmed P1 closed and auditor found no safety issue. *(The M1 milestone checkboxes below were never ticked despite this; corrected in place with the verification above.)* **M2 remains blocked on [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254), which is open and carries the `in-progress` label — actively claimed by another worktree.** M3 and M4 have not started.
+**Status** *(corrected 2026-08-17)*: **M1 complete and verified in source; M2 unblocked and starting now; M3 and M4 genuinely open.** M1 delivered in two rounds on PR [#270](https://github.com/prageethw/dot-agent-deck/pull/270), final commit `436b745f`. `"landed"` now lives as `PromptDelivery::landed: bool`, a **single pane-keyed field on a struct both delivery paths already populate and clear**; the separate `HashSet` is gone (`git grep seed_delivery_landed\|seed_prompt_landed src/` returns only comments describing why round 1's rename was rejected) and `process_pending_seed_prompts` now classifies through `delivery_phase()` (`src/ui.rs:3980`). CI fully green — fast tier 3098/3098, e2e 9114/9114, `prompt/pane-input/024` passing unmodified. Reviewer confirmed P1 closed and auditor found no safety issue. *(The M1 milestone checkboxes below were never ticked despite this; corrected in place with the verification above.)*
 
-**M2 remains blocked on [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254)**, which has itself been rescoped — Codex's native `UserPromptSubmit` hook turns out to already carry the prompt text, so the open question there is why removing LEVEL broke Codex at all. **This PRD therefore does NOT close #256**, and PR #270 must not carry a closing keyword: M1 is a behaviour-neutral refactor that reduces the representation count, and the silent-loss half — the actual subject of the issue — is untouched.
+**M2's blocker on fork #254 is resolved, not merely waited out.** [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254) has been rescoped (2026-08-17): the LEVEL-based unfalsifiable-confirmation defect this section originally cited no longer exists on `main` (deleted by an unrelated rewrite, PRD fork#197), and current-main confirmation is already proven falsifiable by an existing test. #254's remaining scope is a narrow, orthogonal capability-detection gap that does not affect confirmation soundness for this path — see the Sequencing section below for the full evidence trail. **This PRD still does NOT close #256 on M1 alone**, and PR #270 correctly carried no closing keyword: M1 is a behaviour-neutral refactor that reduces the representation count, and the silent-loss half — the actual subject of the issue — is what M2, starting now, addresses.
 
 Round 1 shipped a **rename** rather than a migration and was caught the same day; see the note under Success Criteria for what the gameable criterion was and why it mattered.
 
@@ -126,11 +126,13 @@ The confirmation check is then **inherited**, not re-implemented — which is th
 
 ## Sequencing
 
-**Blocked on fork #254.** A confirmation check is only as sound as the signal behind it, and for wrapper-strategy agents that signal is currently LEVEL, which cannot return false on a genuinely lost write. Extending confirmation to the mode-seed path today would spread a **known-unfalsifiable** check to a second path — mechanising the defect rather than fixing it.
+**Unblocked as of 2026-08-17 — re-verified, not assumed.** This section originally read "Blocked on fork #254," reasoning that confirmation was only as sound as the LEVEL signal behind it, which could not falsify a genuinely lost write. That premise no longer holds: an unrelated rewrite (PRD fork#197) deleted LEVEL and the fixed-window retry entirely, and confirmation on `main` is now TEXT+identity-only (`prompt_submission_evidence`, `src/ui.rs:4077`), already proven falsifiable by an existing deterministic test (`pane_input_026`, `src/ui.rs:36083`) — see fork#254's rescoping comment (2026-08-17) and PRD `prds/254-confirmation-capability-defer-to-hook-outcome.md` for the full evidence.
 
-**fork #257 is not a blocker but should land first** — its overridable retry floor is what lets M2's parity tests drive the mode-seed retry branch deterministically.
+fork#254's remaining scope (a `ConfirmationCapability` latch resolved from agent type before the native hook's install/trust outcome is known) is a narrow, orthogonal gap in *deadline-abandon* behavior for a misclassified pane — it does not affect whether TEXT confirmation itself is sound for the mode-seed path. M2 does not need fork#254's fix to land first.
 
-Order: **#257 → #254 → #256.**
+**fork #257 is closed** (its overridable retry floor already landed) — no longer a sequencing concern either.
+
+Order: **none — M2 can proceed independently.**
 
 ## Rule 12 — cross-version contract
 
