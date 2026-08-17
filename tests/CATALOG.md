@@ -231,6 +231,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** behavior across an actual resize event mid-session (this renders two independent frames at two heights, not a live resize).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/grid/008 — The PRD's own headline repro case (7 roles, one column, ~32 rows) paints the exact `[5, 5, 5, 5, 4, 4, 4]` height split (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** the PRD's own "Outcome" example verbatim — 7 roles, width narrow enough for 1 column, 32 available rows — paints all 7 role names with no scroll-suffix, and measures the actual painted top-border boundaries to confirm the row-height split is genuinely `[5, 5, 5, 5, 4, 4, 4]` (not merely some other split that also happens to fit); `dashboard/grid/006`'s 7-role case takes the ordinary two-column fit path, not this fit-all fallback, so the 5-row card tier specifically was previously exercised by no test.
+- **Does not assert:** the `even_row_heights` arithmetic in isolation (covered by `even_row_heights_seven_rows_thirty_two_matches_expected_split`); this test pins that the same split reaches the actual render path.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.

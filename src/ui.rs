@@ -25194,6 +25194,81 @@ mod tests {
         }
     }
 
+    /// Scenario: Render the PRD's own headline repro case verbatim — 7
+    /// roles, one column, ~32 available rows — and check the fit-all
+    /// row-height split painted on screen is genuinely `[5, 5, 5, 5, 4, 4,
+    /// 4]` (four 5-row cards, then three 4-row cards), not merely some
+    /// other split that happens to fit every role. `grid_006`'s 7-role case
+    /// looks like it already covers this but takes the ordinary
+    /// two-column fit path, never the fit-all fallback this exact shape
+    /// forces — so the 5-row card tier specifically was pinned by no test.
+    #[spec("dashboard/grid/008")]
+    #[test]
+    fn grid_008_prd_headline_seven_roles_five_and_four_row_split() {
+        const N: usize = 7;
+        // width=39 keeps max_cols_for_width(39)=1, so cols stays 1 and
+        // total_rows == N; available_for_density=32 is the PRD's own
+        // "Outcome" example (4 rows of 5, 3 rows of 4, summing to 32).
+        let available_for_density = 32u16;
+        let height = available_for_density + 3; // hints bar (1) + title/stats bar (2)
+        let (rendered, _ui) = render_dashboard_grid(N, 39, height);
+
+        for i in 1..=N {
+            let role = format!("role{i}");
+            assert!(
+                rendered.contains(&role),
+                "expected role name {role} in rendered output; got:\n{rendered}"
+            );
+        }
+        let title_line = rendered.lines().next().unwrap_or_default();
+        assert!(
+            !title_line.contains("more") && !title_line.contains("scroll to see"),
+            "title must carry no \"more — scroll to see\" suffix once every \
+             card fits via even division; got title line {title_line:?}"
+        );
+
+        // Distinguish the actual painted split from "some split that also
+        // fits everything" by measuring the real card boundaries in the
+        // buffer, not by re-deriving `even_row_heights` — that function is
+        // already unit-tested in isolation
+        // (`even_row_heights_seven_rows_thirty_two_matches_expected_split`);
+        // this test's job is to pin that the same split reaches the actual
+        // render path. Every card is unselected (Plain border), so each
+        // row's top border paints the box-drawing top-left corner "┌" at
+        // the start of its line; fit-all mode packs rows back to back with
+        // no gap (grid_007), so the distance between consecutive top
+        // borders is exactly that row's painted height.
+        let lines: Vec<&str> = rendered.lines().collect();
+        let top_border_rows: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with('┌'))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(
+            top_border_rows.len(),
+            N,
+            "expected {N} painted card top borders (one per role); got top \
+             borders at rows {top_border_rows:?} in:\n{rendered}"
+        );
+
+        let first_top = top_border_rows[0];
+        let mut heights: Vec<u16> = top_border_rows
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as u16)
+            .collect();
+        let consumed: u16 = heights.iter().sum();
+        heights.push(available_for_density - consumed);
+
+        assert_eq!(
+            heights,
+            vec![5u16, 5, 5, 5, 4, 4, 4],
+            "expected the PRD's exact split [5,5,5,5,4,4,4]; got painted \
+             row heights {heights:?} from top borders at rows \
+             {top_border_rows:?} (first at row {first_top}) in:\n{rendered}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PRD #76 M2.13: dashboard placeholder render-decision tests.
     //
