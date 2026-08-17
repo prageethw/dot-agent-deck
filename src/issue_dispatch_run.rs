@@ -575,10 +575,23 @@ async fn dispatch_one_issue(
         // `reuse_existing_branch: true` above means `BranchExists` is never
         // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
         // which is exactly what keeps the vacated slot reclaimable. `TimedOut`
-        // cannot actually occur on this async path today either (its
-        // `run_status`/`run_status_args` calls have no bound). Both are
-        // treated as a skip alongside `AlreadyClaimed` so the match stays
-        // exhaustive and safe if either ever changes.
+        // IS reachable here (fork #282 audit S4 bounded the branch-probe /
+        // `git worktree add` calls; final-pass F1/A1 further made
+        // `run_status` kill the timed-out child and gave this path its own
+        // best-effort cleanup — see `run_status`'s and
+        // `attempt_worktree_cleanup_async`'s doc comments for the trace).
+        // It is still folded into the same `SkipReason::ConcurrentCreator`
+        // skip as `AlreadyClaimed` rather than getting its own reason: a
+        // genuine `TimedOut` here means OUR OWN add wedged and was killed,
+        // not that a concurrent dispatch won a TOCTOU race, so the rendered
+        // "a concurrent dispatch claimed the worktree first" mislabels the
+        // cause in that one case. Known and left as-is per the
+        // reviewer/auditor final pass (non-blocking, F1/A1): every later
+        // fire still stops retrying the slug either way, `cleaned_up` (when
+        // `true`) still frees it for reuse, and a distinct `SkipReason` +
+        // notification for this case is follow-up material rather than part
+        // of this fix. The match stays exhaustive across all three so it
+        // remains safe if any of them ever change again.
         WorktreeCreation::AlreadyClaimed
         | WorktreeCreation::BranchExists
         | WorktreeCreation::TimedOut { .. } => {
@@ -1289,8 +1302,10 @@ fn ensure_worktree_parent_dir(worktree_dir: &Path) -> Result<(), String> {
 
 /// Pure classification result of [`classify_worktree_add_result`] — the
 /// shape under direct unit test (`orchestration/worktree/007`), before
-/// [`create_worktree_sync`] layers cleanup on top of `TimedOut` to produce
-/// the richer [`WorktreeCreation`] its own caller sees.
+/// [`create_worktree_sync`] (and, since fork #282's final-pass F1/A1,
+/// [`create_worktree`] too — via [`attempt_worktree_cleanup_async`]) layers
+/// cleanup on top of `TimedOut` to produce the richer [`WorktreeCreation`]
+/// its own caller sees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddOutcome {
     Created,
@@ -1299,10 +1314,14 @@ enum AddOutcome {
 }
 
 /// A failed `git` invocation from [`run_status`] / [`run_status_args`] /
-/// [`run_status_sync`], distinguishing a genuine command failure from the
-/// bounded [`run_status_sync`] wait expiring before the child exited.
-/// [`run_status`]/[`run_status_args`] can never time out (no bound on that
-/// path — see their doc comments) and always produce `Failed`.
+/// [`run_status_sync`], distinguishing a genuine command failure from a
+/// bounded wait expiring before the child exited. That bound used to exist
+/// only on [`run_status_sync`]'s path, making `Failed` the only outcome
+/// [`run_status`]/[`run_status_args`] could ever produce — no longer true as
+/// of fork #282: [`create_worktree`] now wraps its own calls to
+/// [`run_status_args`] in an external `tokio::time::timeout` and constructs
+/// `TimedOut` from that. See [`run_status`]'s doc comment for the full
+/// trace of what a timeout on this path now does (and does not) kill.
 #[derive(Debug)]
 enum AddError {
     Failed(String),
@@ -1499,17 +1518,23 @@ pub(crate) async fn create_worktree(
             worktree_dir.display()
         ))),
     };
-    // Unlike before this bound was added, `AddOutcome::TimedOut` IS reachable
-    // here now. There is no async counterpart to `create_worktree_sync`'s
-    // `attempt_worktree_cleanup`, so `cleaned_up` is always `false` on this
-    // path — matching how the arm below already treats it.
+    // `AddOutcome::TimedOut` is reachable here (unlike before this bound was
+    // added). Fork #282 final-pass F1/A1: `run_status`'s `kill_on_drop(true)`
+    // means the direct child was already sent a kill signal by the time we
+    // get here (see that function's doc comment), so — mirroring
+    // `create_worktree_sync`'s `attempt_worktree_cleanup` — attempt best-effort
+    // cleanup of whatever the add half-registered before it was killed,
+    // rather than hardcoding `cleaned_up: false` and leaving the slug wedged.
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
             let marker_warning = mark_worktree_owned_best_effort(worktree_dir, creator);
             WorktreeCreation::Created { marker_warning }
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
-        AddOutcome::TimedOut => WorktreeCreation::TimedOut { cleaned_up: false },
+        AddOutcome::TimedOut => {
+            let cleaned_up = attempt_worktree_cleanup_async(clone_dir, worktree_dir).await;
+            WorktreeCreation::TimedOut { cleaned_up }
+        }
     })
 }
 
@@ -1888,6 +1913,40 @@ fn attempt_worktree_cleanup(clone_dir: &Path, worktree_dir: &Path) -> bool {
     removed && !worktree_dir.exists()
 }
 
+/// Fork #282 final-pass F1 (reviewer) / A1 (auditor): async twin of
+/// [`attempt_worktree_cleanup`] for [`create_worktree`]'s `TimedOut` arm.
+/// Runs after [`run_status`]'s `kill_on_drop(true)` has already sent the
+/// direct child a kill signal (see that function's doc comment for the
+/// trace and its residual), through the same bounded, non-interactive
+/// subprocess path the add itself used (stdin closed,
+/// `GIT_TERMINAL_PROMPT=0`, …), reusing the identical
+/// [`crate::issue_dispatch::worktree_remove_argv`] the sync twin uses so the
+/// two argv shapes cannot drift. Bounded by its OWN, shorter
+/// [`WORKTREE_CLEANUP_TIMEOUT`] via an external `tokio::time::timeout` —
+/// there is no bound built into `run_status_args` itself, unlike
+/// `run_status_sync`'s internal poll loop — so a stuck cleanup cannot itself
+/// hang the scheduler tick it exists to unwedge.
+///
+/// "Confirmed" means the same thing it means for the sync twin: both the
+/// command exited successfully AND the directory is actually gone
+/// afterward; either check failing is reported as `false` so the caller
+/// reports an honest `cleaned_up: false` (and the manual
+/// `git worktree remove --force` recovery command) rather than assuming
+/// success it cannot back up.
+async fn attempt_worktree_cleanup_async(clone_dir: &Path, worktree_dir: &Path) -> bool {
+    let removed = tokio::time::timeout(
+        WORKTREE_CLEANUP_TIMEOUT,
+        run_status_args(
+            "git",
+            &crate::issue_dispatch::worktree_remove_argv(clone_dir, worktree_dir),
+        ),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false);
+    removed && !worktree_dir.exists()
+}
+
 /// Parse a `gh issue list --json number,labels` array into [`OpenIssue`]s, in
 /// order. Entries missing a numeric `number` are skipped rather than failing
 /// the whole parse; a missing/empty `labels` array (or one that doesn't name
@@ -1932,27 +1991,44 @@ fn parse_open_issues(json: &str) -> Result<Vec<OpenIssue>, String> {
 /// scheduler's own tokio task), so a slow call here does not freeze the TUI
 /// the way a synchronous one on the `SpawnPane` dispatch path would.
 ///
-/// Fork issue #133 deliberately does not touch this function: `.output()`
-/// waits unboundedly and this path never kills its child on a timeout, so it
-/// has no kill whose blast radius could be too narrow — there is nothing here
-/// for a process-group kill to fix, and no `AgentProcessGroup` handle worth
-/// threading through an await that never times out. The asymmetry with
-/// [`run_status_sync`] is intentional, not an oversight.
+/// Fork issue #133's whole-process-group escalation
+/// (`terminate_child_with_grace_and_detached_reap_forcing_group_backstop`)
+/// targets [`run_status_sync`] only, not this function. This path kills only
+/// the DIRECT child (`kill_on_drop(true)` below, added by fork #282's
+/// reviewer/auditor final-pass findings F1/A1), not its whole process group,
+/// so a hook grandchild `git` forks (e.g. `post-checkout`) is not reached and
+/// can keep running past the bound. Building an async equivalent of
+/// `spawn_in_new_process_group` plus a group-wide kill would close that
+/// residual gap but is substantial new machinery this path does not
+/// currently need — see the next paragraph for why the direct-child kill
+/// alone already closes the hazard that mattered.
 ///
-/// Fork #282 audit S1: the premise above ("a slow call here only affects
-/// this path") stopped being the whole story once [`create_worktree`]
-/// started calling this function while holding the attach lock it now
-/// shares with the TUI's `create_worktree_sync`. That caller wraps its own
-/// calls to this function in an external `tokio::time::timeout` against
-/// `WORKTREE_GIT_TIMEOUT` so a wedged `git` cannot hold the shared lock (and
-/// therefore starve the TUI) indefinitely — but that external timeout only
-/// stops the caller from awaiting the child, it does not kill it (same
-/// reasoning as the paragraph above: no kill exists on this path). A child
-/// this function spawned can therefore keep running as an orphan past the
-/// bound. Acceptable for what `create_worktree` needs (bounding the shared
-/// lock's hold, not the child's lifetime), but worth knowing if this
-/// function grows another caller that assumes "unbounded" means "nothing
-/// else is watching the clock."
+/// Fork #282 audit S1 / final-pass F1 (reviewer) / A1 (auditor): the premise
+/// above ("a slow call here only affects this path") stopped being the whole
+/// story once [`create_worktree`] started calling this function while
+/// holding the attach lock it now shares with the TUI's
+/// `create_worktree_sync`. That caller wraps its own calls to this function
+/// in an external `tokio::time::timeout` against `WORKTREE_GIT_TIMEOUT` so a
+/// wedged `git` cannot hold the shared lock (and therefore starve the TUI)
+/// indefinitely. Before `kill_on_drop(true)` was added, that external
+/// timeout only stopped the CALLER from awaiting the child — it did not kill
+/// it, so a timed-out `git worktree add` kept running in the background and
+/// could finish (creating the worktree, without an ownership marker) after
+/// `create_worktree` had already reported a timeout/failure and released the
+/// lock, reproducing the fork #122/#123 "wedge this slug forever" failure on
+/// the async path. `kill_on_drop(true)` closes that: dropping a timed-out
+/// future here drops the `tokio::process::Command`'s underlying `Child`, and
+/// with `kill_on_drop` set that drop issues an immediate
+/// `SIGKILL`/`TerminateProcess` to the direct child instead of leaving it to
+/// finish unattended. `create_worktree` then runs its own best-effort
+/// cleanup (`attempt_worktree_cleanup_async`) on that same timeout arm, so a
+/// worktree the child half-registered before the kill does not wedge the
+/// slug either way. What remains unreached: any GRANDCHILD the child forked
+/// before the kill signal landed (see the paragraph above) — acceptable for
+/// what `create_worktree` needs (closing the common case, the `git` process
+/// itself hanging, not every hook it might have spawned), but worth knowing
+/// if this function grows another caller relying on a full process-group
+/// kill.
 pub(crate) async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
@@ -1960,6 +2036,11 @@ pub(crate) async fn run_status(program: &str, args: &[&str]) -> Result<(), Strin
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "")
+        // Fork #282 final-pass F1/A1: without this, dropping a timed-out
+        // future (via the external `tokio::time::timeout` in
+        // `create_worktree`) detaches the child instead of killing it — see
+        // the doc comment above for the full trace.
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("failed to run `{program}`: {e}"))?;
@@ -3833,6 +3914,155 @@ exit 0
              {duplicate_listed}/{TRIALS} trials showed the path more than once in `git worktree \
              list`. Failures:\n{}",
             failures.join("\n")
+        );
+    }
+
+    /// Scenario: fork #282 final-pass F1 (reviewer) / A1 (auditor). Pins
+    /// [`run_status`]'s `kill_on_drop(true)` directly, at the same seam
+    /// [`create_worktree`] itself uses (an external `tokio::time::timeout`
+    /// wrapping the call) — rather than driving the real
+    /// [`WORKTREE_GIT_TIMEOUT`] (30s, not injectable), which would make this
+    /// a 30s-plus test for no added coverage; `run_status_sync`'s own tests
+    /// take the same shortcut by calling it with a short explicit `timeout`
+    /// instead of `create_worktree_sync`'s hardcoded constant.
+    ///
+    /// A fake `git` is a shell script that touches a `started` marker
+    /// immediately, sleeps a full second, then touches a `finished` marker.
+    /// `run_status` is called wrapped in a 100ms `tokio::time::timeout`, so
+    /// the sleep has not elapsed when the timeout fires. Before
+    /// `kill_on_drop(true)` was added, dropping that timed-out future left
+    /// the script running in the background — it would go on to sleep out
+    /// its full second and write `finished` regardless of the caller having
+    /// already moved on. With `kill_on_drop(true)`, the drop sends a kill
+    /// signal immediately, so `finished` must never appear even after
+    /// waiting well past the script's own sleep duration.
+    #[cfg(unix)]
+    #[test]
+    fn run_status_kill_on_drop_kills_the_child_instead_of_orphaning_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let started_marker = scratch.path().join("started");
+        let finished_marker = scratch.path().join("finished");
+        let script = scratch.path().join("slow-git.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch {}\nsleep 1\ntouch {}\n",
+                started_marker.display(),
+                finished_marker.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+
+        rt.block_on(async {
+            let program = script.to_str().unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_millis(100), run_status(program, &[])).await;
+            assert!(
+                result.is_err(),
+                "the external 100ms timeout should have elapsed before the script's 1s sleep \
+                 finished, got {result:?}"
+            );
+
+            // Generous headroom well past the script's own 1s sleep: if
+            // `kill_on_drop` were not set, the script would finish and write
+            // `finished` somewhere in this window.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        });
+
+        assert!(
+            started_marker.exists(),
+            "the script must have actually started running for this test to mean anything"
+        );
+        assert!(
+            !finished_marker.exists(),
+            "run_status's kill_on_drop should have killed the child before its 1s sleep \
+             completed, but the finished marker exists -- the child ran to completion in the \
+             background instead of being killed, reproducing fork #282 final-pass F1/A1"
+        );
+    }
+
+    /// Scenario: fork #282 final-pass F1 (reviewer) / A1 (auditor). Pins
+    /// [`attempt_worktree_cleanup_async`] directly — the cleanup path
+    /// [`create_worktree`]'s `TimedOut` arm now runs instead of hardcoding
+    /// `cleaned_up: false`. Creates a REAL worktree the way a killed `git
+    /// worktree add` would leave one (registered via a genuine `git
+    /// worktree add`, standing in for the half-finished state a kill leaves
+    /// behind), then asserts cleanup both reports `true` and actually makes
+    /// the worktree disappear from `git worktree list` and the directory
+    /// itself — matching the sync twin's "confirmed" contract exactly.
+    #[cfg(unix)]
+    #[test]
+    fn attempt_worktree_cleanup_async_removes_a_registered_worktree_and_confirms_it() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+        git(&clone_dir, &["branch", "cleanup-target"]);
+
+        let worktree_dir = ws.path().join("wt");
+        git(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                worktree_dir.to_str().unwrap(),
+                "cleanup-target",
+            ],
+        );
+        assert!(worktree_dir.exists(), "setup: worktree add must succeed");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        let cleaned_up =
+            rt.block_on(async { attempt_worktree_cleanup_async(&clone_dir, &worktree_dir).await });
+
+        assert!(
+            cleaned_up,
+            "attempt_worktree_cleanup_async must report true for a plain `git worktree remove \
+             --force` against a directory it created"
+        );
+        assert!(
+            !worktree_dir.exists(),
+            "the worktree directory must actually be gone after a confirmed cleanup"
+        );
+        let list = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list must spawn");
+        let listing = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            !listing.contains(worktree_dir.to_str().unwrap()),
+            "the cleaned-up worktree must no longer be registered: {listing}"
         );
     }
 
