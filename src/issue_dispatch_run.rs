@@ -1725,9 +1725,11 @@ pub async fn create_worktree(
             // construction — issue #164: it RETURNS the warning instead of
             // only logging it, so this caller can surface it via
             // `WorktreeCreation::Created`'s `marker_warning` field.
-            let marker_warning =
-                crate::worktree_owner::write_marker_best_effort(worktree_dir, branch, creator)
-                    .await;
+            let creator_str = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+                "{}:{}",
+                creator.kind, creator.subject
+            ));
+            let marker_warning = mark_worktree_owned_best_effort(worktree_dir, &creator_str);
             // Release the shared attach lock before warming. It exists to
             // serialize `git worktree add` (fork #282/#541); the warm-up
             // below is a subprocess that can sit for seconds and is bounded
