@@ -4,9 +4,22 @@
 
 **Priority**: High
 
-**Status** *(corrected 2026-08-14)*: **M1 complete and verified in source; M2, M3 and M4 are genuinely open.** M1 delivered in two rounds on PR [#270](https://github.com/prageethw/dot-agent-deck/pull/270), final commit `436b745f`. `"landed"` now lives as `PromptDelivery::landed: bool`, a **single pane-keyed field on a struct both delivery paths already populate and clear**; the separate `HashSet` is gone (`git grep seed_delivery_landed\|seed_prompt_landed src/` returns only comments describing why round 1's rename was rejected) and `process_pending_seed_prompts` now classifies through `delivery_phase()` (`src/ui.rs:3980`). CI fully green — fast tier 3098/3098, e2e 9114/9114, `prompt/pane-input/024` passing unmodified. Reviewer confirmed P1 closed and auditor found no safety issue. *(The M1 milestone checkboxes below were never ticked despite this; corrected in place with the verification above.)* **M2 remains blocked on [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254), which is open and carries the `in-progress` label — actively claimed by another worktree.** M3 and M4 have not started.
+**Status** *(corrected 2026-08-17, third correction the same day — see below)*: **Close as resolved. `main`'s actual behavior already satisfies M2's closing criteria — but not for the reason the previous version of this section claimed, and that wrong reason was suppressing a real, unresolved question.**
 
-**M2 remains blocked on [fork #254](https://github.com/prageethw/dot-agent-deck/issues/254)**, which has itself been rescoped — Codex's native `UserPromptSubmit` hook turns out to already carry the prompt text, so the open question there is why removing LEVEL broke Codex at all. **This PRD therefore does NOT close #256**, and PR #270 must not carry a closing keyword: M1 is a behaviour-neutral refactor that reduces the representation count, and the silent-loss half — the actual subject of the issue — is untouched.
+Earlier today this section read "M1 complete and verified in source (PR #270, `436b745f`); M2 unblocked and starting now" — wrong, caught by the tester delegated to write M2's RED test rather than assumed correct. The next correction attributed the gap to "fork#365 superseded fork#256's machinery" — also wrong, caught independently by both reviewer and auditor on this PR. **The corrected chain, verified by pickaxe against the root checkout:**
+
+- `DeliveryPhase`/`delivery_phase()`/`reset_delivery_cycle()` were introduced by PRD fork#197's commit `619d0f60`.
+- PR #270's M1 work (`3f306354`, `436b745f`) built on top of that.
+- **The 2026-08-15 upstream sync dropped all three commits.** `619d0f60`, `3f306354` and `436b745f` are not ancestors of current `main`'s HEAD. A commit carrying PR #270's *merge message* is an ancestor (`8fbc9470`) — the sync/rebase process recreated the merge commit but its tree lost the source changes; only the doc-only half of that merge survived.
+- **This is already documented, and finding it required a repo-wide grep, not a `src/`-scoped one** — `grep -rn "DeliveryPhase\|..." src/` (the check the previous correction ran) returns zero hits and looks conclusive, but it excludes the one file that explains why: `docs/develop/fork-sync-workflow.md:268` records this drop as "DROPPED 2026-08-15 — correctly for one half, wrongly for the other," and `:300` says the sync "kept upstream's new confirmation model but lost the fork's `DeliveryPhase`-aware re-arm eligibility and per-cycle reset." **This is a CLAUDE.md rule 24 event — a fork feature lost in a sync, which rule 24 treats as a defect by default, not as supersession** — and it is not this PRD's first time causing damage: the same commit-drop already silently reintroduced a duplicate-prompt defect once before, restored separately as `e26982ba` (issue #194). Nothing indicates the rest of that 2026-08-15 sync has been audited for further losses. **Tracked as its own follow-up, not solved here:** [#443](https://github.com/prageethw/dot-agent-deck/issues/443), auditing the rest of that sync for other silently-dropped fork commits of the same shape.
+
+**Separately — and this is the reason closing is still correct despite the above** — `main`'s current behavior, arrived at through different, later, unrelated work (not through fork#365 "replacing" anything; no single commit does what the previous correction claimed), already meets M2's actual closing bar. Verified independently by reviewer and auditor, not merely asserted: `process_pending_seed_prompts` (`src/ui.rs:3630`) and `deliver_orchestrator_prompt` (`src/ui.rs:4693`) both call the same `schedule_unconfirmed_retry` (`:3920`, `:4989`) on the same backoff schedule, run the same `ConfirmationCapability` three-way match in the same order (confirmation checked before backoff on both), and both finalize their deadline honestly (`log_prompt_unconfirmable`/`log_prompt_abandoned`, never a silent drop). Both paths now read `ui.prompt_delivery`/`ui.send_retry_backoff` — **one shared representation, not three** — which is #256's actual closing condition, satisfied without a rename (the anti-gaming clause under Success Criteria is honored). This is already tested: `pane_input_025_unconfirmed_retry_deadline_and_late_readiness` (`src/ui.rs:35901`) drives *both* delivery functions in one test, and `pane_input_024_seed_write_is_provisional_until_confirmation` (`src/ui.rs:34631` — its current scenario is confirmation/retry-state, not the readiness buffer this PRD's text elsewhere describes it as; the catalog has moved since this PRD was written).
+
+**The one documented difference between the two paths is deliberate, not a gap** (independently judged, not just quoted): `seed_result_is_terminal` (`:4620`) vs. `is_terminal_send_result` (`:4592`) differ on whether a pre-write `WrongSession`/`Unknown` is terminal. The asymmetry is confined to the pre-write case — nothing is bound yet, so a refusal there is an ordinary non-delivery, with an asymmetric consequence (the orchestrator's abandon path also finalizes tab role state, which the seed path has no equivalent of). `Ambiguous` is terminal unconditionally on both, and the safety-critical post-write half is identical, pinned by `pane_input_028`/`pane_input_006`.
+
+**Accepted residual, not fixed here:** the two paths' parity is behaviorally present but not pinned as an *invariant* — `pane_input_025` asserts each path separately rather than asserting they can't diverge, so a future refactor could re-split them with every existing test still green. This is exactly the recurrence class the #188 → #197 → #256 lineage keeps predicting; recording it rather than fixing it, since fixing it is a new, small, separate change, not part of closing this PRD.
+
+**Recommendation: close #256 as resolved by current `main`'s actual behavior.** #182 (the parent) is already closed — do not re-close it. No further code work belongs on this PRD's branch. M3/M4 (comment updates at now-nonexistent line numbers, changelog, upstream offer) are moot — there is no behavior change on this branch to document or offer.
 
 Round 1 shipped a **rename** rather than a migration and was caught the same day; see the note under Success Criteria for what the gameable criterion was and why it mattered.
 
@@ -78,9 +91,11 @@ The confirmation check is then **inherited**, not re-implemented — which is th
 
 ### M1 — migrate, then delete
 
-- [x] `process_pending_seed_prompts` uses `DeliveryPhase` / `delivery_phase()` / `reset_delivery_cycle()`. — Done: `src/ui.rs:3980` matches on `delivery_phase(true, deliveries.get(&sp.pane_id).is_some_and(|d| d.landed))`.
-- [x] `UiState::seed_delivery_landed` is **deleted** — struct field, initialiser, take/restore — and **not replaced by an equivalent under another name**. The test is that no separate landed-store exists, not that a particular identifier is absent (see the note under Success Criteria). — Done: `git grep 'seed_delivery_landed\|seed_prompt_landed' src/` returns only comments explaining why round 1's rename (`seed_prompt_landed`) was rejected, no live field.
-- [x] The keyspace difference is resolved explicitly. The `HashSet` is keyed by pane id string while the phase machine is keyed by tab; state which is authoritative and why, rather than mapping between them at each call site — a mapping layer is a fourth representation wearing a disguise. — Resolved (2026-08-13, see the note below): pane id is authoritative.
+**These checkboxes describe work that shipped on PR #270 and was then lost to the 2026-08-15 sync (see Status) — left `[x]` as a historical record of what was verified true on 2026-08-14/15, not a claim about current `main`. `git grep` for any of the cited identifiers on `main` today returns nothing.**
+
+- [x] *(historical — lost in sync)* `process_pending_seed_prompts` uses `DeliveryPhase` / `delivery_phase()` / `reset_delivery_cycle()`. — Verified true as of PR #270's merge: `src/ui.rs:3980` matched on `delivery_phase(true, deliveries.get(&sp.pane_id).is_some_and(|d| d.landed))`.
+- [x] *(historical — lost in sync)* `UiState::seed_delivery_landed` was **deleted** — struct field, initialiser, take/restore — and **not replaced by an equivalent under another name**. — Verified true as of PR #270's merge: `git grep 'seed_delivery_landed\|seed_prompt_landed' src/` returned only comments explaining why round 1's rename was rejected, no live field.
+- [x] *(historical — lost in sync)* The keyspace difference is resolved explicitly. The `HashSet` is keyed by pane id string while the phase machine is keyed by tab; state which is authoritative and why, rather than mapping between them at each call site — a mapping layer is a fourth representation wearing a disguise. — Resolved (2026-08-13, see the note below): pane id is authoritative.
 
   **Resolved (2026-08-13): pane id is authoritative, and the tab-less constraint behind it is real.** Verified by the reviewer at `src/ui.rs:10083-10100`: the plain dashboard-card enqueue constructs a `PendingSeedPrompt` from `new_id` after switching to the dashboard, with **no orchestration tab id in play at all** (the mode-tab enqueue at `9995-10016` is a distinct site). So a pane→tab bridge would be invented state, exactly as this milestone forbids.
 
@@ -117,20 +132,20 @@ The confirmation check is then **inherited**, not re-implemented — which is th
 
 ## Key Files
 
-- `src/ui.rs:2076` — `DeliveryPhase`
-- `src/ui.rs:2114` — `delivery_phase()`
-- `src/ui.rs:2134` — `reset_delivery_cycle()`
-- `src/ui.rs:2679`, `:2854` — `seed_delivery_landed`, the field to delete
-- `src/ui.rs:3787-3947` — `process_pending_seed_prompts`, including the take at `:3811` and restore at `:3947`
-- `src/ui.rs:2640`, `:3865` — the two honest comments to update
+**Stale — describes the M1 implementation lost to the 2026-08-15 sync (see Status), not current `main`.** `:2076` is now an unrelated comment and `:2114` is `selected_index`; none of the identifiers below exist in `src/` today. Left here only as a historical record of what the original M1 touched, not as a guide for any further work — see the Status section for the actual current-`main` locations (`process_pending_seed_prompts` at `:3630`, `deliver_orchestrator_prompt` at `:4693`, `schedule_unconfirmed_retry` at `:3920`/`:4989`).
+
+- `src/ui.rs:2076` — `DeliveryPhase` *(gone)*
+- `src/ui.rs:2114` — `delivery_phase()` *(gone)*
+- `src/ui.rs:2134` — `reset_delivery_cycle()` *(gone)*
+- `src/ui.rs:2679`, `:2854` — `seed_delivery_landed` *(gone)*
+- `src/ui.rs:3787-3947` — `process_pending_seed_prompts` as it existed pre-sync-loss
+- `src/ui.rs:2640`, `:3865` — comments referenced by the original M1 scope
 
 ## Sequencing
 
-**Blocked on fork #254.** A confirmation check is only as sound as the signal behind it, and for wrapper-strategy agents that signal is currently LEVEL, which cannot return false on a genuinely lost write. Extending confirmation to the mode-seed path today would spread a **known-unfalsifiable** check to a second path — mechanising the defect rather than fixing it.
+**Moot — this PRD is closing, not proceeding to M2.** This section previously argued M2 was "blocked on fork #254" (an unfalsifiable-confirmation premise that no longer holds — see fork#254's rescoping comment, 2026-08-17, and PRD `prds/254-confirmation-capability-defer-to-hook-outcome.md`), then briefly argued M2 was "unblocked and can proceed independently." Both were reasoning about work that turns out not to be needed: see the Status section above — `main`'s current behavior already satisfies M2's closing bar through unrelated later work, so there is no M2 implementation left to sequence.
 
-**fork #257 is not a blocker but should land first** — its overridable retry floor is what lets M2's parity tests drive the mode-seed retry branch deterministically.
-
-Order: **#257 → #254 → #256.**
+For the historical record: fork#254's actual remaining scope (a `ConfirmationCapability` latch resolved from agent type before hook install/trust is known) is a narrow, orthogonal gap that never bore on whether TEXT confirmation is sound for this path — so the original "blocked on #254" reasoning was already wrong on its own terms, independent of the sync-loss/closing conclusion above. fork #257 is closed.
 
 ## Rule 12 — cross-version contract
 
