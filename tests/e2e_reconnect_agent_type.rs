@@ -56,6 +56,13 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         resp.error
     );
+    // PRD #365 M2: the daemon mints its own `pane_id` and strips whatever the
+    // client proposed, so hook events below must carry the daemon-minted id,
+    // not the client's literal `"pane-recon"` proposal.
+    let pane_id = resp
+        .pane_id
+        .clone()
+        .expect("daemon returns the minted pane_id");
 
     // The agent registers, but with no known type yet — this is the
     // "No agent" state a reconnect would render before the fix.
@@ -72,7 +79,7 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
         "agent_type": "claude_code",
         "event_type": "session_start",
         "timestamp": "2026-06-20T12:00:00Z",
-        "pane_id": "pane-recon",
+        "pane_id": pane_id,
     });
     write_hook_line(&daemon.hook_socket, &event.to_string())
         .expect("write SessionStart hook to the per-test socket");
@@ -149,6 +156,13 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         resp.error
     );
+    // PRD #365 M2: the daemon mints its own `pane_id` and strips whatever the
+    // client proposed, so hook events below must carry the daemon-minted id,
+    // not the client's literal `"pane-recon"` proposal.
+    let pane_id = resp
+        .pane_id
+        .clone()
+        .expect("daemon returns the minted pane_id");
 
     // Capture the daemon-assigned registry id — the `ListAgents` live-snapshot
     // join (PRD #162 M1.2) matches the session on agent_id AND pane_id, so the
@@ -184,7 +198,7 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
         "agent_type": "claude_code",
         "event_type": "session_start",
         "timestamp": "2026-06-20T12:00:00Z",
-        "pane_id": "pane-recon",
+        "pane_id": pane_id,
         "agent_id": agent_id,
     });
     write_hook_line(&daemon.hook_socket, &session_start.to_string())
@@ -215,7 +229,7 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
         "tool_name": "Read",
         "tool_detail": "src/main.rs",
         "timestamp": "2026-06-20T12:00:01Z",
-        "pane_id": "pane-recon",
+        "pane_id": pane_id,
         "agent_id": agent_id,
     });
     write_hook_line(&daemon.hook_socket, &tool_start.to_string()).expect("write ToolStart hook");

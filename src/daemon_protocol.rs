@@ -100,7 +100,7 @@ use crate::platform::ipc::{IpcListener, IpcStream};
 
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
-use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
+use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, mint_pane_id};
 use crate::event::{AgentType, BroadcastMsg};
 use crate::pane_input::escape_bytes_for_log;
 use crate::state::SharedState;
@@ -396,6 +396,65 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`] now
 /// enforces this constant on the local path too, so a bump refuses BOTH
 /// pairings rather than only the SSH one.
+/// fork#192 M1.2: NOT bumped for the `display_title` promotion. Weighed the
+/// bump explicitly, per the module doc's own test above ("bump when a
+/// change would cause an older or newer peer to mis-parse a frame") —
+/// `display_title` is unchanged on the wire (still `Option<String>` with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]`; no
+/// `KIND_*` code, no field rename, no non-forward-compatible schema
+/// change), so no peer at any version fails to parse a frame carrying it.
+/// What changed is only that this TUI now reads the field for a second
+/// purpose (the new-pane uniqueness check), which the wire format cannot
+/// see and a version comparison cannot express as a parse failure.
+///
+/// Re-examined per fork#192 review F5: the mixed-version failure mode this
+/// paragraph originally argued from — "an older daemon, or any peer that
+/// still treats `display_title` as droppable decoration, yields fewer
+/// titles" — cannot occur, so it is not the reason not to bump.
+/// [`crate::build_version_handshake::ensure_compatible_daemon_or_die`]
+/// refuses on `probe.response.server_version != Some(PROTOCOL_VERSION)` —
+/// EXACT equality, not a floor — so only a daemon that already reports
+/// protocol 7 can pair at all; a genuinely older peer never reaches the
+/// point where its handling of `display_title` matters. `display_title`
+/// itself predates protocol 7 by two months (landed 2026-06-14 in
+/// `8b863b0`, PRD #107 / PR #160; `PROTOCOL_VERSION = 7` landed
+/// 2026-08-09, and the previous release `v0.36.1` already carries it), so
+/// every daemon that CAN pass the handshake has round-tripped the field
+/// the whole time it has existed. The not-bumping decision is still
+/// correct — more clearly so than the reasoning that used to sit here: a
+/// bump here would refuse only pairings that already handle `display_title`
+/// correctly.
+///
+/// The "fewer titles reach the uniqueness check" failure shape IS real; it
+/// just arrives from a same-version cause, not a cross-version one. The
+/// daemon's own spawn-time validation (`validate_tab_membership` /
+/// `validate_orchestration_surface` in `src/agent_pty.rs`) nulls an
+/// invalid `display_title` and keeps the membership, regardless of which
+/// protocol version either peer runs — and the downstream effect of that
+/// miss is not merely a stale form suggestion: it is two worktrees
+/// recording byte-identical `created-by:` ownership markers, the exact
+/// fork #74 condition this PRD exists to prevent (fork#192 audit F2). See
+/// `changelog.d/192.breaking.md` for the corrected mixed-version write-up.
+///
+/// PRD 236 bumped 7 → 8, a later, unrelated change to fork#192's own bump
+/// reasoning above: the `KIND_EVENT` payload
+/// ([`crate::event::BroadcastMsg`]) gained a new
+/// [`crate::event::BroadcastMsg::WorktreeKept`] variant (a new `kind` tag) so
+/// the daemon can tell an attached TUI that a dispatched worktree was kept
+/// rather than removed on tab close, and where. Same class of change as
+/// PRD #120's `OrchestrationSurface` bump above: an older client receiving
+/// the new tag would fail to deserialize the frame, so this is a
+/// non-forward-compatible payload-schema change, not an additive field.
+///
+/// PRD #365 M2 bumped 8 → 9: `AttachRequest::StartAgent` no longer trusts a
+/// client-proposed `DOT_AGENT_DECK_PANE_ID` in `env` — the daemon mints its
+/// own `pane_id` (see [`crate::agent_pty::mint_pane_id`]) and returns it on
+/// the new [`AttachResponse::pane_id`] field. The new field is technically
+/// wire-additive, but this is a same-wire/different-*meaning* semantic
+/// break per CLAUDE.md rule 12, not a forward-compatible add: an old client
+/// keeps minting a client-side id the new daemon never asked for and does
+/// not recognize as authoritative, which is exactly the ambiguity this PRD
+/// exists to close. See `changelog.d/365.breaking.md`.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -775,13 +834,17 @@ pub enum AttachRequest {
     /// **Trust boundary.** The attach socket is bound at mode `0o600` and
     /// only accepts connections from the same OS user as the daemon, so
     /// any peer reaching this request can already exec arbitrary code as
-    /// that user. We deliberately do **not** sandbox `command`, `cwd`, or
-    /// `env`: there is no allowlist, no policy layer, no shell-quoting
+    /// that user. We deliberately do **not** sandbox `command` or `cwd`:
+    /// there is no allowlist, no policy layer, no shell-quoting
     /// validation. Adding any of those here would be security theater —
     /// the same user has equivalent local-exec capability via `sh -c`,
     /// and the daemon's job is to expose PTY plumbing, not to be a
     /// privilege boundary. Multi-tenant or remote scenarios must be
     /// handled at a different layer (separate UID, container, SSH).
+    /// `env` is the one exception (PRD #365 M2): any client-proposed
+    /// `DOT_AGENT_DECK_PANE_ID` entry is stripped and replaced with the
+    /// daemon-minted `pane_id` before the spawn path sees it, so `env` is
+    /// not forwarded verbatim for that one key.
     StartAgent {
         #[serde(default)]
         command: Option<String>,
@@ -1453,6 +1516,18 @@ pub struct AttachResponse {
     /// between daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_revision: Option<u64>,
+    /// PRD #365 M2: the daemon-minted `pane_id` for a `StartAgent` spawn.
+    /// The daemon, not the client, is now authoritative for this value —
+    /// see [`crate::agent_pty::mint_pane_id`]. Wire-additive
+    /// (`#[serde(default, skip_serializing_if)]`), but this is the
+    /// same-wire/different-*meaning* semantic break CLAUDE.md rule 12 calls
+    /// out by name: an old client that doesn't know to read this field
+    /// keeps client-side-minting an id the new daemon never asked for and
+    /// no longer treats as authoritative, which is why `PROTOCOL_VERSION`
+    /// bumps alongside this field rather than shipping it as a silent
+    /// additive-only change. `None` on every response but `StartAgent`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
 }
 
 impl AttachResponse {
@@ -2409,7 +2484,7 @@ async fn handle_connection(
             cwd,
             rows,
             cols,
-            env,
+            mut env,
             display_name,
             tab_membership,
             agent_type,
@@ -2431,13 +2506,15 @@ async fn handle_connection(
                 return Ok(());
             }
             // Trust boundary: same OS user, same exec capability — see the
-            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`/
-            // `env` to the spawn path verbatim. The only check here is a
-            // sanity guard against an empty/whitespace-only `command`,
-            // which is almost certainly a client bug rather than an
-            // attack: it would otherwise resolve to a binary named "" or
-            // " " and fail with a confusing OS error. This is *not* an
-            // allowlist.
+            // `AttachRequest::StartAgent` docs. We forward `command`/`cwd`
+            // to the spawn path verbatim; `env` is forwarded verbatim
+            // except for `DOT_AGENT_DECK_PANE_ID`, which is stripped and
+            // re-stamped with the daemon-minted `pane_id` below (PRD #365
+            // M2). The only check here is a sanity guard against an
+            // empty/whitespace-only `command`, which is almost certainly a
+            // client bug rather than an attack: it would otherwise resolve
+            // to a binary named "" or " " and fail with a confusing OS
+            // error. This is *not* an allowlist.
             if let Some(c) = command.as_deref()
                 && c.trim().is_empty()
             {
@@ -2571,16 +2648,28 @@ async fn handle_connection(
                 }
             }
 
+            // PRD #365 M2: the daemon, not the client, is authoritative for
+            // `pane_id`. Strip whatever the client proposed (or omitted)
+            // under `DOT_AGENT_DECK_PANE_ID` — the pre-M2 shape — and stamp
+            // a freshly-minted, collision-resistant id into the same `env`
+            // vec that reaches `spawn_agent`/`SpawnOptions.env` below, so
+            // the child process's own `DOT_AGENT_DECK_PANE_ID` is the
+            // minted value. `spawn_agent`'s own `pane_id_env` extraction
+            // (`agent_pty.rs`) reads this same env vec, so its
+            // duplicate-pane-id rejection and registry mirror pick up the
+            // minted value automatically — no separate plumbing needed
+            // there; it now defends against a daemon-minting bug instead
+            // of a client-minting race, a strictly smaller threat surface.
+            env.retain(|(k, _)| k != DOT_AGENT_DECK_PANE_ID);
+            let minted_pane_id = mint_pane_id();
+            env.push((DOT_AGENT_DECK_PANE_ID.to_string(), minted_pane_id.clone()));
+
             // PRD #93 round-5: capture the bits we need to populate the
             // daemon's `AppState` role map BEFORE the spawn (we'll need
             // the pane id from env and the orchestration metadata from
             // tab_membership). The spawn moves `opts`, so we clone what
             // we need first.
-            let pane_id_env: Option<String> = env
-                .iter()
-                .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
-                .map(|(_, v)| v.clone())
-                .filter(|v| is_valid_pane_id_env(v));
+            let pane_id_env: Option<String> = Some(minted_pane_id.clone());
             // Round-11 auditor #C: also pull `orchestration_cwd` out of
             // the membership so the daemon can use it (not StartAgent.cwd)
             // as the disambiguator in `pane_orchestration_map`. This keeps
@@ -2805,7 +2894,17 @@ async fn handle_connection(
                             crate::agent_pty::seed_fallback_grace(),
                         );
                     }
-                    write_resp(&mut stream, &AttachResponse::with_id(id)).await?
+                    // PRD #365 M2: return the daemon-minted pane_id
+                    // alongside the existing `id` field so the client can
+                    // adopt it instead of proposing its own.
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse {
+                            pane_id: Some(minted_pane_id),
+                            ..AttachResponse::with_id(id)
+                        },
+                    )
+                    .await?
                 }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
