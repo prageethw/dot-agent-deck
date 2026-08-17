@@ -76,6 +76,15 @@ const EXEMPT_BRANCH_PREFIXES: [&str; 3] = ["renovate/", "sync/", "upstream/"];
 /// for one fact, rather than the two that used to drift independently.
 const RULE_COUNT: usize = 5;
 
+/// The one changelog suffix that maps to [`WorkType::Prd`] via
+/// [`suffix_to_work_type`] but is a severity axis, not a work type of its
+/// own (fork#451) — the single fact [`derive_work_type`]'s branch-aware
+/// carve-out and [`collect_bug_diff`]'s `No-Test:` filter both key off. One
+/// literal for one fact ([`RULE_COUNT`]'s shape), so the frozen five-suffix
+/// set gaining another `Prd`-mapping severity suffix cannot silently miss
+/// one of the sites that must agree on it.
+const BREAKING_SUFFIX: &str = "breaking";
+
 /// `git merge-base HEAD <base>` target when `--base` is not given.
 pub const DEFAULT_BASE: &str = "origin/main";
 
@@ -233,7 +242,8 @@ impl fmt::Display for WorkTypeError {
 pub fn suffix_to_work_type(suffix: &str) -> Option<WorkType> {
     match suffix {
         "bugfix" => Some(WorkType::Bug),
-        "feature" | "breaking" => Some(WorkType::Prd),
+        "feature" => Some(WorkType::Prd),
+        BREAKING_SUFFIX => Some(WorkType::Prd),
         "doc" => Some(WorkType::Doc),
         "misc" => Some(WorkType::Chore),
         _ => None,
@@ -277,6 +287,21 @@ pub fn branch_prefix_to_work_type(branch: &str) -> Option<WorkType> {
 /// map to `Prd`) must still disagree with a `fix/` branch exactly as
 /// today, because that combination is a real feature, not a breaking bug
 /// fix.
+///
+/// This carve-out returns [`Supplier::BranchPrefix`], not
+/// [`Supplier::Fragment`] — the branch's `Bug` signal is what actually won
+/// this resolution, so that is also the more honest label for
+/// [`describe_success`] and `--self-test` to report.
+///
+/// **Accepted trade-off, not a new hole:** routing a `.breaking.md`-only
+/// fragment to `Bug` here means it skips [`check_prd_fragments`] (R4),
+/// which only runs for a `WorkType::Prd` derivation — so a `prd`-class
+/// breaking change can ship classified as `bug`, without R4's `prds/`
+/// linkage check, purely by naming the branch `fix/`. This is consistent
+/// with [`EXEMPT_BRANCH_PREFIXES`]'s existing threat model (the branch name
+/// is not a trust signal, and a PR still needs an approving human review to
+/// merge); it is called out here so a reader does not mistake R4 for an
+/// unconditional guarantee.
 pub fn derive_work_type(
     fragments: &[AddedFragment],
     branch: &str,
@@ -293,7 +318,7 @@ pub fn derive_work_type(
                 path: fragment.path.clone(),
                 suffix: fragment.suffix.clone(),
             })?;
-        if fragment.suffix != "breaking" {
+        if fragment.suffix != BREAKING_SUFFIX {
             fragment_all_breaking = false;
         }
         match &fragment_supply {
@@ -325,13 +350,37 @@ pub fn derive_work_type(
                 // `.feature.md`, and the branch says `fix/` — the fragment's
                 // Prd mapping was only ever the no-branch-signal fallback,
                 // so the branch's Bug signal wins instead of disagreeing.
+                // `supplier` is `BranchPrefix`, not `Fragment` (F1): the
+                // branch is what actually supplied `Bug` here.
                 Ok(Derivation {
                     work_type: WorkType::Bug,
-                    supplier: Supplier::Fragment,
+                    supplier: Supplier::BranchPrefix,
                 })
             } else {
+                // F3: when this disagreement is a Prd-mapping mismatch
+                // (the guard above declined because a genuine, non-breaking
+                // Prd fragment is also present), name that fragment rather
+                // than whichever one happened to sort first into
+                // `fragment_supply` — a `.breaking.md` sorting first would
+                // otherwise get blamed for a suffix this very carve-out
+                // makes legal, pointing the author at the wrong file. Falls
+                // back to `path` when every Prd-mapping fragment actually
+                // is `breaking` (shouldn't reach this arm per F2, but kept
+                // as a defensive fallback rather than an unreachable panic).
+                let named_path = if fragment_type == WorkType::Prd {
+                    fragments
+                        .iter()
+                        .find(|f| {
+                            suffix_to_work_type(&f.suffix) == Some(WorkType::Prd)
+                                && f.suffix != BREAKING_SUFFIX
+                        })
+                        .map(|f| f.path.clone())
+                        .unwrap_or(path)
+                } else {
+                    path
+                };
                 Err(WorkTypeError::FragmentBranchDisagree {
-                    fragment: (path, fragment_type),
+                    fragment: (named_path, fragment_type),
                     branch: (branch.to_string(), branch_type),
                 })
             }
@@ -1631,9 +1680,21 @@ fn collect_bug_diff(
     // at `HEAD` in both CI and `--self-test`'s scratch repos, so the two
     // are identical in practice, and `.ok()?` fails *closed* on a missing
     // file (no escape hatch found, rather than one silently assumed).
+    //
+    // F2: also admit a `.breaking.md` fragment, not only `.bugfix.md`'s
+    // exact-type match. This function only runs when `derive_work_type`
+    // already resolved the diff to `WorkType::Bug` (`check_rule`'s dispatch
+    // is the sole call site), so a `breaking`-suffixed fragment reaching
+    // here can only be one the branch-aware carve-out re-resolved to `Bug`
+    // — never a `feat/`-branch `.breaking.md`, which stays `Prd` and never
+    // reaches `collect_bug_diff` at all. Without this, a breaking bug fix
+    // that legitimately touches no `#[spec]` test has no fragment R3 will
+    // read its `No-Test:` line from.
     let no_test_reason = fragments
         .iter()
-        .filter(|f| suffix_to_work_type(&f.suffix) == Some(WorkType::Bug))
+        .filter(|f| {
+            suffix_to_work_type(&f.suffix) == Some(WorkType::Bug) || f.suffix == BREAKING_SUFFIX
+        })
         .find_map(|f| {
             let body = std::fs::read_to_string(repo_dir.join(&f.path)).ok()?;
             parse_no_test_directive(&body)
@@ -1917,7 +1978,11 @@ mod tests {
             derivation,
             Derivation {
                 work_type: WorkType::Bug,
-                supplier: Supplier::Fragment,
+                // F1: the branch's Bug signal is what actually supplied
+                // this, not the fragment (whose own mapping is Prd) — see
+                // `describe_success_names_branch_prefix_for_the_breaking_carve_out`
+                // for the success-line consequence of getting this wrong.
+                supplier: Supplier::BranchPrefix,
             }
         );
     }
@@ -1977,6 +2042,43 @@ mod tests {
                     ("changelog.d/451.breaking.md".to_string(), WorkType::Prd)
                 );
                 assert_eq!(branch, ("docs/451-thing".to_string(), WorkType::Doc));
+            }
+            other => panic!("expected FragmentBranchDisagree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn breaking_plus_feature_fragments_on_fix_branch_still_disagree_naming_the_feature() {
+        // F3 + F4: a genuine `.feature.md` alongside a `.breaking.md` on a
+        // `fix/` branch is a real feature, not a breaking bug fix — it must
+        // still fail, and the error must name the `.feature.md` (the actual
+        // offender), not the `.breaking.md` that sorts first and that this
+        // very PR makes legal on its own. Asserting the `Err` variant here
+        // (not just that *an* error occurs) is also what catches the
+        // "any-suffix-seen sets fragment_all_breaking" mutation: under that
+        // mutation this resolves to `Ok(Bug)` regardless of fragment order,
+        // letting a genuine feature ship as a bug fix.
+        let fragments = [
+            AddedFragment {
+                path: "changelog.d/451.breaking.md".to_string(),
+                suffix: "breaking".to_string(),
+            },
+            AddedFragment {
+                path: "changelog.d/451.feature.md".to_string(),
+                suffix: "feature".to_string(),
+            },
+        ];
+        let err = derive_work_type(&fragments, "fix/451-thing").expect_err(
+            "a genuine feature alongside a breaking fragment must still disagree with fix/",
+        );
+        match err {
+            WorkTypeError::FragmentBranchDisagree { fragment, branch } => {
+                assert_eq!(
+                    fragment,
+                    ("changelog.d/451.feature.md".to_string(), WorkType::Prd),
+                    "must name the .feature.md, not whichever fragment sorted first"
+                );
+                assert_eq!(branch, ("fix/451-thing".to_string(), WorkType::Bug));
             }
             other => panic!("expected FragmentBranchDisagree, got {other:?}"),
         }
@@ -2612,6 +2714,93 @@ mod tests {
         );
     }
 
+    /// Scenario: builds a scratch git repo (same helpers `--self-test` uses)
+    /// whose only added fragment is a `.breaking.md` carrying a `No-Test:`
+    /// line and no `#[spec]` test delta, on a `fix/` branch — the exact
+    /// shape F2 describes as previously having no legal way through R3.
+    /// Asserts `collect_bug_diff` actually reads the `No-Test:` reason out
+    /// of the `.breaking.md` fragment (not just that `check_r3_bug` accepts
+    /// a hand-built `BugDiff`, which the tests above already cover and which
+    /// would pass even with the pre-fix filter).
+    #[test]
+    fn collect_bug_diff_reads_no_test_reason_from_a_breaking_only_fragment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        init_self_test_repo(dir).expect("init scratch repo");
+        let base_sha = resolve_base(Some("origin/main"), dir).expect("resolve base");
+
+        run_git(&["checkout", "-q", "-b", "fix/451-breaking-no-test"], dir).expect("checkout");
+        std::fs::create_dir_all(dir.join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(
+            dir.join("changelog.d/451.breaking.md"),
+            "A breaking bug fix in xtask/, outside R3's tests/+src/ scan.\n\n\
+             No-Test: fix lives entirely in xtask/, which R3 does not scan\n",
+        )
+        .expect("write changelog.d/451.breaking.md");
+        run_git(&["add", "changelog.d/451.breaking.md"], dir).expect("add fragment");
+        run_git(
+            &["commit", "-q", "-m", "breaking bugfix, no spec test"],
+            dir,
+        )
+        .expect("commit fragment");
+
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let diff = collect_bug_diff(dir, &base_sha, &fragments).expect("collect_bug_diff");
+        assert_eq!(
+            diff.no_test_reason.as_deref(),
+            Some("fix lives entirely in xtask/, which R3 does not scan"),
+            "a .breaking.md fragment's No-Test: line must be read once the diff has \
+             already resolved to Bug, not silently filtered out"
+        );
+        assert_eq!(
+            check_r3_bug(&diff),
+            Ok(()),
+            "the escape hatch must actually satisfy R3 for this shape"
+        );
+    }
+
+    /// Scenario: same scratch-repo shape as above, but the `.breaking.md`
+    /// fragment carries no `No-Test:` line — confirms F2's widened filter
+    /// did not also make R3 toothless for a `.breaking.md`-derived bug that
+    /// genuinely has neither a spec-test delta nor a documented exemption.
+    #[test]
+    fn collect_bug_diff_still_fails_r3_for_a_breaking_fragment_with_no_escape_hatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        init_self_test_repo(dir).expect("init scratch repo");
+        let base_sha = resolve_base(Some("origin/main"), dir).expect("resolve base");
+
+        run_git(&["checkout", "-q", "-b", "fix/451-breaking-untested"], dir).expect("checkout");
+        std::fs::create_dir_all(dir.join("changelog.d")).expect("mkdir changelog.d");
+        std::fs::write(
+            dir.join("changelog.d/451.breaking.md"),
+            "A breaking bug fix with no No-Test: line and no spec test delta.\n",
+        )
+        .expect("write changelog.d/451.breaking.md");
+        run_git(&["add", "changelog.d/451.breaking.md"], dir).expect("add fragment");
+        run_git(
+            &["commit", "-q", "-m", "breaking bugfix, no escape hatch"],
+            dir,
+        )
+        .expect("commit fragment");
+
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let diff = collect_bug_diff(dir, &base_sha, &fragments).expect("collect_bug_diff");
+        assert_eq!(diff.no_test_reason, None);
+        assert_eq!(
+            check_r3_bug(&diff),
+            Err(RuleViolation::BugMissingSpecTestDelta),
+            "widening the No-Test: filter must not also let an undocumented \
+             .breaking.md-derived bug fix through R3"
+        );
+    }
+
     #[test]
     fn parse_no_test_directive_finds_a_reason() {
         let fragment = "Fixed the daemon lazy-spawn timeout.\n\nNo-Test: CI-config bug, no harness to exercise it\n";
@@ -2756,6 +2945,32 @@ mod tests {
             msg.contains(&format!("{RULE_COUNT} rules")),
             "describe_success must derive its rule count from RULE_COUNT, not a \
              separate hardcoded literal (N1): got {msg:?}"
+        );
+    }
+
+    /// Scenario: renders the success line for the exact `.breaking.md` +
+    /// `fix/` derivation the branch-aware carve-out produces, and asserts it
+    /// names the branch prefix rather than falling through to `describe_success`'s
+    /// `unwrap_or("?")` (F1) — before the fix, `derivation.supplier` was
+    /// `Supplier::Fragment` while the only fragment present (`.breaking.md`)
+    /// maps to `Prd`, not `Bug`, so the fragment lookup found nothing and
+    /// the line read `... from changelog fragment '?' ...`.
+    #[test]
+    fn describe_success_names_branch_prefix_for_the_breaking_carve_out() {
+        let fragments = [AddedFragment {
+            path: "changelog.d/451.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        }];
+        let derivation = derive_work_type(&fragments, "fix/451-thing")
+            .expect("a breaking bugfix on a fix/ branch must resolve");
+        let msg = describe_success(&derivation, "fix/451-thing", "abc123", &fragments);
+        assert!(
+            msg.contains("from branch prefix 'fix/'"),
+            "expected the success line to name the branch, not fall through to '?': got {msg:?}"
+        );
+        assert!(
+            !msg.contains('?'),
+            "the success line must never contain the unresolved-lookup fallback: got {msg:?}"
         );
     }
 }
