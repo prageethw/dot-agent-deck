@@ -25676,6 +25676,163 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Grid-fit render tests (fork issue #437, upstream #588): pin the ACTUAL
+    // painted output for the narrow-AND-short case the `choose_grid_layout_*`
+    // tests above prove algorithmically — that all cards get drawn, that
+    // `ui.columns` is kept in sync with what the render path actually drew
+    // (dead-state hygiene; `ui.columns` has no reader today), and that a
+    // genuine viewport overflow is indicated rather than silently dropped.
+    // -----------------------------------------------------------------------
+
+    /// Render `n` ClaudeCode sessions ("role1".."role{n}") into a
+    /// `width`x`height` dashboard `TestBackend`, following the same
+    /// `compute_frame_layout` + `render_frame` construction as
+    /// `test_render_wide_grid_layout` above. Returns the rendered buffer
+    /// content and the post-render `UiState` so callers can assert on either.
+    fn render_dashboard_grid(n: usize, width: u16, height: u16) -> (String, UiState) {
+        let mut state = AppState::default();
+        for i in 1..=n {
+            state.apply_event(AgentEvent {
+                session_id: format!("role{i}"),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some("/tmp".to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: None,
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            });
+        }
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+
+        (buffer_to_string(terminal.backend().buffer()), ui)
+    }
+
+    /// Scenario: Render a dashboard with 7 role cards on a narrow, short
+    /// 99x33 terminal — the exact fork issue #437 shape — and check every
+    /// card actually painted on screen.
+    #[spec("dashboard/grid/004")]
+    #[test]
+    fn grid_004_narrow_short_dashboard_paints_all_cards() {
+        // fork issue #437's reported shape: 7 roles, width 99, height 33 ->
+        // dashboard_area.height=32 (frame height minus the 1-row hints bar)
+        // -> available_for_density=30 — the exact numbers
+        // `choose_grid_layout_narrow_short_reported_case_uses_two_cols_compact`
+        // pins. Before the fix, grid_columns(99)=1 col with visible_rows=30/6=5
+        // painted only 5 of the 7 cards below, with nothing on screen
+        // indicating the other 2 were dropped.
+        let (rendered, _ui) = render_dashboard_grid(7, 99, 33);
+        for i in 1..=7 {
+            let id = format!("role{i}");
+            assert!(
+                rendered.contains(&id),
+                "expected card {id} to be painted at the fitted (2-col) \
+                 layout; got:\n{rendered}"
+            );
+        }
+    }
+
+    /// Scenario: Render the same narrow, short 7-role dashboard and check
+    /// that `ui.columns` is kept in sync with the render path's actual
+    /// fitted column count, rather than left stale or independently
+    /// computed.
+    #[spec("dashboard/grid/005")]
+    #[test]
+    fn grid_005_narrow_short_dashboard_sets_ui_columns_to_fitted_cols() {
+        // Regression test for the desync risk upstream #588 flags explicitly:
+        // the OTHER `grid_columns` caller (the main-loop `ui.columns =
+        // grid_columns(dashboard_width)` call, src/ui.rs:13271) must not
+        // disagree with what the render path actually drew — `ui.columns`
+        // has no reader today, so this is dead-state hygiene, not a
+        // navigation-behavior test. Same 7-role narrow+short scenario as
+        // above: `choose_grid_layout(7, 99, 30).cols == 2`, so `ui.columns`
+        // must read 2, not the 1 that `grid_columns(99)` alone would produce.
+        let (_rendered, ui) = render_dashboard_grid(7, 99, 33);
+        assert_eq!(ui.columns, 2);
+    }
+
+    /// Scenario: Render a dashboard with 50 sessions in a viewport so small
+    /// that only 1 card fits even at the fitted layout's Compact density,
+    /// and check the title line shows an explicit count of the cards that
+    /// didn't fit rather than staying silent about the drop.
+    #[spec("dashboard/grid/006")]
+    #[test]
+    fn grid_006_dashboard_title_indicates_viewport_hidden_cards() {
+        // Reuses `choose_grid_layout_falls_back_to_compact_when_nothing_fits`'s
+        // shape: 50 sessions, width 40 (max_columns_for_width=1 either way, so
+        // this isolates the missing-indicator defect from the column-fit
+        // defect), height 8 -> dashboard_area.height=7 ->
+        // available_for_density=5. cols=1, density=Compact (card_height=6),
+        // visible_rows=(5/6=0).max(1)=1 -> only 1 of 50 single-card rows is
+        // on screen, 49 hidden. Before this fix the title read a plain "— 50
+        // session(s)" with nothing indicating 49 of them didn't fit — the
+        // same silent-drop defect the filter-based "X/Y session(s)" text
+        // solves for *filtering* has no equivalent for *viewport overflow*.
+        let (rendered, _ui) = render_dashboard_grid(50, 40, 8);
+        let title_line = rendered.lines().next().unwrap_or_default();
+
+        let after_session_count = title_line
+            .find("session(s)")
+            .map(|i| title_line[i + "session(s)".len()..].trim())
+            .unwrap_or("");
+        assert!(
+            !after_session_count.is_empty(),
+            "title must append a viewport-hidden indicator (distinct from \
+             the filter-based \"X/Y session(s)\" text) when cards exist but \
+             didn't fit even at max_cols_for_width/Compact; got title line \
+             {title_line:?}"
+        );
+        assert!(
+            title_line.contains("49"),
+            "viewport-hidden indicator must show the count of cards that \
+             didn't fit (49 of 50 here); got title line {title_line:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // PRD #76 M2.13: dashboard placeholder render-decision tests.
     //
     // `render_session_card` flips a single gate on `session.agent_type ==
@@ -29898,13 +30055,15 @@ mod tests {
     }
 
     /// Issue #588's reported case and its neighbours. Seven roles on a
-    /// 90-column deck: one column needs 7*5 = 35 rows at the densest tier, two
-    /// columns need 7.div_ceil(2)*5 = 20.
+    /// 90-column deck: one column needs 7*6 = 42 rows at the densest tier
+    /// (PRD fork#405 M1's identity row: Compact=6, Normal=9, Spacious=11),
+    /// two columns need 7.div_ceil(2)*6 = 24.
     #[test]
     fn choose_grid_layout_widens_only_to_fit_every_card() {
-        // 35 rows available: one column already fits all seven, so nothing is
-        // spent. This is the property that keeps every existing layout intact.
-        assert_eq!(choose_grid_layout(7, 90, 35).cols, 1);
+        // 42 rows available: one column already fits all seven at Compact, so
+        // nothing is spent. This is the property that keeps every existing
+        // layout intact.
+        assert_eq!(choose_grid_layout(7, 90, 42).cols, 1);
 
         // 25 rows — the reported geometry. One column fits five of seven at
         // Compact; a second column fits all seven with room to spare.
@@ -29916,11 +30075,12 @@ mod tests {
             }
         );
 
-        // 34 rows: one column misses Compact by a single row. The second column
-        // buys back enough height for Normal — the issue's open question
-        // answered as it suggests, richer cards over a narrower grid.
+        // 36 rows: one column misses even Compact (7*6=42>36). The second
+        // column buys back enough height for Normal (4*9=36) — the issue's
+        // open question answered as it suggests, richer cards over a
+        // narrower grid.
         assert_eq!(
-            choose_grid_layout(7, 90, 34),
+            choose_grid_layout(7, 90, 36),
             GridLayout {
                 cols: 2,
                 density: CardDensity::Normal
@@ -29970,6 +30130,103 @@ mod tests {
         assert_eq!(scroll_indicator(12, 0), "  (\u{2191}12)");
         assert_eq!(scroll_indicator(0, 34), "  (\u{2193}34)");
         assert_eq!(scroll_indicator(12, 34), "  (\u{2191}12 \u{2193}34)");
+    }
+
+    // ---------------------------------------------------------------------------
+    // choose_grid_layout / max_columns_for_width tests (fork issue #437,
+    // upstream #588 — #588 is the same defect, independently fixed here with
+    // the richer `Option`-returning `fitting_density` in place of #437's
+    // always-Compact-fallback `choose_density`; these pin the same scenarios
+    // #437 reported, against the surviving API).
+    //
+    // `grid_columns` picks columns from width ALONE and density alone picks
+    // from height at a GIVEN column count, so neither axis can compensate for
+    // the other — a narrow-AND-short terminal can get stuck on 1 column even
+    // though 2 narrower-but-shorter columns would let everything fit.
+    // `choose_grid_layout` jointly searches (cols, density) instead.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn max_columns_for_width_boundaries() {
+        // MIN_CARD_W = 40; max_columns_for_width(width) = (width / 40).max(1).
+        assert_eq!(max_columns_for_width(1), 1); // 1/40=0, clamped to 1
+        assert_eq!(max_columns_for_width(39), 1); // 39/40=0, clamped to 1
+        assert_eq!(max_columns_for_width(40), 1); // 40/40=1
+        assert_eq!(max_columns_for_width(79), 1); // 79/40=1
+        assert_eq!(max_columns_for_width(80), 2); // 80/40=2
+        assert_eq!(max_columns_for_width(119), 2); // 119/40=2
+        assert_eq!(max_columns_for_width(120), 3); // 120/40=3
+        assert_eq!(max_columns_for_width(200), 5); // 200/40=5
+    }
+
+    #[test]
+    fn choose_grid_layout_narrow_short_reported_case_uses_two_cols_compact() {
+        // fork issue #437's reported shape: 7 roles, width 99 (<100, so the
+        // old width-only grid_columns locked this to 1 column), height giving
+        // available_for_density=30.
+        //
+        // max_columns_for_width(99) = 99/40 = 2.
+        //
+        // cols=1 rejected: nothing fits (7*11=77, 7*9=63, 7*6=42 all >30), so
+        // cols=1 never fits at any density.
+        //
+        // cols=2 accepted: rows=ceil(7/2)=4, 4*11=44>30, 4*9=36>30,
+        // 4*6=24<=30 -> Compact fits.
+        assert_eq!(
+            choose_grid_layout(7, 99, 30),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+    }
+
+    #[test]
+    fn choose_grid_layout_keeps_single_col_when_it_already_fits() {
+        // 2 cards, width 99 (max_columns_for_width(99)=2), height 20: at cols=1
+        // there are 2 rows (one card per row when there's only 1 column,
+        // rows=ceil(2/1)=2), so Spacious (2*11=22>20) does not fit but
+        // Normal (2*9=18<=20) does. cols=1 already fits at Normal, so the
+        // joint search must not spend an extra column the richer
+        // single-column layout doesn't need.
+        assert_eq!(
+            choose_grid_layout(2, 99, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Normal
+            }
+        );
+    }
+
+    #[test]
+    fn choose_grid_layout_falls_back_to_compact_when_nothing_fits() {
+        // width 40 -> max_columns_for_width(40) = 1 (no column count can do
+        // better). 50 cards in 1 column need 50 rows; even Compact (6 rows)
+        // needs 300, nowhere near height 5. No (cols, density) fits, so the
+        // layout must return the documented fallback rather than panicking
+        // or returning cols=0.
+        assert_eq!(
+            choose_grid_layout(50, 40, 5),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
+    }
+
+    #[test]
+    fn choose_grid_layout_prefers_grid_columns_start_on_wide_terminals() {
+        // 6 cards, width 200 (grid_columns(200)=3, max_columns_for_width(200)=5),
+        // height 38: cols=3 already fits at Spacious (2 rows * 11 = 22 <= 38), so
+        // the search must not settle for cols=1 (6 rows * 6 = 36 <= 38 also
+        // "fits", but wastes width and gives strictly less content per card).
+        assert_eq!(
+            choose_grid_layout(6, 200, 38),
+            GridLayout {
+                cols: 3,
+                density: CardDensity::Spacious
+            }
+        );
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
