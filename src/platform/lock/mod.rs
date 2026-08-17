@@ -41,6 +41,55 @@ pub use unix::acquire_spawn_lock_sync_bounded as acquire_worktree_lock_sync;
 #[cfg(windows)]
 pub use windows::acquire_path_lock_sync_bounded as acquire_worktree_lock_sync;
 
+/// Asynchronous, bounded counterpart to [`acquire_spawn_lock`] (fork #282
+/// audit B1): [`crate::issue_dispatch_run::create_worktree`] (the
+/// `issue_dispatch` scheduler's async attach path) needs the SAME
+/// `.await`-able acquisition [`acquire_spawn_lock`] gives, but bounded —
+/// unlike [`acquire_worktree_lock_sync`] above, it cannot block its calling
+/// thread, because that thread is a tokio worker.
+///
+/// Deliberately NOT `tokio::time::timeout(WORKTREE_GIT_TIMEOUT,
+/// acquire_spawn_lock(path))`: dropping the future on timeout cannot cancel
+/// what is running underneath, so the wait keeps going, unbounded, on
+/// whatever it was running on. Unix's [`acquire_spawn_lock`] runs the
+/// unbounded `flock` inside `spawn_blocking`, whose `JoinHandle` cannot be
+/// cancelled — dropping the timeout future detaches the task and the pool
+/// thread stays parked in `flock` until it is eventually granted, leaking
+/// one blocking-pool thread (capped at 512, process-wide, shared by every
+/// other `spawn_blocking` caller in the daemon) per timeout. Windows'
+/// dedicated owner thread leaks the same way, with no cap at all. This repo
+/// already litigated the identical shape once, for a wedged `ps` invocation
+/// — see `src/platform/proc/unix.rs`'s doc comment on why a `spawn_blocking`
+/// handle cannot be raced against an external timeout.
+///
+/// So the bound has to live INSIDE the primitive instead, where it can
+/// actually terminate the wait rather than merely stop awaiting it:
+///
+/// - **Unix** ([`unix::acquire_spawn_lock_sync_bounded`] inside
+///   `spawn_blocking`): `flock` has no wait-with-timeout form, so the sync
+///   primitive polls `LOCK_EX | LOCK_NB` against a deadline and genuinely
+///   *returns* on expiry — the `spawn_blocking` task then completes and the
+///   thread is released, unlike the unbounded `flock(LOCK_EX)` above.
+/// - **Windows** (`windows::acquire_spawn_lock_bounded`): `create_and_acquire`
+///   already takes a `timeout_ms`; the unbounded [`acquire_spawn_lock`]
+///   above just happens to pass `INFINITE`. Passing the real bound instead
+///   means `WaitForSingleObject` itself returns `WAIT_TIMEOUT`, the owner
+///   thread reports the error and exits immediately rather than parking —
+///   no thread is retained past the bound.
+///
+/// `PathLock` (Windows' sync guard, behind [`acquire_worktree_lock_sync`])
+/// is deliberately not reused here even though it is already bounded: its
+/// `Drop` must run on the thread that acquired it, and its inner
+/// `OwnedHandle(HANDLE)` is not `Send` — wrapping it in `spawn_blocking` and
+/// returning the guard to the async task would not compile on Windows,
+/// which is fortunate, because the Unix-only version of that shortcut
+/// compiles fine and would be a latent Windows bug the moment the `cfg` was
+/// widened.
+#[cfg(unix)]
+pub use unix::acquire_spawn_lock_bounded;
+#[cfg(windows)]
+pub use windows::acquire_spawn_lock_bounded;
+
 /// Name of the Windows named mutex that stands in for the Unix `flock(2)` on
 /// `lock_path` (PRD #163 M2). `user_token` is
 /// [`crate::platform::paths::endpoint_user_suffix`] — the current user's SID.
@@ -129,8 +178,14 @@ pub(crate) fn spawn_mutex_name(user_token: &str, lock_path: &Path) -> String {
 /// FNV-1a (64-bit). Fixed constants, so the digest is identical across Rust
 /// versions, builds and platforms — the property [`spawn_mutex_name`] needs and
 /// `DefaultHasher` does not provide.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn fnv1a64(bytes: &[u8]) -> u64 {
+///
+/// Fork #282 audit S5: also used by
+/// [`crate::issue_dispatch_run::worktree_attach_lock_path`], for the same
+/// reason — a scheduled daemon dispatch and an interactive TUI attach can be
+/// different builds and must derive the identical lock filename for the same
+/// `worktree_dir` (CLAUDE.md rule 12). `DefaultHasher` would let two builds
+/// silently fail to contend on the same key.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         hash ^= u64::from(*b);
