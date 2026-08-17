@@ -19896,20 +19896,19 @@ fn render_session_card(
         //     left span for a non-live card, and `liveness_marker` is folded
         //     into the text so it competes with the role name for space
         //     rather than being unconditionally dropped (R3).
-        //   - Issue #442's selection colour cue, on the left span itself
-        //     since there is no border here to carry it via `border_style`
-        //     the way the taller tiers do (R4).
         //   - A one-column leading gutter, matching the leading space every
         //     other tier's title starts with and the PRD's own mock-up (R8).
+        //
+        // No distinct colour cue is available at this tier: there is no
+        // border to carry `border_style`'s selection thickening/BOLD the way
+        // the taller tiers do, and `palette::SELECTED` is `Color::Reset` —
+        // identical to `title_bold`'s own foreground — so a selected/
+        // unselected branch here would be a no-op. The `▸ ` selection prefix
+        // (`sel_prefix`, folded into `left` below) is this tier's only
+        // selection indicator, matching the PRD's own mock-up.
         use unicode_width::UnicodeWidthStr;
 
-        let left_style = if is_selected {
-            Style::default()
-                .fg(palette::SELECTED)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            title_bold
-        };
+        let left_style = title_bold;
         let left_style = if is_live {
             left_style
         } else {
