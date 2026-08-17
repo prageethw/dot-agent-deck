@@ -2898,17 +2898,50 @@ exit 0
     // PRD #120 — when the per-issue worktree dir is already present (a concurrent
     // fire claimed it in the window after the idempotency check), `create_worktree`
     // reports AlreadyClaimed so the caller skips the issue rather than failing it.
-    // Deterministic: the production code keys solely on `worktree_dir.exists()`
-    // after a failed `git worktree add`, so a non-git clone dir suffices to force
-    // the add to fail; the pre-created worktree dir drives the already-claimed verdict.
+    // The production code keys on `worktree_dir.exists()` after a failed `git
+    // worktree add`.
+    //
+    // Fork #282 (async half): `clone_dir` must now be a REAL git repo, not a
+    // bare directory — `create_worktree` resolves the attach lock's path via
+    // `git rev-parse --git-common-dir` before it ever reaches `git worktree
+    // add`, and that resolution itself fails fast (as an `Err`, not
+    // `AlreadyClaimed`) against a non-git directory. So the add is now made
+    // to fail the way a real concurrent racer would produce: a NON-EMPTY
+    // pre-existing target directory, which `git worktree add` refuses
+    // outright ("already exists") regardless of whether `worktree_dir` is a
+    // worktree registration or, as here, just another file already sitting
+    // at that path.
     #[tokio::test]
     async fn create_worktree_already_claimed_when_dir_present() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
         let ws = tempfile::tempdir().unwrap();
-        let clone_dir = ws.path().join("clone"); // not a git repo → add fails
+        let clone_dir = ws.path().join("clone");
         std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
         let worktree_dir = clone_dir.join(".worktrees").join("issue-7");
-        // Simulate the concurrent fire having already created the worktree dir.
+        // Simulate the concurrent fire having already created (and started
+        // populating) the worktree dir.
         std::fs::create_dir_all(&worktree_dir).unwrap();
+        std::fs::write(worktree_dir.join("marker"), "concurrent\n").unwrap();
 
         let outcome =
             create_worktree(&clone_dir, &worktree_dir, "agent/issue-7", false, "test").await;
@@ -2922,10 +2955,15 @@ exit 0
     // PRD #120 — a genuine `git worktree add` failure with NO worktree dir on disk
     // stays a hard failure (Err), so real problems (bad ref, permissions, …) are
     // still surfaced as IssueDispatchFailed rather than masked as a skip.
+    //
+    // Fork #282 (async half): a non-git `clone_dir` still exercises this —
+    // it now fails earlier, at the attach-lock path resolution rather than at
+    // `git worktree add` itself, but either way it is a genuine `Err` with no
+    // worktree ever created, which is all this test asserts.
     #[tokio::test]
     async fn create_worktree_propagates_genuine_failure() {
         let ws = tempfile::tempdir().unwrap();
-        let clone_dir = ws.path().join("clone"); // not a git repo → add fails
+        let clone_dir = ws.path().join("clone"); // not a git repo → fails
         std::fs::create_dir_all(&clone_dir).unwrap();
         let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
 
@@ -2933,7 +2971,7 @@ exit 0
             create_worktree(&clone_dir, &worktree_dir, "agent/issue-9", false, "test").await;
         assert!(
             outcome.is_err(),
-            "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
+            "a real failure with no worktree on disk must propagate as Err, got {outcome:?}"
         );
     }
 
