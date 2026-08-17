@@ -1965,6 +1965,71 @@ mod tests {
         );
     }
 
+    /// Scenario: same fixture as `worktree_reclaim_008` above -- a
+    /// deck-created, MERGED, clean worktree that a bare `reclaim` removes --
+    /// but this time the caller names WHO is running the reclaim. Issue #325
+    /// documents two incidents where a worktree vanished mid-use with no
+    /// trace of who did it; this pins that when the deck's OWN
+    /// `remove_worktree_dir` call site does the removing, the identity/context
+    /// the caller supplied is recorded on the removed worktree's own report,
+    /// not silently dropped on the floor.
+    #[spec("worktree/reclaim/037")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_037_removal_records_remover_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let branch = "feat/attribute-removal";
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let worktree_dir = scratch.path().join("wt-attribute-removal");
+        crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            branch,
+            "test-creator",
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
+
+        let remover =
+            "worktree:/tmp/dot-agent-deck-attr325@fix/325-worktree-removal-attribution|test-host";
+        let outcome = run_reclaim(&repo, false, remover)
+            .expect("run_reclaim must succeed against a real git repo");
+
+        assert_eq!(
+            outcome.removed.len(),
+            1,
+            "expected exactly one removed worktree, got removed={:?} pending={:?} kept={:?}",
+            outcome.removed,
+            outcome.pending,
+            outcome.kept
+        );
+        assert_eq!(
+            outcome.removed[0].removed_by.as_deref(),
+            Some(remover),
+            "a worktree the deck's own `run_reclaim` just removed must record who ran the \
+             reclaim in `removed_by` (issue #325) -- got {:?}",
+            outcome.removed[0].removed_by
+        );
+    }
+
     /// Scenario: `create_worktree_sync` (the sync creation path both the
     /// TUI's `SpawnPane` dispatch and this module's own test above drive) is
     /// asked to create a worktree with a specific creator identity. The

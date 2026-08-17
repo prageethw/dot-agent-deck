@@ -3583,6 +3583,76 @@ exit 0
         );
     }
 
+    /// Scenario: `attempt_worktree_cleanup` is the best-effort removal
+    /// `create_worktree_sync` runs against a directory IT half-created, after
+    /// `git worktree add` timed out (fork #122/#123). Fed a real,
+    /// already-registered worktree standing in for that half-created state
+    /// and the identity of the creator attempting the cleanup, a confirmed
+    /// removal must attribute that identity (issue #325's attribution gap —
+    /// today this call site drops it on the floor). A second call against
+    /// the now-absent directory removes nothing, and attribution must stay
+    /// absent rather than naming an identity for a removal that never
+    /// happened.
+    #[test]
+    fn attempt_worktree_cleanup_records_remover_identity() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let worktree_dir = ws.path().join("wt-half-created");
+        git(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/half-created",
+                worktree_dir.to_str().unwrap(),
+            ],
+        );
+        assert!(worktree_dir.exists());
+
+        let remover = "test-creator";
+        let removed_by = attempt_worktree_cleanup(&clone_dir, &worktree_dir, remover);
+        assert!(
+            !worktree_dir.exists(),
+            "attempt_worktree_cleanup must actually remove the directory on a confirmed cleanup"
+        );
+        assert_eq!(
+            removed_by.as_deref(),
+            Some(remover),
+            "a confirmed cleanup removal must attribute the identity attempting it (issue #325) \
+             -- got {removed_by:?}"
+        );
+
+        let second = attempt_worktree_cleanup(&clone_dir, &worktree_dir, remover);
+        assert_eq!(
+            second, None,
+            "nothing was removed on this call (the directory is already gone) -- attribution \
+             must be None, not fabricated, got {second:?}"
+        );
+    }
+
     // --- fork issue #282: the attach race ---
 
     /// Scenario: fork issue #282. Two concurrent callers of
