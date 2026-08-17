@@ -2178,6 +2178,39 @@ async fn run_hook_loop(
                                         let _ = write_half.flush().await;
                                     }
                                 }
+                                DaemonMessage::GetRegistrationGeneration(req) => {
+                                    // Fork #358: read-only lookup the
+                                    // `work-done` CLI issues immediately
+                                    // before sending its `WorkDone` signal,
+                                    // so the generation it echoes back is as
+                                    // fresh as this round trip allows. `0`
+                                    // when the daemon holds no registration
+                                    // for this pane_id — never matches a
+                                    // real registration's generation (those
+                                    // start at `1`), so `handle_work_done`
+                                    // refuses rather than guessing.
+                                    let generation = state
+                                        .read()
+                                        .await
+                                        .pane_registration_generation
+                                        .get(&req.pane_id)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    info!(
+                                        pane_id = %req.pane_id,
+                                        generation,
+                                        "Received get-registration-generation request"
+                                    );
+                                    let resp = crate::event::GetRegistrationGenerationResponse {
+                                        generation,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
                             // `tool_name`/`tool_detail` are logged so a post-mortem can

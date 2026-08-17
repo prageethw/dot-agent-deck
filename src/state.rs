@@ -570,20 +570,21 @@ pub struct AppState {
     /// tuple preserved as the `NameCwd` fallback for clients that predate
     /// the token.
     pub pane_orchestration_map: HashMap<String, OrchestrationIdentity>,
-    /// Fork #358 M1 scaffold: maps pane_id → how many times
+    /// Fork #358: maps pane_id → how many times
     /// [`Self::register_orchestration_role`] has been called for that
     /// pane_id, incremented on EVERY call regardless of whether the identity
     /// changed (a same-identity re-register, e.g. a torn-down-and-recreated
     /// worktree reusing both the same pane_id and the same
     /// [`OrchestrationIdentity`], still advances this).
     ///
-    /// This field exists so a [`crate::event::WorkDoneSignal`] can carry the
-    /// generation it was produced under — nothing yet COMPARES that carried
-    /// value against the current one here to decide refusal; the compare-
-    /// and-refuse gate in [`Self::handle_work_done`] is fork #358's actual
-    /// fix and is deliberately NOT part of this scaffold. See
+    /// A [`crate::event::WorkDoneSignal`] carries the generation it was
+    /// produced under (`work-done` reads it fresh from the daemon via
+    /// [`crate::event::DaemonMessage::GetRegistrationGeneration`] right
+    /// before sending); [`Self::handle_work_done`] compares that carried
+    /// value against the CURRENT entry here and refuses delivery on a
+    /// mismatch — see
     /// `handle_work_done_refuses_a_stale_cross_orchestration_signal_after_pane_reuse`
-    /// below for the RED test this field exists to make compile.
+    /// below for the test pinning this.
     pub pane_registration_generation: HashMap<String, u64>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
@@ -4251,6 +4252,38 @@ impl AppState {
                 return;
             }
         };
+
+        // Fork #358: refuse a signal produced under a registration this pane
+        // no longer holds. `register_orchestration_role` bumps
+        // `pane_registration_generation` on EVERY call (same-identity
+        // re-register included), so a signal whose carried generation no
+        // longer matches the pane's CURRENT one means the pane was
+        // re-registered — a worktree torn down and its pane_id reused,
+        // possibly for a different orchestration entirely — since this
+        // signal's worker began. Deliver it now and it lands in the wrong
+        // tenant's worktree, under the wrong tenant's role, reported to the
+        // wrong tenant's orchestrator (see `pane_cwd_map`/`pane_role_map`
+        // resolution below). `pane_role_map` and `pane_registration_generation`
+        // are always written together by `register_orchestration_role`, so
+        // having survived the `pane_role_map` lookup above without an entry
+        // here means either a genuinely stale/reused pane_id or a caller
+        // that skipped proper registration — both are refused the same way,
+        // per the PRD's "missing entry, treat conservatively" design.
+        let current_generation = self
+            .pane_registration_generation
+            .get(&signal.pane_id)
+            .copied();
+        if current_generation != Some(signal.generation) {
+            warn!(
+                pane_id = %signal.pane_id,
+                role = %role_name,
+                signal_generation = signal.generation,
+                current_generation = ?current_generation,
+                "work-done: refusing stale cross-orchestration signal — pane was \
+                 re-registered since this signal was produced (generation mismatch)"
+            );
+            return;
+        }
 
         // Orchestrator's own `--done`: completion signal, no feedback to write.
         if signal.done && self.orchestrator_pane_ids.contains(&signal.pane_id) {

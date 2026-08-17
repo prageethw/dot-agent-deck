@@ -439,6 +439,17 @@ fn register_orchestration(state: &mut AppState, cwd: &str) {
     state
         .pane_cwd_map
         .insert(WORKER_PANE.to_string(), cwd.to_string());
+    // Fork #358: this hand-rolls what `register_orchestration_role` does in
+    // production, which also bumps `pane_registration_generation` — without
+    // it here, `handle_work_done`'s stale-signal gate sees "no registration
+    // on file" and refuses every signal these tests send, generation 0 or
+    // not. `1` matches what a real first registration would record.
+    state
+        .pane_registration_generation
+        .insert(ORCH_PANE.to_string(), 1);
+    state
+        .pane_registration_generation
+        .insert(WORKER_PANE.to_string(), 1);
 }
 
 #[cfg(unix)]
@@ -1649,7 +1660,9 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             task: "Completed without hook activity.".to_string(),
                             done: false,
                             timestamp: chrono::Utc::now(),
-                            generation: 0,
+                            // Matches the generation `register_orchestration`
+                            // records for WORKER_PANE (fork #358).
+                            generation: 1,
                         },
                         &harness.registry,
                     )
@@ -1679,7 +1692,9 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         task: "The superseded task completed late.".to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
-                        generation: 0,
+                        // Matches the generation `register_orchestration`
+                        // records for WORKER_PANE (fork #358).
+                        generation: 1,
                     },
                     &harness.registry,
                 )
@@ -2022,6 +2037,11 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                     .pane_role_map
                     .insert(pane.to_string(), "coder".to_string());
                 state.pane_cwd_map.insert(pane.to_string(), cwd_str.clone());
+                // Fork #358: matches what `register_orchestration_role`
+                // would record for a first registration.
+                state
+                    .pane_registration_generation
+                    .insert(pane.to_string(), 1);
             }
 
             let registry = AgentPtyRegistry::new();
@@ -2036,7 +2056,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         task: REPORT_A.to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
-                        generation: 0,
+                        generation: 1,
                     },
                     &registry,
                 )
@@ -2048,7 +2068,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         task: REPORT_B.to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
-                        generation: 0,
+                        generation: 1,
                     },
                     &registry,
                 )
@@ -2188,6 +2208,14 @@ async fn run_two_work_done_calls(
     state
         .pane_cwd_map
         .insert(worker_pane.clone(), cwd_str.clone());
+    // Fork #358: matches what `register_orchestration_role` would record
+    // for a first registration.
+    state
+        .pane_registration_generation
+        .insert(orch_pane.clone(), 1);
+    state
+        .pane_registration_generation
+        .insert(worker_pane.clone(), 1);
 
     state
         .handle_work_done(
@@ -2196,7 +2224,7 @@ async fn run_two_work_done_calls(
                 task: "ORIGINAL-REPORT-MARKER".to_string(),
                 done: false,
                 timestamp: chrono::Utc::now(),
-                generation: 0,
+                generation: 1,
             },
             &registry,
         )
@@ -2232,7 +2260,7 @@ async fn run_two_work_done_calls(
                 task: "BRIEF-SUMMARY-MARKER".to_string(),
                 done: false,
                 timestamp: chrono::Utc::now(),
-                generation: 0,
+                generation: 1,
             },
             &registry,
         )
@@ -2324,6 +2352,12 @@ fn delegate_025_third_collision_destroys_the_first_archived_report() {
             state
                 .pane_cwd_map
                 .insert("triple-coder".to_string(), cwd_str.clone());
+            // Fork #358: matches what `register_orchestration_role` would
+            // record for a first registration; unchanged across all three
+            // calls below since this pane is never re-registered.
+            state
+                .pane_registration_generation
+                .insert("triple-coder".to_string(), 1);
 
             let registry = AgentPtyRegistry::new();
 
@@ -2339,7 +2373,7 @@ fn delegate_025_third_collision_destroys_the_first_archived_report() {
                             task: report.to_string(),
                             done: false,
                             timestamp: chrono::Utc::now(),
-                            generation: 0,
+                            generation: 1,
                         },
                         &registry,
                     )

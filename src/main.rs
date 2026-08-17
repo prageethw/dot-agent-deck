@@ -1359,17 +1359,42 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Fork #358: ask the daemon for this pane's CURRENT registration
+            // generation, as close to send time as the round trip allows,
+            // and echo it back on the signal below. `handle_work_done`
+            // compares this against the pane's generation again at delivery
+            // time — a mismatch there means the pane was re-registered
+            // (worktree torn down and its pane_id reused) since this
+            // request, and the report is refused rather than misdelivered
+            // to whichever tenant now holds the pane_id. A missing/older
+            // daemon, or any failure of this lookup, degrades to `0`, which
+            // never matches a real registration (those start at `1`) — so a
+            // failed lookup here means this report is refused at delivery,
+            // not silently delivered unchecked. See
+            // `WorkDoneSignal::generation`'s doc for the cross-version cost
+            // of that choice.
+            let generation_req = dot_agent_deck::event::DaemonMessage::GetRegistrationGeneration(
+                dot_agent_deck::event::GetRegistrationGenerationRequest {
+                    pane_id: pane_id.clone(),
+                },
+            );
+            let generation = match serde_json::to_string(&generation_req) {
+                Ok(json) => match dot_agent_deck::hook::request_from_socket(&json) {
+                    Some(line) if !line.trim().is_empty() => serde_json::from_str::<
+                        dot_agent_deck::event::GetRegistrationGenerationResponse,
+                    >(&line)
+                    .map(|resp| resp.generation)
+                    .unwrap_or(0),
+                    _ => 0,
+                },
+                Err(_) => 0,
+            };
             let signal = dot_agent_deck::event::WorkDoneSignal {
                 pane_id,
                 task,
                 done,
                 timestamp: chrono::Utc::now(),
-                // Fork #358 M1 scaffold: the CLI does not yet learn its own
-                // registration generation (Open Question in the PRD — where
-                // it should read this from is undecided), so it always
-                // echoes 0 for now. Threading the real value through is the
-                // fix, not this scaffold.
-                generation: 0,
+                generation,
             };
             let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
             let json = match serde_json::to_string(&msg) {

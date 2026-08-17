@@ -117,15 +117,26 @@ impl SyntheticAgent {
 
     /// Build the [`WorkDoneSignal`] this agent (as a worker, or as the
     /// orchestrator with `done`) would send via `dot-agent-deck work-done`.
+    ///
+    /// Fork #358: no test currently calls this method against a live
+    /// `handle_work_done`, so the placeholder `generation: 0` below has
+    /// never needed to be real. If a future caller wires this up, note that
+    /// `handle_work_done` now refuses on a generation mismatch, and
+    /// [`Self::register_role`] does NOT call the real
+    /// `AppState::register_orchestration_role` (it hand-rolls the same
+    /// maps), so it does not populate `pane_registration_generation`
+    /// either — `0` would be refused as "no registration on file" exactly
+    /// as `state.rs`'s and `delegate_prompt_injection.rs`'s test helpers
+    /// were before their fork #358 fixes. A caller wiring this up for real
+    /// needs to set `state.pane_registration_generation` explicitly (or
+    /// switch `register_role` to call `register_orchestration_role`) and
+    /// pass a matching value here.
     pub fn work_done(&self, task: impl Into<String>, done: bool) -> WorkDoneSignal {
         WorkDoneSignal {
             pane_id: self.pane_id.clone(),
             task: task.into(),
             done,
             timestamp: chrono::Utc::now(),
-            // Fork #358 M1 scaffold: no e2e coverage yet exercises the
-            // generation-mismatch refusal path, so this helper always sends
-            // the same placeholder every other pre-#358 signal does.
             generation: 0,
         }
     }

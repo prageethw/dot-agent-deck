@@ -722,6 +722,19 @@ pub enum DaemonMessage {
     /// daemon simply never replies, which the CLI degrades on.
     #[serde(rename = "list_targets")]
     ListTargets(ListTargetsRequest),
+    /// Fork #358: a READ-ONLY request for the pane's current
+    /// `AppState::pane_registration_generation` value, issued by the
+    /// `work-done` CLI immediately before it sends [`Self::WorkDone`] — the
+    /// generation travels on the signal, so the daemon can tell (at
+    /// delivery time) whether the pane has since been re-registered for a
+    /// different tenant. Like [`Self::GetSeed`], the daemon writes a
+    /// [`GetRegistrationGenerationResponse`] JSON line back on the same
+    /// connection; rides the unversioned hook socket, so it does NOT move
+    /// the attach `PROTOCOL_VERSION`. An older daemon that doesn't know this
+    /// variant sends no reply, and the CLI degrades to `generation: 0` — see
+    /// [`WorkDoneSignal::generation`] for what that costs.
+    #[serde(rename = "get_registration_generation")]
+    GetRegistrationGeneration(GetRegistrationGenerationRequest),
 }
 
 /// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
@@ -779,6 +792,27 @@ pub struct ListTargetsResponse {
 pub struct ListedOrchestration {
     pub name: String,
     pub roles: usize,
+}
+
+/// Fork #358: payload of [`DaemonMessage::GetRegistrationGeneration`] — the
+/// pane whose current registration generation the caller wants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetRegistrationGenerationRequest {
+    pub pane_id: String,
+}
+
+/// Fork #358: the daemon's reply to a
+/// [`DaemonMessage::GetRegistrationGeneration`], one JSON line back on the
+/// hook-socket connection (the [`GetSeedResponse`] pattern). `0` means the
+/// daemon has no registration on file for this pane_id — either it was
+/// never registered via `AppState::register_orchestration_role`, or (should
+/// never happen for a live pane) it was cleared by `unregister_pane`. `0`
+/// deliberately also never matches a real registration, whose first
+/// generation is `1` — see [`WorkDoneSignal::generation`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetRegistrationGenerationResponse {
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on
@@ -1067,13 +1101,20 @@ pub struct WorkDoneSignal {
     #[serde(default)]
     pub done: bool,
     pub timestamp: DateTime<Utc>,
-    /// Fork #358 M1 scaffold: the pane's
-    /// `AppState::pane_registration_generation` value at the point this
-    /// signal was produced for. `#[serde(default)]` so an older CLI build
-    /// that doesn't send this field still parses (defaulting to `0`, which
-    /// never matches a real registration's generation — those start at `1`).
-    /// Nothing in `handle_work_done` reads this yet to decide refusal; that
-    /// gate is fork #358's actual fix, not this scaffold.
+    /// Fork #358: the pane's `AppState::pane_registration_generation` value
+    /// at the point this signal was produced for — the `work-done` CLI reads
+    /// this fresh from the daemon (see
+    /// [`DaemonMessage::GetRegistrationGeneration`]) immediately before
+    /// sending. `handle_work_done` refuses delivery when this no longer
+    /// matches the pane's CURRENT generation: the pane was re-registered
+    /// (worktree teardown + reuse) since this signal's worker began, so
+    /// `pane_cwd_map`/`pane_role_map` now point at a different tenant.
+    /// `#[serde(default)]` so an older CLI build that doesn't send this
+    /// field still parses (defaulting to `0`, which never matches a real
+    /// registration's generation — those start at `1` — so an old CLI
+    /// talking to a post-#358 daemon has its reports refused rather than
+    /// silently misdelivered; see the fork#358 work-done report for why this
+    /// tradeoff was accepted).
     #[serde(default)]
     pub generation: u64,
 }
