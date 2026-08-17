@@ -31,6 +31,11 @@
 #        `DeliveryPhase` implementation was removed)
 #   '<'  no match found in the new range at all — the strongest automated
 #        signal of a genuine drop
+# A fourth outcome, '>' (present only in the new range), is reported by
+# `range-diff` but deliberately not surfaced below: it can only ever be a
+# newly-added commit, never a drop, so it carries no signal for this
+# drop-hunting audit. Its absence from the output below is intentional, not
+# a gap in coverage.
 # Neither '!' nor '<' is proof by itself: '!' can be a legitimate rewrite
 # (message reworded, tests renamed) and '<' can be a commit whose content
 # was folded into a differently-shaped commit elsewhere (verified false
@@ -76,14 +81,17 @@ echo "---"
 out="$(git range-diff --no-color "$base..$old_tip" "$base..$new_tip")"
 
 echo "$out" | grep -E "^ *[0-9]+: +[0-9a-f]+ < " | sed -E 's/^/UNMATCHED       /' || true
-echo "$out" | grep -E "^ *[0-9]+: +[0-9a-f]+ ! +[0-9]+: +[0-9a-f]+ / " > /dev/null 2>&1 || true
 echo "$out" | grep -E "^ *[0-9]+: +[0-9a-f]+ ! " | sed -E 's/^/CORRELATED-DIFF /' || true
 
 echo "---"
-echo "UNMATCHED rows have no match at all in the new range — investigate first."
-echo "CORRELATED-DIFF rows matched by message/context but their patch content"
-echo "differs — read the diff-of-diff (rerun without piping to grep) for large"
-echo "deletions before ruling them safe."
-echo "Either verdict must be confirmed by grepping current src//tests/ for the"
-echo "commit's actual symbols — a SHA-only verdict produces false positives"
-echo "(see the header comment in this script)."
+# NOTE: these legend lines are deliberately prefixed "# " so they cannot
+# collide with the "UNMATCHED"/"CORRELATED-DIFF" data-line prefixes above —
+# a bare `grep -c "^UNMATCHED"` on this script's own output would otherwise
+# overcount by one (hit by both the reviewer and auditor of fork issue #443).
+echo "# UNMATCHED rows have no match at all in the new range — investigate first."
+echo "# CORRELATED-DIFF rows matched by message/context but their patch content"
+echo "# differs — read the diff-of-diff (rerun without piping to grep) for large"
+echo "# deletions before ruling them safe."
+echo "# Either verdict must be confirmed by grepping current src//tests/ for the"
+echo "# commit's actual symbols — a SHA-only verdict produces false positives"
+echo "# (see the header comment in this script)."
