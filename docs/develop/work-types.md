@@ -8,7 +8,7 @@ Before this PRD the repo had five surfaces carrying work-type vocabulary, three 
 
 | Work type | changelog suffix | GitHub label | in `prds/`? | branch prefix | commit prefix |
 |---|---|---|---|---|---|
-| `bug` | `.bugfix.md` | `bug` | no | `fix/` | `fix:` |
+| `bug` | `.bugfix.md`, or `.breaking.md` on a `fix/` branch when the fix also breaks compatibility | `bug` | no | `fix/` | `fix:` |
 | `prd` | `.feature.md`, or `.breaking.md` when it breaks the TUI↔daemon contract | `enhancement` | yes | `feat/` | `feat:` |
 | `doc` | `.doc.md` | *none — see "documentation is an area label" below* | no | `docs/` | `docs:` |
 | `chore` | `.misc.md` | `chore` | no | `chore/` | `chore:`/`ci:`/`test:`/`refactor:` |
