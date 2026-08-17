@@ -94,10 +94,14 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         deck.snapshot_grid()
     );
     // No agent-type badge to key off anymore; the sole restored pane's
-    // auto-assigned display name ("pane-1") is the retained identity text.
+    // retained identity text is its daemon-minted pane id, truncated to the
+    // dashboard's 11-char `id_display` prefix (`mint_pane_id`'s
+    // "pane-<16-hex-nonce>-<seq>" shape is always longer than that, so the
+    // truncation is exercised on every run, not just when it happens to be).
+    let id_display = pane_id.get(..11).unwrap_or(pane_id);
     assert!(
-        deck.wait_for_grid_string_within("pane-1", Duration::from_secs(10)),
-        "the live dashboard card did not show its pane identity:\n{}",
+        deck.wait_for_grid_string_within(id_display, Duration::from_secs(10)),
+        "the live dashboard card did not show its pane identity ({id_display}):\n{}",
         deck.snapshot_grid()
     );
 
