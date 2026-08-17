@@ -4268,10 +4268,13 @@ exit 0
             .expect("build current-thread runtime");
 
         let start = Instant::now();
-        let result = rt.block_on(tokio::time::timeout(
-            Duration::from_millis(200),
-            git_common_dir_async(scratch.path()),
-        ));
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                git_common_dir_async(scratch.path()),
+            )
+            .await
+        });
         let elapsed = start.elapsed();
 
         // SAFETY: see the comment on the previous unsafe block.
