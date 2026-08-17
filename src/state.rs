@@ -514,6 +514,20 @@ impl OrchestrationIdentity {
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
+    /// PRD #254 M1 scaffold: pane ids whose Codex native hook install/trust
+    /// (`codex_spawn_prep` in `src/wrap.rs`) is KNOWN to have failed for that
+    /// specific pane. `codex_spawn_prep`'s outcome is currently only
+    /// `tracing::warn!`'d and discarded (`CodexSpawnPrep` carries just the
+    /// pinned `CODEX_HOME`, not a trust-success flag) — nothing today
+    /// populates this from a real spawn, and `delivery_capability` does not
+    /// consult it either. It exists purely so
+    /// `delivery_capability_does_not_defer_codex_reports_to_hook_outcome`
+    /// below can express "the hook is known to have failed for this pane"
+    /// without driving an actual `codex` process through `codex_spawn_prep`.
+    /// Threading the real outcome here (or wherever else `delivery_capability`
+    /// ends up reading it) and gating `Reports` on it is PRD #254's actual
+    /// fix, not this field.
+    pub codex_hook_trust_failed: HashSet<String>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Set by the background version-check task when a newer release exists.

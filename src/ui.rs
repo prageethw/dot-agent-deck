@@ -36525,6 +36525,90 @@ mod tests {
         ));
     }
 
+    /// Scenario: A Codex pane's native hook install/trust is recorded as
+    /// having failed (PRD #254's `codex_hook_trust_failed` scaffold, standing
+    /// in for `codex_spawn_prep`'s real outcome), then a fresh, unwritten
+    /// delivery asks `delivery_capability` for that pane. It must not resolve
+    /// `Reports`: a pane whose hook genuinely failed to install/trust can
+    /// never produce TEXT confirmation (`Emitter::emit_with_metadata` hardcodes
+    /// `user_prompt: None` on that degraded path), so classifying it `Reports`
+    /// burns the full 60s escalating retry cycle against a live interactive
+    /// Codex TUI and then permanently abandons the tab's remit at the deadline.
+    ///
+    /// PRD #254: today `delivery_capability` resolves capability from agent
+    /// TYPE alone (`pane_confirmation_capability` over `session.agent_type`) —
+    /// nothing reads `codex_hook_trust_failed`, so this is RED until the hook
+    /// outcome is threaded into resolution.
+    #[test]
+    fn delivery_capability_does_not_yet_defer_codex_reports_to_hook_outcome() {
+        const PANE_ID: &str = "codex-hook-failed-pane";
+        const AGENT_ID: &str = "codex-hook-failed-agent";
+
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.codex_hook_trust_failed.insert(PANE_ID.to_string());
+
+        let delivery = PromptDelivery {
+            expected_agent_id: Some(AGENT_ID.to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "codex-hook-failed-1".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        };
+
+        assert_ne!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports,
+            "PRD #254: a Codex pane whose native hook install/trust is known \
+             to have failed must not be classified Reports — it is resolved \
+             from agent type alone today, so this is expected to fail until \
+             the hook outcome is threaded into capability resolution"
+        );
+    }
+
+    /// Scenario: the healthy-path counterpart to the test above — the same
+    /// Codex pane, but with no failure recorded in
+    /// `codex_hook_trust_failed` (standing in for a `codex_spawn_prep` that
+    /// installed and trusted its hooks successfully). A fresh, unwritten
+    /// delivery must still resolve `Reports`, exactly as it does today: PRD
+    /// #254 narrows WHEN a pane is classified `Reports`, it does not change
+    /// the healthy case. This passes both before and after PRD #254's fix —
+    /// a regression guard, not the RED half of this pin.
+    #[test]
+    fn delivery_capability_still_reports_a_codex_pane_with_no_recorded_hook_failure() {
+        const PANE_ID: &str = "codex-hook-healthy-pane";
+        const AGENT_ID: &str = "codex-hook-healthy-agent";
+
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        assert!(
+            !snapshot.codex_hook_trust_failed.contains(PANE_ID),
+            "sanity: this pane must not carry a recorded hook failure"
+        );
+
+        let delivery = PromptDelivery {
+            expected_agent_id: Some(AGENT_ID.to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "codex-hook-healthy-1".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        };
+
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports,
+            "no behavior change for a Codex pane with no recorded hook failure"
+        );
+    }
+
     /// Issue #424 (tester's finding / C2, coder-authored): which seed-path
     /// outcomes are terminal, and why "already written" is part of the answer.
     #[test]
