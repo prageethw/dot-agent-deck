@@ -668,6 +668,11 @@ impl AgentEvent {
     /// absent — an old wrapper build, a non-Codex-identity spawn, or any
     /// non-wrapper producer, none of which report anything about hook trust,
     /// and none of which should be read as either a success or a failure.
+    /// `Some(false)` (auditor I2) when the key IS present but its value is
+    /// neither `"true"` nor `"false"` — a future format, a typo, a corrupted
+    /// write. A present-but-garbled value is evidence something went wrong
+    /// and must not be read the same as an absent key, or it silently
+    /// restores the pre-fix `Reports` behaviour H1 exists to close.
     pub fn codex_hook_trust_outcome(&self) -> Option<bool> {
         match self
             .metadata
@@ -676,7 +681,8 @@ impl AgentEvent {
         {
             Some("true") => Some(true),
             Some("false") => Some(false),
-            _ => None,
+            Some(_) => Some(false),
+            None => None,
         }
     }
 

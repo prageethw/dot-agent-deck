@@ -3804,6 +3804,7 @@ impl AppState {
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
+        self.codex_hook_trust_failed.remove(pane_id);
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.

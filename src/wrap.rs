@@ -733,7 +733,7 @@ fn codex_spawn_prep(
         match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd) {
             Ok(count) => {
                 tracing::debug!(count, "codex: recorded scoped trust for deck hooks");
-                hook_trust_confirmed = true;
+                hook_trust_confirmed = count > 0;
             }
             Err(e) => tracing::warn!(
                 "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
