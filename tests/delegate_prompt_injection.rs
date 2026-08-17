@@ -1649,6 +1649,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             task: "Completed without hook activity.".to_string(),
                             done: false,
                             timestamp: chrono::Utc::now(),
+                            generation: 0,
                         },
                         &harness.registry,
                     )
@@ -1678,6 +1679,7 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         task: "The superseded task completed late.".to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
+                        generation: 0,
                     },
                     &harness.registry,
                 )
@@ -2034,6 +2036,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         task: REPORT_A.to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
+                        generation: 0,
                     },
                     &registry,
                 )
@@ -2045,6 +2048,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         task: REPORT_B.to_string(),
                         done: false,
                         timestamp: chrono::Utc::now(),
+                        generation: 0,
                     },
                     &registry,
                 )
@@ -2192,6 +2196,7 @@ async fn run_two_work_done_calls(
                 task: "ORIGINAL-REPORT-MARKER".to_string(),
                 done: false,
                 timestamp: chrono::Utc::now(),
+                generation: 0,
             },
             &registry,
         )
@@ -2227,6 +2232,7 @@ async fn run_two_work_done_calls(
                 task: "BRIEF-SUMMARY-MARKER".to_string(),
                 done: false,
                 timestamp: chrono::Utc::now(),
+                generation: 0,
             },
             &registry,
         )
@@ -2333,6 +2339,7 @@ fn delegate_025_third_collision_destroys_the_first_archived_report() {
                             task: report.to_string(),
                             done: false,
                             timestamp: chrono::Utc::now(),
+                            generation: 0,
                         },
                         &registry,
                     )

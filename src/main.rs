@@ -1364,6 +1364,12 @@ fn main() -> ExitCode {
                 task,
                 done,
                 timestamp: chrono::Utc::now(),
+                // Fork #358 M1 scaffold: the CLI does not yet learn its own
+                // registration generation (Open Question in the PRD — where
+                // it should read this from is undecided), so it always
+                // echoes 0 for now. Threading the real value through is the
+                // fix, not this scaffold.
+                generation: 0,
             };
             let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
             let json = match serde_json::to_string(&msg) {

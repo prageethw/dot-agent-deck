@@ -123,6 +123,10 @@ impl SyntheticAgent {
             task: task.into(),
             done,
             timestamp: chrono::Utc::now(),
+            // Fork #358 M1 scaffold: no e2e coverage yet exercises the
+            // generation-mismatch refusal path, so this helper always sends
+            // the same placeholder every other pre-#358 signal does.
+            generation: 0,
         }
     }
 

@@ -570,6 +570,21 @@ pub struct AppState {
     /// tuple preserved as the `NameCwd` fallback for clients that predate
     /// the token.
     pub pane_orchestration_map: HashMap<String, OrchestrationIdentity>,
+    /// Fork #358 M1 scaffold: maps pane_id → how many times
+    /// [`Self::register_orchestration_role`] has been called for that
+    /// pane_id, incremented on EVERY call regardless of whether the identity
+    /// changed (a same-identity re-register, e.g. a torn-down-and-recreated
+    /// worktree reusing both the same pane_id and the same
+    /// [`OrchestrationIdentity`], still advances this).
+    ///
+    /// This field exists so a [`crate::event::WorkDoneSignal`] can carry the
+    /// generation it was produced under — nothing yet COMPARES that carried
+    /// value against the current one here to decide refusal; the compare-
+    /// and-refuse gate in [`Self::handle_work_done`] is fork #358's actual
+    /// fix and is deliberately NOT part of this scaffold. See
+    /// `handle_work_done_refuses_a_stale_cross_orchestration_signal_after_pane_reuse`
+    /// below for the RED test this field exists to make compile.
+    pub pane_registration_generation: HashMap<String, u64>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -3650,6 +3665,13 @@ impl AppState {
             .insert(pane_id.to_string(), role_name.to_string());
         self.pane_orchestration_map
             .insert(pane_id.to_string(), identity);
+        // Fork #358 M1 scaffold: advance on every call, same-identity
+        // re-register included — see the field doc on
+        // `pane_registration_generation` for why.
+        *self
+            .pane_registration_generation
+            .entry(pane_id.to_string())
+            .or_insert(0) += 1;
         if let Some(cwd) = cwd {
             self.pane_cwd_map
                 .insert(pane_id.to_string(), cwd.to_string());
@@ -6794,6 +6816,91 @@ clear = false
             !state.orchestrator_pane_ids.contains("19"),
             "a pane_id reused for a non-start role must no longer be flagged \
              as an orchestrator"
+        );
+    }
+
+    /// Scenario: register worker pane `"P"` as `coder` for orchestration A and
+    /// capture the registration generation A's `work-done` would carry, then
+    /// re-register the SAME pane_id `"P"` — still as `coder` — for a
+    /// DIFFERENT orchestration B, simulating a worktree teardown + reuse
+    /// (the #358 repro: pane ids are small daemon-scoped integers that
+    /// recycle). Deliver a work-done signal stamped with A's now-stale
+    /// generation and assert it is refused: nothing may be written into B's
+    /// `.dot-agent-deck` directory under B's role, because pane `"P"`
+    /// currently belongs to B, not A.
+    ///
+    /// Fork #358 M1 scaffold note: `AppState::pane_registration_generation`
+    /// and `WorkDoneSignal::generation` exist purely so this test can be
+    /// EXPRESSED — `register_orchestration_role` increments the former on
+    /// every call, and this test reads it back and threads it onto the
+    /// signal by hand (standing in for #358's still-undecided real seam:
+    /// where the worker CLI would capture and echo it). `handle_work_done`
+    /// does not yet compare the two to decide refusal — that gate is fork
+    /// #358's actual fix. This test is RED against pre-fix `handle_work_done`
+    /// because delivery is resolved purely from `signal.pane_id`, which now
+    /// resolves to B: today's code writes A's report into B's worktree under
+    /// B's role and notifies B's orchestrator, exactly the misdelivery this
+    /// assertion exists to catch.
+    #[tokio::test]
+    async fn handle_work_done_refuses_a_stale_cross_orchestration_signal_after_pane_reuse() {
+        let cwd_a = tempfile::tempdir().expect("tempdir");
+        let cwd_b = tempfile::tempdir().expect("tempdir");
+        let identity_a = instance("orch-a");
+        let identity_b = instance("orch-b");
+
+        let mut state = AppState::default();
+        state.register_orchestration_role("A_orch", "orchestrator", true, identity_a.clone(), None);
+        state.register_orchestration_role(
+            "P",
+            "coder",
+            false,
+            identity_a.clone(),
+            Some(cwd_a.path().to_str().expect("utf8 cwd")),
+        );
+        let generation_a = *state
+            .pane_registration_generation
+            .get("P")
+            .expect("registering a pane must record its generation");
+
+        state.register_orchestration_role("B_orch", "orchestrator", true, identity_b.clone(), None);
+        // The teardown-and-reuse: same pane_id "P", different orchestration.
+        state.register_orchestration_role(
+            "P",
+            "coder",
+            false,
+            identity_b,
+            Some(cwd_b.path().to_str().expect("utf8 cwd")),
+        );
+        assert_ne!(
+            *state
+                .pane_registration_generation
+                .get("P")
+                .expect("re-registering must still record a generation"),
+            generation_a,
+            "sanity: re-registering pane P must advance its generation past A's"
+        );
+
+        // A's work-done signal, produced back when "P" belonged to A — it
+        // carries A's now-stale generation.
+        let stale_signal = WorkDoneSignal {
+            pane_id: "P".to_string(),
+            task: "A's report — must never land in B's worktree".to_string(),
+            done: false,
+            timestamp: Utc::now(),
+            generation: generation_a,
+        };
+
+        let registry = AgentPtyRegistry::new();
+        state.handle_work_done(stale_signal, &registry).await;
+
+        let file_name = work_done_file_name("coder", "P");
+        let misdelivered_path = cwd_b.path().join(".dot-agent-deck").join(&file_name);
+        assert!(
+            !misdelivered_path.exists(),
+            "A's stale work-done signal (generation {generation_a}) must be refused \
+             rather than written into B's worktree at {}: today's `handle_work_done` \
+             has no generation check and misdelivers it there",
+            misdelivered_path.display()
         );
     }
 

@@ -1067,6 +1067,15 @@ pub struct WorkDoneSignal {
     #[serde(default)]
     pub done: bool,
     pub timestamp: DateTime<Utc>,
+    /// Fork #358 M1 scaffold: the pane's
+    /// `AppState::pane_registration_generation` value at the point this
+    /// signal was produced for. `#[serde(default)]` so an older CLI build
+    /// that doesn't send this field still parses (defaulting to `0`, which
+    /// never matches a real registration's generation — those start at `1`).
+    /// Nothing in `handle_work_done` reads this yet to decide refusal; that
+    /// gate is fork #358's actual fix, not this scaffold.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[cfg(test)]
@@ -1448,6 +1457,7 @@ mod tests {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-17T10:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            generation: 0,
         };
         let msg = DaemonMessage::WorkDone(signal);
         let json = serde_json::to_string(&msg).unwrap();

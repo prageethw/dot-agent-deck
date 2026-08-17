@@ -301,6 +301,7 @@ impl IdleHarness {
                     task: "The delegated test task is complete.".to_string(),
                     done: false,
                     timestamp: chrono::Utc::now(),
+                    generation: 0,
                 },
                 &self.registry,
             )
