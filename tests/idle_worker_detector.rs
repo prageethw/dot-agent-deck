@@ -302,6 +302,9 @@ impl IdleHarness {
     }
 
     async fn work_done(&self, role: &str) {
+        // Fork #358 M4: read the harness's own daemon_boot_id so the signal
+        // below matches, same reasoning as `generation`.
+        let daemon_boot_id = self.state.read().await.daemon_boot_id().to_string();
         self.state
             .read()
             .await
@@ -315,6 +318,7 @@ impl IdleHarness {
                     // for every worker pane (fork #358); these panes are
                     // never re-registered mid-test.
                     generation: 1,
+                    daemon_boot_id,
                 },
                 &self.registry,
             )

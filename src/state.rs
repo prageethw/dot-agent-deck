@@ -511,6 +511,55 @@ impl OrchestrationIdentity {
     }
 }
 
+/// Fork #358 M4: a value that identifies THIS daemon process's lifetime,
+/// distinct from any pane. Minted fresh every time one is constructed — see
+/// `impl Default` below, deliberately hand-written rather than derived —
+/// so it changes across a daemon restart even though [`AppState`]'s own
+/// `#[derive(Default)]` constructs one the same way it constructs every
+/// other field.
+///
+/// This is the other half of the fix M1/M2 turned out not to close
+/// (reviewer + auditor, independently, on 2026-08-17): `pane_registration_generation`
+/// alone cannot tell a pre-restart registration from a post-restart one that
+/// reuses the same pane_id, because the counter is in-memory and both a
+/// pre-restart and a post-restart `AppState` start every pane at generation
+/// `1`. Pairing the generation with a value that is ALSO fresh per daemon
+/// boot closes that: two independently-started `AppState`s (a real restart,
+/// or the two-instance shape `handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart`
+/// uses to model one) can never mint the same [`DaemonBootId`], so a signal
+/// carrying the pre-restart value can never match post-restart, whatever the
+/// generation counter says.
+///
+/// See [`AppState::daemon_boot_id`] and [`AppState::handle_work_done`]'s
+/// compound-key comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonBootId(String);
+
+impl Default for DaemonBootId {
+    /// Same minting recipe as [`crate::agent_pty::mint_pane_id`] /
+    /// `mint_orchestration_id` — a hash of the process id and the current
+    /// epoch nanoseconds, plus a monotonic per-process sequence so two
+    /// mints within the same nanosecond (unlikely, but the sequence is
+    /// cheap insurance) still differ. Unlike those two, this does NOT cache
+    /// the hash behind a `OnceLock`: each call must mint a genuinely FRESH
+    /// value, because tests model two different daemon processes as two
+    /// `AppState::default()` calls within the SAME real process, and a
+    /// process-cached nonce would hand both the same value, silently
+    /// defeating the entire compound key.
+    fn default() -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        seq.hash(&mut h);
+        DaemonBootId(format!("boot-{:016x}", h.finish()))
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -593,6 +642,16 @@ pub struct AppState {
     /// by construction whatever a stale signal's delivery is trying to
     /// detect.
     pub pane_registration_generation: HashMap<String, u64>,
+    /// Fork #358 M4: minted fresh for THIS `AppState` instance (see
+    /// [`DaemonBootId`]'s doc for why `#[derive(Default)]` still does the
+    /// right thing here). Paired with the per-pane entry in
+    /// `pane_registration_generation` to form the compound key
+    /// [`Self::handle_work_done`] checks a [`crate::event::WorkDoneSignal`]
+    /// against — the generation alone resets to the same starting values on
+    /// every restart, so it cannot by itself distinguish a pre-restart
+    /// registration from a post-restart one that reuses the same pane_id;
+    /// this field can, because a fresh `AppState` always mints a fresh one.
+    daemon_boot_id: DaemonBootId,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -3718,6 +3777,18 @@ impl AppState {
         *entry
     }
 
+    /// Fork #358 M4: this `AppState` instance's [`DaemonBootId`], read
+    /// alongside [`Self::reserve_registration_generation`] at spawn time so
+    /// a production spawn call site can inject BOTH into the child's
+    /// environment (`DOT_AGENT_DECK_DAEMON_BOOT_ID`, sibling to
+    /// `DOT_AGENT_DECK_REGISTRATION_GENERATION`), and again by
+    /// [`Self::handle_work_done`] to validate an incoming signal's compound
+    /// key. Never changes for the lifetime of one `AppState` — it is stamped
+    /// once, in [`DaemonBootId::default`], when this instance was built.
+    pub fn daemon_boot_id(&self) -> &str {
+        &self.daemon_boot_id.0
+    }
+
     /// Fork #358 M2: the post-spawn counterpart of
     /// [`Self::reserve_registration_generation`] — sets
     /// `pane_registration_generation` to the caller-supplied
@@ -4255,6 +4326,56 @@ impl AppState {
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
     pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+        // Fork #358 M4 (auditor B2 / issue #444): validate the signal's
+        // registration BEFORE touching retire_silence_watch /
+        // retire_outstanding_delegation below, so a signal this pane's
+        // CURRENT tenant never actually produced can't disarm that tenant's
+        // own bookkeeping. This used to run AFTER the retire calls (see PRD
+        // #126's reasoning on them, preserved below) — fine while a refusal
+        // was rare, but M4's fail-closed compound key makes ONE case
+        // guaranteed rather than rare: an old `worker-agent-deck` binary on
+        // a worker's `$PATH` during a rolling upgrade sends no generation
+        // and no boot id at all (`generation: 0`, `daemon_boot_id: ""`),
+        // which can never match a live registration — every such report was
+        // being refused AND silently cancelling the current tenant's own
+        // silence-watch/outstanding-delegation tracking first, so a
+        // legitimately still-working worker looked idle with its nudge
+        // already disarmed. `pane_registration_generation` is read here
+        // directly (not via the `pane_role_map` lookup below) because
+        // `unregister_pane` deliberately leaves it populated after a
+        // teardown — see that field's doc — so a torn-down pane's
+        // last-known generation is still available for this comparison.
+        //
+        // This narrows fork issue #444 to the specific case M4's own
+        // fail-closed design makes guaranteed (a KNOWN pane with a
+        // mismatched generation/boot id); it deliberately leaves retiring
+        // BEFORE the "unknown pane" check below unchanged, matching PRD
+        // #126's original reasoning for that case (a pane already
+        // unregistered but whose generation didn't change — e.g. a pending
+        // teardown racing a late, still-valid report — should still have
+        // its bookkeeping cleaned up). #444 stays open for that residual,
+        // narrower slice.
+        let current_generation = self
+            .pane_registration_generation
+            .get(&signal.pane_id)
+            .copied();
+        let current_boot_id = self.daemon_boot_id();
+        if current_generation != Some(signal.generation) || current_boot_id != signal.daemon_boot_id
+        {
+            warn!(
+                pane_id = %signal.pane_id,
+                role = ?self.pane_role_map.get(&signal.pane_id),
+                signal_generation = signal.generation,
+                current_generation = ?current_generation,
+                signal_boot_id = %signal.daemon_boot_id,
+                current_boot_id = %current_boot_id,
+                "work-done: refusing stale signal — pane was re-registered or the \
+                 daemon restarted since this signal was produced (generation/boot id \
+                 mismatch)"
+            );
+            return;
+        }
+
         // PRD #126: the worker answered, so one outstanding delegation is
         // resolved. Retire FIRST — above every early return below — so an
         // unknown pane, an orchestrator's own `--done`, or a missing
@@ -4323,6 +4444,17 @@ impl AppState {
             }
         }
 
+        // Fork #358 M1/M4: the compound generation/boot-id check now runs
+        // BEFORE the retire calls above (see the comment there) — this is
+        // purely the "do we know this pane_id at all" check, unrelated to
+        // whether ITS registration is current. `pane_role_map` and
+        // `pane_registration_generation` are always written together by
+        // `register_orchestration_role`, so having survived the compound
+        // check above (which requires a `pane_registration_generation`
+        // entry) and still lacking a `pane_role_map` entry here means a
+        // caller that skipped proper registration entirely — refused the
+        // same way, per the PRD's "missing entry, treat conservatively"
+        // design.
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {
@@ -4330,38 +4462,6 @@ impl AppState {
                 return;
             }
         };
-
-        // Fork #358: refuse a signal produced under a registration this pane
-        // no longer holds. `register_orchestration_role` bumps
-        // `pane_registration_generation` on EVERY call (same-identity
-        // re-register included), so a signal whose carried generation no
-        // longer matches the pane's CURRENT one means the pane was
-        // re-registered — a worktree torn down and its pane_id reused,
-        // possibly for a different orchestration entirely — since this
-        // signal's worker began. Deliver it now and it lands in the wrong
-        // tenant's worktree, under the wrong tenant's role, reported to the
-        // wrong tenant's orchestrator (see `pane_cwd_map`/`pane_role_map`
-        // resolution below). `pane_role_map` and `pane_registration_generation`
-        // are always written together by `register_orchestration_role`, so
-        // having survived the `pane_role_map` lookup above without an entry
-        // here means either a genuinely stale/reused pane_id or a caller
-        // that skipped proper registration — both are refused the same way,
-        // per the PRD's "missing entry, treat conservatively" design.
-        let current_generation = self
-            .pane_registration_generation
-            .get(&signal.pane_id)
-            .copied();
-        if current_generation != Some(signal.generation) {
-            warn!(
-                pane_id = %signal.pane_id,
-                role = %role_name,
-                signal_generation = signal.generation,
-                current_generation = ?current_generation,
-                "work-done: refusing stale cross-orchestration signal — pane was \
-                 re-registered since this signal was produced (generation mismatch)"
-            );
-            return;
-        }
 
         // Orchestrator's own `--done`: completion signal, no feedback to write.
         if signal.done && self.orchestrator_pane_ids.contains(&signal.pane_id) {
@@ -7040,6 +7140,14 @@ clear = false
             done: false,
             timestamp: Utc::now(),
             generation: generation_a,
+            // Fork #358 M4: this is the SAME `AppState` instance throughout
+            // (A's registration, B's re-registration, and delivery all
+            // happen on `state`), so its `daemon_boot_id` never changes —
+            // this test is specifically about the intra-process pane-reuse
+            // case, which the generation mismatch above already catches on
+            // its own. `handle_work_done_refuses_a_stale_signal_from_before_a_daemon_restart`
+            // below is the one that pins the cross-restart case.
+            daemon_boot_id: state.daemon_boot_id().to_string(),
         };
 
         let registry = AgentPtyRegistry::new();
@@ -7105,6 +7213,12 @@ clear = false
             done: false,
             timestamp: Utc::now(),
             generation: generation_before,
+            // Fork #358 M4: the OTHER half of the compound key — read back
+            // from `state_before`, never hand-typed, exactly like
+            // `generation_before` above. A real worker's env would carry
+            // this from the pre-restart daemon it was actually spawned
+            // under.
+            daemon_boot_id: state_before.daemon_boot_id().to_string(),
         };
 
         // Post-restart daemon: a FRESH AppState — nothing carries over,
@@ -7131,6 +7245,20 @@ clear = false
             "sanity: two independent AppState instances (simulating a \
              daemon restart) must both start pane P's generation at the \
              same value — closing that collision is exactly what M4 must do"
+        );
+        // Sanity: this is the actual mechanism M4 adds. Two independently
+        // constructed `AppState`s must mint DIFFERENT `daemon_boot_id`s —
+        // the compound key is only a real fix if this holds; if it didn't,
+        // the refusal below would be passing for the wrong reason (the
+        // generation mismatch would have to do all the work, and the M1
+        // test above already covers that case).
+        assert_ne!(
+            state_before.daemon_boot_id(),
+            state_after.daemon_boot_id(),
+            "sanity: two independent AppState instances (simulating a daemon \
+             restart) must mint DIFFERENT daemon_boot_id values — this is \
+             what lets the compound key catch a collision the generation \
+             alone cannot"
         );
 
         let registry = AgentPtyRegistry::new();
@@ -7185,6 +7313,7 @@ clear = false
             done: false,
             timestamp: Utc::now(),
             generation: reserved,
+            daemon_boot_id: state.daemon_boot_id().to_string(),
         };
 
         let registry = AgentPtyRegistry::new();

@@ -96,7 +96,8 @@ use crate::platform::ipc::{IpcListener, IpcStream};
 pub use crate::agent_pty::TabMembership;
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{
-    DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_REGISTRATION_GENERATION, mint_pane_id,
+    DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID, DOT_AGENT_DECK_REGISTRATION_GENERATION,
+    mint_pane_id,
 };
 use crate::event::{AgentType, BroadcastMsg};
 use crate::pane_input::escape_bytes_for_log;
@@ -1421,15 +1422,22 @@ async fn handle_connection(
             // send time (see `AppState::reserve_registration_generation`'s
             // doc, and the `WorkDoneSignal::generation` field doc, for why
             // that distinction is the whole fix for fork issue #358).
+            // Fork #358 M4: the daemon's boot id, read in the SAME write
+            // guard as the generation reservation above (so both come from
+            // the exact same `AppState` instance) and injected alongside
+            // it. See `DOT_AGENT_DECK_DAEMON_BOOT_ID`'s doc for why the
+            // generation alone cannot tell a pre-restart registration from
+            // a post-restart one that reuses the same pane_id.
             let reserved_generation = if orchestration_meta.is_some() {
-                let generation = state
-                    .write()
-                    .await
-                    .reserve_registration_generation(&minted_pane_id);
+                let mut st = state.write().await;
+                let generation = st.reserve_registration_generation(&minted_pane_id);
+                let boot_id = st.daemon_boot_id().to_string();
+                drop(st);
                 env.push((
                     DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
                     generation.to_string(),
                 ));
+                env.push((DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(), boot_id));
                 Some(generation)
             } else {
                 None

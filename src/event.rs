@@ -1089,6 +1089,28 @@ pub struct WorkDoneSignal {
     /// `changelog.d/358.breaking.md` for why this tradeoff was accepted).
     #[serde(default)]
     pub generation: u64,
+    /// Fork #358 M4: the `AppState::daemon_boot_id` value in effect when
+    /// this worker's registration generation (above) was reserved — read
+    /// from `DOT_AGENT_DECK_DAEMON_BOOT_ID`, injected at spawn time sibling
+    /// to `DOT_AGENT_DECK_REGISTRATION_GENERATION`, same recipe as that
+    /// field. Needed because `generation` ALONE turned out not to close
+    /// fork issue #358's actual repro (reviewer + auditor, independently,
+    /// on 2026-08-17): `pane_registration_generation` is an in-memory map
+    /// that resets to empty on every daemon restart, exactly like the
+    /// counter it guards — so a pre-restart worker's signal and the
+    /// post-restart pane that reused its pane_id can both legitimately
+    /// carry generation `1`, and the generation check alone lets the stale
+    /// signal through. Pairing it with the daemon's own boot id closes that:
+    /// a fresh `AppState` mints a fresh `daemon_boot_id` on every
+    /// construction (real restart or test), so a pre-restart value can
+    /// never match a post-restart one, whatever the generation says.
+    /// `#[serde(default)]` so an older CLI build that doesn't send this
+    /// field still parses (defaulting to `""`, which no real
+    /// `daemon_boot_id` is ever minted as — see `DaemonBootId::default` —
+    /// so an old CLI's report is refused exactly like a bare `generation: 0`
+    /// already was; see `changelog.d/358.breaking.md`).
+    #[serde(default)]
+    pub daemon_boot_id: String,
 }
 
 #[cfg(test)]
@@ -1471,6 +1493,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             generation: 0,
+            daemon_boot_id: "boot-deadbeef".into(),
         };
         let msg = DaemonMessage::WorkDone(signal);
         let json = serde_json::to_string(&msg).unwrap();
@@ -1480,6 +1503,7 @@ mod tests {
                 assert_eq!(s.pane_id, "pane-2");
                 assert_eq!(s.task, "Implemented login");
                 assert!(!s.done);
+                assert_eq!(s.daemon_boot_id, "boot-deadbeef");
             }
             _ => panic!("expected WorkDone"),
         }

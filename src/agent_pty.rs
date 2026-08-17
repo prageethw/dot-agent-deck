@@ -53,6 +53,20 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// symbol.
 pub const DOT_AGENT_DECK_REGISTRATION_GENERATION: &str = "DOT_AGENT_DECK_REGISTRATION_GENERATION";
 
+/// Fork #358 M4: the daemon's `AppState::daemon_boot_id` in effect when the
+/// generation above was reserved, injected alongside it into the worker's
+/// spawn-time environment — sibling to [`DOT_AGENT_DECK_PANE_ID`] and
+/// [`DOT_AGENT_DECK_REGISTRATION_GENERATION`], same drift-safety reasoning.
+/// `pane_registration_generation` alone cannot tell a pre-restart
+/// registration from a post-restart one that reuses the same pane_id — both
+/// start the pane at generation `1`, since the map is in-memory and resets
+/// on restart exactly like the counter it guards. Pairing it with a value
+/// that is ALSO fresh per daemon boot (see
+/// [`crate::state::AppState::daemon_boot_id`]) closes that: a pre-restart
+/// worker's env can never carry the post-restart daemon's boot id, whatever
+/// the generation says.
+pub const DOT_AGENT_DECK_DAEMON_BOOT_ID: &str = "DOT_AGENT_DECK_DAEMON_BOOT_ID";
+
 /// PRD #92 F9 followup-7: per-spawn daemon-side agent id the daemon
 /// injects into every spawned agent's environment. The agent's hook
 /// script reads this and attaches it to each emitted `AgentEvent` as

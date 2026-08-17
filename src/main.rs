@@ -1386,12 +1386,25 @@ fn main() -> ExitCode {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
+            // Fork #358 M4: sibling to `generation` above — read from its own
+            // env var, injected at spawn time alongside
+            // `DOT_AGENT_DECK_REGISTRATION_GENERATION`, for the same
+            // "travels with the worker process from spawn" reason. Missing
+            // (an old CLI predating this variable, or a non-managed caller)
+            // degrades to `""`, which no real `daemon_boot_id` is ever
+            // minted as (see `DaemonBootId::default`), so this report is
+            // refused at delivery exactly like a bare `generation: 0`
+            // already was.
+            let daemon_boot_id: String =
+                std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_DAEMON_BOOT_ID)
+                    .unwrap_or_default();
             let signal = dot_agent_deck::event::WorkDoneSignal {
                 pane_id,
                 task,
                 done,
                 timestamp: chrono::Utc::now(),
                 generation,
+                daemon_boot_id,
             };
             let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
             let json = match serde_json::to_string(&msg) {

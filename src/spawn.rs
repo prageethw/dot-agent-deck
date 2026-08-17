@@ -46,7 +46,7 @@ use tokio::sync::broadcast;
 use chrono::{DateTime, Utc};
 
 use crate::agent_pty::{
-    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID,
+    AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
     DOT_AGENT_DECK_REGISTRATION_GENERATION, DeliveryNotice, GuardedSend, GuardedSendDetail,
     SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
@@ -472,7 +472,8 @@ pub async fn spawn(
                 req.owner.as_deref(),
                 // A single-agent spawn is never registered as an
                 // orchestration role (see the block below `state` gates on),
-                // so it never needs a registration generation.
+                // so it never needs a registration generation or boot id.
+                None,
                 None,
                 notifier,
             )?;
@@ -552,14 +553,19 @@ pub async fn spawn(
                     display_title: None,
                     orchestration_id: Some(orchestration_id.clone()),
                 };
-                let reserved_generation = match state {
-                    Some(state) => Some(
-                        state
-                            .write()
-                            .await
-                            .reserve_registration_generation(&pane_id),
-                    ),
-                    None => None,
+                // Fork #358 M4: read alongside the generation reservation
+                // (same `write` guard, so the two are read from the exact
+                // same AppState instance) and injected into the child's env
+                // sibling to it — see `DOT_AGENT_DECK_DAEMON_BOOT_ID`'s doc
+                // for why the generation alone is not enough.
+                let (reserved_generation, daemon_boot_id) = match state {
+                    Some(state) => {
+                        let mut st = state.write().await;
+                        let generation = st.reserve_registration_generation(&pane_id);
+                        let boot_id = st.daemon_boot_id().to_string();
+                        (Some(generation), Some(boot_id))
+                    }
+                    None => (None, None),
                 };
                 let id = spawn_one(
                     registry,
@@ -577,6 +583,7 @@ pub async fn spawn(
                     false,
                     req.owner.as_deref(),
                     reserved_generation,
+                    daemon_boot_id,
                     notifier,
                 )?;
                 agents.push(SpawnedAgent {
@@ -775,6 +782,11 @@ fn spawn_one(
     // role of an orchestration. Injected into the child's env so the
     // `work-done` CLI can report it without asking the daemon.
     registration_generation: Option<u64>,
+    // Fork #358 M4: the daemon's `AppState::daemon_boot_id` at the moment
+    // `registration_generation` was reserved — same `Some`/`None` gate,
+    // injected alongside it. See `DOT_AGENT_DECK_DAEMON_BOOT_ID`'s doc for
+    // why the generation alone does not survive a daemon restart.
+    daemon_boot_id: Option<String>,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let opts = SpawnOptions {
@@ -783,7 +795,13 @@ fn spawn_one(
         display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
-        env: pane_env(pane_id, pin_sh, owner, registration_generation),
+        env: pane_env(
+            pane_id,
+            pin_sh,
+            owner,
+            registration_generation,
+            daemon_boot_id,
+        ),
         tab_membership: membership,
         // PRD #127 finding #4: tag the daemon-side registry entry with the
         // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
@@ -819,6 +837,7 @@ fn pane_env(
     pin_sh: bool,
     owner: Option<&str>,
     registration_generation: Option<u64>,
+    daemon_boot_id: Option<String>,
 ) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
@@ -845,6 +864,14 @@ fn pane_env(
             DOT_AGENT_DECK_REGISTRATION_GENERATION.to_string(),
             generation.to_string(),
         ));
+    }
+    // Fork #358 M4: sibling to the generation above — same `Some` gate
+    // (present only for an orchestration-role pane), same "the work-done
+    // CLI reads this directly" reasoning. See
+    // `DOT_AGENT_DECK_DAEMON_BOOT_ID`'s doc for why the generation alone
+    // does not survive a daemon restart.
+    if let Some(boot_id) = daemon_boot_id {
+        env.push((DOT_AGENT_DECK_DAEMON_BOOT_ID.to_string(), boot_id));
     }
     env
 }
@@ -3912,7 +3939,7 @@ mod tests {
         assert!(command_needs_shell_wrap("touch x; sleep 30"));
 
         // pane_env: single-word (pin_sh=false) → only the pane-id tag.
-        let env = pane_env("sched-x-0", false, None, None);
+        let env = pane_env("sched-x-0", false, None, None, None);
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, DOT_AGENT_DECK_PANE_ID);
         assert!(!env.iter().any(|(k, _)| k == "SHELL"));
@@ -3923,7 +3950,7 @@ mod tests {
         // resolves `%COMSPEC%` (else `cmd.exe`) instead. Asserting the real value
         // on each platform rather than skipping the Windows half — the expectation
         // is restated here independently, not read back out of the seam.
-        let env = pane_env("sched-x-1", true, None, None);
+        let env = pane_env("sched-x-1", true, None, None, None);
         assert_eq!(env.len(), 2);
         let shell = env
             .iter()
@@ -3952,13 +3979,43 @@ mod tests {
     /// was never exercised by any test.
     #[test]
     fn pane_env_injects_the_registration_generation_when_present() {
-        let env = pane_env("sched-x-2", false, None, Some(3));
+        let env = pane_env("sched-x-2", false, None, Some(3), None);
         assert!(
             env.iter()
                 .any(|(k, v)| k == DOT_AGENT_DECK_REGISTRATION_GENERATION && v == "3"),
-            "pane_env(.., Some(3)) must inject \
+            "pane_env(.., Some(3), ..) must inject \
              (DOT_AGENT_DECK_REGISTRATION_GENERATION, \"3\") into the child's \
              env so the work-done CLI can report the generation it was \
+             actually spawned under; got {env:?}"
+        );
+    }
+
+    /// Scenario: call `pane_env` with `daemon_boot_id` set to
+    /// `Some("boot-abc123".to_string())` (an orchestration-role pane, the
+    /// branch every production spawn call site actually exercises) and
+    /// assert the returned env vec carries
+    /// `(DOT_AGENT_DECK_DAEMON_BOOT_ID, "boot-abc123")` alongside the pane-id
+    /// tag. Fork #358 M4: sibling to
+    /// `pane_env_injects_the_registration_generation_when_present` above —
+    /// the `Some` branch for the NEW field needs the same direct coverage,
+    /// not just a hand-written literal on both sides of `handle_work_done`'s
+    /// comparison (reviewer F1 / auditor B3's finding, restated for the
+    /// field M4 adds).
+    #[test]
+    fn pane_env_injects_the_daemon_boot_id_when_present() {
+        let env = pane_env(
+            "sched-x-3",
+            false,
+            None,
+            None,
+            Some("boot-abc123".to_string()),
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == DOT_AGENT_DECK_DAEMON_BOOT_ID && v == "boot-abc123"),
+            "pane_env(.., Some(\"boot-abc123\")) must inject \
+             (DOT_AGENT_DECK_DAEMON_BOOT_ID, \"boot-abc123\") into the child's \
+             env so the work-done CLI can report the daemon boot it was \
              actually spawned under; got {env:?}"
         );
     }

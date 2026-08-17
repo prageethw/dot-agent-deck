@@ -1663,6 +1663,10 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                             // Matches the generation `register_orchestration`
                             // records for WORKER_PANE (fork #358).
                             generation: 1,
+                            // Fork #358 M4: matches this harness's own
+                            // `AppState.daemon_boot_id()`, same reasoning as
+                            // `generation` above — the compound key needs both.
+                            daemon_boot_id: harness.state.daemon_boot_id().to_string(),
                         },
                         &harness.registry,
                     )
@@ -1695,6 +1699,8 @@ fn delegate_021_work_done_releases_only_its_own_delivery_state() {
                         // Matches the generation `register_orchestration`
                         // records for WORKER_PANE (fork #358).
                         generation: 1,
+                        // Fork #358 M4: see the first signal in this test.
+                        daemon_boot_id: harness.state.daemon_boot_id().to_string(),
                     },
                     &harness.registry,
                 )
@@ -2057,6 +2063,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         done: false,
                         timestamp: chrono::Utc::now(),
                         generation: 1,
+                        daemon_boot_id: state.daemon_boot_id().to_string(),
                     },
                     &registry,
                 )
@@ -2069,6 +2076,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                         done: false,
                         timestamp: chrono::Utc::now(),
                         generation: 1,
+                        daemon_boot_id: state.daemon_boot_id().to_string(),
                     },
                     &registry,
                 )
@@ -2225,6 +2233,7 @@ async fn run_two_work_done_calls(
                 done: false,
                 timestamp: chrono::Utc::now(),
                 generation: 1,
+                daemon_boot_id: state.daemon_boot_id().to_string(),
             },
             &registry,
         )
@@ -2261,6 +2270,7 @@ async fn run_two_work_done_calls(
                 done: false,
                 timestamp: chrono::Utc::now(),
                 generation: 1,
+                daemon_boot_id: state.daemon_boot_id().to_string(),
             },
             &registry,
         )
@@ -2374,6 +2384,7 @@ fn delegate_025_third_collision_destroys_the_first_archived_report() {
                             done: false,
                             timestamp: chrono::Utc::now(),
                             generation: 1,
+                            daemon_boot_id: state.daemon_boot_id().to_string(),
                         },
                         &registry,
                     )
