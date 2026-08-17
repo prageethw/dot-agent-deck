@@ -3199,20 +3199,45 @@ fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
     CardDensityKind::Compact
 }
 
+/// Row heights dividing `total_available` across `total_rows` as evenly as
+/// possible — mirrors `even_row_heights` (PRD fork#446 M1, `src/ui.rs`,
+/// beside `fit_grid`) without depending on the private function, the same
+/// mirroring `pick_density` above does for `choose_density`. The first
+/// `total_available % total_rows` rows get one extra row over the floor of
+/// `total_available / total_rows`. `None` only when `total_available` can't
+/// give every row at least 1.
+fn even_row_heights_mirror(total_rows: usize, total_available: u16) -> Option<Vec<u16>> {
+    if (total_available as usize) < total_rows {
+        return None;
+    }
+    let total_rows_u16 = total_rows as u16;
+    let base = total_available / total_rows_u16;
+    let remainder = (total_available % total_rows_u16) as usize;
+    Some(
+        (0..total_rows)
+            .map(|i| if i < remainder { base + 1 } else { base })
+            .collect(),
+    )
+}
+
 /// Scenario: Model the single-column orchestration deck card area (the ~34%
-/// width column → one grid column) at a typical terminal where ~48 rows are
-/// available for cards, and compute the renderer's own capacity
-/// (`visible_rows = available / card_height`) for 7 decks; assert all 7 fit
-/// without scrolling and that the 7th deck actually renders in the visible
-/// slice, while a much larger deck count still engages scrolling. This locks in
-/// PRD #147: with the content-derived Compact height of 6 (PRD fork#405 M1
-/// added the unconditional role-name row, moving Compact height 5 → 6),
-/// 48 / 6 = 8 rows fit so all 7 decks show. Before #147 the hardcoded Compact
-/// height of 7 fit only 48 / 7 = 6 rows, dropping the 7th deck to a scroll —
-/// the regression this test guards against. PRD fork#405 M1 also spends this
-/// test's last margin: 48 / 7 = 6 < 7, so height 6 is now the LARGEST Compact
-/// height that still satisfies it — the next content row anyone adds to a
-/// card breaks this test, and there is no more slack to absorb it.
+/// width column → one grid column) at several card-area heights, and compute
+/// the renderer's own capacity (`visible_rows = available / card_height`) for
+/// 7 decks; assert all 7 fit without scrolling and that the 7th deck actually
+/// renders in the visible slice, at every height tried — not pinned to one
+/// assumed terminal size. This locks in PRD #147: with the content-derived
+/// Compact height of 6 (PRD fork#405 M1 added the unconditional role-name
+/// row, moving Compact height 5 → 6), 48 / 6 = 8 rows fit so all 7 decks
+/// show. Before #147 the hardcoded Compact height of 7 fit only 48 / 7 = 6
+/// rows, dropping the 7th deck to a scroll — the regression this test guards
+/// against.
+///
+/// A much larger deck count (20, at AVAILABLE=48) used to be this test's
+/// "over-correction guard" — scrolling had to still engage past Compact's
+/// capacity. PRD fork#446 (even card division) inverts that on purpose: no
+/// card is ever hidden, so at 20 decks the column instead divides evenly
+/// (`even_row_heights`) and every deck still renders, degraded to a shorter
+/// M2 card tier rather than dropped to a scroll.
 #[spec("orchestration/layout/001")]
 #[test]
 fn layout_001_seven_decks_fit_single_column() {
@@ -3221,54 +3246,89 @@ fn layout_001_seven_decks_fit_single_column() {
     // `visible_rows = available_for_density / card_height` rows (src/ui.rs
     // ~7861); the rest scroll. We mirror that math through the public
     // `rendered_height` seam, then confirm it with a real card render.
-
-    // Card-area rows available for cards (production: dashboard_area.height - 2,
-    // i.e. a ~50-row card column).
-    const AVAILABLE: u16 = 48;
     const COLS: usize = 1;
     const DECKS: usize = 7;
 
-    let density = pick_density(DECKS, COLS, AVAILABLE);
-    let card_height = density.rendered_height();
-    let visible_rows = (AVAILABLE / card_height).max(1) as usize;
+    // Generalised beyond a single terminal size (PRD fork#446): 42 is the
+    // exact 7*6 boundary, 48 is the size the test used to pin alone, 54 and
+    // 90 give slack on top. The property must hold at all of them, not just
+    // the one AVAILABLE=48 fork#405 M1 left as the tightest-possible margin.
+    for available in [42u16, 48, 54, 90] {
+        let density = pick_density(DECKS, COLS, available);
+        let card_height = density.rendered_height();
+        let visible_rows = (available / card_height).max(1) as usize;
 
-    // (1) Capacity: all 7 decks must fit in the single column with no scrolling.
-    assert!(
-        visible_rows >= DECKS,
-        "all {DECKS} orchestration decks must fit without scrolling at \
-         card-area height {AVAILABLE} (density={density:?}, card_height={card_height}); \
-         only {visible_rows} fit"
-    );
+        // (1) Capacity: all 7 decks must fit in the single column with no scrolling.
+        assert!(
+            visible_rows >= DECKS,
+            "all {DECKS} orchestration decks must fit without scrolling at \
+             card-area height {available} (density={density:?}, card_height={card_height}); \
+             only {visible_rows} fit"
+        );
 
-    // (2) Buffer proof: the orchestration renderer draws only the first
-    //     `visible_rows` of the deck rows (src/ui.rs ~7871); render that visible
-    //     slice as real cards and assert the 7th deck shows. If the cards were
-    //     too tall to all fit, the 7th would be scrolled off and absent.
-    let visible = visible_rows.min(DECKS);
-    let session = filled_session();
-    let names: Vec<String> = (1..=visible).map(|i| format!("deck-{i}")).collect();
-    let cards: Vec<(&SessionState, Option<&str>)> =
-        names.iter().map(|n| (&session, Some(n.as_str()))).collect();
-    // PRD #113: `selected` is `Option<usize>`; this capacity test highlights
-    // nothing, so pass `None` (the old out-of-range `usize::MAX` sentinel).
-    let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, 64);
-    let text = buffer_to_text(&buffer);
-    assert!(
-        text.contains("deck-7"),
-        "the 7th orchestration deck must render in the visible card area \
-         (rendered {visible} of {DECKS} decks):\n{text}"
-    );
+        // (2) Buffer proof: the orchestration renderer draws only the first
+        //     `visible_rows` of the deck rows (src/ui.rs ~7871); render that visible
+        //     slice as real cards and assert the 7th deck shows. If the cards were
+        //     too tall to all fit, the 7th would be scrolled off and absent.
+        let visible = visible_rows.min(DECKS);
+        let session = filled_session();
+        let names: Vec<String> = (1..=visible).map(|i| format!("deck-{i}")).collect();
+        let cards: Vec<(&SessionState, Option<&str>)> =
+            names.iter().map(|n| (&session, Some(n.as_str()))).collect();
+        // PRD #113: `selected` is `Option<usize>`; this capacity test highlights
+        // nothing, so pass `None` (the old out-of-range `usize::MAX` sentinel).
+        let buffer = render_dashboard_cards_to_buffer(&cards, None, density, 0, 64);
+        let text = buffer_to_text(&buffer);
+        assert!(
+            text.contains("deck-7"),
+            "the 7th orchestration deck must render in the visible card area \
+             at card-area height {available} (rendered {visible} of {DECKS} decks):\n{text}"
+        );
+    }
 
-    // (3) Over-correction guard: a deck count well past the (now tighter)
-    //     capacity must still engage scrolling — the fix right-sizes the cards,
-    //     it does not remove scrolling for genuinely too-many decks.
+    // (3) INVERTED ON PURPOSE (PRD fork#446 — see the "An existing guard is
+    //     inverted on purpose" section of prds/fork-446-even-card-division.md):
+    //     a deck count well past Compact's old capacity must no longer engage
+    //     scrolling. At 20 decks and AVAILABLE=48 (48 / 20 = 2, 48 % 20 = 8),
+    //     even division gives the first 8 rows 3 rows and the remaining 12
+    //     rows 2 rows, summing to exactly 48 — every deck renders, each at
+    //     M2's shortest bordered tier (>= 2 rows), none dropped to a scroll.
     const MANY: usize = 20;
-    let many_density = pick_density(MANY, COLS, AVAILABLE);
-    let many_visible = (AVAILABLE / many_density.rendered_height()).max(1) as usize;
-    assert!(
-        many_visible < MANY,
-        "with {MANY} decks scrolling must still engage (only {many_visible} fit)"
+    const AVAILABLE_MANY: u16 = 48;
+    let heights = even_row_heights_mirror(MANY, AVAILABLE_MANY)
+        .expect("48 rows for 20 decks must divide — at least 1 row per deck");
+    assert_eq!(heights.len(), MANY);
+    assert_eq!(
+        heights.iter().sum::<u16>(),
+        AVAILABLE_MANY,
+        "row heights {heights:?} must sum to exactly {AVAILABLE_MANY} — no blank tail"
     );
+
+    let session = filled_session();
+    let names: Vec<String> = (1..=MANY).map(|i| format!("deck-{i}")).collect();
+    let mut rendered_all = String::new();
+    for (i, height) in heights.iter().enumerate() {
+        let card_number = if i < 9 { Some((i + 1) as u8) } else { None };
+        let buffer = render_card_to_buffer(
+            &session,
+            Some(names[i].as_str()),
+            card_number,
+            CardDensityKind::Compact,
+            0,
+            false,
+            64,
+            *height,
+        );
+        rendered_all.push_str(&buffer_to_text(&buffer));
+        rendered_all.push('\n');
+    }
+    for name in &names {
+        assert!(
+            rendered_all.contains(name.as_str()),
+            "deck {name} must render — no orchestration deck is ever hidden \
+             once the column divides evenly (heights={heights:?}):\n{rendered_all}"
+        );
+    }
 }
 
 /// The longest prefix of `s` that fits in `max` bytes without splitting a
@@ -3623,9 +3683,19 @@ fn grid_003_unavoidable_overflow_is_signalled() {
     let sessions = reported_role_sessions();
     let cards = as_cards(&sessions);
 
-    // 12 rows less title and stats bar leaves 10: two Compact cards. Two columns
-    // would need 7.div_ceil(2) * 5 = 20, so no layout 90 columns allows fits.
-    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 12);
+    // PRD fork#446 M1: before this feature, a layout that didn't fit at the
+    // joint-fit-seeking density simply truncated to a scrolled window at the
+    // PREFERRED column count. Now the render path first tries widening to
+    // `max_columns_for_width` and dividing the available height evenly across
+    // rows (`even_row_heights`) — so genuine, unavoidable overflow now
+    // requires height so small that even ONE row per (widened) row-of-cards
+    // doesn't fit: `even_row_heights` returns `None` only when
+    // `available_height < total_rows`. At width 90, `max_columns_for_width`
+    // is 2, so 7 cards need `7.div_ceil(2) = 4` row-slots; height 5 leaves
+    // `available_for_cards = 3 < 4`, which is still genuinely unavoidable —
+    // and the widened 2-column count is what the old scroll/truncate
+    // fallback then renders at.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 5);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
 
@@ -3645,22 +3715,26 @@ fn grid_003_unavoidable_overflow_is_signalled() {
     );
     assert_eq!(
         drawn_columns(&rendered),
-        1,
-        "when no layout fits, the deck keeps the columns it has always had — \
-         narrowing every card buys nothing once completeness is out of reach:\n{rendered}"
+        2,
+        "PRD fork#446: the joint fit-seeking failing no longer keeps the \
+         preferred column count as-is — it widens to `max_columns_for_width` \
+         first (attempting even row division), and that widened count is \
+         what the truncating fallback renders at even when the division \
+         itself still can't make everything fit:\n{rendered}"
     );
     insta::assert_snapshot!(rendered);
 
     // Scrolled to the bottom: the marker must flip to counting what is above.
-    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, 90, 12);
+    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, 90, 5);
     let scrolled_title = buffer_to_text(&scrolled)
         .lines()
         .next()
         .expect("a rendered title row")
         .to_string();
     assert!(
-        scrolled_title.contains("(↑5)"),
-        "selecting the last card scrolls five cards above the window, and the \
-         title must say so:\n{scrolled_title}"
+        scrolled_title.contains("(\u{2191}6)"),
+        "selecting the last card (index 6) at the widened 2-column layout \
+         scrolls six cards above the window (row 3 of 4, one card per \
+         visible row), and the title must say so:\n{scrolled_title}"
     );
 }

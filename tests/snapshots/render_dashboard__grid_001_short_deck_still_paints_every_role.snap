@@ -2,23 +2,27 @@
 source: tests/render_dashboard.rs
 expression: rendered
 ---
- dot-agent-deck — 7 session(s)                                                            
-┏ ▸ 1 ClaudeCode · orchestrator ━━━━ ● Idle ┓┌ 2 ClaudeCode · developer ───────── ● Idle ┐
+ worker-deck — 7 session(s)                                                               
+┏ ▸ 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓┌ 2 ──────────────────────────────── ● Idle ┐
+┃orchestrator                               ┃│developer                                  │
 ┃Dir:  dot-agent-deck                       ┃│Dir:  dot-agent-deck                       │
 ┃                                           ┃│                                           │
 ┃                                           ┃│                                           │
 ┗━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛└─────────────────────── Last: 0s  Tools: 0 ┘
-┌ 3 ClaudeCode · tester ──────────── ● Idle ┐┌ 4 ClaudeCode · reviewer ────────── ● Idle ┐
+┌ 3 ──────────────────────────────── ● Idle ┐┌ 4 ──────────────────────────────── ● Idle ┐
+│tester                                     ││reviewer                                   │
 │Dir:  dot-agent-deck                       ││Dir:  dot-agent-deck                       │
 │                                           ││                                           │
 │                                           ││                                           │
 └─────────────────────── Last: 0s  Tools: 0 ┘└─────────────────────── Last: 0s  Tools: 0 ┘
-┌ 5 ClaudeCode · releaser ────────── ● Idle ┐┌ 6 ClaudeCode · researcher ──────── ● Idle ┐
+┌ 5 ──────────────────────────────── ● Idle ┐┌ 6 ──────────────────────────────── ● Idle ┐
+│releaser                                   ││researcher                                 │
 │Dir:  dot-agent-deck                       ││Dir:  dot-agent-deck                       │
 │                                           ││                                           │
 │                                           ││                                           │
 └─────────────────────── Last: 0s  Tools: 0 ┘└─────────────────────── Last: 0s  Tools: 0 ┘
-┌ 7 ClaudeCode · documenter ──────── ● Idle ┐                                             
+┌ 7 ──────────────────────────────── ● Idle ┐                                             
+│documenter                                 │                                             
 │Dir:  dot-agent-deck                       │                                             
 │                                           │                                             
 │                                           │                                             

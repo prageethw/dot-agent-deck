@@ -233,6 +233,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact wording of the indicator, only that it is present and names the correct count.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/grid/009 — Role name and status text survive at every M2 card-height tier (1, 2, 3 rows) (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a narrow, single-column, 5-role dashboard sized so every card lands at exactly 1, 2, and 3 rows tall — both the role name and the "Idle" status text remain in the rendered output at each tier, the squeeze order (`Prmt:`/tool lines/`Dir:` give way first) the PRD requires.
+- **Does not assert:** which specific body line (`Dir:`, prompts, tools) is dropped at each tier, only that role name and status never are.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/010 — A `Working` card paints its status at every M2 card-height tier (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** same tiered squeeze as `dashboard/grid/009`, with one card's status set to `Working` — the status text survives at every tier, so the tab's aggregated "working" claim always has a visibly attributable owner even at the shortest card height.
+- **Does not assert:** aggregation logic itself (covered by PRD #78's own tests), only that the per-card status text is not dropped.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/011 — Every role name paints, with no scroll-suffix left on the title, across role counts on both sides of the M1 even-division boundary (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** in the fork#437 narrow-and-short shape (width 99, height 33), 7, 10, and 16 roles all paint every role name with no `" (N more — scroll to see)"` suffix on the title — 7 and 10 already fit today's joint (cols, density) search, 16 needs even division.
+- **Does not assert:** the exact per-card height chosen at 16 roles (covered by `dashboard/grid/009`'s tier tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/012 — Re-rendering the same roles at a different area height re-divides completely, with no blank tail and no hidden role (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a 6-role, single-column dashboard rendered at two different heights each paints every role name, and the row directly above the stats bar is genuine card content rather than blank `Constraint::Min(0)` filler — confirming the per-frame, nothing-persisted redivision the PRD requires (a resize re-fits on the very next frame, no restart, no stale cache).
+- **Does not assert:** behavior across an actual resize event mid-session (this renders two independent frames at two heights, not a live resize).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/grid/013 — The PRD's own headline repro case (7 roles, one column, ~32 rows) paints the exact `[5, 5, 5, 5, 4, 4, 4]` height split (PRD fork#446).
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** the PRD's own "Outcome" example verbatim — 7 roles, width narrow enough for 1 column, 32 available rows — paints all 7 role names with no scroll-suffix, and measures the actual painted top-border boundaries to confirm the row-height split is genuinely `[5, 5, 5, 5, 4, 4, 4]` (not merely some other split that also happens to fit); `dashboard/grid/011`'s 7-role case takes the ordinary two-column fit path, not this fit-all fallback, so the 5-row card tier specifically was previously exercised by no test.
+- **Does not assert:** the `even_row_heights` arithmetic in isolation (covered by `even_row_heights_seven_rows_thirty_two_matches_expected_split`); this test pins that the same split reaches the actual render path.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/selection
 
 ##### dashboard/selection/001 — While the selection is active, `j` / `Down` selects the next card and wraps at the end.
