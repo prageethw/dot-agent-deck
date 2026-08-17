@@ -4362,13 +4362,8 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
         delivery.observed_generation = Some(announced);
     }
     if !delivery.can_report_prompts {
-        delivery.can_report_prompts = pane_confirmation_capability(
-            snapshot
-                .sessions
-                .values()
-                .filter(|session| session.pane_id.as_deref() == Some(pane_id))
-                .map(|session| &session.agent_type),
-        ) == ConfirmationCapability::Reports;
+        delivery.can_report_prompts =
+            pane_confirmation_capability_for(snapshot, pane_id) == ConfirmationCapability::Reports;
     }
 }
 
@@ -4474,6 +4469,12 @@ fn delivery_capability(
     pane_id: &str,
     delivery: Option<&PromptDelivery>,
 ) -> ConfirmationCapability {
+    let pane_sessions = || {
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    };
     // Reviewer MEDIUM (C6): the mixed legacy-hook shape. A perfectly ordinary
     // daemon-backed pane can have a known controller/registry agent id AND a
     // reporting `AgentType`, while an older pre-F9 hook binary emits events that
@@ -4496,15 +4497,24 @@ fn delivery_capability(
     if delivery.is_some_and(|d| evidence_channel_is_unidentified(snapshot, pane_id, d)) {
         return ConfirmationCapability::Unknown;
     }
+    // PRD #254 M1 (auditor): the codex hook-trust downgrade must outrank the
+    // sticky `can_report_prompts` latch just below, for the identical reason
+    // C6 does above — once the latch is set `true` it is never cleared (only
+    // `|=` writes and one assignment feed it; `adopt_generation`'s epoch bump
+    // does not reset it), so a pane whose native hook install/trust is known
+    // to have failed would have this downgrade permanently defeated if it
+    // stayed inside `pane_confirmation_capability_for` alone, which is reached
+    // only after the latch check below has already returned. `Unknown`, not
+    // `CannotReport` (H2): the pane cannot be assumed to Report, but nothing
+    // here says the in-flight delivery must be finalized either.
+    if snapshot.codex_hook_trust_failed.contains(pane_id)
+        && pane_sessions().any(|session| session.agent_type == AgentType::Codex)
+    {
+        return ConfirmationCapability::Unknown;
+    }
     if delivery.is_some_and(|d| d.can_report_prompts) {
         return ConfirmationCapability::Reports;
     }
-    let pane_sessions = || {
-        snapshot
-            .sessions
-            .values()
-            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
-    };
     let identity_known = delivery.is_some_and(|d| d.expected_agent_id.is_some())
         || pane_sessions().any(|session| session.agent_id.is_some());
     if !identity_known {
@@ -4517,7 +4527,44 @@ fn delivery_capability(
             ConfirmationCapability::Unknown
         };
     }
-    pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type))
+    pane_confirmation_capability_for(snapshot, pane_id)
+}
+
+/// PRD #254: [`pane_confirmation_capability`] over one pane's sessions, but
+/// downgraded from `Reports` to `Unknown` when the pane is Codex-typed AND its
+/// native hook install/trust is known to have failed
+/// (`AppState::codex_hook_trust_failed`). A pane whose hook genuinely failed to
+/// install/trust can never produce TEXT confirmation — the wrapper hardcodes
+/// `user_prompt: None` on that degraded path — so classifying it `Reports`
+/// burns the full retry cycle against a live interactive Codex TUI and then
+/// permanently abandons the tab's remit at the deadline. `Unknown`, not
+/// `CannotReport` (H2, auditor on PR #441): `CannotReport` finalizes the
+/// orchestrator/seed prompt at the very first write, ~500 ms after the wrapper
+/// forks — typically before a launcher-started Codex TUI even exists to
+/// receive it — while `Unknown` holds delivery provisional to the 60 s
+/// deadline and then finalizes honestly, which is what the PRD specifies.
+///
+/// Every call site that would otherwise resolve capability from a pane's
+/// sessions directly must go through this instead of
+/// [`pane_confirmation_capability`], or the sticky `can_report_prompts` latch
+/// can still be set `true` from the un-downgraded path (see
+/// `bind_delivery_generation`).
+fn pane_confirmation_capability_for(snapshot: &AppState, pane_id: &str) -> ConfirmationCapability {
+    let pane_sessions = || {
+        snapshot
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(pane_id))
+    };
+    let capability =
+        pane_confirmation_capability(pane_sessions().map(|session| &session.agent_type));
+    if capability == ConfirmationCapability::Reports
+        && snapshot.codex_hook_trust_failed.contains(pane_id)
+        && pane_sessions().any(|session| session.agent_type == AgentType::Codex)
+    {
+        return ConfirmationCapability::Unknown;
+    }
+    capability
 }
 
 /// Issue #424 (reviewer MEDIUM, C6): has this pane produced evidence since our
@@ -37348,6 +37395,137 @@ mod tests {
         assert!(!evidence_channel_is_unidentified(
             &untouched, PANE_ID, &delivery
         ));
+    }
+
+    /// Scenario: A Codex pane's native hook install/trust is recorded as
+    /// having failed (PRD #254's `codex_hook_trust_failed` scaffold, standing
+    /// in for `codex_spawn_prep`'s real outcome), then a fresh, unwritten
+    /// delivery asks `delivery_capability` for that pane. It must not resolve
+    /// `Reports`: a pane whose hook genuinely failed to install/trust can
+    /// never produce TEXT confirmation (`Emitter::emit_with_metadata` hardcodes
+    /// `user_prompt: None` on that degraded path), so classifying it `Reports`
+    /// burns the full 60s escalating retry cycle against a live interactive
+    /// Codex TUI and then permanently abandons the tab's remit at the deadline.
+    ///
+    /// PRD #254: `delivery_capability` now defers to
+    /// `pane_confirmation_capability_for`, which reads `codex_hook_trust_failed`
+    /// and downgrades the resolution away from `Reports` for exactly this
+    /// pane, instead of resolving capability from agent TYPE alone.
+    #[test]
+    fn delivery_capability_defers_codex_reports_to_hook_outcome() {
+        const PANE_ID: &str = "codex-hook-failed-pane";
+        const AGENT_ID: &str = "codex-hook-failed-agent";
+
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.codex_hook_trust_failed.insert(PANE_ID.to_string());
+
+        let delivery = PromptDelivery {
+            expected_agent_id: Some(AGENT_ID.to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "codex-hook-failed-1".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        };
+
+        assert_ne!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports,
+            "PRD #254: a Codex pane whose native hook install/trust is known \
+             to have failed must not be classified Reports — classifying it \
+             Reports would burn the full 60s escalating retry cycle against a \
+             live interactive Codex TUI and then permanently abandon the \
+             tab's remit at the deadline"
+        );
+    }
+
+    /// Scenario: the healthy-path counterpart to the test above — the same
+    /// Codex pane, but with no failure recorded in
+    /// `codex_hook_trust_failed` (standing in for a `codex_spawn_prep` that
+    /// installed and trusted its hooks successfully). A fresh, unwritten
+    /// delivery must still resolve `Reports`, exactly as it does today: PRD
+    /// #254 narrows WHEN a pane is classified `Reports`, it does not change
+    /// the healthy case. This passes both before and after PRD #254's fix —
+    /// a regression guard, not the RED half of this pin.
+    #[test]
+    fn delivery_capability_still_reports_a_codex_pane_with_no_recorded_hook_failure() {
+        const PANE_ID: &str = "codex-hook-healthy-pane";
+        const AGENT_ID: &str = "codex-hook-healthy-agent";
+
+        let snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        assert!(
+            !snapshot.codex_hook_trust_failed.contains(PANE_ID),
+            "sanity: this pane must not carry a recorded hook failure"
+        );
+
+        let delivery = PromptDelivery {
+            expected_agent_id: Some(AGENT_ID.to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "codex-hook-healthy-1".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+            epoch: 0,
+            wire_issued: false,
+        };
+
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Reports,
+            "no behavior change for a Codex pane with no recorded hook failure"
+        );
+    }
+
+    /// PRD #254 M1 (auditor) + H2: the codex hook-trust downgrade must run
+    /// AHEAD of the sticky `can_report_prompts` latch, and the target it
+    /// downgrades to must be exactly `Unknown`, never `CannotReport`. This is
+    /// the one fixture the two tests above do not cover: both set
+    /// `can_report_prompts: false`, so neither ever reaches the latch
+    /// short-circuit at `delivery_capability`'s `if
+    /// delivery.is_some_and(|d| d.can_report_prompts)` check — meaning
+    /// deleting the pre-latch downgrade block entirely would still leave both
+    /// green. Here `can_report_prompts: true`, so if the downgrade were
+    /// missing or ordered after the latch, this would resolve `Reports`
+    /// instead. And `assert_eq!` against `Unknown` specifically (not
+    /// `assert_ne!(.., Reports)`) means reverting the downgrade target back to
+    /// `CannotReport` fails this test too, closing both gaps with one
+    /// fixture.
+    #[test]
+    fn delivery_capability_downgrade_outranks_the_can_report_prompts_latch() {
+        const PANE_ID: &str = "codex-hook-failed-latched-pane";
+        const AGENT_ID: &str = "codex-hook-failed-latched-agent";
+
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        snapshot.codex_hook_trust_failed.insert(PANE_ID.to_string());
+
+        let delivery = PromptDelivery {
+            expected_agent_id: Some(AGENT_ID.to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            closures_at_write: None,
+            delivery_id: "codex-hook-failed-latched-1".into(),
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: true,
+            epoch: 0,
+            wire_issued: false,
+        };
+
+        assert_eq!(
+            delivery_capability(&snapshot, PANE_ID, Some(&delivery)),
+            ConfirmationCapability::Unknown,
+            "PRD #254 / auditor M1: the hook-trust downgrade must outrank the \
+             sticky can_report_prompts latch and must resolve to Unknown, not \
+             CannotReport — CannotReport would finalize this pane's prompt at \
+             the very first write instead of holding it provisional to the \
+             60s deadline"
+        );
     }
 
     /// Issue #424 (tester's finding / C2, coder-authored): which seed-path

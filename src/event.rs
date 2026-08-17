@@ -469,6 +469,21 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 
+/// `AgentEvent.metadata` key carrying `codex_spawn_prep`'s (`src/wrap.rs`) REAL
+/// native hook install/trust outcome for the invocation that produced this
+/// `SessionStart` (PRD #254). Only the wrapper sets it, and only on a
+/// Codex-identity event — every other producer and agent type omit it. Value
+/// is the `bool`'s `Display` form (`"true"`/`"false"`); an absent key means
+/// "no outcome reported" (an old wrapper build, a non-Codex identity, or a
+/// non-wrapper producer), which consumers must read as unknown, not as
+/// success — see [`AgentEvent::codex_hook_trust_outcome`].
+///
+/// Additive on the wire in both directions, same as
+/// [`SESSION_START_ORIGIN_METADATA_KEY`]: an old wrapper omits the key and a
+/// new daemon reads `None`; a new wrapper's key is ignored by an old daemon.
+/// Not a [`crate::daemon_protocol::PROTOCOL_VERSION`] bump.
+pub const CODEX_HOOK_TRUST_METADATA_KEY: &str = "codex_hook_trust_confirmed";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -646,6 +661,29 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
+
+    /// PRD #254: this event's stamped Codex native-hook install/trust outcome
+    /// (see [`CODEX_HOOK_TRUST_METADATA_KEY`]), if any. `None` when the key is
+    /// absent — an old wrapper build, a non-Codex-identity spawn, or any
+    /// non-wrapper producer, none of which report anything about hook trust,
+    /// and none of which should be read as either a success or a failure.
+    /// `Some(false)` (auditor I2) when the key IS present but its value is
+    /// neither `"true"` nor `"false"` — a future format, a typo, a corrupted
+    /// write. A present-but-garbled value is evidence something went wrong
+    /// and must not be read the same as an absent key, or it silently
+    /// restores the pre-fix `Reports` behaviour H1 exists to close.
+    pub fn codex_hook_trust_outcome(&self) -> Option<bool> {
+        match self
+            .metadata
+            .get(CODEX_HOOK_TRUST_METADATA_KEY)
+            .map(String::as_str)
+        {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(_) => Some(false),
+            None => None,
+        }
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
@@ -1657,5 +1695,92 @@ mod tests {
             "timestamp": "2026-03-22T10:00:00Z"
         }"#;
         assert!(serde_json::from_str::<DaemonMessage>(json).is_err());
+    }
+
+    /// Builds a Codex `SessionStart` `AgentEvent` with `CODEX_HOOK_TRUST_METADATA_KEY`
+    /// stamped to `value` in its metadata (or omitted entirely when `value` is
+    /// `None`), for exercising `codex_hook_trust_outcome()`'s parse in isolation.
+    fn codex_session_start_with_trust_metadata(value: Option<&str>) -> AgentEvent {
+        let mut metadata = HashMap::new();
+        if let Some(value) = value {
+            metadata.insert(CODEX_HOOK_TRUST_METADATA_KEY.to_string(), value.to_string());
+        }
+        AgentEvent {
+            session_id: "codex-hook-outcome".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some("codex-hook-outcome-pane".into()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        }
+    }
+
+    /// Scenario: PRD #254's `codex_hook_trust_outcome()` parses the wrapper's
+    /// two real stamped values -- `"true"` reports a known-successful hook
+    /// install/trust, `"false"` reports a known failure. Neither passes
+    /// through any resolution logic beyond the literal string match, so this
+    /// pins the parse in isolation from the rest of the plumbing chain
+    /// (`codex_spawn_prep`, `apply_event`) that consumes it.
+    #[test]
+    fn codex_hook_trust_outcome_parses_true_and_false() {
+        assert_eq!(
+            codex_session_start_with_trust_metadata(Some("true")).codex_hook_trust_outcome(),
+            Some(true)
+        );
+        assert_eq!(
+            codex_session_start_with_trust_metadata(Some("false")).codex_hook_trust_outcome(),
+            Some(false)
+        );
+    }
+
+    /// Scenario: an event carrying no `CODEX_HOOK_TRUST_METADATA_KEY` at all
+    /// -- an old wrapper build, a non-Codex-identity spawn, or any
+    /// non-wrapper producer -- must resolve `None` ("no outcome reported"),
+    /// never read as either a success or a failure. This is the deliberate
+    /// backward-compatibility default the function's own doc comment
+    /// describes, and it stays `None` even though I2 (below) changed how a
+    /// PRESENT-but-garbled value resolves -- an absent key and a garbled
+    /// value are different facts and must not collapse to the same outcome.
+    #[test]
+    fn codex_hook_trust_outcome_absent_key_is_none() {
+        assert_eq!(
+            codex_session_start_with_trust_metadata(None).codex_hook_trust_outcome(),
+            None
+        );
+    }
+
+    /// Scenario: PRD #254 auditor I2. A stamped-but-UNRECOGNISED value --
+    /// neither the literal `"true"` nor `"false"` any current wrapper writes
+    /// (a future format, a typo, a corrupted write) -- must NOT fall into the
+    /// same arm as an ABSENT key, which would read as "no outcome reported"
+    /// and resolve the pane back to `Reports` -- the exact
+    /// silently-healthy-looking failure shape H1 is about (see
+    /// `codex_spawn_prep_ok_zero_hooks_is_not_confirmed` in `wrap.rs`), just
+    /// reached through a garbled value instead of a missing one. A key that
+    /// IS present but unparseable is evidence something went wrong and must
+    /// not be indistinguishable from "nothing was reported": it resolves to
+    /// `Some(false)` (not confirmed), the same fail-safe direction as every
+    /// other unresolvable outcome in this chain. This pins that fix: it was
+    /// proven RED against the pre-fix code, where the `Some(_)` and `None`
+    /// arms both collapsed into one wildcard.
+    #[test]
+    fn codex_hook_trust_outcome_unrecognized_present_value_is_not_confirmed() {
+        assert_eq!(
+            codex_session_start_with_trust_metadata(Some("maybe")).codex_hook_trust_outcome(),
+            Some(false),
+            "PRD #254 I2: a stamped-but-unrecognised trust value must resolve \
+             as a known failure (Some(false)), not fall through to None as if \
+             the key were absent -- that silently restores the pre-fix \
+             Reports behaviour"
+        );
     }
 }
