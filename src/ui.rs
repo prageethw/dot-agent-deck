@@ -24741,9 +24741,9 @@ mod tests {
     // Grid-fit render tests (fork issue #437, upstream #588): pin the ACTUAL
     // painted output for the narrow-AND-short case the `fit_grid_*` tests
     // above prove algorithmically — that all cards get drawn, that
-    // `ui.columns` matches what was actually drawn (no navigation desync),
-    // and that a genuine viewport overflow is indicated rather than silently
-    // dropped.
+    // `ui.columns` is kept in sync with what the render path actually drew
+    // (dead-state hygiene; `ui.columns` has no reader today), and that a
+    // genuine viewport overflow is indicated rather than silently dropped.
     // -----------------------------------------------------------------------
 
     /// Render `n` ClaudeCode sessions ("role1".."role{n}") into a
@@ -24847,11 +24847,11 @@ mod tests {
         // Regression test for the desync risk upstream #588 flags explicitly:
         // the OTHER `grid_columns` caller (the main-loop `ui.columns =
         // grid_columns(dashboard_width)` call, src/ui.rs:13271) must not
-        // disagree with what the render path actually drew, or left/right
-        // card navigation moves through a different column count than what's
-        // on screen. Same 7-role narrow+short scenario as above:
-        // `fit_grid(7, 99, 30) == (2, _)`, so `ui.columns` must read 2, not
-        // the 1 that `grid_columns(99)` alone would produce.
+        // disagree with what the render path actually drew — `ui.columns`
+        // has no reader today, so this is dead-state hygiene, not a
+        // navigation-behavior test. Same 7-role narrow+short scenario as
+        // above: `fit_grid(7, 99, 30) == (2, _)`, so `ui.columns` must read
+        // 2, not the 1 that `grid_columns(99)` alone would produce.
         let (_rendered, ui) = render_dashboard_grid(7, 99, 33);
         assert_eq!(ui.columns, 2);
     }
