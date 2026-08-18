@@ -1522,7 +1522,15 @@ async fn confirm_prompt_delivery(
             // `accepts_late_producer` above. Refusals are logged once, so a
             // delivery that then holds to its deadline is diagnosable rather
             // than mysterious.
-            PromptWatch::Elapsed { can_report_prompts } => {
+            PromptWatch::Elapsed {
+                can_report_prompts,
+                codex_hook_trust_failed: watch_codex_hook_trust_failed,
+            } => {
+                // Issue #468 follow-up (reviewer M1): a hook-trust failure the
+                // window itself observed must veto this and every later arm
+                // attempt too, same accumulate-only pattern as
+                // `gap_codex_hook_trust_failed` below.
+                codex_hook_trust_failed |= watch_codex_hook_trust_failed;
                 // Issue #459: `accepts_late_producer` clearing this would arm on
                 // its own merit; `codex_hook_trust_failed` still must veto it —
                 // see `ConfirmationTask::codex_hook_trust_failed`.
@@ -1625,8 +1633,18 @@ async fn confirm_prompt_delivery(
             log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
             return;
         }
-        // Issue #468: accumulate-only, same as `ConfirmationTask::codex_hook_trust_failed`
-        // — once seen, this delivery is vetoed for good.
+        // Issue #468 follow-up (reviewer M2): this branch only ever runs once
+        // `armed` is already `true` — the `if !armed { continue; }` guard
+        // above sends every not-yet-armed delivery back around the loop
+        // before reaching here. So this accumulation cannot itself PREVENT
+        // arming; both `armed |=` expressions it feeds (here and at the
+        // `PromptWatch::Elapsed` arm above) are no-ops once `armed` already
+        // holds. Its one observable effect is on a LATER `Elapsed` arm's
+        // choice of which `log_prompt_unconfirmable` message to print. The
+        // genuine, always-reachable veto — vetoing an arm attempt regardless
+        // of `armed`'s current state — is the `Elapsed` arm's own
+        // `watch_codex_hook_trust_failed` accumulation above, which runs
+        // unconditionally every loop iteration rather than only once armed.
         codex_hook_trust_failed |= gap_codex_hook_trust_failed;
         // Issue #459: same veto as the `PromptWatch::Elapsed` arm above.
         armed |= gap_capability && accepts_late_producer && !codex_hook_trust_failed;
@@ -1873,7 +1891,12 @@ struct ConfirmationTask {
     generation: Option<(String, DateTime<Utc>)>,
     can_report_prompts: bool,
     /// Issue #459: this pane's Codex native-hook install/trust was observed,
-    /// pre-write, to have FAILED (`SessionStartWait::codex_hook_trust_failed`).
+    /// PRE-write, to have FAILED (`SessionStartWait::codex_hook_trust_failed`)
+    /// — this field only ever carries that pre-write value; `confirm_prompt_delivery`
+    /// copies it into a task-local `mut` binding of the same name that goes on
+    /// to accumulate POST-write sources too (issue #468 follow-up): the
+    /// `PromptWatch::Elapsed` arm's own window observation, and the gap drain's
+    /// (`drain_pre_write_events`). See those call sites for the post-write half.
     ///
     /// Sticky for the whole task, matching PR #441's ui.rs comment that this
     /// downgrade "must outrank the sticky `can_report_prompts`-style latch":
@@ -2746,6 +2769,11 @@ mod tests {
              currently resolves purely from agent_reports_submitted_prompt(&event.agent_type), \
              the same defect PR #441 fixed on the TUI-attached path in \
              src/ui.rs::delivery_capability"
+        );
+        assert!(
+            codex_hook_trust_failed,
+            "issue #468: the single failing event this drain observed must be reported back \
+             via the out-param, not just suppressed from can_report_prompts"
         );
     }
 
