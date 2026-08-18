@@ -3826,9 +3826,10 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
 /// #439) so the trust-config-writing behavior can be exercised without real
 /// Codex credentials.
 pub fn write_codex_project_trust(codex_home: &Path, project: &Path) -> std::io::Result<()> {
+    let canonical_project = std::fs::canonicalize(project)?;
     let config = format!(
         "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-        toml_escape(project.to_str().ok_or_else(|| {
+        toml_escape(canonical_project.to_str().ok_or_else(|| {
             std::io::Error::other("isolated Codex fixture path is not UTF-8")
         })?)
     );
