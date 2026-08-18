@@ -9625,15 +9625,20 @@ mod spawn_tests {
     #[tokio::test]
     async fn guarded_send_with_no_expected_identity_writes_to_the_live_pane() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        reg.spawn_agent(SpawnOptions {
-            command: Some("/bin/sh"),
-            env: vec![(
-                DOT_AGENT_DECK_PANE_ID.to_string(),
-                "pane-no-expected-identity".to_string(),
-            )],
-            ..SpawnOptions::default()
-        })
-        .expect("spawn agent");
+        // `spawn_agent` returns the REGISTRY's own agent id — a UUID, not the
+        // `pane_id_env` string — and `AgentPtyRegistry::snapshot` reads
+        // scrollback by that agent id, so it has to be captured here rather
+        // than discarded.
+        let agent_id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-no-expected-identity".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
 
         let outcome = reg
             .write_and_submit_guarded_detailed(
@@ -9652,18 +9657,11 @@ mod spawn_tests {
         );
 
         // Confirm bytes actually reached the live pane, not merely that the
-        // outcome claims `Applied`. A generous deadline: CI's `nextest` runs
-        // this alongside hundreds of other PTY-spawning tests, and the
-        // SUBMIT_DELAY plus a contended reader-thread scheduling round trip
-        // can exceed a tight budget under that load (observed once at 2s on
-        // GitHub Actions), matching `write_and_wait_for_scrollback`'s own 3s+
-        // convention elsewhere in this file.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // outcome claims `Applied`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let mut found = false;
         while tokio::time::Instant::now() < deadline {
-            let snap = reg
-                .snapshot("pane-no-expected-identity")
-                .unwrap_or_default();
+            let snap = reg.snapshot(&agent_id).unwrap_or_default();
             if snap
                 .windows(b"none-identity-permissive-marker".len())
                 .any(|w| w == b"none-identity-permissive-marker")
