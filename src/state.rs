@@ -1476,6 +1476,12 @@ pub(crate) fn orchestration_still_matches(
 /// `Instance` variant carries no cwd, so `orchestration_cwd` is resolved by the
 /// caller (see [`AppState::orchestration_cwd_of`]) and passed separately rather
 /// than read back out of the identity.
+///
+/// Issue #465 F2: returns the armed record's generation (`Some(seq)`) when a
+/// watch was armed, `None` on any of the three no-op paths above. The caller
+/// threads this into `dispatch_one_owned`, which uses it to bind the eventual
+/// worker agent id onto this same record once that identity resolves — see
+/// [`AgentPtyRegistry::bind_delegation_worker_agent_id`].
 fn arm_idle_worker_watch_for_delegation(
     registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
@@ -1484,14 +1490,14 @@ fn arm_idle_worker_watch_for_delegation(
     orchestration: Option<&OrchestrationIdentity>,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
-) {
+) -> Option<u64> {
     let Some(timeout) = worker_response_timeout(orchestration_cwd, worker_cwd) else {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
             "idle-worker detector disabled; no watch armed for this delegation"
         );
-        return;
+        return None;
     };
     let Some(orchestrator_agent_id) = registry.pane_current_agent_id(orchestrator_pane_id) else {
         warn!(
@@ -1500,7 +1506,7 @@ fn arm_idle_worker_watch_for_delegation(
             "idle-worker watch not armed: no live agent owns the orchestrator pane, so an idle \
              prompt could not be bound to a verifiable delivery target"
         );
-        return;
+        return None;
     };
     let Some(armed) = registry.arm_outstanding_delegation(
         worker_pane_id,
@@ -1514,14 +1520,16 @@ fn arm_idle_worker_watch_for_delegation(
             role = %role,
             "idle-worker watch not armed: the worker or orchestrator pane is closing"
         );
-        return;
+        return None;
     };
+    let seq = armed.seq;
     arm_idle_worker_watch(
         Arc::clone(registry),
         worker_pane_id.to_string(),
         armed,
         timeout,
     );
+    Some(seq)
 }
 
 /// PRD #126: arm the idle watch for one just-armed delegation. Spawns a task
@@ -2951,6 +2959,7 @@ async fn dispatch_one_owned(
     task: String,
     cwd: Option<String>,
     silence_watch: Option<SilenceWatch>,
+    delegation_seq: Option<u64>,
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
@@ -3254,6 +3263,19 @@ async fn dispatch_one_owned(
     if expected_worker_agent_id.is_none() {
         expected_worker_agent_id = registry.pane_current_agent_id(&pane_id);
     }
+    // Issue #465 F2: this is the first point at which the worker's identity is
+    // actually known — either the respawn's fresh `new_agent_id`, or whoever
+    // already owns the pane on a `clear = false` delegate. Bind it onto the
+    // idle-worker delegation `arm_idle_worker_watch_for_delegation` armed
+    // (unbound) back in the synchronous fan-out loop, so the EOF sweep can
+    // finally tell this delegation's worker apart from the pane's previous
+    // occupant. A no-op if the record is gone (superseded, retired, or the
+    // detector was disabled at arm time).
+    if let (Some(seq), Some(worker_agent_id)) =
+        (delegation_seq, expected_worker_agent_id.as_deref())
+    {
+        registry.bind_delegation_worker_agent_id(&pane_id, seq, worker_agent_id);
+    }
     // PRD #249 M3: arm the cancellation record and subscribe BEFORE the write.
     // Subscribing first means an agent that consumes the pointer and emits its
     // first event immediately cannot be mistaken for a silent one; arming first
@@ -3262,9 +3284,17 @@ async fn dispatch_one_owned(
     // when the detector is enabled: a disabled window (see
     // [`delegate_no_event_window`]) resolves to `None` in the caller, so no
     // record, no subscription and no task are created. `arm_silence_watch`
-    // additionally refuses while either pane is mid-close.
+    // additionally refuses while either pane is mid-close. Issue #465 F2: the
+    // worker identity just resolved above is passed straight through so the
+    // silence watch's own record is bound at arm time (unlike the idle
+    // delegation, this call always runs AFTER the identity is known, so no
+    // separate bind step is needed).
     let silence = silence_watch.and_then(|watch| {
-        let armed = registry.arm_silence_watch(&pane_id, &orchestrator_pane_id)?;
+        let armed = registry.arm_silence_watch(
+            &pane_id,
+            &orchestrator_pane_id,
+            expected_worker_agent_id.as_deref(),
+        )?;
         Some((watch, armed, event_tx.subscribe()))
     });
     // Legacy PTY injection for every non-pi-native path: claude / opencode
@@ -4410,7 +4440,7 @@ impl AppState {
             // a disabled detector (`0`, PRD #126 M1 audit finding 4) arms no
             // record and spawns no task at all, and so the orchestrator's
             // registry identity is captured while the delegate is still live.
-            arm_idle_worker_watch_for_delegation(
+            let delegation_seq = arm_idle_worker_watch_for_delegation(
                 &registry,
                 &pane_id,
                 &target_role,
@@ -4448,6 +4478,7 @@ impl AppState {
                     task,
                     cwd,
                     silence_watch,
+                    delegation_seq,
                 )
                 .await;
             });
@@ -7668,7 +7699,7 @@ clear = false
 
         let registry = Arc::new(AgentPtyRegistry::new());
         let armed_watch = registry
-            .arm_silence_watch("P", "orchestrator-pane")
+            .arm_silence_watch("P", "orchestrator-pane", None)
             .expect("pane P is not mid-close, arming must succeed");
         let armed_delegation = registry
             .arm_outstanding_delegation("P", "coder", "orchestrator-pane", "orch-agent", None)
@@ -8111,7 +8142,11 @@ clear = false
 
         let (event_tx, _) = broadcast::channel(8);
         let armed = registry
-            .arm_silence_watch(WORKER_PANE, ORCHESTRATOR_PANE)
+            .arm_silence_watch(
+                WORKER_PANE,
+                ORCHESTRATOR_PANE,
+                Some("notice-launder-worker-agent"),
+            )
             .expect("arm production silent-worker watch");
         arm_delegate_silence_watch(
             registry.clone(),

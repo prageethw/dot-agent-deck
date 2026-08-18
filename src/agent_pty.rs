@@ -1558,7 +1558,7 @@ fn pump_reader(
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
     {
-        let swept = registry.sweep_delegations_on_exit(pane_id);
+        let swept = registry.sweep_delegations_on_exit(pane_id, &agent_id);
         // Issue #465 M2: only the records for which THIS pane was the WORKER
         // side warrant an "exited without work-done" notice — a record this
         // pane touched only as the orchestrator that issued it (its own
@@ -2875,6 +2875,13 @@ struct SilenceWatchRecord {
     /// ORCHESTRATOR cancels the watch too — its notice would otherwise be aimed
     /// at a pane id a later, unrelated agent can inherit.
     orchestrator_pane_id: String,
+    /// Issue #465 F2: mirrors [`OutstandingDelegation::worker_agent_id`] — the
+    /// worker's registry agent id, when known at arm time. Unlike the idle
+    /// delegation, [`AgentPtyRegistry::arm_silence_watch`] is called from
+    /// `dispatch_one_owned` AFTER any `clear = true` respawn has already
+    /// resolved the worker's identity, so this is set directly at arm time
+    /// rather than bound later.
+    worker_agent_id: Option<String>,
     /// The live end of the watch task's cancellation channel. Never *sent* on:
     /// the task selects on it and exits as soon as it resolves, which happens
     /// when this record leaves the map (work-done, supersede, pane close, or the
@@ -2938,6 +2945,20 @@ pub struct OutstandingDelegation {
     /// clobbering delegation #2's still-live record — which used to leave the
     /// newest delegation silent forever with no nudge.
     superseded: u32,
+    /// Issue #465 F2: the worker's registry agent id, bound once it is known
+    /// rather than at arm time — `None` until [`AgentPtyRegistry::bind_delegation_worker_agent_id`]
+    /// sets it. This record is armed synchronously in `AppState::handle_delegate`,
+    /// BEFORE the dispatch task that may respawn the worker pane even starts
+    /// running, so the eventual worker identity (the respawn's fresh agent, or
+    /// whoever already owns the pane on a `clear = false` delegate) is not yet
+    /// knowable at arm time. `pump_reader`'s EOF sweep only retires a record
+    /// via its WORKER-side match when this field is bound AND matches the
+    /// agent that just exited — an unbound record belongs to a delegation
+    /// whose identity has not resolved yet, so the exiting agent (necessarily
+    /// some OTHER, previous occupant of the pane) cannot be it. Left unmatched
+    /// this way, an unbound record simply falls through to its own timer
+    /// instead of being drained by a stranger's death.
+    worker_agent_id: Option<String>,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
     /// selects on it and exits as soon as it resolves, which happens when this
@@ -3279,6 +3300,7 @@ impl AgentPtyRegistry {
                 orchestration: orchestration.cloned(),
                 armed_at: Instant::now(),
                 superseded,
+                worker_agent_id: None,
                 _watch_cancel: cancel_tx,
             },
         );
@@ -3286,6 +3308,29 @@ impl AgentPtyRegistry {
             seq,
             cancel: cancel_rx,
         })
+    }
+
+    /// Issue #465 F2: bind the worker's registry agent id onto an already-armed
+    /// [`OutstandingDelegation`] once it becomes known — after a `clear = true`
+    /// respawn resolves, or immediately for a `clear = false` delegate. `seq`
+    /// guards against binding a DIFFERENT (superseded, or already-retired)
+    /// delegation than the one the caller resolved this identity for: if the
+    /// record for `worker_pane_id` no longer exists, or a newer delegation has
+    /// since replaced it, this is a no-op. See [`OutstandingDelegation::worker_agent_id`]
+    /// for why the sweep needs this bound before it will ever act on a
+    /// worker-side match.
+    pub fn bind_delegation_worker_agent_id(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+        worker_agent_id: &str,
+    ) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.worker_agent_id = Some(worker_agent_id.to_string());
+        }
     }
 
     /// PRD #249 M3 review (finding B4/S4): register the silent-worker watch for
@@ -3306,10 +3351,14 @@ impl AgentPtyRegistry {
     /// round-6 review; see [`SilenceWatchRecord::superseded`]), because the
     /// `work-done` that belonged to the superseded delegation may still be in
     /// flight and must not be credited to this new watch.
+    ///
+    /// Issue #465 F2: `worker_agent_id` is the worker's registry agent id, when
+    /// the caller already knows it — see [`SilenceWatchRecord::worker_agent_id`].
     pub fn arm_silence_watch(
         &self,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
+        worker_agent_id: Option<&str>,
     ) -> Option<ArmedSilenceWatch> {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
@@ -3329,6 +3378,7 @@ impl AgentPtyRegistry {
                 seq,
                 superseded,
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
+                worker_agent_id: worker_agent_id.map(str::to_string),
                 _cancel: cancel_tx,
             },
         );
@@ -3566,10 +3616,28 @@ impl AgentPtyRegistry {
     /// matching record, so a race against a near-simultaneous `work-done` or
     /// explicit close — whichever reaches the tracker first — leaves nothing
     /// for the other to retire twice.
-    pub fn sweep_delegations_on_exit(&self, pane_id: &str) -> Vec<OutstandingDelegation> {
+    ///
+    /// Issue #465 F2: unlike [`Self::begin_pane_close`]/[`Self::finish_pane_close`],
+    /// a WORKER-side match here is additionally gated on `exited_agent_id` —
+    /// see [`drain_delegations_touching_for_exit`]/[`drain_silence_watches_touching_for_exit`]
+    /// and [`OutstandingDelegation::worker_agent_id`] for why. The two
+    /// deliberate closes need no such gate: their sweep runs INSIDE the same
+    /// operation that decided to end the pane, with no dispatch/respawn window
+    /// in between for a fresher, not-yet-bound delegation to be mistaken for
+    /// the one being closed.
+    ///
+    /// Private: `pump_reader`, its only caller, lives in this same module —
+    /// see issue #465 review finding F7.
+    fn sweep_delegations_on_exit(
+        &self,
+        pane_id: &str,
+        exited_agent_id: &str,
+    ) -> Vec<OutstandingDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
-        let cancelled_watches = Self::drain_silence_watches_touching(&mut tracker, pane_id);
-        let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
+        let cancelled_watches =
+            Self::drain_silence_watches_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
+        let swept =
+            Self::drain_delegations_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
         if cancelled_watches > 0 || !swept.is_empty() {
             tracing::debug!(
                 pane_id = %pane_id,
@@ -3746,6 +3814,59 @@ impl AgentPtyRegistry {
             .iter()
             .filter(|(worker_pane, watch)| {
                 worker_pane.as_str() == pane_id || watch.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter(|key| tracker.silence_watches.remove(*key).is_some())
+            .count()
+    }
+
+    /// Issue #465 F2: the [`Self::drain_delegations_touching`] counterpart used
+    /// by [`Self::sweep_delegations_on_exit`] — identical ORCHESTRATOR-side
+    /// match (that identity is always known and current, captured synchronously
+    /// at arm time), but a WORKER-side match additionally requires
+    /// `record.worker_agent_id` to be bound AND equal to `exited_agent_id`. A
+    /// record whose identity has not resolved yet (`None`) is left alone: the
+    /// agent that just exited is necessarily some OTHER, earlier occupant of
+    /// the pane, not the one this delegation is for. Caller holds the tracker
+    /// lock.
+    fn drain_delegations_touching_for_exit(
+        tracker: &mut DelegationTracker,
+        pane_id: &str,
+        exited_agent_id: &str,
+    ) -> Vec<OutstandingDelegation> {
+        let keys: Vec<String> = tracker
+            .records
+            .iter()
+            .filter(|(worker_pane, record)| {
+                (worker_pane.as_str() == pane_id
+                    && record.worker_agent_id.as_deref() == Some(exited_agent_id))
+                    || record.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter_map(|key| tracker.records.remove(key))
+            .collect()
+    }
+
+    /// Issue #465 F2: the [`Self::drain_silence_watches_touching`] counterpart
+    /// used by [`Self::sweep_delegations_on_exit`] — same identity gate as
+    /// [`Self::drain_delegations_touching_for_exit`], applied to silence
+    /// watches. Caller holds the tracker lock.
+    fn drain_silence_watches_touching_for_exit(
+        tracker: &mut DelegationTracker,
+        pane_id: &str,
+        exited_agent_id: &str,
+    ) -> usize {
+        let keys: Vec<String> = tracker
+            .silence_watches
+            .iter()
+            .filter(|(worker_pane, watch)| {
+                (worker_pane.as_str() == pane_id
+                    && watch.worker_agent_id.as_deref() == Some(exited_agent_id))
+                    || watch.orchestrator_pane_id == pane_id
             })
             .map(|(worker_pane, _)| worker_pane.clone())
             .collect();
@@ -9631,9 +9752,13 @@ mod spawn_tests {
     #[test]
     fn retire_silence_watch_applies_work_done_to_the_oldest_watch() {
         let reg = Arc::new(AgentPtyRegistry::new());
-        let first = reg.arm_silence_watch("worker", "orch").expect("arm #1");
+        let first = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("arm #1");
         let mut first_cancel = first.cancel;
-        let second = reg.arm_silence_watch("worker", "orch").expect("arm #2");
+        let second = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("arm #2");
         let mut second_cancel = second.cancel;
         assert!(second.seq > first.seq, "seq must be monotonic");
         assert!(

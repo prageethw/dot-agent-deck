@@ -100,11 +100,14 @@ enum OrchestratorStub {
     /// Same observable shape, but the process ENDS BY ITSELF the moment
     /// [`NATURAL_EXIT_FLAG`] appears in its cwd. That is the path
     /// `scheduler/idle-worker/008` cannot reach: `StopAgent` runs
-    /// `begin_pane_close`, whose sweep drops every record pointing at the pane
-    /// *before* any timer can wake, whereas a process that simply exits
-    /// triggers no close transition and therefore no sweep at all. On that path
-    /// the `write_and_submit_guarded` agent-id gate is the ONLY thing between a
-    /// still-armed timer and whichever agent inherits the freed pane id.
+    /// `begin_pane_close`, whose CLOSE-transition sweep drops every record
+    /// pointing at the pane *before* any timer can wake, whereas a process
+    /// that simply exits triggers no close transition. Issue #465 gave
+    /// `pump_reader`'s own EOF branch a SEPARATE sweep that still catches this
+    /// path — `scheduler/idle-worker/014` pins that — so the
+    /// `write_and_submit_guarded` agent-id gate is only reachable here once
+    /// the registry entry is *also* already gone before EOF, which
+    /// `scheduler/idle-worker/018` constructs directly.
     ExitsOnFlag,
 }
 
@@ -373,9 +376,13 @@ impl IdleHarness {
     /// caller can hand the freed pane id to a successor.
     ///
     /// Deliberately NOT a `StopAgent`: nothing in this path calls
-    /// `begin_pane_close`, so no record sweep runs and the armed delegation
-    /// survives its orchestrator. The caller asserts `is_pane_closing` is false
-    /// afterwards to pin that down.
+    /// `begin_pane_close`, so no CLOSE-transition sweep runs. Issue #465 added
+    /// a SEPARATE sweep on this exact path — `pump_reader`'s own EOF branch —
+    /// which does retire the armed delegation once this reader thread
+    /// observes the exit (`scheduler/idle-worker/014`); `018` reaches a
+    /// registry-entry-already-gone state where even that one is skipped. The
+    /// caller asserts `is_pane_closing` is false afterwards to pin down which
+    /// sweep, if any, is in play.
     async fn end_orchestrator_process(&self) {
         std::fs::write(self.cwd.path().join(NATURAL_EXIT_FLAG), b"exit\n")
             .expect("write the orchestrator stub's exit flag");
@@ -1051,7 +1058,7 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delegate to a silent worker, then let the ORCHESTRATOR's own process end — no StopAgent, so no close transition and no record sweep ever runs. A brand-new unrelated agent inherits the freed orchestrator pane id before the deadline, and after two further timeout windows its PTY must still hold nothing but its own readiness marker.
+/// Scenario: Delegate to a silent worker, then let the ORCHESTRATOR's own process end — no StopAgent, so no close-transition sweep runs. Issue #465's EOF sweep retires the worker's record anyway (the exiting orchestrator's own registry entry lingers, still `contains_key`-registered, until this same reader thread observes EOF) — this test pins THAT retirement, not the identity gate `scheduler/idle-worker/018` now covers. A brand-new unrelated agent still inherits the freed orchestrator pane id before the deadline, and after two further timeout windows its PTY must still hold nothing but its own readiness marker.
 #[spec("scheduler/idle-worker/014")]
 #[test]
 fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
@@ -1068,16 +1075,124 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
 
         let delegated_at = tokio::time::Instant::now();
         harness.delegate(&["orphaned-worker"]).await;
+        let worker_pane_id = worker_pane("orphaned-worker");
 
         // The orchestrator simply ENDS. Unlike `008`'s StopAgent, this path
-        // never enters `begin_pane_close`, so nothing sweeps the armed record
-        // and the identity gate is the only guard left.
+        // never enters `begin_pane_close`, so no CLOSE-transition sweep runs.
         harness.end_orchestrator_process().await;
         assert!(
             !harness.registry.is_pane_closing(ORCH_PANE),
             "the orchestrator pane is in a CLOSE transition, so the close-time record sweep — \
-             not the identity gate — would be what suppresses the prompt, and this test would \
-             stop covering the natural-exit path"
+             not the issue #465 EOF sweep this test actually covers — would be what suppresses \
+             the prompt, and this test would stop covering the natural-exit path"
+        );
+
+        // An unrelated agent takes the freed pane id, as any fresh spawn
+        // reusing a recycled `pane_id_env` would.
+        let successor = spawn_raw_cat_observer(
+            &harness.registry,
+            ORCH_PANE,
+            "SUCCESSOR-READY",
+            &harness.cwd_str(),
+        );
+        let ready = harness
+            .wait_for_snapshot_of(
+                &successor,
+                |snapshot| snapshot.contains("SUCCESSOR-READY"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            ready.contains("SUCCESSOR-READY"),
+            "the successor agent never became ready, so it could not have observed a stray \
+             submit either; snapshot = {ready:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < delegated_at + timeout,
+            "the successor only took the pane AFTER the delegation's deadline had already \
+             passed, so the timer had nobody to mis-deliver to and this test would pass for the \
+             wrong reason: it became ready {:?} after the delegate (timeout {timeout:?})",
+            tokio::time::Instant::now() - delegated_at
+        );
+
+        // Issue #465 F1 review: prove the EOF sweep is what retires the
+        // worker's record, so the `idle_count == 0` below is not vacuously
+        // true for the wrong reason. The orchestrator's own registry entry is
+        // still `contains_key`-present at the moment its process dies (only
+        // its `exited` flag is set, and `end_orchestrator_process` polls THAT,
+        // not registry removal) — so `is_agent_still_registered` reads true
+        // and `pump_reader`'s EOF branch on the orchestrator's own reader
+        // thread runs the sweep, which drains this worker's record via
+        // `record.orchestrator_pane_id == ORCH_PANE` well before the timer
+        // below would otherwise wake.
+        assert!(
+            matches!(
+                harness
+                    .registry
+                    .retire_outstanding_delegation(&worker_pane_id),
+                DelegationRetirement::Nothing
+            ),
+            "the worker's outstanding idle-worker delegation was still armed after the \
+             orchestrator's natural exit — the issue #465 EOF sweep should have retired it \
+             already, before the identity gate this test used to rely on ever got a chance to \
+             act"
+        );
+
+        // Two further timeout windows: the deadline passes while the successor
+        // owns the pane and is fully observable.
+        tokio::time::sleep(timeout * 2).await;
+        let snapshot = harness.snapshot_of(&successor);
+        assert!(
+            snapshot.contains("SUCCESSOR-READY"),
+            "the successor's own output vanished, so absence below proves nothing; \
+             snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            idle_count(&snapshot),
+            0,
+            "the dead orchestration's idle prompt was auto-submitted into an unrelated agent \
+             that merely inherited the pane id of an orchestrator which exited on its own; \
+             snapshot = {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains("orphaned-worker"),
+            "no fragment of the dead orchestration's delegation may reach the successor; \
+             snapshot = {snapshot:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a silent worker, then remove the ORCHESTRATOR's registry entry directly via `AgentPtyRegistry::close_agent` — the same "entry gone before the reader thread's own EOF" shape `close_agent`/`respawn_agent_for_pane` produce, but WITHOUT going through `begin_pane_close`, so no close-transition sweep runs. Because the entry is already gone before EOF, `is_agent_still_registered` is false too, so the issue #465 EOF sweep `014` now covers does not run either. A brand-new unrelated agent inherits the freed orchestrator pane id before the deadline, and after two further timeout windows its PTY must still hold nothing but its own readiness marker — the `write_and_submit_guarded` agent-id gate is the only guard left standing on this path.
+#[spec("scheduler/idle-worker/018")]
+#[test]
+fn idle_worker_018_registry_entry_removed_without_any_sweep_receives_nothing() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("1500"));
+    let timeout = Duration::from_millis(1500);
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["orphaned-worker"], None).await;
+
+        let delegated_at = tokio::time::Instant::now();
+        harness.delegate(&["orphaned-worker"]).await;
+
+        // Issue #465 F1 review: `close_agent` removes the registry entry
+        // BEFORE killing its child (see `pump_reader`'s doc comment), and,
+        // called directly like this, never goes through `begin_pane_close` —
+        // so `closing_panes` is never marked and no close-transition sweep
+        // runs. Once the killed child's own reader thread observes EOF,
+        // `is_agent_still_registered` is already false (the entry is gone),
+        // so `pump_reader`'s EOF branch skips the issue #465 sweep too. Both
+        // sweeps are provably absent on this path, so if the armed record
+        // still reached a successor, only `write_and_submit_guarded`'s
+        // agent-id gate could have stopped it.
+        harness
+            .registry
+            .close_agent(&harness.orchestrator_agent_id)
+            .expect("close the orchestrator's registry entry directly");
+        assert!(
+            !harness.registry.is_pane_closing(ORCH_PANE),
+            "close_agent alone must not mark the pane closing — that would mean this test is \
+             exercising begin_pane_close's sweep instead of the identity gate it exists to cover"
         );
 
         // An unrelated agent takes the freed pane id, as any fresh spawn
@@ -1121,7 +1236,7 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
             idle_count(&snapshot),
             0,
             "the dead orchestration's idle prompt was auto-submitted into an unrelated agent \
-             that merely inherited the pane id of an orchestrator which exited on its own; \
+             that merely inherited the pane id of a directly-removed orchestrator entry; \
              snapshot = {snapshot:?}"
         );
         assert!(
@@ -1482,6 +1597,56 @@ fn idle_worker_017_work_done_immediately_before_exit_suppresses_the_exit_notice(
             !idle_mentions_role(&snapshot, WORKER_ROLE),
             "the legitimate work-done must not be shadowed by a stray idle-worker prompt either; \
              snapshot = {snapshot:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a worker (arming a real outstanding idle-worker delegation and a real silence watch), then respawn that same worker pane directly through `AgentPtyRegistry::respawn_agent_for_pane` — the same primitive a `clear = true` delegate uses — and confirm both records still exist afterward instead of having been swept by the respawn itself.
+#[spec("scheduler/idle-worker/019")]
+#[test]
+fn idle_worker_019_respawn_carries_forward_armed_delegation_and_silence_watch() {
+    // Issue #465 F3: `pump_reader`'s doc comment rests its EOF-vs-deliberate-
+    // close distinction on `respawn_agent_for_pane` removing the OLD entry
+    // before killing it, then installing a fresh one — never touching the
+    // delegations tracker at all, so an outstanding delegation/silence watch
+    // armed for the pane "carries forward" to whichever agent occupies it
+    // next. Every existing `clear = true` test disables both watches
+    // (`WORKER_RESPONSE_TIMEOUT_ENV=0`, `DELEGATE_NO_EVENT_WINDOW_ENV=0`), so
+    // that carry-forward claim has never actually been observed — a future
+    // refactor moving the entry removal after the kill would break it with
+    // every gate green. This test arms both with a real, non-zero window and
+    // drives the respawn directly, isolating the no-sweep CONTRACT from the
+    // SessionStart/readiness machinery `dispatch_one_owned` wraps around it.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("8000"));
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&["respawning-worker"], None).await;
+        harness.delegate(&["respawning-worker"]).await;
+        let worker_pane_id = worker_pane("respawning-worker");
+
+        harness
+            .registry
+            .respawn_agent_for_pane(&worker_pane_id, WORKER_COMMAND)
+            .await
+            .expect("respawn the delegated worker pane");
+
+        assert!(
+            !matches!(
+                harness
+                    .registry
+                    .retire_outstanding_delegation(&worker_pane_id),
+                DelegationRetirement::Nothing
+            ),
+            "the outstanding idle-worker delegation armed before the respawn did not survive \
+             it — respawn_agent_for_pane's no-sweep contract (issue #465 F3) is unpinned"
+        );
+        assert!(
+            !matches!(
+                harness.registry.retire_silence_watch(&worker_pane_id),
+                SilenceWatchRetirement::Nothing
+            ),
+            "the silence watch armed before the respawn did not survive it — \
+             respawn_agent_for_pane's no-sweep contract (issue #465 F3) is unpinned"
         );
     });
 }
