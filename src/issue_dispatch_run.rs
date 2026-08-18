@@ -219,8 +219,17 @@ pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bo
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoveOutcome {
-    /// The worktree was removed.
-    Removed,
+    /// The worktree was removed. Carries the identity (issue #469) that
+    /// removed it — the caller-supplied `remover` [`remove_worktree`] was
+    /// given, mirroring [`RemoveFailed`](RemoveOutcome::RemoveFailed)'s own
+    /// caller-supplied string. Stored RAW, not the sanitized copy that
+    /// reaches the log line — safe today because the only non-test consumers
+    /// discard this payload entirely, but its sibling variant
+    /// [`RemoveFailed`](RemoveOutcome::RemoveFailed) already crosses the wire
+    /// as [`crate::event::WorktreeKeptNotice`], so any future sink that
+    /// surfaces THIS payload (to a TUI, a log, anywhere) must sanitize it
+    /// first, the same way [`remove_worktree`]'s own log line does.
+    Removed(String),
     /// The worktree was left in place. Carries why — see
     /// [`crate::event::KeptReason`].
     Kept(crate::event::KeptReason),
@@ -236,6 +245,29 @@ pub enum RemoveOutcome {
     RemoveFailed(String),
 }
 
+/// Build the argv for `git -C <clone_dir> worktree remove [--force] -- <worktree_dir>`
+/// — a pure function so the `--` end-of-options separator (issue #469 /
+/// #144 finding 4) can be pinned by a plain data assertion instead of a
+/// PATH-shadowed shell-stub test, mirroring `issue_dispatch.rs`'s
+/// `worktree_remove_argv` (PR #458), which solved the identical problem for
+/// its own caller. Unlike that sibling, `force` is conditional here (this
+/// caller uses [`RemovalPolicy::KeepIfDirty`] too), so it takes a `bool`
+/// rather than always pushing `--force`.
+fn remove_worktree_argv(clone_dir: &str, worktree_dir: &str, force: bool) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_string(),
+        clone_dir.to_string(),
+        "worktree".to_string(),
+        "remove".to_string(),
+    ];
+    if force {
+        args.push("--force".to_string());
+    }
+    args.push("--".to_string());
+    args.push(worktree_dir.to_string());
+    args
+}
+
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
 /// <worktree>`), PRESERVING the clone. Never fatal to the caller — a non-zero
 /// exit (already removed, locked) or a spawn error is logged AND reported back
@@ -248,10 +280,17 @@ pub enum RemoveOutcome {
 /// probe that fails, so dirtiness is unknown) is left in place, logged, and
 /// reported back as [`RemoveOutcome::Kept`]; under [`RemovalPolicy::Force`] the
 /// tree is removed regardless.
+///
+/// `remover` (issue #469) names the caller responsible for this removal —
+/// forwarded verbatim into [`RemoveOutcome::Removed`] and the success log,
+/// mirroring how [`attempt_worktree_cleanup`]/[`attempt_worktree_cleanup_async`]
+/// attribute their own removals. Caller-supplied and just as unauthenticated
+/// as those siblings' `remover`, so it is sanitised before logging.
 pub async fn remove_worktree(
     worktree_dir: &Path,
     clone_dir: &Path,
     policy: RemovalPolicy,
+    remover: &str,
 ) -> RemoveOutcome {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
@@ -260,6 +299,7 @@ pub async fn remove_worktree(
             Ok(output) if !output.trim().is_empty() => {
                 tracing::warn!(
                     worktree = %worktree_dir.display(),
+                    remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
                 return RemoveOutcome::Kept(crate::event::KeptReason::Dirty);
@@ -268,6 +308,7 @@ pub async fn remove_worktree(
             Err(e) => {
                 tracing::warn!(
                     worktree = %worktree_dir.display(),
+                    remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                     error = %e,
                     "dispatch: could not check worktree status; leaving in place"
                 );
@@ -276,25 +317,27 @@ pub async fn remove_worktree(
         }
     }
 
-    let clone = clone_dir.to_string_lossy();
-    let mut args = vec!["-C", &clone, "worktree", "remove", &worktree];
-    if policy == RemovalPolicy::Force {
-        args.push("--force");
-    }
-    let res = run_status("git", &args).await;
+    let args = remove_worktree_argv(
+        &clone_dir.to_string_lossy(),
+        &worktree,
+        policy == RemovalPolicy::Force,
+    );
+    let res = run_status_args("git", &args).await;
     match res {
         Ok(()) => {
             tracing::info!(
                 worktree = %worktree_dir.display(),
-                "issue-dispatch: removed worktree on tab close (clone preserved)"
+                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                "dispatch: removed worktree (clone preserved)"
             );
-            RemoveOutcome::Removed
+            RemoveOutcome::Removed(remover.to_string())
         }
         Err(e) => {
             tracing::warn!(
                 worktree = %worktree_dir.display(),
+                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                 error = %e,
-                "issue-dispatch: worktree cleanup on close failed"
+                "dispatch: worktree cleanup failed"
             );
             RemoveOutcome::RemoveFailed(e)
         }
@@ -3938,6 +3981,106 @@ exit 0
             "nothing was removed on this call (the directory is already gone) -- attribution \
              must be None, not fabricated, got {second:?}"
         );
+    }
+
+    // --- issue #469: `remove_worktree` attribution + the `--` argv gap ---
+
+    /// Scenario: issue #469. Unlike its siblings `attempt_worktree_cleanup(_async)`
+    /// and `worktree_reclaim::remove_worktree_dir` (all from PR #458),
+    /// `remove_worktree`'s success log carries no identity of the caller.
+    /// Mirrors `attempt_worktree_cleanup_records_remover_identity`'s shape: a
+    /// real worktree is force-removed, and the returned outcome must carry
+    /// the identity that removed it, not just log it.
+    #[tokio::test]
+    async fn remove_worktree_records_remover_identity() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let worktree_dir = ws.path().join("wt-remove-attrib");
+        git(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/remove-attrib",
+                worktree_dir.to_str().unwrap(),
+            ],
+        );
+        assert!(worktree_dir.exists());
+
+        let remover = "test-remover";
+        let outcome =
+            remove_worktree(&worktree_dir, &clone_dir, RemovalPolicy::Force, remover).await;
+        assert!(
+            !worktree_dir.exists(),
+            "remove_worktree must actually remove the directory"
+        );
+        match outcome {
+            RemoveOutcome::Removed(ref actual) => assert_eq!(
+                actual, remover,
+                "a removed worktree must attribute the identity that removed it (issue #469)"
+            ),
+            other => panic!(
+                "expected RemoveOutcome::Removed to carry the remover identity, got {other:?}"
+            ),
+        }
+    }
+
+    /// Scenario: issue #469 / #144 finding 4, reviewer F5b. Pure data
+    /// assertion against [`remove_worktree_argv`] — no process spawn, no
+    /// PATH shadow, no `unsafe`, no platform gate — that the `--`
+    /// end-of-options separator sits immediately before the worktree path,
+    /// same shape as `issue_dispatch.rs`'s
+    /// `worktree_remove_argv_carries_end_of_options_separator_before_path`
+    /// (PR #458), which this test is named distinctly from (reviewer F5b:
+    /// the previous shell-stub test in this module shared that exact name
+    /// across two modules, so a filtered `cargo test` matched both).
+    #[test]
+    fn remove_worktree_argv_puts_end_of_options_separator_before_path() {
+        let argv = remove_worktree_argv("/repo/clone", "/repo/worktrees/agent-issue-7", true);
+        let dash_dash = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("remove_worktree_argv must contain a `--` end-of-options separator");
+        assert_eq!(
+            argv.get(dash_dash + 1).map(String::as_str),
+            Some("/repo/worktrees/agent-issue-7"),
+            "the `--` separator must sit IMMEDIATELY before the path argument, got {argv:?}"
+        );
+    }
+
+    /// Scenario: `remove_worktree_argv`'s `force` parameter is what makes it
+    /// diverge from `issue_dispatch.rs`'s always-`--force` sibling — assert
+    /// `--force` is present when requested and absent otherwise.
+    #[test]
+    fn remove_worktree_argv_pushes_force_flag_only_when_requested() {
+        let forced = remove_worktree_argv("/repo/clone", "/repo/worktrees/agent-issue-7", true);
+        assert!(forced.iter().any(|a| a == "--force"));
+
+        let unforced = remove_worktree_argv("/repo/clone", "/repo/worktrees/agent-issue-7", false);
+        assert!(!unforced.iter().any(|a| a == "--force"));
     }
 
     // --- fork issue #282: the attach race ---
