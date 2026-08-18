@@ -2520,6 +2520,115 @@ mod tests {
         assert!(capability, "an identified Claude frame proves the channel");
     }
 
+    /// Scenario: Issue #468, follow-up to #459/PR #466. PR #466 taught
+    /// `drain_pre_write_events` to recognize a Codex `SessionStart` event
+    /// whose native hook install/trust is recorded as failed
+    /// (`codex_hook_trust_outcome() == Some(false)`) and refuse to arm
+    /// `can_report_prompts` FROM THAT EVENT — but gave the function no way to
+    /// tell its caller the failure was ever seen. This drains two events in
+    /// order: (1) a Codex `SessionStart` with a recorded hook-trust failure,
+    /// then (2) an ordinary Codex event with no hook-trust metadata at all
+    /// (ordinary status/heartbeat shape). Event 2 unconditionally arms
+    /// `can_report_prompts` (today's correct behavior for a metadata-free
+    /// Codex frame), which silently erases the fact that event 1's failure
+    /// was ever observed — nothing in the current 5-argument signature can
+    /// report it. The fix needs a new out-param (mirrored on
+    /// `SessionStartWait::codex_hook_trust_failed` in `src/state.rs`) so the
+    /// caller can veto `can_report_prompts` downstream the same way
+    /// `deliver()` already does with `observed.codex_hook_trust_failed`. This
+    /// pins that missing signal by calling a 6-argument
+    /// `drain_pre_write_events` that does not exist yet on `main` — it must
+    /// fail to COMPILE (E0061, too many arguments) until that parameter is
+    /// added, which is deliberate: there is no way to express this test
+    /// against the current signature at all.
+    #[test]
+    fn drain_pre_write_events_reports_hook_trust_failure_even_when_a_later_event_arms_capability() {
+        const PANE_ID: &str = "codex-hook-trust-failed-then-armed-pane";
+        const AGENT_ID: &str = "codex-hook-trust-failed-then-armed-agent";
+
+        let mut failed_metadata = HashMap::new();
+        failed_metadata.insert(
+            crate::event::CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+            "false".to_string(),
+        );
+        let failed_event = AgentEvent {
+            session_id: "codex-hook-trust-failed-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: failed_metadata,
+            pane_id: Some(PANE_ID.to_string()),
+            agent_id: Some(AGENT_ID.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        };
+        assert_eq!(
+            failed_event.codex_hook_trust_outcome(),
+            Some(false),
+            "sanity: this event must carry a recorded hook-trust failure"
+        );
+
+        // Ordinary Codex frame with no hook-trust metadata at all — the shape
+        // that unconditionally arms `can_report_prompts` today.
+        let metadata_free_event = AgentEvent {
+            session_id: "codex-hook-trust-failed-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.to_string()),
+            agent_id: Some(AGENT_ID.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        };
+        assert_eq!(
+            metadata_free_event.codex_hook_trust_outcome(),
+            None,
+            "sanity: this event must carry no hook-trust metadata"
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(failed_event));
+        let _ = tx.send(BroadcastMsg::Event(metadata_free_event));
+
+        let mut generation = None;
+        let mut can_report_prompts = false;
+        // Not on `main` yet: `drain_pre_write_events` today takes 5
+        // arguments. This 6th argument is the missing out-param the fix must
+        // add so a hook-trust failure observed mid-drain survives past a
+        // later event that would otherwise arm `can_report_prompts`.
+        let mut codex_hook_trust_failed = false;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut can_report_prompts,
+                &mut codex_hook_trust_failed,
+            ),
+            None
+        );
+        assert!(
+            codex_hook_trust_failed,
+            "issue #468: a hook-trust failure observed mid-drain must be reported back even \
+             when a later, metadata-free Codex event goes on to arm can_report_prompts — \
+             drain_pre_write_events currently has no out-param to carry this signal at all"
+        );
+    }
+
     /// Scenario: Issue #459, follow-up to #254/PR #441. PR #441 fixed the
     /// TUI-attached path (`src/ui.rs`'s `delivery_capability`) to downgrade a
     /// Codex pane away from `Reports` when its native hook install/trust is
