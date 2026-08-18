@@ -10349,9 +10349,22 @@ fn dispatch_action(
                                 // command rather than falling back to the
                                 // deck's cwd.
                                 Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
-                                    cleaned_up,
+                                    cleaned_up_by,
                                 }) => {
-                                    let detail = if cleaned_up {
+                                    let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                        // Issue #325 reviewer P2-2: the identity
+                                        // is always the same `creator` this
+                                        // request just supplied, so it carries
+                                        // no NEW information for the status
+                                        // line -- but it is still worth a log
+                                        // line for a post-incident reader
+                                        // grepping DOT_AGENT_DECK_LOG, and it
+                                        // was previously discarded entirely.
+                                        tracing::info!(
+                                            path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                            remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                            "worktree add timed out; half-created directory removed automatically"
+                                        );
                                         "the half-created directory was removed automatically — try again".to_string()
                                     } else {
                                         format!(

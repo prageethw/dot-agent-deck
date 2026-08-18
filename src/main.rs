@@ -2394,10 +2394,19 @@ fn run_worktree_list_cli(json: bool, mine: bool) -> ExitCode {
 /// worktree; only a failure to enumerate worktrees at all (e.g. not a git
 /// repo) is reported as failure.
 fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::issue_claim::resolve_remover_identity;
     use dot_agent_deck::terminal_sanitize::sanitize_for_terminal_display;
     use dot_agent_deck::worktree_reclaim::{
         format_reclaim_error_for_cli, format_reclaim_human, run_reclaim,
     };
+
+    // issue #325 / reviewer NEW-1 / auditor P1: without this, the
+    // `tracing::info!("worktree removed")` in `remove_worktree_dir` is
+    // silently dropped -- `run_worktree_reclaim_cli` is a distinct top-level
+    // `Commands::Worktree` arm, mutually exclusive with `Commands::Daemon`'s
+    // `Serve` arm and `run_dashboard()` (the two existing call sites), so
+    // this can never double-install a subscriber and panic on `.init()`.
+    init_logging_from_env();
 
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -2409,7 +2418,18 @@ fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run_reclaim(&cwd, yes) {
+    // issue #325 / reviewer P2-1 / auditor F2: attribute this reclaim's own
+    // removals to whoever is actually running it. `resolve_remover_identity`
+    // (not the bare `resolve_caller_identity` the claim LOCK uses) is
+    // deliberate: `worktree reclaim`'s dominant caller is an orchestration
+    // running it from the root checkout, which `resolve_caller_identity`
+    // refuses to attribute (correctly, for the lock it was built for) --
+    // this is diagnostic data, not a lock, so it degrades to whatever local
+    // signal is available (pane id + host + cwd) rather than the bare
+    // "unknown" a naive reuse of the lock resolver would produce for
+    // exactly this case.
+    let remover = resolve_remover_identity(&cwd);
+    match run_reclaim(&cwd, yes, &remover) {
         Ok(outcome) => {
             print!("{}", format_reclaim_human(&outcome));
             ExitCode::SUCCESS
