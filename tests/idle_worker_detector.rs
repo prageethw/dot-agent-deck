@@ -572,6 +572,88 @@ fn idle_count(snapshot: &str) -> usize {
     snapshot.match_indices(IDLE_NEEDLE).count()
 }
 
+/// Shared tail for the idle-worker cancellation tests below: wait for
+/// `control_role`'s idle prompt to prove the detector fired at all, then
+/// assert `absent_role`'s prompt never appeared — cancelled by whatever the
+/// caller did in between (work-done, StopAgent, ...). `fired_msg` and
+/// `absent_msg` are the exact failure messages each caller previously
+/// inlined, so the assertions and their wording are unchanged; only this
+/// mechanical "wait, settle, snapshot, assert twice" scaffolding — flagged
+/// by SonarCloud as new-code duplication between `idle_worker_002` and
+/// `idle_worker_006` — was extracted.
+async fn assert_idle_fired_then_role_absent(
+    harness: &IdleHarness,
+    control_role: &str,
+    control_timeout: Duration,
+    fired_msg: &str,
+    absent_role: &str,
+    absent_msg: &str,
+) {
+    let _ = harness
+        .wait_for_idle_role(control_role, control_timeout)
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+    assert!(
+        idle_mentions_role(&snapshot, control_role),
+        "{fired_msg}; snapshot = {snapshot:?}"
+    );
+    assert!(
+        !idle_mentions_role(&snapshot, absent_role),
+        "{absent_msg}; snapshot = {snapshot:?}"
+    );
+}
+
+/// Deterministic stand-in per the PRD's own test-plan guidance, shared by
+/// `idle_worker_016`/`idle_worker_017`: writes a readiness marker, holds
+/// the pane open long enough for `delegate()` to arm both watches, then
+/// exits cleanly with no work-done call ever made.
+const EXIT_STUB: &str =
+    "stty -echo -icanon -icrnl -opost min 1 time 0; printf 'WORKER-READY'; sleep 1; exit 0";
+
+/// Shared setup for `idle_worker_016`/`idle_worker_017` (issue #465
+/// M1/M3): spawn a worker running [`EXIT_STUB`], wait for its readiness
+/// marker, delegate to arm both watches, and confirm the worker is still
+/// live before the caller drives whichever EOF-timing scenario it tests.
+/// `live_check_context` fills in the "prove nothing about ..." tail of the
+/// liveness assertion's failure message so each caller keeps its own
+/// specific wording — the assertions themselves are unchanged from what
+/// each test previously inlined. Extracted to resolve a SonarCloud
+/// new-code duplication finding between the two callers.
+async fn spawn_and_delegate_exit_stub_worker(
+    worker_role: &'static str,
+    live_check_context: &str,
+) -> (IdleHarness, String) {
+    let harness = IdleHarness::with_workers(&[(worker_role, EXIT_STUB)], None).await;
+    let worker_pane_id = worker_pane(worker_role);
+    let worker_agent_id = harness
+        .worker_agent_ids
+        .get(worker_role)
+        .expect("worker agent id recorded at spawn")
+        .clone();
+
+    let ready = harness
+        .wait_for_snapshot_of(
+            &worker_agent_id,
+            |snapshot| snapshot.contains("WORKER-READY"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        ready.contains("WORKER-READY"),
+        "the exit-stub worker never became ready; snapshot = {ready:?}"
+    );
+
+    harness.delegate(&[worker_role]).await;
+    assert!(
+        harness.registry.pane_is_live(&worker_pane_id),
+        "the worker had already exited before delegate() could arm its records, so this \
+         test would prove nothing about {live_check_context}"
+    );
+
+    (harness, worker_pane_id)
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -631,19 +713,15 @@ fn idle_worker_002_work_done_cancels_idle_prompt() {
         tokio::time::sleep(Duration::from_millis(250)).await;
         harness.work_done("responsive-worker").await;
 
-        let _ = harness
-            .wait_for_idle_role("silent-control", Duration::from_secs(4))
-            .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
-        assert!(
-            idle_mentions_role(&snapshot, "silent-control"),
-            "silent control worker did not prove the detector fired; snapshot = {snapshot:?}"
-        );
-        assert!(
-            !idle_mentions_role(&snapshot, "responsive-worker"),
-            "work-done did not cancel the responsive worker's idle prompt; snapshot = {snapshot:?}"
-        );
+        assert_idle_fired_then_role_absent(
+            &harness,
+            "silent-control",
+            Duration::from_secs(4),
+            "silent control worker did not prove the detector fired",
+            "responsive-worker",
+            "work-done did not cancel the responsive worker's idle prompt",
+        )
+        .await;
     });
 }
 
@@ -901,19 +979,15 @@ fn idle_worker_006_stop_agent_cancels_idle_prompt() {
         .expect("StopAgent over attach socket");
         assert!(response.ok, "StopAgent failed: {:?}", response.error);
 
-        let _ = harness
-            .wait_for_idle_role("silent-control", Duration::from_secs(6))
-            .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
-        assert!(
-            idle_mentions_role(&snapshot, "silent-control"),
-            "silent control worker did not prove the detector fired; snapshot = {snapshot:?}"
-        );
-        assert!(
-            !idle_mentions_role(&snapshot, "stopped-worker"),
-            "StopAgent did not cancel the stopped worker's idle prompt; snapshot = {snapshot:?}"
-        );
+        assert_idle_fired_then_role_absent(
+            &harness,
+            "silent-control",
+            Duration::from_secs(6),
+            "silent control worker did not prove the detector fired",
+            "stopped-worker",
+            "StopAgent did not cancel the stopped worker's idle prompt",
+        )
+        .await;
     });
 }
 
@@ -1269,43 +1343,14 @@ fn idle_worker_016_pty_eof_retires_armed_delegation_and_silence_watch() {
     // retirement — never by the timeout coincidentally elapsing first.
     let _env = EnvGuard::set(Some("8000"));
     const WORKER_ROLE: &str = "silent-exit-worker";
-    // Deterministic stand-in per the PRD's own test-plan guidance: writes a
-    // readiness marker, holds the pane open long enough for delegate() to
-    // arm both watches, then exits cleanly with no work-done call ever made.
-    const EXIT_STUB: &str =
-        "stty -echo -icanon -icrnl -opost min 1 time 0; printf 'WORKER-READY'; sleep 1; exit 0";
     runtime().block_on(async {
-        let harness = IdleHarness::with_workers(&[(WORKER_ROLE, EXIT_STUB)], None).await;
-        let worker_pane_id = worker_pane(WORKER_ROLE);
-        let worker_agent_id = harness
-            .worker_agent_ids
-            .get(WORKER_ROLE)
-            .expect("worker agent id recorded at spawn")
-            .clone();
-
-        let ready = harness
-            .wait_for_snapshot_of(
-                &worker_agent_id,
-                |snapshot| snapshot.contains("WORKER-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            ready.contains("WORKER-READY"),
-            "the exit-stub worker never became ready; snapshot = {ready:?}"
-        );
-
-        harness.delegate(&[WORKER_ROLE]).await;
-
-        // Fixture precondition: the worker is still alive right after both
-        // watches are armed, so the retirement asserted below is caused by
-        // the EOF the stub produces a moment later — not by the pane never
-        // having held a live agent in the first place.
-        assert!(
-            harness.registry.pane_is_live(&worker_pane_id),
-            "the worker had already exited before delegate() could arm its records, so this \
-             test would prove nothing about EOF-triggered retirement"
-        );
+        // Fixture precondition (asserted inside the helper): the worker is
+        // still alive right after both watches are armed, so the retirement
+        // asserted below is caused by the EOF the stub produces a moment
+        // later — not by the pane never having held a live agent in the
+        // first place.
+        let (harness, worker_pane_id) =
+            spawn_and_delegate_exit_stub_worker(WORKER_ROLE, "EOF-triggered retirement").await;
 
         // The stub's own `sleep 1; exit 0` produces PTY EOF shortly after
         // arming, with no work-done call ever made for this pane.
@@ -1396,35 +1441,9 @@ fn idle_worker_017_work_done_immediately_before_exit_suppresses_the_exit_notice(
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(Some("8000"));
     const WORKER_ROLE: &str = "reports-then-exits-worker";
-    const EXIT_STUB: &str =
-        "stty -echo -icanon -icrnl -opost min 1 time 0; printf 'WORKER-READY'; sleep 1; exit 0";
     runtime().block_on(async {
-        let harness = IdleHarness::with_workers(&[(WORKER_ROLE, EXIT_STUB)], None).await;
-        let worker_pane_id = worker_pane(WORKER_ROLE);
-        let worker_agent_id = harness
-            .worker_agent_ids
-            .get(WORKER_ROLE)
-            .expect("worker agent id recorded at spawn")
-            .clone();
-
-        let ready = harness
-            .wait_for_snapshot_of(
-                &worker_agent_id,
-                |snapshot| snapshot.contains("WORKER-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            ready.contains("WORKER-READY"),
-            "the exit-stub worker never became ready; snapshot = {ready:?}"
-        );
-
-        harness.delegate(&[WORKER_ROLE]).await;
-        assert!(
-            harness.registry.pane_is_live(&worker_pane_id),
-            "the worker had already exited before delegate() could arm its records, so this \
-             test would prove nothing about the work-done-then-exit race"
-        );
+        let (harness, worker_pane_id) =
+            spawn_and_delegate_exit_stub_worker(WORKER_ROLE, "the work-done-then-exit race").await;
 
         // The worker reports completion BEFORE its process ends — the stub's
         // own `sleep 1` has not elapsed yet, so this is the legitimate

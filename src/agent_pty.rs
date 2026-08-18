@@ -319,6 +319,63 @@ pub fn is_valid_cwd(value: &str) -> bool {
     !value.is_empty() && value.len() <= CWD_MAX_LEN && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
+/// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
+/// complexity): validate a caller-supplied `DOT_AGENT_DECK_PANE_ID` for
+/// retention in the registry, dropping (and logging) anything that fails
+/// [`is_valid_pane_id_env`]. The spawned child still sees the caller's
+/// verbatim value via `opts.env` — only the registry's retained mirror
+/// goes through this filter (see the doc comment at the `spawn_agent` call
+/// site for why that mirror needs scrubbing).
+fn capture_pane_id_env(opts: &SpawnOptions<'_>) -> Option<String> {
+    let value = opts
+        .env
+        .iter()
+        .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
+        .map(|(_, v)| v.clone())?;
+    if is_valid_pane_id_env(&value) {
+        Some(value)
+    } else {
+        tracing::debug!(
+            len = value.len(),
+            "spawn_agent: dropping caller-supplied DOT_AGENT_DECK_PANE_ID — fails validation, child still sees it but registry won't echo it"
+        );
+        None
+    }
+}
+
+/// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
+/// complexity): validate a caller-supplied display name via
+/// [`is_valid_display_name`], dropping (and logging) anything that fails.
+fn capture_display_name(display_name: Option<&str>) -> Option<String> {
+    let value = display_name?;
+    if is_valid_display_name(value) {
+        Some(value.to_string())
+    } else {
+        tracing::debug!(
+            len = value.len(),
+            "spawn_agent: dropping caller-supplied display_name — fails validation"
+        );
+        None
+    }
+}
+
+/// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
+/// complexity): validate a caller-supplied cwd via [`is_valid_cwd`],
+/// dropping (and logging) anything that fails. The child still sees the
+/// caller's verbatim cwd; only the registry's retained copy is scrubbed.
+fn capture_cwd(cwd: Option<&str>) -> Option<String> {
+    let value = cwd?;
+    if is_valid_cwd(value) {
+        Some(value.to_string())
+    } else {
+        tracing::debug!(
+            len = value.len(),
+            "spawn_agent: dropping caller-supplied cwd from registry — fails validation (child still sees it)"
+        );
+        None
+    }
+}
+
 /// Which tab a daemon-tracked agent pane belonged to at spawn time
 /// (PRD #76 M2.12). Echoed back via `list_agents` so the TUI can rebuild
 /// the user's mode/orchestration tab structure on reconnect instead of
@@ -4041,22 +4098,7 @@ impl AgentPtyRegistry {
         // `list_agents` response past `MAX_FRAME_LEN` and breaking
         // hydration for *every* agent. The child process still sees the
         // caller's verbatim value — only the registry's mirror is scrubbed.
-        let pane_id_env = opts
-            .env
-            .iter()
-            .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
-            .map(|(_, v)| v.clone())
-            .and_then(|v| {
-                if is_valid_pane_id_env(&v) {
-                    Some(v)
-                } else {
-                    tracing::debug!(
-                        len = v.len(),
-                        "spawn_agent: dropping caller-supplied DOT_AGENT_DECK_PANE_ID — fails validation, child still sees it but registry won't echo it"
-                    );
-                    None
-                }
-            });
+        let pane_id_env = capture_pane_id_env(&opts);
 
         // Point the child at THIS daemon's hook socket rather than letting it
         // re-resolve the endpoint from inherited environment at emit time.
@@ -4077,28 +4119,8 @@ impl AgentPtyRegistry {
         // (no control chars in display_name, bounded length) hold the same
         // way whether the value arrived via the initial StartAgent or via a
         // later SetAgentLabel.
-        let display_name = opts.display_name.and_then(|v| {
-            if is_valid_display_name(v) {
-                Some(v.to_string())
-            } else {
-                tracing::debug!(
-                    len = v.len(),
-                    "spawn_agent: dropping caller-supplied display_name — fails validation"
-                );
-                None
-            }
-        });
-        let cwd_stored = opts.cwd.and_then(|v| {
-            if is_valid_cwd(v) {
-                Some(v.to_string())
-            } else {
-                tracing::debug!(
-                    len = v.len(),
-                    "spawn_agent: dropping caller-supplied cwd from registry — fails validation (child still sees it)"
-                );
-                None
-            }
-        });
+        let display_name = capture_display_name(opts.display_name);
+        let cwd_stored = capture_cwd(opts.cwd);
 
         // M2.12: capture tab_membership through the same validation lens
         // (the embedded `name` must satisfy `is_valid_display_name`) so the
