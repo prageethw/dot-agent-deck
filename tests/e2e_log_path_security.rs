@@ -62,8 +62,6 @@ fn log_path_001_default_log_lives_under_state_dir_with_owner_only_permissions() 
         "1",
     );
 
-    let daemon_pid = daemon.id() as i32;
-
     // The fix's log file is written synchronously (a plain `std::fs::File`
     // writer — see the PRD #170 doc comment on `init_logging_from_env`), but
     // give it a short bounded window past socket-bind for the first tracing
@@ -103,13 +101,10 @@ fn log_path_001_default_log_lives_under_state_dir_with_owner_only_permissions() 
         "expected the state dir to be created owner-only (mode 0o700), got {mode:#o}"
     );
 
-    // Cleanup: never leak the daemon out of the test.
+    // Cleanup: never leak the daemon out of the test. `kill()` + `wait()`
+    // reaps the child; a `process_running` re-check after a successful reap
+    // can only be true of a recycled pid, so there is no follow-up SIGKILL
+    // to send.
     let _ = daemon.kill();
     let _ = daemon.wait();
-    if common::process_running(daemon_pid) {
-        // SAFETY: best-effort cleanup kill.
-        unsafe {
-            libc::kill(daemon_pid, libc::SIGKILL);
-        }
-    }
 }
