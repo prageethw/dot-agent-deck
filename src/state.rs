@@ -3335,14 +3335,25 @@ async fn dispatch_one_owned(
     // the pane in a gap opened by pane-id REUSE: the worker's agent exits or is
     // closed (`close_agent`, a crash, a natural process exit), freeing its
     // `pane_id_env`, and a brand-new, unrelated agent then inherits that same
-    // pane id before this dispatch reaches its write — `idle_worker_014`/`_018`
-    // (`tests/idle_worker_detector.rs`) demonstrate this reuse is real and fast
-    // enough to matter. It is NOT a concurrent respawn of THIS pane racing this
+    // pane id before this dispatch reaches its write. `idle_worker_014`/`_018`
+    // (`tests/idle_worker_detector.rs`) demonstrate this reuse mechanism is real
+    // and fast enough to matter — measured against `ORCH_PANE` (both tests
+    // reuse the ORCHESTRATOR pane, not a worker pane), but the underlying
+    // primitive (`pane_id_env` being freed and reassigned on agent exit) is the
+    // same one for any pane, worker panes included.
+    //
+    // In PRODUCTION this is NOT a concurrent respawn of THIS pane racing this
     // dispatch: `dispatch_one_owned` is the only production caller of
     // `respawn_agent_for_pane`, and it runs under `registry.pane_dispatch_lock`,
     // which serializes every dispatch on a pane (a `clear = true` respawn always
     // resolves `expected_worker_agent_id` to its own fresh `new_agent_id` above,
-    // never `None`). Calling `write_and_submit_guarded_detailed` with
+    // never `None`). `idle_worker_019` reaches this same `None` branch by a
+    // route production code cannot take: it calls `respawn_agent_for_pane`
+    // directly on the worker pane, outside `pane_dispatch_lock`, racing the
+    // detached task `handle_delegate` spawned for this very dispatch — a
+    // concurrent respawn of this pane, but reachable only because the test
+    // drives the primitive itself rather than going through
+    // `dispatch_one_owned`. Calling `write_and_submit_guarded_detailed` with
     // `expected_agent_id = None` in that gap is NOT a safe no-op: its pre-lock
     // identity gate only compares `expected` against the pane's current owner
     // when `expected` is `Some` — so `None` skips the gate entirely and the call
@@ -3458,23 +3469,28 @@ async fn dispatch_one_owned(
     // record we registered before the write rather than leaving it to be swept
     // by the next delegate or close.
     //
-    // Issue #465 F2/F3: EXCEPT when the identity gate above never got a target
-    // to write to in the first place (`expected_worker_agent_id` was `None`).
-    // That is not "the delegate failed" — the write was refused UNGUARDED
-    // precisely because a concurrent respawn of this pane may be in flight (see
-    // the comment on `outcome`'s resolution above) — and cancelling here would
-    // reintroduce, from this side of the write, the exact same defeat of issue
-    // #465 F3's "an outstanding delegation/silence watch carries forward across
-    // a respawn" contract that binding the record's identity was meant to
-    // prevent from the EOF-sweep side. Leave the record ARMED — present but
-    // unbound and with no watch task spawned below — so it still exists to be
-    // superseded, closed, or retired by whatever inherits the pane, exactly as
-    // an unbound `OutstandingDelegation` is already left alone rather than
-    // drained by a stranger's exit.
+    // Issue #465 F4 (reviewer, PR #477): an earlier version of this comment kept
+    // the record ARMED when `expected_worker_agent_id` was `None`, reasoning by
+    // analogy to `OutstandingDelegation`'s "an unbound record carries forward
+    // across a respawn" contract (issue #465 F3). That analogy does not hold
+    // here. `OutstandingDelegation::worker_agent_id` is deliberately
+    // late-bindable — `bind_delegation_worker_agent_id` can still fill it in
+    // after arm time, so leaving an unbound record alive lets it become useful
+    // later. `SilenceWatchRecord::worker_agent_id` has no such late-binding
+    // path: it is set once, at `arm_silence_watch` call time, and never updated
+    // again — this call is the only writer. A record armed here with
+    // `worker_agent_id = None` can therefore never become useful; of "superseded,
+    // closed, or retired by whatever inherits the pane," closed/retired are
+    // inert for a record with no watch task, and superseded is actively
+    // harmful: the next `arm_silence_watch` on this pane reads the leftover
+    // record as a predecessor and increments `superseded`
+    // (`AgentPtyRegistry::arm_silence_watch`), so `retire_silence_watch` later
+    // spends that credit on the NEXT delegation's genuine `work-done` instead of
+    // retiring it — letting that next watch run to its timeout and emit a
+    // spurious silent-worker notice for work that actually completed. Cancel
+    // unconditionally instead.
     if !delivered {
-        if expected_worker_agent_id.is_some() {
-            registry.cancel_silence_watch_if(&pane_id, armed.seq);
-        }
+        registry.cancel_silence_watch_if(&pane_id, armed.seq);
         return;
     }
     let Some(worker_agent_id) = expected_worker_agent_id else {
@@ -7207,6 +7223,55 @@ clear = false
             log.contains("delegate: worker identity could not be resolved"),
             "dispatch_one_owned must take the else arm and refuse the write itself, rather \
              than ever handing the primitive a bare None; captured log = {log:?}"
+        );
+    }
+
+    /// Issue #465 F4 (reviewer, PR #477): when the worker identity cannot be
+    /// resolved, `dispatch_one_owned` must not leave the silence-watch record it
+    /// armed before the write ARMED afterward. A record left armed here has no
+    /// watch task — nothing on this path ever spawns one — so it can never emit
+    /// a notice itself; its only observable effect is on the NEXT watch armed
+    /// for this pane, which reads the leftover record as a predecessor and
+    /// increments `superseded`. That inflated count is then spent retiring a
+    /// LATER, genuine `work-done`, leaving the real watch armed to run to its
+    /// timeout and emit a spurious silent-worker notice for work that actually
+    /// completed. Pin the fix by confirming nothing is left in the map: a
+    /// `retire_silence_watch` on the same pane immediately after the refusal
+    /// must see `Nothing`, not a record to spend a retirement on.
+    #[tokio::test]
+    async fn dispatch_one_owned_cancels_silence_watch_when_worker_identity_is_unresolved() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let worker_pane = "worker-pane-no-agent-silence-watch";
+
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            None,
+            "orch-pane".to_string(),
+            "worker-role".to_string(),
+            worker_pane.to_string(),
+            "probe task".to_string(),
+            None,
+            Some(SilenceWatch {
+                window: std::time::Duration::from_secs(60),
+                target: SilenceReportTarget {
+                    pane_id: "orch-pane".to_string(),
+                    agent_id: None,
+                    orchestration: None,
+                },
+            }),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                registry.retire_silence_watch(worker_pane),
+                crate::agent_pty::SilenceWatchRetirement::Nothing
+            ),
+            "an identity-unresolved refusal must cancel the silence watch it armed, not leave \
+             a taskless record behind to inflate the next watch's `superseded` counter"
         );
     }
 
