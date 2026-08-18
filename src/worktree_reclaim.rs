@@ -424,6 +424,12 @@ pub struct WorktreeReport {
     /// Nothing in this crate branches on `removed_by` today, and the point
     /// of this note is to keep it that way; there is no `owner_kind`-style
     /// discrete field for this one to fall back on instead.
+    ///
+    /// `#[serde(skip)]`, same as `real_path` above and for the same reason:
+    /// there is no `worktree reclaim --json` today, so this field is never
+    /// actually serialized by anything that exists. A future `--json`
+    /// consumer looking for `removed_by` in the JSON document and finding it
+    /// silently absent should land here rather than guess.
     #[serde(skip)]
     pub removed_by: Option<String>,
 }

@@ -152,13 +152,12 @@ pub fn decide_claim(
 /// the SAME identity and the lock would wave them all through while
 /// appearing to work.
 ///
-/// `pub(crate)`: the only callers are [`resolve_remover_identity`] (same
+/// Private: the only callers are [`resolve_remover_identity`] (same
 /// module) and `issue_claim`'s own claim-lock entry point. `main.rs`'s
-/// `run_worktree_reclaim_cli` calls `resolve_remover_identity` instead
+/// `run_worktree_reclaim_cli` calls [`resolve_remover_identity`] instead
 /// (issue #325 / reviewer NEW-3 / auditor), which stays `pub` because it —
 /// not this function — is the one crossing the binary/library crate
-/// boundary; `pub(crate)` here would not reach `main.rs` either, but nothing
-/// there needs it to. Keeping the lock resolver un-exported is also the
+/// boundary. Keeping the lock resolver un-exported is also the
 /// cheapest way to enforce the warning below: a function nothing outside
 /// this module can even name is a function nothing outside this module can
 /// misuse.
