@@ -2,7 +2,7 @@
 
 **Issue:** [prageethw/dot-agent-deck#325](https://github.com/prageethw/dot-agent-deck/issues/325)
 **Priority:** High
-**Status:** Planning — decision needed, not yet an implementation plan
+**Status:** Planning — M1 decided 2026-08-18 (maintainer approved the proposed direction as written); M2 (amend fork#166) landing in the same commit as this update. M3-M6 not yet started.
 **Predecessors:** PR #331 (attach-race lock, shallow-clone detection), PR #420 (repository-state preflight), PR #458 / PR #471 (worktree-removal attribution + liveness gate) — all three already-merged directions of #325; this PRD covers only the fourth, deliberately deferred by all three: *"Consider whether concurrent orchestrations should share one clone at all."*
 **Related:** PRD fork#166 (agent-provisioned worktrees — the PRD that made today's single-shared-clone model **explicit and intended**), PRD fork#175 (delegate provisions the worktree — unimplemented, assumes single-clone), PRD fork#298 (worktree owner human/agent), PRD #236 (worktree removal safety — already notes #120 and #220 use two different, unreconciled clone strategies)
 **Fork-only?** No — the underlying provisioning code (`dispatch.rs`, `issue_dispatch_run.rs`, `ui.rs`'s spawn path) is upstream code. Offer upstream per rule 19 once a direction is decided and shipped.
@@ -55,8 +55,8 @@ This section is deliberately a proposal, not a settled call — reversing PRD fo
 
 ## Milestones
 
-- [ ] M1 — Maintainer decision recorded on the Decisions table above (or a revised version of it) — this milestone gates all others.
-- [ ] M2 — PRD fork#166 amended to record the narrowed scope of its "intended" shared-checkout model, once M1 is decided.
+- [x] M1 — Maintainer decision recorded on the Decisions table above — **approved as written, 2026-08-18**: concurrent/automated orchestration provisioning (scheduled dispatch, delegate-provisioned orchestrations) moves toward its own isolated clone; a human's own interactive TUI session against their own working checkout is unaffected.
+- [x] M2 — PRD fork#166 amended to record the narrowed scope of its "intended" shared-checkout model (see `prds/done/fork-166-agent-provisioned-worktrees.md`'s Problem Statement, step 1).
 - [ ] M3 — `provision_repo`'s clone-if-absent pattern generalized for reuse by Models A/B, scoped per the M1 decision.
 - [ ] M4 — `owned_git_dir` and the attach-race lock updated to be clone-aware rather than assuming exactly one shared repo.
 - [ ] M5 — Tests: two concurrent orchestrations under the new model provably cannot collide on worktree removal or object-store state (the original #325 incident, reproduced and shown fixed under the new architecture — not just argued).
