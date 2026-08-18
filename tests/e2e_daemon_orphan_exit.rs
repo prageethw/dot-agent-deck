@@ -143,32 +143,20 @@ fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
     let state_dir = work.join("state");
     let log_path = work.join("deck.log");
 
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let mut daemon = std::process::Command::new(bin)
-        .arg("daemon")
-        .arg("serve")
-        .env_clear()
-        .env("PATH", &path_env)
-        .env("HOME", &home)
-        .env("DOT_AGENT_DECK_SOCKET", &hook_socket)
-        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_socket)
-        .env("DOT_AGENT_DECK_STATE_DIR", &state_dir)
-        // Only the signal handler may end this daemon.
-        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
-        .env("DOT_AGENT_DECK_LOG", &log_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn `dot-agent-deck daemon serve`");
+    // Only the signal handler may end this daemon (idle shutdown disabled).
+    // `spawn_bare_daemon_and_wait_for_attach` blocks until the attach socket
+    // is bound — by then the signal handler is installed too, since both are
+    // set up before the hook loop runs.
+    let mut daemon = common::spawn_bare_daemon_and_wait_for_attach(
+        bin,
+        &home,
+        &hook_socket,
+        &attach_socket,
+        &state_dir,
+        &log_path,
+    );
 
     let daemon_pid = daemon.id() as i32;
-
-    // Bound the wait on readiness: once the attach socket exists the signal
-    // handler is installed (both are set up before the hook loop runs).
-    assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
-        "daemon never bound its attach socket"
-    );
 
     // The behavior under test: a plain SIGTERM, exactly what `daemon stop` sends.
     // SAFETY: kill(2) with a real pid and SIGTERM; ESRCH/EPERM are ignored.
@@ -226,28 +214,16 @@ fn sigterm_002_second_signal_forces_exit_instead_of_being_swallowed() {
     let state_dir = work.join("state");
     let log_path = work.join("deck.log");
 
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let mut daemon = std::process::Command::new(bin)
-        .arg("daemon")
-        .arg("serve")
-        .env_clear()
-        .env("PATH", &path_env)
-        .env("HOME", &home)
-        .env("DOT_AGENT_DECK_SOCKET", &hook_socket)
-        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_socket)
-        .env("DOT_AGENT_DECK_STATE_DIR", &state_dir)
-        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
-        .env("DOT_AGENT_DECK_LOG", &log_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn `dot-agent-deck daemon serve`");
+    let mut daemon = common::spawn_bare_daemon_and_wait_for_attach(
+        bin,
+        &home,
+        &hook_socket,
+        &attach_socket,
+        &state_dir,
+        &log_path,
+    );
 
     let daemon_pid = daemon.id() as i32;
-    assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
-        "daemon never bound its attach socket"
-    );
 
     // First signal: begins graceful shutdown. Wait for the handler to have
     // consumed it (its log line is the observable), so the second signal is

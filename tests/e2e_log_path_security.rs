@@ -49,32 +49,20 @@ fn log_path_001_default_log_lives_under_state_dir_with_owner_only_permissions() 
     let state_dir = work.join("state");
     let expected_log_path = state_dir.join("deck.log");
 
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let mut daemon = std::process::Command::new(bin)
-        .arg("daemon")
-        .arg("serve")
-        .env_clear()
-        .env("PATH", &path_env)
-        .env("HOME", &home)
-        .env("DOT_AGENT_DECK_SOCKET", &hook_socket)
-        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_socket)
-        .env("DOT_AGENT_DECK_STATE_DIR", &state_dir)
-        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
-        // The behavior under test: the empty/"1" default-resolution branch.
-        .env("DOT_AGENT_DECK_LOG", "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn `dot-agent-deck daemon serve`");
+    // The behavior under test: the empty/"1" default-resolution branch.
+    // `spawn_bare_daemon_and_wait_for_attach` already blocks until the attach
+    // socket is bound — the readiness signal that startup logging (the first
+    // thing `DaemonCmd::Serve` does) has already run.
+    let mut daemon = common::spawn_bare_daemon_and_wait_for_attach(
+        bin,
+        &home,
+        &hook_socket,
+        &attach_socket,
+        &state_dir,
+        "1",
+    );
 
     let daemon_pid = daemon.id() as i32;
-
-    // Readiness signal: by the time the attach socket is bound, startup
-    // logging has already run (it's the first thing `DaemonCmd::Serve` does).
-    assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
-        "daemon never bound its attach socket"
-    );
 
     // The fix's log file is written synchronously (a plain `std::fs::File`
     // writer — see the PRD #170 doc comment on `init_logging_from_env`), but

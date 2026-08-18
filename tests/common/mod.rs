@@ -5789,6 +5789,58 @@ fn register_temp_root_cleanup() {
 fn register_temp_root_cleanup() {}
 
 // ---------------------------------------------------------------------------
+// Bare `daemon serve` spawn — no `DaemonProc` (no schedules, no process-group
+// teardown, no orphan-watchdog env pins)
+// ---------------------------------------------------------------------------
+
+/// Spawn `dot-agent-deck daemon serve` directly (a bare, non-`DaemonProc`
+/// child — the caller owns cleanup) wired to the given sockets, state dir,
+/// and `DOT_AGENT_DECK_LOG` value, with idle shutdown disabled. Blocks until
+/// the attach socket exists — the daemon's readiness signal, since signal
+/// handling and startup logging are both wired up before the hook loop runs
+/// — then returns the [`std::process::Child`] so the caller can read its pid,
+/// send it signals, and reap it.
+///
+/// Shared by the `lifecycle/sigterm/*` tests and `lifecycle/log-path/001`,
+/// none of which want `DaemonProc`'s schedule-file, process-group-teardown,
+/// or orphan-watchdog machinery (`spawn_daemon_serve` above) — just the raw
+/// spawn-and-wait-for-socket shape.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn spawn_bare_daemon_and_wait_for_attach(
+    bin: &str,
+    home: &Path,
+    hook_socket: &Path,
+    attach_socket: &Path,
+    state_dir: &Path,
+    log_env: impl AsRef<std::ffi::OsStr>,
+) -> std::process::Child {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let daemon = std::process::Command::new(bin)
+        .arg("daemon")
+        .arg("serve")
+        .env_clear()
+        .env("PATH", &path_env)
+        .env("HOME", home)
+        .env("DOT_AGENT_DECK_SOCKET", hook_socket)
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", attach_socket)
+        .env("DOT_AGENT_DECK_STATE_DIR", state_dir)
+        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+        .env("DOT_AGENT_DECK_LOG", log_env)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn `dot-agent-deck daemon serve`");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        "daemon never bound its attach socket"
+    );
+
+    daemon
+}
+
+// ---------------------------------------------------------------------------
 // PRD #127 Phase 1 — headless `daemon serve` harness
 // ---------------------------------------------------------------------------
 //
