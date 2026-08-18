@@ -265,6 +265,41 @@ fn git_common_dir(dir: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("canonicalize git common dir {resolved:?} for {dir:?}: {e}"))
 }
 
+/// Read `dir`'s currently checked-out branch name via `git rev-parse
+/// --abbrev-ref HEAD` — the observable proof that issue #325 reviewer P1-2's
+/// fix landed the isolated clone on the user's typed slug rather than
+/// silently staying on the source's HEAD branch.
+fn current_branch(dir: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("git rev-parse --abbrev-ref HEAD must spawn");
+    assert!(
+        out.status.success(),
+        "git rev-parse --abbrev-ref HEAD failed in {dir:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Read `dir`'s configured `origin` remote URL, or `None` when no `origin`
+/// is configured at all — the observable proof of issue #325 reviewer
+/// P1-1's fix: the clone's `origin` must be the SOURCE's own origin URL
+/// (when the source has one), never the local filesystem path a plain `git
+/// clone` defaults to.
+fn remote_origin_url(dir: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .expect("git remote get-url origin must spawn");
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Drive the new-pane form's real keyboard path to open the `orch-clone-gate`
 /// fixture's one orchestration with a TYPED worktree slug — `Ctrl+n` ->
 /// directory picker -> confirm -> Mode cycled to the orchestration -> Tab to
@@ -308,6 +343,11 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
     let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
     let work = deck.workdir().to_path_buf();
     commit_fixture(&work);
+    // Issue #325 reviewer P1-1: give the source checkout a real `origin` so
+    // the isolated clone's origin-URL fixup below has something to prove —
+    // never fetched/pushed, just read back with `git remote get-url`.
+    let fake_origin = "https://example.invalid/orch-clone-gate-fixture.git";
+    run_git(&work, &["remote", "add", "origin", fake_origin]);
 
     deck.wait_for_string("No active sessions");
 
@@ -381,6 +421,35 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
          instead of sharing {}'s via a `git worktree add` sibling the way \
          `create_worktree_sync` does today unconditionally, regardless of \
          how many orchestrations are already live against it",
+        work.display()
+    );
+
+    // Issue #325 reviewer P1-2: both arms must land on the SLUG the user
+    // typed, not silently stay on the source's HEAD branch — the absence of
+    // this assertion is exactly what let the isolated arm's dropped
+    // `branch` argument through a green suite.
+    assert_eq!(
+        current_branch(pwd_1),
+        "clonegate1",
+        "the 1st (shared-worktree) orchestration must be on the typed slug's branch"
+    );
+    assert_eq!(
+        current_branch(pwd_2),
+        "clonegate2",
+        "the 2nd (isolated-clone) orchestration must be checked out on the typed \
+         slug's branch, not the source's HEAD branch — this is issue #325 \
+         reviewer P1-2's fix"
+    );
+
+    // Issue #325 reviewer P1-1: the isolated clone's `origin` must be the
+    // SOURCE's own origin URL, never the local filesystem path a plain
+    // `git clone` defaults `origin` to — a `git push origin` from the clone
+    // would otherwise land silently in `work`, the user's own root checkout.
+    assert_eq!(
+        remote_origin_url(pwd_2).as_deref(),
+        Some(fake_origin),
+        "the isolated clone's origin must be the source checkout's own \
+         origin URL, not a local path pointing back at {}",
         work.display()
     );
 }

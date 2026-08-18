@@ -1008,6 +1008,21 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
 /// added to either returned list inherits an unvalidated string — compare
 /// only, never render, without first routing through the same sanitizers
 /// the other two paths use.
+///
+/// PRD fork#325 fix round (auditor A5): that "future consumer" arrived —
+/// [`root_checkout_has_live_sibling`] — and does something this warning did
+/// not anticipate: it passes the daemon-supplied `cwd` to
+/// [`crate::issue_dispatch_run::git_common_dir`], i.e.
+/// `Command::current_dir(cwd)`. The string now selects a SUBPROCESS WORKING
+/// DIRECTORY, not merely a comparand. Still safe under this product's
+/// same-uid trust model (a peer that can reach the `0o600` attach socket at
+/// all can already exec arbitrary code as this user via `StartAgent`, which
+/// is strictly worse), and a nonexistent directory just fails that one
+/// `git` spawn, which the caller correctly skips rather than treating as
+/// fatal — but "compare only, never render" was already an incomplete
+/// description of what stays safe, so update this invariant at the next
+/// consumer added here rather than assuming the warning above still covers
+/// every shape a future one might take.
 fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
@@ -1082,10 +1097,31 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// being unreachable at all (the actual failure mode #325's race depends on)
 /// is what closes the gate, not one stale record among possibly several
 /// live ones.
+///
+/// PRD fork#325 fix round (reviewer P2-1 / auditor A1): the "fails CLOSED on
+/// ANY daemon-query problem" claim above did not actually hold for a
+/// *successful* round trip that answers with no usable data. Two shapes
+/// read straight through `resp.agent_records.unwrap_or_default()` as "no
+/// live sibling" (`Ok(false)`) — silently reinstating the shared-checkout
+/// path this gate exists to refuse: `{ok: false, agent_records: None}`,
+/// which `serve_attach` emits for a malformed request today and a wedged
+/// daemon could emit for any other reason; and `{ok: true, agent_records:
+/// None}`, the documented shape an OLDER daemon sends (`agent_records`'s own
+/// doc comment: "Older daemons omit this field; newer clients fall back to
+/// `agents` when it's `None`") — a shape rule 12's cross-version support
+/// makes routine, not hypothetical. Every OTHER `ListAgents` consumer
+/// correctly falls back to `agents` on `None`; this one cannot, because a
+/// legacy `agents` list carries only ids, no `tab_membership`, so it cannot
+/// answer the question this gate exists to ask. Both are now refused
+/// explicitly, matching `Action::ScheduleRunNow`'s `Ok(resp) if resp.ok`
+/// pattern (the file's other correctness-sensitive blocking daemon call)
+/// rather than [`live_orchestration_cwds_and_titles`]'s fail-open-hint idiom
+/// this function's `agent_records.unwrap_or_default()` was copied from.
 fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
-    let resp = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
-        .map_err(|e| format!("could not reach the daemon to check for live orchestrations: {e}"))?;
-
+    // Issue #325 reviewer nit: resolve the LOCAL, knowable-in-milliseconds
+    // answer before paying for the daemon round trip — a non-git `target_dir`
+    // now fails fast instead of waiting up to `DAEMON_REQUEST_TIMEOUT` (5s)
+    // first for an answer this check never needed.
     let target_common = crate::issue_dispatch_run::git_common_dir(target_dir).map_err(|e| {
         format!(
             "could not resolve {}'s git common dir: {e}",
@@ -1094,8 +1130,24 @@ fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
     })?;
     let target_common = std::fs::canonicalize(&target_common).unwrap_or(target_common);
 
+    let resp = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
+        .map_err(|e| format!("could not reach the daemon to check for live orchestrations: {e}"))?;
+    if !resp.ok {
+        return Err(format!(
+            "the daemon rejected the request: {}",
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    let Some(agent_records) = resp.agent_records else {
+        return Err(
+            "this daemon is too old to report orchestration tab membership — \
+             restart it before opening a second orchestration"
+                .to_string(),
+        );
+    };
+
     let mut seen_cwds: HashSet<String> = HashSet::new();
-    for r in resp.agent_records.unwrap_or_default() {
+    for r in agent_records {
         let Some(TabMembership::Orchestration {
             orchestration_cwd: Some(cwd),
             ..
@@ -10519,6 +10571,7 @@ fn dispatch_action(
                                 Ok(true) => match crate::issue_dispatch_run::provision_isolated_clone_sync(
                                     &req.dir,
                                     worktree_path,
+                                    &branch,
                                     creator.as_deref().expect("just assigned above"),
                                 ) {
                                     Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
@@ -10527,10 +10580,44 @@ fn dispatch_action(
                                         worktree_marker_warning = marker_warning;
                                         worktree_path.display().to_string()
                                     }
+                                    // Issue #325 reviewer P3-1: say "clone",
+                                    // not "worktree" — `git worktree remove`
+                                    // does not apply to this path at all.
                                     Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::AlreadyClaimed) => {
                                         ui.status_message = Some((
                                             format!(
-                                                "Orchestration failed: worktree already exists at {}",
+                                                "Orchestration failed: clone already exists at {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // Issue #325 auditor A4: mirrors the
+                                    // shared-checkout `WorktreeCreation::TimedOut`
+                                    // arm above, but the recovery command is a
+                                    // plain `rm -rf` — this directory is an
+                                    // independent clone, not a linked worktree,
+                                    // so `git worktree remove` does not apply.
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::TimedOut {
+                                        cleaned_up_by,
+                                    }) => {
+                                        let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                            tracing::info!(
+                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                                "isolated clone timed out; half-created directory removed automatically"
+                                            );
+                                            "the half-created directory was removed automatically — try again".to_string()
+                                        } else {
+                                            format!(
+                                                "run `rm -rf {}` to clear it, then try again",
+                                                worktree_path.display()
+                                            )
+                                        };
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: isolated clone timed out at {} — {detail}",
                                                 worktree_path.display()
                                             ),
                                             std::time::Instant::now(),
@@ -34105,6 +34192,171 @@ mod tests {
             _env_lock: env_lock,
             prev_attach,
         }
+    }
+
+    /// PRD fork#325 fix round (reviewer P2-1 / auditor A1) test support:
+    /// like [`with_empty_agents_daemon`], but instead of routing every
+    /// `ListAgents` through the real [`crate::daemon_protocol::serve_attach`]
+    /// handler — which, against an empty registry, can only ever answer
+    /// `{ok: true, agent_records: Some(vec![])}` — this hand-rolls the
+    /// minimal frame exchange so the stub answers with a CALLER-SUPPLIED
+    /// [`crate::daemon_protocol::AttachResponse`]. That is what lets a test
+    /// construct the two well-formed-but-empty shapes this fix round closes:
+    /// `AttachResponse::err(_)` (`ok: false`, `agent_records: None` — what a
+    /// malformed request or a wedged daemon answers with today) and
+    /// `AttachResponse::agents(_)` (`ok: true`, `agents: Some(_)`,
+    /// `agent_records: None` — the documented older-daemon shape). Loops
+    /// accepting connections for the life of the test process, same as its
+    /// sibling; every request received is drained and discarded, since the
+    /// stub answers identically regardless of which `AttachRequest` variant
+    /// arrives.
+    fn with_crafted_response_daemon(
+        unique_dir: &std::path::Path,
+        response: crate::daemon_protocol::AttachResponse,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub crafted-response daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx
+                                .send(Err(format!("bind stub crafted-response listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let payload =
+                    serde_json::to_vec(&response).expect("serialize crafted AttachResponse");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let _ = crate::daemon_protocol::read_frame(&mut stream).await;
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub crafted-response daemon must report readiness within 10s")
+            .expect("stub crafted-response daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// Precondition helper shared by the two tests below: a bare, valid git
+    /// repository with no commits needed (`root_checkout_has_live_sibling`
+    /// resolves the common dir via `git rev-parse`, which needs no commit).
+    fn init_bare_git_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("create dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(dir)
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init must succeed");
+    }
+
+    /// Scenario: PRD fork#325 fix round (reviewer P2-1 / auditor A1). Point
+    /// the M3 gate at a stub daemon answering `ListAgents` with a well-formed
+    /// ERROR response (`ok: false`, `agent_records: None`) — the shape
+    /// `serve_attach` emits for a malformed request today, and a
+    /// wedged/half-upgraded daemon that still accepts connections could emit
+    /// for any other reason. Before this fix round,
+    /// `resp.agent_records.unwrap_or_default()` flattened this straight to
+    /// an empty vec and the gate read it as "no live sibling" (`Ok(false)`)
+    /// — silently reinstating the shared-checkout path this gate exists to
+    /// refuse. Assert `Err`.
+    #[test]
+    fn root_checkout_has_live_sibling_fails_closed_on_daemon_error_response() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_bare_git_repo(&dir);
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::err("simulated daemon-side failure"),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir);
+        assert!(
+            result.is_err(),
+            "an `ok: false` daemon response must fail the gate closed, not read as \
+             'no live sibling'; got {result:?}"
+        );
+    }
+
+    /// Scenario: same gate, same fix round, the SECOND fail-open shape
+    /// (auditor A1 point 2): a well-formed response with `ok: true` but
+    /// `agent_records: None` — the documented shape an OLDER daemon sends
+    /// (it only ever populated the legacy `agents` field).
+    /// `agent_records`'s own doc comment says every OTHER consumer falls
+    /// back to `agents` when this is `None`; this gate cannot answer "no
+    /// live sibling" from a legacy list that carries no `tab_membership` at
+    /// all, so it must refuse rather than silently assume nothing is live.
+    /// Assert `Err`.
+    #[test]
+    fn root_checkout_has_live_sibling_fails_closed_on_legacy_agents_only_response() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_bare_git_repo(&dir);
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agents(vec!["agent-1".to_string()]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir);
+        assert!(
+            result.is_err(),
+            "an older-daemon-shaped response (agent_records: None) must fail the \
+             gate closed, not read as 'no live sibling'; got {result:?}"
+        );
     }
 
     /// Scenario: Build a `NewPaneRequest` whose `dir` is a real git repository

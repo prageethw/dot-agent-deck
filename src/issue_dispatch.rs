@@ -253,6 +253,34 @@ pub fn worktree_remove_argv(clone_dir: &Path, worktree_dir: &Path) -> Vec<String
     ]
 }
 
+/// Argv for `git checkout` inside a freshly cloned isolated working tree
+/// (PRD fork#325 M3 fix round, reviewer P1-2): `provision_isolated_clone_sync`'s
+/// plain `git clone` lands on the SOURCE's HEAD branch (typically `main`),
+/// never the slug the user typed — this is the follow-up step that lands it
+/// on `branch` instead, matching what `worktree_add_argv`'s attach-vs-create
+/// split already does for the shared-checkout arm: attach `branch` when
+/// `branch_exists` (a clone carries every ref the source had, so a branch
+/// the user's slug happens to match already exists in the clone too),
+/// otherwise create it fresh with `-b` off the clone's checked-out HEAD.
+pub fn isolated_clone_checkout_argv(
+    clone_dir: &Path,
+    branch: &str,
+    branch_exists: bool,
+) -> Vec<String> {
+    let mut argv = vec![
+        "-C".to_string(),
+        clone_dir.to_string_lossy().into_owned(),
+        "checkout".to_string(),
+    ];
+    if branch_exists {
+        argv.push(branch.to_string());
+    } else {
+        argv.push("-b".to_string());
+        argv.push(branch.to_string());
+    }
+    argv
+}
+
 // ---------------------------------------------------------------------------
 // M1 — validate the user-config GitHub knobs that flow into `gh`/`git` argv
 // ---------------------------------------------------------------------------
@@ -1425,6 +1453,40 @@ mod tests {
             argv.get(dash_dash + 1).map(String::as_str),
             Some(worktree_dir.to_string_lossy().as_ref()),
             "the `--` separator must sit IMMEDIATELY before the path argument, got {argv:?}"
+        );
+    }
+
+    /// Scenario: issue #325 fix round (reviewer P1-2) — `isolated_clone_checkout_argv`
+    /// must create a NEW branch (`-b <branch>`) when the typed slug does not
+    /// already exist as a branch, so the isolated clone lands on the branch
+    /// the user actually typed instead of silently staying on the source's
+    /// HEAD branch.
+    #[test]
+    fn isolated_clone_checkout_argv_creates_new_branch_when_absent() {
+        let clone_dir = Path::new("/repo/clone-my-feature");
+        assert_eq!(
+            isolated_clone_checkout_argv(clone_dir, "my-feature", false),
+            vec![
+                "-C",
+                "/repo/clone-my-feature",
+                "checkout",
+                "-b",
+                "my-feature",
+            ]
+        );
+    }
+
+    /// Same fix round: when the typed slug already exists as a branch in the
+    /// clone (it carries every ref the source had), the checkout must ATTACH
+    /// to it rather than retry `-b`, which `git checkout -b` on an existing
+    /// branch name refuses — mirroring `worktree_add_argv`'s identical
+    /// attach-vs-create split for the shared-checkout arm.
+    #[test]
+    fn isolated_clone_checkout_argv_attaches_existing_branch() {
+        let clone_dir = Path::new("/repo/clone-my-feature");
+        assert_eq!(
+            isolated_clone_checkout_argv(clone_dir, "my-feature", true),
+            vec!["-C", "/repo/clone-my-feature", "checkout", "my-feature"]
         );
     }
 
