@@ -599,8 +599,8 @@ async fn dispatch_one_issue(
         // "a concurrent dispatch claimed the worktree first" mislabels the
         // cause in that one case. Known and left as-is per the
         // reviewer/auditor final pass (non-blocking, F1/A1): every later
-        // fire still stops retrying the slug either way, `cleaned_up` (when
-        // `true`) still frees it for reuse, and a distinct `SkipReason` +
+        // fire still stops retrying the slug either way, `cleaned_up_by`
+        // (when `Some`) still frees it for reuse, and a distinct `SkipReason` +
         // notification for this case is follow-up material rather than part
         // of this fix. The match stays exhaustive across all three so it
         // remains safe if any of them ever change again.
@@ -1262,11 +1262,14 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
 /// never folded into `AlreadyClaimed` — the two mean different things
 /// (another actor holds this path vs. we half-created it ourselves) and
 /// reporting one as the other hid the wedge entirely (see
-/// [`classify_worktree_add_result`]). `cleaned_up` records whether the
+/// [`classify_worktree_add_result`]). `cleaned_up_by` records whether the
 /// best-effort `git worktree remove --force` attempt
 /// ([`create_worktree_sync`]) confirmed the half-created directory was
 /// actually removed, so the caller can tell the user either "try again" or
-/// give them the exact manual command.
+/// give them the exact manual command — issue #325: `Some(remover)` names
+/// who ran the cleanup (this is always a self-cleanup of the creator's own
+/// half-created directory, so `remover` is that same `creator`), `None`
+/// when nothing was actually removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeCreation {
     /// `marker_warning` is `Some(error)` when `git worktree add` itself
@@ -1296,7 +1299,7 @@ pub enum WorktreeCreation {
     /// true — the directory is plainly gone — with no hint of the real cause.
     BranchExists,
     TimedOut {
-        cleaned_up: bool,
+        cleaned_up_by: Option<String>,
     },
 }
 
@@ -1559,7 +1562,7 @@ pub(crate) async fn create_worktree(
     // signal by the time we get here (see that function's doc comment), so
     // — mirroring `create_worktree_sync`'s `attempt_worktree_cleanup` —
     // attempt best-effort cleanup of whatever the add half-registered
-    // before it was killed, rather than hardcoding `cleaned_up: false` and
+    // before it was killed, rather than hardcoding `cleaned_up_by: None` and
     // leaving the slug wedged.
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
@@ -1568,8 +1571,9 @@ pub(crate) async fn create_worktree(
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
         AddOutcome::TimedOut => {
-            let cleaned_up = attempt_worktree_cleanup_async(clone_dir, worktree_dir).await;
-            WorktreeCreation::TimedOut { cleaned_up }
+            let cleaned_up_by =
+                attempt_worktree_cleanup_async(clone_dir, worktree_dir, creator).await;
+            WorktreeCreation::TimedOut { cleaned_up_by }
         }
     })
 }
@@ -2003,8 +2007,8 @@ pub(crate) fn create_worktree_sync(
         // own (shorter) timeout so a stuck cleanup cannot hang the very loop
         // this exists to unwedge — see `attempt_worktree_cleanup`.
         AddOutcome::TimedOut => {
-            let cleaned_up = attempt_worktree_cleanup(clone_dir, worktree_dir);
-            WorktreeCreation::TimedOut { cleaned_up }
+            let cleaned_up_by = attempt_worktree_cleanup(clone_dir, worktree_dir, creator);
+            WorktreeCreation::TimedOut { cleaned_up_by }
         }
     })
 }
@@ -2024,17 +2028,30 @@ pub(crate) fn create_worktree_sync(
 /// intended direct sibling — never a path from anywhere else.
 ///
 /// "Confirmed" means both the command exited successfully AND the directory
-/// is actually gone afterward; either check failing is reported as `false`
+/// is actually gone afterward; either check failing is reported as `None`
 /// so the caller fails loudly with the manual command rather than assuming
-/// success it cannot back up.
-fn attempt_worktree_cleanup(clone_dir: &Path, worktree_dir: &Path) -> bool {
+/// success it cannot back up. Issue #325: this is always a self-cleanup of
+/// `remover`'s own half-created directory (see [`create_worktree_sync`]'s
+/// only call site, its `AddOutcome::TimedOut` arm) — `remover` is that same
+/// `creator`, forwarded straight through rather than re-resolved, and the
+/// return carries it (`Some(remover.to_string())`) only when the removal is
+/// actually confirmed, never fabricating an identity for a no-op.
+fn attempt_worktree_cleanup(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    remover: &str,
+) -> Option<String> {
     let removed = run_status_sync(
         "git",
         &crate::issue_dispatch::worktree_remove_argv(clone_dir, worktree_dir),
         WORKTREE_CLEANUP_TIMEOUT,
     )
     .is_ok();
-    removed && !worktree_dir.exists()
+    if removed && !worktree_dir.exists() {
+        Some(remover.to_string())
+    } else {
+        None
+    }
 }
 
 /// Fork #282 final-pass F1 (reviewer) / A1 (auditor): async twin of
@@ -2056,11 +2073,20 @@ fn attempt_worktree_cleanup(clone_dir: &Path, worktree_dir: &Path) -> bool {
 ///
 /// "Confirmed" means the same thing it means for the sync twin: both the
 /// command exited successfully AND the directory is actually gone
-/// afterward; either check failing is reported as `false` so the caller
-/// reports an honest `cleaned_up: false` (and the manual
-/// `git worktree remove --force` recovery command) rather than assuming
-/// success it cannot back up.
-async fn attempt_worktree_cleanup_async(clone_dir: &Path, worktree_dir: &Path) -> bool {
+/// afterward; either check failing is reported as `None` so the caller
+/// fails loudly with the manual `git worktree remove --force` recovery
+/// command rather than assuming success it cannot back up. Issue #325: this
+/// is always a self-cleanup of `remover`'s own half-created directory (see
+/// [`create_worktree`]'s only call site, its `AddOutcome::TimedOut` arm) —
+/// `remover` is that same `creator`, forwarded straight through rather than
+/// re-resolved, and the return carries it (`Some(remover.to_string())`)
+/// only when the removal is actually confirmed, never fabricating an
+/// identity for a no-op.
+async fn attempt_worktree_cleanup_async(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    remover: &str,
+) -> Option<String> {
     let removed = tokio::time::timeout(
         WORKTREE_CLEANUP_TIMEOUT,
         run_status_killable_args(
@@ -2071,7 +2097,23 @@ async fn attempt_worktree_cleanup_async(clone_dir: &Path, worktree_dir: &Path) -
     .await
     .map(|result| result.is_ok())
     .unwrap_or(false);
-    removed && !worktree_dir.exists()
+    if removed && !worktree_dir.exists() {
+        // Issue #325 reviewer P2-B / auditor A2: logged HERE rather than at
+        // each of the two production consumers of `WorktreeCreation::TimedOut`
+        // (`dispatch_one_issue` above and `dispatch.rs`'s currently-unreachable
+        // arm) — mirroring the confirmed-removal log the sync twin's caller
+        // does in `ui.rs`, but at one site so neither consumer has to
+        // remember to log, including the unattended scheduled `issue_dispatch`
+        // flow this async twin actually serves.
+        tracing::info!(
+            path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_dir),
+            remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+            "worktree add timed out; half-created directory removed automatically"
+        );
+        Some(remover.to_string())
+    } else {
+        None
+    }
 }
 
 /// Parse a `gh issue list --json number,labels` array into [`OpenIssue`]s, in
@@ -3840,6 +3882,76 @@ exit 0
         );
     }
 
+    /// Scenario: `attempt_worktree_cleanup` is the best-effort removal
+    /// `create_worktree_sync` runs against a directory IT half-created, after
+    /// `git worktree add` timed out (fork #122/#123). Fed a real,
+    /// already-registered worktree standing in for that half-created state
+    /// and the identity of the creator attempting the cleanup, a confirmed
+    /// removal must attribute that identity (issue #325's attribution gap —
+    /// today this call site drops it on the floor). A second call against
+    /// the now-absent directory removes nothing, and attribution must stay
+    /// absent rather than naming an identity for a removal that never
+    /// happened.
+    #[test]
+    fn attempt_worktree_cleanup_records_remover_identity() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let worktree_dir = ws.path().join("wt-half-created");
+        git(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/half-created",
+                worktree_dir.to_str().unwrap(),
+            ],
+        );
+        assert!(worktree_dir.exists());
+
+        let remover = "test-creator";
+        let removed_by = attempt_worktree_cleanup(&clone_dir, &worktree_dir, remover);
+        assert!(
+            !worktree_dir.exists(),
+            "attempt_worktree_cleanup must actually remove the directory on a confirmed cleanup"
+        );
+        assert_eq!(
+            removed_by.as_deref(),
+            Some(remover),
+            "a confirmed cleanup removal must attribute the identity attempting it (issue #325) \
+             -- got {removed_by:?}"
+        );
+
+        let second = attempt_worktree_cleanup(&clone_dir, &worktree_dir, remover);
+        assert_eq!(
+            second, None,
+            "nothing was removed on this call (the directory is already gone) -- attribution \
+             must be None, not fabricated, got {second:?}"
+        );
+    }
+
     // --- fork issue #282: the attach race ---
 
     /// Scenario: fork issue #282. Two concurrent callers of
@@ -4557,15 +4669,16 @@ exit 0
         );
     }
 
-    /// Scenario: fork #282 final-pass F1 (reviewer) / A1 (auditor). Pins
-    /// [`attempt_worktree_cleanup_async`] directly — the cleanup path
-    /// [`create_worktree`]'s `TimedOut` arm now runs instead of hardcoding
-    /// `cleaned_up: false`. Creates a REAL worktree the way a killed `git
-    /// worktree add` would leave one (registered via a genuine `git
-    /// worktree add`, standing in for the half-finished state a kill leaves
-    /// behind), then asserts cleanup both reports `true` and actually makes
-    /// the worktree disappear from `git worktree list` and the directory
-    /// itself — matching the sync twin's "confirmed" contract exactly.
+    /// Scenario: fork #282 final-pass F1 (reviewer) / A1 (auditor), extended
+    /// by issue #325 for attribution. Pins [`attempt_worktree_cleanup_async`]
+    /// directly — the cleanup path [`create_worktree`]'s `TimedOut` arm now
+    /// runs instead of hardcoding `cleaned_up_by: None`. Creates a REAL
+    /// worktree the way a killed `git worktree add` would leave one
+    /// (registered via a genuine `git worktree add`, standing in for the
+    /// half-finished state a kill leaves behind), then asserts cleanup both
+    /// reports `Some(remover)` and actually makes the worktree disappear
+    /// from `git worktree list` and the directory itself — matching the
+    /// sync twin's "confirmed" contract exactly.
     #[cfg(unix)]
     #[test]
     fn attempt_worktree_cleanup_async_removes_a_registered_worktree_and_confirms_it() {
@@ -4610,13 +4723,15 @@ exit 0
             .enable_all()
             .build()
             .expect("build current-thread runtime");
-        let cleaned_up =
-            rt.block_on(async { attempt_worktree_cleanup_async(&clone_dir, &worktree_dir).await });
+        let cleaned_up_by = rt.block_on(async {
+            attempt_worktree_cleanup_async(&clone_dir, &worktree_dir, "test-remover").await
+        });
 
-        assert!(
-            cleaned_up,
-            "attempt_worktree_cleanup_async must report true for a plain `git worktree remove \
-             --force` against a directory it created"
+        assert_eq!(
+            cleaned_up_by,
+            Some("test-remover".to_string()),
+            "attempt_worktree_cleanup_async must report Some(remover) for a plain `git worktree \
+             remove --force` against a directory it created"
         );
         assert!(
             !worktree_dir.exists(),
