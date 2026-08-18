@@ -408,6 +408,30 @@ pub struct WorktreeReport {
     /// happens to resolve to a different registered (or symlinked) worktree.
     #[serde(skip)]
     pub real_path: PathBuf,
+    /// Who/what triggered this worktree's removal (issue #325) — the
+    /// caller-supplied `remover` identity string, following the exact
+    /// `owner`/`owner_kind` pattern above. `Some(_)` only for a report
+    /// [`run_reclaim`] actually pushed into [`ReclaimOutcome::removed`];
+    /// `None` for `pending`/`kept` — nothing was removed, so there is
+    /// nothing to attribute.
+    ///
+    /// Same warning as `owner` above, and for the same reason (issue #325
+    /// auditor A3): this is a display string spanning several free-form
+    /// namespaces (`worktree:…@…|…`, `human:…@…`, `pane:…@… (cwd …)`,
+    /// `"unknown"`, or literally anything a caller of the `pub` `run_reclaim`
+    /// passes) and is NOT authenticated — anyone able to influence the
+    /// caller's identity resolution can plant an arbitrary value here.
+    /// Nothing in this crate branches on `removed_by` today, and the point
+    /// of this note is to keep it that way; there is no `owner_kind`-style
+    /// discrete field for this one to fall back on instead.
+    ///
+    /// `#[serde(skip)]`, same as `real_path` above and for the same reason:
+    /// there is no `worktree reclaim --json` today, so this field is never
+    /// actually serialized by anything that exists. A future `--json`
+    /// consumer looking for `removed_by` in the JSON document and finding it
+    /// silently absent should land here rather than guess.
+    #[serde(skip)]
+    pub removed_by: Option<String>,
 }
 
 /// Reports where the on-disk marker names `owner`, but the independent
@@ -1385,6 +1409,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             owner_kind,
             owner_reason,
             real_path,
+            removed_by: None,
         });
     }
     Ok(reports)
@@ -1496,14 +1521,28 @@ pub fn format_list_error_for_cli(e: &str) -> String {
 /// its source instead of defending against it downstream. [`WorktreeReport`]
 /// still carries a lossy `path: String` for the report/JSON document; only
 /// this call site needs the exact bytes.
-fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path) -> Result<(), String> {
+fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> Result<(), String> {
     let out = Command::new("git")
         .current_dir(repo_dir)
         .args(["worktree", "remove", "--"])
         .arg(worktree_path)
         .output()
-        .map_err(|e| format!("failed to spawn `git worktree remove`: {e}"))?;
+        .map_err(|e| {
+            format!("failed to spawn `git worktree remove` (requested by {remover}): {e}")
+        })?;
     if out.status.success() {
+        // Issue #325 / reviewer B1 / auditor F2: the ONLY durable trace of a
+        // confirmed removal, so a post-incident reader has something to grep
+        // `DOT_AGENT_DECK_LOG` for even if `format_reclaim_human`'s printed
+        // report is long gone. `remover` is an unauthenticated,
+        // caller-supplied string (auditor F3) -- sanitize it here exactly as
+        // `format_reclaim_human` sanitizes it for the terminal, since a log
+        // file gets `cat`/`tail`ed to a terminal too.
+        tracing::info!(
+            path = %sanitize_path_for_terminal_display(worktree_path),
+            remover = %sanitize_for_terminal_display(remover),
+            "worktree removed"
+        );
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
@@ -1523,7 +1562,7 @@ pub struct ReclaimOutcome {
 /// unconditionally (ownership already proves it's safe); `Ask`-verdict
 /// worktrees are removed only when `yes` is true, otherwise added to
 /// `pending`; `Keep`-verdict worktrees are left untouched.
-pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String> {
+pub fn run_reclaim(repo_dir: &Path, yes: bool, remover: &str) -> Result<ReclaimOutcome, String> {
     let reports = examine_worktrees(repo_dir)?;
     let mut removed = Vec::new();
     let mut pending = Vec::new();
@@ -1531,16 +1570,24 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool) -> Result<ReclaimOutcome, String>
 
     for r in reports {
         match r.verdict.as_str() {
-            "remove" => match remove_worktree_dir(repo_dir, &r.real_path) {
-                Ok(()) => removed.push(r),
+            "remove" => match remove_worktree_dir(repo_dir, &r.real_path, remover) {
+                Ok(()) => {
+                    let mut r = r;
+                    r.removed_by = Some(remover.to_string());
+                    removed.push(r);
+                }
                 Err(e) => {
                     let mut r = r;
                     r.reason = Some(format!("removal failed: {e}"));
                     kept.push(r);
                 }
             },
-            "ask" if yes => match remove_worktree_dir(repo_dir, &r.real_path) {
-                Ok(()) => removed.push(r),
+            "ask" if yes => match remove_worktree_dir(repo_dir, &r.real_path, remover) {
+                Ok(()) => {
+                    let mut r = r;
+                    r.removed_by = Some(remover.to_string());
+                    removed.push(r);
+                }
                 Err(e) => {
                     let mut r = r;
                     r.reason = Some(format!("removal failed: {e}"));
@@ -1601,10 +1648,25 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     if !outcome.removed.is_empty() {
         out.push_str("Removed:\n");
         for r in &outcome.removed {
-            out.push_str(&format!(
-                "  - {}\n",
-                sanitize_path_for_terminal_display(&r.path)
-            ));
+            // Issue #325 / reviewer B1 / auditor F2: this is the ONLY
+            // user-facing surface for `removed_by` -- there is no `worktree
+            // reclaim --json`, so an operator reading this line is the
+            // whole delivered feature. `removed_by` is `Some` for every
+            // report actually pushed into `removed` (see the field's own
+            // doc), but match rather than assume, so a future construction
+            // site that leaves it `None` degrades to the plain path instead
+            // of printing a misleading "(removed by )".
+            match &r.removed_by {
+                Some(remover) => out.push_str(&format!(
+                    "  - {} (removed by {})\n",
+                    sanitize_path_for_terminal_display(&r.path),
+                    sanitize_for_terminal_display(remover)
+                )),
+                None => out.push_str(&format!(
+                    "  - {}\n",
+                    sanitize_path_for_terminal_display(&r.path)
+                )),
+            }
         }
     } else {
         out.push_str("Removed: none\n");
@@ -1780,6 +1842,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-a"),
+            removed_by: None,
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2103,8 +2166,8 @@ mod tests {
             "create_worktree_sync reported Created but the worktree directory is missing"
         );
 
-        let outcome =
-            run_reclaim(&repo, false).expect("run_reclaim must succeed against a real git repo");
+        let outcome = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
         assert_eq!(
             outcome.removed.len(),
             1,
@@ -2120,6 +2183,71 @@ mod tests {
             !worktree_dir.exists(),
             "the worktree directory must actually be gone after the bare reclaim above, not \
              merely reported as removed"
+        );
+    }
+
+    /// Scenario: same fixture as `worktree_reclaim_008` above -- a
+    /// deck-created, MERGED, clean worktree that a bare `reclaim` removes --
+    /// but this time the caller names WHO is running the reclaim. Issue #325
+    /// documents two incidents where a worktree vanished mid-use with no
+    /// trace of who did it; this pins that when the deck's OWN
+    /// `remove_worktree_dir` call site does the removing, the identity/context
+    /// the caller supplied is recorded on the removed worktree's own report,
+    /// not silently dropped on the floor.
+    #[spec("worktree/reclaim/048")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_048_removal_records_remover_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let branch = "feat/attribute-removal";
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let worktree_dir = scratch.path().join("wt-attribute-removal");
+        crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            branch,
+            "test-creator",
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
+
+        let remover =
+            "worktree:/tmp/dot-agent-deck-attr325@fix/325-worktree-removal-attribution|test-host";
+        let outcome = run_reclaim(&repo, false, remover)
+            .expect("run_reclaim must succeed against a real git repo");
+
+        assert_eq!(
+            outcome.removed.len(),
+            1,
+            "expected exactly one removed worktree, got removed={:?} pending={:?} kept={:?}",
+            outcome.removed,
+            outcome.pending,
+            outcome.kept
+        );
+        assert_eq!(
+            outcome.removed[0].removed_by.as_deref(),
+            Some(remover),
+            "a worktree the deck's own `run_reclaim` just removed must record who ran the \
+             reclaim in `removed_by` (issue #325) -- got {:?}",
+            outcome.removed[0].removed_by
         );
     }
 
@@ -2723,6 +2851,7 @@ mod tests {
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
                 real_path: PathBuf::from("/repo/wt-owned"),
+                removed_by: None,
             },
             WorktreeReport {
                 path: PathBuf::from("/repo/wt-legacy"),
@@ -2736,6 +2865,7 @@ mod tests {
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
                 real_path: PathBuf::from("/repo/wt-legacy"),
+                removed_by: None,
             },
         ];
 
@@ -2805,6 +2935,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-disagree"),
+            removed_by: None,
         };
         let genuinely_owned = WorktreeReport {
             path: PathBuf::from("/repo/wt-owned"),
@@ -2818,6 +2949,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: PathBuf::from("/repo/wt-owned"),
+            removed_by: None,
         };
         let different_owner = WorktreeReport {
             path: PathBuf::from("/repo/wt-other"),
@@ -2831,6 +2963,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: PathBuf::from("/repo/wt-other"),
+            removed_by: None,
         };
         // P2-1: without these two, an owner-blind `owner_disagreements` --
         // e.g. `filter(|r| !r.owned)` -- would still pass this test, because
@@ -2850,6 +2983,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-foreign-marked"),
+            removed_by: None,
         };
         let owned_false_no_owner = WorktreeReport {
             path: PathBuf::from("/repo/wt-unmarked"),
@@ -2863,6 +2997,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: None,
             real_path: PathBuf::from("/repo/wt-unmarked"),
+            removed_by: None,
         };
         let reports = vec![
             disagreeing.clone(),
@@ -3039,6 +3174,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3087,6 +3223,7 @@ mod tests {
                     .to_string(),
             ),
             real_path: path,
+            removed_by: None,
         };
         let outcome = ReclaimOutcome {
             removed: Vec::new(),
@@ -3130,6 +3267,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: None,
             real_path: path,
+            removed_by: None,
         };
         let outcome = ReclaimOutcome {
             removed: vec![report],
@@ -3154,6 +3292,57 @@ mod tests {
         assert_hostile_content_is_sanitized(cell);
     }
 
+    /// Scenario: `format_reclaim_human` renders a `Removed:` entry whose
+    /// `removed_by` (issue #325's whole reason to exist -- reviewer B1 /
+    /// auditor F2/F3) embeds the hostile mix. Unlike `owner`, `removed_by`
+    /// is never routed through `sanitize_marker_creator` on the way in --
+    /// it is an unauthenticated, caller-supplied identity string -- so it
+    /// must be sanitized at THIS render site rather than assumed safe
+    /// because `path` already is.
+    #[test]
+    fn format_reclaim_human_escapes_hostile_content_in_removed_by() {
+        let path = PathBuf::from("/repo/wt-normal");
+        let remover = hostile_string_component();
+        let report = WorktreeReport {
+            path: path.clone(),
+            branch: Some("feat/hostile-remover".to_string()),
+            clean: true,
+            owned: true,
+            owner: Some("test-owner".to_string()),
+            owner_kind: "agent".to_string(),
+            owner_reason: None,
+            pr_state: "merged".to_string(),
+            verdict: "remove".to_string(),
+            reason: None,
+            real_path: path,
+            removed_by: Some(remover),
+        };
+        let outcome = ReclaimOutcome {
+            removed: vec![report],
+            pending: Vec::new(),
+            kept: Vec::new(),
+        };
+
+        let out = format_reclaim_human(&outcome);
+        assert_eq!(
+            out.lines().count(),
+            2,
+            "a raw newline embedded in removed_by must not corrupt the line count (`Removed:` \
+             header, bullet), got: {out:?}"
+        );
+        let bullet = out
+            .lines()
+            .nth(1)
+            .expect("format_reclaim_human must emit a removed bullet as the second line");
+        let cell = bullet
+            .strip_prefix("  - /repo/wt-normal (removed by ")
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or_else(|| {
+                panic!("removed bullet must be `<path> (removed by <remover>)`, got {bullet:?}")
+            });
+        assert_hostile_content_is_sanitized(cell);
+    }
+
     /// Scenario: `format_reclaim_human` renders a `Kept:` entry -- read to
     /// decide whether further cleanup/reclaim is safe, especially for a
     /// pending/dirty reason -- whose path embeds the hostile mix.
@@ -3174,6 +3363,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
             real_path: path,
+            removed_by: None,
         };
         let outcome = ReclaimOutcome {
             removed: Vec::new(),
@@ -3225,6 +3415,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: None,
             real_path: path.clone(),
+            removed_by: None,
         }];
 
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
@@ -3363,6 +3554,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3411,6 +3603,7 @@ mod tests {
             verdict: "keep".to_string(),
             reason: Some(reason),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3481,6 +3674,7 @@ mod tests {
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
             real_path: path,
+            removed_by: None,
         }];
 
         let out = format_list_human(&reports);
@@ -3673,7 +3867,7 @@ mod tests {
         let repo_dir = scratch.path().join("wherever");
         std::fs::create_dir_all(&repo_dir).unwrap();
 
-        let err = match run_reclaim(&repo_dir, false) {
+        let err = match run_reclaim(&repo_dir, false, "test-remover") {
             Err(e) => e,
             // `ReclaimOutcome` derives no `Debug`, so this cannot print what it
             // got -- the arm is unreachable anyway, since the mocked `git`
