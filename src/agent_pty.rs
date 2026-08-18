@@ -9652,8 +9652,13 @@ mod spawn_tests {
         );
 
         // Confirm bytes actually reached the live pane, not merely that the
-        // outcome claims `Applied`.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        // outcome claims `Applied`. A generous deadline: CI's `nextest` runs
+        // this alongside hundreds of other PTY-spawning tests, and the
+        // SUBMIT_DELAY plus a contended reader-thread scheduling round trip
+        // can exceed a tight budget under that load (observed once at 2s on
+        // GitHub Actions), matching `write_and_wait_for_scrollback`'s own 3s+
+        // convention elsewhere in this file.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut found = false;
         while tokio::time::Instant::now() < deadline {
             let snap = reg
