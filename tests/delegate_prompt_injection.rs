@@ -2050,7 +2050,7 @@ fn delegate_022_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
                     .insert(pane.to_string(), 1);
             }
 
-            let registry = AgentPtyRegistry::new();
+            let registry = Arc::new(AgentPtyRegistry::new());
 
             const REPORT_A: &str = "REPORT-FROM-ORCHESTRATION-A-CODER-7f3a1c";
             const REPORT_B: &str = "REPORT-FROM-ORCHESTRATION-B-CODER-9c1e4d";
@@ -2369,7 +2369,7 @@ fn delegate_025_third_collision_destroys_the_first_archived_report() {
                 .pane_registration_generation
                 .insert("triple-coder".to_string(), 1);
 
-            let registry = AgentPtyRegistry::new();
+            let registry = Arc::new(AgentPtyRegistry::new());
 
             const REPORT_A: &str = "REPORT-A-FIRST-CURRENT-3f8b2a";
             const REPORT_B: &str = "REPORT-B-SECOND-ARCHIVED-6d1c9e";

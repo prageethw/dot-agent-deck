@@ -762,7 +762,7 @@ pub async fn spawn(
 /// `membership`. Surfaces a spawn failure via the notifier.
 #[allow(clippy::too_many_arguments)]
 fn spawn_one(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     command: Option<&str>,
     cwd: &str,
     pane_id: &str,
@@ -2418,7 +2418,7 @@ mod tests {
         }
     }
 
-    fn spawn_shell_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    fn spawn_shell_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
         let command = crate::platform::shell::fixed_command_shell("/bin/sh");
         registry
             .spawn_agent(SpawnOptions {
@@ -2429,7 +2429,7 @@ mod tests {
             .expect("spawn shell observation target")
     }
 
-    fn spawn_byte_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    fn spawn_byte_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
         #[cfg(unix)]
         let command = "/bin/cat";
         #[cfg(windows)]

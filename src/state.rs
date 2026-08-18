@@ -7114,7 +7114,7 @@ clear = false
     fn orchestration_cwd_of_falls_back_to_the_orchestrator_pane_cwd() {
         // A registry with no live agent on the pane: `pane_orchestration` yields
         // `None`, which is the fallback branch.
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let mut state = AppState::default();
         register_role_pane(&mut state, "A_orch", "orchestrator", true, instance("i-0"));
         assert_eq!(state.orchestration_cwd_of("A_orch", &registry), None);
@@ -7402,7 +7402,7 @@ clear = false
             daemon_boot_id: state.daemon_boot_id().to_string(),
         };
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         state.handle_work_done(stale_signal, &registry).await;
 
         let file_name = work_done_file_name("coder", "P");
@@ -7513,7 +7513,7 @@ clear = false
              alone cannot"
         );
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         state_after.handle_work_done(stale_signal, &registry).await;
 
         let file_name = work_done_file_name("coder", "P");
@@ -7568,7 +7568,7 @@ clear = false
             daemon_boot_id: state.daemon_boot_id().to_string(),
         };
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         state.handle_work_done(signal, &registry).await;
 
         let file_name = work_done_file_name("coder", "P");
@@ -7619,7 +7619,7 @@ clear = false
             reserved,
         );
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let armed_watch = registry
             .arm_silence_watch("P", "orchestrator-pane")
             .expect("pane P is not mid-close, arming must succeed");

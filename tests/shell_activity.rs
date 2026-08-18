@@ -644,7 +644,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
         trigger_path = trigger.path.display(),
     );
 
-    let registry = AgentPtyRegistry::new();
+    let registry = std::sync::Arc::new(AgentPtyRegistry::new());
     let id = registry
         .spawn_agent(SpawnOptions {
             command: Some(&command),

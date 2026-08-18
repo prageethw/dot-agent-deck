@@ -450,7 +450,7 @@ async fn start_attach_server(harness: &IdleHarness) -> AttachServer {
 /// into that pane appears exactly once in the agent's scrollback and nothing
 /// else does, so "no bytes were submitted" is directly observable.
 fn spawn_raw_cat_observer(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     marker: &str,
     cwd: &str,
@@ -467,7 +467,7 @@ fn spawn_raw_cat_observer(
 /// keeping it absent is what leaves the `write_and_submit_guarded` agent-id gate
 /// as the only guard in `008`/`014`.
 fn spawn_raw_cat_observer_with_membership(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     marker: &str,
     cwd: &str,
@@ -516,7 +516,7 @@ fn orchestrator_membership(cwd: &str) -> TabMembership {
 /// pane is never an observation target: the successor that inherits its pane id
 /// is.
 fn spawn_exit_on_flag_observer(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     marker: &str,
     cwd: &str,
