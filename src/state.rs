@@ -3347,13 +3347,25 @@ async fn dispatch_one_owned(
     // `respawn_agent_for_pane`, and it runs under `registry.pane_dispatch_lock`,
     // which serializes every dispatch on a pane (a `clear = true` respawn always
     // resolves `expected_worker_agent_id` to its own fresh `new_agent_id` above,
-    // never `None`). `idle_worker_019` reaches this same `None` branch by a
-    // route production code cannot take: it calls `respawn_agent_for_pane`
-    // directly on the worker pane, outside `pane_dispatch_lock`, racing the
-    // detached task `handle_delegate` spawned for this very dispatch — a
-    // concurrent respawn of this pane, but reachable only because the test
-    // drives the primitive itself rather than going through
-    // `dispatch_one_owned`. Calling `write_and_submit_guarded_detailed` with
+    // never `None`). Issue #465 F4/F7: an earlier version of this comment
+    // claimed `idle_worker_019` reaches this same `None` branch, by calling
+    // `respawn_agent_for_pane` directly on the worker pane outside
+    // `pane_dispatch_lock`, racing the detached task `handle_delegate` spawns
+    // for this very dispatch. That was true, but it was a defect in the
+    // test's own construction rather than a route worth documenting here:
+    // `handle_delegate` returns once its dispatches are QUEUED (`tokio::spawn`,
+    // not awaited), so `idle_worker_019`'s own `harness.delegate(...)` call
+    // could return before this function had resolved `expected_worker_agent_id`
+    // at all, letting the test's very next line — its own direct
+    // `respawn_agent_for_pane` call — race this resolution and occasionally
+    // drive it down the `None` path, canceling the silence watch the test
+    // meant to check for survival (issue #465 F4) for a reason unrelated to
+    // what the test claims to isolate. `idle_worker_019` now waits for the
+    // task pointer to land on the pre-respawn agent before respawning, which
+    // closes that race at the test's own construction; this identity-unresolved
+    // path stays reachable in production only via genuine pane-id reuse (the
+    // paragraph above), never via a same-dispatch concurrent respawn. Calling
+    // `write_and_submit_guarded_detailed` with
     // `expected_agent_id = None` in that gap is NOT a safe no-op: its pre-lock
     // identity gate only compares `expected` against the pane's current owner
     // when `expected` is `Some` — so `None` skips the gate entirely and the call

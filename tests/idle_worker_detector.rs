@@ -1610,7 +1610,7 @@ fn idle_worker_017_work_done_immediately_before_exit_suppresses_the_exit_notice(
     });
 }
 
-/// Scenario: Delegate to a worker (arming a real outstanding idle-worker delegation and a real silence watch), then respawn that same worker pane directly through `AgentPtyRegistry::respawn_agent_for_pane` — the same primitive a `clear = true` delegate uses — and confirm both records still exist afterward instead of having been swept by the respawn itself.
+/// Scenario: Delegate to a worker (arming a real outstanding idle-worker delegation and a real silence watch, and waiting for the task pointer to actually land), then respawn that same worker pane directly through `AgentPtyRegistry::respawn_agent_for_pane` — the same primitive a `clear = true` delegate uses — and confirm both records still exist afterward instead of having been swept by the respawn itself.
 #[spec("scheduler/idle-worker/019")]
 #[test]
 fn idle_worker_019_respawn_carries_forward_armed_delegation_and_silence_watch() {
@@ -1630,8 +1630,42 @@ fn idle_worker_019_respawn_carries_forward_armed_delegation_and_silence_watch() 
     let _env = EnvGuard::set(Some("8000"));
     runtime().block_on(async {
         let harness = IdleHarness::new(&["respawning-worker"], None).await;
-        harness.delegate(&["respawning-worker"]).await;
         let worker_pane_id = worker_pane("respawning-worker");
+        let pre_respawn_agent_id = harness
+            .worker_agent_ids
+            .get("respawning-worker")
+            .expect("worker agent id recorded at spawn")
+            .clone();
+
+        harness.delegate(&["respawning-worker"]).await;
+        // Issue #465 F4/F7: `handle_delegate` fans out via a detached
+        // `tokio::spawn` (`src/state.rs`), so the `delegate()` call above
+        // returns once the dispatch is QUEUED, not once it has actually
+        // resolved the worker's identity and written the task pointer. This
+        // test's very next step used to be the direct `respawn_agent_for_pane`
+        // call below, which raced that still-in-flight dispatch: if the
+        // dispatch's own identity resolution (`registry.pane_current_agent_id`)
+        // landed inside the gap this respawn opens, it took the
+        // identity-unresolved path and canceled the very silence watch this
+        // test means to check for survival — a defect in this test's own
+        // construction (a race with itself), not a violation of respawn's
+        // no-sweep contract. Waiting here for the task pointer to actually
+        // land on the pre-respawn agent closes that race: only after the
+        // dispatch has fully resolved, bound both records to a real agent id,
+        // and armed a real watch task does the test drive the respawn it
+        // means to isolate.
+        let delivered = harness
+            .wait_for_snapshot_of(
+                &pre_respawn_agent_id,
+                |snapshot| snapshot.contains("Perform the delegated test task."),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            delivered.contains("Perform the delegated test task."),
+            "the delegated task pointer never landed on the pre-respawn worker agent, so the \
+             respawn below would not be racing a settled dispatch; snapshot = {delivered:?}"
+        );
 
         harness
             .registry
