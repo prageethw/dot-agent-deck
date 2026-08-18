@@ -3792,6 +3792,17 @@ exit 0
     /// on PATH with a stub that only logs argv and exits 0, calls
     /// `remove_worktree` against a fake (never-touched) path, and asserts the
     /// captured invocation carries `--` immediately before the path argument.
+    //
+    // `#[cfg(unix)]`: the stub is a `#!/bin/sh` script located via a PATH
+    // shadow. Windows' PATH search only matches `PATHEXT` extensions
+    // (`.exe`, `.bat`, `.cmd`, ...) — a bare `git` file with a shebang is
+    // invisible to it, so the search falls through to the REAL `git` on
+    // PATH, which then fails against the fake `/repo/...` paths. Same
+    // reasoning as the other shell-stub tests in this file
+    // (`issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`,
+    // `git_common_dir_async_is_bounded_by_an_external_timeout`), which are
+    // gated the same way.
+    #[cfg(unix)]
     #[tokio::test]
     async fn remove_worktree_argv_carries_end_of_options_separator_before_path() {
         let scratch = tempfile::tempdir().unwrap();
