@@ -59,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
+      docs_only: ${{ steps.detect.outputs.docs_only }}
     steps:
       - id: detect
         env:
@@ -69,15 +70,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Anything that is not a Renovate PR gets the full matrix. On `push` to
-          # main and on workflow_dispatch there is no pull_request payload, so
-          # PR_AUTHOR is empty and we exit here — which is what keeps the
-          # post-merge verification described in ci.yml intact. That matters most
-          # for exactly these PRs: they land unreviewed, so the push-to-main run is
-          # the first time e2e ever sees the merged result.
-          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
-            echo "author='${PR_AUTHOR:-}' is not Renovate -> full CI"
+          # No PR payload (push to main's post-merge check, or workflow_dispatch)
+          # -- always run the full tier. Keep in lockstep with ci.yml's `changes`
+          # job -- see the header comment above.
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "no PR number (push/workflow_dispatch) -> full CI"
             echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -93,6 +92,30 @@ jobs:
           # everything rather than read that as "nothing to test".
           if [ -z "$files" ]; then
             echo "no files reported -> full CI"
+            echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # docs_only applies to EVERY PR author -- see ci.yml's `changes` job
+          # for the full reasoning. Keep this block identical to ci.yml's.
+          docs_only=true
+          while IFS= read -r f; do
+            case "$f" in
+              docs/*) ;;
+              */*) docs_only=false ;;
+              *.md | README*) ;;
+              *) docs_only=false ;;
+            esac
+            [ "$docs_only" = false ] && break
+          done <<< "$files"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          if [ "$docs_only" = true ]; then
+            echo "docs-only diff -> skipping e2e"
+          fi
+
+          if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
+            echo "author='${PR_AUTHOR:-}' is not Renovate -> devbox_only stays false"
             echo "devbox_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -174,7 +197,7 @@ jobs:
   # --log` (or the checks API's log endpoint) can read.
   e2e:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
