@@ -1039,6 +1039,10 @@ async fn deliver(
     // design; see `crate::state::SessionStartWait::generation`.
     let mut generation: Option<(String, DateTime<Utc>)> = observed.generation.clone();
     let mut drained_capability = false;
+    // Issue #468: a hook-trust failure this pre-write drain sees directly must
+    // reach `deliver()`'s own veto below even if a later event in the same
+    // drain arms `drained_capability`.
+    let mut drained_codex_hook_trust_failed = false;
     if let Some(rx) = event_rx.as_mut()
         && let Some(reason) = drain_pre_write_events(
             rx,
@@ -1046,6 +1050,7 @@ async fn deliver(
             agent_id,
             &mut generation,
             &mut drained_capability,
+            &mut drained_codex_hook_trust_failed,
         )
     {
         log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
@@ -1148,7 +1153,13 @@ async fn deliver(
                 agent_id,
                 prompt,
                 delivery_id,
-                codex_hook_trust_failed: observed.codex_hook_trust_failed,
+                // Issue #468: OR in a failure the pre-write drain saw directly —
+                // `wait_for_session_start` only observes the wrapper's fork-time
+                // `SessionStart`, so a failure this drain sees on its own must
+                // still reach the veto, the same way `drained_capability` is
+                // already OR'd into `can_report_prompts` above.
+                codex_hook_trust_failed: observed.codex_hook_trust_failed
+                    || drained_codex_hook_trust_failed,
                 generation,
                 can_report_prompts,
                 deadline,
@@ -1260,9 +1271,11 @@ async fn guarded_submit(
 }
 
 /// Consume everything already queued on `rx` — every frame of it produced
-/// before the write this precedes — latching the pane's hook generation and
-/// noting whether the producer can report a submitted prompt. Returns a stop
-/// reason when the drained frames show the target is already gone.
+/// before the write this precedes — latching the pane's hook generation,
+/// noting whether the producer can report a submitted prompt, and recording
+/// whether a Codex native hook-trust failure was observed in any drained
+/// frame. Returns a stop reason when the drained frames show the target is
+/// already gone.
 ///
 /// Auditor HIGH: the generation decision is [`crate::state::latch_generation`],
 /// the SAME function the post-write watch uses, rather than the open-coded copy
@@ -1282,6 +1295,7 @@ fn drain_pre_write_events(
     agent_id: &str,
     generation: &mut Option<(String, DateTime<Utc>)>,
     can_report_prompts: &mut bool,
+    codex_hook_trust_failed: &mut bool,
 ) -> Option<&'static str> {
     loop {
         match rx.try_recv() {
@@ -1294,10 +1308,18 @@ fn drain_pre_write_events(
                     None => continue,
                     Some(_) => {}
                 }
-                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type)
-                    && event.codex_hook_trust_outcome() != Some(false)
-                {
-                    *can_report_prompts = true;
+                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
+                    // Issue #468: a hook-trust failure observed here must survive
+                    // past a later, metadata-free event that would otherwise arm
+                    // `can_report_prompts` — accumulate-only, same as
+                    // `SessionStartWait::codex_hook_trust_failed` in
+                    // `src/state.rs`, so callers can veto downstream the same way
+                    // `deliver()` already does with `observed.codex_hook_trust_failed`.
+                    if event.codex_hook_trust_outcome() == Some(false) {
+                        *codex_hook_trust_failed = true;
+                    } else {
+                        *can_report_prompts = true;
+                    }
                 }
                 if let Some(crate::state::PromptWatch::TargetChanged { reason }) =
                     crate::state::latch_generation(generation, &event)
@@ -1388,7 +1410,7 @@ async fn confirm_prompt_delivery(
         delivery_id,
         mut generation,
         can_report_prompts,
-        codex_hook_trust_failed,
+        mut codex_hook_trust_failed,
         deadline,
     } = task;
     // Issue #424 S1/S2 (both reviewers): THIS delivery's own clock — the
@@ -1520,7 +1542,15 @@ async fn confirm_prompt_delivery(
             // spawned a known agent there. See `accepts_late_producer` above.
             // Refusals are logged once, so a delivery that then holds to its
             // deadline is diagnosable rather than mysterious.
-            PromptWatch::Elapsed { can_report_prompts } => {
+            PromptWatch::Elapsed {
+                can_report_prompts,
+                codex_hook_trust_failed: watch_codex_hook_trust_failed,
+            } => {
+                // Issue #468 follow-up (reviewer M1): a hook-trust failure the
+                // window itself observed must veto this and every later arm
+                // attempt too, same accumulate-only pattern as
+                // `gap_codex_hook_trust_failed` below.
+                codex_hook_trust_failed |= watch_codex_hook_trust_failed;
                 let armed_before_this_claim = armed;
                 // Issue #459: `accepts_late_producer` clearing this would arm on
                 // its own merit; `codex_hook_trust_failed` still must veto it —
@@ -1628,16 +1658,37 @@ async fn confirm_prompt_delivery(
         // Issue #424 F4: the gap drain's capability observation is post-write
         // too, so it needs the same standing the window's does.
         let mut gap_capability = false;
+        // Issue #468: a hook-trust failure discovered in the gap drain itself
+        // must veto this and every later arm attempt too.
+        let mut gap_codex_hook_trust_failed = false;
         if let Some(reason) = drain_pre_write_events(
             &mut rx,
             &pane_id,
             &agent_id,
             &mut generation,
             &mut gap_capability,
+            &mut gap_codex_hook_trust_failed,
         ) {
             log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
             return;
         }
+        // Issue #468 follow-up (reviewer M2): this branch only ever runs once
+        // `armed` is already `true` — the `if !armed { continue; }` guard
+        // above sends every not-yet-armed delivery back around the loop
+        // before reaching here. So this accumulation cannot itself PREVENT
+        // arming; both `armed |=` expressions it feeds (here and at the
+        // `PromptWatch::Elapsed` arm above) are no-ops once `armed` already
+        // holds. Its one observable effect is on a LATER `Elapsed` arm's
+        // choice of which `log_prompt_unconfirmable` message to print. What
+        // the `Elapsed` arm's own `watch_codex_hook_trust_failed`
+        // accumulation above does differently is run every loop iteration
+        // regardless of `armed`'s current state — but that accumulation's
+        // effect on `armed` itself is, just the same, still gated by whether
+        // `armed` was already true; what is unconditional is only the write
+        // into `codex_hook_trust_failed` itself, which then vetoes any
+        // FUTURE arm attempt in a later iteration, not the veto having any
+        // effect within an already-armed iteration.
+        codex_hook_trust_failed |= gap_codex_hook_trust_failed;
         // Issue #459: same veto as the `PromptWatch::Elapsed` arm above.
         armed |= gap_capability && accepts_late_producer && !codex_hook_trust_failed;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
@@ -1883,7 +1934,12 @@ struct ConfirmationTask {
     generation: Option<(String, DateTime<Utc>)>,
     can_report_prompts: bool,
     /// Issue #459: this pane's Codex native-hook install/trust was observed,
-    /// pre-write, to have FAILED (`SessionStartWait::codex_hook_trust_failed`).
+    /// PRE-write, to have FAILED (`SessionStartWait::codex_hook_trust_failed`)
+    /// — this field only ever carries that pre-write value; `confirm_prompt_delivery`
+    /// copies it into a task-local `mut` binding of the same name that goes on
+    /// to accumulate POST-write sources too (issue #468 follow-up): the
+    /// `PromptWatch::Elapsed` arm's own window observation, and the gap drain's
+    /// (`drain_pre_write_events`). See those call sites for the post-write half.
     ///
     /// Sticky for the whole task, matching PR #441's ui.rs comment that this
     /// downgrade "must outrank the sticky `can_report_prompts`-style latch":
@@ -2548,8 +2604,16 @@ mod tests {
         }
         let mut generation = Some(("original-generation".to_string(), Utc::now()));
         let mut capability = false;
+        let mut codex_hook_trust_failed = false;
         assert_eq!(
-            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut codex_hook_trust_failed
+            ),
             Some("lagged-event-stream"),
             "dropped frames may have carried the end/start this delivery needed to see"
         );
@@ -2565,11 +2629,130 @@ mod tests {
         )));
         let mut generation = Some(("original-generation".to_string(), Utc::now()));
         let mut capability = false;
+        let mut codex_hook_trust_failed = false;
         assert_eq!(
-            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut codex_hook_trust_failed
+            ),
             None
         );
         assert!(capability, "an identified Claude frame proves the channel");
+        assert!(
+            !codex_hook_trust_failed,
+            "a non-Codex, non-failing event must not trip the hook-trust-failed out-param"
+        );
+    }
+
+    /// Scenario: Issue #468, follow-up to #459/PR #466. PR #466 taught
+    /// `drain_pre_write_events` to recognize a Codex `SessionStart` event
+    /// whose native hook install/trust is recorded as failed
+    /// (`codex_hook_trust_outcome() == Some(false)`) and refuse to arm
+    /// `can_report_prompts` FROM THAT EVENT — but gave the function no way to
+    /// tell its caller the failure was ever seen. This drains two events in
+    /// order: (1) a Codex `SessionStart` with a recorded hook-trust failure,
+    /// then (2) an ordinary Codex event with no hook-trust metadata at all
+    /// (ordinary status/heartbeat shape). Event 2 unconditionally arms
+    /// `can_report_prompts` (today's correct behavior for a metadata-free
+    /// Codex frame), which used to silently erase the fact that event 1's
+    /// failure was ever observed — the previous 5-argument signature had no
+    /// way to report it. The fix adds a new out-param (mirrored on
+    /// `SessionStartWait::codex_hook_trust_failed` in `src/state.rs`) so the
+    /// caller can veto `can_report_prompts` downstream the same way
+    /// `deliver()` already does with `observed.codex_hook_trust_failed`. This
+    /// pins that signal by calling the 6-argument `drain_pre_write_events`
+    /// the fix added — the out-param it introduced is what makes this
+    /// scenario expressible at all.
+    #[test]
+    fn drain_pre_write_events_reports_hook_trust_failure_even_when_a_later_event_arms_capability() {
+        const PANE_ID: &str = "codex-hook-trust-failed-then-armed-pane";
+        const AGENT_ID: &str = "codex-hook-trust-failed-then-armed-agent";
+
+        let mut failed_metadata = HashMap::new();
+        failed_metadata.insert(
+            crate::event::CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+            "false".to_string(),
+        );
+        let failed_event = AgentEvent {
+            session_id: "codex-hook-trust-failed-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: failed_metadata,
+            pane_id: Some(PANE_ID.to_string()),
+            agent_id: Some(AGENT_ID.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        };
+        assert_eq!(
+            failed_event.codex_hook_trust_outcome(),
+            Some(false),
+            "sanity: this event must carry a recorded hook-trust failure"
+        );
+
+        // Ordinary Codex frame with no hook-trust metadata at all — the shape
+        // that unconditionally arms `can_report_prompts` today.
+        let metadata_free_event = AgentEvent {
+            session_id: "codex-hook-trust-failed-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE_ID.to_string()),
+            agent_id: Some(AGENT_ID.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        };
+        assert_eq!(
+            metadata_free_event.codex_hook_trust_outcome(),
+            None,
+            "sanity: this event must carry no hook-trust metadata"
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(failed_event));
+        let _ = tx.send(BroadcastMsg::Event(metadata_free_event));
+
+        let mut generation = None;
+        let mut can_report_prompts = false;
+        // The 6th argument: the out-param the fix added so a hook-trust
+        // failure observed mid-drain survives past a later event that would
+        // otherwise arm `can_report_prompts`.
+        let mut codex_hook_trust_failed = false;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut can_report_prompts,
+                &mut codex_hook_trust_failed,
+            ),
+            None
+        );
+        assert!(
+            codex_hook_trust_failed,
+            "issue #468: a hook-trust failure observed mid-drain must be reported back even \
+             when a later, metadata-free Codex event goes on to arm can_report_prompts — \
+             codex_hook_trust_failed came back false, so the out-param drain_pre_write_events \
+             added to carry this signal has regressed"
+        );
     }
 
     /// Scenario: Issue #459, follow-up to #254/PR #441. PR #441 fixed the
@@ -2627,13 +2810,15 @@ mod tests {
 
         let mut generation = None;
         let mut can_report_prompts = false;
+        let mut codex_hook_trust_failed = false;
         assert_eq!(
             drain_pre_write_events(
                 &mut rx,
                 PANE_ID,
                 AGENT_ID,
                 &mut generation,
-                &mut can_report_prompts
+                &mut can_report_prompts,
+                &mut codex_hook_trust_failed
             ),
             None
         );
@@ -2644,6 +2829,11 @@ mod tests {
              currently resolves purely from agent_reports_submitted_prompt(&event.agent_type), \
              the same defect PR #441 fixed on the TUI-attached path in \
              src/ui.rs::delivery_capability"
+        );
+        assert!(
+            codex_hook_trust_failed,
+            "issue #468: the single failing event this drain observed must be reported back \
+             via the out-param, not just suppressed from can_report_prompts"
         );
     }
 
