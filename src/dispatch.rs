@@ -5,7 +5,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
     RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree, run_status,
+    remove_worktree, run_status, worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -385,8 +385,10 @@ pub async fn handle_dispatch(
         compose_orchestrator_context: true,
         // Fork #166 M2.4: the SAME string just written into the worktree's
         // `created-by:` marker above (`create_worktree`), not a second
-        // derivation of it.
-        owner: Some(creator),
+        // derivation of it. Cloned rather than moved: issue #469's
+        // spawn-rollback arm below also needs `creator`, as the `remover`
+        // identity for its own `remove_worktree` call.
+        owner: Some(creator.clone()),
     };
 
     let notifier = StderrNotifier;
@@ -430,14 +432,37 @@ pub async fn handle_dispatch(
             // later dispatch. That is NOT true for a multi-role
             // orchestration, though (PRD 236 review) — `spawn()`'s
             // orchestration branch spawns roles in a loop with `?`
-            // (`spawn.rs:536`), so a later role's spawn failure still
-            // leaves EARLIER roles as live PTY children already rooted in
-            // this worktree, and this call force-removes it out from under
-            // them. Left as-is rather than guarded with
-            // `worktree_still_in_use` here — that would be a behaviour
-            // change, out of scope for this fix — but flagged for a
-            // follow-up issue.
-            let _ = remove_worktree(&paths.worktree_dir, &clone_dir, RemovalPolicy::Force).await;
+            // (`spawn.rs:536`), so a later role's spawn failure can find
+            // EARLIER roles already live as PTY children rooted in this
+            // worktree. Issue #469: guarded with `worktree_still_in_use` —
+            // when a live sibling is still rooted here it may hold
+            // committed work whose only record is this worktree, its
+            // branch, or its registry entry, so all three are left alone
+            // rather than yanked out from under it.
+            if worktree_still_in_use(&ctx.registry.agent_records(), &paths.worktree_dir) {
+                tracing::warn!(
+                    worktree = %paths.worktree_dir.display(),
+                    "spawn rollback: a live sibling role is still rooted in this worktree; \
+                     skipping cleanup"
+                );
+                return DispatchResult {
+                    message: format!(
+                        "dispatch: spawn failed: {e} (cleanup skipped: {} is still rooted by a \
+                         live sibling role — worktree, branch, and registry entry left in place)",
+                        paths.worktree_dir.display()
+                    ),
+                    success: false,
+                    worktree_dir: paths.worktree_dir,
+                };
+            }
+
+            let _ = remove_worktree(
+                &paths.worktree_dir,
+                &clone_dir,
+                RemovalPolicy::Force,
+                &creator,
+            )
+            .await;
             // Also delete the branch: `git worktree remove` never deletes
             // it. Same multi-role caveat as above — a still-live sibling
             // role may hold committed work whose only record is this
@@ -592,7 +617,13 @@ mod tests {
         );
 
         // Tab close: the worktree goes away, the branch does not.
-        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(
+            &paths.worktree_dir,
+            &repo,
+            RemovalPolicy::KeepIfDirty,
+            "dispatch:test",
+        )
+        .await;
         assert!(!paths.worktree_dir.exists(), "worktree dir should be gone");
         assert!(
             branch_exists(&repo, &paths.branch),
@@ -632,7 +663,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(
+            &paths.worktree_dir,
+            &repo,
+            RemovalPolicy::KeepIfDirty,
+            "dispatch:test",
+        )
+        .await;
         std::process::Command::new("git")
             .args(["branch", "-D", &paths.branch])
             .current_dir(&repo)
@@ -676,7 +713,13 @@ mod tests {
         .unwrap();
         std::fs::write(paths.worktree_dir.join("uncommitted.txt"), "work").unwrap();
 
-        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(
+            &paths.worktree_dir,
+            &repo,
+            RemovalPolicy::KeepIfDirty,
+            "dispatch:test",
+        )
+        .await;
 
         assert!(
             paths.worktree_dir.exists(),
@@ -702,7 +745,7 @@ mod tests {
             .unwrap();
         std::fs::write(worktree_dir.join("uncommitted.txt"), "wip").unwrap();
 
-        let _ = remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force).await;
+        let _ = remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force, "dispatch:test").await;
 
         assert!(
             !worktree_dir.exists(),

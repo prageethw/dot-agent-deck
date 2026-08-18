@@ -219,8 +219,11 @@ pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bo
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoveOutcome {
-    /// The worktree was removed.
-    Removed,
+    /// The worktree was removed. Carries the identity (issue #469) that
+    /// removed it — the caller-supplied `remover` [`remove_worktree`] was
+    /// given, mirroring [`RemoveFailed`](RemoveOutcome::RemoveFailed)'s own
+    /// caller-supplied string.
+    Removed(String),
     /// The worktree was left in place. Carries why — see
     /// [`crate::event::KeptReason`].
     Kept(crate::event::KeptReason),
@@ -248,10 +251,17 @@ pub enum RemoveOutcome {
 /// probe that fails, so dirtiness is unknown) is left in place, logged, and
 /// reported back as [`RemoveOutcome::Kept`]; under [`RemovalPolicy::Force`] the
 /// tree is removed regardless.
+///
+/// `remover` (issue #469) names the caller responsible for this removal —
+/// forwarded verbatim into [`RemoveOutcome::Removed`] and the success log,
+/// mirroring how [`attempt_worktree_cleanup`]/[`attempt_worktree_cleanup_async`]
+/// attribute their own removals. Caller-supplied and just as unauthenticated
+/// as those siblings' `remover`, so it is sanitised before logging.
 pub async fn remove_worktree(
     worktree_dir: &Path,
     clone_dir: &Path,
     policy: RemovalPolicy,
+    remover: &str,
 ) -> RemoveOutcome {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
@@ -277,18 +287,21 @@ pub async fn remove_worktree(
     }
 
     let clone = clone_dir.to_string_lossy();
-    let mut args = vec!["-C", &clone, "worktree", "remove", &worktree];
+    let mut args = vec!["-C", &clone, "worktree", "remove"];
     if policy == RemovalPolicy::Force {
         args.push("--force");
     }
+    args.push("--");
+    args.push(&worktree);
     let res = run_status("git", &args).await;
     match res {
         Ok(()) => {
             tracing::info!(
                 worktree = %worktree_dir.display(),
+                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                 "issue-dispatch: removed worktree on tab close (clone preserved)"
             );
-            RemoveOutcome::Removed
+            RemoveOutcome::Removed(remover.to_string())
         }
         Err(e) => {
             tracing::warn!(
