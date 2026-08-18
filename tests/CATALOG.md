@@ -2588,6 +2588,16 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Regression origin:** installing a handler replaces the default disposition process-wide, so once the first signal is consumed every later SIGTERM would be absorbed by a stream nobody reads — removing the `pkill` escape hatch that the pre-handler behaviour always provided.
 - **Platform coverage:** linux+mac (Unix signals).
 
+#### lifecycle/log-path
+
+##### lifecycle/log-path/001 — With file logging enabled and no override path, the log lands under the per-user state dir (created owner-only) instead of the hardcoded, predictable `/tmp/dot-agent-deck.log` (issue #467).
+- **Layer:** L2 (real `daemon serve` subprocess spawn; no PTY — driven through attach-socket readiness, mirroring `lifecycle/sigterm/001`'s non-PTY drive).
+- **Agent:** none (a bare `daemon serve` with idle shutdown disabled).
+- **Asserts:** with `DOT_AGENT_DECK_LOG=1` and `DOT_AGENT_DECK_STATE_DIR` pointed at a fresh, not-yet-created directory, once the daemon has bound its attach socket the log file exists at `<state_dir>/deck.log` with tracing output, `<state_dir>` itself was created at mode `0o700` (owner-only) — mirroring `daemon_attach.rs`'s `ensure_owner_only_dir` call ahead of `daemon.log` — and the `deck.log` file itself was created at mode `0o600` (owner-only), pinning that `init_logging_from_env` actually reaches `open_deck_log_file` on the default branch rather than the plain unhardened open it replaced.
+- **Does not assert:** the exact log content beyond the presence of startup output; behavior when `DOT_AGENT_DECK_LOG` names an explicit override path (unchanged by this fix — only the empty/`"1"` default branch is affected); Windows ACL semantics; symlink refusal, and the file mode check's own correctness in isolation — those deeper properties of `open_deck_log_file`'s hardening are covered by the two unit tests directly against the helper (`open_deck_log_file_refuses_a_preexisting_symlink`, `open_deck_log_file_creates_a_fresh_file_at_mode_0o600` in `src/main.rs`); this entry's mode check exists only to prove the production call site actually reaches that helper end-to-end.
+- **Regression origin:** `init_logging_from_env` resolved the empty/`"1"` default to the hardcoded `/tmp/dot-agent-deck.log`, opened with `create(true).append(true)` and no symlink protection — a predictable path in a world-writable directory (CWE-59/377).
+- **Platform coverage:** linux+mac (Unix-only permission check; the test itself is `#[cfg(unix)]`-gated).
+
 #### lifecycle/version
 
 ##### lifecycle/version/001 — A build environment that pre-sets `DAD_VERSION` / `DAD_BUILD_ID` / `DAD_RELEASE_REPO` produces a binary that reports those values, and changing any one of them invalidates the cached build (issue #250, widened by issue #398 review finding F1).
