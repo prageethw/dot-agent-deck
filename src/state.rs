@@ -2465,6 +2465,27 @@ pub(crate) struct SessionStartWait {
     /// gate on its fork-time start rather than being skipped, so it is still
     /// recorded and still arms.
     pub(crate) observed_producer: Option<AgentType>,
+    /// Issue #459: whether ANY `SessionStart` this wait observed for this pane
+    /// — including one it SKIPPED for readiness — carried a stamped Codex
+    /// native-hook install/trust outcome (`AgentEvent::codex_hook_trust_outcome`)
+    /// of `Some(false)`: a hook known to have failed to install/trust. Not
+    /// limited to the event that satisfied readiness: PRD #254's wrapper stamps
+    /// this metadata on its fork-time `SessionStart`, which
+    /// `session_start_means_ready` skips for a Codex pane precisely because a
+    /// genuine native one is still coming — so the event carrying the real
+    /// outcome and the event that satisfies `observed_producer` are usually two
+    /// different events, and this has to be collected across both (see
+    /// `wait_for_session_start`). Kept as its OWN field rather than folded into
+    /// `observed_producer` itself, matching this struct's own rule that
+    /// `observed_producer` answers only "which producer owns this pane" (see
+    /// the doc comment on the struct) and must not be filtered by a capability
+    /// judgement made elsewhere. A hook in this state can never emit the TEXT
+    /// confirmation `agent_reports_submitted_prompt` promises for
+    /// `AgentType::Codex`, so a caller resolving `can_report_prompts` from
+    /// `observed_producer` must also read this flag — see
+    /// [`crate::spawn::spawn`]'s use of it, mirroring
+    /// `drain_pre_write_events`'s identical check on the raw event.
+    pub(crate) codex_hook_trust_failed: bool,
     /// Issue #424 F4: this pane declared, BEFORE the prompt was written, that
     /// what we were about to write into is a LAUNCHER with a real agent coming
     /// behind it — a `SessionStart` carrying
@@ -2499,11 +2520,12 @@ pub(crate) struct SessionStartWait {
 }
 
 impl SessionStartWait {
-    fn unready(launcher_handoff: bool) -> Self {
+    fn unready(launcher_handoff: bool, codex_hook_trust_failed: bool) -> Self {
         Self {
             ready: false,
             generation: None,
             observed_producer: None,
+            codex_hook_trust_failed,
             launcher_handoff,
         }
     }
@@ -2570,9 +2592,20 @@ pub(crate) async fn wait_for_session_start(
     // every exit from this loop, including the timeout, because the launcher
     // case is exactly the one that times out.
     let mut launcher_handoff = false;
+    // Issue #459: like `launcher_handoff` just above, carried across every exit
+    // from this loop rather than read only from the event that satisfies
+    // readiness. PRD #254's wrapper stamps the Codex hook-trust outcome on the
+    // wrapper's fork-time `SessionStart` — see `Emitter::emit_fork_session_start`
+    // — which `session_start_means_ready` SKIPS for a Codex pane (it has a
+    // native hook installer), so the event that actually satisfies readiness
+    // here is the native hook's OWN `SessionStart` and never carries this
+    // metadata itself. Reading `codex_hook_trust_outcome()` only from the
+    // ready-satisfying event below would therefore never observe a real
+    // failure at all; it has to be picked up from the skipped event too.
+    let mut codex_hook_trust_failed = false;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return SessionStartWait::unready(launcher_handoff);
+            return SessionStartWait::unready(launcher_handoff, codex_hook_trust_failed);
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
@@ -2589,6 +2622,12 @@ pub(crate) async fn wait_for_session_start(
                         launcher_handoff |= crate::prompt_delivery::agent_reports_submitted_prompt(
                             &event.agent_type,
                         );
+                        // Issue #459: this is the ONLY event that ever carries
+                        // PRD #254's Codex hook-trust metadata, so it must be
+                        // read here rather than only from the ready-satisfying
+                        // event further down — see the comment on
+                        // `codex_hook_trust_failed`'s declaration above.
+                        codex_hook_trust_failed |= event.codex_hook_trust_outcome() == Some(false);
                         tracing::debug!(
                             pane_id,
                             agent_id,
@@ -2628,10 +2667,16 @@ pub(crate) async fn wait_for_session_start(
                     // `session_start_means_ready` above keeps waiting for the
                     // genuine `SessionStart` of every agent that will emit one.
                     let genuine = !event.is_wrapper_fork_session_start();
+                    // `|=`, not overwrite: keep whatever the skipped fork-time
+                    // event above already recorded even if THIS event carries no
+                    // metadata of its own (the ordinary case for a native hook's
+                    // genuine `SessionStart`).
+                    codex_hook_trust_failed |= event.codex_hook_trust_outcome() == Some(false);
                     return SessionStartWait {
                         ready: true,
                         generation: genuine.then_some((event.session_id, event.timestamp)),
                         observed_producer: Some(event.agent_type),
+                        codex_hook_trust_failed,
                         launcher_handoff,
                     };
                 }
@@ -2642,7 +2687,7 @@ pub(crate) async fn wait_for_session_start(
             Ok(Ok(BroadcastMsg::WorktreeKept(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                return SessionStartWait::unready(launcher_handoff);
+                return SessionStartWait::unready(launcher_handoff, codex_hook_trust_failed);
             }
         }
     }
@@ -2783,8 +2828,18 @@ pub(crate) async fn wait_for_prompt_submission(
                 if let Some(changed) = latch_generation(generation, &event) {
                     return changed;
                 }
+                // Issue #459: mirrors `drain_pre_write_events`'s identical
+                // check — `agent_reports_submitted_prompt` is `true`
+                // unconditionally for every `AgentType::Codex` event, so an
+                // event whose own `codex_hook_trust_outcome()` records a
+                // failed native hook install/trust must not latch capability
+                // here either, or a post-write Codex event during THIS window
+                // arms `armed` in `confirm_prompt_delivery` via
+                // `PromptWatch::Elapsed` from a producer that can never emit
+                // the TEXT confirmation this delivery is waiting for.
                 can_report_prompts |=
-                    crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type);
+                    crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type)
+                        && event.codex_hook_trust_outcome() != Some(false);
                 if let Some(reported) = event.user_prompt.as_deref() {
                     if crate::prompt_delivery::prompt_submission_matches(expected, reported) {
                         return PromptWatch::Confirmed;
