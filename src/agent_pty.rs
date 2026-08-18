@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -1426,12 +1426,25 @@ impl AgentBus {
 /// explicit `StopAgent` close. `pane_id_env` is `None` for a spawn that
 /// never carried one (most unit-test fixtures), in which case there is
 /// nothing in the tracker keyed by it and the sweep is skipped.
+///
+/// `registry` is a [`Weak`] reference, deliberately NOT an owned `Arc`: this
+/// thread is detached and only exits once the child's PTY reaches EOF, so an
+/// owned `Arc<AgentPtyRegistry>` held here would keep the registry alive for
+/// as long as the thread runs — which is exactly backwards, since
+/// `AgentPtyRegistry`'s own `Drop` is what calls `shutdown_all` to kill any
+/// still-live children in the first place (`registry_drop_kills_agents`
+/// caught this the hard way: an owned `Arc` here means the registry's strong
+/// count never reaches zero while any spawned agent's reader thread is still
+/// blocked on `read`, so `Drop` never runs, so the child is never killed, so
+/// the thread never unblocks). A `Weak` upgrade fails harmlessly if the
+/// registry has already been dropped by the time EOF is observed — there is
+/// nothing left to sweep in that case either way.
 fn pump_reader(
     mut reader: Box<dyn std::io::Read + Send>,
     bus: Arc<AgentBus>,
     exited: Arc<AtomicBool>,
     change_notify: Arc<Notify>,
-    registry: Arc<AgentPtyRegistry>,
+    registry: Weak<AgentPtyRegistry>,
     pane_id_env: Option<String>,
 ) {
     let mut buf = [0u8; 8192];
@@ -1443,7 +1456,9 @@ fn pump_reader(
         }
     }
     exited.store(true, Ordering::SeqCst);
-    if let Some(pane_id) = pane_id_env.as_deref() {
+    if let Some(pane_id) = pane_id_env.as_deref()
+        && let Some(registry) = registry.upgrade()
+    {
         registry.sweep_delegations_on_exit(pane_id);
     }
     change_notify.notify_one();
@@ -4126,11 +4141,13 @@ impl AgentPtyRegistry {
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
         let notify_for_thread = self.change_notify.clone();
-        // Issue #465 M1: the reader thread needs its own registry handle and
-        // the pane's id so its EOF branch can retire any armed
-        // OutstandingDelegation/SilenceWatchRecord — clone both BEFORE
-        // `pane_id_env` is moved into `RunningAgent` below.
-        let registry_for_thread = Arc::clone(self);
+        // Issue #465 M1: the reader thread needs a registry handle and the
+        // pane's id so its EOF branch can retire any armed
+        // OutstandingDelegation/SilenceWatchRecord. WEAK, deliberately — see
+        // `pump_reader`'s doc comment for why an owned `Arc` here deadlocks
+        // `AgentPtyRegistry`'s Drop-triggered `shutdown_all`. Clone the pane
+        // id BEFORE it's moved into `RunningAgent` below.
+        let registry_for_thread = Arc::downgrade(self);
         let pane_id_env_for_thread = pane_id_env.clone();
         // Detached thread: exits when the PTY returns EOF (child killed).
         // On exit, pump_reader sets `exited` and signals `change_notify` so
