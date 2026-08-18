@@ -1418,7 +1418,8 @@ impl AgentBus {
 /// idle shutdown).
 ///
 /// Issue #465 M1: loop exit is also the daemon's earliest, unconditional
-/// "this process is gone" signal, so it retires any armed
+/// "this process is gone" signal, so — for a process that died WITHOUT the
+/// daemon's own doing — it retires any armed
 /// `OutstandingDelegation`/`SilenceWatchRecord` for this pane via
 /// [`AgentPtyRegistry::sweep_delegations_on_exit`] — instead of leaving
 /// either record armed for its full timeout window when the pane's process
@@ -1426,6 +1427,23 @@ impl AgentBus {
 /// explicit `StopAgent` close. `pane_id_env` is `None` for a spawn that
 /// never carried one (most unit-test fixtures), in which case there is
 /// nothing in the tracker keyed by it and the sweep is skipped.
+///
+/// "Without the daemon's own doing" is load-bearing: [`AgentPtyRegistry::close_agent`]
+/// and [`AgentPtyRegistry::respawn_agent_for_pane`] BOTH remove the agent's
+/// entry from the registry BEFORE killing its child, so by the time THIS
+/// thread's `read` unblocks on the resulting EOF, `agent_id` no longer names
+/// a live entry — checked via [`AgentPtyRegistry::is_agent_still_registered`]
+/// — and the sweep is skipped. Both of those callers already own the sweep
+/// decision for their own kill: `close_agent` deliberately performs none on
+/// its own (a bare call is the documented no-sweep primitive a rebound
+/// successor on the same pane relies on — see
+/// `delegate_rebound_worker_event_does_not_suppress_original_watch`), the
+/// `StopAgent` daemon-protocol handler wraps it with an explicit
+/// `begin_pane_close`/`finish_pane_close` when IT wants one, and respawn
+/// deliberately lets an outstanding delegation carry forward to whichever
+/// agent next occupies the pane. Only a still-registered entry — nothing
+/// else has removed it, so nothing else has decided what to do about its
+/// death yet — is this thread's own natural-exit signal to act on.
 ///
 /// `registry` is a [`Weak`] reference, deliberately NOT an owned `Arc`: this
 /// thread is detached and only exits once the child's PTY reaches EOF, so an
@@ -1445,6 +1463,7 @@ fn pump_reader(
     exited: Arc<AtomicBool>,
     change_notify: Arc<Notify>,
     registry: Weak<AgentPtyRegistry>,
+    agent_id: String,
     pane_id_env: Option<String>,
 ) {
     let mut buf = [0u8; 8192];
@@ -1458,6 +1477,7 @@ fn pump_reader(
     exited.store(true, Ordering::SeqCst);
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
+        && registry.is_agent_still_registered(&agent_id)
     {
         registry.sweep_delegations_on_exit(pane_id);
     }
@@ -3448,6 +3468,18 @@ impl AgentPtyRegistry {
         swept
     }
 
+    /// Issue #465 M1: whether `agent_id` still names a live entry in the
+    /// registry. `pump_reader`'s EOF branch uses this to tell a process that
+    /// died NATURALLY (nothing has removed its entry yet — the death is news
+    /// to the registry) from one whose death was the daemon's own doing:
+    /// [`Self::close_agent`] and [`Self::respawn_agent_for_pane`] both
+    /// remove the entry BEFORE killing its child, so by the time that kill's
+    /// resulting EOF is observed, the entry is already gone and this
+    /// correctly answers `false`.
+    fn is_agent_still_registered(&self, agent_id: &str) -> bool {
+        self.inner.lock().unwrap().agents.contains_key(agent_id)
+    }
+
     /// PRD #126: whether `pane_id` is between [`Self::begin_pane_close`] and
     /// [`Self::finish_pane_close`]. The idle watch re-checks this immediately
     /// before writing (inside the guarded-send revalidation) so a close that
@@ -4141,13 +4173,17 @@ impl AgentPtyRegistry {
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
         let notify_for_thread = self.change_notify.clone();
-        // Issue #465 M1: the reader thread needs a registry handle and the
-        // pane's id so its EOF branch can retire any armed
-        // OutstandingDelegation/SilenceWatchRecord. WEAK, deliberately — see
-        // `pump_reader`'s doc comment for why an owned `Arc` here deadlocks
-        // `AgentPtyRegistry`'s Drop-triggered `shutdown_all`. Clone the pane
-        // id BEFORE it's moved into `RunningAgent` below.
+        // Issue #465 M1: the reader thread needs a registry handle, its own
+        // agent id, and the pane's id so its EOF branch can retire any armed
+        // OutstandingDelegation/SilenceWatchRecord — but ONLY when this
+        // agent's death is news to the registry (see `pump_reader`'s doc
+        // comment on `is_agent_still_registered`). The registry handle is
+        // WEAK, deliberately — see the same doc comment for why an owned
+        // `Arc` here deadlocks `AgentPtyRegistry`'s Drop-triggered
+        // `shutdown_all`. Clone the id and pane id BEFORE either is moved
+        // (into `inner.agents.insert` / `RunningAgent`) below.
         let registry_for_thread = Arc::downgrade(self);
+        let agent_id_for_thread = preallocated_id.clone();
         let pane_id_env_for_thread = pane_id_env.clone();
         // Detached thread: exits when the PTY returns EOF (child killed).
         // On exit, pump_reader sets `exited` and signals `change_notify` so
@@ -4160,6 +4196,7 @@ impl AgentPtyRegistry {
                 exited_for_thread,
                 notify_for_thread,
                 registry_for_thread,
+                agent_id_for_thread,
                 pane_id_env_for_thread,
             )
         });
