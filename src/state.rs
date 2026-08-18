@@ -3375,9 +3375,9 @@ async fn dispatch_one_owned(
         tracing::debug!(
             pane_id = %pane_id,
             role = %target_role,
-            "delegate: worker identity could not be resolved (a concurrent respawn of this \
-             pane is plausible); refusing to write the task pointer unguarded rather than to \
-             whoever currently owns the pane"
+            "delegate: worker identity could not be resolved (pane-id reuse after the prior \
+             worker's exit/close is plausible); refusing to write the task pointer unguarded \
+             rather than to whoever currently owns the pane"
         );
         Ok(GuardedSendDetail::Outcome(
             crate::agent_pty::GuardedSend::NoLiveTarget,
