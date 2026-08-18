@@ -308,32 +308,80 @@ pub fn derive_work_type(
     fragments: &[AddedFragment],
     branch: &str,
 ) -> Result<Derivation, WorkTypeError> {
+    // fork#453: a `.breaking.md` fragment's `Prd` mapping is only ever a
+    // no-branch-signal fallback (see the doc above) — so it is not a real
+    // conflict against a genuine `.bugfix.md` (`Bug`) fragment, in either
+    // order, as long as no genuine `.feature.md` is also present in the
+    // set. `.feature.md` alongside `.bugfix.md` is a real, non-breaking
+    // conflict and must still fail below exactly as before
+    // (`bugfix_plus_feature_fragments_still_conflict_regression_guard`) —
+    // precomputed once, order-independently, over the whole fragment set,
+    // so an exemption never fires just because the feature fragment
+    // happens to sort after the bugfix/breaking pair.
+    let any_feature_fragment = fragments.iter().any(|f| f.suffix == "feature");
+
     // Tier 1: every added fragment must map, and every mapped fragment must
     // agree — an unrecognized suffix fails immediately (does not fall
     // through to tier 2), and a disagreement between two fragments fails
-    // before tier 2 is even consulted.
+    // before tier 2 is even consulted, except for the `.bugfix.md` +
+    // `.breaking.md` exemption above, which is deferred to tier 2 instead.
     let mut fragment_supply: Option<(String, WorkType)> = None;
-    let mut fragment_all_breaking = true;
+    let mut breaking_fragment_path: Option<String> = None;
     for fragment in fragments {
         let work_type =
             suffix_to_work_type(&fragment.suffix).ok_or_else(|| WorkTypeError::UnknownSuffix {
                 path: fragment.path.clone(),
                 suffix: fragment.suffix.clone(),
             })?;
-        if fragment.suffix != BREAKING_SUFFIX {
-            fragment_all_breaking = false;
+        if fragment.suffix == BREAKING_SUFFIX && breaking_fragment_path.is_none() {
+            breaking_fragment_path = Some(fragment.path.clone());
         }
-        match &fragment_supply {
-            None => fragment_supply = Some((fragment.path.clone(), work_type)),
-            Some((first_path, first_type)) if *first_type != work_type => {
-                return Err(WorkTypeError::ConflictingFragments {
-                    first: (first_path.clone(), *first_type),
-                    second: (fragment.path.clone(), work_type),
-                });
+
+        let Some((first_path, first_type)) = fragment_supply.clone() else {
+            fragment_supply = Some((fragment.path.clone(), work_type));
+            continue;
+        };
+
+        if first_type == work_type {
+            continue;
+        }
+
+        let is_breaking_bug_pair = (first_type == WorkType::Bug
+            && fragment.suffix == BREAKING_SUFFIX)
+            || (first_type == WorkType::Prd && !any_feature_fragment && work_type == WorkType::Bug);
+        if is_breaking_bug_pair {
+            if work_type == WorkType::Bug {
+                // A genuine `.bugfix.md` fragment supersedes a
+                // breaking-only `Prd` fallback as the authoritative
+                // established type, so a later real conflict (e.g. a
+                // `.feature.md`) still compares against `Bug` and fails.
+                fragment_supply = Some((fragment.path.clone(), WorkType::Bug));
             }
-            Some(_) => {}
+            continue;
         }
+
+        return Err(WorkTypeError::ConflictingFragments {
+            first: (first_path, first_type),
+            second: (fragment.path.clone(), work_type),
+        });
     }
+
+    // fork#453: when tier 1 settled on `Bug` only because a genuine
+    // `.bugfix.md` fragment superseded a breaking-only `Prd` fallback
+    // above, hand tier 2 the fallback `Prd` reading instead of the
+    // promoted `Bug` one — that is what the existing branch-aware
+    // carve-out below expects, and it is what makes the resolved
+    // `Supplier::BranchPrefix` correct: the branch, not the fragment, is
+    // what actually wins this resolution, the same as a lone
+    // `.breaking.md` on `fix/`
+    // (`breaking_fragment_on_fix_branch_resolves_to_bug`).
+    let fragment_supply = match (&fragment_supply, &breaking_fragment_path) {
+        (Some((_, WorkType::Bug)), Some(breaking_path)) => {
+            Some((breaking_path.clone(), WorkType::Prd))
+        }
+        _ => fragment_supply,
+    };
+    let fragment_all_breaking = !any_feature_fragment;
 
     let branch_supply = branch_prefix_to_work_type(branch);
 
