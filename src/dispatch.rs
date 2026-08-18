@@ -450,8 +450,7 @@ pub async fn handle_dispatch(
                     success: false,
                     message: format!(
                         "dispatch: spawn failed: {e} (cleanup skipped: {} is still rooted by a \
-                         live sibling role — worktree, branch, and registry entry left in place; \
-                         close the remaining role panes to release it automatically)",
+                         live sibling role — worktree, branch, and registry entry left in place)",
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(
                             &paths.worktree_dir
                         )
