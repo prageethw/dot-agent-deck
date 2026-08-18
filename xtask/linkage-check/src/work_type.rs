@@ -252,6 +252,19 @@ pub fn suffix_to_work_type(suffix: &str) -> Option<WorkType> {
     }
 }
 
+/// Whether `fragment` maps to [`WorkType::Prd`] via [`suffix_to_work_type`]
+/// but is not the [`BREAKING_SUFFIX`] severity axis — i.e. a genuine
+/// feature-shaped fragment, as opposed to a `.breaking.md` whose `Prd`
+/// mapping is only ever a no-branch-signal fallback. Shared by
+/// [`derive_work_type`]'s `any_feature_fragment` precomputation and its
+/// `named_path` selection so a future non-`breaking` `Prd`-mapping suffix
+/// is caught by both sites rather than only one (`BREAKING_SUFFIX`'s doc
+/// comment names this as one of the four sites that must agree).
+fn is_non_breaking_prd_fragment(fragment: &AddedFragment) -> bool {
+    suffix_to_work_type(&fragment.suffix) == Some(WorkType::Prd)
+        && fragment.suffix != BREAKING_SUFFIX
+}
+
 /// Tier 2: map a branch name's prefix to a work type.
 ///
 /// `None` when `branch` carries no `/` at all, or a prefix outside the four
@@ -318,7 +331,7 @@ pub fn derive_work_type(
     // precomputed once, order-independently, over the whole fragment set,
     // so an exemption never fires just because the feature fragment
     // happens to sort after the bugfix/breaking pair.
-    let any_feature_fragment = fragments.iter().any(|f| f.suffix == "feature");
+    let any_feature_fragment = fragments.iter().any(is_non_breaking_prd_fragment);
 
     // Tier 1: every added fragment must map, and every mapped fragment must
     // agree — an unrecognized suffix fails immediately (does not fall
@@ -326,15 +339,15 @@ pub fn derive_work_type(
     // before tier 2 is even consulted, except for the `.bugfix.md` +
     // `.breaking.md` exemption above, which is deferred to tier 2 instead.
     let mut fragment_supply: Option<(String, WorkType)> = None;
-    let mut breaking_fragment_path: Option<String> = None;
+    let mut fragment_all_breaking = true;
     for fragment in fragments {
         let work_type =
             suffix_to_work_type(&fragment.suffix).ok_or_else(|| WorkTypeError::UnknownSuffix {
                 path: fragment.path.clone(),
                 suffix: fragment.suffix.clone(),
             })?;
-        if fragment.suffix == BREAKING_SUFFIX && breaking_fragment_path.is_none() {
-            breaking_fragment_path = Some(fragment.path.clone());
+        if fragment.suffix != BREAKING_SUFFIX {
+            fragment_all_breaking = false;
         }
 
         let Some((first_path, first_type)) = fragment_supply.clone() else {
@@ -365,23 +378,6 @@ pub fn derive_work_type(
             second: (fragment.path.clone(), work_type),
         });
     }
-
-    // fork#453: when tier 1 settled on `Bug` only because a genuine
-    // `.bugfix.md` fragment superseded a breaking-only `Prd` fallback
-    // above, hand tier 2 the fallback `Prd` reading instead of the
-    // promoted `Bug` one — that is what the existing branch-aware
-    // carve-out below expects, and it is what makes the resolved
-    // `Supplier::BranchPrefix` correct: the branch, not the fragment, is
-    // what actually wins this resolution, the same as a lone
-    // `.breaking.md` on `fix/`
-    // (`breaking_fragment_on_fix_branch_resolves_to_bug`).
-    let fragment_supply = match (&fragment_supply, &breaking_fragment_path) {
-        (Some((_, WorkType::Bug)), Some(breaking_path)) => {
-            Some((breaking_path.clone(), WorkType::Prd))
-        }
-        _ => fragment_supply,
-    };
-    let fragment_all_breaking = !any_feature_fragment;
 
     let branch_supply = branch_prefix_to_work_type(branch);
 
@@ -424,10 +420,7 @@ pub fn derive_work_type(
                 let named_path = if fragment_type == WorkType::Prd {
                     fragments
                         .iter()
-                        .find(|f| {
-                            suffix_to_work_type(&f.suffix) == Some(WorkType::Prd)
-                                && f.suffix != BREAKING_SUFFIX
-                        })
+                        .find(|f| is_non_breaking_prd_fragment(f))
                         .map(|f| f.path.clone())
                         .unwrap_or(path)
                 } else {
@@ -2225,6 +2218,121 @@ mod tests {
                 );
             }
             other => panic!("expected ConflictingFragments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_then_bugfix_fragments_still_conflict_guard_regression() {
+        // Scenario: a `.feature.md` fragment appears before a `.bugfix.md`
+        // in the pairwise scan (P3-2) — this pins the `!any_feature_fragment`
+        // guard on the exemption's second disjunct. Without that guard,
+        // `first_type == Prd && work_type == Bug` alone would wrongly treat
+        // this as if it were the bugfix+breaking carve-out, even though a
+        // genuine `.feature.md` is present. Must still hard-conflict, the
+        // same as `bugfix_plus_feature_fragments_still_conflict_regression_guard`
+        // above but with the fragments in the opposite order.
+        let fragments = [
+            AddedFragment {
+                path: "changelog.d/453.feature.md".to_string(),
+                suffix: "feature".to_string(),
+            },
+            AddedFragment {
+                path: "changelog.d/453.bugfix.md".to_string(),
+                suffix: "bugfix".to_string(),
+            },
+        ];
+        let err = derive_work_type(&fragments, "fix/453-thing").expect_err(
+            "a genuine .feature.md before a .bugfix.md must still conflict, even though the \
+             pairwise types echo the bugfix+breaking exemption's shape",
+        );
+        match err {
+            WorkTypeError::ConflictingFragments { first, second } => {
+                assert_eq!(
+                    first,
+                    ("changelog.d/453.feature.md".to_string(), WorkType::Prd)
+                );
+                assert_eq!(
+                    second,
+                    ("changelog.d/453.bugfix.md".to_string(), WorkType::Bug)
+                );
+            }
+            other => panic!("expected ConflictingFragments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn breaking_then_bugfix_fragments_on_fix_branch_resolve_to_bug_production_order() {
+        // Scenario: the same `.bugfix.md` + `.breaking.md` pair as
+        // `bugfix_plus_breaking_fragments_on_fix_branch_resolve_to_bug`
+        // above, but in the order production actually sees it (P3-3):
+        // `collect_added_fragments` sorts fragments by path, and for a
+        // single issue number `changelog.d/<n>.breaking.md` sorts before
+        // `changelog.d/<n>.bugfix.md` ('r' < 'u') — this PR's own fragment
+        // pair takes exactly this order in CI. Exercises the exemption's
+        // *second* disjunct (`first_type == Prd && ... && work_type ==
+        // Bug`), not the first.
+        let fragments = [
+            AddedFragment {
+                path: "changelog.d/453.breaking.md".to_string(),
+                suffix: "breaking".to_string(),
+            },
+            AddedFragment {
+                path: "changelog.d/453.bugfix.md".to_string(),
+                suffix: "bugfix".to_string(),
+            },
+        ];
+        let derivation = derive_work_type(&fragments, "fix/453-thing").expect(
+            "a .breaking.md followed by a .bugfix.md on a fix/ branch is a breaking bug fix, \
+             not a fragment conflict",
+        );
+        assert_eq!(
+            derivation,
+            Derivation {
+                work_type: WorkType::Bug,
+                // The .bugfix.md fragment directly supplies Bug here — the
+                // branch merely agrees, so Fragment is the more honest
+                // supplier than BranchPrefix (reviewer P2-2).
+                supplier: Supplier::Fragment,
+            }
+        );
+    }
+
+    #[test]
+    fn bugfix_breaking_feature_three_fragment_permutations_all_conflict() {
+        // Scenario: a diff carries all three of `.bugfix.md`, `.breaking.md`,
+        // and `.feature.md` on a `fix/` branch — a real conflict in every
+        // ordering (P3-4), since a genuine `.feature.md` can never be
+        // exempted (`any_feature_fragment` is precomputed once over the
+        // whole set before the loop). Asserts at minimum `is_err()` across
+        // all six permutations, closing P3-2's guard as a side effect.
+        let bugfix = AddedFragment {
+            path: "changelog.d/453.bugfix.md".to_string(),
+            suffix: "bugfix".to_string(),
+        };
+        let breaking = AddedFragment {
+            path: "changelog.d/453.breaking.md".to_string(),
+            suffix: "breaking".to_string(),
+        };
+        let feature = AddedFragment {
+            path: "changelog.d/453.feature.md".to_string(),
+            suffix: "feature".to_string(),
+        };
+        let base = [bugfix, breaking, feature];
+        const ORDERS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in ORDERS {
+            let fragments: Vec<AddedFragment> = order.iter().map(|&i| base[i].clone()).collect();
+            let result = derive_work_type(&fragments, "fix/453-thing");
+            assert!(
+                result.is_err(),
+                "expected an error for fragment order {order:?}, got {result:?}"
+            );
         }
     }
 
