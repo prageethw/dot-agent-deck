@@ -34,7 +34,8 @@ use tempfile::TempDir;
 use tokio::sync::{RwLock, broadcast};
 
 use dot_agent_deck::agent_pty::{
-    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, DelegationRetirement, SilenceWatchRetirement,
+    SpawnOptions, TabMembership,
 };
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
@@ -1242,6 +1243,101 @@ fn idle_worker_013_late_first_completion_leaves_the_second_watch_armed() {
             idle_count(&snapshot),
             1,
             "exactly one of the four delegations may report; snapshot = {snapshot:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a worker whose stub process prints readiness output and then exits on its own (`sleep 1; exit 0`, never calling work-done). Once the daemon's reader thread observes the resulting PTY EOF, both the worker's outstanding idle-worker delegation and its silence watch must already be retired a short, generous grace period later — nowhere near the (here, deliberately lengthened) timeout window either watch was armed with.
+#[spec("scheduler/idle-worker/016")]
+#[test]
+fn idle_worker_016_pty_eof_retires_armed_delegation_and_silence_watch() {
+    // Issue #465 M1: `pump_reader`'s EOF branch (src/agent_pty.rs) does not
+    // yet retire any armed `OutstandingDelegation` / `SilenceWatchRecord` for
+    // the pane that just went silent. This test pins that the moment the
+    // worker's process exits without ever calling `work-done`, both records
+    // are gone promptly, not merely at the end of their own timeout window.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Deliberately far longer than the grace window this test allows after
+    // observed EOF, so a pass can only be explained by EOF-triggered
+    // retirement — never by the timeout coincidentally elapsing first.
+    let _env = EnvGuard::set(Some("8000"));
+    const WORKER_ROLE: &str = "silent-exit-worker";
+    // Deterministic stand-in per the PRD's own test-plan guidance: writes a
+    // readiness marker, holds the pane open long enough for delegate() to
+    // arm both watches, then exits cleanly with no work-done call ever made.
+    const EXIT_STUB: &str =
+        "stty -echo -icanon -icrnl -opost min 1 time 0; printf 'WORKER-READY'; sleep 1; exit 0";
+    runtime().block_on(async {
+        let harness = IdleHarness::with_workers(&[(WORKER_ROLE, EXIT_STUB)], None).await;
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+        let worker_agent_id = harness
+            .worker_agent_ids
+            .get(WORKER_ROLE)
+            .expect("worker agent id recorded at spawn")
+            .clone();
+
+        let ready = harness
+            .wait_for_snapshot_of(
+                &worker_agent_id,
+                |snapshot| snapshot.contains("WORKER-READY"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            ready.contains("WORKER-READY"),
+            "the exit-stub worker never became ready; snapshot = {ready:?}"
+        );
+
+        harness.delegate(&[WORKER_ROLE]).await;
+
+        // Fixture precondition: the worker is still alive right after both
+        // watches are armed, so the retirement asserted below is caused by
+        // the EOF the stub produces a moment later — not by the pane never
+        // having held a live agent in the first place.
+        assert!(
+            harness.registry.pane_is_live(&worker_pane_id),
+            "the worker had already exited before delegate() could arm its records, so this \
+             test would prove nothing about EOF-triggered retirement"
+        );
+
+        // The stub's own `sleep 1; exit 0` produces PTY EOF shortly after
+        // arming, with no work-done call ever made for this pane.
+        let observed_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            while harness.registry.pane_is_live(&worker_pane_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            observed_exit.is_ok(),
+            "the exit-stub worker never exited on its own, so the EOF scenario under test never \
+             occurred"
+        );
+
+        // A short, generous grace period for the daemon to react to the EOF —
+        // comfortably inside the 8s window this test armed both watches with,
+        // and nowhere near the 120-minute / 30-second production defaults
+        // issue #465 describes.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        assert!(
+            matches!(
+                harness
+                    .registry
+                    .retire_outstanding_delegation(&worker_pane_id),
+                DelegationRetirement::Nothing
+            ),
+            "the outstanding idle-worker delegation for the exited worker's pane was still \
+             armed 1s after its PTY reached EOF — pump_reader's EOF path does not yet retire it \
+             (issue #465 M1)"
+        );
+        assert!(
+            matches!(
+                harness.registry.retire_silence_watch(&worker_pane_id),
+                SilenceWatchRetirement::Nothing
+            ),
+            "the silence watch for the exited worker's pane was still armed 1s after its PTY \
+             reached EOF — pump_reader's EOF path does not yet retire it (issue #465 M1)"
         );
     });
 }

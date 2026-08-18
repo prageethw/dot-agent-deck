@@ -5322,6 +5322,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the broader idle-worker detection policy or the exact diagnostic prose, only that the production notice caller cannot reauthorize a blind probe.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/016 — A worker pane whose process exits on its own (PTY EOF), never calling work-done, has its armed idle-worker delegation AND silence watch retired promptly — not left armed for the rest of their timeout window (issue #465 M1).
+- **Layer:** fast integration; the worker is a real PTY-backed shell stub (`printf` a readiness marker, `sleep 1`, `exit 0`) — a genuine process exit, not a signalled close and not a `work-done` call.
+- **Agent:** none (deterministic exiting shell stand-in per the PRD's own test-plan guidance to start with a synthetic/stand-in case before a real-agent one).
+- **Asserts:** a fixture precondition that the worker pane is still live immediately after `delegate()` arms both the outstanding idle-worker delegation and the silence watch (so the retirement below is caused by the EOF that follows, not by the pane never having held a live agent); then, once the registry observes the pane is no longer live, that a short fixed grace period later (1s, against an 8s armed window — far short of the 120-minute/30-second production defaults) both `AgentPtyRegistry::retire_outstanding_delegation` and `AgentPtyRegistry::retire_silence_watch` report nothing left to retire for that pane, proving `pump_reader`'s EOF observation already swept both records.
+- **Does not assert:** the M2 "exited without reporting" notice text/composer, or delivery of any notice to the orchestrator pane — out of scope for M1, which covers retirement only; the idempotent late-work-done-vs-exit race (M3).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
