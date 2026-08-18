@@ -38,6 +38,8 @@ The cost is the documented failure, fork **#74**: *"a second orchestration's tas
 ### The workflow this serves
 
 1. Every orchestration starts from the deck's own checkout (`main`). **Intended** — not something to prevent.
+
+   ***Narrowed 2026-08-18, PRD fork#325 M1/M2.*** This step's "every orchestration" is no longer unconditional. Fork#325's investigation found that concurrent/automated orchestration provisioning (scheduled issue-dispatch, delegate-provisioned orchestrations) is exactly where #325's original incidents happened — an orchestration deleting another's worktree mid-use, a shallow fetch breaking merges across every worktree on the shared repo — and that scheduled issue-dispatch already runs a different, safer model in production (one clone per task name, `src/issue_dispatch_run.rs:1038`'s `provision_repo`), unreconciled with this PRD's shared-checkout model until now. Per fork#325's Decisions table, concurrent/automated orchestration work is moving toward that per-task clone isolation; **a human's own interactive TUI session against their own working checkout is unaffected and keeps this step's original behavior.** See `prds/fork-325-shared-clone-architecture.md` for the full reasoning and the implementation milestones (M3-M6) that carry this out.
 2. Each change gets **its own** worktree, created by the agent when work starts.
 3. That worktree belongs to the orchestration that created it.
 4. The orchestration can list what it owns, and works only on those.
