@@ -2090,6 +2090,96 @@ mod tests {
         }
     }
 
+    // -- `.bugfix.md` + `.breaking.md` is a breaking bug fix, not a
+    // fragment conflict (fork#453) -------------------------------------------
+    //
+    // The fork#451 carve-out above only fires once tier 1 has settled on a
+    // single fragment-supplied type — but `.bugfix.md` (`Bug`) and
+    // `.breaking.md` (`Prd`) map to *different* types, so the tier-1 loop's
+    // own pairwise comparison (`fragment_supply` vs each next fragment)
+    // raises `ConflictingFragments` before the branch-aware carve-out is
+    // ever consulted. Currently `Err`; fixed, this must resolve to `Bug`
+    // the same way a lone `.breaking.md` on a `fix/` branch already does
+    // (`breaking_fragment_on_fix_branch_resolves_to_bug` above).
+    //
+    // N-fragment note: a third fragment such as `.feature.md` alongside
+    // `.bugfix.md` + `.breaking.md` is deliberately left unpinned here.
+    // `.feature.md` is a genuine, non-breaking `Prd` fragment sitting next
+    // to a `Bug` fragment — a real conflict that must still error — but
+    // which `WorkTypeError` variant it should report, and which fragments
+    // it should name, depends on how the eventual fix restructures tier 1's
+    // pairwise loop; asserting a specific shape now would pin an
+    // implementation detail rather than an observable contract.
+
+    #[test]
+    fn bugfix_plus_breaking_fragments_on_fix_branch_resolve_to_bug() {
+        // Scenario: a diff carries both a `.bugfix.md` and a `.breaking.md`
+        // fragment on a `fix/` branch — a breaking bug fix, the same
+        // combination fork#451's carve-out already resolves for a lone
+        // `.breaking.md`. It must resolve to `Bug`, not fail as a fragment
+        // conflict.
+        let fragments = [
+            AddedFragment {
+                path: "changelog.d/453.bugfix.md".to_string(),
+                suffix: "bugfix".to_string(),
+            },
+            AddedFragment {
+                path: "changelog.d/453.breaking.md".to_string(),
+                suffix: "breaking".to_string(),
+            },
+        ];
+        let derivation = derive_work_type(&fragments, "fix/453-thing").expect(
+            "a .bugfix.md alongside a .breaking.md on a fix/ branch is a breaking bug fix, \
+             not a fragment conflict",
+        );
+        assert_eq!(
+            derivation,
+            Derivation {
+                work_type: WorkType::Bug,
+                // The branch's Bug signal is what actually resolves this,
+                // matching `breaking_fragment_on_fix_branch_resolves_to_bug`.
+                supplier: Supplier::BranchPrefix,
+            }
+        );
+    }
+
+    #[test]
+    fn bugfix_plus_feature_fragments_still_conflict_regression_guard() {
+        // Scenario: a diff carries a `.bugfix.md` and a `.feature.md`
+        // fragment — a real two-type conflict, not the breaking-specific
+        // carve-out fork#453 introduces. This must keep failing with
+        // `ConflictingFragments` once that carve-out lands, proving the fix
+        // does not overcorrect into accepting every fragment-type
+        // disagreement.
+        let fragments = [
+            AddedFragment {
+                path: "changelog.d/453.bugfix.md".to_string(),
+                suffix: "bugfix".to_string(),
+            },
+            AddedFragment {
+                path: "changelog.d/453.feature.md".to_string(),
+                suffix: "feature".to_string(),
+            },
+        ];
+        let err = derive_work_type(&fragments, "fix/453-thing").expect_err(
+            "a genuine .feature.md alongside a .bugfix.md must still conflict — this is not \
+             the breaking-specific carve-out",
+        );
+        match err {
+            WorkTypeError::ConflictingFragments { first, second } => {
+                assert_eq!(
+                    first,
+                    ("changelog.d/453.bugfix.md".to_string(), WorkType::Bug)
+                );
+                assert_eq!(
+                    second,
+                    ("changelog.d/453.feature.md".to_string(), WorkType::Prd)
+                );
+            }
+            other => panic!("expected ConflictingFragments, got {other:?}"),
+        }
+    }
+
     // -- The base-ref guard (E1) ---------------------------------------------
 
     #[test]
