@@ -3328,24 +3328,54 @@ async fn dispatch_one_owned(
     // subscriber `init_logging_from_env` installs solely when
     // `DOT_AGENT_DECK_LOG` is set — a delegated task lost with nothing on the
     // card to say so, which is the shape of issue #424 itself.
-    let outcome = registry
-        .write_and_submit_guarded_detailed(
-            &pane_id,
-            &one_liner,
-            expected_worker_agent_id.as_deref(),
-            || async move {
-                if revalidate_registry.is_pane_closing(&revalidate_pane) {
-                    return false;
-                }
-                orchestration_still_matches(
-                    expected_orchestration.as_ref(),
-                    revalidate_registry
-                        .pane_orchestration(&revalidate_pane)
-                        .as_ref(),
-                )
-            },
-        )
-        .await;
+    //
+    // Issue #465 F2/F3 (fixing #465 F3's own test 019): `expected_worker_agent_id`
+    // is only ever `None` here for the non-`clear = true` path, whose fallback
+    // resolution above (`registry.pane_current_agent_id(&pane_id)`) can observe
+    // the pane in the exact gap `respawn_agent_for_pane` opens between removing
+    // the OLD agent and installing the new one — a respawn driven by some OTHER
+    // concurrent caller of that primitive, not this dispatch's own (a `clear =
+    // true` respawn always resolves `expected_worker_agent_id` to its own fresh
+    // `new_agent_id` above, never `None`). Calling
+    // `write_and_submit_guarded_detailed` with `expected_agent_id = None` in that
+    // gap is NOT a safe no-op: its pre-lock identity gate only compares
+    // `expected` against the pane's current owner when `expected` is `Some` — so
+    // `None` skips the gate entirely and the call falls through as an UNGUARDED
+    // write to whoever occupies the pane by the time the writer lock is
+    // acquired (plausibly the respawn's fresh agent by then), defeating the
+    // exact guarantee PRD #249 finding B1 built this call to enforce. Treat an
+    // unresolved identity as "no verified target" and never attempt the write.
+    let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
+        registry
+            .write_and_submit_guarded_detailed(
+                &pane_id,
+                &one_liner,
+                Some(worker_agent_id),
+                || async move {
+                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    orchestration_still_matches(
+                        expected_orchestration.as_ref(),
+                        revalidate_registry
+                            .pane_orchestration(&revalidate_pane)
+                            .as_ref(),
+                    )
+                },
+            )
+            .await
+    } else {
+        tracing::debug!(
+            pane_id = %pane_id,
+            role = %target_role,
+            "delegate: worker identity could not be resolved (a concurrent respawn of this \
+             pane is plausible); refusing to write the task pointer unguarded rather than to \
+             whoever currently owns the pane"
+        );
+        Ok(GuardedSendDetail::Outcome(
+            crate::agent_pty::GuardedSend::NoLiveTarget,
+        ))
+    };
     let delivered = match outcome {
         // `Ambiguous` is a partial write: some bytes reached the authorized
         // worker, so the delegate may or may not have landed — exactly the
@@ -3420,15 +3450,34 @@ async fn dispatch_one_owned(
     // Nothing was delivered, so there is nothing to be silent about: disarm the
     // record we registered before the write rather than leaving it to be swept
     // by the next delegate or close.
+    //
+    // Issue #465 F2/F3: EXCEPT when the identity gate above never got a target
+    // to write to in the first place (`expected_worker_agent_id` was `None`).
+    // That is not "the delegate failed" — the write was refused UNGUARDED
+    // precisely because a concurrent respawn of this pane may be in flight (see
+    // the comment on `outcome`'s resolution above) — and cancelling here would
+    // reintroduce, from this side of the write, the exact same defeat of issue
+    // #465 F3's "an outstanding delegation/silence watch carries forward across
+    // a respawn" contract that binding the record's identity was meant to
+    // prevent from the EOF-sweep side. Leave the record ARMED — present but
+    // unbound and with no watch task spawned below — so it still exists to be
+    // superseded, closed, or retired by whatever inherits the pane, exactly as
+    // an unbound `OutstandingDelegation` is already left alone rather than
+    // drained by a stranger's exit.
     if !delivered {
-        registry.cancel_silence_watch_if(&pane_id, armed.seq);
+        if expected_worker_agent_id.is_some() {
+            registry.cancel_silence_watch_if(&pane_id, armed.seq);
+        }
         return;
     }
     let Some(worker_agent_id) = expected_worker_agent_id else {
-        // Unreachable in practice: with no live agent on the pane the guarded
-        // send returns `NoLiveTarget` and `delivered` is false. Belt and braces —
-        // an unbound watch could not tell this worker's events from a
-        // successor's (review finding S1), so it must not be armed.
+        // Unreachable: `delivered` is `true` only when `outcome` came from an
+        // actual `write_and_submit_guarded_detailed` call, which only happens
+        // above when `expected_worker_agent_id` is `Some` — the `None` arm
+        // resolves a fixed `NoLiveTarget` outcome, which is never a `delivered`
+        // variant in the match above. Belt and braces — an unbound watch could
+        // not tell this worker's events from a successor's (review finding S1),
+        // so it must not be armed.
         registry.cancel_silence_watch_if(&pane_id, armed.seq);
         return;
     };

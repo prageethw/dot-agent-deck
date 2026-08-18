@@ -1058,6 +1058,81 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
     });
 }
 
+/// Spawn a successor agent that inherits the freed [`ORCH_PANE`] id and wait for
+/// its own readiness marker, then confirm it became ready before the
+/// delegation's own deadline could have expired — so a later "the daemon wrote
+/// nothing into the successor" assertion isn't vacuously true because nobody
+/// was there yet to receive a stray write. Returns the successor's registry
+/// agent id. Shared by `idle_worker_014`/`idle_worker_018`; flagged by
+/// SonarCloud as new-code duplication between the two.
+async fn spawn_successor_and_confirm_ready_before_deadline(
+    harness: &IdleHarness,
+    delegated_at: tokio::time::Instant,
+    timeout: Duration,
+) -> String {
+    let successor = spawn_raw_cat_observer(
+        &harness.registry,
+        ORCH_PANE,
+        "SUCCESSOR-READY",
+        &harness.cwd_str(),
+    );
+    let ready = harness
+        .wait_for_snapshot_of(
+            &successor,
+            |snapshot| snapshot.contains("SUCCESSOR-READY"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        ready.contains("SUCCESSOR-READY"),
+        "the successor agent never became ready, so it could not have observed a stray \
+         submit either; snapshot = {ready:?}"
+    );
+    assert!(
+        tokio::time::Instant::now() < delegated_at + timeout,
+        "the successor only took the pane AFTER the delegation's deadline had already \
+         passed, so the timer had nobody to mis-deliver to and this test would pass for the \
+         wrong reason: it became ready {:?} after the delegate (timeout {timeout:?})",
+        tokio::time::Instant::now() - delegated_at
+    );
+    successor
+}
+
+/// After [`spawn_successor_and_confirm_ready_before_deadline`], wait out two
+/// further timeout windows and confirm the successor's PTY still holds nothing
+/// but its own readiness marker — no idle prompt, and no fragment naming
+/// `absent_role_needle`. `pane_id_reuse_context` fills in the idle-prompt
+/// assertion's own failure message, since each caller covers a different "the
+/// entry vanished without a sweep running" path. Shared by
+/// `idle_worker_014`/`idle_worker_018`; flagged by SonarCloud as new-code
+/// duplication between the two.
+async fn assert_successor_snapshot_stays_clean(
+    harness: &IdleHarness,
+    successor: &str,
+    timeout: Duration,
+    absent_role_needle: &str,
+    pane_id_reuse_context: &str,
+) {
+    tokio::time::sleep(timeout * 2).await;
+    let snapshot = harness.snapshot_of(successor);
+    assert!(
+        snapshot.contains("SUCCESSOR-READY"),
+        "the successor's own output vanished, so absence below proves nothing; \
+         snapshot = {snapshot:?}"
+    );
+    assert_eq!(
+        idle_count(&snapshot),
+        0,
+        "the dead orchestration's idle prompt was auto-submitted into an unrelated agent that \
+         merely inherited the pane id of {pane_id_reuse_context}; snapshot = {snapshot:?}"
+    );
+    assert!(
+        !snapshot.contains(absent_role_needle),
+        "no fragment of the dead orchestration's delegation may reach the successor; \
+         snapshot = {snapshot:?}"
+    );
+}
+
 /// Scenario: Delegate to a silent worker, then let the ORCHESTRATOR's own process end — no StopAgent, so no close-transition sweep runs. Issue #465's EOF sweep retires the worker's record anyway (the exiting orchestrator's own registry entry lingers, still `contains_key`-registered, until this same reader thread observes EOF) — this test pins THAT retirement, not the identity gate `scheduler/idle-worker/018` now covers. A brand-new unrelated agent still inherits the freed orchestrator pane id before the deadline, and after two further timeout windows its PTY must still hold nothing but its own readiness marker.
 #[spec("scheduler/idle-worker/014")]
 #[test]
@@ -1089,31 +1164,9 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
 
         // An unrelated agent takes the freed pane id, as any fresh spawn
         // reusing a recycled `pane_id_env` would.
-        let successor = spawn_raw_cat_observer(
-            &harness.registry,
-            ORCH_PANE,
-            "SUCCESSOR-READY",
-            &harness.cwd_str(),
-        );
-        let ready = harness
-            .wait_for_snapshot_of(
-                &successor,
-                |snapshot| snapshot.contains("SUCCESSOR-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            ready.contains("SUCCESSOR-READY"),
-            "the successor agent never became ready, so it could not have observed a stray \
-             submit either; snapshot = {ready:?}"
-        );
-        assert!(
-            tokio::time::Instant::now() < delegated_at + timeout,
-            "the successor only took the pane AFTER the delegation's deadline had already \
-             passed, so the timer had nobody to mis-deliver to and this test would pass for the \
-             wrong reason: it became ready {:?} after the delegate (timeout {timeout:?})",
-            tokio::time::Instant::now() - delegated_at
-        );
+        let successor =
+            spawn_successor_and_confirm_ready_before_deadline(&harness, delegated_at, timeout)
+                .await;
 
         // Issue #465 F1 review: prove the EOF sweep is what retires the
         // worker's record, so the `idle_count == 0` below is not vacuously
@@ -1140,25 +1193,14 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
 
         // Two further timeout windows: the deadline passes while the successor
         // owns the pane and is fully observable.
-        tokio::time::sleep(timeout * 2).await;
-        let snapshot = harness.snapshot_of(&successor);
-        assert!(
-            snapshot.contains("SUCCESSOR-READY"),
-            "the successor's own output vanished, so absence below proves nothing; \
-             snapshot = {snapshot:?}"
-        );
-        assert_eq!(
-            idle_count(&snapshot),
-            0,
-            "the dead orchestration's idle prompt was auto-submitted into an unrelated agent \
-             that merely inherited the pane id of an orchestrator which exited on its own; \
-             snapshot = {snapshot:?}"
-        );
-        assert!(
-            !snapshot.contains("orphaned-worker"),
-            "no fragment of the dead orchestration's delegation may reach the successor; \
-             snapshot = {snapshot:?}"
-        );
+        assert_successor_snapshot_stays_clean(
+            &harness,
+            &successor,
+            timeout,
+            "orphaned-worker",
+            "an orchestrator which exited on its own",
+        )
+        .await;
     });
 }
 
@@ -1197,53 +1239,20 @@ fn idle_worker_018_registry_entry_removed_without_any_sweep_receives_nothing() {
 
         // An unrelated agent takes the freed pane id, as any fresh spawn
         // reusing a recycled `pane_id_env` would.
-        let successor = spawn_raw_cat_observer(
-            &harness.registry,
-            ORCH_PANE,
-            "SUCCESSOR-READY",
-            &harness.cwd_str(),
-        );
-        let ready = harness
-            .wait_for_snapshot_of(
-                &successor,
-                |snapshot| snapshot.contains("SUCCESSOR-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            ready.contains("SUCCESSOR-READY"),
-            "the successor agent never became ready, so it could not have observed a stray \
-             submit either; snapshot = {ready:?}"
-        );
-        assert!(
-            tokio::time::Instant::now() < delegated_at + timeout,
-            "the successor only took the pane AFTER the delegation's deadline had already \
-             passed, so the timer had nobody to mis-deliver to and this test would pass for the \
-             wrong reason: it became ready {:?} after the delegate (timeout {timeout:?})",
-            tokio::time::Instant::now() - delegated_at
-        );
+        let successor =
+            spawn_successor_and_confirm_ready_before_deadline(&harness, delegated_at, timeout)
+                .await;
 
         // Two further timeout windows: the deadline passes while the successor
         // owns the pane and is fully observable.
-        tokio::time::sleep(timeout * 2).await;
-        let snapshot = harness.snapshot_of(&successor);
-        assert!(
-            snapshot.contains("SUCCESSOR-READY"),
-            "the successor's own output vanished, so absence below proves nothing; \
-             snapshot = {snapshot:?}"
-        );
-        assert_eq!(
-            idle_count(&snapshot),
-            0,
-            "the dead orchestration's idle prompt was auto-submitted into an unrelated agent \
-             that merely inherited the pane id of a directly-removed orchestrator entry; \
-             snapshot = {snapshot:?}"
-        );
-        assert!(
-            !snapshot.contains("orphaned-worker"),
-            "no fragment of the dead orchestration's delegation may reach the successor; \
-             snapshot = {snapshot:?}"
-        );
+        assert_successor_snapshot_stays_clean(
+            &harness,
+            &successor,
+            timeout,
+            "orphaned-worker",
+            "a directly-removed orchestrator entry",
+        )
+        .await;
     });
 }
 
