@@ -2144,13 +2144,12 @@ mod tests {
     // (`breaking_fragment_on_fix_branch_resolves_to_bug` above).
     //
     // N-fragment note: a third fragment such as `.feature.md` alongside
-    // `.bugfix.md` + `.breaking.md` is deliberately left unpinned here.
-    // `.feature.md` is a genuine, non-breaking `Prd` fragment sitting next
-    // to a `Bug` fragment — a real conflict that must still error — but
-    // which `WorkTypeError` variant it should report, and which fragments
-    // it should name, depends on how the eventual fix restructures tier 1's
-    // pairwise loop; asserting a specific shape now would pin an
-    // implementation detail rather than an observable contract.
+    // `.bugfix.md` + `.breaking.md` is pinned below by
+    // `bugfix_breaking_feature_three_fragment_permutations_all_conflict`,
+    // which asserts `is_err()` across all six orderings rather than a
+    // specific `WorkTypeError` shape — a genuine `.feature.md` can never be
+    // exempted, but which variant/fields it reports is still an
+    // implementation detail not worth pinning further.
 
     #[test]
     fn bugfix_plus_breaking_fragments_on_fix_branch_resolve_to_bug() {
@@ -2177,9 +2176,10 @@ mod tests {
             derivation,
             Derivation {
                 work_type: WorkType::Bug,
-                // The branch's Bug signal is what actually resolves this,
-                // matching `breaking_fragment_on_fix_branch_resolves_to_bug`.
-                supplier: Supplier::BranchPrefix,
+                // The .bugfix.md fragment directly supplies Bug here — the
+                // branch merely agrees, so Fragment is the more honest
+                // supplier than BranchPrefix (reviewer P2-2).
+                supplier: Supplier::Fragment,
             }
         );
     }
