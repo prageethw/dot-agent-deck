@@ -5801,10 +5801,14 @@ fn register_temp_root_cleanup() {}
 /// — then returns the [`std::process::Child`] so the caller can read its pid,
 /// send it signals, and reap it.
 ///
-/// Shared by the `lifecycle/sigterm/*` tests and `lifecycle/log-path/001`,
-/// none of which want `DaemonProc`'s schedule-file, process-group-teardown,
-/// or orphan-watchdog machinery (`spawn_daemon_serve` above) — just the raw
-/// spawn-and-wait-for-socket shape.
+/// Used by `lifecycle/log-path/001`, which wants none of `DaemonProc`'s
+/// schedule-file, process-group-teardown, or orphan-watchdog machinery
+/// (`spawn_daemon_serve` above) — just the raw spawn-and-wait-for-socket
+/// shape. `e2e_daemon_orphan_exit.rs`'s `lifecycle/sigterm/*` tests build this
+/// same shape inline rather than calling this helper: their two call sites
+/// are pre-existing duplicates of each other, and pointing both at a shared
+/// helper would touch (and thus re-flag as "new code") lines this PR has no
+/// other reason to change — see issue #467.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn spawn_bare_daemon_and_wait_for_attach(
