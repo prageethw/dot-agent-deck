@@ -1549,7 +1549,8 @@ pub(crate) async fn create_worktree(
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
         AddOutcome::TimedOut => {
-            let cleaned_up_by = attempt_worktree_cleanup_async(clone_dir, worktree_dir, creator).await;
+            let cleaned_up_by =
+                attempt_worktree_cleanup_async(clone_dir, worktree_dir, creator).await;
             WorktreeCreation::TimedOut { cleaned_up_by }
         }
     })
