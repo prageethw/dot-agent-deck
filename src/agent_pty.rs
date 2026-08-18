@@ -9609,6 +9609,74 @@ mod spawn_tests {
         reg.shutdown_all();
     }
 
+    /// Issue #465 auditor confirmation, finding M1: pin the PRIMITIVE's
+    /// documented-permissive `None` behavior as an asserted fact, not merely a
+    /// reader's inference from the source. `write_guarded`'s pre-lock identity
+    /// gate (`if !is_paneless && let Some(expected) = expected_agent_id && ...`)
+    /// only compares identities when `expected_agent_id` is `Some` — passing
+    /// `None` skips the gate entirely, and the call proceeds as an UNGUARDED
+    /// write to whoever currently owns the pane. That is correct at THIS layer:
+    /// the primitive is generic, and it is every caller's job never to pass
+    /// `None` when it needs verified delivery — `dispatch_one_owned`'s own
+    /// refusal (`dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`
+    /// in `state.rs`) is exactly that caller-side responsibility. Without this
+    /// test, a future reader would have to re-derive the permissive semantics
+    /// from the gate's `if let` shape rather than finding them asserted.
+    #[tokio::test]
+    async fn guarded_send_with_no_expected_identity_writes_to_the_live_pane() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        reg.spawn_agent(SpawnOptions {
+            command: Some("/bin/sh"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "pane-no-expected-identity".to_string(),
+            )],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn agent");
+
+        let outcome = reg
+            .write_and_submit_guarded_detailed(
+                "pane-no-expected-identity",
+                "echo none-identity-permissive-marker",
+                None,
+                || async { true },
+            )
+            .await
+            .expect("guarded send result");
+        assert_eq!(
+            outcome,
+            GuardedSendDetail::Outcome(GuardedSend::Applied),
+            "a None expected identity must not be refused by the primitive — it is the \
+             caller's job to withhold None when it wants verification"
+        );
+
+        // Confirm bytes actually reached the live pane, not merely that the
+        // outcome claims `Applied`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let snap = reg
+                .snapshot("pane-no-expected-identity")
+                .unwrap_or_default();
+            if snap
+                .windows(b"none-identity-permissive-marker".len())
+                .any(|w| w == b"none-identity-permissive-marker")
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "the guarded primitive must have written the payload into the live pane when \
+             expected_agent_id was None"
+        );
+
+        reg.shutdown_all();
+    }
+
     #[test]
     fn delivery_ledger_lru_touch_and_forget() {
         let mut ledger = DeliveryLedger::default();

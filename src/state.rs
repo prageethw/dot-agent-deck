@@ -3332,18 +3332,25 @@ async fn dispatch_one_owned(
     // Issue #465 F2/F3 (fixing #465 F3's own test 019): `expected_worker_agent_id`
     // is only ever `None` here for the non-`clear = true` path, whose fallback
     // resolution above (`registry.pane_current_agent_id(&pane_id)`) can observe
-    // the pane in the exact gap `respawn_agent_for_pane` opens between removing
-    // the OLD agent and installing the new one — a respawn driven by some OTHER
-    // concurrent caller of that primitive, not this dispatch's own (a `clear =
-    // true` respawn always resolves `expected_worker_agent_id` to its own fresh
-    // `new_agent_id` above, never `None`). Calling
-    // `write_and_submit_guarded_detailed` with `expected_agent_id = None` in that
-    // gap is NOT a safe no-op: its pre-lock identity gate only compares
-    // `expected` against the pane's current owner when `expected` is `Some` — so
-    // `None` skips the gate entirely and the call falls through as an UNGUARDED
-    // write to whoever occupies the pane by the time the writer lock is
-    // acquired (plausibly the respawn's fresh agent by then), defeating the
-    // exact guarantee PRD #249 finding B1 built this call to enforce. Treat an
+    // the pane in a gap opened by pane-id REUSE: the worker's agent exits or is
+    // closed (`close_agent`, a crash, a natural process exit), freeing its
+    // `pane_id_env`, and a brand-new, unrelated agent then inherits that same
+    // pane id before this dispatch reaches its write — `idle_worker_014`/`_018`
+    // (`tests/idle_worker_detector.rs`) demonstrate this reuse is real and fast
+    // enough to matter. It is NOT a concurrent respawn of THIS pane racing this
+    // dispatch: `dispatch_one_owned` is the only production caller of
+    // `respawn_agent_for_pane`, and it runs under `registry.pane_dispatch_lock`,
+    // which serializes every dispatch on a pane (a `clear = true` respawn always
+    // resolves `expected_worker_agent_id` to its own fresh `new_agent_id` above,
+    // never `None`). Calling `write_and_submit_guarded_detailed` with
+    // `expected_agent_id = None` in that gap is NOT a safe no-op: its pre-lock
+    // identity gate only compares `expected` against the pane's current owner
+    // when `expected` is `Some` — so `None` skips the gate entirely and the call
+    // falls through as an UNGUARDED write to whoever owns the pane at
+    // `write_guarded`'s own ENTRY-TIME resolution (not at the moment the writer
+    // lock is later acquired — a rebind between entry and the writer lock is
+    // still caught by the post-lock re-validation), defeating the exact
+    // guarantee PRD #249 finding B1 built this call to enforce. Treat an
     // unresolved identity as "no verified target" and never attempt the write.
     let outcome = if let Some(worker_agent_id) = expected_worker_agent_id.as_deref() {
         registry
@@ -7111,6 +7118,95 @@ clear = false
             resp.unresolved_roles,
             vec!["tester".to_string()],
             "the tester resolved to no pane and must be named as unresolved"
+        );
+    }
+
+    /// Issue #465 auditor confirmation, finding M1: pin `dispatch_one_owned`'s
+    /// OWN refusal — the fix itself, at `src/state.rs:3348-3377` — not merely the
+    /// primitive's permissive-on-`None` default pinned from the other side by
+    /// `guarded_send_with_no_expected_identity_writes_to_the_live_pane` in
+    /// `agent_pty.rs`. When the worker identity cannot be resolved (no live
+    /// agent owns the pane, and no `clear = true` respawn ran to mint one),
+    /// `dispatch_one_owned` must take the `else` arm and synthesize
+    /// `GuardedSend::NoLiveTarget` itself — WITHOUT ever calling
+    /// `AgentPtyRegistry::write_and_submit_guarded_detailed` and handing the
+    /// permissive primitive a bare `None`.
+    ///
+    /// A regression that "simplified" the `if let Some(worker_agent_id) = ...
+    /// else { .. }` guard back to calling the primitive with
+    /// `expected_worker_agent_id.as_deref()` straight through would reach the
+    /// SAME final `NoLiveTarget`-shaped outcome in this no-agent scenario —
+    /// there is nothing to write to either way — so the outcome alone cannot
+    /// tell "refused before calling the primitive" apart from "called the
+    /// primitive, which itself found nothing". Only the `else` arm's own
+    /// `tracing::debug!` distinguishes the two, so this test captures the real
+    /// log output through a genuine `tracing` subscriber rather than inferring
+    /// it, and a rewording of that line fails the test loudly instead of
+    /// silently losing coverage of which branch ran.
+    #[tokio::test]
+    async fn dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // A registry with no agent ever spawned onto this pane: the ordinary,
+        // non-racy production shape of "identity unresolved". `cwd: None` makes
+        // the `(cwd.as_deref(), orchestration.as_ref())` role lookup miss (so no
+        // `clear = true` respawn is attempted), and the `pane_current_agent_id`
+        // fallback then finds no live agent either — exactly the same "role
+        // config went missing" shape `dispatch_one_owned`'s own `warn!` guards
+        // against when `cwd`/`orchestration` ARE present, minus that unrelated
+        // log line.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            None,
+            "orch-pane".to_string(),
+            "worker-role".to_string(),
+            "worker-pane-no-agent".to_string(),
+            "probe task".to_string(),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        drop(subscriber_guard);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        assert!(
+            log.contains("delegate: worker identity could not be resolved"),
+            "dispatch_one_owned must take the else arm and refuse the write itself, rather \
+             than ever handing the primitive a bare None; captured log = {log:?}"
         );
     }
 
