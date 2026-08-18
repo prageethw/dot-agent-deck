@@ -1253,6 +1253,33 @@ pub(crate) enum IsolatedCloneOutcome {
 /// than left in place: a later `git push origin` then fails loudly ("no such
 /// remote") instead of silently landing in the source checkout, which is the
 /// same risk either way and the whole reason this needed fixing at all.
+///
+/// PRD fork#325 fix round 2 (reviewer P1, P2-A, P2-B, P2-C): four follow-up
+/// fixes to the above, one of which taught the others their exact ordering.
+/// The origin fixup used to run entirely AFTER the checkout, so a checkout
+/// failure left this variant's own hazard — the local-path `origin` — in
+/// place with no cleanup at all (P1); the checkout now gets the same
+/// timeout/failure cleanup the clone step already had, and a `Failed` clone
+/// or checkout with `clone_dir` present is no longer misreported as
+/// `AlreadyClaimed` (P2-B — see [`handle_isolated_clone_add_error`], which
+/// now covers both steps). The origin fixup's own two `git remote` calls no
+/// longer discard their result silently (P2-C — see
+/// [`point_isolated_clone_origin`] / [`remove_isolated_clone_origin_default`]).
+///
+/// The SET-URL half of the origin fixup was moved earlier, before the
+/// branch probe/checkout, exactly as P1 wants. The REMOVE half (source has
+/// no origin) was deliberately NOT moved there too, even though it is "the
+/// same fixup" conceptually: `git remote remove` deletes
+/// `refs/remotes/origin/*`, not just the remote's config, and P2-A's
+/// widened branch probe (below) needs exactly those refs to still be
+/// present at probe/checkout time for a branch that only exists on the
+/// source as a remote-tracking ref in this fresh clone. Moving the removal
+/// early was tried and broke P2-A outright — a branch that exists only as
+/// `refs/remotes/origin/<b>` again became unattachable, in precisely the
+/// "no origin configured" shape the `orch-clone-gate` fixture represents —
+/// caught by `provision_isolated_clone_sync_attaches_branch_that_exists_only_as_remote_tracking_ref`
+/// failing in CI. So the removal runs where round 1 ran it, after a
+/// successful checkout; only the set-url half moved.
 pub(crate) fn provision_isolated_clone_sync(
     source_dir: &Path,
     clone_dir: &Path,
@@ -1305,22 +1332,45 @@ pub(crate) fn provision_isolated_clone_sync(
         return handle_isolated_clone_add_error(err, clone_dir, creator);
     }
 
-    // Issue #325 reviewer P1 (fix round 2): the origin fixup now runs
-    // IMMEDIATELY after the clone succeeds, before the branch probe and the
-    // checkout — nothing about it depends on the branch. Round 1 ran this
+    // Issue #325 reviewer P1 (fix round 2): read the source's own origin URL
+    // now — a pure, side-effect-free read — and, when the source HAS an
+    // origin, point the clone's `origin` at it IMMEDIATELY, before the
+    // branch probe and the checkout. Round 1 ran the whole origin fixup
     // AFTER the checkout, so a checkout failure (or a WORKTREE_GIT_TIMEOUT
     // kill mid-checkout) left a fully populated, valid-looking clone, on the
     // source's HEAD branch, with the dangerous local-path `origin` a plain
     // `git clone` sets up still in place — P1-1's exact hazard, reinstated
-    // one step later in this same function. Running it first means no later
-    // failure in this function can leave that behind.
+    // one step later in this same function. Doing the set-url this early
+    // means no later failure in this function can leave that behind, and
+    // (P2-A, below) `set-url` never touches `refs/remotes/origin/*`, so
+    // moving it here is free.
+    //
+    // When the source has NO origin, the fixup is a REMOVAL rather than a
+    // repoint — and `git remote remove` deletes `refs/remotes/origin/*`
+    // along with it (verified: it is not merely a config change). Removing
+    // it THIS early would destroy the very `refs/remotes/origin/<branch>`
+    // ref the widened probe below (and `git checkout`'s own DWIM attach)
+    // need for a branch that exists on the source only as a remote-tracking
+    // ref in this fresh clone — silently reintroducing P2-A while fixing
+    // P1. So for this branch alone, the removal is deferred until AFTER a
+    // successful checkout (see the two-part `let source_origin` handling
+    // below). A checkout failure in between still can't leave the
+    // dangerous default behind in practice: it now routes through
+    // `handle_isolated_clone_add_error`, which removes the WHOLE directory
+    // (config and all) rather than leaving it partially fixed up — the
+    // residual risk is only that `remove_dir_all` itself fails, the same
+    // low-probability case P3-E already accepts for this path.
     //
     // `git remote get-url`/`set-url`/`remove` are cheap local metadata reads
     // with no network I/O — the same class of call `git_common_dir` already
     // runs unbounded on this synchronous path (fork issue #388) — so this
     // deliberately does not add its own `WORKTREE_GIT_TIMEOUT`-bounded
     // subprocess plumbing for a one-line `Command::output()`.
-    let origin_warning = fixup_isolated_clone_origin(source_dir, clone_dir);
+    let source_origin = read_source_origin_url(source_dir);
+    let mut origin_warning = None;
+    if let Some(url) = source_origin.as_deref() {
+        origin_warning = point_isolated_clone_origin(clone_dir, url);
+    }
 
     // Issue #325 reviewer P2-A: `worktree_branch_probe_argv` alone (probing
     // only `refs/heads/<branch>`) is correct for the shared-checkout arm,
@@ -1336,10 +1386,9 @@ pub(crate) fn provision_isolated_clone_sync(
     // either probe succeeding is enough to use the attach form, since git's
     // own checkout DWIM resolves a plain branch name against a
     // remote-tracking ref of the same name and sets up tracking correctly.
-    //
-    // Ordering matters: this must run after the origin fixup above, since
-    // the attach form sets `branch.<b>.remote=origin`, which is only
-    // correct once `origin` genuinely points at the real remote.
+    // These refs are intact at this point in BOTH origin-fixup branches: the
+    // set-url case never touched them, and the remove case is deferred past
+    // this point (see above).
     let branch_exists = run_status_sync(
         "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
@@ -1362,11 +1411,19 @@ pub(crate) fn provision_isolated_clone_sync(
         // cleanup-and-recovery treatment the clone step already has (via
         // `handle_isolated_clone_add_error`), rather than the plain `Err`
         // return round 1 left it with — that returned before this point
-        // with no cleanup, and (compounded by the origin fixup used to run
-        // AFTER this step) left the hazard above in place. It also
-        // permanently wedged the slug: every retry saw `clone_dir.exists()`
-        // and reported "clone already exists", naming no recovery command.
+        // with no cleanup. It also permanently wedged the slug: every retry
+        // saw `clone_dir.exists()` and reported "clone already exists",
+        // naming no recovery command.
         return handle_isolated_clone_add_error(err, clone_dir, creator);
+    }
+
+    if source_origin.is_none() {
+        // Only now, after checkout has succeeded and nothing downstream
+        // still needs `refs/remotes/origin/*`, remove the clone's default
+        // local-path origin (reviewer P1-1's other branch — see the long
+        // comment above for why this is deferred rather than run
+        // immediately after the clone).
+        origin_warning = remove_isolated_clone_origin_default(clone_dir);
     }
 
     let marker_warning = mark_worktree_owned_best_effort(clone_dir, creator);
@@ -1418,69 +1475,93 @@ fn handle_isolated_clone_add_error(
     }
 }
 
-/// Point a freshly cloned `clone_dir`'s `origin` at `source_dir`'s own
-/// origin URL instead of the local filesystem path `git clone` defaults it
-/// to (reviewer P1-1) — or, when `source_dir` has no origin configured
-/// itself, remove the clone's default local-path `origin` entirely rather
-/// than leave a push able to land there silently (same risk either way; see
-/// `provision_isolated_clone_sync`'s doc comment for the full reasoning and
-/// the reviewer's verification of both branches).
-///
-/// PRD fork#325 fix round 2 (reviewer P2-C): both `git remote` calls used to
-/// discard their result with `let _ = …` — if either failed, the clone
-/// silently kept the dangerous local-path `origin`, P1-1's exact condition,
-/// with no record anywhere. Returns `Some(warning)` on failure instead, so
-/// the caller can surface it through the same `marker_warning` channel
-/// [`mark_worktree_owned_best_effort`] already uses for a failed ownership-
-/// marker write — this is at least as safety-critical as that.
-///
-/// The `--` end-of-options separator on the `set-url` call (matching
-/// auditor A2's hardening of the `git clone` argv above) guards against a
-/// source origin URL beginning with `-` being read as an option; `remove`
-/// takes no attacker-influenced argument, so it needs none.
-fn fixup_isolated_clone_origin(source_dir: &Path, clone_dir: &Path) -> Option<String> {
-    let source_origin = std::process::Command::new("git")
+/// Read `source_dir`'s own `origin` URL, if it has one — a pure,
+/// side-effect-free lookup, safe to call at any point in
+/// [`provision_isolated_clone_sync`] regardless of clone/checkout state
+/// (PRD fork#325 fix round 2, reviewer P1-1). `None` covers both "no
+/// `origin` remote configured" and "configured but empty", which
+/// [`provision_isolated_clone_sync`] treats identically: nothing better to
+/// point the clone's `origin` at.
+fn read_source_origin_url(source_dir: &Path) -> Option<String> {
+    std::process::Command::new("git")
         .current_dir(source_dir)
         .args(["remote", "get-url", "origin"])
         .output()
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|url| !url.is_empty());
-    match source_origin {
-        Some(url) => match std::process::Command::new("git")
-            .current_dir(clone_dir)
-            .args(["remote", "set-url", "--", "origin", &url])
-            .output()
-        {
-            Ok(out) if out.status.success() => None,
-            Ok(out) => Some(format!(
-                "failed to point the clone's origin at the source's own origin ({url}): {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
-            Err(e) => Some(format!(
-                "failed to point the clone's origin at the source's own origin ({url}): {e}"
-            )),
-        },
-        None => {
-            // `source_dir` itself has no origin — nothing better to point
-            // at. Remove the local-path origin `git clone` set up rather
-            // than leave a push able to land there silently.
-            match std::process::Command::new("git")
-                .current_dir(clone_dir)
-                .args(["remote", "remove", "origin"])
-                .output()
-            {
-                Ok(out) if out.status.success() => None,
-                Ok(out) => Some(format!(
-                    "failed to remove the clone's default local-path origin: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Err(e) => Some(format!(
-                    "failed to remove the clone's default local-path origin: {e}"
-                )),
-            }
-        }
+        .filter(|url| !url.is_empty())
+}
+
+/// Point a freshly cloned `clone_dir`'s `origin` at `url` — `source_dir`'s
+/// own origin URL — instead of the local filesystem path `git clone`
+/// defaults it to (reviewer P1-1). Never touches `refs/remotes/origin/*`
+/// (only the remote's config entry), so it is safe to call before the
+/// branch probe/checkout — see `provision_isolated_clone_sync`'s doc
+/// comment for why that placement matters and why the OTHER branch
+/// ([`remove_isolated_clone_origin_default`]) cannot be called at the same
+/// point.
+///
+/// PRD fork#325 fix round 2 (reviewer P2-C): this call used to discard its
+/// result with `let _ = …` — if it failed, the clone silently kept the
+/// dangerous local-path `origin`, P1-1's exact condition, with no record
+/// anywhere. Returns `Some(warning)` on failure instead, so the caller can
+/// surface it through the same `marker_warning` channel
+/// [`mark_worktree_owned_best_effort`] already uses for a failed
+/// ownership-marker write — this is at least as safety-critical as that.
+/// The `--` end-of-options separator (matching auditor A2's hardening of
+/// the `git clone` argv) guards against a source origin URL beginning with
+/// `-` being read as an option.
+fn point_isolated_clone_origin(clone_dir: &Path, url: &str) -> Option<String> {
+    match std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["remote", "set-url", "--", "origin", url])
+        .output()
+    {
+        Ok(out) if out.status.success() => None,
+        Ok(out) => Some(format!(
+            "failed to point the clone's origin at the source's own origin ({url}): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(format!(
+            "failed to point the clone's origin at the source's own origin ({url}): {e}"
+        )),
+    }
+}
+
+/// Remove `clone_dir`'s default local-path `origin` entirely — the OTHER
+/// branch of reviewer P1-1, when `source_dir` itself has no origin
+/// configured and there is nothing better to point at — rather than leave a
+/// push able to land silently back in the source checkout.
+///
+/// Unlike [`point_isolated_clone_origin`], `git remote remove` deletes
+/// `refs/remotes/origin/*` along with the remote's config (verified
+/// empirically, not merely a config change) — so
+/// `provision_isolated_clone_sync` deliberately calls this only AFTER a
+/// successful checkout, once nothing downstream still needs those refs
+/// (reviewer P2-A's widened branch probe, and `git checkout`'s own DWIM
+/// attach, both depend on them for a branch that exists on the source only
+/// as a remote-tracking ref in a fresh clone). See that function's doc
+/// comment for the full reasoning. `remove` takes no attacker-influenced
+/// argument, so unlike `set-url` it needs no `--` hardening.
+///
+/// PRD fork#325 fix round 2 (reviewer P2-C): as with the set-url branch,
+/// this used to discard its result with `let _ = …`; returns
+/// `Some(warning)` on failure instead.
+fn remove_isolated_clone_origin_default(clone_dir: &Path) -> Option<String> {
+    match std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["remote", "remove", "origin"])
+        .output()
+    {
+        Ok(out) if out.status.success() => None,
+        Ok(out) => Some(format!(
+            "failed to remove the clone's default local-path origin: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(format!(
+            "failed to remove the clone's default local-path origin: {e}"
+        )),
     }
 }
 
