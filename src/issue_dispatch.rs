@@ -280,30 +280,81 @@ pub fn worktree_remove_argv(clone_dir: &Path, worktree_dir: &Path) -> Vec<String
     ]
 }
 
+/// Where [`isolated_clone_checkout_argv`]'s two-probe branch check
+/// (`worktree_branch_probe_argv` / `isolated_clone_remote_branch_probe_argv`)
+/// found `branch` in a freshly cloned isolated working tree (PRD fork#325 fix
+/// round 3, reviewer P2-1 / auditor C3). A fresh `git clone` gives
+/// `refs/heads/` only the source's checked-out HEAD branch, so any other
+/// branch the source had arrives as a remote-tracking ref ONLY — the two
+/// probes tell those cases apart, and `isolated_clone_checkout_argv` needs to
+/// know which one matched because the checkout FORM differs between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchLocation {
+    /// Absent from the clone entirely — create it fresh with `-b`.
+    Absent,
+    /// Already a local branch (`refs/heads/<branch>`) — attach with a plain
+    /// `git checkout <branch>`, exactly like the shared-checkout arm.
+    Local,
+    /// Exists only as a remote-tracking ref (`refs/remotes/origin/<branch>`)
+    /// — round 2 relied on git's checkout DWIM to resolve a plain `git
+    /// checkout <branch>` against this ref. Round 3 (reviewer C3, auditor
+    /// C3) found that dependency itself unsafe: DWIM is controlled by
+    /// `checkout.guess` (a user's global git config with it set `false`
+    /// makes checkout refuse outright with "pathspec … did not match"), and
+    /// is shadowed entirely when the repo root holds a file sharing the
+    /// branch's name ("could both be a local file and a tracking branch").
+    /// Both destroy the clone via `handle_isolated_clone_add_error`'s
+    /// cleanup and loop identically on retry, since the same DWIM-dependent
+    /// form runs again. Use the explicit, DWIM-free
+    /// `--track origin/<branch>` form instead.
+    RemoteOnly,
+}
+
 /// Argv for `git checkout` inside a freshly cloned isolated working tree
 /// (PRD fork#325 M3 fix round, reviewer P1-2): `provision_isolated_clone_sync`'s
 /// plain `git clone` lands on the SOURCE's HEAD branch (typically `main`),
 /// never the slug the user typed — this is the follow-up step that lands it
 /// on `branch` instead, matching what `worktree_add_argv`'s attach-vs-create
-/// split already does for the shared-checkout arm: attach `branch` when
-/// `branch_exists` (a clone carries every ref the source had, so a branch
-/// the user's slug happens to match already exists in the clone too),
-/// otherwise create it fresh with `-b` off the clone's checked-out HEAD.
+/// split already does for the shared-checkout arm: attach `branch` when it
+/// already exists locally, otherwise create it fresh with `-b` off the
+/// clone's checked-out HEAD.
+///
+/// PRD fork#325 fix round 3 (reviewer P2-1 / auditor C3): a THIRD case,
+/// [`BranchLocation::RemoteOnly`], was folded into "attach" alongside
+/// `Local` in round 2, both producing the identical bare `git checkout
+/// <branch>` and relying on git's checkout DWIM to make the remote-only case
+/// work. See [`BranchLocation::RemoteOnly`]'s doc comment for the two real
+/// failures that dependency caused. `RemoteOnly` now gets its own explicit,
+/// DWIM-free form: `git checkout -b <branch> --track origin/<branch>`. This
+/// still depends on `refs/remotes/origin/<branch>` being present at checkout
+/// time — exactly as the DWIM form did — so `provision_isolated_clone_sync`'s
+/// deferral of the no-origin-on-source removal until after a successful
+/// checkout is unchanged and still required; only the checkout's own argv
+/// form changed.
 pub fn isolated_clone_checkout_argv(
     clone_dir: &Path,
     branch: &str,
-    branch_exists: bool,
+    location: BranchLocation,
 ) -> Vec<String> {
     let mut argv = vec![
         "-C".to_string(),
         clone_dir.to_string_lossy().into_owned(),
         "checkout".to_string(),
     ];
-    if branch_exists {
-        argv.push(branch.to_string());
-    } else {
-        argv.push("-b".to_string());
-        argv.push(branch.to_string());
+    match location {
+        BranchLocation::Local => {
+            argv.push(branch.to_string());
+        }
+        BranchLocation::RemoteOnly => {
+            argv.push("-b".to_string());
+            argv.push(branch.to_string());
+            argv.push("--track".to_string());
+            argv.push(format!("origin/{branch}"));
+        }
+        BranchLocation::Absent => {
+            argv.push("-b".to_string());
+            argv.push(branch.to_string());
+        }
     }
     argv
 }
@@ -1492,7 +1543,7 @@ mod tests {
     fn isolated_clone_checkout_argv_creates_new_branch_when_absent() {
         let clone_dir = Path::new("/repo/clone-my-feature");
         assert_eq!(
-            isolated_clone_checkout_argv(clone_dir, "my-feature", false),
+            isolated_clone_checkout_argv(clone_dir, "my-feature", BranchLocation::Absent),
             vec![
                 "-C",
                 "/repo/clone-my-feature",
@@ -1503,17 +1554,42 @@ mod tests {
         );
     }
 
-    /// Same fix round: when the typed slug already exists as a branch in the
-    /// clone (it carries every ref the source had), the checkout must ATTACH
-    /// to it rather than retry `-b`, which `git checkout -b` on an existing
-    /// branch name refuses — mirroring `worktree_add_argv`'s identical
-    /// attach-vs-create split for the shared-checkout arm.
+    /// Same fix round: when the typed slug already exists as a LOCAL branch
+    /// in the clone (it carries every ref the source had), the checkout must
+    /// ATTACH to it rather than retry `-b`, which `git checkout -b` on an
+    /// existing branch name refuses — mirroring `worktree_add_argv`'s
+    /// identical attach-vs-create split for the shared-checkout arm.
     #[test]
-    fn isolated_clone_checkout_argv_attaches_existing_branch() {
+    fn isolated_clone_checkout_argv_attaches_existing_local_branch() {
         let clone_dir = Path::new("/repo/clone-my-feature");
         assert_eq!(
-            isolated_clone_checkout_argv(clone_dir, "my-feature", true),
+            isolated_clone_checkout_argv(clone_dir, "my-feature", BranchLocation::Local),
             vec!["-C", "/repo/clone-my-feature", "checkout", "my-feature"]
+        );
+    }
+
+    /// Scenario: issue #325 fix round 3 (reviewer P2-1 / auditor C3) —
+    /// when the typed slug exists ONLY as a remote-tracking ref (a fresh
+    /// clone's shape for every branch but the source's checked-out HEAD),
+    /// the checkout must use the explicit `-b <branch> --track
+    /// origin/<branch>` form rather than a bare `git checkout <branch>`
+    /// that depends on git's DWIM to resolve it — DWIM refuses outright
+    /// under a `checkout.guess=false` git config, and is shadowed by a
+    /// same-named file at the repo root.
+    #[test]
+    fn isolated_clone_checkout_argv_tracks_remote_only_branch_explicitly() {
+        let clone_dir = Path::new("/repo/clone-my-feature");
+        assert_eq!(
+            isolated_clone_checkout_argv(clone_dir, "my-feature", BranchLocation::RemoteOnly),
+            vec![
+                "-C",
+                "/repo/clone-my-feature",
+                "checkout",
+                "-b",
+                "my-feature",
+                "--track",
+                "origin/my-feature",
+            ]
         );
     }
 

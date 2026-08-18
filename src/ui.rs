@@ -1078,8 +1078,9 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// shared object store) regardless of where each sibling's working
 /// directory happens to sit on disk.
 ///
-/// Fails CLOSED (`Err`) on ANY daemon-query problem — unlike every other
-/// consumer of `ListAgents` on this same seam ([`live_orchestration_cwds_and_titles`],
+/// Fails CLOSED (`Err`) on ANY daemon-unreachable problem, and on a
+/// malformed or absent response — unlike every other consumer of
+/// `ListAgents` on this same seam ([`live_orchestration_cwds_and_titles`],
 /// a best-effort HINT that fails open by design): this is a correctness
 /// GATE, and a down/wedged daemon silently reporting "nothing live" would
 /// reintroduce #325's exact race under ambiguous state. Bounded by
@@ -1088,6 +1089,20 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// [`DAEMON_HINT_TIMEOUT`]'s much tighter 250ms — a gate needs a real answer,
 /// not a best-effort one, so refusing to spawn is preferred over a false
 /// refusal caused by a daemon that is merely slow rather than actually down.
+///
+/// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1), not yet fixed:
+/// the fail-closed guarantee above does NOT extend to a live orchestration
+/// reported by an OLDER CLIENT whose record omits `orchestration_cwd`
+/// (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
+/// pre-#325 client's record deserializes with it as `None` rather than
+/// failing to parse at all). The per-record loop below matches only
+/// `orchestration_cwd: Some(cwd)`, so such a record silently falls through
+/// the `else { continue; }` arm — it is invisible to this gate and treated
+/// exactly like "no live sibling" for that entry, even though a genuine live
+/// orchestration sits behind it. This is a real, tracked gap on that one
+/// axis (older-client visibility), not a claim that the whole function fails
+/// open; every other failure mode this doc comment describes still fails
+/// closed as stated.
 ///
 /// A single LIVE entry whose own `git-common-dir` fails to resolve (e.g. its
 /// worktree was removed after the daemon's record went stale) is skipped
@@ -1146,11 +1161,18 @@ fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
         );
     };
 
-    // Issue #325 reviewer P3-B: the cheapest and most common instance of a
-    // live sibling — this orchestration's own cwd literally IS
-    // `target_dir` — is answerable without consulting git at all, and
-    // closes the fail-open gap below (an unresolvable `cwd` is skipped, by
-    // design) for exactly the record most likely to matter.
+    // Issue #325 reviewer P3-B, corrected by fix round 3 (reviewer P3-3):
+    // the cheapest and most common instance of a live sibling — this
+    // orchestration's own cwd literally IS `target_dir` — is answerable
+    // without consulting git at all. This does NOT close the fail-open gap
+    // below (an unresolvable `cwd` is skipped, by design), as the original
+    // comment claimed: `target_common` above is already resolved
+    // successfully via `?`-propagation, so `git_common_dir` on this SAME
+    // path cannot fail differently here absent a TOCTOU where the directory
+    // is deleted mid-function — the loop's fallthrough would reach `Ok(true)`
+    // for this record either way. The real, and only, benefit is saving one
+    // `git_common_dir` subprocess call in the common case where a live
+    // sibling's cwd equals `target_dir` exactly.
     let target_dir_canon =
         std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
 
@@ -10401,6 +10423,16 @@ fn dispatch_action(
                     // so it survives past the `match` arm into the final
                     // status message set after `open_orchestration_tab`.
                     let mut worktree_marker_warning: Option<String> = None;
+                    // PRD fork#325 fix round 3 (reviewer C0 / auditor P2-3):
+                    // only ever set by the isolated-clone arm below — the
+                    // shared-checkout arm has no origin-fixup step at all.
+                    // Kept separate from `worktree_marker_warning` rather
+                    // than folded into it: the final status message below
+                    // renders `worktree_marker_warning` via
+                    // `format_marker_warning`, a fixed template built for the
+                    // ownership-marker failure, which would misdescribe an
+                    // origin-fixup failure entirely.
+                    let mut worktree_origin_warning: Option<String> = None;
                     let dir_str = match req.orchestration_worktree_path.as_ref() {
                         Some(worktree_path) => {
                             // Fork #122 audit (P1): use the validated raw
@@ -10589,8 +10621,10 @@ fn dispatch_action(
                                 ) {
                                     Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
                                         marker_warning,
+                                        origin_warning,
                                     }) => {
                                         worktree_marker_warning = marker_warning;
+                                        worktree_origin_warning = origin_warning;
                                         worktree_path.display().to_string()
                                     }
                                     // Issue #325 reviewer P3-1: say "clone",
@@ -10631,6 +10665,40 @@ fn dispatch_action(
                                         ui.status_message = Some((
                                             format!(
                                                 "Orchestration failed: isolated clone timed out at {} — {detail}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // Issue #325 fix round 3 (reviewer C2 /
+                                    // auditor C2): a genuine (non-timeout)
+                                    // clone/checkout failure used to be
+                                    // reported through the SAME "timed out"
+                                    // arm above, discarding git's actual
+                                    // error text. This arm shows it instead —
+                                    // reserving the "timed out" wording for
+                                    // a genuine timeout only.
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Failed {
+                                        error,
+                                        cleaned_up_by,
+                                    }) => {
+                                        let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                            tracing::info!(
+                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                                "isolated clone failed; half-created directory removed automatically"
+                                            );
+                                            "the half-created directory was removed automatically — try again".to_string()
+                                        } else {
+                                            format!(
+                                                "run `rm -rf {}` to clear it, then try again",
+                                                worktree_path.display()
+                                            )
+                                        };
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: isolated clone failed at {} — {error} ({detail})",
                                                 worktree_path.display()
                                             ),
                                             std::time::Instant::now(),
@@ -10844,31 +10912,62 @@ fn dispatch_action(
                             // in the agent's stdin, polluting the prompt buffer.
 
                             ui.status_message = Some((
-                                // Show the same name as the tab title (PRD #107
-                                // display intent): the user's form name when
-                                // typed, else the canonical config name. This is
-                                // display-only and does not affect identity.
-                                //
-                                // Issue #164: when `create_worktree_sync` above
-                                // created the worktree but its ownership marker
-                                // write failed, append that warning here — this
-                                // is the ONE status message this whole flow
-                                // sets on success, so it is the only place a
-                                // caller can still tell the user at creation
-                                // time (the moment this fact is known) rather
-                                // than only via a daemon trace.
-                                match &worktree_marker_warning {
-                                    Some(error) => format!(
-                                        "Activated orchestration: {} — {}",
-                                        display_title.as_deref().unwrap_or(&orch_config.name),
-                                        crate::worktree_reclaim::format_marker_warning(
-                                            &dir_str, error
-                                        )
-                                    ),
-                                    None => format!(
+                                {
+                                    // Show the same name as the tab title (PRD #107
+                                    // display intent): the user's form name when
+                                    // typed, else the canonical config name. This is
+                                    // display-only and does not affect identity.
+                                    let title = format!(
                                         "Activated orchestration: {}",
                                         display_title.as_deref().unwrap_or(&orch_config.name)
-                                    ),
+                                    );
+                                    // Issue #164: when `create_worktree_sync`
+                                    // above created the worktree but its
+                                    // ownership marker write failed, append
+                                    // that warning here — this is the ONE
+                                    // status message this whole flow sets on
+                                    // success, so it is the only place a
+                                    // caller can still tell the user at
+                                    // creation time (the moment this fact is
+                                    // known) rather than only via a daemon
+                                    // trace.
+                                    //
+                                    // PRD fork#325 fix round 3 (reviewer C0 /
+                                    // auditor P2-3): `worktree_origin_warning`
+                                    // (isolated-clone arm only) gets its OWN
+                                    // message here rather than being folded
+                                    // into `worktree_marker_warning` and run
+                                    // through `format_marker_warning` — that
+                                    // template names the ownership-marker
+                                    // hazard ("a later `reclaim` … will need
+                                    // `--yes`"), which is simply wrong for an
+                                    // origin-fixup failure. The real hazard
+                                    // there is that the clone still points
+                                    // `origin` at the user's OWN root
+                                    // checkout, so `git push origin` from
+                                    // inside it lands there silently instead
+                                    // of reaching the real remote.
+                                    let mut warnings: Vec<String> = Vec::new();
+                                    if let Some(error) = &worktree_origin_warning {
+                                        warnings.push(format!(
+                                            "this clone's `origin` could not be pointed at the \
+                                             real remote ({error}) — manually run `git remote \
+                                             set-url origin <url>` (or `git remote remove origin` \
+                                             if none exists) before pushing from inside it"
+                                        ));
+                                    }
+                                    if let Some(error) = &worktree_marker_warning {
+                                        warnings.push(
+                                            crate::worktree_reclaim::format_marker_warning(
+                                                &dir_str, error,
+                                            ),
+                                        );
+                                    }
+                                    if warnings.is_empty() {
+                                        title
+                                    } else {
+                                        format!("{title} — {}", warnings.join("; "))
+                                    }
                                 },
                                 std::time::Instant::now(),
                             ));
