@@ -5936,6 +5936,119 @@ mod tests {
         );
     }
 
+    /// Scenario: issue #468 follow-up, reviewer finding M1. PR #466/#468 taught
+    /// `drain_pre_write_events` (`src/spawn.rs`) to recognize a Codex event
+    /// whose native hook install/trust is recorded as failed
+    /// (`codex_hook_trust_outcome() == Some(false)`) and to report that failure
+    /// back even when a LATER, metadata-free Codex event in the same drain
+    /// would otherwise arm `can_report_prompts`. The identical shape survives
+    /// one level up, in `wait_for_prompt_submission`: its own
+    /// `can_report_prompts |= agent_reports_submitted_prompt(...) &&
+    /// event.codex_hook_trust_outcome() != Some(false)` only vetoes
+    /// `can_report_prompts` FOR THE EVENT CARRYING THE FAILURE — a second,
+    /// metadata-free Codex event arriving later in the SAME window
+    /// unconditionally re-arms it, and nothing survives to tell the caller a
+    /// failure was ever seen. This sends exactly that pair of events — (1) a
+    /// Codex `SessionStart` with a recorded hook-trust failure, then (2) an
+    /// ordinary metadata-free Codex event — into one `wait_for_prompt_submission`
+    /// call and lets its window elapse. `PromptWatch::Elapsed` has only
+    /// `can_report_prompts` today, so there is no way to express "the failure
+    /// was seen, even though a later event armed capability" against the
+    /// current shape at all — this pins the missing signal by matching a
+    /// `codex_hook_trust_failed` field on `Elapsed` that does not exist yet; it
+    /// must fail to COMPILE (E0026, no such field) until the fix adds it, the
+    /// same pattern as `drain_pre_write_events_reports_hook_trust_failure_even_when_a_later_event_arms_capability`
+    /// (`src/spawn.rs`).
+    #[tokio::test]
+    async fn wait_for_prompt_submission_reports_hook_trust_failure_even_when_a_later_event_arms_capability()
+     {
+        const PANE_ID: &str = "codex-hook-trust-failed-then-armed-pane-wfps";
+        const AGENT_ID: &str = "codex-hook-trust-failed-then-armed-agent-wfps";
+
+        fn codex_event(event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+            AgentEvent {
+                session_id: "codex-hook-trust-failed-session-wfps".to_string(),
+                agent_type: AgentType::Codex,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(PANE_ID.to_string()),
+                agent_id: Some(AGENT_ID.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                model: None,
+            }
+        }
+
+        let mut failed_metadata = HashMap::new();
+        failed_metadata.insert(
+            crate::event::CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+            "false".to_string(),
+        );
+        let failed_event = codex_event(EventType::SessionStart, failed_metadata);
+        assert_eq!(
+            failed_event.codex_hook_trust_outcome(),
+            Some(false),
+            "sanity: this event must carry a recorded hook-trust failure"
+        );
+
+        // Ordinary Codex frame with no hook-trust metadata at all — the shape
+        // that unconditionally re-arms `can_report_prompts` today.
+        let metadata_free_event = codex_event(EventType::Thinking, Default::default());
+        assert_eq!(
+            metadata_free_event.codex_hook_trust_outcome(),
+            None,
+            "sanity: this event must carry no hook-trust metadata"
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(failed_event));
+        let _ = tx.send(BroadcastMsg::Event(metadata_free_event));
+
+        let mut generation = None;
+        let watch = wait_for_prompt_submission(
+            &mut rx,
+            PANE_ID,
+            AGENT_ID,
+            "some-unrelated-prompt-text-never-reported-wfps",
+            &mut generation,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+
+        match watch {
+            // Not on `main` yet: `PromptWatch::Elapsed` today carries only
+            // `can_report_prompts`. This second field is the missing out-param
+            // the fix must add so a hook-trust failure observed mid-window
+            // survives past a later event that would otherwise arm
+            // `can_report_prompts` — mirrored on
+            // `SessionStartWait`/`drain_pre_write_events`'s own
+            // `codex_hook_trust_failed` in `src/spawn.rs`.
+            PromptWatch::Elapsed {
+                can_report_prompts,
+                codex_hook_trust_failed,
+            } => {
+                assert!(
+                    can_report_prompts,
+                    "sanity: the metadata-free event must still arm can_report_prompts today"
+                );
+                assert!(
+                    codex_hook_trust_failed,
+                    "issue #468 follow-up (reviewer M1): a hook-trust failure observed mid-window \
+                     must be reported back even when a later, metadata-free Codex event goes on to \
+                     arm can_report_prompts — PromptWatch::Elapsed currently has no field to carry \
+                     this signal at all"
+                );
+            }
+            other => panic!("expected Elapsed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn compose_delegate_prompt_is_single_line_file_pointer() {
         let prompt =
