@@ -3984,13 +3984,22 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let project = test_home.parent().ok_or_else(|| {
         std::io::Error::other("isolated Codex HOME has no fixture working directory")
     })?;
+    write_codex_project_trust(&dst, project)
+}
+
+/// Write Codex's per-project trust entry into `<codex_home>/config.toml`,
+/// trusting `project`. Split out from [`import_codex_credentials`] (issue
+/// #439) so the trust-config-writing behavior can be exercised without real
+/// Codex credentials.
+pub fn write_codex_project_trust(codex_home: &Path, project: &Path) -> std::io::Result<()> {
+    let canonical_project = std::fs::canonicalize(project)?;
     let config = format!(
         "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-        toml_escape(project.to_str().ok_or_else(|| {
+        toml_escape(canonical_project.to_str().ok_or_else(|| {
             std::io::Error::other("isolated Codex fixture path is not UTF-8")
         })?)
     );
-    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())?;
+    write_credential_file_atomic_0o600(&codex_home.join("config.toml"), config.as_bytes())?;
 
     // Issue #243: dismiss the update notice in the ISOLATED home.
     //
@@ -4010,7 +4019,10 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     // a notice. The host's own file is not copied — it carries a
     // `last_checked_at` timestamp and whatever version the developer happens to
     // be on, neither of which a test wants to inherit.
-    let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
+    let _ = std::fs::write(
+        codex_home.join("version.json"),
+        codex_update_notice_dismissal(),
+    );
     Ok(())
 }
 
