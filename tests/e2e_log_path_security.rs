@@ -101,6 +101,23 @@ fn log_path_001_default_log_lives_under_state_dir_with_owner_only_permissions() 
         "expected the state dir to be created owner-only (mode 0o700), got {mode:#o}"
     );
 
+    // Pins that `init_logging_from_env` actually reaches `open_deck_log_file`
+    // on the default branch, not just that the log ends up under state_dir():
+    // reverting the call site back to a plain `create(true).append(true)`
+    // open would leave every unit test against `open_deck_log_file` green
+    // while this end-to-end check catches it.
+    let log_file_metadata = std::fs::metadata(&expected_log_path).unwrap_or_else(|e| {
+        panic!(
+            "expected the log file at {} to exist by now: {e}",
+            expected_log_path.display()
+        )
+    });
+    let log_file_mode = log_file_metadata.mode() & 0o777;
+    assert_eq!(
+        log_file_mode, 0o600,
+        "expected the log file to be created owner-only (mode 0o600), got {log_file_mode:#o}"
+    );
+
     // Cleanup: never leak the daemon out of the test. `kill()` + `wait()`
     // reaps the child; a `process_running` re-check after a successful reap
     // can only be true of a recycled pid, so there is no follow-up SIGKILL
