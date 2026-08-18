@@ -30,6 +30,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -229,4 +230,157 @@ fn worktree_005_form_worktree_field_creates_and_roots_role_panes_on_real_binary(
              orchestration's own worktree"
         );
     }
+}
+
+/// Resolve `dir`'s git COMMON dir via `git -C dir rev-parse --git-common-dir`
+/// — for a linked worktree this resolves to the MAIN repository's `.git` (the
+/// same value every other worktree of that repository resolves to); for a
+/// genuinely separate clone it resolves to that clone's own `.git`. This is
+/// the observable signature PRD fork#325 M3's gate is about: whether the
+/// Nth-concurrent orchestration shares the 1st's object store (today, always)
+/// or gets its own (the fix). Mirrors `resolve_git_dir` above, which reads
+/// `--git-dir` instead — deliberately duplicated rather than generalized,
+/// following this file's existing convention of asserting the OBSERVABLE
+/// path a user/tool would see, not a shared internal helper.
+fn git_common_dir(dir: &std::path::Path) -> PathBuf {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .expect("git rev-parse --git-common-dir must spawn");
+    assert!(
+        out.status.success(),
+        "git rev-parse --git-common-dir failed in {dir:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let common_dir = PathBuf::from(raw);
+    let resolved = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        dir.join(common_dir)
+    };
+    resolved
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("canonicalize git common dir {resolved:?} for {dir:?}: {e}"))
+}
+
+/// Drive the new-pane form's real keyboard path to open the `orch-clone-gate`
+/// fixture's one orchestration with a TYPED worktree slug — `Ctrl+n` ->
+/// directory picker -> confirm -> Mode cycled to the orchestration -> Tab to
+/// Worktree -> slug -> submit. A typed (non-blank) slug is required to reach
+/// `create_worktree_sync`/the M3 gate at all — an accepted-blank Worktree
+/// field (as `e2e_orchestration_identity.rs::open_orchestration` uses) never
+/// provisions a worktree at all, so it can't exercise this feature.
+fn open_orchestration_with_slug(deck: &TuiDeck, slug: &str) {
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right -> [Orch: clone-gate-demo] (the fixture's only orchestration)
+    deck.send_keys(b"\r"); // Mode -> Name
+    deck.send_keys(b"\t"); // Tab: Name -> Worktree (Command is hidden for an orchestration)
+    deck.send_keys(slug.as_bytes());
+    deck.send_keys(b"\r"); // submit
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration TWICE against the SAME directory — with distinct typed
+/// worktree slugs, the second one while the first is still live — mirroring
+/// the N-concurrent-orchestrations shape of issue #325's actual incident
+/// (three-plus, here reduced to the PRD's own stated M3 starting case: the
+/// simplest 2nd-against-a-live-1st collision). Each instance's role pane
+/// appends its own `DOT_AGENT_DECK_WORKTREE_OWNER` identity plus its own
+/// `pwd` to one shared, HOME-relative log file, so the 1st and 2nd
+/// instances' actual working directories can be read back and told apart by
+/// owner string once both role panes have run — without this test needing to
+/// know in advance where either instance's worktree/clone lands on disk.
+/// Assert the 1st instance's directory shares the launch dir's git common
+/// dir (unaffected, per the PRD's own "the 1st orchestration is out of
+/// scope" note — no behavior change for the common case), and the 2nd
+/// instance's directory does NOT — it must have its own isolated clone (a
+/// distinct git object store), never a `git worktree add` sibling reusing
+/// the shared checkout's common dir the way `create_worktree_sync` does
+/// today unconditionally, regardless of how many orchestrations are already
+/// live against it.
+#[spec("orchestration/worktree/014")]
+#[test]
+fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    // fork#192 M1.0: the Name field is never typed into on this keyboard
+    // path (Mode -> Tab straight to Worktree), so it keeps its pre-filled
+    // suggestion — the next free `<basename>-orchestrator-N` — and that
+    // value is what `Action::SpawnPane` actually derives as the
+    // creator/owner identity (see `orchestration/worktree/005` above).
+    let owner_1 = format!("orchestration:{launch_dir_basename}-orchestrator-1");
+    let owner_2 = format!("orchestration:{launch_dir_basename}-orchestrator-2");
+    let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
+
+    open_orchestration_with_slug(&deck, "clonegate1");
+    deck.wait_for_absence("New Agent"); // first orchestration's form closed -> tab up
+
+    // Back to the Dashboard to open a second orchestration in the same dir,
+    // while the first is still live.
+    deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
+    deck.send_keys(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    open_orchestration_with_slug(&deck, "clonegate2");
+    deck.wait_for_string(&second_label); // second orchestration deck is up, distinctly labeled
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 2, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "both role panes must have appended their owner+pwd line to \
+             {log_path:?}: {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let mut pwd_by_owner: HashMap<String, PathBuf> = HashMap::new();
+    for line in contents.lines() {
+        if let Some((owner, pwd)) = line.split_once(' ') {
+            pwd_by_owner.insert(owner.to_string(), PathBuf::from(pwd));
+        }
+    }
+
+    let pwd_1 = pwd_by_owner.get(&owner_1).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner_1:?}; got: {contents:?}")
+    });
+    let pwd_2 = pwd_by_owner.get(&owner_2).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner_2:?}; got: {contents:?}")
+    });
+
+    let work_common = git_common_dir(&work);
+    let pwd_1_common = git_common_dir(pwd_1);
+    let pwd_2_common = git_common_dir(pwd_2);
+
+    assert_eq!(
+        pwd_1_common, work_common,
+        "the 1ST orchestration against a root checkout must be unaffected — \
+         it shares the launch dir's git common dir exactly as today, per the \
+         PRD's own out-of-scope note"
+    );
+    assert_ne!(
+        pwd_2_common,
+        work_common,
+        "the 2ND (Nth-concurrent) orchestration against the SAME root \
+         checkout, spawned while the 1st is still live, must provision its \
+         OWN isolated clone — a distinct git common dir/object store — \
+         instead of sharing {}'s via a `git worktree add` sibling the way \
+         `create_worktree_sync` does today unconditionally, regardless of \
+         how many orchestrations are already live against it",
+        work.display()
+    );
 }
