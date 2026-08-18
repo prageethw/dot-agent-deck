@@ -1540,7 +1540,7 @@ pub(crate) async fn create_worktree(
     // signal by the time we get here (see that function's doc comment), so
     // — mirroring `create_worktree_sync`'s `attempt_worktree_cleanup` —
     // attempt best-effort cleanup of whatever the add half-registered
-    // before it was killed, rather than hardcoding `cleaned_up: false` and
+    // before it was killed, rather than hardcoding `cleaned_up_by: None` and
     // leaving the slug wedged.
     Ok(match classify_worktree_add_result(worktree_dir, add)? {
         AddOutcome::Created => {
@@ -2076,6 +2076,18 @@ async fn attempt_worktree_cleanup_async(
     .map(|result| result.is_ok())
     .unwrap_or(false);
     if removed && !worktree_dir.exists() {
+        // Issue #325 reviewer P2-B / auditor A2: logged HERE rather than at
+        // each of the two production consumers of `WorktreeCreation::TimedOut`
+        // (`dispatch_one_issue` above and `dispatch.rs`'s currently-unreachable
+        // arm) — mirroring the confirmed-removal log the sync twin's caller
+        // does in `ui.rs`, but at one site so neither consumer has to
+        // remember to log, including the unattended scheduled `issue_dispatch`
+        // flow this async twin actually serves.
+        tracing::info!(
+            path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_dir),
+            remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+            "worktree add timed out; half-created directory removed automatically"
+        );
         Some(remover.to_string())
     } else {
         None

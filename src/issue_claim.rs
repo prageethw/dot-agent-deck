@@ -162,7 +162,7 @@ pub fn decide_claim(
 /// cheapest way to enforce the warning below: a function nothing outside
 /// this module can even name is a function nothing outside this module can
 /// misuse.
-pub(crate) fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
+fn resolve_caller_identity(cwd: &Path) -> Result<Identity, String> {
     match std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID) {
         Err(_) => {
             // No pane env: a human terminal. The login IS part of the
@@ -642,17 +642,32 @@ mod tests {
     // --- issue #325 / reviewer NEW-2 / auditor: pin resolve_remover_identity's
     // fallback branch, so reverting main.rs's call site back to the bare
     // resolve_caller_identity().unwrap_or_else(|_| "unknown") cannot pass
-    // silently. `std::env::set_var`/`remove_var` are process-global, so
-    // serialize against PANE_ID_ENV_LOCK the same way agent_pty.rs's
-    // ENV_TEST_LOCK does.
+    // silently. `std::env::set_var`/`remove_var` are process-global, so this
+    // test serializes its own mutation against PANE_ID_ENV_LOCK.
+    //
+    // Corrected (issue #325 auditor A4): PANE_ID_ENV_LOCK does NOT serialize
+    // against `agent_pty.rs`'s `ENV_TEST_LOCK` — they are two independent
+    // mutexes guarding the same `DOT_AGENT_DECK_PANE_ID` global, and
+    // `agent_pty`'s copy lives inside a `#[cfg(all(test, unix))]` submodule
+    // that this module cannot reach without either widening its visibility
+    // (a real cross-module dependency, and Unix-only, so a platform-gated
+    // one) or duplicating it unconditionally. Neither is worth it here:
+    // soundness rests entirely on `cargo nextest`'s process-per-test
+    // isolation (the repo's actual gate — see CLAUDE.md rule 5), not on
+    // this mutex actually contending with `agent_pty`'s. Under a plain
+    // `cargo test` (thread-per-test, one process) the two modules' env
+    // mutations ARE racy against each other; this lock only protects this
+    // module's own tests from each other.
     static PANE_ID_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn resolve_remover_identity_falls_back_to_pane_id_outside_a_worktree() {
         let _g = PANE_ID_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by PANE_ID_ENV_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: soundness here rests on nextest's process-per-test
+        // isolation, not on PANE_ID_ENV_LOCK alone (see the module-level
+        // note above) — the lock only serializes this module's own tests.
+        // Prior value is restored before the lock is released.
         let prior = std::env::var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID).ok();
         unsafe {
             std::env::set_var(crate::agent_pty::DOT_AGENT_DECK_PANE_ID, "7");

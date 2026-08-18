@@ -414,7 +414,17 @@ pub struct WorktreeReport {
     /// [`run_reclaim`] actually pushed into [`ReclaimOutcome::removed`];
     /// `None` for `pending`/`kept` — nothing was removed, so there is
     /// nothing to attribute.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Same warning as `owner` above, and for the same reason (issue #325
+    /// auditor A3): this is a display string spanning several free-form
+    /// namespaces (`worktree:…@…|…`, `human:…@…`, `pane:…@… (cwd …)`,
+    /// `"unknown"`, or literally anything a caller of the `pub` `run_reclaim`
+    /// passes) and is NOT authenticated — anyone able to influence the
+    /// caller's identity resolution can plant an arbitrary value here.
+    /// Nothing in this crate branches on `removed_by` today, and the point
+    /// of this note is to keep it that way; there is no `owner_kind`-style
+    /// discrete field for this one to fall back on instead.
+    #[serde(skip)]
     pub removed_by: Option<String>,
 }
 

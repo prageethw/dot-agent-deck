@@ -236,7 +236,11 @@ pub fn worktree_add_argv(
 /// before checkout/hooks finish, so a killed add leaves a half-created
 /// directory (and usually its registration) behind; `--force` is required
 /// because a plain `worktree remove` refuses a directory whose checkout
-/// never completed cleanly.
+/// never completed cleanly. The `--` end-of-options separator before the
+/// path (issue #325 auditor A7) matches `worktree_reclaim.rs`'s
+/// `remove_worktree_dir` — not reachable today since every path here is
+/// deck-derived from a slug, but it costs nothing and removes the
+/// assumption that a future path can never begin with `-`.
 pub fn worktree_remove_argv(clone_dir: &Path, worktree_dir: &Path) -> Vec<String> {
     vec![
         "-C".to_string(),
@@ -244,6 +248,7 @@ pub fn worktree_remove_argv(clone_dir: &Path, worktree_dir: &Path) -> Vec<String
         "worktree".to_string(),
         "remove".to_string(),
         "--force".to_string(),
+        "--".to_string(),
         worktree_dir.to_string_lossy().into_owned(),
     ]
 }
@@ -1398,6 +1403,29 @@ mod tests {
         // M1: both builders terminate with the `--` end-of-options marker.
         assert!(issue_list_argv("o/r", 1, None, None).contains(&"--".to_string()));
         assert!(pr_list_for_issue_argv("o/r", 1).contains(&"--".to_string()));
+    }
+
+    /// Scenario: issue #325 auditor A7 — `worktree_remove_argv` (the
+    /// `AddOutcome::TimedOut` cleanup twins' argv builder) must carry the
+    /// `--` end-of-options separator immediately before the worktree path,
+    /// matching `worktree_reclaim.rs`'s `remove_worktree_dir` — otherwise a
+    /// worktree path beginning with `-` would be parsed as a `git worktree
+    /// remove` flag rather than the target. Pure data assertion, no process
+    /// spawn.
+    #[test]
+    fn worktree_remove_argv_carries_end_of_options_separator_before_path() {
+        let clone_dir = Path::new("/repo/clone");
+        let worktree_dir = Path::new("/repo/worktrees/agent-issue-7");
+        let argv = worktree_remove_argv(clone_dir, worktree_dir);
+        let dash_dash = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("worktree_remove_argv must contain a `--` end-of-options separator");
+        assert_eq!(
+            argv.get(dash_dash + 1).map(String::as_str),
+            Some(worktree_dir.to_string_lossy().as_ref()),
+            "the `--` separator must sit IMMEDIATELY before the path argument, got {argv:?}"
+        );
     }
 
     #[test]
