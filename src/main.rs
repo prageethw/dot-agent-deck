@@ -1792,15 +1792,16 @@ async fn run_dashboard() -> ExitCode {
 /// `apply_login_shell_path` `set_var` (main.rs); a logging thread spawned here
 /// would land inside that single-threaded window and break the `set_var`
 /// soundness invariant the login-shell PATH capture relies on.
+fn warn_log_setup_failure(action: &str, path: &std::path::Path, e: impl std::fmt::Display) {
+    eprintln!("Warning: failed to {action} {}: {e}", path.display());
+}
+
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
         let log_path = if log_val.is_empty() || log_val == "1" {
             let dir = state_dir();
             if let Err(e) = dot_agent_deck::platform::fsperm::ensure_owner_only_dir(&dir) {
-                eprintln!(
-                    "Warning: failed to create owner-only state dir {}: {e}",
-                    dir.display()
-                );
+                warn_log_setup_failure("create owner-only state dir", &dir, e);
                 return;
             }
             dir.join("deck.log")
@@ -1823,10 +1824,7 @@ fn init_logging_from_env() {
                     .init();
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to open log file {}: {e}",
-                    log_path.display()
-                );
+                warn_log_setup_failure("open log file", &log_path, e);
             }
         }
     }
