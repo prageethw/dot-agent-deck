@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use dot_agent_deck::build_version_handshake;
-use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
+use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::DaemonClient;
@@ -1795,9 +1795,17 @@ async fn run_dashboard() -> ExitCode {
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
         let log_path = if log_val.is_empty() || log_val == "1" {
-            "/tmp/dot-agent-deck.log".to_string()
+            let dir = state_dir();
+            if let Err(e) = dot_agent_deck::platform::fsperm::ensure_owner_only_dir(&dir) {
+                eprintln!(
+                    "Warning: failed to create owner-only state dir {}: {e}",
+                    dir.display()
+                );
+                return;
+            }
+            dir.join("deck.log")
         } else {
-            log_val
+            std::path::PathBuf::from(log_val)
         };
         match std::fs::OpenOptions::new()
             .create(true)
@@ -1815,7 +1823,10 @@ fn init_logging_from_env() {
                     .init();
             }
             Err(e) => {
-                eprintln!("Warning: failed to open log file {log_path}: {e}");
+                eprintln!(
+                    "Warning: failed to open log file {}: {e}",
+                    log_path.display()
+                );
             }
         }
     }
