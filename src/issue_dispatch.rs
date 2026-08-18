@@ -204,6 +204,33 @@ pub fn worktree_branch_probe_argv(clone_dir: &Path, branch: &str) -> Vec<String>
     ]
 }
 
+/// Argv for `git rev-parse --verify --quiet refs/remotes/origin/<branch>` —
+/// the second half of the isolated-clone branch probe (PRD fork#325 fix
+/// round 2, reviewer P2-A). [`worktree_branch_probe_argv`] alone (probing
+/// only `refs/heads/<branch>`) answers ABSENT for every branch a FRESH `git
+/// clone` did not check out: a clone gives `refs/heads/` only the source's
+/// checked-out HEAD branch, and every other branch the source had arrives
+/// as a remote-tracking ref only. Probing this ref too lets
+/// `provision_isolated_clone_sync` correctly ATTACH to a branch that
+/// already exists on the source (git's own checkout DWIM resolves the
+/// plain branch name to the remote-tracking tip and sets up tracking) —
+/// instead of silently re-creating it at the clone's HEAD, discarding
+/// whatever committed work the real branch carried, which the reviewer
+/// reproduced end to end. Not used by the shared-checkout arm
+/// (`create_worktree`/`create_worktree_sync`): that arm's `clone_dir` only
+/// ever grows LOCAL branches, via its own earlier `git worktree add -b`
+/// calls, so `worktree_branch_probe_argv` alone is already correct there.
+pub fn isolated_clone_remote_branch_probe_argv(clone_dir: &Path, branch: &str) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        clone_dir.to_string_lossy().into_owned(),
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "--quiet".to_string(),
+        format!("refs/remotes/origin/{branch}"),
+    ]
+}
+
 /// Argv for `git worktree add`: attaches `branch` when `branch_exists`,
 /// otherwise creates it with `-b`. A branch left behind by an earlier run
 /// whose worktree was removed (but branch preserved) must be attached, not
@@ -1487,6 +1514,27 @@ mod tests {
         assert_eq!(
             isolated_clone_checkout_argv(clone_dir, "my-feature", true),
             vec!["-C", "/repo/clone-my-feature", "checkout", "my-feature"]
+        );
+    }
+
+    /// Scenario: issue #325 fix round 2 (reviewer P2-A) — pure argv
+    /// assertion for `isolated_clone_remote_branch_probe_argv`, mirroring
+    /// the plain `refs/heads/<branch>` probe but against
+    /// `refs/remotes/origin/<branch>`, the location a fresh clone's
+    /// non-HEAD branches actually live at.
+    #[test]
+    fn isolated_clone_remote_branch_probe_argv_probes_remote_tracking_ref() {
+        let clone_dir = Path::new("/repo/clone-my-feature");
+        assert_eq!(
+            isolated_clone_remote_branch_probe_argv(clone_dir, "my-feature"),
+            vec![
+                "-C",
+                "/repo/clone-my-feature",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/my-feature",
+            ]
         );
     }
 

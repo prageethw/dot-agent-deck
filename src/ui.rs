@@ -1146,6 +1146,14 @@ fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
         );
     };
 
+    // Issue #325 reviewer P3-B: the cheapest and most common instance of a
+    // live sibling — this orchestration's own cwd literally IS
+    // `target_dir` — is answerable without consulting git at all, and
+    // closes the fail-open gap below (an unresolvable `cwd` is skipped, by
+    // design) for exactly the record most likely to matter.
+    let target_dir_canon =
+        std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
+
     let mut seen_cwds: HashSet<String> = HashSet::new();
     for r in agent_records {
         let Some(TabMembership::Orchestration {
@@ -1157,6 +1165,11 @@ fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
         };
         if !seen_cwds.insert(cwd.clone()) {
             continue;
+        }
+        let cwd_path = Path::new(&cwd);
+        let cwd_canon = std::fs::canonicalize(cwd_path).unwrap_or_else(|_| cwd_path.to_path_buf());
+        if cwd_canon == target_dir_canon {
+            return Ok(true);
         }
         let Ok(live_common) = crate::issue_dispatch_run::git_common_dir(Path::new(&cwd)) else {
             continue;
@@ -34288,10 +34301,13 @@ mod tests {
         }
     }
 
-    /// Precondition helper shared by the two tests below: a bare, valid git
-    /// repository with no commits needed (`root_checkout_has_live_sibling`
+    /// Precondition helper shared by the two tests below: a minimal, valid
+    /// git repository with no commits needed (`root_checkout_has_live_sibling`
     /// resolves the common dir via `git rev-parse`, which needs no commit).
-    fn init_bare_git_repo(dir: &std::path::Path) {
+    /// Issue #325 reviewer P3-C: renamed from `init_bare_git_repo` — `git
+    /// init --quiet` creates an ordinary (non-`--bare`) repository, and the
+    /// old name was a misnomer in a codebase this documentation-heavy.
+    fn init_git_repo(dir: &std::path::Path) {
         std::fs::create_dir_all(dir).expect("create dir");
         let status = std::process::Command::new("git")
             .arg("init")
@@ -34316,7 +34332,7 @@ mod tests {
     fn root_checkout_has_live_sibling_fails_closed_on_daemon_error_response() {
         let tmp = tempdir().expect("tempdir");
         let dir = tmp.path().join("repo");
-        init_bare_git_repo(&dir);
+        init_git_repo(&dir);
 
         let _daemon = with_crafted_response_daemon(
             tmp.path(),
@@ -34344,7 +34360,7 @@ mod tests {
     fn root_checkout_has_live_sibling_fails_closed_on_legacy_agents_only_response() {
         let tmp = tempdir().expect("tempdir");
         let dir = tmp.path().join("repo");
-        init_bare_git_repo(&dir);
+        init_git_repo(&dir);
 
         let _daemon = with_crafted_response_daemon(
             tmp.path(),

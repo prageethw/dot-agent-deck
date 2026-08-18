@@ -1150,6 +1150,17 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
 /// killed clone leaves a half-created `clone_dir` behind exactly like a
 /// killed `git worktree add` does. `cleaned_up_by` carries the same meaning
 /// as [`WorktreeCreation::TimedOut`]'s field of the same name.
+///
+/// PRD fork#325 fix round 2 (reviewer P1): this variant is now also what a
+/// FAILED (not just timed-out) checkout produces, and what a `Failed` clone
+/// with the directory present produces (P2-B — a `git clone` that already
+/// created `clone_dir` before failing, e.g. "Clone succeeded, but checkout
+/// failed", is not a concurrent claim by another actor the way a `git
+/// worktree add` failure is; see `provision_isolated_clone_sync`'s doc
+/// comment). Both routes are covered by [`handle_isolated_clone_add_error`],
+/// which is what actually makes this doc comment's "the clone itself, and
+/// the branch checkout" claim true — round 1 stated it before the checkout
+/// step was wired to produce this variant at all.
 #[derive(Debug)]
 pub(crate) enum IsolatedCloneOutcome {
     Created { marker_warning: Option<String> },
@@ -1290,52 +1301,144 @@ pub(crate) fn provision_isolated_clone_sync(
         ],
         WORKTREE_GIT_TIMEOUT,
     );
-    match clone_result {
-        Ok(()) => {}
-        // Issue #325 auditor A4: a killed clone leaves a half-created
-        // `clone_dir` behind — best-effort clean it up now, mirroring
-        // `create_worktree_sync`'s identical `AddOutcome::TimedOut` handling,
-        // so the slug isn't wedged permanently with no path to recovery.
-        Err(AddError::TimedOut(e)) => {
-            return if clone_dir.exists() {
-                let cleaned_up_by = attempt_isolated_clone_cleanup(clone_dir, creator);
-                Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })
-            } else {
-                Err(e)
-            };
-        }
-        Err(AddError::Failed(e)) => {
-            return if clone_dir.exists() {
-                Ok(IsolatedCloneOutcome::AlreadyClaimed)
-            } else {
-                Err(e)
-            };
-        }
+    if let Err(err) = clone_result {
+        return handle_isolated_clone_add_error(err, clone_dir, creator);
     }
 
-    // Issue #325 reviewer P1-2: land on the branch the user actually typed.
-    let branch_exists = run_status_sync(
-        "git",
-        &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
-        WORKTREE_GIT_TIMEOUT,
-    )
-    .is_ok();
-    run_status_sync(
-        "git",
-        &crate::issue_dispatch::isolated_clone_checkout_argv(clone_dir, branch, branch_exists),
-        WORKTREE_GIT_TIMEOUT,
-    )
-    .map_err(|e| match e {
-        AddError::Failed(m) | AddError::TimedOut(m) => m,
-    })?;
-
-    // Issue #325 reviewer P1-1: point `origin` at the SOURCE's own origin
-    // URL rather than the local filesystem path `git clone` defaults it to.
+    // Issue #325 reviewer P1 (fix round 2): the origin fixup now runs
+    // IMMEDIATELY after the clone succeeds, before the branch probe and the
+    // checkout — nothing about it depends on the branch. Round 1 ran this
+    // AFTER the checkout, so a checkout failure (or a WORKTREE_GIT_TIMEOUT
+    // kill mid-checkout) left a fully populated, valid-looking clone, on the
+    // source's HEAD branch, with the dangerous local-path `origin` a plain
+    // `git clone` sets up still in place — P1-1's exact hazard, reinstated
+    // one step later in this same function. Running it first means no later
+    // failure in this function can leave that behind.
+    //
     // `git remote get-url`/`set-url`/`remove` are cheap local metadata reads
     // with no network I/O — the same class of call `git_common_dir` already
     // runs unbounded on this synchronous path (fork issue #388) — so this
     // deliberately does not add its own `WORKTREE_GIT_TIMEOUT`-bounded
     // subprocess plumbing for a one-line `Command::output()`.
+    let origin_warning = fixup_isolated_clone_origin(source_dir, clone_dir);
+
+    // Issue #325 reviewer P2-A: `worktree_branch_probe_argv` alone (probing
+    // only `refs/heads/<branch>`) is correct for the shared-checkout arm,
+    // whose `clone_dir` only ever grows LOCAL branches via earlier `git
+    // worktree add -b` calls — but wrong here. A FRESH `git clone` gives
+    // `refs/heads/` only the source's checked-out HEAD branch; every other
+    // branch the source had arrives as `refs/remotes/origin/<b>` only. So
+    // the plain probe always answered ABSENT for a real existing branch,
+    // and the code ran `git checkout -b <branch>`, silently creating a NEW
+    // branch at the clone's HEAD instead of attaching to the real one —
+    // reproduced empirically by the reviewer, discarding committed work.
+    // `isolated_clone_remote_branch_probe_argv` covers the second location;
+    // either probe succeeding is enough to use the attach form, since git's
+    // own checkout DWIM resolves a plain branch name against a
+    // remote-tracking ref of the same name and sets up tracking correctly.
+    //
+    // Ordering matters: this must run after the origin fixup above, since
+    // the attach form sets `branch.<b>.remote=origin`, which is only
+    // correct once `origin` genuinely points at the real remote.
+    let branch_exists = run_status_sync(
+        "git",
+        &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .is_ok()
+        || run_status_sync(
+            "git",
+            &crate::issue_dispatch::isolated_clone_remote_branch_probe_argv(clone_dir, branch),
+            WORKTREE_GIT_TIMEOUT,
+        )
+        .is_ok();
+    let checkout_result = run_status_sync(
+        "git",
+        &crate::issue_dispatch::isolated_clone_checkout_argv(clone_dir, branch, branch_exists),
+        WORKTREE_GIT_TIMEOUT,
+    );
+    if let Err(err) = checkout_result {
+        // Issue #325 reviewer P1: give the checkout the same
+        // cleanup-and-recovery treatment the clone step already has (via
+        // `handle_isolated_clone_add_error`), rather than the plain `Err`
+        // return round 1 left it with — that returned before this point
+        // with no cleanup, and (compounded by the origin fixup used to run
+        // AFTER this step) left the hazard above in place. It also
+        // permanently wedged the slug: every retry saw `clone_dir.exists()`
+        // and reported "clone already exists", naming no recovery command.
+        return handle_isolated_clone_add_error(err, clone_dir, creator);
+    }
+
+    let marker_warning = mark_worktree_owned_best_effort(clone_dir, creator);
+    let combined_warning = match (origin_warning, marker_warning) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(w), None) | (None, Some(w)) => Some(w),
+        (None, None) => None,
+    };
+    Ok(IsolatedCloneOutcome::Created {
+        marker_warning: combined_warning,
+    })
+}
+
+/// Shared failure handling for [`provision_isolated_clone_sync`]'s `git
+/// clone` and `git checkout` steps (PRD fork#325 fix round 2, reviewer
+/// P1/P2-B): both steps can leave `clone_dir` present after a failure —
+/// `git clone`'s own `Clone succeeded, but checkout failed` case, a
+/// `WORKTREE_GIT_TIMEOUT` kill mid-checkout, or a killed clone — and in
+/// every one of those cases `clone_dir`'s presence is OURS, not evidence
+/// that another actor claimed the slug: unlike `git worktree add`,
+/// `clone_dir.exists()` is checked INSIDE this function's attach lock,
+/// immediately before the clone runs (see the lock acquisition above), so a
+/// concurrent claim through any deck code path is impossible by
+/// construction here. Reporting it as `AlreadyClaimed` (round 1's
+/// treatment of a non-timeout `Failed`, borrowed from
+/// `classify_worktree_add_result`'s reasoning for `git worktree add`, which
+/// does not transfer) discarded the real git error and wedged the slug
+/// permanently. `TimedOut` — despite the name, now covering `Failed` too —
+/// is the right outcome for both: it cleans up the partial directory and
+/// gives the user the `rm -rf` recovery line via `ui.rs`'s existing arm.
+fn handle_isolated_clone_add_error(
+    err: AddError,
+    clone_dir: &Path,
+    creator: &str,
+) -> Result<IsolatedCloneOutcome, String> {
+    let e = match err {
+        AddError::TimedOut(e) | AddError::Failed(e) => e,
+    };
+    if clone_dir.exists() {
+        tracing::warn!(
+            clone = %clone_dir.display(),
+            error = %e,
+            "issue-dispatch: isolated clone left a partially-populated directory behind; cleaning up"
+        );
+        let cleaned_up_by = attempt_isolated_clone_cleanup(clone_dir, creator);
+        Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })
+    } else {
+        Err(e)
+    }
+}
+
+/// Point a freshly cloned `clone_dir`'s `origin` at `source_dir`'s own
+/// origin URL instead of the local filesystem path `git clone` defaults it
+/// to (reviewer P1-1) — or, when `source_dir` has no origin configured
+/// itself, remove the clone's default local-path `origin` entirely rather
+/// than leave a push able to land there silently (same risk either way; see
+/// `provision_isolated_clone_sync`'s doc comment for the full reasoning and
+/// the reviewer's verification of both branches).
+///
+/// PRD fork#325 fix round 2 (reviewer P2-C): both `git remote` calls used to
+/// discard their result with `let _ = …` — if either failed, the clone
+/// silently kept the dangerous local-path `origin`, P1-1's exact condition,
+/// with no record anywhere. Returns `Some(warning)` on failure instead, so
+/// the caller can surface it through the same `marker_warning` channel
+/// [`mark_worktree_owned_best_effort`] already uses for a failed ownership-
+/// marker write — this is at least as safety-critical as that.
+///
+/// The `--` end-of-options separator on the `set-url` call (matching
+/// auditor A2's hardening of the `git clone` argv above) guards against a
+/// source origin URL beginning with `-` being read as an option; `remove`
+/// takes no attacker-influenced argument, so it needs none.
+fn fixup_isolated_clone_origin(source_dir: &Path, clone_dir: &Path) -> Option<String> {
     let source_origin = std::process::Command::new("git")
         .current_dir(source_dir)
         .args(["remote", "get-url", "origin"])
@@ -1345,25 +1448,40 @@ pub(crate) fn provision_isolated_clone_sync(
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|url| !url.is_empty());
     match source_origin {
-        Some(url) => {
-            let _ = std::process::Command::new("git")
-                .current_dir(clone_dir)
-                .args(["remote", "set-url", "origin", &url])
-                .output();
-        }
+        Some(url) => match std::process::Command::new("git")
+            .current_dir(clone_dir)
+            .args(["remote", "set-url", "--", "origin", &url])
+            .output()
+        {
+            Ok(out) if out.status.success() => None,
+            Ok(out) => Some(format!(
+                "failed to point the clone's origin at the source's own origin ({url}): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => Some(format!(
+                "failed to point the clone's origin at the source's own origin ({url}): {e}"
+            )),
+        },
         None => {
             // `source_dir` itself has no origin — nothing better to point
             // at. Remove the local-path origin `git clone` set up rather
             // than leave a push able to land there silently.
-            let _ = std::process::Command::new("git")
+            match std::process::Command::new("git")
                 .current_dir(clone_dir)
                 .args(["remote", "remove", "origin"])
-                .output();
+                .output()
+            {
+                Ok(out) if out.status.success() => None,
+                Ok(out) => Some(format!(
+                    "failed to remove the clone's default local-path origin: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                Err(e) => Some(format!(
+                    "failed to remove the clone's default local-path origin: {e}"
+                )),
+            }
         }
     }
-
-    let marker_warning = mark_worktree_owned_best_effort(clone_dir, creator);
-    Ok(IsolatedCloneOutcome::Created { marker_warning })
 }
 
 /// Best-effort cleanup for an isolated `git clone` killed by
@@ -1390,6 +1508,16 @@ pub(crate) fn provision_isolated_clone_sync(
 /// cleanup whose failure already degrades gracefully to a named manual
 /// command.
 fn attempt_isolated_clone_cleanup(clone_dir: &Path, remover: &str) -> Option<String> {
+    // Issue #325 reviewer P3-E: a one-line guard that makes this
+    // destructive, unconditional `remove_dir_all` self-evidently safe to a
+    // future reader — this function is only ever called on a path we just
+    // created via `git clone`, under this function's own attach lock, so
+    // `.git` is always present in practice; the check costs nothing and
+    // means a future caller mistake (a wrong path passed in) removes
+    // nothing instead of silently deleting an unrelated directory.
+    if !clone_dir.join(".git").exists() {
+        return None;
+    }
     let removed = std::fs::remove_dir_all(clone_dir).is_ok();
     if removed && !clone_dir.exists() {
         Some(remover.to_string())
@@ -4523,6 +4651,259 @@ exit 0
              back at {}",
             source.display()
         );
+    }
+
+    /// Scenario: PRD fork#325 fix round 2 (reviewer P2-A), reproducing the
+    /// reviewer's own empirical transcript. The source repo has TWO
+    /// branches — `main` (checked out) and `clonegate1`, carrying a commit
+    /// `main` does not have. `provision_isolated_clone_sync` is called
+    /// typing `clonegate1` as the branch. Before this fix, `clonegate1`
+    /// arrives in the fresh clone ONLY as `refs/remotes/origin/clonegate1`
+    /// (never `refs/heads/clonegate1`), so the old `refs/heads/`-only probe
+    /// answered ABSENT and `git checkout -b clonegate1` silently created a
+    /// NEW branch at the clone's HEAD (`main`'s tip), discarding
+    /// `clonegate1`'s real commit. Asserts the clone attaches to the REAL
+    /// branch instead: HEAD is `clonegate1`'s own commit (not `main`'s),
+    /// and the file that commit added is present.
+    #[test]
+    fn provision_isolated_clone_sync_attaches_branch_that_exists_only_as_remote_tracking_ref() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let source = ws.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "--initial-branch=main", "--quiet"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        git(&source, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(source.join("README.md"), "seed\n").unwrap();
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "--quiet", "-m", "seed"]);
+
+        // A second branch, checked out only long enough to add a commit
+        // `main` never gets, then switched back to `main` — so the CLONE
+        // (which follows `git clone`'s own default of checking out the
+        // source's current HEAD, `main`) never has a local `clonegate1`
+        // head of its own to inherit; it only ever sees it via `origin`.
+        git(&source, &["checkout", "-b", "clonegate1"]);
+        std::fs::write(source.join("WORK.md"), "real work\n").unwrap();
+        git(&source, &["add", "WORK.md"]);
+        git(&source, &["commit", "--quiet", "-m", "real work"]);
+        let clonegate1_sha = std::process::Command::new("git")
+            .current_dir(&source)
+            .args(["rev-parse", "clonegate1"])
+            .output()
+            .expect("git rev-parse must spawn");
+        let clonegate1_sha = String::from_utf8_lossy(&clonegate1_sha.stdout)
+            .trim()
+            .to_string();
+        git(&source, &["checkout", "main"]);
+
+        let clone_dir = ws.path().join("source-clonegate1");
+        let result = provision_isolated_clone_sync(&source, &clone_dir, "clonegate1", "tester");
+        assert!(
+            matches!(result, Ok(IsolatedCloneOutcome::Created { .. })),
+            "isolated clone must succeed, got {result:?}"
+        );
+
+        let head_sha = std::process::Command::new("git")
+            .current_dir(&clone_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse must spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&head_sha.stdout).trim(),
+            clonegate1_sha,
+            "the clone must attach to the REAL `clonegate1` (source's commit), not create a \
+             fresh branch of the same name at the clone's HEAD (`main`'s commit) — that would \
+             silently discard the committed work"
+        );
+        assert!(
+            clone_dir.join("WORK.md").exists(),
+            "WORK.md (added on the real `clonegate1`) must be present — its absence means the \
+             branch was re-created from `main` instead of attached"
+        );
+    }
+
+    /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E). Two threads call
+    /// `provision_isolated_clone_sync` for the SAME `source_dir`/`clone_dir`
+    /// pair concurrently — the new attach lock (auditor A3) exists
+    /// specifically to serialize this. Asserts exactly one thread reports
+    /// `Created` and the other reports `AlreadyClaimed`, across many
+    /// trials, mirroring `worktree/create/001`'s own reasoning for why a
+    /// single trial proves nothing.
+    ///
+    /// `#[cfg(unix)]` matches `worktree/create/001`'s own precedent — many
+    /// trials of real `git` subprocesses (here, full clones, heavier than
+    /// that test's `worktree add`) starved `build-windows`'s shared CI
+    /// runner.
+    #[cfg(unix)]
+    #[test]
+    fn provision_isolated_clone_sync_concurrent_calls_never_both_create() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        const TRIALS: usize = 20;
+
+        let ws = tempfile::tempdir().unwrap();
+        let source = ws.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "--initial-branch=main", "--quiet"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        git(&source, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(source.join("README.md"), "seed\n").unwrap();
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "--quiet", "-m", "seed"]);
+
+        let barriers: Vec<std::sync::Barrier> =
+            (0..TRIALS).map(|_| std::sync::Barrier::new(2)).collect();
+
+        let results: Vec<[Result<IsolatedCloneOutcome, String>; 2]> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(TRIALS);
+            for (i, barrier) in barriers.iter().enumerate() {
+                let source = &source;
+                let clone_dir = ws.path().join(format!("source-race-{i}"));
+                let clone_dir_a = clone_dir.clone();
+                let clone_dir_b = clone_dir.clone();
+                let h_a = s.spawn(move || {
+                    barrier.wait();
+                    provision_isolated_clone_sync(source, &clone_dir_a, "race", "racer-a")
+                });
+                let h_b = s.spawn(move || {
+                    barrier.wait();
+                    provision_isolated_clone_sync(source, &clone_dir_b, "race", "racer-b")
+                });
+                handles.push((h_a, h_b));
+            }
+            handles
+                .into_iter()
+                .map(|(a, b)| [a.join().unwrap(), b.join().unwrap()])
+                .collect()
+        });
+
+        for (i, pair) in results.iter().enumerate() {
+            let created_count = pair
+                .iter()
+                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::Created { .. })))
+                .count();
+            let claimed_count = pair
+                .iter()
+                .filter(|r| matches!(r, Ok(IsolatedCloneOutcome::AlreadyClaimed)))
+                .count();
+            assert_eq!(
+                created_count, 1,
+                "trial {i}: exactly one caller must report Created, got {pair:?}"
+            );
+            assert_eq!(
+                claimed_count, 1,
+                "trial {i}: exactly one caller must report AlreadyClaimed, got {pair:?}"
+            );
+        }
+    }
+
+    /// Scenario: PRD fork#325 fix round 2 (reviewer P2-E, P2-B). Unit tests
+    /// `handle_isolated_clone_add_error` directly rather than inducing a
+    /// real `WORKTREE_GIT_TIMEOUT` (30s) wait through `provision_isolated_clone_sync`
+    /// — the function is a pure classifier over an `AddError` plus whatever
+    /// is actually on disk at `clone_dir`, so a real timeout is unnecessary
+    /// to exercise every branch. Covers three cases: (1) `TimedOut` with
+    /// the directory present — the original timeout-cleanup path,
+    /// unchanged; (2) `Failed` with the directory present — P2-B's fix,
+    /// asserting this is now ALSO `TimedOut` (cleaned up, recovery path
+    /// reported), never `AlreadyClaimed`; (3) either variant with the
+    /// directory absent — the error propagates unchanged, since there is
+    /// nothing to clean up.
+    #[test]
+    fn handle_isolated_clone_add_error_covers_timed_out_failed_and_absent() {
+        let ws = tempfile::tempdir().unwrap();
+
+        // Case 1: TimedOut, directory present (with a `.git` marker so
+        // P3-E's cleanup guard does not skip it) -> cleaned up, TimedOut.
+        let timed_out_dir = ws.path().join("timed-out");
+        std::fs::create_dir_all(timed_out_dir.join(".git")).unwrap();
+        let result = handle_isolated_clone_add_error(
+            AddError::TimedOut("simulated timeout".to_string()),
+            &timed_out_dir,
+            "tester",
+        );
+        assert!(
+            matches!(
+                result,
+                Ok(IsolatedCloneOutcome::TimedOut {
+                    cleaned_up_by: Some(ref who)
+                }) if who == "tester"
+            ),
+            "TimedOut + present must clean up and report TimedOut, got {result:?}"
+        );
+        assert!(
+            !timed_out_dir.exists(),
+            "the partially-populated directory must actually be removed"
+        );
+
+        // Case 2 (P2-B): Failed, directory present -> the SAME treatment as
+        // TimedOut, never AlreadyClaimed — a `git clone` failure with
+        // `clone_dir` present under this function's own attach lock is
+        // ours, not evidence of a concurrent claim.
+        let failed_dir = ws.path().join("failed-present");
+        std::fs::create_dir_all(failed_dir.join(".git")).unwrap();
+        let result = handle_isolated_clone_add_error(
+            AddError::Failed("simulated: Clone succeeded, but checkout failed".to_string()),
+            &failed_dir,
+            "tester",
+        );
+        assert!(
+            matches!(
+                result,
+                Ok(IsolatedCloneOutcome::TimedOut {
+                    cleaned_up_by: Some(ref who)
+                }) if who == "tester"
+            ),
+            "Failed + present must be treated exactly like TimedOut + present (cleaned up, \
+             TimedOut outcome), never AlreadyClaimed, got {result:?}"
+        );
+        assert!(
+            !failed_dir.exists(),
+            "the partially-populated directory must actually be removed"
+        );
+
+        // Case 3: either variant, directory absent -> the original git
+        // error propagates unchanged (nothing to clean up, nothing to
+        // wedge).
+        let absent_dir = ws.path().join("never-existed");
+        let result = handle_isolated_clone_add_error(
+            AddError::Failed("genuine git failure".to_string()),
+            &absent_dir,
+            "tester",
+        );
+        match result {
+            Err(ref e) if e == "genuine git failure" => {}
+            other => panic!(
+                "an absent directory means a genuine failure, not ours to clean up — the \
+                 original error must propagate, got {other:?}"
+            ),
+        }
     }
 
     /// Scenario: fork issue #282, async twin of `worktree/create/001`. The
