@@ -69,6 +69,13 @@ const TIMEOUT_ENV: &str = "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS";
 const IDLE_NEEDLE: &str = "has not responded with work-done (dot-agent-deck daemon report, not a \
                            message from a person or an agent)";
 
+/// The daemon-authored opening clause of `compose_worker_exited_notice`
+/// (issue #465 M2), spelled out here rather than imported from `src/` for the
+/// same "a silent rewording fails these tests instead of following them"
+/// reason as [`IDLE_NEEDLE`].
+const WORKER_EXITED_NEEDLE: &str =
+    "delegated worker exited without work-done (dot-agent-deck daemon report)";
+
 /// Ordinary `cat` worker stub: stays alive, never answers, dies on SIGTERM.
 const WORKER_COMMAND: &str = "cat";
 
@@ -1338,6 +1345,124 @@ fn idle_worker_016_pty_eof_retires_armed_delegation_and_silence_watch() {
             ),
             "the silence watch for the exited worker's pane was still armed 1s after its PTY \
              reached EOF — pump_reader's EOF path does not yet retire it (issue #465 M1)"
+        );
+
+        // Issue #465 M2: the retirement above is silent on its own — the
+        // orchestrator must also SEE that the worker exited, promptly, not
+        // after either watch's full timeout window. `wait_for_snapshot`
+        // returns as soon as the needle appears rather than sleeping out a
+        // fixed duration, so this also proves "promptly" rather than merely
+        // "eventually".
+        let notified = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains(WORKER_EXITED_NEEDLE),
+                Duration::from_secs(3),
+            )
+            .await;
+        assert!(
+            notified.contains(WORKER_EXITED_NEEDLE),
+            "the orchestrator pane never received the 'worker exited without work-done' notice \
+             within 3s of the worker's PTY reaching EOF (issue #465 M2); snapshot = {notified:?}"
+        );
+        assert!(
+            notified.contains(&worker_pane_id),
+            "the notice must name the exited worker's pane so the orchestrator knows which one \
+             to check, without having to interpolate the (untrusted, config-controlled) role \
+             name; snapshot = {notified:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a worker whose stub process holds the pane open for a beat, then have it call `work-done` and only afterwards let the stub exit ON ITS OWN (never a `StopAgent`, so no close-transition sweep runs — only the EOF sweep this PRD adds is in play, same as `scheduler/idle-worker/016`). The worker already retired its own records via `work-done`; the EOF sweep that follows must find nothing left to sweep and must not fire a second, spurious "exited without work-done" notice.
+#[spec("scheduler/idle-worker/017")]
+#[test]
+fn idle_worker_017_work_done_immediately_before_exit_suppresses_the_exit_notice() {
+    // Issue #465 M3's core claim, pinned here (directly adjacent to M2, cheap
+    // to add once the notice path exists): whichever path retires a pane's
+    // records first — `work-done` or the EOF sweep — must win cleanly, with
+    // no double notice and no lost `work-done`. This test drives the
+    // legitimate-`work-done`-then-exit ordering; `scheduler/idle-worker/016`
+    // above pins the opposite (no `work-done` at all) case.
+    //
+    // Deliberately NOT `AgentPtyRegistry::close_agent` to end the worker's
+    // process: `close_agent` removes the registry entry BEFORE killing its
+    // child (see `pump_reader`'s doc comment), which would make
+    // `is_agent_still_registered` false and skip the EOF sweep entirely —
+    // proving nothing about the race this test exists to cover. The stub
+    // below exits ON ITS OWN, exactly like `scheduler/idle-worker/016`'s,
+    // so the registry entry is still present when EOF fires and the sweep
+    // genuinely runs (and genuinely finds nothing, because `work_done()`
+    // below already retired both records first).
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("8000"));
+    const WORKER_ROLE: &str = "reports-then-exits-worker";
+    const EXIT_STUB: &str =
+        "stty -echo -icanon -icrnl -opost min 1 time 0; printf 'WORKER-READY'; sleep 1; exit 0";
+    runtime().block_on(async {
+        let harness = IdleHarness::with_workers(&[(WORKER_ROLE, EXIT_STUB)], None).await;
+        let worker_pane_id = worker_pane(WORKER_ROLE);
+        let worker_agent_id = harness
+            .worker_agent_ids
+            .get(WORKER_ROLE)
+            .expect("worker agent id recorded at spawn")
+            .clone();
+
+        let ready = harness
+            .wait_for_snapshot_of(
+                &worker_agent_id,
+                |snapshot| snapshot.contains("WORKER-READY"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            ready.contains("WORKER-READY"),
+            "the exit-stub worker never became ready; snapshot = {ready:?}"
+        );
+
+        harness.delegate(&[WORKER_ROLE]).await;
+        assert!(
+            harness.registry.pane_is_live(&worker_pane_id),
+            "the worker had already exited before delegate() could arm its records, so this \
+             test would prove nothing about the work-done-then-exit race"
+        );
+
+        // The worker reports completion BEFORE its process ends — the stub's
+        // own `sleep 1` has not elapsed yet, so this is the legitimate
+        // ordering this test exists to protect. `work_done()` retires both
+        // records synchronously via `AppState::handle_work_done`.
+        harness.work_done(WORKER_ROLE).await;
+
+        // Now let the stub's own `sleep 1; exit 0` produce PTY EOF naturally.
+        let observed_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            while harness.registry.pane_is_live(&worker_pane_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            observed_exit.is_ok(),
+            "the exit-stub worker never exited on its own after work-done, so the \
+             EOF-after-work-done race under test never occurred"
+        );
+
+        // A generous settle window — long enough for the EOF sweep to run (it
+        // is near-instant) and, if this regresses, long enough for a spurious
+        // notice to land too. Nowhere near the 8s armed window or the
+        // 120-minute/30-second production defaults.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert!(
+            !snapshot.contains(WORKER_EXITED_NEEDLE),
+            "a worker that called work-done before its process exited must not also produce the \
+             EOF-triggered 'exited without work-done' notice — the retirement work-done already \
+             performed made this record a no-op for the later sweep to find; snapshot = \
+             {snapshot:?}"
+        );
+        assert!(
+            !idle_mentions_role(&snapshot, WORKER_ROLE),
+            "the legitimate work-done must not be shadowed by a stray idle-worker prompt either; \
+             snapshot = {snapshot:?}"
         );
     });
 }

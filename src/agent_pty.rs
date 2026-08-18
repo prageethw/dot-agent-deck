@@ -1428,6 +1428,26 @@ impl AgentBus {
 /// never carried one (most unit-test fixtures), in which case there is
 /// nothing in the tracker keyed by it and the sweep is skipped.
 ///
+/// Issue #465 M2: when the sweep returns a non-empty `Vec<OutstandingDelegation>`,
+/// each record for which `pane_id` (the pane that just reached EOF) was the
+/// **worker** side — i.e. `record.orchestrator_pane_id != pane_id`, which rules
+/// out records this pane only touched as the *orchestrator* that issued them —
+/// gets [`AgentPtyRegistry::deliver_worker_exited_notice`]'s "exited without
+/// work-done" notice delivered to its orchestrator pane. That delivery is
+/// `async` (it goes through the identity-guarded
+/// [`AgentPtyRegistry::write_notice_guarded`]), but this function runs on a
+/// bare `std::thread` with no `tokio` runtime context of its own, so it cannot
+/// simply `.await` it. `runtime_handle` is a [`tokio::runtime::Handle`]
+/// captured with `try_current()` (never `current()`, which panics outside a
+/// runtime) at the SAME moment this thread was spawned — see
+/// [`AgentPtyRegistry::spawn_agent`]'s call site — and used here to
+/// `handle.spawn` the notice delivery onto that runtime instead. A `None`
+/// handle means `spawn_agent` itself ran with no runtime in scope (every
+/// production spawn happens inside the daemon's async request handling or a
+/// `tokio::spawn`ed dispatch task, so this is a synchronous unit-test fixture
+/// that never exercises this path) — in that case the notice cannot be
+/// delivered at all, which is logged rather than attempted.
+///
 /// "Without the daemon's own doing" is load-bearing: [`AgentPtyRegistry::close_agent`]
 /// and [`AgentPtyRegistry::respawn_agent_for_pane`] BOTH remove the agent's
 /// entry from the registry BEFORE killing its child, so by the time THIS
@@ -1457,6 +1477,7 @@ impl AgentBus {
 /// the thread never unblocks). A `Weak` upgrade fails harmlessly if the
 /// registry has already been dropped by the time EOF is observed — there is
 /// nothing left to sweep in that case either way.
+#[allow(clippy::too_many_arguments)]
 fn pump_reader(
     mut reader: Box<dyn std::io::Read + Send>,
     bus: Arc<AgentBus>,
@@ -1465,6 +1486,7 @@ fn pump_reader(
     registry: Weak<AgentPtyRegistry>,
     agent_id: String,
     pane_id_env: Option<String>,
+    runtime_handle: Option<tokio::runtime::Handle>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -1479,7 +1501,41 @@ fn pump_reader(
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
     {
-        registry.sweep_delegations_on_exit(pane_id);
+        let swept = registry.sweep_delegations_on_exit(pane_id);
+        // Issue #465 M2: only the records for which THIS pane was the WORKER
+        // side warrant an "exited without work-done" notice — a record this
+        // pane touched only as the orchestrator that issued it (its own
+        // `orchestrator_pane_id == pane_id`) means a DIFFERENT, still-live
+        // worker pane's delegation, and the orchestrator that would receive
+        // the notice is the pane that just exited, so there is nobody to
+        // notify.
+        let worker_exits: Vec<OutstandingDelegation> = swept
+            .into_iter()
+            .filter(|delegation| delegation.orchestrator_pane_id != pane_id)
+            .collect();
+        if !worker_exits.is_empty() {
+            match runtime_handle {
+                Some(handle) => {
+                    let pane_id = pane_id.to_string();
+                    let registry = registry.clone();
+                    handle.spawn(async move {
+                        for delegation in worker_exits {
+                            registry
+                                .deliver_worker_exited_notice(&pane_id, delegation)
+                                .await;
+                        }
+                    });
+                }
+                None => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        count = worker_exits.len(),
+                        "pane EOF: a worker exited without work-done, but no tokio runtime \
+                         handle was captured at spawn time, so its notice could not be delivered"
+                    );
+                }
+            }
+        }
     }
     change_notify.notify_one();
 }
@@ -3480,6 +3536,84 @@ impl AgentPtyRegistry {
         self.inner.lock().unwrap().agents.contains_key(agent_id)
     }
 
+    /// Issue #465 M2: deliver the "worker exited without work-done" notice for
+    /// one [`OutstandingDelegation`] [`Self::sweep_delegations_on_exit`] just
+    /// swept off `worker_pane_id`. Follows exactly the guarded-write path PRD
+    /// #249's silence watch already uses
+    /// ([`crate::state::arm_delegate_silence_watch`]'s tail): compose the
+    /// fixed-text notice, write it through
+    /// [`Self::write_notice_guarded`] bound to the orchestrator's registry
+    /// agent id captured when the delegation was armed, with a revalidation
+    /// closure that refuses a pane that is mid-close or has since been
+    /// re-homed into a different orchestration
+    /// ([`crate::state::orchestration_still_matches`]) — the same identity
+    /// guard every other daemon-authored notice in this file relies on, so a
+    /// pane id freed by the exit and reused by an unrelated agent cannot
+    /// receive this orchestration's diagnostics.
+    ///
+    /// Called from `pump_reader`'s EOF branch via a `tokio::runtime::Handle`
+    /// captured at spawn time, since the reader thread itself is a bare
+    /// `std::thread` with no async context of its own — see that function's
+    /// doc comment for why the handle can be absent and what happens then.
+    async fn deliver_worker_exited_notice(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        delegation: OutstandingDelegation,
+    ) {
+        let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
+        let orchestrator_pane_id = delegation.orchestrator_pane_id.clone();
+        let expected_agent_id = delegation.orchestrator_agent_id.clone();
+        let orchestration = delegation.orchestration.clone();
+        let revalidate_registry = Arc::clone(self);
+        let revalidate_pane = orchestrator_pane_id.clone();
+        let outcome = self
+            .write_notice_guarded(
+                &orchestrator_pane_id,
+                &notice,
+                Some(&expected_agent_id),
+                || async move {
+                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    crate::state::orchestration_still_matches(
+                        orchestration.as_ref(),
+                        revalidate_registry
+                            .pane_orchestration(&revalidate_pane)
+                            .as_ref(),
+                    )
+                },
+            )
+            .await;
+        match outcome {
+            Ok(GuardedSend::Applied) => tracing::info!(
+                worker_pane_id = %worker_pane_id,
+                role = %delegation.role,
+                "pane EOF: reported a worker that exited without work-done to the orchestrator"
+            ),
+            // Some bytes reached the authorized target; a retry would
+            // duplicate a half-written line rather than repair it.
+            Ok(GuardedSend::Ambiguous) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %delegation.role,
+                "pane EOF: worker-exited notice delivery was ambiguous (partial write); not \
+                 retried"
+            ),
+            Ok(refused) => tracing::debug!(
+                pane_id = %orchestrator_pane_id,
+                role = %delegation.role,
+                expected_agent_id = %expected_agent_id,
+                outcome = ?refused,
+                "pane EOF: identity gate refused the worker-exited notice; nothing written"
+            ),
+            Err(e) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %delegation.role,
+                error = %e,
+                "pane EOF: failed to write the worker-exited notice into the orchestrator pane"
+            ),
+        }
+    }
+
     /// PRD #126: whether `pane_id` is between [`Self::begin_pane_close`] and
     /// [`Self::finish_pane_close`]. The idle watch re-checks this immediately
     /// before writing (inside the guarded-send revalidation) so a close that
@@ -4185,6 +4319,16 @@ impl AgentPtyRegistry {
         let registry_for_thread = Arc::downgrade(self);
         let agent_id_for_thread = preallocated_id.clone();
         let pane_id_env_for_thread = pane_id_env.clone();
+        // Issue #465 M2: captured HERE, at spawn time, rather than inside
+        // `pump_reader` itself — `Handle::try_current()` must run on a
+        // thread that is currently inside a tokio runtime, and `spawn_agent`
+        // (this method) is that thread; the detached reader thread below
+        // never is. Deliberately `try_current()`, never `current()`: this
+        // method is also called from plenty of synchronous `#[test]`
+        // fixtures with no runtime in scope at all, and `current()` panics
+        // in that case instead of returning `None` — see `pump_reader`'s doc
+        // comment for what a `None` handle means at EOF time.
+        let runtime_handle_for_thread = tokio::runtime::Handle::try_current().ok();
         // Detached thread: exits when the PTY returns EOF (child killed).
         // On exit, pump_reader sets `exited` and signals `change_notify` so
         // the idle monitor learns about the death immediately instead of
@@ -4198,6 +4342,7 @@ impl AgentPtyRegistry {
                 registry_for_thread,
                 agent_id_for_thread,
                 pane_id_env_for_thread,
+                runtime_handle_for_thread,
             )
         });
 

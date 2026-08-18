@@ -1444,7 +1444,7 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 /// and the registry membership holds only the un-defaulted field, so the two
 /// sources can disagree about the cwd for a perfectly healthy pane — a
 /// comparison that would refuse a legitimate nudge.
-fn orchestration_still_matches(
+pub(crate) fn orchestration_still_matches(
     expected: Option<&OrchestrationIdentity>,
     live: Option<&crate::agent_pty::PaneOrchestration>,
 ) -> bool {
@@ -1767,6 +1767,53 @@ fn compose_delegate_silence_notice(window: std::time::Duration) -> String {
          received its task pointer but then emitted no agent event within {window}. It may never \
          have received the prompt; check the worker panes. The daemon log names the worker pane \
          and role (RUST_LOG=pane_write=trace also has the delivered bytes)."
+    ))
+}
+
+/// Issue #465 M2: the single-line notice written into the orchestrator's pane
+/// when a delegated worker's PROCESS exited without ever calling `work-done` —
+/// detected by `pump_reader`'s EOF branch retiring the worker's still-armed
+/// [`crate::agent_pty::OutstandingDelegation`] via
+/// [`crate::agent_pty::AgentPtyRegistry::sweep_delegations_on_exit`], rather
+/// than either timeout watch running out its own window. This is a distinct
+/// symptom from [`compose_delegate_silence_notice`]'s (a worker that received
+/// its pointer and stayed quiet while still *running*): here the process is
+/// gone, which is unambiguous, so there is nothing to wait out.
+///
+/// Deliberately matches [`compose_delegate_silence_notice`]'s precedent, not
+/// [`compose_idle_worker_prompt`]'s — PRD #465's own Decisions table calls
+/// this out explicitly, citing PRD #249's review:
+///
+/// * **Not submitted.** Delivered with
+///   [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`], the same
+///   LF-terminated, non-submitting path #249's silence notice uses — this
+///   only makes an invisible failure visible, it does not hand the
+///   orchestrator a turn to answer.
+/// * **Fixed daemon-authored text — no role name, no delegated task text.**
+///   PRD #465's own draft wording floats interpolating the role and "its
+///   last known task", but neither is actually available to interpolate
+///   safely here: [`crate::agent_pty::OutstandingDelegation`] carries no
+///   delegated-task text at all (only `dispatch_one_owned`'s local `task`
+///   argument does, and it is never persisted onto the record), and a role
+///   name is exactly the value PRD #249's own review (finding B3) removed
+///   from this notice family on purpose — a `write_notice_guarded` delivery
+///   cannot guarantee its LF is read as Enter (see that method's own doc
+///   comment), so a later ordinary write can concatenate this notice's raw
+///   bytes with the NEXT real prompt, which defeats
+///   [`quote_untrusted_role`]'s framing guarantee (that guarantee assumes the
+///   frame arrives as one whole, distinct turn). The pane id, by contrast, is
+///   a daemon-internal identifier (`format!("pane-{{nonce:016x}}-{{seq}}")`,
+///   never derived from repository config or agent output) and carries none
+///   of that risk, so it is interpolated raw. Role and elapsed-armed detail
+///   stay in the `tracing::info!`/`warn!` that always accompanies delivery —
+///   exactly #249's own resolution: the pane gets "a worker exited, look at
+///   the log," the log gets the identifying detail.
+pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
+    compose_delegate_prompt(&format!(
+        "⚠ delegated worker exited without work-done (dot-agent-deck daemon report): the process \
+         behind pane {worker_pane_id} ended and no work-done was ever received for its \
+         outstanding delegation. Check that pane's scrollback for what happened; the daemon log \
+         names the role and how long it had been delegated."
     ))
 }
 
@@ -7990,6 +8037,27 @@ clear = false
             compose_delegate_silence_notice(std::time::Duration::from_secs(30))
                 .contains("within 30 seconds"),
             "a whole-second window must not be rendered as milliseconds"
+        );
+    }
+
+    /// Scenario: Compose the issue #465 M2 "worker exited without work-done" notice for a made-up pane id and assert it names the pane, stays single-line, and — matching PRD #249 finding B3's precedent exactly — carries no quoted-untrusted role field, because it carries no role at all.
+    #[test]
+    fn compose_worker_exited_notice_carries_no_role_or_task_interpolation() {
+        let notice = compose_worker_exited_notice("pane-deadbeefdeadbeef-3");
+
+        assert!(
+            !notice.contains('\n'),
+            "the notice must stay single-line so it lands as plain bytes: {notice:?}"
+        );
+        assert!(
+            notice.contains("pane-deadbeefdeadbeef-3"),
+            "the notice must name the exited pane so the orchestrator knows which worker to \
+             check: {notice:?}"
+        );
+        assert!(
+            !notice.contains("UNTRUSTED-ROLE-LABEL"),
+            "the notice must carry no role at all — role and task detail stay in the daemon log \
+             only, matching PRD #249's finding B3 precedent: {notice:?}"
         );
     }
 
