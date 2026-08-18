@@ -179,7 +179,7 @@ See [Remote Environments › Getting files to the remote](remote-environments.md
 When something goes wrong and the dashboard's status messages aren't enough to diagnose it, set the `DOT_AGENT_DECK_LOG` environment variable to capture tracing output to a file:
 
 ```bash
-# Default — writes to /tmp/dot-agent-deck.log
+# Default — writes to <state dir>/deck.log (e.g. ~/.local/state/dot-agent-deck/deck.log on Linux)
 DOT_AGENT_DECK_LOG=1 dot-agent-deck
 
 # Custom path

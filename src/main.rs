@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use dot_agent_deck::build_version_handshake;
-use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
+use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path, state_dir};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::DaemonClient;
@@ -1812,16 +1812,26 @@ async fn run_dashboard() -> ExitCode {
 /// soundness invariant the login-shell PATH capture relies on.
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
-        let log_path = if log_val.is_empty() || log_val == "1" {
-            "/tmp/dot-agent-deck.log".to_string()
+        let is_default = log_val.is_empty() || log_val == "1";
+        let log_path = if is_default {
+            let dir = state_dir();
+            if let Err(e) = dot_agent_deck::platform::fsperm::ensure_owner_only_dir(&dir) {
+                warn_log_setup_failure("create owner-only state dir", &dir, e);
+                return;
+            }
+            dir.join("deck.log")
         } else {
-            log_val
+            std::path::PathBuf::from(log_val)
         };
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        let open_result = if is_default {
+            open_deck_log_file(&log_path)
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+        };
+        match open_result {
             Ok(log_file) => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
@@ -1833,10 +1843,49 @@ fn init_logging_from_env() {
                     .init();
             }
             Err(e) => {
-                eprintln!("Warning: failed to open log file {log_path}: {e}");
+                warn_log_setup_failure("open log file", &log_path, e);
             }
         }
     }
+}
+
+/// Opens the default `deck.log` with the same symlink/mode hardening
+/// `daemon.log` already has (`platform/detach/unix.rs`): `O_NOFOLLOW` +
+/// mode `0o600`, refusing rather than following a pre-planted symlink at the
+/// exact log path. Applies only to the default `state_dir()`-derived path —
+/// `init_logging_from_env`'s explicit `DOT_AGENT_DECK_LOG=<path>` branch is
+/// user-specified and stays on the unhardened open, matching how the rest of
+/// this fix draws that line.
+#[cfg(unix)]
+fn open_deck_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(log_path)
+    {
+        Ok(f) => Ok(f),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(std::io::Error::other(format!(
+            "log path {} is a symlink — refusing to follow (someone may have planted it to redirect log output)",
+            log_path.display()
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_deck_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+}
+
+fn warn_log_setup_failure(action: &str, path: &std::path::Path, e: impl std::fmt::Display) {
+    eprintln!("Warning: failed to {action} {}: {e}", path.display());
 }
 
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
@@ -3300,5 +3349,63 @@ mod tests {
                  must be treated as unverifiable, not as success: {line}"
             );
         }
+    }
+
+    // --- issue #467 F1: `open_deck_log_file`'s symlink refusal + file mode ---
+
+    /// Scenario: pre-create the log path as a symlink to another file, call
+    /// `open_deck_log_file` directly against it, and confirm it returns an
+    /// error — the `O_NOFOLLOW`/`ELOOP` refusal — instead of silently
+    /// opening and writing through the symlink.
+    #[test]
+    #[cfg(unix)]
+    fn open_deck_log_file_refuses_a_preexisting_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("elsewhere.log");
+        std::fs::write(&target, b"not the deck log\n").expect("write symlink target");
+        let log_path = dir.path().join("deck.log");
+        std::os::unix::fs::symlink(&target, &log_path).expect("create symlink");
+
+        let err = open_deck_log_file(&log_path)
+            .expect_err("a pre-planted symlink at the log path must be refused, not followed");
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal error should name the symlink as the cause: {err}"
+        );
+
+        // Refusing means never opening through the symlink at all, not
+        // opening-then-erroring — the target must be untouched.
+        let target_contents =
+            std::fs::read_to_string(&target).expect("symlink target must still be readable");
+        assert_eq!(
+            target_contents, "not the deck log\n",
+            "the symlink target must not have been truncated or appended to"
+        );
+    }
+
+    /// Scenario: call `open_deck_log_file` against a fresh, non-symlinked
+    /// path and confirm the file it creates is mode `0o600` — the
+    /// file-mode half `lifecycle/log-path/001` doesn't cover, since that
+    /// e2e test only asserts the parent directory's mode (`0o700`).
+    #[test]
+    #[cfg(unix)]
+    fn open_deck_log_file_creates_a_fresh_file_at_mode_0o600() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("deck.log");
+
+        let file =
+            open_deck_log_file(&log_path).expect("a fresh, non-symlinked path must open cleanly");
+        drop(file);
+
+        let mode = std::fs::metadata(&log_path)
+            .expect("the log file must exist after a successful open")
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected the log file to be created owner-only (mode 0o600), got {mode:#o}"
+        );
     }
 }
