@@ -1131,6 +1131,95 @@ async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Resul
     Ok(())
 }
 
+/// [`provision_isolated_clone_sync`]'s two possible successes — deliberately
+/// its OWN, narrower enum rather than reusing [`WorktreeCreation`]: that type
+/// also carries `TimedOut`/`BranchExists`, which describe `git worktree add`
+/// TOCTOU shapes this function's plain `git clone` can't produce, and giving
+/// this caller a type that can only ever express what can actually happen is
+/// better than an exhaustive match padded with "structurally unreachable"
+/// arms (the pattern [`create_worktree_sync`]'s own caller already accepts
+/// for `BranchExists`, but not one worth repeating for TWO more variants
+/// here).
+#[derive(Debug)]
+pub(crate) enum IsolatedCloneOutcome {
+    Created { marker_warning: Option<String> },
+    AlreadyClaimed,
+}
+
+/// PRD fork#325 M3 sync twin, structurally mirroring [`provision_repo`]'s
+/// clone-if-absent shape, for `src/ui.rs`'s `Action::SpawnPane` dispatch —
+/// synchronous, exactly like [`create_worktree_sync`] is the sync twin of
+/// [`create_worktree`] for the same reason (that dispatch runs on the TUI's
+/// synchronous render/event loop and cannot `.await`).
+///
+/// Deliberate deviation from the design draft's suggestion to derive an
+/// `owner/name` repo slug from `source_dir`'s `origin` remote and route
+/// through `gh repo clone` (mirroring `provision_repo` exactly): verified
+/// unreliable for precisely the case this gate exists to handle. The
+/// `orchestration/worktree/014` e2e fixture this feature is pinned against —
+/// an ordinary `git init`-only checkout, no `origin` configured at all — is
+/// not a test artifact; it is representative of any local project a user
+/// opens the deck against without ever adding a remote. Requiring an
+/// `origin` would make the Nth-concurrent-orchestration gate refuse to
+/// isolate exactly the ordinary case it exists to isolate. `source_dir` is
+/// already a valid, present, local git repository by construction — it is
+/// the SAME `req.dir` [`create_worktree_sync`] would otherwise `git
+/// worktree add` against — so a plain LOCAL `git clone` needs no network
+/// access, no `gh` auth, and no repo-identity derivation at all: it
+/// produces an independent `.git` object store (this function's whole
+/// purpose — `orchestration/worktree/014` asserts exactly that, a distinct
+/// `git rev-parse --git-common-dir`), while still getting git's own
+/// local-clone hardlink optimization for object storage for free.
+///
+/// `clone_dir` is the SAME resolved sibling path (`<launch-dir>-<slug>`)
+/// [`create_worktree_sync`] would have targeted — not a separately-named
+/// location — so the on-disk result is where the user's typed slug says it
+/// should be regardless of which provisioning mechanism the gate picked; see
+/// the PRD's Design step 5 ("where the isolated clone lives on disk" is
+/// otherwise undecided by the PRD itself). A pre-existing directory at that
+/// path is therefore treated exactly like [`create_worktree_sync`] treats
+/// one — [`IsolatedCloneOutcome::AlreadyClaimed`], a refusal, never a silent
+/// reuse/refresh — since the path was already meant to be fresh.
+///
+/// No attach lock is taken here (unlike [`create_worktree_sync`]'s
+/// [`worktree_attach_lock_path`]): that lock exists to serialize concurrent
+/// `git worktree add` calls racing for the SAME shared checkout, but
+/// `clone_dir` here is unique per live orchestration instance (keyed off
+/// [`crate::issue_dispatch::sanitize_clone_segment`]-shaped identity
+/// upstream, at the call site) — no second caller is ever racing for this
+/// exact path, so there is no shared resource to contend over.
+///
+/// PRD fork#325 M4 (future, not this milestone): [`crate::worktree_reclaim`]'s
+/// ownership-marker scanning assumes every marked directory is a linked
+/// worktree of a known clone root; an isolated clone is its own independent
+/// repository, invisible to that scan today. The marker is still written
+/// (best-effort, matching every other creation path) so a future M4 fix has
+/// something to find — it just does not do anything yet.
+pub(crate) fn provision_isolated_clone_sync(
+    source_dir: &Path,
+    clone_dir: &Path,
+    creator: &str,
+) -> Result<IsolatedCloneOutcome, String> {
+    ensure_worktree_parent_dir(clone_dir)?;
+    if clone_dir.exists() {
+        return Ok(IsolatedCloneOutcome::AlreadyClaimed);
+    }
+    run_status_sync(
+        "git",
+        &[
+            "clone".to_string(),
+            source_dir.to_string_lossy().into_owned(),
+            clone_dir.to_string_lossy().into_owned(),
+        ],
+        WORKTREE_GIT_TIMEOUT,
+    )
+    .map_err(|e| match e {
+        AddError::Failed(m) | AddError::TimedOut(m) => m,
+    })?;
+    let marker_warning = mark_worktree_owned_best_effort(clone_dir, creator);
+    Ok(IsolatedCloneOutcome::Created { marker_warning })
+}
+
 /// Keep the per-issue worktrees dir (`<clone>/.worktrees/`) out of the clone's
 /// `git status` WITHOUT touching the user's tracked files: append `.worktrees/`
 /// to the clone's LOCAL exclude file (`<clone>/.git/info/exclude`) — never a
@@ -1782,7 +1871,13 @@ fn worktree_attach_lock_path_from_common_dir(common_dir: &Path, worktree_dir: &P
 /// function — see [`git_common_dir_async`], its bounded counterpart, added
 /// by fork #282 final-pass F3 for exactly the async call site #388 does not
 /// cover.
-fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
+///
+/// `pub(crate)` since PRD fork#325 M3: `src/ui.rs`'s Nth-concurrent-
+/// orchestration gate reuses this exact resolution (not a re-derivation) to
+/// decide whether a target root checkout already shares its object store
+/// with a live orchestration's working directory — the same "ask git, don't
+/// assume `.git` is a directory" reasoning applies identically there.
+pub(crate) fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
     let out = std::process::Command::new("git")
         .current_dir(clone_dir)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])

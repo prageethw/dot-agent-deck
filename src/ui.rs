@@ -1042,6 +1042,81 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
     (cwds, titles)
 }
 
+/// PRD fork#325 M3: the Nth-concurrent-orchestration GATE — does
+/// `target_dir` (the root checkout `Action::SpawnPane` is about to provision
+/// against) already share its `.git` object store with a LIVE
+/// orchestration's working directory? This is the correctness signal M3
+/// decides worktree-vs-isolated-clone provisioning on.
+///
+/// Deliberately NOT [`live_orchestration_in_same_cwd`]'s raw path-equality
+/// compare, which only catches two orchestrations sharing the exact same
+/// pane cwd (the no-worktree-slug case). The actual #325 incident shape is N
+/// orchestrations each carving their OWN worktree sibling off one shared
+/// checkout — `orchestration_cwd` for each of those is the WORKTREE path,
+/// never `target_dir` itself (see [`crate::tab::TabManager::open_orchestration_tab`],
+/// which stamps `orchestration_cwd: Some(cwd.to_string())` where `cwd` is
+/// the already-resolved worktree dir) — so raw equality against `target_dir`
+/// can't see the collision at all. Comparing `--git-common-dir` can: for any
+/// worktree `git worktree add` carved off `target_dir`, its common dir
+/// resolves to `target_dir`'s own `.git`, which is exactly the signal that
+/// matters for the actual risk (concurrent git operations against one
+/// shared object store) regardless of where each sibling's working
+/// directory happens to sit on disk.
+///
+/// Fails CLOSED (`Err`) on ANY daemon-query problem — unlike every other
+/// consumer of `ListAgents` on this same seam ([`live_orchestration_cwds_and_titles`],
+/// a best-effort HINT that fails open by design): this is a correctness
+/// GATE, and a down/wedged daemon silently reporting "nothing live" would
+/// reintroduce #325's exact race under ambiguous state. Bounded by
+/// [`DAEMON_REQUEST_TIMEOUT`] (the same default every other correctness-
+/// sensitive blocking daemon round-trip in this file uses), not
+/// [`DAEMON_HINT_TIMEOUT`]'s much tighter 250ms — a gate needs a real answer,
+/// not a best-effort one, so refusing to spawn is preferred over a false
+/// refusal caused by a daemon that is merely slow rather than actually down.
+///
+/// A single LIVE entry whose own `git-common-dir` fails to resolve (e.g. its
+/// worktree was removed after the daemon's record went stale) is skipped
+/// rather than failing the whole gate closed — `git rev-parse
+/// --git-common-dir` takes no lock and does no network I/O, so a failure
+/// there reflects a genuinely gone directory, not contention; the daemon
+/// being unreachable at all (the actual failure mode #325's race depends on)
+/// is what closes the gate, not one stale record among possibly several
+/// live ones.
+fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
+    let resp = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
+        .map_err(|e| format!("could not reach the daemon to check for live orchestrations: {e}"))?;
+
+    let target_common = crate::issue_dispatch_run::git_common_dir(target_dir).map_err(|e| {
+        format!(
+            "could not resolve {}'s git common dir: {e}",
+            target_dir.display()
+        )
+    })?;
+    let target_common = std::fs::canonicalize(&target_common).unwrap_or(target_common);
+
+    let mut seen_cwds: HashSet<String> = HashSet::new();
+    for r in resp.agent_records.unwrap_or_default() {
+        let Some(TabMembership::Orchestration {
+            orchestration_cwd: Some(cwd),
+            ..
+        }) = r.tab_membership
+        else {
+            continue;
+        };
+        if !seen_cwds.insert(cwd.clone()) {
+            continue;
+        }
+        let Ok(live_common) = crate::issue_dispatch_run::git_common_dir(Path::new(&cwd)) else {
+            continue;
+        };
+        let live_common = std::fs::canonicalize(&live_common).unwrap_or(live_common);
+        if live_common == target_common {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
 /// in [`Action::FormFocusField`] (a click on a field's row focuses it, the
 /// same as Tab landing there).
@@ -10323,94 +10398,153 @@ fn dispatch_action(
                             // shared computation the restore path also calls,
                             // so the two can't drift apart.
                             creator = Some(orchestration_creator_string(typed_name));
-                            match crate::issue_dispatch_run::create_worktree_sync(
-                                &req.dir,
-                                worktree_path,
-                                &branch,
-                                creator.as_deref().expect("just assigned above"),
-                            ) {
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::Created {
-                                    marker_warning,
-                                }) => {
-                                    worktree_marker_warning = marker_warning;
-                                    worktree_path.display().to_string()
-                                }
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed) => {
+                            // PRD fork#325 M3: decide SHARED vs ISOLATED
+                            // before touching disk. See
+                            // `root_checkout_has_live_sibling`'s doc comment
+                            // for the collision signal (a shared
+                            // `--git-common-dir`, not raw cwd equality) and
+                            // the fail-closed decision on a daemon query
+                            // failure this branches on.
+                            match root_checkout_has_live_sibling(&req.dir) {
+                                Err(reason) => {
                                     ui.status_message = Some((
                                         format!(
-                                            "Orchestration failed: worktree already exists at {}",
-                                            worktree_path.display()
+                                            "Orchestration failed: could not confirm no other \
+                                             live orchestration already shares {} — {reason}",
+                                            req.dir.display()
                                         ),
                                         std::time::Instant::now(),
                                     ));
                                     return Flow::Continue;
                                 }
-                                // Fork #122/#123 re-audit (P2): distinct from
-                                // `AlreadyClaimed` above — `git worktree add`
-                                // was killed for taking too long, not beaten
-                                // by another actor, and it may have left a
-                                // half-created directory behind that
-                                // permanently wedges this slug unless
-                                // cleared. Name the exact path and exact
-                                // command rather than falling back to the
-                                // deck's cwd.
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
-                                    cleaned_up_by,
-                                }) => {
-                                    let detail = if let Some(remover) = cleaned_up_by.as_deref() {
-                                        // Issue #325 reviewer P2-2: the identity
-                                        // is always the same `creator` this
-                                        // request just supplied, so it carries
-                                        // no NEW information for the status
-                                        // line -- but it is still worth a log
-                                        // line for a post-incident reader
-                                        // grepping DOT_AGENT_DECK_LOG, and it
-                                        // was previously discarded entirely.
-                                        tracing::info!(
-                                            path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
-                                            remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                                            "worktree add timed out; half-created directory removed automatically"
-                                        );
-                                        "the half-created directory was removed automatically — try again".to_string()
-                                    } else {
-                                        format!(
-                                            "run `git -C {} worktree remove --force {}` to clear it, then try again",
-                                            req.dir.display(),
-                                            worktree_path.display()
-                                        )
-                                    };
-                                    ui.status_message = Some((
-                                        format!(
-                                            "Orchestration failed: worktree add timed out at {} — {detail}",
-                                            worktree_path.display()
-                                        ),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
-                                // `create_worktree_sync` always attaches an
-                                // existing branch rather than refusing it, so
-                                // this variant is structurally unreachable
-                                // from this call site — kept only because the
-                                // match must stay exhaustive against the
-                                // shared `WorktreeCreation` enum.
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::BranchExists) => {
-                                    ui.status_message = Some((
-                                        format!(
-                                            "Orchestration failed: branch already exists for {}",
-                                            worktree_path.display()
-                                        ),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
-                                Err(e) => {
-                                    ui.status_message = Some((
-                                        format!("Orchestration failed: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
+                                // 1st orchestration against this root
+                                // checkout — unaffected, exactly today's
+                                // `git worktree add` sibling path.
+                                Ok(false) => match crate::issue_dispatch_run::create_worktree_sync(
+                                    &req.dir,
+                                    worktree_path,
+                                    &branch,
+                                    creator.as_deref().expect("just assigned above"),
+                                ) {
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::Created {
+                                        marker_warning,
+                                    }) => {
+                                        worktree_marker_warning = marker_warning;
+                                        worktree_path.display().to_string()
+                                    }
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed) => {
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: worktree already exists at {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // Fork #122/#123 re-audit (P2): distinct from
+                                    // `AlreadyClaimed` above — `git worktree add`
+                                    // was killed for taking too long, not beaten
+                                    // by another actor, and it may have left a
+                                    // half-created directory behind that
+                                    // permanently wedges this slug unless
+                                    // cleared. Name the exact path and exact
+                                    // command rather than falling back to the
+                                    // deck's cwd.
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
+                                        cleaned_up_by,
+                                    }) => {
+                                        let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                            // Issue #325 reviewer P2-2: the identity
+                                            // is always the same `creator` this
+                                            // request just supplied, so it carries
+                                            // no NEW information for the status
+                                            // line -- but it is still worth a log
+                                            // line for a post-incident reader
+                                            // grepping DOT_AGENT_DECK_LOG, and it
+                                            // was previously discarded entirely.
+                                            tracing::info!(
+                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                                "worktree add timed out; half-created directory removed automatically"
+                                            );
+                                            "the half-created directory was removed automatically — try again".to_string()
+                                        } else {
+                                            format!(
+                                                "run `git -C {} worktree remove --force {}` to clear it, then try again",
+                                                req.dir.display(),
+                                                worktree_path.display()
+                                            )
+                                        };
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: worktree add timed out at {} — {detail}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // `create_worktree_sync` always attaches an
+                                    // existing branch rather than refusing it, so
+                                    // this variant is structurally unreachable
+                                    // from this call site — kept only because the
+                                    // match must stay exhaustive against the
+                                    // shared `WorktreeCreation` enum.
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::BranchExists) => {
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: branch already exists for {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Orchestration failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                },
+                                // Nth-concurrent orchestration against a root
+                                // checkout a live sibling already shares —
+                                // isolate via its own clone instead of a
+                                // `git worktree add` sibling of the shared
+                                // checkout. Same resolved sibling PATH
+                                // (`worktree_path`) as the shared case above
+                                // — only the provisioning mechanism differs.
+                                Ok(true) => match crate::issue_dispatch_run::provision_isolated_clone_sync(
+                                    &req.dir,
+                                    worktree_path,
+                                    creator.as_deref().expect("just assigned above"),
+                                ) {
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                                        marker_warning,
+                                    }) => {
+                                        worktree_marker_warning = marker_warning;
+                                        worktree_path.display().to_string()
+                                    }
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::AlreadyClaimed) => {
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: worktree already exists at {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Orchestration failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                },
                             }
                         }
                         None => dir_str,
@@ -33655,6 +33789,128 @@ mod tests {
         assert!(
             !message.is_empty(),
             "worktree creation failure must surface a status message, not fail silently"
+        );
+    }
+
+    /// Scenario: Submit an orchestration form with a typed worktree slug
+    /// against a directory that IS a genuine, valid git repository (unlike
+    /// `worktree_002`'s deliberately-broken one — the only thing standing
+    /// between this spawn and success is the gate itself), but with the
+    /// daemon's attach socket redirected to a path nothing is listening on —
+    /// a stand-in for a down/wedged daemon. Dispatch the real
+    /// `Action::SpawnPane`. PRD fork#325 M3's Nth-concurrent-orchestration
+    /// gate must FAIL CLOSED: refuse the spawn through the same status-
+    /// message-driven refusal path `worktree_002` exercises for a plain
+    /// `git worktree add` failure, never silently proceed as if no live
+    /// sibling orchestration exists — which would reintroduce #325's exact
+    /// race under exactly the ambiguous state (daemon down/unreachable) the
+    /// PRD's own Design step 4 flags as the danger of failing open here.
+    #[spec("orchestration/worktree/015")]
+    #[test]
+    fn worktree_015_daemon_unreachable_refuses_spawn_fail_closed() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .status()
+            .expect("run git init");
+        assert!(
+            status.success(),
+            "git init must succeed for this test's precondition repo"
+        );
+
+        // Point the attach socket at a path nothing is listening on — the
+        // same env-var override technique `platform::paths` tests already
+        // use for this, guarded by the same process-wide lock since env
+        // vars are process-global state shared across parallel tests.
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+        let no_daemon_here = tmp.path().join("no-daemon-here.sock");
+        // SAFETY: env-var lock held above; the previous value is restored
+        // before this guard is dropped, below.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &no_daemon_here);
+        }
+
+        let mut form = NewPaneFormState::new(
+            dir.clone(),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_worktree_slug("my-feature".to_string());
+        form.selection_index = 1;
+
+        let req = build_new_pane_request(&form, "claude");
+        assert!(
+            req.orchestration_worktree_path.is_some(),
+            "precondition: the form must resolve a worktree path to attempt creating"
+        );
+        let worktree_path = req
+            .orchestration_worktree_path
+            .clone()
+            .expect("just asserted Some above");
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_attach {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+            }
+        }
+
+        // Fail-closed: no tab was created...
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "a down/unreachable daemon must refuse the spawn (fail closed), never silently \
+             open the orchestration tab as if no live sibling orchestration exists"
+        );
+        // ...no role pane was spawned...
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "no role pane should be spawned when the gate can't confirm no live sibling exists"
+        );
+        // ...the error surfaces to the user...
+        let message = ui
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !message.is_empty(),
+            "the fail-closed refusal must surface a status message, not fail silently"
+        );
+        // ...and nothing was created on disk — the gate must refuse BEFORE
+        // any git operation (shared or isolated) runs against the target.
+        assert!(
+            !worktree_path.exists(),
+            "the fail-closed refusal must happen before any provisioning attempt touches disk, \
+             found {} unexpectedly present",
+            worktree_path.display()
         );
     }
 
