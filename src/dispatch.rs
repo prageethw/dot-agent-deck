@@ -347,9 +347,12 @@ pub async fn handle_dispatch(
         // (see `create_worktree`'s doc comment). Kept as an explicit arm
         // rather than a wildcard so a future change that gives this path a
         // bound fails loudly here instead of silently falling through.
-        Ok(WorktreeCreation::TimedOut { cleaned_up }) => {
-            let detail = if cleaned_up {
-                "the half-created directory was removed automatically — try again".to_string()
+        Ok(WorktreeCreation::TimedOut { cleaned_up_by }) => {
+            let detail = if let Some(remover) = cleaned_up_by {
+                format!(
+                    "the half-created directory was removed automatically by {remover} — try \
+                     again"
+                )
             } else {
                 format!(
                     "run `git -C {} worktree remove --force {}` to clear it, then try again",
@@ -396,8 +399,10 @@ pub async fn handle_dispatch(
         compose_orchestrator_context: true,
         // Fork #166 M2.4: the SAME string just written into the worktree's
         // `created-by:` marker above (`create_worktree`), not a second
-        // derivation of it.
-        owner: Some(creator),
+        // derivation of it. Cloned rather than moved: issue #469's
+        // spawn-rollback arm below also needs `creator`, as the `remover`
+        // identity for its own `remove_worktree` call.
+        owner: Some(creator.clone()),
     };
 
     let notifier = StderrNotifier;
@@ -440,6 +445,7 @@ pub async fn handle_dispatch(
                 &paths.worktree_dir,
                 &clone_dir,
                 &paths.branch,
+                &creator,
             )
             .await
             {
@@ -521,6 +527,7 @@ async fn rollback_dispatched_worktree(
     worktree_dir: &Path,
     clone_dir: &Path,
     branch: &str,
+    creator: &str,
 ) -> RollbackOutcome {
     let live = crate::issue_dispatch_run::agents_rooted_in_worktree(
         &registry.agent_records(),
@@ -541,7 +548,8 @@ async fn rollback_dispatched_worktree(
     // rooted here: this worktree was created seconds ago for an agent that is not
     // running, so there is no user work to protect — and it MUST actually go, or
     // the leftover dir and branch wedge this name for every later dispatch.
-    let remove_outcome = remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await;
+    let remove_outcome =
+        remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force, creator).await;
     if let RemoveOutcome::RemoveFailed(error) = remove_outcome {
         // PRD 236 review: `#[must_use]` exists precisely so this can't be
         // discarded and read back as success. There is no event channel here
@@ -693,7 +701,13 @@ mod tests {
         );
 
         // Tab close: the worktree goes away, the branch does not.
-        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(
+            &paths.worktree_dir,
+            &repo,
+            RemovalPolicy::KeepIfDirty,
+            "dispatch:test",
+        )
+        .await;
         assert!(!paths.worktree_dir.exists(), "worktree dir should be gone");
         assert!(
             branch_exists(&repo, &paths.branch),
@@ -733,7 +747,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(
+            &paths.worktree_dir,
+            &repo,
+            RemovalPolicy::KeepIfDirty,
+            "dispatch:test",
+        )
+        .await;
         std::process::Command::new("git")
             .args(["branch", "-D", &paths.branch])
             .current_dir(&repo)
@@ -777,7 +797,13 @@ mod tests {
         .unwrap();
         std::fs::write(paths.worktree_dir.join("uncommitted.txt"), "work").unwrap();
 
-        let _ = remove_worktree(&paths.worktree_dir, &repo, RemovalPolicy::KeepIfDirty).await;
+        let _ = remove_worktree(
+            &paths.worktree_dir,
+            &repo,
+            RemovalPolicy::KeepIfDirty,
+            "dispatch:test",
+        )
+        .await;
 
         assert!(
             paths.worktree_dir.exists(),
@@ -803,7 +829,7 @@ mod tests {
             .unwrap();
         std::fs::write(worktree_dir.join("uncommitted.txt"), "wip").unwrap();
 
-        let _ = remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force).await;
+        let _ = remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force, "dispatch:test").await;
 
         assert!(
             !worktree_dir.exists(),
@@ -1346,6 +1372,7 @@ mod tests {
             &worktree_dir,
             &repo,
             "agent/dispatch-survivor",
+            "test",
         )
         .await;
 
@@ -1377,6 +1404,7 @@ mod tests {
             &worktree_dir,
             &repo,
             "agent/dispatch-survivor",
+            "test",
         )
         .await;
         assert_eq!(
@@ -1438,6 +1466,150 @@ mod tests {
         assert!(
             !branch_exists(&repo, "agent/dispatch-typo-unit"),
             "no branch may be left behind either"
+        );
+    }
+
+    // --- issue #469: ownership/liveness gate on the spawn-rollback path ---
+
+    /// Scenario: issue #469. `handle_dispatch`'s spawn-rollback arm
+    /// force-removes the worktree it just created whenever `spawn()` fails —
+    /// but for a multi-role orchestration, an earlier role can already be a
+    /// live PTY child rooted in that same worktree by the time a later
+    /// role's spawn fails, and today's unconditional force-removal yanks the
+    /// worktree out from under it. This fakes that state directly: a live
+    /// sibling agent is registered with a `cwd` matching the worktree
+    /// `handle_dispatch` is about to create, and the dispatch's own agent
+    /// command is pointed at a binary that cannot exist, so `spawn()` fails
+    /// deterministically and fast. With a live sibling still rooted there,
+    /// the worktree, its branch, and the registry entry must all survive.
+    #[tokio::test]
+    async fn spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "guard-trip-unit");
+
+        // The worktree doesn't exist yet -- `handle_dispatch` creates it --
+        // but a real PTY-backed sibling needs a real cwd to spawn into, so
+        // create the plain (non-worktree) directory ahead of it. `git
+        // worktree add` succeeds into a pre-existing EMPTY directory, so
+        // this does not trip the `AlreadyClaimed` path.
+        std::fs::create_dir_all(&paths.worktree_dir).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // The real defect is a multi-role orchestration: `worktree_of_record`
+        // resolves a role pane's worktree via `TabMembership::Orchestration`'s
+        // `orchestration_cwd`, not via the record's own `cwd` (reviewer F3) --
+        // so the sibling must carry that membership shape, not a bare `cwd`,
+        // to exercise the same resolution arm the real code path uses.
+        let sibling_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                cwd: Some(&paths.worktree_dir.to_string_lossy()),
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "guard-trip-unit".to_string(),
+                    role_index: 0,
+                    role_name: "coder".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(paths.worktree_dir.to_string_lossy().into_owned()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn a live sibling agent rooted in the about-to-be-created worktree");
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-469".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "guard-trip-unit", "task", None).await;
+
+        // Close the sibling shell before any assertion can panic (reviewer
+        // F5a): a failing `assert!` below must not leak a real `setsid`'d
+        // process past a `let _ =` that never runs.
+        let _ = registry.close_agent(&sibling_id);
+
+        assert!(
+            !result.success,
+            "the spawn itself must still report failure"
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "a live sibling still rooted in the worktree must keep it from being \
+             force-removed (issue #469): {}",
+            result.message
+        );
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "the branch must survive too -- a still-live sibling may hold committed work \
+             whose only record is this branch"
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "the registry entry must survive so a later close can still find and clean it up"
+        );
+        assert!(
+            result.message.contains("LEFT IN PLACE") && result.message.contains("still running"),
+            "the skip message must name the cause so an operator doesn't reach for a \
+             manual force-removal: {}",
+            result.message
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
+    /// Scenario: issue #469 regression guard. Same forced-failure setup as
+    /// `spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_worktree`,
+    /// but with NO live sibling registered: the worktree, its branch, and the
+    /// registry entry must all be gone, exactly as
+    /// `force_removes_a_dirty_worktree_regardless_of_uncommitted_work`
+    /// already proves for `remove_worktree` directly -- this proves the SAME
+    /// thing reached through `handle_dispatch`'s actual failure arm, which
+    /// nothing exercised end-to-end before this issue.
+    #[tokio::test]
+    async fn spawn_rollback_force_removes_when_nothing_else_roots_the_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "guard-notrip-unit");
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-469".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "guard-notrip-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            !paths.worktree_dir.exists(),
+            "with nothing else rooted there, the worktree must still be force-removed \
+             exactly as before: {}",
+            result.message
+        );
+        assert!(
+            !branch_exists(&repo, &paths.branch),
+            "the branch must still be deleted too"
+        );
+        assert!(
+            !ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "the registry entry must still be dropped"
         );
     }
 
