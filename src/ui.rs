@@ -34052,19 +34052,49 @@ mod tests {
                 .unwrap_or_default()
         ));
 
-        let listener = crate::daemon_protocol::bind_attach_listener(&socket_addr)
-            .expect("bind stub attach listener for test");
-        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
-        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        // `bind_attach_listener` constructs a `tokio::net::UnixListener`,
+        // which registers with tokio's I/O driver at BIND time and so needs
+        // an ACTIVE runtime context to even construct — not merely to run
+        // async operations on later — so the bind must happen INSIDE the
+        // spawned thread's `block_on`, not synchronously on this (plain,
+        // non-tokio) test thread. A readiness handshake over this channel is
+        // what lets this function still return only once the socket is
+        // actually bound and ready to accept, matching what the synchronous
+        // `bind_attach_listener` call in `daemon_client.rs`'s own
+        // `spawn_test_server` harness gets for free there (that harness runs
+        // inside `#[tokio::test]`, so a runtime is already current).
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("build stub attach-daemon runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("build stub attach-daemon runtime: {e}")));
+                    return;
+                }
+            };
             rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("bind stub attach listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+                let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
                 let _ = crate::daemon_protocol::serve_attach(listener, registry, event_tx).await;
             });
         });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub attach daemon must report readiness within 10s")
+            .expect("stub attach daemon must bind successfully");
 
         // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
         unsafe {
