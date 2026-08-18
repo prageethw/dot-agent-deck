@@ -1792,13 +1792,10 @@ async fn run_dashboard() -> ExitCode {
 /// `apply_login_shell_path` `set_var` (main.rs); a logging thread spawned here
 /// would land inside that single-threaded window and break the `set_var`
 /// soundness invariant the login-shell PATH capture relies on.
-fn warn_log_setup_failure(action: &str, path: &std::path::Path, e: impl std::fmt::Display) {
-    eprintln!("Warning: failed to {action} {}: {e}", path.display());
-}
-
 fn init_logging_from_env() {
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
-        let log_path = if log_val.is_empty() || log_val == "1" {
+        let is_default = log_val.is_empty() || log_val == "1";
+        let log_path = if is_default {
             let dir = state_dir();
             if let Err(e) = dot_agent_deck::platform::fsperm::ensure_owner_only_dir(&dir) {
                 warn_log_setup_failure("create owner-only state dir", &dir, e);
@@ -1808,11 +1805,15 @@ fn init_logging_from_env() {
         } else {
             std::path::PathBuf::from(log_val)
         };
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        let open_result = if is_default {
+            open_deck_log_file(&log_path)
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+        };
+        match open_result {
             Ok(log_file) => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
@@ -1828,6 +1829,45 @@ fn init_logging_from_env() {
             }
         }
     }
+}
+
+/// Opens the default `deck.log` with the same symlink/mode hardening
+/// `daemon.log` already has (`platform/detach/unix.rs`): `O_NOFOLLOW` +
+/// mode `0o600`, refusing rather than following a pre-planted symlink at the
+/// exact log path. Applies only to the default `state_dir()`-derived path —
+/// `init_logging_from_env`'s explicit `DOT_AGENT_DECK_LOG=<path>` branch is
+/// user-specified and stays on the unhardened open, matching how the rest of
+/// this fix draws that line.
+#[cfg(unix)]
+fn open_deck_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(log_path)
+    {
+        Ok(f) => Ok(f),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(std::io::Error::other(format!(
+            "log path {} is a symlink — refusing to follow (someone may have planted it to redirect log output)",
+            log_path.display()
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_deck_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+}
+
+fn warn_log_setup_failure(action: &str, path: &std::path::Path, e: impl std::fmt::Display) {
+    eprintln!("Warning: failed to {action} {}: {e}", path.display());
 }
 
 /// The TUI body extracted from `run_dashboard` so `connect` can reuse it.
