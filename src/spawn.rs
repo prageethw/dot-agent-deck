@@ -1039,6 +1039,10 @@ async fn deliver(
     // design; see `crate::state::SessionStartWait::generation`.
     let mut generation: Option<(String, DateTime<Utc>)> = observed.generation.clone();
     let mut drained_capability = false;
+    // Issue #468: a hook-trust failure this pre-write drain sees directly must
+    // reach `deliver()`'s own veto below even if a later event in the same
+    // drain arms `drained_capability`.
+    let mut drained_codex_hook_trust_failed = false;
     if let Some(rx) = event_rx.as_mut()
         && let Some(reason) = drain_pre_write_events(
             rx,
@@ -1046,6 +1050,7 @@ async fn deliver(
             agent_id,
             &mut generation,
             &mut drained_capability,
+            &mut drained_codex_hook_trust_failed,
         )
     {
         log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
@@ -1148,7 +1153,13 @@ async fn deliver(
                 agent_id,
                 prompt,
                 delivery_id,
-                codex_hook_trust_failed: observed.codex_hook_trust_failed,
+                // Issue #468: OR in a failure the pre-write drain saw directly —
+                // `wait_for_session_start` only observes the wrapper's fork-time
+                // `SessionStart`, so a failure this drain sees on its own must
+                // still reach the veto, the same way `drained_capability` is
+                // already OR'd into `can_report_prompts` above.
+                codex_hook_trust_failed: observed.codex_hook_trust_failed
+                    || drained_codex_hook_trust_failed,
                 generation,
                 can_report_prompts,
                 deadline,
@@ -1282,6 +1293,7 @@ fn drain_pre_write_events(
     agent_id: &str,
     generation: &mut Option<(String, DateTime<Utc>)>,
     can_report_prompts: &mut bool,
+    codex_hook_trust_failed: &mut bool,
 ) -> Option<&'static str> {
     loop {
         match rx.try_recv() {
@@ -1294,10 +1306,18 @@ fn drain_pre_write_events(
                     None => continue,
                     Some(_) => {}
                 }
-                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type)
-                    && event.codex_hook_trust_outcome() != Some(false)
-                {
-                    *can_report_prompts = true;
+                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
+                    // Issue #468: a hook-trust failure observed here must survive
+                    // past a later, metadata-free event that would otherwise arm
+                    // `can_report_prompts` — accumulate-only, same as
+                    // `SessionStartWait::codex_hook_trust_failed` in
+                    // `src/state.rs`, so callers can veto downstream the same way
+                    // `deliver()` already does with `observed.codex_hook_trust_failed`.
+                    if event.codex_hook_trust_outcome() == Some(false) {
+                        *codex_hook_trust_failed = true;
+                    } else {
+                        *can_report_prompts = true;
+                    }
                 }
                 if let Some(crate::state::PromptWatch::TargetChanged { reason }) =
                     crate::state::latch_generation(generation, &event)
@@ -1388,7 +1408,7 @@ async fn confirm_prompt_delivery(
         delivery_id,
         mut generation,
         can_report_prompts,
-        codex_hook_trust_failed,
+        mut codex_hook_trust_failed,
         deadline,
     } = task;
     // Issue #424 S1/S2 (both reviewers): THIS delivery's own clock — the
@@ -1591,16 +1611,23 @@ async fn confirm_prompt_delivery(
         // Issue #424 F4: the gap drain's capability observation is post-write
         // too, so it needs the same standing the window's does.
         let mut gap_capability = false;
+        // Issue #468: a hook-trust failure discovered in the gap drain itself
+        // must veto this and every later arm attempt too.
+        let mut gap_codex_hook_trust_failed = false;
         if let Some(reason) = drain_pre_write_events(
             &mut rx,
             &pane_id,
             &agent_id,
             &mut generation,
             &mut gap_capability,
+            &mut gap_codex_hook_trust_failed,
         ) {
             log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
             return;
         }
+        // Issue #468: accumulate-only, same as `ConfirmationTask::codex_hook_trust_failed`
+        // — once seen, this delivery is vetoed for good.
+        codex_hook_trust_failed |= gap_codex_hook_trust_failed;
         // Issue #459: same veto as the `PromptWatch::Elapsed` arm above.
         armed |= gap_capability && accepts_late_producer && !codex_hook_trust_failed;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
@@ -2496,8 +2523,16 @@ mod tests {
         }
         let mut generation = Some(("original-generation".to_string(), Utc::now()));
         let mut capability = false;
+        let mut codex_hook_trust_failed = false;
         assert_eq!(
-            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut codex_hook_trust_failed
+            ),
             Some("lagged-event-stream"),
             "dropped frames may have carried the end/start this delivery needed to see"
         );
@@ -2513,8 +2548,16 @@ mod tests {
         )));
         let mut generation = Some(("original-generation".to_string(), Utc::now()));
         let mut capability = false;
+        let mut codex_hook_trust_failed = false;
         assert_eq!(
-            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut codex_hook_trust_failed
+            ),
             None
         );
         assert!(capability, "an identified Claude frame proves the channel");
@@ -2684,13 +2727,15 @@ mod tests {
 
         let mut generation = None;
         let mut can_report_prompts = false;
+        let mut codex_hook_trust_failed = false;
         assert_eq!(
             drain_pre_write_events(
                 &mut rx,
                 PANE_ID,
                 AGENT_ID,
                 &mut generation,
-                &mut can_report_prompts
+                &mut can_report_prompts,
+                &mut codex_hook_trust_failed
             ),
             None
         );
