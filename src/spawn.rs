@@ -1299,10 +1299,17 @@ async fn deliver(
     // producer assertions wherever they appear, so an unmarked start arriving
     // afterwards would otherwise arm the full replacement payload, and the blind
     // submit CRs after it, against a pane that may be a shell.
-    let can_report_prompts = observed
+    // Issue #459: mirrors `drain_pre_write_events`'s identical check on the raw
+    // event — `observed_producer` alone is `AgentType::Codex` unconditionally
+    // for a Codex readiness event regardless of whether its native hook
+    // install/trust is known to have failed, so `codex_hook_trust_failed` must
+    // gate it here too or a failed-trust Codex pane still arms retries that can
+    // never be confirmed.
+    let can_report_prompts = (observed
         .observed_producer
         .as_ref()
         .is_some_and(crate::prompt_delivery::agent_reports_submitted_prompt)
+        && !observed.codex_hook_trust_failed)
         || drained_capability;
     // Issue #424 F4: the launcher handoff is STANDING, not capability, so it is
     // recorded rather than folded into the answer above. With
@@ -1336,6 +1343,7 @@ async fn deliver(
                 agent_id,
                 prompt,
                 delivery_id,
+                codex_hook_trust_failed: observed.codex_hook_trust_failed,
                 generation,
                 can_report_prompts,
                 deadline,
@@ -1481,7 +1489,9 @@ fn drain_pre_write_events(
                     None => continue,
                     Some(_) => {}
                 }
-                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
+                if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type)
+                    && event.codex_hook_trust_outcome() != Some(false)
+                {
                     *can_report_prompts = true;
                 }
                 if let Some(crate::state::PromptWatch::TargetChanged { reason }) =
@@ -1573,6 +1583,7 @@ async fn confirm_prompt_delivery(
         delivery_id,
         mut generation,
         can_report_prompts,
+        codex_hook_trust_failed,
         deadline,
     } = task;
     // Issue #424 S1/S2 (both reviewers): THIS delivery's own clock — the
@@ -1611,7 +1622,9 @@ async fn confirm_prompt_delivery(
         prompt: &prompt,
     }];
     let mut attempt: u32 = 1;
-    let mut armed = can_report_prompts;
+    // Issue #459: `codex_hook_trust_failed` suppresses arming here and at every
+    // `armed |=` site below — see [`ConfirmationTask::codex_hook_trust_failed`].
+    let mut armed = can_report_prompts && !codex_hook_trust_failed;
     // Issue #424 F4: whether a producer identifying itself AFTER the write may
     // arm this delivery at all. True only when something said BEFORE we wrote
     // what this pane is, so that a producer appearing later is genuinely this
@@ -1704,7 +1717,11 @@ async fn confirm_prompt_delivery(
             // deadline is diagnosable rather than mysterious.
             PromptWatch::Elapsed { can_report_prompts } => {
                 let armed_before_this_claim = armed;
-                armed |= can_report_prompts && accepts_late_producer;
+                // Issue #459: `accepts_late_producer` clearing this would arm on
+                // its own merit; `codex_hook_trust_failed` still must veto it —
+                // see `ConfirmationTask::codex_hook_trust_failed`.
+                let would_arm = can_report_prompts && accepts_late_producer;
+                armed |= would_arm && !codex_hook_trust_failed;
                 // Issue #570: a delivery that starts UNARMED writes nothing at
                 // all on every prior iteration (`if !armed { continue; }`
                 // below skips straight past the write), so the moment a late
@@ -1722,7 +1739,18 @@ async fn confirm_prompt_delivery(
                 if armed && !armed_before_this_claim {
                     attempt = 0;
                 }
-                if can_report_prompts && !armed && !refused_claim_logged {
+                if would_arm && codex_hook_trust_failed && !refused_claim_logged {
+                    refused_claim_logged = true;
+                    log_prompt_unconfirmable(
+                        DELIVERY_LOG_PATH,
+                        &pane_id,
+                        &delivery_id,
+                        "a producer claimed a reporting agent only after the prompt was written, \
+                         but this pane's Codex native hook install/trust is known to have failed \
+                         and can never emit the text confirmation this delivery needs; holding \
+                         the write instead of retyping into a target that may never report",
+                    );
+                } else if can_report_prompts && !armed && !refused_claim_logged {
                     refused_claim_logged = true;
                     log_prompt_unconfirmable(
                         DELIVERY_LOG_PATH,
@@ -1805,7 +1833,8 @@ async fn confirm_prompt_delivery(
             log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
             return;
         }
-        armed |= gap_capability && accepts_late_producer;
+        // Issue #459: same veto as the `PromptWatch::Elapsed` arm above.
+        armed |= gap_capability && accepts_late_producer && !codex_hook_trust_failed;
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
         // Issue #424 D5 / fork #194: only the FIRST attempt writes the payload
@@ -2048,6 +2077,21 @@ struct ConfirmationTask {
     /// `/clear` between them is caught (reviewer findings B1/B2).
     generation: Option<(String, DateTime<Utc>)>,
     can_report_prompts: bool,
+    /// Issue #459: this pane's Codex native-hook install/trust was observed,
+    /// pre-write, to have FAILED (`SessionStartWait::codex_hook_trust_failed`).
+    ///
+    /// Sticky for the whole task, matching PR #441's ui.rs comment that this
+    /// downgrade "must outrank the sticky `can_report_prompts`-style latch":
+    /// `armed` in `confirm_prompt_delivery` only ever grows via `|=`, so an
+    /// ordinary later Codex event with no hook-trust metadata of its own (every
+    /// event but the wrapper's one fork-time `SessionStart` lacks it) would
+    /// otherwise re-arm a delivery this flag has already correctly suppressed.
+    /// Suppressing at every `armed |=` site closes that without re-deriving the
+    /// verdict from any single event downstream, and without reading
+    /// `AppState`/`SharedState` — which `deliver`/`confirm_prompt_delivery`
+    /// don't currently receive and threading in would be new territory beyond
+    /// this delivery's own task-scoped state.
+    codex_hook_trust_failed: bool,
     deadline: Instant,
 }
 
@@ -2758,6 +2802,142 @@ mod tests {
         assert!(capability, "an identified Claude frame proves the channel");
     }
 
+    /// Scenario: Issue #459, follow-up to #254/PR #441. PR #441 fixed the
+    /// TUI-attached path (`src/ui.rs`'s `delivery_capability`) to downgrade a
+    /// Codex pane away from `Reports` when its native hook install/trust is
+    /// recorded as having failed, instead of resolving capability from agent
+    /// TYPE alone. The dispatch/scheduler path here never got that fix:
+    /// `drain_pre_write_events` sets `can_report_prompts` purely from
+    /// `agent_reports_submitted_prompt(&event.agent_type)`, which is `true`
+    /// for every `AgentType::Codex` event regardless of what that event's own
+    /// `codex_hook_trust_outcome()` reports. This drains one Codex
+    /// `SessionStart` event stamped with a failed hook-trust outcome
+    /// (`codex_hook_trust_outcome() == Some(false)`) and pins that
+    /// `can_report_prompts` must NOT come out `true` for it — a hook that
+    /// failed to install/trust can never emit TEXT confirmation
+    /// (`Emitter::emit_with_metadata` hardcodes `user_prompt: None` on that
+    /// degraded path), so treating this pane as reporting burns the full 60s
+    /// escalating retry cycle against a live interactive Codex TUI and then
+    /// permanently abandons the tab's remit at the deadline.
+    #[test]
+    fn drain_pre_write_events_does_not_arm_a_codex_pane_with_failed_hook_trust() {
+        const PANE_ID: &str = "codex-hook-trust-failed-pane";
+        const AGENT_ID: &str = "codex-hook-trust-failed-agent";
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+            "false".to_string(),
+        );
+        let event = AgentEvent {
+            session_id: "codex-hook-trust-failed-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(PANE_ID.to_string()),
+            agent_id: Some(AGENT_ID.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        };
+        assert_eq!(
+            event.codex_hook_trust_outcome(),
+            Some(false),
+            "sanity: this event must carry a recorded hook-trust failure"
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(event));
+
+        let mut generation = None;
+        let mut can_report_prompts = false;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut can_report_prompts
+            ),
+            None
+        );
+        assert!(
+            !can_report_prompts,
+            "issue #459: a Codex event whose native hook install/trust is known to have \
+             failed must not arm can_report_prompts on the dispatch/scheduler path — this \
+             currently resolves purely from agent_reports_submitted_prompt(&event.agent_type), \
+             the same defect PR #441 fixed on the TUI-attached path in \
+             src/ui.rs::delivery_capability"
+        );
+    }
+
+    /// Scenario: Issue #459's sticky-latch parity, mirroring PR #441's ui.rs
+    /// comment that the codex hook-trust downgrade "must outrank the sticky
+    /// `can_report_prompts`-style latch". `armed` in `confirm_prompt_delivery`
+    /// only ever grows via `|=` and is never cleared, so this constructs a
+    /// `ConfirmationTask` with `can_report_prompts: true` (standing in for a
+    /// pre-write resolution that mislatched `Reports`, or a later ordinary
+    /// Codex event with no hook-trust metadata of its own re-arming it) AND
+    /// `codex_hook_trust_failed: true`, runs the loop to its short deadline with
+    /// no confirming event ever arriving, and asserts no "abandoned" delivery
+    /// notice was published — the observable tell that `armed` was (wrongly)
+    /// `true` at the deadline (`abandon_spawn_prompt` publishes one; the
+    /// unconfirmable, never-armed path publishes nothing).
+    #[tokio::test]
+    async fn confirm_prompt_delivery_veto_codex_hook_trust_failed_outranks_mislatched_can_report_prompts()
+     {
+        const PANE_ID: &str = "codex-hook-trust-failed-sticky-pane";
+        const PROMPT: &str = "STICKY-HOOK-TRUST-FAILED-MUST-NOT-ABANDON";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = spawn_byte_target(&registry, PANE_ID);
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .await
+                .expect("initial detached delivery"),
+            GuardedSend::Applied
+        );
+
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+
+        let (_event_tx, event_rx) = broadcast::channel(8);
+        confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: PANE_ID.into(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: "sticky-hook-trust-failed-test".into(),
+                generation: None,
+                can_report_prompts: true,
+                codex_hook_trust_failed: true,
+                deadline: Instant::now() + Duration::from_millis(150),
+            },
+        )
+        .await;
+
+        registry.shutdown_all();
+        let published = notices.lock().unwrap().clone();
+        assert!(
+            published.is_empty(),
+            "issue #459: codex_hook_trust_failed must veto `armed` even when \
+             can_report_prompts was (mis)latched true, so the deadline must end in an \
+             unconfirmable log, never an abandoned-delivery notice; notices={published:?}"
+        );
+    }
+
     /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes. Finally, send that same unmarked post-write claim to a pane the deck itself spawned as a reporting agent: there it must arm the retry instead, so the prompt is typed into the pane again rather than held unsubmitted.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
@@ -2780,6 +2960,7 @@ mod tests {
                 delivery_id: "replacement-guard-test".into(),
                 generation: Some(("original-generation".into(), Utc::now())),
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -2823,6 +3004,7 @@ mod tests {
                 delivery_id: "clear-generation-test".into(),
                 generation: Some(("bound-before-clear".into(), Utc::now())),
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -2883,6 +3065,7 @@ mod tests {
                 delivery_id: "lagged-stream-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -2905,6 +3088,7 @@ mod tests {
                 delivery_id: "closed-stream-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -2946,6 +3130,7 @@ mod tests {
                 delivery_id: "close-cancel-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -2963,6 +3148,7 @@ mod tests {
                 delivery_id: "single-flight-old".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -2976,6 +3162,7 @@ mod tests {
                 delivery_id: "single-flight-new".into(),
                 generation: None,
                 can_report_prompts: false,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -2993,6 +3180,7 @@ mod tests {
                     delivery_id: format!("shutdown-cancel-{pane_id}"),
                     generation: None,
                     can_report_prompts: true,
+                    codex_hook_trust_failed: false,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             );
@@ -3050,6 +3238,7 @@ mod tests {
                 delivery_id: "unmarked-forged-capability".into(),
                 generation: None,
                 can_report_prompts: false,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -3202,6 +3391,7 @@ mod tests {
                 delivery_id: "detached-user-draft-safety".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(4),
             },
         ));
@@ -3675,6 +3865,7 @@ mod tests {
                 delivery_id: "detached-backstop-report".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
@@ -3788,6 +3979,7 @@ mod tests {
                 delivery_id: "cap-exhausted-257".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );
@@ -3837,6 +4029,7 @@ mod tests {
                 delivery_id: "absolute-deadline-test".into(),
                 generation: None,
                 can_report_prompts: true,
+                codex_hook_trust_failed: false,
                 deadline,
             },
         ));
