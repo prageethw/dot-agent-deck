@@ -1271,9 +1271,11 @@ async fn guarded_submit(
 }
 
 /// Consume everything already queued on `rx` — every frame of it produced
-/// before the write this precedes — latching the pane's hook generation and
-/// noting whether the producer can report a submitted prompt. Returns a stop
-/// reason when the drained frames show the target is already gone.
+/// before the write this precedes — latching the pane's hook generation,
+/// noting whether the producer can report a submitted prompt, and recording
+/// whether a Codex native hook-trust failure was observed in any drained
+/// frame. Returns a stop reason when the drained frames show the target is
+/// already gone.
 ///
 /// Auditor HIGH: the generation decision is [`crate::state::latch_generation`],
 /// the SAME function the post-write watch uses, rather than the open-coded copy
@@ -1640,11 +1642,15 @@ async fn confirm_prompt_delivery(
         // arming; both `armed |=` expressions it feeds (here and at the
         // `PromptWatch::Elapsed` arm above) are no-ops once `armed` already
         // holds. Its one observable effect is on a LATER `Elapsed` arm's
-        // choice of which `log_prompt_unconfirmable` message to print. The
-        // genuine, always-reachable veto — vetoing an arm attempt regardless
-        // of `armed`'s current state — is the `Elapsed` arm's own
-        // `watch_codex_hook_trust_failed` accumulation above, which runs
-        // unconditionally every loop iteration rather than only once armed.
+        // choice of which `log_prompt_unconfirmable` message to print. What
+        // the `Elapsed` arm's own `watch_codex_hook_trust_failed`
+        // accumulation above does differently is run every loop iteration
+        // regardless of `armed`'s current state — but that accumulation's
+        // effect on `armed` itself is, just the same, still gated by whether
+        // `armed` was already true; what is unconditional is only the write
+        // into `codex_hook_trust_failed` itself, which then vetoes any
+        // FUTURE arm attempt in a later iteration, not the veto having any
+        // effect within an already-armed iteration.
         codex_hook_trust_failed |= gap_codex_hook_trust_failed;
         // Issue #459: same veto as the `PromptWatch::Elapsed` arm above.
         armed |= gap_capability && accepts_late_producer && !codex_hook_trust_failed;
@@ -2584,6 +2590,10 @@ mod tests {
             None
         );
         assert!(capability, "an identified Claude frame proves the channel");
+        assert!(
+            !codex_hook_trust_failed,
+            "a non-Codex, non-failing event must not trip the hook-trust-failed out-param"
+        );
     }
 
     /// Scenario: Issue #468, follow-up to #459/PR #466. PR #466 taught
@@ -2596,17 +2606,15 @@ mod tests {
     /// then (2) an ordinary Codex event with no hook-trust metadata at all
     /// (ordinary status/heartbeat shape). Event 2 unconditionally arms
     /// `can_report_prompts` (today's correct behavior for a metadata-free
-    /// Codex frame), which silently erases the fact that event 1's failure
-    /// was ever observed — nothing in the current 5-argument signature can
-    /// report it. The fix needs a new out-param (mirrored on
+    /// Codex frame), which used to silently erase the fact that event 1's
+    /// failure was ever observed — the previous 5-argument signature had no
+    /// way to report it. The fix adds a new out-param (mirrored on
     /// `SessionStartWait::codex_hook_trust_failed` in `src/state.rs`) so the
     /// caller can veto `can_report_prompts` downstream the same way
     /// `deliver()` already does with `observed.codex_hook_trust_failed`. This
-    /// pins that missing signal by calling a 6-argument
-    /// `drain_pre_write_events` that does not exist yet on `main` — it must
-    /// fail to COMPILE (E0061, too many arguments) until that parameter is
-    /// added, which is deliberate: there is no way to express this test
-    /// against the current signature at all.
+    /// pins that signal by calling the 6-argument `drain_pre_write_events`
+    /// the fix added — the out-param it introduced is what makes this
+    /// scenario expressible at all.
     #[test]
     fn drain_pre_write_events_reports_hook_trust_failure_even_when_a_later_event_arms_capability() {
         const PANE_ID: &str = "codex-hook-trust-failed-then-armed-pane";
@@ -2671,10 +2679,9 @@ mod tests {
 
         let mut generation = None;
         let mut can_report_prompts = false;
-        // Not on `main` yet: `drain_pre_write_events` today takes 5
-        // arguments. This 6th argument is the missing out-param the fix must
-        // add so a hook-trust failure observed mid-drain survives past a
-        // later event that would otherwise arm `can_report_prompts`.
+        // The 6th argument: the out-param the fix added so a hook-trust
+        // failure observed mid-drain survives past a later event that would
+        // otherwise arm `can_report_prompts`.
         let mut codex_hook_trust_failed = false;
         assert_eq!(
             drain_pre_write_events(
@@ -2691,7 +2698,8 @@ mod tests {
             codex_hook_trust_failed,
             "issue #468: a hook-trust failure observed mid-drain must be reported back even \
              when a later, metadata-free Codex event goes on to arm can_report_prompts — \
-             drain_pre_write_events currently has no out-param to carry this signal at all"
+             codex_hook_trust_failed came back false, so the out-param drain_pre_write_events \
+             added to carry this signal has regressed"
         );
     }
 
