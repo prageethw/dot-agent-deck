@@ -1868,6 +1868,7 @@ mod tests {
             owner: None,
             owner_kind: "unknown".to_string(),
             owner_reason: None,
+            removed_by: None,
         }
     }
 

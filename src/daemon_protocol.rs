@@ -2169,6 +2169,7 @@ async fn handle_connection(
                         // instead of leaving the user with the dialog's
                         // arm-time prediction.
                         let event_tx = event_tx.clone();
+                        let remover = format!("agent:{id}");
                         tokio::spawn(async move {
                             if !crate::issue_dispatch_run::worktree_still_in_use(
                                 &registry.agent_records(),
@@ -2181,6 +2182,7 @@ async fn handle_connection(
                                     &worktree,
                                     &entry.clone_dir,
                                     entry.policy,
+                                    &remover,
                                 )
                                 .await;
                                 // PRD 236 review: a failed removal must reach
@@ -2200,7 +2202,7 @@ async fn handle_connection(
                                     ) => {
                                         Some((crate::event::KeptReason::RemovalFailed, Some(error)))
                                     }
-                                    crate::issue_dispatch_run::RemoveOutcome::Removed => None,
+                                    crate::issue_dispatch_run::RemoveOutcome::Removed(_) => None,
                                 };
                                 if let Some((reason, error)) = reason_and_error {
                                     let _ = event_tx.send(BroadcastMsg::WorktreeKept(
