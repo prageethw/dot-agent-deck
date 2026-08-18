@@ -2476,6 +2476,81 @@ mod tests {
         assert!(capability, "an identified Claude frame proves the channel");
     }
 
+    /// Scenario: Issue #459, follow-up to #254/PR #441. PR #441 fixed the
+    /// TUI-attached path (`src/ui.rs`'s `delivery_capability`) to downgrade a
+    /// Codex pane away from `Reports` when its native hook install/trust is
+    /// recorded as having failed, instead of resolving capability from agent
+    /// TYPE alone. The dispatch/scheduler path here never got that fix:
+    /// `drain_pre_write_events` sets `can_report_prompts` purely from
+    /// `agent_reports_submitted_prompt(&event.agent_type)`, which is `true`
+    /// for every `AgentType::Codex` event regardless of what that event's own
+    /// `codex_hook_trust_outcome()` reports. This drains one Codex
+    /// `SessionStart` event stamped with a failed hook-trust outcome
+    /// (`codex_hook_trust_outcome() == Some(false)`) and pins that
+    /// `can_report_prompts` must NOT come out `true` for it — a hook that
+    /// failed to install/trust can never emit TEXT confirmation
+    /// (`Emitter::emit_with_metadata` hardcodes `user_prompt: None` on that
+    /// degraded path), so treating this pane as reporting burns the full 60s
+    /// escalating retry cycle against a live interactive Codex TUI and then
+    /// permanently abandons the tab's remit at the deadline.
+    #[test]
+    fn drain_pre_write_events_does_not_arm_a_codex_pane_with_failed_hook_trust() {
+        const PANE_ID: &str = "codex-hook-trust-failed-pane";
+        const AGENT_ID: &str = "codex-hook-trust-failed-agent";
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::CODEX_HOOK_TRUST_METADATA_KEY.to_string(),
+            "false".to_string(),
+        );
+        let event = AgentEvent {
+            session_id: "codex-hook-trust-failed-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(PANE_ID.to_string()),
+            agent_id: Some(AGENT_ID.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        };
+        assert_eq!(
+            event.codex_hook_trust_outcome(),
+            Some(false),
+            "sanity: this event must carry a recorded hook-trust failure"
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(event));
+
+        let mut generation = None;
+        let mut can_report_prompts = false;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut can_report_prompts
+            ),
+            None
+        );
+        assert!(
+            !can_report_prompts,
+            "issue #459: a Codex event whose native hook install/trust is known to have \
+             failed must not arm can_report_prompts on the dispatch/scheduler path — this \
+             currently resolves purely from agent_reports_submitted_prompt(&event.agent_type), \
+             the same defect PR #441 fixed on the TUI-attached path in \
+             src/ui.rs::delivery_capability"
+        );
+    }
+
     /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
