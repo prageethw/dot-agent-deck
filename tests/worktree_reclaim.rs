@@ -2381,6 +2381,7 @@ async fn worktree_reclaim_042_remove_worktree_returns_a_kept_outcome_not_unit() 
         &worktree_dir,
         &clone_dir,
         dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        "test-remover",
     )
     .await;
 
@@ -2431,6 +2432,7 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
         &clean_wt,
         &clone_dir,
         dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        "test-remover",
     )
     .await;
     assert!(
@@ -2440,7 +2442,7 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
     );
     assert_eq!(
         removed_outcome,
-        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Removed,
+        dot_agent_deck::issue_dispatch_run::RemoveOutcome::Removed("test-remover".to_string()),
         "the removed-clean-tree branch must return `RemoveOutcome::Removed`, distinguishable \
          from the kept/dirty branch -- a caller must be able to tell \"removed\" from \"kept\" \
          without re-probing the filesystem itself; got {removed_outcome:?}"
@@ -2455,6 +2457,7 @@ async fn worktree_reclaim_043_remove_worktree_outcome_covers_removed_and_probe_e
         &bogus_wt,
         &clone_dir,
         dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        "test-remover",
     )
     .await;
     assert!(
@@ -2514,6 +2517,7 @@ async fn worktree_reclaim_044_close_path_detached_spawn_propagates_nothing() {
             &wt_for_task,
             &clone_for_task,
             dot_agent_deck::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+            "test-remover",
         )
         .await
     });
@@ -2664,6 +2668,7 @@ async fn worktree_reclaim_045_issue_dispatch_producer_records_keep_if_dirty() {
         &paths.worktree_dir,
         &entry.clone_dir,
         entry.policy,
+        "test-remover",
     )
     .await;
     assert!(
