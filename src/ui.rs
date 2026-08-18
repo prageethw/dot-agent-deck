@@ -33984,6 +33984,99 @@ mod tests {
         }
     }
 
+    /// PRD fork#325 M3 test support: since `Action::SpawnPane`'s worktree-
+    /// creation branch now consults `root_checkout_has_live_sibling` (a real
+    /// daemon `ListAgents` round trip) before provisioning ANY worktree, a
+    /// unit test that dispatches that path with no daemon running would have
+    /// the gate fail closed and refuse the spawn — even though these tests
+    /// predate M3 and are about `create_worktree_sync`/marker/pane-cwd
+    /// mechanics the gate is orthogonal to. This spins up a REAL, in-process
+    /// attach-socket server (production [`crate::daemon_protocol::serve_attach`]
+    /// against a fresh, empty [`crate::agent_pty::AgentPtyRegistry`]) so the
+    /// gate's daemon round trip succeeds and resolves "no live orchestrations"
+    /// (`Ok(false)`) — never touched by anything else in this codebase's
+    /// pure-unit-test `Action::SpawnPane` dispatches, since
+    /// `CapturingPaneController` spawns panes purely in-memory and never
+    /// registers them with any daemon, so the registry this stub serves stays
+    /// empty for the whole test regardless of how many orchestrations a test
+    /// spawns.
+    ///
+    /// Mirrors `daemon_client.rs`'s own `spawn_test_server` harness (the same
+    /// `bind_attach_listener` + `serve_attach` shape) but is NOT
+    /// `#[cfg(unix)]`-only the way that one is: that harness also spawns
+    /// `/bin/sh`, which is what makes it Unix-only, but binding and serving
+    /// the attach protocol itself has no such dependency — and the three
+    /// tests this helper serves must keep passing on Windows too, so a
+    /// Windows-legal named-pipe address is used there instead of a
+    /// filesystem socket path (`IpcListener::bind` on Windows takes the
+    /// whole path as the literal pipe name, and a tempdir-based filesystem
+    /// path is not one).
+    ///
+    /// Returns an RAII guard: `DOT_AGENT_DECK_ATTACH_SOCKET` is restored to
+    /// its previous value when the guard drops, under the same
+    /// `STATE_DIR_ENV_LOCK` env-var-mutation lock `worktree_015`'s test uses,
+    /// held for the guard's whole lifetime. The server's own background
+    /// thread is intentionally never joined — it runs for the life of the
+    /// test process, which tears it down on exit.
+    struct EmptyAgentsDaemonGuard {
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+        prev_attach: Option<String>,
+    }
+
+    impl Drop for EmptyAgentsDaemonGuard {
+        fn drop(&mut self) {
+            // SAFETY: `_env_lock` is held for this guard's entire lifetime.
+            unsafe {
+                match self.prev_attach.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+                }
+            }
+        }
+    }
+
+    fn with_empty_agents_daemon(unique_dir: &std::path::Path) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let listener = crate::daemon_protocol::bind_attach_listener(&socket_addr)
+            .expect("bind stub attach listener for test");
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build stub attach-daemon runtime");
+            rt.block_on(async move {
+                let _ = crate::daemon_protocol::serve_attach(listener, registry, event_tx).await;
+            });
+        });
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
     /// Scenario: Build a `NewPaneRequest` whose `dir` is a real git repository
     /// and whose `orchestration_worktree_path` is `Some(<sibling path>)` —
     /// the shape `001` proves the form produces, `002` proves fails loud, and
@@ -34039,6 +34132,7 @@ mod tests {
             "precondition: req.dir must differ from the worktree path"
         );
         let worktree_str = worktree.display().to_string();
+        let _daemon = with_empty_agents_daemon(tmp.path());
 
         let config = make_orchestration("review");
         let req = NewPaneRequest {
@@ -34201,6 +34295,7 @@ mod tests {
             "init",
         ]);
 
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let owner_a =
             spawn_and_read_owner(tmp.path(), &repo, "instance-a", "review-orchestrator-1");
         let owner_b =
@@ -34317,6 +34412,7 @@ mod tests {
         ]);
 
         let worktree = tmp.path().join("repo-identity-008");
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let config = make_orchestration("review");
         let req = NewPaneRequest {
             dir: repo.clone(),
