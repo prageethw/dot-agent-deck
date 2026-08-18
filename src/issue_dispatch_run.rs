@@ -1629,8 +1629,12 @@ pub async fn create_worktree(
         }
         AddOutcome::AlreadyClaimed => WorktreeCreation::AlreadyClaimed,
         AddOutcome::TimedOut => {
+            let creator_str = crate::worktree_reclaim::sanitize_marker_creator(&format!(
+                "{}:{}",
+                creator.kind, creator.subject
+            ));
             let cleaned_up_by =
-                attempt_worktree_cleanup_async(clone_dir, worktree_dir, creator).await;
+                attempt_worktree_cleanup_async(clone_dir, worktree_dir, &creator_str).await;
             WorktreeCreation::TimedOut { cleaned_up_by }
         }
     })
