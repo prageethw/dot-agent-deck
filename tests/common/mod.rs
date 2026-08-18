@@ -3818,13 +3818,21 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let project = test_home.parent().ok_or_else(|| {
         std::io::Error::other("isolated Codex HOME has no fixture working directory")
     })?;
+    write_codex_project_trust(&dst, project)
+}
+
+/// Write Codex's per-project trust entry into `<codex_home>/config.toml`,
+/// trusting `project`. Split out from [`import_codex_credentials`] (issue
+/// #439) so the trust-config-writing behavior can be exercised without real
+/// Codex credentials.
+pub fn write_codex_project_trust(codex_home: &Path, project: &Path) -> std::io::Result<()> {
     let config = format!(
         "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
         toml_escape(project.to_str().ok_or_else(|| {
             std::io::Error::other("isolated Codex fixture path is not UTF-8")
         })?)
     );
-    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
+    write_credential_file_atomic_0o600(&codex_home.join("config.toml"), config.as_bytes())
 }
 
 /// Write a minimal `session.toml` containing exactly one pane that
