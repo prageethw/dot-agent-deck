@@ -3695,6 +3695,155 @@ exit 0
         );
     }
 
+    // --- issue #469: `remove_worktree` attribution + the `--` argv gap ---
+
+    /// Scenario: issue #469. Unlike its siblings `attempt_worktree_cleanup(_async)`
+    /// and `worktree_reclaim::remove_worktree_dir` (all from PR #458),
+    /// `remove_worktree`'s success log carries no identity of the caller.
+    /// Mirrors `attempt_worktree_cleanup_records_remover_identity`'s shape: a
+    /// real worktree is force-removed, and the returned outcome must carry
+    /// the identity that removed it, not just log it.
+    #[tokio::test]
+    async fn remove_worktree_records_remover_identity() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let clone_dir = ws.path().join("clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        git(&clone_dir, &["init", "--initial-branch=main", "--quiet"]);
+        git(&clone_dir, &["config", "user.email", "test@example.com"]);
+        git(&clone_dir, &["config", "user.name", "Test"]);
+        git(&clone_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(clone_dir.join("README.md"), "seed\n").unwrap();
+        git(&clone_dir, &["add", "README.md"]);
+        git(&clone_dir, &["commit", "--quiet", "-m", "seed"]);
+
+        let worktree_dir = ws.path().join("wt-remove-attrib");
+        git(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/remove-attrib",
+                worktree_dir.to_str().unwrap(),
+            ],
+        );
+        assert!(worktree_dir.exists());
+
+        let remover = "test-remover";
+        let outcome =
+            remove_worktree(&worktree_dir, &clone_dir, RemovalPolicy::Force, remover).await;
+        assert!(
+            !worktree_dir.exists(),
+            "remove_worktree must actually remove the directory"
+        );
+        match outcome {
+            RemoveOutcome::Removed(ref actual) => assert_eq!(
+                actual, remover,
+                "a removed worktree must attribute the identity that removed it (issue #469)"
+            ),
+            other => panic!(
+                "expected RemoveOutcome::Removed to carry the remover identity, got {other:?}"
+            ),
+        }
+    }
+
+    /// A minimal synthetic `git` for
+    /// [`remove_worktree_argv_carries_end_of_options_separator_before_path`]
+    /// only: logs every invocation's argv to `$GITSTUB_DIR/git-calls.log`
+    /// (mirroring `CLAIM_019_GH_STUB`/`CLAIM_024_GH_STUB`'s
+    /// `$GHSTUB_DIR/gh-calls.log` pattern for `gh`) and always exits 0, so
+    /// `remove_worktree` never touches a real worktree here -- this is a
+    /// pure argv assertion against the real call, not a behavioural one.
+    const GIT_ARGV_STUB: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GITSTUB_DIR/git-calls.log" 2>/dev/null || true
+exit 0
+"#;
+
+    /// Scenario: issue #469 / #144 finding 4. `worktree_reclaim::remove_worktree_dir`
+    /// and `issue_dispatch::worktree_remove_argv` both already carry a `--`
+    /// end-of-options separator before the worktree path (PR #458) --
+    /// `remove_worktree` is the one call site PR #458 missed. Shadows `git`
+    /// on PATH with a stub that only logs argv and exits 0, calls
+    /// `remove_worktree` against a fake (never-touched) path, and asserts the
+    /// captured invocation carries `--` immediately before the path argument.
+    #[tokio::test]
+    async fn remove_worktree_argv_carries_end_of_options_separator_before_path() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let git_stub = bindir.join("git");
+        std::fs::write(&git_stub, GIT_ARGV_STUB).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&git_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let gitstub_dir = scratch.path().join("gitstub");
+        std::fs::create_dir_all(&gitstub_dir).unwrap();
+
+        let prior_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: `std::env::set_var` is process-global, but CLAUDE.md rule 5's
+        // fork addendum means every test run happens in CI via `cargo nextest`,
+        // which runs each test in its OWN process — so no sibling test in this
+        // module ever observes this mutation. The prior value is restored
+        // below regardless, before this function returns.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
+            std::env::set_var("GITSTUB_DIR", &gitstub_dir);
+        }
+
+        let worktree_dir = Path::new("/repo/worktrees/agent-issue-7");
+        let clone_dir = Path::new("/repo/clone");
+        let outcome = remove_worktree(
+            worktree_dir,
+            clone_dir,
+            RemovalPolicy::Force,
+            "test-remover",
+        )
+        .await;
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("PATH", prior_path);
+            std::env::remove_var("GITSTUB_DIR");
+        }
+
+        assert!(
+            matches!(outcome, RemoveOutcome::Removed(_)),
+            "the stub always exits 0, so remove_worktree must report Removed, got {outcome:?}"
+        );
+        let calls = std::fs::read_to_string(gitstub_dir.join("git-calls.log")).unwrap_or_default();
+        let first_call = calls
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("no invocation was logged to git-calls.log"));
+        let argv: Vec<&str> = first_call.split(' ').collect();
+        let dash_dash = argv.iter().position(|a| *a == "--").unwrap_or_else(|| {
+            panic!(
+                "remove_worktree's git invocation must contain a `--` end-of-options \
+                 separator, got {argv:?}"
+            )
+        });
+        assert_eq!(
+            argv.get(dash_dash + 1).copied(),
+            Some(worktree_dir.to_string_lossy().as_ref()),
+            "the `--` separator must sit IMMEDIATELY before the path argument, got {argv:?}"
+        );
+    }
+
     // --- fork issue #282: the attach race ---
 
     /// Scenario: fork issue #282. Two concurrent callers of

@@ -1038,6 +1038,126 @@ mod tests {
         );
     }
 
+    // --- issue #469: ownership/liveness gate on the spawn-rollback path ---
+
+    /// Scenario: issue #469. `handle_dispatch`'s spawn-rollback arm
+    /// force-removes the worktree it just created whenever `spawn()` fails —
+    /// but for a multi-role orchestration, an earlier role can already be a
+    /// live PTY child rooted in that same worktree by the time a later
+    /// role's spawn fails, and today's unconditional force-removal yanks the
+    /// worktree out from under it. This fakes that state directly: a live
+    /// sibling agent is registered with a `cwd` matching the worktree
+    /// `handle_dispatch` is about to create, and the dispatch's own agent
+    /// command is pointed at a binary that cannot exist, so `spawn()` fails
+    /// deterministically and fast. With a live sibling still rooted there,
+    /// the worktree, its branch, and the registry entry must all survive.
+    #[tokio::test]
+    async fn spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "guard-trip-unit");
+
+        // The worktree doesn't exist yet -- `handle_dispatch` creates it --
+        // but a real PTY-backed sibling needs a real cwd to spawn into, so
+        // create the plain (non-worktree) directory ahead of it. `git
+        // worktree add` succeeds into a pre-existing EMPTY directory, so
+        // this does not trip the `AlreadyClaimed` path.
+        std::fs::create_dir_all(&paths.worktree_dir).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let sibling_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                cwd: Some(&paths.worktree_dir.to_string_lossy()),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn a live sibling agent rooted in the about-to-be-created worktree");
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-469".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "guard-trip-unit", "task", None).await;
+
+        assert!(
+            !result.success,
+            "the spawn itself must still report failure"
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "a live sibling still rooted in the worktree must keep it from being \
+             force-removed (issue #469): {}",
+            result.message
+        );
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "the branch must survive too -- a still-live sibling may hold committed work \
+             whose only record is this branch"
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "the registry entry must survive so a later close can still find and clean it up"
+        );
+
+        let _ = registry.close_agent(&sibling_id);
+        let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
+    /// Scenario: issue #469 regression guard. Same forced-failure setup as
+    /// `spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_worktree`,
+    /// but with NO live sibling registered: the worktree, its branch, and the
+    /// registry entry must all be gone, exactly as
+    /// `force_removes_a_dirty_worktree_regardless_of_uncommitted_work`
+    /// already proves for `remove_worktree` directly -- this proves the SAME
+    /// thing reached through `handle_dispatch`'s actual failure arm, which
+    /// nothing exercised end-to-end before this issue.
+    #[tokio::test]
+    async fn spawn_rollback_force_removes_when_nothing_else_roots_the_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let paths = derive_dispatch_paths(&repo, "guard-notrip-unit");
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-469".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "guard-notrip-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            !paths.worktree_dir.exists(),
+            "with nothing else rooted there, the worktree must still be force-removed \
+             exactly as before: {}",
+            result.message
+        );
+        assert!(
+            !branch_exists(&repo, &paths.branch),
+            "the branch must still be deleted too"
+        );
+        assert!(
+            !ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "the registry entry must still be dropped"
+        );
+    }
+
     /// The wire choice maps onto the spawn override, and ABSENT stays absent —
     /// that is what preserves the pre-selector behaviour for an older CLI.
     #[test]
