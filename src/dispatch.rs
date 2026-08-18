@@ -446,13 +446,16 @@ pub async fn handle_dispatch(
                      skipping cleanup"
                 );
                 return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
                     message: format!(
                         "dispatch: spawn failed: {e} (cleanup skipped: {} is still rooted by a \
-                         live sibling role — worktree, branch, and registry entry left in place)",
-                        paths.worktree_dir.display()
+                         live sibling role — worktree, branch, and registry entry left in place; \
+                         close the remaining role panes to release it automatically)",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        )
                     ),
-                    success: false,
-                    worktree_dir: paths.worktree_dir,
                 };
             }
 
@@ -1108,9 +1111,23 @@ mod tests {
         // this does not trip the `AlreadyClaimed` path.
         std::fs::create_dir_all(&paths.worktree_dir).unwrap();
         let registry = Arc::new(AgentPtyRegistry::new());
+        // The real defect is a multi-role orchestration: `worktree_of_record`
+        // resolves a role pane's worktree via `TabMembership::Orchestration`'s
+        // `orchestration_cwd`, not via the record's own `cwd` (reviewer F3) --
+        // so the sibling must carry that membership shape, not a bare `cwd`,
+        // to exercise the same resolution arm the real code path uses.
         let sibling_id = registry
             .spawn_agent(crate::agent_pty::SpawnOptions {
                 cwd: Some(&paths.worktree_dir.to_string_lossy()),
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "guard-trip-unit".to_string(),
+                    role_index: 0,
+                    role_name: "coder".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(paths.worktree_dir.to_string_lossy().into_owned()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
                 ..crate::agent_pty::SpawnOptions::default()
             })
             .expect("spawn a live sibling agent rooted in the about-to-be-created worktree");
@@ -1126,6 +1143,11 @@ mod tests {
         };
 
         let result = handle_dispatch(&ctx, "guard-trip-unit", "task", None).await;
+
+        // Close the sibling shell before any assertion can panic (reviewer
+        // F5a): a failing `assert!` below must not leak a real `setsid`'d
+        // process past a `let _ =` that never runs.
+        let _ = registry.close_agent(&sibling_id);
 
         assert!(
             !result.success,
@@ -1149,8 +1171,13 @@ mod tests {
                 .contains_key(&paths.worktree_dir),
             "the registry entry must survive so a later close can still find and clean it up"
         );
+        assert!(
+            result.message.contains("cleanup skipped"),
+            "the skip message must name the cause so an operator doesn't reach for a \
+             manual force-removal: {}",
+            result.message
+        );
 
-        let _ = registry.close_agent(&sibling_id);
         let _ = std::fs::remove_dir_all(&paths.worktree_dir);
     }
 

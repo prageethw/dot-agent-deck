@@ -222,7 +222,13 @@ pub enum RemoveOutcome {
     /// The worktree was removed. Carries the identity (issue #469) that
     /// removed it — the caller-supplied `remover` [`remove_worktree`] was
     /// given, mirroring [`RemoveFailed`](RemoveOutcome::RemoveFailed)'s own
-    /// caller-supplied string.
+    /// caller-supplied string. Stored RAW, not the sanitized copy that
+    /// reaches the log line — safe today because the only non-test consumers
+    /// discard this payload entirely, but its sibling variant
+    /// [`RemoveFailed`](RemoveOutcome::RemoveFailed) already crosses the wire
+    /// as [`crate::event::WorktreeKeptNotice`], so any future sink that
+    /// surfaces THIS payload (to a TUI, a log, anywhere) must sanitize it
+    /// first, the same way [`remove_worktree`]'s own log line does.
     Removed(String),
     /// The worktree was left in place. Carries why — see
     /// [`crate::event::KeptReason`].
@@ -237,6 +243,29 @@ pub enum RemoveOutcome {
     /// no client-visible trace (PRD 236 review, reproduced against a locked
     /// worktree on git 2.55.0).
     RemoveFailed(String),
+}
+
+/// Build the argv for `git -C <clone_dir> worktree remove [--force] -- <worktree_dir>`
+/// — a pure function so the `--` end-of-options separator (issue #469 /
+/// #144 finding 4) can be pinned by a plain data assertion instead of a
+/// PATH-shadowed shell-stub test, mirroring `issue_dispatch.rs`'s
+/// `worktree_remove_argv` (PR #458), which solved the identical problem for
+/// its own caller. Unlike that sibling, `force` is conditional here (this
+/// caller uses [`RemovalPolicy::KeepIfDirty`] too), so it takes a `bool`
+/// rather than always pushing `--force`.
+fn remove_worktree_argv(clone_dir: &str, worktree_dir: &str, force: bool) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_string(),
+        clone_dir.to_string(),
+        "worktree".to_string(),
+        "remove".to_string(),
+    ];
+    if force {
+        args.push("--force".to_string());
+    }
+    args.push("--".to_string());
+    args.push(worktree_dir.to_string());
+    args
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
@@ -270,6 +299,7 @@ pub async fn remove_worktree(
             Ok(output) if !output.trim().is_empty() => {
                 tracing::warn!(
                     worktree = %worktree_dir.display(),
+                    remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
                 return RemoveOutcome::Kept(crate::event::KeptReason::Dirty);
@@ -278,6 +308,7 @@ pub async fn remove_worktree(
             Err(e) => {
                 tracing::warn!(
                     worktree = %worktree_dir.display(),
+                    remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                     error = %e,
                     "dispatch: could not check worktree status; leaving in place"
                 );
@@ -286,28 +317,27 @@ pub async fn remove_worktree(
         }
     }
 
-    let clone = clone_dir.to_string_lossy();
-    let mut args = vec!["-C", &clone, "worktree", "remove"];
-    if policy == RemovalPolicy::Force {
-        args.push("--force");
-    }
-    args.push("--");
-    args.push(&worktree);
-    let res = run_status("git", &args).await;
+    let args = remove_worktree_argv(
+        &clone_dir.to_string_lossy(),
+        &worktree,
+        policy == RemovalPolicy::Force,
+    );
+    let res = run_status_args("git", &args).await;
     match res {
         Ok(()) => {
             tracing::info!(
                 worktree = %worktree_dir.display(),
                 remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                "issue-dispatch: removed worktree on tab close (clone preserved)"
+                "dispatch: removed worktree (clone preserved)"
             );
             RemoveOutcome::Removed(remover.to_string())
         }
         Err(e) => {
             tracing::warn!(
                 worktree = %worktree_dir.display(),
+                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
                 error = %e,
-                "issue-dispatch: worktree cleanup on close failed"
+                "dispatch: worktree cleanup failed"
             );
             RemoveOutcome::RemoveFailed(e)
         }
@@ -3773,99 +3803,39 @@ exit 0
         }
     }
 
-    /// A minimal synthetic `git` for
-    /// [`remove_worktree_argv_carries_end_of_options_separator_before_path`]
-    /// only: logs every invocation's argv to `$GITSTUB_DIR/git-calls.log`
-    /// (mirroring `CLAIM_019_GH_STUB`/`CLAIM_024_GH_STUB`'s
-    /// `$GHSTUB_DIR/gh-calls.log` pattern for `gh`) and always exits 0, so
-    /// `remove_worktree` never touches a real worktree here -- this is a
-    /// pure argv assertion against the real call, not a behavioural one.
-    const GIT_ARGV_STUB: &str = r#"#!/bin/sh
-printf '%s\n' "$*" >> "$GITSTUB_DIR/git-calls.log" 2>/dev/null || true
-exit 0
-"#;
-
-    /// Scenario: issue #469 / #144 finding 4. `worktree_reclaim::remove_worktree_dir`
-    /// and `issue_dispatch::worktree_remove_argv` both already carry a `--`
-    /// end-of-options separator before the worktree path (PR #458) --
-    /// `remove_worktree` is the one call site PR #458 missed. Shadows `git`
-    /// on PATH with a stub that only logs argv and exits 0, calls
-    /// `remove_worktree` against a fake (never-touched) path, and asserts the
-    /// captured invocation carries `--` immediately before the path argument.
-    //
-    // `#[cfg(unix)]`: the stub is a `#!/bin/sh` script located via a PATH
-    // shadow. Windows' PATH search only matches `PATHEXT` extensions
-    // (`.exe`, `.bat`, `.cmd`, ...) — a bare `git` file with a shebang is
-    // invisible to it, so the search falls through to the REAL `git` on
-    // PATH, which then fails against the fake `/repo/...` paths. Same
-    // reasoning as the other shell-stub tests in this file
-    // (`issue_claim_019_dispatch_path_assignee_refresh_keeps_assignee`,
-    // `git_common_dir_async_is_bounded_by_an_external_timeout`), which are
-    // gated the same way.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn remove_worktree_argv_carries_end_of_options_separator_before_path() {
-        let scratch = tempfile::tempdir().unwrap();
-        let bindir = scratch.path().join("bin");
-        std::fs::create_dir_all(&bindir).unwrap();
-        let git_stub = bindir.join("git");
-        std::fs::write(&git_stub, GIT_ARGV_STUB).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&git_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let gitstub_dir = scratch.path().join("gitstub");
-        std::fs::create_dir_all(&gitstub_dir).unwrap();
-
-        let prior_path = std::env::var("PATH").unwrap_or_default();
-        // SAFETY: `std::env::set_var` is process-global, but CLAUDE.md rule 5's
-        // fork addendum means every test run happens in CI via `cargo nextest`,
-        // which runs each test in its OWN process — so no sibling test in this
-        // module ever observes this mutation. The prior value is restored
-        // below regardless, before this function returns.
-        unsafe {
-            std::env::set_var("PATH", format!("{}:{prior_path}", bindir.display()));
-            std::env::set_var("GITSTUB_DIR", &gitstub_dir);
-        }
-
-        let worktree_dir = Path::new("/repo/worktrees/agent-issue-7");
-        let clone_dir = Path::new("/repo/clone");
-        let outcome = remove_worktree(
-            worktree_dir,
-            clone_dir,
-            RemovalPolicy::Force,
-            "test-remover",
-        )
-        .await;
-
-        // SAFETY: see above.
-        unsafe {
-            std::env::set_var("PATH", prior_path);
-            std::env::remove_var("GITSTUB_DIR");
-        }
-
-        assert!(
-            matches!(outcome, RemoveOutcome::Removed(_)),
-            "the stub always exits 0, so remove_worktree must report Removed, got {outcome:?}"
-        );
-        let calls = std::fs::read_to_string(gitstub_dir.join("git-calls.log")).unwrap_or_default();
-        let first_call = calls
-            .lines()
-            .next()
-            .unwrap_or_else(|| panic!("no invocation was logged to git-calls.log"));
-        let argv: Vec<&str> = first_call.split(' ').collect();
-        let dash_dash = argv.iter().position(|a| *a == "--").unwrap_or_else(|| {
-            panic!(
-                "remove_worktree's git invocation must contain a `--` end-of-options \
-                 separator, got {argv:?}"
-            )
-        });
+    /// Scenario: issue #469 / #144 finding 4, reviewer F5b. Pure data
+    /// assertion against [`remove_worktree_argv`] — no process spawn, no
+    /// PATH shadow, no `unsafe`, no platform gate — that the `--`
+    /// end-of-options separator sits immediately before the worktree path,
+    /// same shape as `issue_dispatch.rs`'s
+    /// `worktree_remove_argv_carries_end_of_options_separator_before_path`
+    /// (PR #458), which this test is named distinctly from (reviewer F5b:
+    /// the previous shell-stub test in this module shared that exact name
+    /// across two modules, so a filtered `cargo test` matched both).
+    #[test]
+    fn remove_worktree_argv_puts_end_of_options_separator_before_path() {
+        let argv = remove_worktree_argv("/repo/clone", "/repo/worktrees/agent-issue-7", true);
+        let dash_dash = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("remove_worktree_argv must contain a `--` end-of-options separator");
         assert_eq!(
-            argv.get(dash_dash + 1).copied(),
-            Some(worktree_dir.to_string_lossy().as_ref()),
+            argv.get(dash_dash + 1).map(String::as_str),
+            Some("/repo/worktrees/agent-issue-7"),
             "the `--` separator must sit IMMEDIATELY before the path argument, got {argv:?}"
         );
+    }
+
+    /// Scenario: `remove_worktree_argv`'s `force` parameter is what makes it
+    /// diverge from `issue_dispatch.rs`'s always-`--force` sibling — assert
+    /// `--force` is present when requested and absent otherwise.
+    #[test]
+    fn remove_worktree_argv_pushes_force_flag_only_when_requested() {
+        let forced = remove_worktree_argv("/repo/clone", "/repo/worktrees/agent-issue-7", true);
+        assert!(forced.iter().any(|a| a == "--force"));
+
+        let unforced = remove_worktree_argv("/repo/clone", "/repo/worktrees/agent-issue-7", false);
+        assert!(!unforced.iter().any(|a| a == "--force"));
     }
 
     // --- fork issue #282: the attach race ---
