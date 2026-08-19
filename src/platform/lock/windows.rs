@@ -14,8 +14,27 @@
 //! the mutex name is derived from (see
 //! [`crate::platform::lock::spawn_mutex_name`], which also documents why the name
 //! is per-path and how this object doubles as the singleton-daemon guard). No file
-//! is created: a kernel object needs no on-disk artifact, and the Unix
-//! `spawn.lock` file has no readers other than `flock` itself.
+//! is created: a kernel object needs no on-disk artifact, and at the time this was
+//! written (PRD #163) the Unix `spawn.lock` file had no readers other than `flock`
+//! itself.
+//!
+//! **That "no readers" premise no longer holds for [`PathLock`]/
+//! [`acquire_path_lock_sync_bounded`]** (fork#325 M4, diagnosing the same-symptom
+//! failure that survived the M4 candidate-path canonicalization fix): fork#325 M4a
+//! added [`crate::worktree_reclaim::candidate_has_attach_lock`], which treats the
+//! Unix `flock` file's mere ON-DISK EXISTENCE at
+//! [`crate::issue_dispatch_run::worktree_attach_lock_path_from_common_dir`]'s
+//! resolved path as provenance — a reader this module's original design never
+//! anticipated. `acquire_spawn_lock_sync_bounded` (`unix.rs`) always leaves that
+//! file behind via `OpenOptions::create(true)`, but `acquire_path_lock_sync_bounded`
+//! below created only the named mutex, no file — so `candidate_has_attach_lock`'s
+//! `.is_file()` probe could never succeed on Windows regardless of whether the
+//! write-time and check-time `common_dir`/candidate-path computations agreed (they
+//! do — verified directly against a real `build-windows` run with temporary
+//! instrumentation: write-time and check-time produced the byte-identical hash and
+//! lock path every time). `acquire_path_lock_sync_bounded` now also best-effort
+//! touches an owner-only file at the lock path, restoring the parity
+//! `candidate_has_attach_lock`'s own doc comment already assumed.
 //!
 //! **Thread affinity is the one place this cannot be a naive translation.** A
 //! Win32 mutex is owned by the *thread* that waited on it: `ReleaseMutex` from any
@@ -260,13 +279,17 @@ impl Drop for PathLock {
 ///
 /// Bounded (fork #331 audit S1): waits at most `timeout` rather than
 /// `INFINITE`, refusing with an `ErrorKind::TimedOut` error on expiry rather
-/// than blocking the caller forever. The sole caller,
-/// [`crate::issue_dispatch_run::create_worktree_sync`], runs directly on the
-/// TUI's synchronous render/event loop, so an unbounded wait here would
-/// reopen the freeze `WORKTREE_GIT_TIMEOUT` exists to prevent on the `git`
-/// calls either side of it. [`acquire_spawn_lock`] above stays unbounded —
-/// the daemon-start/lazy-spawn callers deliberately wait for the in-flight
-/// spawn to finish.
+/// than blocking the caller forever. Callers —
+/// [`crate::issue_dispatch_run::create_worktree_sync`], called directly on
+/// the TUI's synchronous render/event loop, and
+/// [`crate::issue_dispatch_run::provision_isolated_clone_sync`], called both
+/// from there (`src/ui.rs`) and from `src/dispatch.rs`'s CLI path via
+/// `tokio::task::spawn_blocking` — an unbounded wait here would reopen the
+/// freeze `WORKTREE_GIT_TIMEOUT` exists to prevent on the `git` calls either
+/// side of it, or park a blocking-pool thread indefinitely on the
+/// `spawn_blocking` path. [`acquire_spawn_lock`] above stays unbounded — the
+/// daemon-start/lazy-spawn callers deliberately wait for the in-flight spawn
+/// to finish.
 pub fn acquire_path_lock_sync_bounded(path: &Path, timeout: Duration) -> std::io::Result<PathLock> {
     let user = crate::platform::paths::endpoint_user_suffix();
     let name = super::spawn_mutex_name(&user, path);
@@ -275,7 +298,58 @@ pub fn acquire_path_lock_sync_bounded(path: &Path, timeout: Duration) -> std::io
     // opposite of this function's contract. Clamp one below it instead.
     let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
     let held = create_and_acquire(&name, &user, timeout_ms)?;
+    // fork#325 M4: restore the on-disk-artifact parity the Unix `flock` file
+    // has always given `candidate_has_attach_lock` for free -- see this
+    // function's own module doc for why the mutex alone is not enough.
+    // Best-effort: a failure here must never fail the lock acquisition
+    // itself, since the mutex (already held above) is what every caller's
+    // correctness actually depends on -- this file is provenance for a
+    // DIFFERENT, best-effort-only consumer.
+    touch_attach_lock_artifact_best_effort(path);
     Ok(PathLock { held, name })
+}
+
+/// Best-effort on-disk touch of the worktree attach-lock artifact at `path`
+/// (fork#325 M4) — see [`acquire_path_lock_sync_bounded`]'s call site and
+/// this module's own doc comment for why this exists: unlike the Unix
+/// backend, the named mutex above leaves nothing on disk by itself, but
+/// [`crate::worktree_reclaim::candidate_has_attach_lock`] reads this exact
+/// path's mere existence as provenance that `provision_isolated_clone_sync`
+/// genuinely created a given isolated clone.
+///
+/// Deliberately infallible and silent-on-failure beyond a `tracing::warn!`:
+/// the caller has already acquired the mutex by the time this runs, and a
+/// failure to write a provenance file must never turn into a failure to
+/// provision a worktree/clone — the same "log and fall back, never fail the
+/// primary operation" shape `issue_dispatch_run::canonicalize_best_effort`
+/// already uses for this same lock-path machinery. Owner-only (mirroring the
+/// Unix file's `0o600`), via the same
+/// [`crate::platform::fsperm::set_create_mode_owner_only`] /
+/// [`crate::platform::fsperm::set_file_owner_only`] pair every other
+/// owner-only file write in this codebase uses.
+fn touch_attach_lock_artifact_best_effort(path: &Path) {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.create(true).write(true).truncate(false);
+    crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
+    let file = match open_opts.open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to create the worktree attach-lock artifact file; \
+                 candidate_has_attach_lock will not recognize this clone/worktree"
+            );
+            return;
+        }
+    };
+    if let Err(error) = crate::platform::fsperm::set_file_owner_only(&file) {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed to set owner-only permissions on the worktree attach-lock artifact file"
+        );
+    }
 }
 
 /// Create-or-open the named mutex and block until this thread owns it, or
