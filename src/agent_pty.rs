@@ -194,6 +194,15 @@ pub fn arm_seed_fallback(
                 // again under the held writer immediately before writing —
                 // mirroring `deliver_worker_exited_notice`.
                 let expected_agent_id = registry.authorized_occupant(&pane_id);
+                // Issue #424 S3: this fallback fires because the native pull
+                // did not happen — it is not a retry of anything, but a
+                // stale, unsettled record from an earlier delivery of
+                // byte-identical text into this same pane (e.g. this exact
+                // seed one-liner delegated to it before) would make the
+                // repeat-guard read this delivery as a retry clobbering a
+                // user's draft. Release it proactively so it can never
+                // refuse this delivery.
+                registry.note_payload_settled(&pane_id, &seed);
                 let outcome = registry
                     .write_and_submit_guarded(
                         &pane_id,

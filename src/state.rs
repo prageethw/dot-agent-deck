@@ -5337,6 +5337,15 @@ impl AppState {
         // `spawn_agent` reusing the same `pane_id_env` after a close does
         // not.
         let expected_agent_id = registry.authorized_occupant(&orch_pane_id);
+        // Issue #424 S3: this report is triggered by a NEW, independent
+        // work-done signal, not a retry of an earlier one — but if an
+        // earlier, unrelated delivery happened to compose byte-identical
+        // feedback text into this same orchestrator pane and left its
+        // record unsettled (e.g. never confirmed), the repeat-guard would
+        // read this genuinely new report as a retry clobbering a user's
+        // draft. Release any such stale record proactively so it can never
+        // refuse this one.
+        registry.note_payload_settled(&orch_pane_id, &feedback);
         let outcome = registry
             .write_and_submit_guarded(
                 &orch_pane_id,

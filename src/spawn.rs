@@ -2431,18 +2431,28 @@ async fn deliver_on_idle(
         }
     }
     let expected_agent_id = registry.authorized_occupant(pane_id);
+    // Issue #424 S3: a recurring scheduled task delivers the SAME fixed
+    // prompt text on every fire, by design — including the very first,
+    // spawn-time delivery, which may still be an unsettled record here (its
+    // own caller settles it on confirm/abandon/stop, a lifecycle this
+    // reuse fire has no part in and may never observe, e.g. when the target
+    // command emits no confirming hook at all). Left in place, that stale
+    // record would make `write_and_submit_guarded`'s repeat-guard read THIS
+    // independent, debounce-decided re-delivery as a retry clobbering a
+    // user's draft — the exact false positive the debounce wait above
+    // already resolved by waiting for the user to go idle. Release it
+    // proactively so an earlier delivery's bookkeeping can never refuse
+    // this one.
+    registry.note_payload_settled(pane_id, prompt);
     let outcome = registry
         .write_and_submit_guarded(pane_id, prompt, expected_agent_id.as_deref(), || async {
             true
         })
         .await;
-    // Issue #424 S3: this delivery is ONE-SHOT — nothing above retries a
-    // reuse prompt, so the record this write leaves behind guards no retry
-    // and can only refuse a LATER delivery of the same fixed prompt text
-    // (every fire of a recurring scheduled task uses the same text). Release
-    // it here rather than leaving it to the TTL, mirroring every other
-    // one-shot guarded-write caller (e.g. `handle_delegate`). Only when
-    // something actually landed — a refusal left no record to release.
+    // Same reasoning in the other direction: release the record THIS write
+    // just left, so a later fire of the same recurring prompt isn't refused
+    // by it either. Only when something actually landed — a refusal left no
+    // record to release.
     if matches!(
         outcome,
         Ok(GuardedSend::Applied) | Ok(GuardedSend::Ambiguous)

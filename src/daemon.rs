@@ -2119,6 +2119,18 @@ async fn run_hook_loop(
                                     // `pane_id_env` after a close does not.
                                     let expected_agent_id =
                                         pty_registry.authorized_occupant(&signal.pane_id);
+                                    // Issue #424 S3: this dispatch result is a
+                                    // NEW, independent delivery, not a retry —
+                                    // but a stale, unsettled record from an
+                                    // earlier delivery of byte-identical
+                                    // result text (e.g. the same failure
+                                    // message) into this same caller pane
+                                    // would make the repeat-guard read this
+                                    // one as a retry clobbering a user's
+                                    // draft. Release it proactively so it can
+                                    // never refuse this delivery.
+                                    pty_registry
+                                        .note_payload_settled(&signal.pane_id, &result.message);
                                     let outcome = pty_registry
                                         .write_and_submit_guarded(
                                             &signal.pane_id,
