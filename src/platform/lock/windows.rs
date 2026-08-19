@@ -34,7 +34,13 @@
 //! instrumentation: write-time and check-time produced the byte-identical hash and
 //! lock path every time). `acquire_path_lock_sync_bounded` now also best-effort
 //! touches an owner-only file at the lock path, restoring the parity
-//! `candidate_has_attach_lock`'s own doc comment already assumed.
+//! `candidate_has_attach_lock`'s own doc comment already assumed. One
+//! consequence worth naming explicitly: this file's persistent, never-removed
+//! existence is now a same-uid-only, bounded provenance-history signal on
+//! Windows too — a lock having been genuinely taken at this path at some
+//! point in the past — matching a property the Unix `flock` file has carried
+//! since [`PathLock`]/[`acquire_path_lock_sync_bounded`] were introduced
+//! (fork #282), not a new kind of guarantee invented here.
 //!
 //! **Thread affinity is the one place this cannot be a naive translation.** A
 //! Win32 mutex is owned by the *thread* that waited on it: `ReleaseMutex` from any

@@ -2792,6 +2792,23 @@ async fn git_common_dir_async(clone_dir: &Path) -> Result<PathBuf, String> {
 /// check time can no longer diverge on which branch they took, only
 /// (unchanged, and already logged) on whether the parent itself fails to
 /// canonicalize.
+///
+/// A second, independent reason not to reintroduce the full-path branch:
+/// the two-branch version could make racing callers hash the SAME target
+/// to two DIFFERENT lock paths, not only a write-time/check-time caller
+/// pair. Two callers racing to provision the identical `clone_dir` both run
+/// at write time (`worktree_attach_lock_path`, before `clone_dir` exists),
+/// so both would take the fallback branch and hash identically today — but
+/// that agreement held only because both callers happened to observe the
+/// path in the same not-yet-created state; anything that let one of them
+/// observe it as already-existing (a slow racer landing after the other's
+/// `AlreadyClaimed` check, for instance) would flip it onto the primary
+/// branch while the other stayed on the fallback, hashing the same real
+/// directory to two different lock files and defeating the mutual
+/// exclusion the lock exists for. Resolving through the parent
+/// unconditionally removes that branch entirely, so no ordering of
+/// concurrent `AlreadyClaimed` checks can make two callers disagree on
+/// which lock file guards a given target.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {

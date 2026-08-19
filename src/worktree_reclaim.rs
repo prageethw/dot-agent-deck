@@ -859,9 +859,11 @@ pub enum Cleanliness {
 
 /// Shared by both a linked worktree's row and a discovered isolated clone's
 /// (`isolated_clone_report`) — always run via [`git_in_untrusted_dir`]
-/// (fork#325 M4a, auditor A3): `-c core.fsmonitor=` is a no-op for a linked
-/// worktree (already reachable only via `git worktree list`, never a
-/// directory an outside party could plant), and is the exact vector the
+/// (fork#325 M4a, auditor A3): `-c core.fsmonitor=` is a CORRECTNESS no-op
+/// for a linked worktree (fsmonitor is genuinely still disabled for that
+/// call; it simply doesn't matter there, since a linked worktree is already
+/// reachable only via `git worktree list`, never a directory an outside
+/// party could plant), and is the exact vector the
 /// audit's own lab reproduced arbitrary code execution through for a
 /// discovered isolated-clone candidate, whose directory this process did
 /// not create.
@@ -1666,16 +1668,54 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 /// a linked worktree: the evidence lives in a location the ENUMERATING
 /// party controls (`repo_dir`'s own `.git`), not one the candidate itself
 /// can write to. A `same-uid` attacker able only to plant a sibling
-/// directory cannot forge this file — closing auditor B1's 4-file/1-SHA
-/// forgery, which the shared-history check could not (it only checked that
-/// the candidate NAMED a commit `repo_dir` had, never that it HELD one).
-/// And unlike the shared-history check, this has no dependency on the
-/// candidate's current `HEAD` at all — a genuine clone that has since
-/// committed real, local-only work is still recognized, closing reviewer
-/// F13.
+/// directory cannot forge the LOCK FILE'S CONTENTS — closing auditor B1's
+/// 4-file/1-SHA forgery, which the shared-history check could not (it only
+/// checked that the candidate NAMED a commit `repo_dir` had, never that it
+/// HELD one). And unlike the shared-history check, this has no dependency
+/// on the candidate's current `HEAD` at all — a genuine clone that has
+/// since committed real, local-only work is still recognized, closing
+/// reviewer F13.
 ///
-/// Honest limits, stated plainly rather than overclaimed (the exact
-/// overclaim auditor B1 flagged in the doc comment this replaces):
+/// **What this does NOT prove (corrected in this doc-only round — reviewer
+/// P1 / auditor C1 — from an earlier version of this comment that
+/// overclaimed it): that the file exists proves the deck itself wrote
+/// something at this exact path AT SOME POINT — not that the CURRENT
+/// occupant of that path is the clone that earned it.** Two concrete, bounded
+/// ways that gap is real:
+/// - **Reviewer P1 — shared namespace with ordinary linked worktrees.** The
+///   attach-lock namespace here is the SAME one [`create_worktree_sync`]
+///   writes into for an ordinary linked worktree, the common case — it is
+///   not isolated-clone-specific. A deck-created-then-later-removed linked
+///   worktree leaves its lock file behind (never cleaned up on that path
+///   either). An attacker who later plants a `.git` dir plus a forged
+///   ownership marker at that exact now-vacant path inherits the genuine,
+///   already-written lock and reaches the same misattribution outcome the
+///   forgery-closing paragraph above was meant to rule out — without
+///   forging the lock file at all.
+/// - **Auditor C1 — the lock is acquired before `clone_dir.exists()` is
+///   checked.** `provision_isolated_clone_sync` acquires this lock
+///   (writing the artifact unconditionally) BEFORE it checks whether
+///   `clone_dir` already exists. An attacker who pre-plants a directory at
+///   the fully deterministic dispatch path gets the deck itself to write a
+///   genuine artifact vouching for that path. This is bounded — the
+///   dispatch then visibly fails to the operator
+///   (`IsolatedCloneOutcome::AlreadyClaimed`), so nothing actually attaches
+///   into the planted directory — but the directory still reports
+///   `owned: true` with an attacker-chosen `created-by` if inspected before
+///   anyone notices the failed dispatch.
+///
+/// Neither residual is fixed in this round; both are deferred to fork#325
+/// M4b, which needs one of: a distinct, clone-specific provenance artifact
+/// (closing the P1 namespace-sharing gap at the source), or unlinking the
+/// lock artifact on the `AlreadyClaimed` early-return path — and only when
+/// THIS call is the one that created it, since an unconditional unlink
+/// would let a losing racer delete the winner's genuine lock. Note that
+/// fix must NOT move the `clone_dir.exists()` check earlier than the lock
+/// acquisition to close C1 directly — that would reopen the exact
+/// `clone_dir.exists()` -> `git clone` TOCTOU fork#325 auditor A3 closed by
+/// moving the lock acquisition first (fork #282's TOCTOU family).
+///
+/// Other honest limits, stated plainly rather than overclaimed:
 /// - **Same-uid still wins.** An attacker with write access to `repo_dir`'s
 ///   own `.git` defeats this exactly as it defeats `owned_git_dir` — this
 ///   is categorically as strong as the linked-worktree case, not stronger,
@@ -1689,7 +1729,9 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
 /// - **Stale entries.** The lock file is never removed when a clone is
 ///   later deleted, so it would vouch for an unrelated directory recreated
 ///   at the same path afterward — weaker than containment in that one
-///   respect.
+///   respect. (This is the same underlying mechanism as the P1 residual
+///   above, restated: staleness of the artifact itself, independent of
+///   which namespace it lives in.)
 fn candidate_has_attach_lock(common_dir: &Path, candidate: &Path) -> bool {
     crate::issue_dispatch_run::worktree_attach_lock_path_from_common_dir(common_dir, candidate)
         .is_file()
@@ -1755,9 +1797,11 @@ fn candidate_has_attach_lock(common_dir: &Path, candidate: &Path) -> bool {
 /// nuisance, never a safety issue.
 ///
 /// Auditor A5 (not fixed here, deliberately): per-sibling work is uncapped.
-/// [`isolated_clone_report`] spawns 2-4 `git`/`gh` processes per accepted
-/// clone (branch, clean, PR state, and `gh pr list`'s network round trip
-/// when a branch resolves) — this function itself no longer spawns
+/// [`isolated_clone_report`] spawns 3-5 `git`/`gh` processes per accepted
+/// clone (slug, branch, clean, PR state, and `gh pr list`'s network round
+/// trip when a branch resolves — the slug spawn is new as of auditor B3's
+/// final-round fix, up from the 2-4 this paragraph originally measured) —
+/// this function itself no longer spawns
 /// anything extra per marked candidate, since `candidate_has_attach_lock`
 /// is a filesystem check, not a subprocess (strictly cheaper than the
 /// two-spawn check it replaces). The auditor's 2.08s/43-sibling measurement
