@@ -170,8 +170,13 @@ const OWNER_ONLY_WRITE_ACCESS: u32 = GENERIC_WRITE | WRITE_DAC;
 /// `OpenOptionsExt::access_mode` *overrides* the mask std derives from
 /// `read`/`write`/`append`, so a future caller that also wants to read through
 /// the same handle must widen [`OWNER_ONLY_WRITE_ACCESS`] rather than set
-/// `.read(true)` and expect it to be honoured. Every current caller — the three
-/// atomic config writers — is write-only.
+/// `.read(true)` and expect it to be honoured. Every current caller is
+/// write-only: the three atomic config writers (`remotes.toml`,
+/// `schedules.toml`, `session.toml`), plus a fourth as of fork#325's M4
+/// Windows fix — `platform::lock::windows::touch_attach_lock_artifact_best_effort`,
+/// the worktree attach-lock provenance touch — which is not a config writer
+/// at all, so "the three atomic config writers" no longer enumerates every
+/// caller; the write-only claim itself still holds for all four.
 pub fn set_create_mode_owner_only(opts: &mut std::fs::OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
 

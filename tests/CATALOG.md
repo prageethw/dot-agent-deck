@@ -1096,14 +1096,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** behaviour on non-Linux filesystems (APFS/HFS+ reject non-UTF-8 filenames outright, so this scenario cannot exist there); which specific byte is preserved, only that the exact bytes round-trip.
 - **Platform coverage:** linux.
 
-##### worktree/reclaim/049 — Two pending worktrees whose names differ only in one non-UTF-8 byte render as two DIFFERENT bullets, so the operator can tell which directory `--yes` would delete.
+##### worktree/reclaim/056 — Two pending worktrees whose names differ only in one non-UTF-8 byte render as two DIFFERENT bullets, so the operator can tell which directory `--yes` would delete.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
 - **Agent:** none (two worktree directories built from raw bytes via `OsStr::from_bytes`/`Command::arg`, named `candidate-\xff` and `candidate-\xfe`, both MERGED and clean and deliberately left unmarked so both land on the `ask` surface).
 - **Asserts:** a **fixture precondition** that the scratch dir holds an entry whose raw bytes exactly match each intended name, and that the two names genuinely differ — ruling out "the filesystem normalised one of them" as the reason the bullets do or do not collide; then, as in `003`/`004`/`005`/`008`, that the exit code/stderr rule out clap's own unrecognized-subcommand error; a **control** that a bare `reclaim` still leaves both directories on disk, so the report is a decision pending rather than a post-mortem; that exactly two bullet lines appear; and finally that those two lines differ. The comparison is made on the subprocess's **raw stdout bytes**, never through `String::from_utf8_lossy` — comparing lossy strings would apply the very conversion under test, so a correct byte-distinct rendering could be reported as colliding purely because the harness collapsed it. Pins issue #578: `format_reclaim_human` rendered paths through `Path::to_string_lossy`, which maps every invalid sequence to `U+FFFD`, so two byte-distinct directories printed as one identical line while the removal acted on the distinct byte-exact values.
 - **Does not assert:** the escape's exact syntax — "the two lines differ" accepts every shape the issue allows (reversible escaping, disambiguation, or refusing to offer the reclaim), rather than pinning the implementation's choice; that a literal `\xFF` in a name cannot alias the raw byte `0xFF` (the unit test `display_path_does_not_alias_a_raw_byte_with_its_literal_escape_text` in `src/worktree_reclaim.rs` covers that half of injectivity, which needs no worktree); the `worktree list` PATH column (unit-tested alongside it); the `--json` document, whose `path` field is still lossy by deliberate schema decision.
 - **Platform coverage:** linux (as `008`: APFS/HFS+ reject non-UTF-8 filenames outright, so this scenario cannot exist there).
 
-##### worktree/reclaim/050 — A worktree created through the deck's REAL creation path reads as deck-owned and reaches the unattended `remove` verdict, while an otherwise-identical hand-made sibling stays foreign.
+##### worktree/reclaim/057 — A worktree created through the deck's REAL creation path reads as deck-owned and reaches the unattended `remove` verdict, while an otherwise-identical hand-made sibling stays foreign.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`), with one addition: the subject worktree is created by calling the production `issue_dispatch_run::create_worktree` in-process — the only `git worktree add` in `src/`, and the function every dispatch and every issue-dispatch fire goes through — rather than by the fixture's own `git worktree add`.
 - **Agent:** none (two worktrees on the same repo, both clean, both with a canned `MERGED` PR; one created by the production path, one by a plain `git worktree add`).
 - **Asserts:** a **fixture precondition** that the production call returned `WorktreeCreation::Created` — the already-claimed arm is somebody else's directory and is deliberately never marked, so a test that accepted it would prove nothing; then that `worktree list --json`'s entry for the deck-created worktree carries `owned: true` and `verdict: "remove"`; and, as a **control**, that the hand-made sibling carries `owned: false` and `verdict: "ask"` — without it, `owned` could be reading `true` for every worktree and the test would still pass. Nothing calls the fixture's `mark_owned` helper: the marker has to arrive from the creation path itself. Pins issue #425, where `OWNER_MARKER_FILENAME` was defined and read but written nowhere in `src/`, so every deck-created worktree read as foreign and the `remove` tier was unreachable in normal use.
@@ -1248,6 +1248,56 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a worktree created through the production `create_worktree_sync` path and reclaimed by a bare `run_reclaim(repo, yes=false, remover)` reports exactly one `removed` entry, and that entry's `removed_by` equals the exact `remover` string the caller passed in.
 - **Does not assert:** that the identity is ever surfaced anywhere outside the in-memory `WorktreeReport` — that is pinned separately by `format_reclaim_human_escapes_hostile_content_in_removed_by` and the module's other `format_reclaim_human` tests; the `pending`/`kept` paths, where `removed_by` stays `None` (covered by the pre-existing `008`/`011` fixtures, unchanged by this test).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other creator-identity tests).
+
+##### worktree/reclaim/049 — M4a (RED, no discovery mechanism exists yet). A deck-owned isolated clone (a genuine `git clone` sibling of the repo, its own `.git` DIRECTORY, marked owned the same way `provision_isolated_clone_sync` marks a real one) is reported by `examine_worktrees` — today it is structurally invisible, since `list_linked_worktrees` (`git worktree list`) never sees a directory that isn't a linked worktree of the enumerating repo at all (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — a real `git clone` fixture, mirroring `worktree/reclaim/017`'s real-`git worktree add` fixture for the linked-worktree case.
+- **Agent:** none.
+- **Asserts:** `examine_worktrees(repo)` includes an entry whose `real_path` equals the isolated clone's directory.
+- **Does not assert:** anything about how the entry is distinguished from an ordinary linked worktree's report (`worktree/reclaim/051`), or about its verdict (`worktree/reclaim/052`).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/050 — M4a (RED). Discovery excludes every sibling directory that is NOT a deck-owned isolated clone: a plain directory with no `.git` at all, an unrelated independent repo (its own `.git` directory, no marker), and a genuine clone of the repo carrying no ownership marker — while the one genuine deck-owned isolated clone in the same fixture still appears (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, same real-`git clone` fixture technique as `worktree/reclaim/049`.
+- **Agent:** none.
+- **Asserts:** `examine_worktrees(repo)` never reports the plain directory, the unrelated repo, or the unmarked clone, and still reports the owned clone, all in one fixture.
+- **Does not assert:** the ordinary-linked-worktree exclusion case (a `.git` FILE redirect) — already covered by the pre-existing `list_linked_worktrees` enumeration this milestone does not touch.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/051 — M4a (RED). An isolated clone's report is distinguishable from an ordinary linked worktree's report — a new `kind` field, `"isolated_clone"` vs. `"linked"`, checked through the `--json` document rather than a `WorktreeReport` struct field so the RED signature is an assertion failure, not a build break (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — reads the `examine_worktrees` → `WorktreeListDocument` → `serde_json::Value` path, mirroring `worktree/reclaim/037`'s own precedent for pinning a not-yet-existing field without a compile break.
+- **Agent:** none.
+- **Asserts:** in one fixture examining a linked worktree and an isolated clone together, their `kind` values differ, and the isolated clone's `kind` reads exactly `"isolated_clone"`.
+- **Does not assert:** the linked worktree's own `kind` value — only that it differs from the isolated clone's; the exact string coder assigns ordinary worktrees is that function's design decision, not pinned here.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/052 — M4a (RED). A discovered isolated clone that is clean and whose branch has a MERGED PR — the exact combination that makes an ordinary linked worktree `Verdict::Remove` — never gets an automatic-removal verdict, and is never actually removed by `worktree reclaim`, with or without `--yes`: this milestone slice is discovery-only, and automatic isolated-clone reclaim is deliberately deferred to a documented follow-up (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — same stub-`gh`-MERGED fixture shape as `worktree/reclaim/008`, applied to a real isolated clone instead of a linked worktree.
+- **Agent:** none.
+- **Asserts:** the isolated clone's report `verdict` is never `"remove"`; a bare `run_reclaim` and a `run_reclaim` with `yes=true` both leave the clone directory on disk and absent from `ReclaimOutcome::removed`.
+- **Does not assert:** what verdict label (`"ask"`, `"keep"`, or a new label) the isolated clone actually gets, or whether it ever becomes reclaimable under `--yes` in a future milestone — only that this slice never removes one automatically.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other `gh`-stub fixtures).
+
+##### worktree/reclaim/053 — M4 final round (reviewer F13 / auditor A1/B1). A genuine isolated clone built through the real production provisioner (`issue_dispatch_run::provision_isolated_clone_sync`), carrying the real attach-lock artifact the provisioner writes, is reported by `examine_worktrees` with `owned: true` and the correct `owner`/`owner_kind` — closing the gap coder flagged that none of `worktree/reclaim/049`-`052` build their fixture this way, so the new `owned: true` path (the actual security fix replacing `candidate_shares_history_with` with `candidate_has_attach_lock`) had zero coverage (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — calls `issue_dispatch_run::provision_isolated_clone_sync` directly (real production provisioning) rather than hand-assembling a marker, so the attach-lock artifact examined is the genuine one the deck's own code writes.
+- **Agent:** none.
+- **Asserts:** the provisioner succeeds with no marker warning and leaves a real attach-lock artifact on disk; `examine_worktrees(repo)`'s report for the resulting clone has `owned: true`, `owner` equal to the exact creator string passed to the provisioner, `owner_kind: "agent"`, `kind: "isolated_clone"`, and no `owner_reason`.
+- **Does not assert:** the forgery-rejection case (`worktree/reclaim/054`) or the subdirectory-anchor case (`worktree/reclaim/055`).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/054 — M4 final round, auditor A1/B1's exact forgery. A sibling directory whose `.git` is a plain directory with no real git objects/refs/config, a `HEAD` file containing a real but unrelated-to-this-candidate commit SHA as plain text, and a hand-planted `dot-agent-deck-owner` marker claiming an arbitrary identity — but no attach-lock artifact — is still discovered (discovery stays purely structural) but reports `owned: false`, `owner_kind: "unknown"`, and never satisfies `is_mine` for any identity, including the one the forged marker claims (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — a hand-built 2-file forgery (no `git` invocation needed to construct it), mirroring auditor B1's own reproduction.
+- **Agent:** none.
+- **Asserts:** `examine_worktrees(repo)` still reports the forged directory's `real_path`; its `owned` is `false`, `owner` is `None` (the forged marker's content is never read absent a matching attach lock), `owner_kind` is `"unknown"`, `owner_reason` equals `ISOLATED_CLONE_NO_ATTACH_LOCK_REASON`; and `is_mine` returns `false` for both the forged identity itself and an unrelated identity.
+- **Does not assert:** the genuine-attach-lock case (`worktree/reclaim/053`) or anything about `worktree reclaim`'s removal behavior for this row (already covered generally by `worktree/reclaim/052`'s never-removed assertions).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/055 — Auditor B4. `examine_worktrees` invoked from a SUBDIRECTORY of the root checkout (not the checkout root itself) still discovers a sibling isolated clone identically to invoking it from the root — pinning the fix `discover_isolated_clones`'s auditor A2 round made (deriving the scan anchor via `resolve_common_dir` rather than assuming `repo_dir` already is the root checkout), which reviewer/auditor had only re-verified manually (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — reuses `worktree/reclaim/049`'s exact fixture shape, calling `examine_worktrees` once against the repo root and once against a real subdirectory of it.
+- **Agent:** none.
+- **Asserts:** the isolated clone's `kind`, `owned`, `owner`, and `owner_kind` are identical whether `examine_worktrees` is called against the root checkout or a subdirectory of it.
+- **Does not assert:** any deeper nesting than one subdirectory level, or the linked-worktree enumeration's own behavior from a subdirectory (unaffected by this milestone).
+- **Platform coverage:** mac+linux+windows.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

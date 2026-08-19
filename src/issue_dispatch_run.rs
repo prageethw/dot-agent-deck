@@ -2606,7 +2606,18 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<Pa
 /// the bounded [`git_common_dir_async`] instead of going through the
 /// unbounded sync [`git_common_dir`]. Pure and infallible: everything that
 /// can fail already happened in resolving `common_dir`.
-fn worktree_attach_lock_path_from_common_dir(common_dir: &Path, worktree_dir: &Path) -> PathBuf {
+///
+/// `pub(crate)`, not private, since fork#325 M4a's final round (reviewer
+/// F13 / auditor A1/B1): [`crate::worktree_reclaim::candidate_has_attach_lock`]
+/// recomputes this exact path for a discovered isolated-clone candidate,
+/// reusing this hash rather than reimplementing it, so that discovery's
+/// ownership check and this function's own lock-acquisition path can never
+/// silently drift apart on what the lock's filename is for the same
+/// `(common_dir, worktree_dir)` pair.
+pub(crate) fn worktree_attach_lock_path_from_common_dir(
+    common_dir: &Path,
+    worktree_dir: &Path,
+) -> PathBuf {
     let canonical_worktree_dir = canonicalize_best_effort(worktree_dir);
 
     let hash = crate::platform::lock::fnv1a64(canonical_worktree_dir.to_string_lossy().as_bytes());
@@ -2778,22 +2789,58 @@ async fn git_common_dir_async(clone_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Best-effort canonicalization for hashing purposes only (fork #331 audit
-/// B2): if `path` exists, canonicalize it directly; otherwise canonicalize
-/// its parent (which must already exist — see the caller) and rejoin the
-/// original file name, so a not-yet-created `worktree_dir` still collapses
-/// symlinks/relative components in the part of the path that DOES exist.
-/// Falls back to `path` unchanged if neither succeeds — never fatal, since
-/// this only affects whether two spellings of one target collide onto the
-/// same lock file, not whether the lock is taken at all. Logs on the
-/// fallback (fork #331 audit F5): the parent that reaches this branch was
-/// just created by `ensure_worktree_parent_dir` moments earlier, so failing
-/// to canonicalize it is genuinely anomalous, and this is a mutual-exclusion
-/// primitive silently under-serializing — worth a greppable trace even
-/// though it is not worth making fatal.
+/// B2): canonicalize `path`'s parent (which must already exist — see the
+/// caller) and rejoin the original file name, so a not-yet-created
+/// `worktree_dir` still collapses symlinks/relative components in the part
+/// of the path that DOES exist. Falls back to `path` unchanged if that
+/// fails — never fatal, since this only affects whether two spellings of
+/// one target collide onto the same lock file, not whether the lock is
+/// taken at all. Logs on the fallback (fork #331 audit F5): the parent that
+/// reaches this branch was just created by `ensure_worktree_parent_dir`
+/// moments earlier, so failing to canonicalize it is genuinely anomalous,
+/// and this is a mutual-exclusion primitive silently under-serializing —
+/// worth a greppable trace even though it is not worth making fatal.
+///
+/// PRD fork#325 M4: this used to try `path.canonicalize()` FIRST — the
+/// primary branch below — and fall back to `parent.canonicalize().join(name)`
+/// only when the whole path did not yet exist. Those are two genuinely
+/// different algorithms, and WHICH one a given call took was decided
+/// entirely by the caller's timing, never by anything about the path
+/// itself: [`worktree_attach_lock_path`] calls this before `clone_dir`
+/// exists (write time, inside `provision_isolated_clone_sync`), so it
+/// always took the fallback branch; `worktree_reclaim::candidate_has_attach_lock`
+/// calls it on a directory `discover_isolated_clones` just found on disk
+/// (check time), so it always took the primary branch. On the GitHub
+/// Actions Windows runner the two branches disagreed for the SAME literal
+/// `worktree_dir` — an 8.3 short-name component (`RUNNER~1`, the alias
+/// Windows itself substitutes into `%TEMP%` for the runner's account) was
+/// in the panic output — so the lock file written at provisioning time and
+/// the path hashed at discovery time resolved to two different final
+/// spellings of the identical clone, and `worktree_reclaim_053_isolated_clone_with_real_attach_lock_reports_owned_true`
+/// reproduced it identically across two consecutive CI runs. Always
+/// resolving through the parent, never through the full path directly,
+/// makes this ONE algorithm regardless of when it runs — write time and
+/// check time can no longer diverge on which branch they took, only
+/// (unchanged, and already logged) on whether the parent itself fails to
+/// canonicalize.
+///
+/// A second, independent reason not to reintroduce the full-path branch:
+/// the two-branch version could make racing callers hash the SAME target
+/// to two DIFFERENT lock paths, not only a write-time/check-time caller
+/// pair. Two callers racing to provision the identical `clone_dir` both run
+/// at write time (`worktree_attach_lock_path`, before `clone_dir` exists),
+/// so both would take the fallback branch and hash identically today — but
+/// that agreement held only because both callers happened to observe the
+/// path in the same not-yet-created state; anything that let one of them
+/// observe it as already-existing (a slow racer landing after the other's
+/// `AlreadyClaimed` check, for instance) would flip it onto the primary
+/// branch while the other stayed on the fallback, hashing the same real
+/// directory to two different lock files and defeating the mutual
+/// exclusion the lock exists for. Resolving through the parent
+/// unconditionally removes that branch entirely, so no ordering of
+/// concurrent `AlreadyClaimed` checks can make two callers disagree on
+/// which lock file guards a given target.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {
             parent
@@ -2810,7 +2857,12 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
                     path.to_path_buf()
                 })
         }
-        _ => path.to_path_buf(),
+        // No parent (e.g. a filesystem root) or no file name to rejoin:
+        // fall back to canonicalizing the whole path if it exists, else
+        // give up on the raw path. Neither call site above can ever pass a
+        // path shaped like this — `clone_dir`/`candidate` are always a
+        // sibling of the root checkout, never a root themselves.
+        _ => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
     }
 }
 
