@@ -36012,10 +36012,14 @@ mod tests {
             ui.prompt_delivery.contains_key(PANE_ID),
             "the delivery identity must remain armed after the no-attribution event"
         );
-        assert_ne!(
+        assert!(
+            ui.send_retry_backoff.contains_key(PANE_ID),
+            "retry backoff must remain armed after the no-attribution event"
+        );
+        assert_eq!(
             role_statuses[0],
-            OrchestrationRoleStatus::Working,
-            "the role must not become Working off a no-attribution event"
+            OrchestrationRoleStatus::Waiting,
+            "the role must stay Waiting off a no-attribution event"
         );
         assert!(
             !ui.orchestration_prompted.contains(&tab_id),
@@ -36024,7 +36028,7 @@ mod tests {
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
-            "the false signal must not itself trigger a retry write"
+            "still inside the first write's backoff window; no retry write is due yet"
         );
 
         // Only genuine matching evidence — an event actually carrying the

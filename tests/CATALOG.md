@@ -1687,7 +1687,7 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Layer:** L1 (in-process orchestrator prompt consumer with a controllable `PaneController` and hook-derived state snapshot).
 - **Agent:** none.
 - **Asserts:** after a provisional write, an `EventType::Thinking` event on the same pane/agent carrying `user_prompt: None` — the exact shape `src/wrap.rs`'s generic stdout classifier emits (`emit_with_metadata`) — leaves the prompt, delivery identity, retry state, role status, and prompted flag unchanged; only a later event that actually carries the matching submitted text finalizes the delivery.
-- **Does not assert:** `src/wrap.rs`'s own classification logic in isolation, or the daemon-owned `spawn::spawn` / seed-prompt delivery paths, both of which route through the same `user_prompt`-gated evidence functions but are out of this layer's reach.
+- **Does not assert:** `src/wrap.rs`'s own classification logic in isolation, or the daemon-owned `spawn::spawn` / seed-prompt delivery paths, which route through an equivalent but separately implemented `user_prompt` gate (`wait_for_prompt_submission`, `src/state.rs`) and are out of this layer's reach. That daemon-side gate is only incidentally pinned, by `src/state.rs`'s `wait_for_prompt_submission_reports_hook_trust_failure_even_when_a_later_event_arms_capability`, whose `other => panic!("expected Elapsed")` arm would catch a regression here but is named and documented as a hook-trust test, not a #422 guard.
 - **Platform coverage:** mac+linux+windows.
 
 #### prompt/quit
