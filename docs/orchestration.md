@@ -573,7 +573,7 @@ This works immediately after a daemon restart: ownership is matched by comparing
 
 ### Same-directory orchestrations are discouraged
 
-Opening a second orchestration in a directory that already runs one is allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:
+Opening a second orchestration in a directory that already runs one is usually still allowed, and routing stays correct — but two resources cannot be partitioned, no matter what the deck does:
 
 - **The coordination files.** `.dot-agent-deck/worker-task-<role>.md` is keyed by role name within the directory. Two orchestrations that both have a `coder` role write the same file, so the second brief overwrites the first before the first worker has necessarily read it. (`.dot-agent-deck/work-done-<role>-<pane digest>.md` is additionally keyed on the reporting pane, so two orchestrations' `coder` roles no longer clobber each other's report — a stale one is archived alongside the new report rather than silently overwritten, and the archive is announced in the orchestrator's feedback.)
 - **The working tree.** Both sets of workers edit the same files, stage into the same git index, and build into the same target directory. This is the same hazard as two people working in one checkout, and no amount of file namespacing fixes it.
@@ -586,7 +586,7 @@ So when you select an orchestration whose directory already hosts a live one, th
     and one working tree; /worktree-prd isolates.
 ```
 
-The warning is non-blocking: press `Enter` and the tab opens as usual. It exists to make the shared files and the shared tree explicit at the moment they start to matter, so proceeding is a deliberate choice rather than a surprise. If the two orchestrations genuinely need to run at once, a worktree per orchestration is the isolated alternative.
+The warning is non-blocking in every case except one: pressing `Enter` normally opens the tab as usual, and it exists to make the shared files and the shared tree explicit at the moment they start to matter, so proceeding is a deliberate choice rather than a surprise. The one exception (issue #489) is a **blank** Worktree field submitted against a directory that **exactly matches** — same working directory, not a worktree carved off it — a live orchestration's own directory: that specific submission is refused outright, and the tab does not open. A **typed** Worktree slug is unaffected by this exception and still isolates into its own worktree (or, if a live orchestration already shares that root checkout's object store, an isolated clone) as before. If the two orchestrations genuinely need to run at once, type a Worktree slug rather than leaving it blank.
 
 ## Troubleshooting
 

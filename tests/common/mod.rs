@@ -2950,6 +2950,72 @@ fn answer_terminal_queries(chunk: &[u8], scan: &mut Vec<u8>, writer: &mut dyn Wr
 }
 
 // ---------------------------------------------------------------------------
+// Git-fixture / orchestration-open helpers
+// ---------------------------------------------------------------------------
+//
+// Issue #489: `run_git`, `commit_fixture`, and `open_orchestration_with_slug`
+// were independently duplicated across `tests/e2e_orchestration_worktree.rs`,
+// `tests/e2e_orchestration_identity.rs`, and `tests/e2e_orchestration_pane_column.rs`,
+// which tripped SonarCloud's `new_duplicated_lines_density` gate. Hoisted here
+// as the single shared copy each of those three files now calls.
+
+/// Run a `git` subcommand against `dir`, panicking on non-zero exit.
+pub fn run_git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed in {dir:?}");
+}
+
+/// Commit the fixture's own `.dot-agent-deck.toml` into `dir` (which the
+/// harness already ran `git init --quiet` on) so a typed Worktree slug's
+/// `git worktree add`/isolated-clone provisioning (issue #489's unaffected
+/// typed-slug arm) has a ref to branch from — it cannot create a worktree
+/// from an unborn HEAD. Identity pinned inline: CI runners carry no global
+/// `user.email`/`user.name`. Adds that ONE explicit path rather than
+/// `-A`/`.` — by the time this runs, `dir` also holds the harness's own
+/// per-test `home/` dir and its hook/attach Unix sockets, which a blanket
+/// add would try (and for the sockets, fail) to walk.
+pub fn commit_fixture(dir: &Path) {
+    run_git(dir, &["add", ".dot-agent-deck.toml"]);
+    run_git(
+        dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+}
+
+/// Drive the new-pane dialog to open a fixture's (single) orchestration with
+/// a TYPED Worktree slug instead of accepting the form's blank default, so
+/// the request goes through issue #489's unaffected typed-slug arm
+/// (`SiblingScope::ExactCwdOnly` only gates a BLANK slug) instead of being
+/// refused as an exact-cwd collision with another live orchestration.
+/// Otherwise identical to each caller's own `open_orchestration`.
+pub fn open_orchestration_with_slug(deck: &TuiDeck, slug: &str) {
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
+    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
+    deck.send_keys(b"\x1b[C"); // Right -> the fixture's one orchestration
+    deck.send_keys(b"\r"); // Mode -> Name
+    deck.send_keys(b"\t"); // Tab: Name -> Worktree (Command hidden for an orchestration)
+    deck.send_keys(slug.as_bytes());
+    deck.send_keys(b"\r"); // submit
+}
+
+// ---------------------------------------------------------------------------
 // L1 buffer-render helpers
 // ---------------------------------------------------------------------------
 //
