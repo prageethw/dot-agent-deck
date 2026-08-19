@@ -1240,6 +1240,29 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// not a best-effort one, so refusing to spawn is preferred over a false
 /// refusal caused by a daemon that is merely slow rather than actually down.
 ///
+/// The one exception to "fails closed" is deliberate and local, not a gap:
+/// issue #489, if `target_dir` itself is genuinely not a git repository —
+/// `git_common_dir`'s own diagnostic contains git's stable `"not a git
+/// repository"` fatal message — this returns `Ok(false)` rather than `Err`:
+/// a non-git directory has no git object store to collide over, so the
+/// collision this function exists to detect cannot apply to it. Every OTHER
+/// `git_common_dir` failure (git unspawnable, a `safe.directory`
+/// dubious-ownership refusal against a genuine repo, empty stdout) is NOT
+/// evidence there is no object store to collide over — it is evidence we
+/// could not find out — and still propagates as `Err`, failing closed
+/// exactly as described above (fix round, auditor A1 / reviewer
+/// SUGGESTION 1: the original `Err(_) => Ok(false)` collapsed all of these
+/// into the narrow case).
+///
+/// PRD fork#325 fix round (issue #489 fix round, reviewer BLOCKER 2): the
+/// per-record loop below is additionally scoped by [`SiblingScope`] — the
+/// blank-slug caller (no typed Worktree slug to isolate into, so its only
+/// remedy is refusal) asks a narrower question than the typed-slug caller
+/// (which isolates into its own clone): does a live orchestration's cwd
+/// literally EQUAL `target_dir`, not merely share its `--git-common-dir`.
+/// See [`SiblingScope`]'s own doc comment for why the two callers need
+/// different answers to what looks like the same question.
+///
 /// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
 /// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
 /// guarantee above does NOT extend to a live orchestration whose record
@@ -1295,17 +1318,27 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// pattern (the file's other correctness-sensitive blocking daemon call)
 /// rather than [`live_orchestration_cwds_and_titles`]'s fail-open-hint idiom
 /// this function's `agent_records.unwrap_or_default()` was copied from.
-pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
+pub(crate) fn root_checkout_has_live_sibling(
+    target_dir: &Path,
+    scope: SiblingScope,
+) -> Result<bool, String> {
     // Issue #325 reviewer nit: resolve the LOCAL, knowable-in-milliseconds
     // answer before paying for the daemon round trip — a non-git `target_dir`
     // now fails fast instead of waiting up to `DAEMON_REQUEST_TIMEOUT` (5s)
     // first for an answer this check never needed.
-    let target_common = crate::issue_dispatch_run::git_common_dir(target_dir).map_err(|e| {
-        format!(
-            "could not resolve {}'s git common dir: {e}",
-            target_dir.display()
-        )
-    })?;
+    //
+    // Issue #489 fix round (auditor A1 / reviewer SUGGESTION 1): only "git
+    // ran and said this is not a repository" is treated as "no live sibling"
+    // (`Ok(false)`) — matched on git's own stable diagnostic substring rather
+    // than collapsing every `git_common_dir` failure. Every other cause
+    // (unspawnable git, a dubious-ownership refusal against a genuine repo,
+    // empty stdout) still fails closed via `?`-propagation below, matching
+    // this function's contract for every other error path.
+    let target_common = match crate::issue_dispatch_run::git_common_dir(target_dir) {
+        Ok(common) => common,
+        Err(e) if e.contains("not a git repository") => return Ok(false),
+        Err(e) => return Err(e),
+    };
     let target_common = std::fs::canonicalize(&target_common).unwrap_or(target_common);
 
     let resp = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
@@ -1356,6 +1389,15 @@ pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, 
         if cwd_canon == target_dir_canon {
             return Ok(true);
         }
+        // Issue #489 fix round (reviewer BLOCKER 2): `ExactCwdOnly` stops
+        // here — it never falls through to the shared-`--git-common-dir`
+        // comparison below, so a live orchestration running in a WORKTREE
+        // carved off `target_dir` (this repo's own everyday model) does not
+        // count as a collision for the blank-slug caller. Only
+        // `AnySharedCommonDir` (the typed-slug caller) reaches it.
+        if scope == SiblingScope::ExactCwdOnly {
+            continue;
+        }
         let Ok(live_common) = crate::issue_dispatch_run::git_common_dir(Path::new(&cwd)) else {
             continue;
         };
@@ -1365,6 +1407,44 @@ pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, 
         }
     }
     Ok(false)
+}
+
+/// Issue #489 fix round (reviewer BLOCKER 2): [`root_checkout_has_live_sibling`]
+/// answers two different questions depending on which caller asks it, and
+/// conflating them was the defect — the blank-slug arm's remedy is an
+/// outright refusal, so it must only refuse on the narrow collision it can't
+/// route around (a live orchestration whose cwd literally IS `target_dir`);
+/// the typed-slug arm's remedy is an isolated clone, so it can safely treat
+/// the broader "shares a `--git-common-dir`" signal as a collision, because
+/// isolating into a clone is always a safe response to that signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiblingScope {
+    /// The blank-slug (`None`) arm: only a live orchestration whose own cwd
+    /// equals `target_dir` counts. A live orchestration in a linked worktree
+    /// of `target_dir` (CLAUDE.md rule 1's every-fix-gets-its-own-worktree
+    /// model) does NOT — refusing on that shape blocked a brand-new,
+    /// unrelated blank-slug orchestration in the root checkout for as long
+    /// as any worker orchestration held a worktree, a real regression
+    /// (`orchestration_dispatch_001`'s e2e failure).
+    ExactCwdOnly,
+    /// The typed-slug (`Some(worktree_path)`) arm: today's pre-#489
+    /// behavior, unchanged — any live orchestration sharing `target_dir`'s
+    /// `--git-common-dir`, whether its own cwd IS `target_dir` or a
+    /// worktree carved off it, counts, so the slug is provisioned as an
+    /// isolated clone rather than a `git worktree add` sibling that would
+    /// race the shared object store (issue #325's original incident shape).
+    AnySharedCommonDir,
+}
+
+/// Shared wording for both `root_checkout_has_live_sibling` call sites'
+/// `Err` arm (the `Some(worktree_path)` and `None`-slug branches) — they
+/// previously duplicated this string verbatim.
+fn live_sibling_check_failed_message(target_dir: &Path, reason: &str) -> String {
+    format!(
+        "Orchestration failed: could not confirm no other live orchestration \
+         already shares {} — {reason}",
+        target_dir.display()
+    )
 }
 
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
@@ -10831,14 +10911,13 @@ fn dispatch_action(
                             // `--git-common-dir`, not raw cwd equality) and
                             // the fail-closed decision on a daemon query
                             // failure this branches on.
-                            match root_checkout_has_live_sibling(&req.dir) {
+                            match root_checkout_has_live_sibling(
+                                &req.dir,
+                                SiblingScope::AnySharedCommonDir,
+                            ) {
                                 Err(reason) => {
                                     ui.status_message = Some((
-                                        format!(
-                                            "Orchestration failed: could not confirm no other \
-                                             live orchestration already shares {} — {reason}",
-                                            req.dir.display()
-                                        ),
+                                        live_sibling_check_failed_message(&req.dir, &reason),
                                         std::time::Instant::now(),
                                     ));
                                     return Flow::Continue;
@@ -11044,7 +11123,40 @@ fn dispatch_action(
                                 },
                             }
                         }
-                        None => dir_str,
+                        // Issue #489: a blank Worktree slug used to skip the
+                        // live-sibling gate entirely and fall straight
+                        // through to `req.dir` — the exact collision this
+                        // gate exists to prevent, just reached via the
+                        // default (unnamed-slug) path instead of a typed
+                        // one. Consult the same
+                        // `root_checkout_has_live_sibling` check the
+                        // `Some(worktree_path)` arm above already runs, and
+                        // fail closed the same way: refuse rather than
+                        // auto-isolate, so the user re-submits with a typed
+                        // slug instead.
+                        None => match root_checkout_has_live_sibling(
+                            &req.dir,
+                            SiblingScope::ExactCwdOnly,
+                        ) {
+                            Err(reason) => {
+                                ui.status_message = Some((
+                                    live_sibling_check_failed_message(&req.dir, &reason),
+                                    std::time::Instant::now(),
+                                ));
+                                return Flow::Continue;
+                            }
+                            Ok(true) => {
+                                ui.status_message = Some((
+                                    "Orchestration failed: another live orchestration already \
+                                     uses this root checkout — type a Worktree slug to isolate \
+                                     this one."
+                                        .to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                                return Flow::Continue;
+                            }
+                            Ok(false) => dir_str,
+                        },
                     };
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
@@ -35675,6 +35787,113 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #489 — `Action::SpawnPane`'s worktree-resolution
+    /// match consults `root_checkout_has_live_sibling` only in the
+    /// `Some(worktree_path)` arm (a typed slug); the `None` arm (a blank
+    /// Worktree field, the default most orchestrations use) falls straight
+    /// through to `req.dir` with no daemon consultation at all. This
+    /// dispatches a blank-slug `Action::SpawnPane` against a real git repo
+    /// while a stubbed daemon reports a live sibling orchestration whose
+    /// `orchestration_cwd` is that same repo, and asserts the spawn is
+    /// refused — no orchestration tab opens, no role pane spawns, and the
+    /// status message carries wording unique to the `Ok(true)` (sibling
+    /// found) refusal, distinguishing it from `worktree_015`'s `Err(reason)`
+    /// (daemon-unreachable) refusal — rather than silently rooting a second
+    /// orchestration in the already-live shared checkout.
+    #[spec("orchestration/worktree/017")]
+    #[test]
+    fn worktree_017_blank_slug_refuses_when_root_checkout_has_live_sibling() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+
+        let sibling_record = crate::agent_pty::AgentRecord {
+            id: "sibling-agent".to_string(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "other-orchestration".to_string(),
+                role_index: 0,
+                role_name: "orchestrator".to_string(),
+                is_start_role: true,
+                orchestration_cwd: Some(repo.display().to_string()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+        };
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![sibling_record]),
+        );
+
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir: repo.clone(),
+            name: String::new(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // Fail-closed: no orchestration tab was opened...
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "a blank-slug spawn against a root checkout with a live sibling orchestration must \
+             be refused (fail closed), not silently open a second orchestration tab rooted in \
+             the same shared checkout"
+        );
+        // ...no role pane was spawned...
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "no role pane should be spawned when the root checkout already has a live sibling \
+             orchestration — the blank-slug path must consult the same gate the typed-slug path \
+             (`orchestration/worktree/014`) already does"
+        );
+        // ...and the refusal surfaces to the user with wording unique to the
+        // `Ok(true)` arm — a live sibling was genuinely found, distinguishing
+        // this from `worktree_015`'s `Err(reason)` (daemon-unreachable)
+        // refusal, which is worded differently and would otherwise satisfy
+        // an `!is_empty()` check identically.
+        let message = ui
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            message.contains("another live orchestration already uses this root checkout"),
+            "the refusal must be worded for the Ok(true) live-sibling-found case, not merely \
+             non-empty (which the Err(reason) daemon-unreachable path would also satisfy); got \
+             {message:?}"
+        );
+    }
+
     /// Scenario: Submit a new-pane orchestration request whose `dir` is
     /// ALREADY the resolved worktree path (simulating that a worktree was
     /// created and its path threaded into the request), and dispatch the
@@ -36000,7 +36219,7 @@ mod tests {
             crate::daemon_protocol::AttachResponse::err("simulated daemon-side failure"),
         );
 
-        let result = root_checkout_has_live_sibling(&dir);
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
         assert!(
             result.is_err(),
             "an `ok: false` daemon response must fail the gate closed, not read as \
@@ -36028,7 +36247,7 @@ mod tests {
             crate::daemon_protocol::AttachResponse::agents(vec!["agent-1".to_string()]),
         );
 
-        let result = root_checkout_has_live_sibling(&dir);
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
         assert!(
             result.is_err(),
             "an older-daemon-shaped response (agent_records: None) must fail the \

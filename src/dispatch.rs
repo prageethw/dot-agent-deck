@@ -397,7 +397,10 @@ pub async fn handle_dispatch(
     let live_sibling_check = {
         let clone_dir_for_check = clone_dir.clone();
         tokio::task::spawn_blocking(move || {
-            crate::ui::root_checkout_has_live_sibling(&clone_dir_for_check)
+            crate::ui::root_checkout_has_live_sibling(
+                &clone_dir_for_check,
+                crate::ui::SiblingScope::AnySharedCommonDir,
+            )
         })
         .await
     };
