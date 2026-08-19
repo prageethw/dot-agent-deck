@@ -52,6 +52,15 @@ use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_
 /// changed. `warnings` and `owner_kind`, added in the same PRD, are additive
 /// and need no bump on their own; `owner`'s meaning change is what forces
 /// this one.
+///
+/// `kind` (fork#325 M4a) is likewise additive: every pre-existing field
+/// keeps its exact pre-M4a meaning for a pre-existing (linked-worktree) row
+/// — `kind` is simply new, always `"linked"` for such a row. The new
+/// `"isolated_clone"` rows it also introduces are not a meaning change of
+/// anything a consumer could have depended on before this milestone either
+/// — array cardinality was never part of this version's contract (running
+/// `git worktree add` between two `worktree list` calls already changes row
+/// count with no version bump), only field shapes/meanings are.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
@@ -63,6 +72,19 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// (`issue_dispatch_run::create_worktree` / `create_worktree_sync`), read by
 /// [`ownership_of`].
 pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
+
+/// `WorktreeReport::kind` value for an ordinary `git worktree list`-visible
+/// row (fork#325 M4a).
+const KIND_LINKED: &str = "linked";
+
+/// `WorktreeReport::kind` value for a deck-owned isolated clone discovered
+/// as a sibling of the enumerating repo (fork#325 M4a — see
+/// [`discover_isolated_clones`]). Deliberately reused verbatim as this
+/// row's `verdict` too (see [`isolated_clone_report`]): a human scanning
+/// `worktree list`'s VERDICT column — which already exists, unlike a new
+/// dedicated table column — sees `isolated_clone` immediately, distinct
+/// from `remove`/`ask`/`keep`, with no separate lookup needed.
+const KIND_ISOLATED_CLONE: &str = "isolated_clone";
 
 /// Resolved PR state for a worktree's branch, or why it could not be
 /// resolved. `Unresolvable` and `NoPr` both keep — the distinction is only
@@ -387,6 +409,19 @@ pub struct WorktreeReport {
     /// (`owned` above), so a `Human`-owned worktree can never become
     /// removable by a bare `reclaim`.
     pub owner_kind: String,
+    /// `"linked"` for an ordinary `git worktree list`-visible row (existing
+    /// rows, unchanged behavior) or `"isolated_clone"` for a deck-owned
+    /// isolated clone discovered as a sibling of the enumerating repo (fork
+    /// #325 M4a — see [`discover_isolated_clones`]). Always present, like
+    /// `owner_kind` above: every examined entry is exactly one of the two.
+    /// Additive, same justification as `owner_kind`/`owner_reason` — no
+    /// `SCHEMA_VERSION` bump for this field alone (see that constant's own
+    /// doc comment for the one case that DID force a bump, and why this
+    /// isn't that case: `kind` introduces no new meaning for any
+    /// pre-existing field or row, only a new, always-"linked" field on rows
+    /// that already existed, plus new rows of a kind no consumer could have
+    /// been relying on before this milestone).
+    pub kind: String,
     /// Why `owner_kind` is `"unknown"` (review F3 / audit F2) — `None` for
     /// `Agent`/`Human`, which need no explaining. Additive (same
     /// justification as `owner_kind`; no `SCHEMA_VERSION` bump needed for
@@ -1436,9 +1471,158 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             owner_reason,
             real_path,
             removed_by: None,
+            kind: KIND_LINKED.to_string(),
         });
     }
+
+    // Fork#325 M4a: sibling deck-owned isolated clones, invisible to
+    // `list_linked_worktrees` above (`git worktree list` structurally
+    // cannot see a directory that is not a linked worktree of `repo_dir` at
+    // all — see `discover_isolated_clones`'s own doc comment).
+    for candidate in discover_isolated_clones(repo_dir) {
+        reports.push(isolated_clone_report(candidate));
+    }
+
     Ok(reports)
+}
+
+/// A sibling directory of `repo_dir` recognized as a deck-owned isolated
+/// clone (fork#325 M4a): a genuine independent repository — its own `.git`
+/// as a DIRECTORY, matching `provision_isolated_clone_sync`'s on-disk shape
+/// and the same `clone_dir.join(".git").is_dir()` guard
+/// `attempt_isolated_clone_cleanup` already uses (deliberately `is_dir()`,
+/// not `exists()`: a linked worktree's `.git` is a FILE redirect, which
+/// this excludes for free, structurally, with no separate check needed) —
+/// carrying a readable ownership marker at `<path>/.git/dot-agent-deck-owner`.
+struct IsolatedCloneCandidate {
+    path: PathBuf,
+    git_dir: PathBuf,
+}
+
+/// Enumerate `repo_dir`'s sibling directories (its parent's other entries)
+/// for deck-owned isolated clones (fork#325 M4a — `provision_isolated_clone_sync`
+/// creates them as siblings of the source repo, and its own doc comment
+/// names this exact scan as the deferred M4 follow-up). Anything else — a
+/// plain directory, an unrelated independent repo, a linked worktree of
+/// `repo_dir` or of any other repo (its `.git` is a FILE, never a
+/// DIRECTORY), or a genuine clone carrying no marker at all — is silently
+/// skipped, never reported, never an error: discovery is best-effort
+/// scanning, not a precondition `worktree list`/`reclaim` can fail on. Does
+/// NOT verify the clone actually originates from `repo_dir` (e.g. by
+/// checking its `origin`) — an unrelated repo is already excluded by the
+/// marker check, since the deck never marks a directory it didn't create.
+fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
+    let Some(parent) = repo_dir.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == repo_dir || !path.is_dir() {
+            continue;
+        }
+        let git_dir = path.join(".git");
+        if !git_dir.is_dir() {
+            continue;
+        }
+        if !git_dir.join(OWNER_MARKER_FILENAME).is_file() {
+            continue;
+        }
+        found.push(IsolatedCloneCandidate { path, git_dir });
+    }
+    found
+}
+
+/// Resolve an isolated clone's current branch via `git symbolic-ref --short
+/// -q HEAD`, run inside the clone itself — `None` for a detached HEAD (a
+/// non-zero exit; `-q` suppresses the stderr message but not the exit
+/// code) or any spawn/parse failure, matching `RawWorktree::branch`'s own
+/// "no branch to report" meaning closely enough for [`resolve_pr_state`] to
+/// treat the two identically.
+fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(clone_dir)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = trim_trailing_newline(&out.stdout);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(raw).into_owned())
+}
+
+/// Build the report row for one discovered isolated clone (fork#325 M4a).
+/// Cleanliness and PR state ARE probed — real signals, useful to a human
+/// scanning `worktree list`'s CLEAN/PR columns — but neither one, nor any
+/// combination of them, is ever allowed to decide removal: unlike
+/// `list_linked_worktrees`'s rows, this bypasses [`decide`] entirely and
+/// hard-codes `verdict`/`reason`, mirroring
+/// [`crate::issue_dispatch_run::RemovalPolicy::IsolatedClone`]'s daemon-side
+/// precedent (`remove_worktree`'s own doc: "the entry is kept
+/// unconditionally... a clean working tree does not prove it is safe to
+/// remove_dir_all — this clone's `.git` may hold the only copy of commits
+/// made on its local branch"). Deliberately never routes through
+/// `Verdict::Ask` either (the task's own explicit call): `--yes` would
+/// otherwise reach [`run_reclaim`]'s `remove_worktree_dir`, which shells out
+/// to `git worktree remove` — a command that fails loudly (exit 128)
+/// against something that isn't a linked worktree at all, rather than
+/// cleanly declining. `verdict` is set to [`KIND_ISOLATED_CLONE`] itself —
+/// a value distinct from `"remove"`/`"ask"` — so [`run_reclaim`]'s string
+/// match falls through to its `_ => kept.push(r)` arm unconditionally,
+/// with no new match arm needed there at all.
+fn isolated_clone_report(candidate: IsolatedCloneCandidate) -> WorktreeReport {
+    let IsolatedCloneCandidate { path, git_dir } = candidate;
+    let branch = resolve_isolated_clone_branch(&path);
+    let cleanliness = check_cleanliness(&path);
+    let clean = cleanliness == Cleanliness::Clean;
+    let pr_state = match &branch {
+        Some(b) => resolve_pr_state(&path, b),
+        None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
+    };
+    // Discovery already required this marker to be `is_file()` — read it
+    // directly rather than through `resolve_worktree_owner`, whose
+    // `owned_git_dir` containment check assumes a LINKED worktree's git-dir
+    // nested under `repo_dir`'s own common dir and would incorrectly
+    // resolve `None` for an isolated clone's own top-level `.git` (which is
+    // correct for `owned_git_dir`'s actual purpose, just not this one).
+    let identity = read_marker_owner(&git_dir.join(OWNER_MARKER_FILENAME));
+    let (owner, owner_kind, owner_reason) = match identity {
+        Some(id) => (Some(id), "agent".to_string(), None),
+        None => (
+            None,
+            "unknown".to_string(),
+            Some(LEGACY_MARKER_UNKNOWN_REASON.to_string()),
+        ),
+    };
+    let real_path = path.clone();
+    WorktreeReport {
+        path,
+        branch,
+        clean,
+        owned: true,
+        pr_state: pr_state.label().to_string(),
+        verdict: KIND_ISOLATED_CLONE.to_string(),
+        reason: Some(
+            "isolated clone: automatic reclaim is deferred to a documented follow-up \
+             milestone -- never auto-removed by `worktree reclaim`, with or without --yes, \
+             regardless of PR state or cleanliness (mirrors RemovalPolicy::IsolatedClone's \
+             daemon-side precedent; fork#325 M4a)"
+                .to_string(),
+        ),
+        owner,
+        owner_kind,
+        owner_reason,
+        real_path,
+        removed_by: None,
+        kind: KIND_ISOLATED_CLONE.to_string(),
+    }
 }
 
 const DASH: &str = "-";
@@ -1834,6 +2018,11 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            // fork#325 M4a: `WorktreeReport` grows a `kind` field -- same
+            // reasoning as `owner`/`owner_kind` above, updated only so this
+            // pre-existing test keeps compiling; not itself coverage for
+            // the field (see `worktree_reclaim_049`-`052` for that).
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-a"),
             removed_by: None,
         }];
@@ -2692,6 +2881,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-owned"),
                 removed_by: None,
             },
@@ -2706,6 +2896,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-legacy"),
                 removed_by: None,
             },
@@ -2776,6 +2967,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-disagree"),
             removed_by: None,
         };
@@ -2790,6 +2982,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-owned"),
             removed_by: None,
         };
@@ -2804,6 +2997,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-other"),
             removed_by: None,
         };
@@ -2824,6 +3018,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-foreign-marked"),
             removed_by: None,
         };
@@ -2838,6 +3033,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-unmarked"),
             removed_by: None,
         };
@@ -3015,6 +3211,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3064,6 +3261,7 @@ mod tests {
                  it created this worktree"
                     .to_string(),
             ),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         };
@@ -3108,6 +3306,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         };
@@ -3156,6 +3355,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: Some(remover),
         };
@@ -3204,6 +3404,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         };
@@ -3256,6 +3457,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: path.clone(),
             removed_by: None,
         }];
@@ -3395,6 +3597,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3444,6 +3647,7 @@ mod tests {
             pr_state: "unresolvable".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3515,6 +3719,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
