@@ -1004,6 +1004,14 @@ pub enum KeptReason {
     /// reached the wire at all (PRD 236 review, reproduced against a locked
     /// worktree on git 2.55.0).
     RemovalFailed,
+    /// The entry is an isolated `git clone`
+    /// ([`RemovalPolicy::IsolatedClone`](crate::issue_dispatch_run::RemovalPolicy::IsolatedClone)),
+    /// not a linked worktree of anything — kept unconditionally rather than
+    /// attempting `git worktree remove` (which does not apply to it) or a
+    /// bare `remove_dir_all` (which could discard commits that exist only
+    /// on this clone's own local branch). PRD fork#325 M3 (issue #490 fix
+    /// round); an actually-safe automatic removal is deferred to M4.
+    IsolatedClone,
     /// The `git status --porcelain` probe itself failed (not a valid worktree,
     /// `git` missing, etc.) — kept fail-safe: unknown is treated as dirty
     /// rather than assumed clean.

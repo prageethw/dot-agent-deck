@@ -1695,10 +1695,16 @@ async fn handle_connection(
                     // ordinary agents and for earlier sibling-role closes.
                     // PRD #220 / PRD 236: the removal POLICY travels with the
                     // registry entry, because this handler serves both
-                    // producers and sees only a path. Both now record
-                    // `KeepIfDirty` (PRD 236 unified the policy — see
-                    // `RemovalPolicy`'s doc comment), so this call can come
-                    // back `Kept` for either producer.
+                    // producers and sees only a path. A shared-checkout
+                    // sibling records `KeepIfDirty` (PRD 236 unified the
+                    // policy — see `RemovalPolicy`'s doc comment); PRD
+                    // fork#325 M3's isolated-clone arm records
+                    // `RemovalPolicy::IsolatedClone` instead (it is not a
+                    // linked worktree of anything, so `git worktree remove`
+                    // does not apply, and a clean working tree alone does
+                    // not prove it is safe to discard — see that variant's
+                    // doc comment). Either way this call can come back
+                    // `Kept` for the entry it was given.
                     //
                     // Cleanup runs DETACHED, and the close is answered without
                     // waiting for it. The agent is already stopped by this point,

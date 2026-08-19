@@ -5454,6 +5454,11 @@ fn process_pending_kept_worktrees(state: &SharedState, ui: &mut UiState) {
             crate::event::KeptReason::ProbeError => {
                 "its status could not be checked (kept fail-safe)".to_string()
             }
+            crate::event::KeptReason::IsolatedClone => {
+                "it is an isolated clone, not a linked worktree — remove it manually with \
+                 `rm -rf` once its work is captured elsewhere"
+                    .to_string()
+            }
             crate::event::KeptReason::RemovalFailed => match &notice.error {
                 Some(error) => format!("removing it failed: {error}"),
                 None => "removing it failed".to_string(),

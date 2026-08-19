@@ -4,9 +4,9 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    IsolatedCloneOutcome, RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree,
-    provision_isolated_clone_sync, record_worktree, remove_worktree, run_status,
-    worktree_still_in_use,
+    IsolatedCloneOutcome, RemovalPolicy, WorktreeCreation, WorktreeRegistry,
+    attempt_isolated_clone_cleanup, create_worktree, provision_isolated_clone_sync,
+    record_worktree, remove_worktree, run_status, worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -328,7 +328,7 @@ pub async fn handle_dispatch(
                 message: format!(
                     "dispatch: could not confirm no other live orchestration already \
                      shares {} — {reason}",
-                    clone_dir.display()
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(&clone_dir)
                 ),
             };
         }
@@ -340,6 +340,18 @@ pub async fn handle_dispatch(
             };
         }
     };
+
+    // PRD fork#325 fix round (reviewer B3 / auditor B1): `Some` when
+    // `point_isolated_clone_origin`/`remove_isolated_clone_origin_default`
+    // failed inside `provision_isolated_clone_sync` -- the clone's `origin`
+    // is still the plain `git clone` default, a local filesystem path
+    // pointing back at `clone_dir` (the user's own root checkout). Captured
+    // here (mirroring `src/ui.rs`'s `worktree_origin_warning`) so it can be
+    // folded into the SUCCESS message below: this function's caller is the
+    // dispatched agent itself, which CLAUDE.md rule 1 tells to run `git push
+    // origin HEAD:refs/heads/<branch>` -- exactly the command this hazard
+    // would silently misdirect.
+    let mut clone_origin_warning: Option<String> = None;
 
     if has_live_sibling {
         // A live sibling already shares `clone_dir`'s git-common-dir --
@@ -359,10 +371,17 @@ pub async fn handle_dispatch(
         })
         .await;
         match outcome {
+            // Issue #164: a marker-write warning is not surfaced on this ad
+            // hoc `dispatch` CLI path, matching the shared-checkout arm's
+            // identical `marker_warning: _` below -- out of scope here.
+            // `origin_warning` is NOT dropped the same way; see the comment
+            // above `clone_origin_warning`.
             Ok(Ok(IsolatedCloneOutcome::Created {
                 marker_warning: _,
-                origin_warning: _,
-            })) => {}
+                origin_warning,
+            })) => {
+                clone_origin_warning = origin_warning;
+            }
             Ok(Ok(IsolatedCloneOutcome::AlreadyClaimed)) => {
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
@@ -370,23 +389,40 @@ pub async fn handle_dispatch(
                     message: format!(
                         "dispatch: isolated clone already exists at {}. Wait for it to \
                          finish, or dispatch under a different name.",
-                        paths.worktree_dir.display()
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        )
                     ),
                 };
             }
             Ok(Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })) => {
-                let detail = if cleaned_up_by.is_some() {
+                let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                    // Model A parity (`src/ui.rs`'s matching arm) --
+                    // originally missing here (P3-2).
+                    tracing::info!(
+                        path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(&paths.worktree_dir),
+                        remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                        "dispatch: isolated clone timed out; half-created directory removed automatically"
+                    );
                     "the half-created directory was removed automatically — try again".to_string()
                 } else {
                     format!(
                         "run `rm -rf {}` to clear it, then try again",
-                        paths.worktree_dir.display()
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        )
                     )
                 };
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
-                    message: format!("dispatch: isolated clone timed out — {detail}"),
+                    // Model A parity (P3-2): name the path, not just "try again".
+                    message: format!(
+                        "dispatch: isolated clone timed out at {} — {detail}",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        )
+                    ),
                 };
             }
             // Issue #325 fix round 3 parity (reviewer C2 / auditor C2): a
@@ -397,25 +433,49 @@ pub async fn handle_dispatch(
                 error,
                 cleaned_up_by,
             })) => {
-                let detail = if cleaned_up_by.is_some() {
+                let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                    // Model A parity (`src/ui.rs`'s matching arm) --
+                    // originally missing here (P3-2).
+                    tracing::info!(
+                        path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(&paths.worktree_dir),
+                        remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                        "dispatch: isolated clone failed; half-created directory removed automatically"
+                    );
                     "the half-created directory was removed automatically — try again".to_string()
                 } else {
                     format!(
                         "run `rm -rf {}` to clear it, then try again",
-                        paths.worktree_dir.display()
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        )
                     )
                 };
+                // `error` is git's own captured stderr -- a lower-trust
+                // source than the same-uid processes the rest of this
+                // function's messages come from (repo content can end up in
+                // it), so it is sanitized like any other untrusted text
+                // written into the caller's pane (issue #325 auditor C1).
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
-                    message: format!("dispatch: isolated clone failed — {error} ({detail})"),
+                    // Model A parity (P3-2): name the path, not just "try again".
+                    message: format!(
+                        "dispatch: isolated clone failed at {} — {} ({detail})",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        ),
+                        crate::terminal_sanitize::sanitize_for_terminal_display(&error)
+                    ),
                 };
             }
             Ok(Err(e)) => {
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
-                    message: format!("dispatch: failed to provision isolated clone: {e}"),
+                    message: format!(
+                        "dispatch: failed to provision isolated clone: {}",
+                        crate::terminal_sanitize::sanitize_for_terminal_display(&e)
+                    ),
                 };
             }
             Err(join_err) => {
@@ -504,14 +564,27 @@ pub async fn handle_dispatch(
         }
     }
 
-    // `RemovalPolicy::KeepIfDirty`: this worktree is a sibling of the user's own
-    // checkout and its name was chosen by an LLM, so closing the tab must not
-    // destroy uncommitted work. See [`RemovalPolicy`].
+    // PRD fork#325 M3 (issue #490 fix round, reviewer B2/A3 / auditor A3):
+    // the isolated-clone arm gets its OWN policy. `paths.worktree_dir` is an
+    // independent `git clone`, not a linked worktree of `clone_dir` -- tab
+    // close must never run `git worktree remove` against it (it isn't one),
+    // and unlike the shared-checkout arm, removing it also destroys its own
+    // `.git`, so `KeepIfDirty`'s dirty-only protection is not enough. See
+    // [`RemovalPolicy::IsolatedClone`].
+    //
+    // `RemovalPolicy::KeepIfDirty`: on the shared-checkout arm this worktree
+    // is a sibling of the user's own checkout and its name was chosen by an
+    // LLM, so closing the tab must not destroy uncommitted work. See
+    // [`RemovalPolicy`].
     record_worktree(
         &ctx.worktrees,
         &paths.worktree_dir,
         &clone_dir,
-        RemovalPolicy::KeepIfDirty,
+        if has_live_sibling {
+            RemovalPolicy::IsolatedClone
+        } else {
+            RemovalPolicy::KeepIfDirty
+        },
     );
 
     let prompt = task.to_string();
@@ -546,9 +619,7 @@ pub async fn handle_dispatch(
     )
     .await
     {
-        Ok(handle) => DispatchResult {
-            worktree_dir: paths.worktree_dir.clone(),
-            success: true,
+        Ok(handle) => {
             // Report what was ACTUALLY opened, from the spawn's own verdict.
             // `spawn` → `decide_target` branches on the dispatched worktree's
             // `.dot-agent-deck.toml`: a repo defining `[[orchestrations]]` gets a
@@ -556,7 +627,7 @@ pub async fn handle_dispatch(
             // #220 M1.1). Hardcoding either word makes this message a lie in the
             // other case — and it is written straight into the caller's pane, so
             // the dispatching agent repeats it to the user verbatim.
-            message: match &handle.kind {
+            let mut message = match &handle.kind {
                 SpawnKind::Orchestration { name: orch } => format!(
                     "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
                     paths.worktree_dir.display()
@@ -565,8 +636,29 @@ pub async fn handle_dispatch(
                     "dispatch: spawned isolated agent for '{name}' in {}",
                     paths.worktree_dir.display()
                 ),
-            },
-        },
+            };
+            // PRD fork#325 fix round (reviewer B3 / auditor B1): surface the
+            // origin-fixup warning captured above. This message reaches the
+            // dispatching agent verbatim (`DispatchResult.message` is written
+            // straight into the caller's pane), and that agent is precisely
+            // the one CLAUDE.md rule 1 tells to run `git push origin
+            // HEAD:refs/heads/<branch>` -- so it must not silently push into
+            // the user's own root checkout. Matches `src/ui.rs`'s handling of
+            // the same field.
+            if let Some(error) = &clone_origin_warning {
+                message.push_str(&format!(
+                    " (warning: this clone's `origin` could not be pointed at the real remote \
+                     ({}) — manually run `git remote set-url origin <url>` (or `git remote \
+                     remove origin` if none exists) before pushing from inside it)",
+                    crate::terminal_sanitize::sanitize_for_terminal_display(error)
+                ));
+            }
+            DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: true,
+                message,
+            }
+        }
         Err(e) => {
             // `Force` on the rollback path, unlike the tab-close path: for a
             // SINGLE-role dispatch no agent has been handed this worktree
@@ -601,34 +693,61 @@ pub async fn handle_dispatch(
                 };
             }
 
-            let _ = remove_worktree(
-                &paths.worktree_dir,
-                &clone_dir,
-                RemovalPolicy::Force,
-                &creator,
-            )
-            .await;
-            // Also delete the branch: `git worktree remove` never deletes
-            // it. Same multi-role caveat as above — a still-live sibling
-            // role may hold committed work whose only record is this
-            // branch.
-            let branch_cleanup_failed = run_status(
-                "git",
-                &[
-                    "-C",
-                    &clone_dir.to_string_lossy(),
-                    "branch",
-                    "-D",
-                    &paths.branch,
-                ],
-            )
-            .await
-            .is_err();
+            // PRD fork#325 M3 (issue #490 fix round, reviewer B2 / auditor
+            // A1/A2): the two mechanisms need entirely different rollback
+            // shapes. `clone_dir` (the root checkout) never created
+            // `paths.worktree_dir` or `paths.branch` on the isolated-clone
+            // arm -- `provision_isolated_clone_sync` created both INSIDE the
+            // clone itself -- so running `git worktree remove`/`branch -D`
+            // against `clone_dir` there is not merely ineffective, it is
+            // actively wrong: `remove_worktree` fails (exit 128, the target
+            // is not a linked worktree of `clone_dir`), and `branch -D`
+            // deletes whatever branch of that name happens to already exist
+            // IN THE ROOT CHECKOUT -- unrelated committed work, force-deleted
+            // with no error surfaced, since the delete itself succeeds
+            // against the wrong repository (auditor A1, verified
+            // empirically).
+            let cleanup_failed = if has_live_sibling {
+                // The clone directory IS `paths.worktree_dir` -- remove it
+                // with the same helper `provision_isolated_clone_sync`'s own
+                // internal `TimedOut`/`Failed` cleanup already uses, never
+                // `remove_worktree` (a shared-checkout-shaped operation) and
+                // never a `branch -D` against `clone_dir` (the branch lives
+                // in the clone, not there).
+                let cleaned_up_by = attempt_isolated_clone_cleanup(&paths.worktree_dir, &creator);
+                cleaned_up_by.is_none()
+            } else {
+                let _ = remove_worktree(
+                    &paths.worktree_dir,
+                    &clone_dir,
+                    RemovalPolicy::Force,
+                    &creator,
+                )
+                .await;
+                // Also delete the branch: `git worktree remove` never
+                // deletes it. Same multi-role caveat as above — a still-live
+                // sibling role may hold committed work whose only record is
+                // this branch.
+                run_status(
+                    "git",
+                    &[
+                        "-C",
+                        &clone_dir.to_string_lossy(),
+                        "branch",
+                        "-D",
+                        &paths.branch,
+                    ],
+                )
+                .await
+                .is_err()
+            };
 
-            if branch_cleanup_failed {
+            if cleanup_failed {
                 tracing::warn!(
+                    worktree = %paths.worktree_dir.display(),
                     branch = %paths.branch,
-                    "spawn rollback: failed to delete branch — name may be wedged for future dispatches"
+                    isolated = has_live_sibling,
+                    "spawn rollback: cleanup failed — name may be wedged for future dispatches"
                 );
             }
 
@@ -637,10 +756,17 @@ pub async fn handle_dispatch(
                 wts.remove(&paths.worktree_dir);
             }
 
-            let cleanup_note = if branch_cleanup_failed {
-                " (cleanup failed: branch may still exist — name may be wedged)"
+            let cleanup_note = if !cleanup_failed {
+                String::new()
+            } else if has_live_sibling {
+                format!(
+                    " (cleanup failed: run `rm -rf {}` to clear it, then try again)",
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
+                )
             } else {
-                ""
+                " (cleanup failed: branch may still exist — name may be wedged)".to_string()
             };
 
             DispatchResult {
