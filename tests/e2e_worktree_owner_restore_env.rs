@@ -7,7 +7,7 @@
 //! `session/restore/017` proves the persisted `owner` string survives a TOML
 //! round trip and reaches `AgentSpawnOptions::owner` — via `CapturingPaneController`,
 //! a test double whose `create_pane_with_options` records the field and returns.
-//! That is the same one-hop-short gap `orchestration/identity/009`'s file doc
+//! That is the same one-hop-short gap `orchestration/identity/013`'s file doc
 //! describes for the CREATE path: a capturing mock proves the value reaches
 //! `AgentSpawnOptions`, nothing about whether a genuinely spawned process's own
 //! environment ever carries it.
@@ -77,7 +77,7 @@ fn restore_020_owner_reaches_every_restored_role_panes_real_environment() {
     // process that has already exited and been filtered is indistinguishable
     // from one that was never spawned. The trailing `sleep 30` keeps each
     // child alive long enough for `wait_for_agent_where`'s poll to observe it
-    // as a live registry entry — the SAME race `orchestration/identity/009`'s
+    // as a live registry entry — the SAME race `orchestration/identity/013`'s
     // single-role variant hits under load (fork #166 CI run 31444090426: 3/3
     // fails on `wait_for_agent_where` with a bare `echo`), not one this
     // two-role test is special in having; both need the keep-alive for the
