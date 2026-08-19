@@ -8185,28 +8185,29 @@ mod spawn_tests {
     /// Scenario: PR #507 fix-round rework (reviewer B1, auditor BLOCKER B1).
     /// The original construction tested `set_pending_seed`/
     /// `take_pending_seed_fallback`'s `!exited` filter, which is correct and
-    /// unrelated to the actual bug this PR introduced: `arm_seed_fallback`'s
-    /// NEW gate (`is_respawn_successor`) is the wrong invariant. It is the
-    /// ONLY caller-site guard with no test at all — nothing exercises it
-    /// firing after a real respawn. Positive control: run the real
-    /// production sequence — spawn, respawn onto the same `pane_id_env`
-    /// (`respawn_agent_for_pane`, `handle_delegate`'s only path to this
-    /// function), stash a seed for the respawn successor, arm the fallback
-    /// with a short grace — with NOTHING else happening before grace
-    /// elapses. The seed was stashed for exactly this occupant, so delivery
-    /// must succeed; today's code refuses unconditionally here (B1), since
-    /// `is_respawn_successor` is true for every respawn successor with no
-    /// way to tell "the intended recipient, unchanged" apart from "a
-    /// stranger". Race: after the seed is stashed and the fallback armed,
-    /// the respawn successor's PTY closes (`AgentPtyRegistry::close_agent`)
-    /// and a completely FRESH `spawn_agent` call — never another respawn —
-    /// binds an unrelated agent onto the SAME `pane_id_env` before grace
-    /// elapses (the actual threat `write_notice_guarded`'s doc names, and
-    /// auditor S3's exact bypass: a fresh spawn never marks
-    /// `respawn_successor_agents`). Assert the seed does NOT reach that
-    /// stranger.
+    /// unrelated to the actual bug this PR introduced: `arm_seed_fallback`
+    /// now gates delivery on `authorized_pane_occupant` — the pane's
+    /// currently-authorized occupant — rather than the round-1 invariant
+    /// ("was this id ever produced by a respawn"), which could never tell
+    /// "the intended recipient, unchanged" apart from "a stranger". Positive
+    /// control: run the real production sequence — spawn, respawn onto the
+    /// same `pane_id_env` (`respawn_agent_for_pane`, `handle_delegate`'s only
+    /// path to this function), stash a seed for the respawn successor, arm
+    /// the fallback with a short grace — with NOTHING else happening before
+    /// grace elapses. The seed was stashed for exactly this occupant, and
+    /// `set_authorized_occupant` records the respawn successor as such, so
+    /// delivery must succeed. Race: after the seed is stashed and the
+    /// fallback armed, the respawn successor's PTY closes
+    /// (`AgentPtyRegistry::close_agent`) and a completely FRESH
+    /// `spawn_agent` call — never another respawn — binds an unrelated
+    /// agent onto the SAME `pane_id_env` before grace elapses (the actual
+    /// threat `write_notice_guarded`'s doc names): the fresh spawn never
+    /// claims `authorized_pane_occupant`
+    /// (`record_authorized_occupant_if_new` is insert-if-absent), so the
+    /// stale, pre-respawn value stays in place and mismatches the stranger.
+    /// Assert the seed does NOT reach that stranger.
     #[tokio::test]
-    async fn arm_seed_fallback_gate_ignores_who_the_seed_was_stashed_for() {
+    async fn arm_seed_fallback_refuses_a_pane_reused_since_the_seed_was_stashed() {
         const CONTROL_PANE: &str = "issue-492-seed-control-pane";
         const RACE_PANE: &str = "issue-492-seed-race-pane";
         const CONTROL_SEED: &str = "issue-492 sentinel seed - ordinary delivery, unchanged pane";
@@ -8240,8 +8241,9 @@ mod spawn_tests {
         assert!(
             String::from_utf8_lossy(&control_output).contains(CONTROL_SEED),
             "positive control: arm_seed_fallback must still deliver a seed to the SAME respawn \
-             successor it was stashed for when nothing else has happened — today's gate \
-             refuses unconditionally because it can't distinguish that from a stranger (B1)"
+             successor it was stashed for when nothing else has happened — otherwise the race \
+             assertion below would pass for the wrong reason (an implementation that \
+             unconditionally refuses)"
         );
         control_registry.shutdown_all();
 
@@ -8286,9 +8288,10 @@ mod spawn_tests {
             !race_output_str.contains(RACE_SEED),
             "arm_seed_fallback injected a seed stashed for a respawn successor into a \
              completely UNRELATED stranger ({stranger_agent_id}) that took over the same \
-             pane_id_env via a fresh spawn_agent call after the successor closed: \
-             `is_respawn_successor` cannot see this handover at all, since a fresh spawn never \
-             marks it. output={race_output_str:?}"
+             pane_id_env via a fresh spawn_agent call after the successor closed: a fresh spawn \
+             never claims `authorized_pane_occupant` (insert-if-absent), so this handover \
+             should have left the stale value in place and mismatched the stranger. \
+             output={race_output_str:?}"
         );
 
         race_registry.shutdown_all();
@@ -8296,21 +8299,21 @@ mod spawn_tests {
 
     /// Scenario: issue #492 M1 (PR #507 fix round, reviewer finding). This
     /// round added a `!exited` filter to `set_pending_seed`/
-    /// `take_pending_seed_fallback` but NOT to their native-pull siblings,
-    /// `take_pending_seed_native` and `seed_delivered_native` — both still
-    /// resolve the first `pane_id_env` match regardless of liveness. Spawn
-    /// an agent bound to `pane_id_env` that stays alive briefly, stash a
-    /// seed for it while it is still live (the only way `set_pending_seed`
-    /// actually stores one — mirroring the real production sequence: a seed
-    /// is stashed for a live pane, then that pane exits, or crashes, before
-    /// anything pulls it), then wait for it to exit — leaving a stale,
-    /// exited-but-not-yet-reaped record that still carries the unconsumed
-    /// seed. The desired behavior is to refuse: no live occupant remains to
-    /// have pulled it natively. Today's unfiltered functions serve it
-    /// anyway.
+    /// `take_pending_seed_fallback` but originally left their native-pull
+    /// siblings, `take_pending_seed_native` and `seed_delivered_native`,
+    /// unfiltered — resolving the first `pane_id_env` match regardless of
+    /// liveness. Spawn an agent bound to `pane_id_env` that stays alive
+    /// briefly, stash a seed for it while it is still live (the only way
+    /// `set_pending_seed` actually stores one — mirroring the real
+    /// production sequence: a seed is stashed for a live pane, then that
+    /// pane exits, or crashes, before anything pulls it), then wait for it
+    /// to exit — leaving a stale, exited-but-not-yet-reaped record that
+    /// still carries the unconsumed seed. The correct behavior is to
+    /// refuse: no live occupant remains to have pulled it natively,
+    /// matching the `!exited` filter already applied to
+    /// `set_pending_seed`/`take_pending_seed_fallback`.
     #[tokio::test]
-    async fn take_pending_seed_native_and_seed_delivered_native_resolve_an_exited_record_with_no_live_filter()
-     {
+    async fn take_pending_seed_native_and_seed_delivered_native_refuse_an_exited_record() {
         const PANE_ID_ENV: &str = "issue-492-m1-native-seed-pane";
         const SEED: &str = "issue-492 m1 sentinel seed - must never resolve from an exited record";
 

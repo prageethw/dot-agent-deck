@@ -8605,7 +8605,7 @@ clear = false
     /// after close, per `write_notice_guarded`'s doc). Assert the composed
     /// feedback text does NOT appear in that new, unrelated occupant's PTY.
     #[tokio::test]
-    async fn handle_work_done_writes_feedback_into_a_pane_reused_since_the_delegation() {
+    async fn handle_work_done_refuses_feedback_into_a_pane_reused_since_the_delegation() {
         const CONTROL_ORCH_PANE: &str = "issue-492-l1a-control-orch-pane";
         const CONTROL_WORKER_PANE: &str = "issue-492-l1a-control-worker-pane";
         const CONTROL_SENTINEL: &str = "issue-492-l1a-control-sentinel-task";
@@ -8752,7 +8752,8 @@ clear = false
             "handle_work_done wrote the worker's feedback into the orchestrator pane's NEW, \
              UNRELATED occupant ({reused_agent_id}) instead of refusing: the original occupant \
              closed and a fresh spawn_agent call (never a respawn) took over the same \
-             pane_id_env, which `is_respawn_successor` cannot see. output={race_output_str:?}"
+             pane_id_env, which should have left `authorized_pane_occupant` naming the stale, \
+             original occupant and mismatched this stranger. output={race_output_str:?}"
         );
 
         registry.shutdown_all();

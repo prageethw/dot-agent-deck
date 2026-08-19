@@ -2833,7 +2833,7 @@ mod hook_ingestion_tests {
     /// (reviewer S1). Assert the message does NOT land in the reused,
     /// unrelated occupant's PTY output.
     #[tokio::test]
-    async fn dispatch_result_writes_into_a_pane_reused_since_the_request() {
+    async fn dispatch_result_refuses_a_pane_reused_since_the_request() {
         const CONTROL_PANE: &str = "issue-492-l1b-control-pane";
         const RACE_PANE: &str = "issue-492-l1b-race-pane";
         const CONTROL_TARGET_NAME: &str = "issue-492-l1b-control-sentinel-target";
@@ -2969,8 +2969,9 @@ mod hook_ingestion_tests {
             "the dispatch result (naming target '{RACE_TARGET_NAME}') was written into the \
              caller pane's NEW, UNRELATED occupant ({reused_agent_id}) instead of being \
              refused: the original occupant closed and a fresh spawn_agent call (never a \
-             respawn) took over the same pane_id_env, which `is_respawn_successor` cannot see. \
-             output={race_output_str:?}"
+             respawn) took over the same pane_id_env, which should have left \
+             `authorized_pane_occupant` naming the stale, original occupant and mismatched \
+             this stranger. output={race_output_str:?}"
         );
 
         handle.abort();

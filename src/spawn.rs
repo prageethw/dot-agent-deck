@@ -4510,11 +4510,13 @@ mod tests {
     // --- Issue #492: `deliver_on_idle`'s ungated pane-keyed write ---
 
     /// Scenario: PR #507 fix-round rework (reviewer M2/M3, auditor S3). The
-    /// original respawn-based construction pinned the WRONG invariant —
-    /// `deliver_on_idle`'s only guard, `is_respawn_successor`, asks "did the
-    /// occupant ever arrive via a respawn?" rather than "is the occupant
-    /// still who the reuse decision named?", and `clear` defaults to `true`
-    /// so a respawn successor is the *normal* state, not a rare one.
+    /// original respawn-based construction pinned the WRONG invariant — its
+    /// guard asked "did the occupant ever arrive via a respawn?" rather than
+    /// "is the occupant still who the reuse decision named?", and `clear`
+    /// defaults to `true` so a respawn successor is the *normal* state, not
+    /// a rare one. `deliver_on_idle`'s guard now checks
+    /// `authorized_pane_occupant` against the pane's currently-authorized
+    /// occupant instead.
     /// Positive control: spawn a byte-observation agent bound to a pane and
     /// call `deliver_on_idle` with nobody in between — the prompt must still
     /// land, proving the assertion below isn't satisfied by an
@@ -4588,8 +4590,9 @@ mod tests {
             !race_output_str.contains(RACE_SENTINEL),
             "deliver_on_idle wrote a scheduled-task prompt into a pane whose ORIGINAL occupant \
              had closed and been replaced by a completely unrelated fresh `spawn_agent` call \
-             (never a respawn) instead of refusing: `is_respawn_successor` only catches a \
-             respawn-produced handover, not this one, which is the actual threat \
+             (never a respawn) instead of refusing: a fresh spawn never claims \
+             `authorized_pane_occupant` (insert-if-absent), so this handover should have left \
+             the stale value in place and mismatched the stranger — the actual threat \
              `write_notice_guarded`'s doc names. output={race_output_str:?}"
         );
 
