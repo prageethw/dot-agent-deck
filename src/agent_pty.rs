@@ -6698,7 +6698,7 @@ impl AgentPtyRegistry {
     /// write with no compiler objection. Its sibling
     /// `write_to_pane_and_submit` was deleted outright. This one is retained
     /// because a PTY fixture genuinely needs an identity-free write to a pane
-    /// it is about to retire — `prompt/pane-input/034` sends the one
+    /// it is about to retire — `prompt/pane-input/039` sends the one
     /// unsubmitted line that ends a predecessor's `read`, so the predecessor
     /// leaves by its own front door and its record (and its seed) survive it,
     /// which is the whole fixture. A guarded write would work there and say
@@ -14939,9 +14939,9 @@ mod spawn_tests {
     /// must be dropped rather than restored anywhere the new occupant could pull
     /// it, with none of its bytes reaching the successor — whose scrollback still
     /// shows a later authorized write.
-    #[spec("prompt/pane-input/034")]
+    #[spec("prompt/pane-input/039")]
     #[tokio::test]
-    async fn pane_input_034_seed_fallback_is_refused_when_the_pane_changed_hands() {
+    async fn pane_input_039_seed_fallback_is_refused_when_the_pane_changed_hands() {
         const PANE: &str = "seed-fallback-handover-pane";
         const SEED: &str = "STASHED-SEED-MUST-NOT-BE-TYPED-BY-A-STRANGERS-TASK-8e42";
         const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-1f56";
@@ -15114,7 +15114,7 @@ mod spawn_tests {
     /// seed exactly where it is, so the successor's own native `get-seed` pull
     /// still returns it verbatim and its PTY is never typed into.
     ///
-    /// The other half of `prompt/pane-input/034`, which pins that the armed
+    /// The other half of `prompt/pane-input/039`, which pins that the armed
     /// injection writes no bytes. Writing no bytes was never the whole property:
     /// the take that fed that refusal was keyed by pane id alone, so it removed
     /// the successor's seed on the way to being refused, and the successor then
@@ -15153,7 +15153,7 @@ mod spawn_tests {
 
         arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
 
-        // The hand-over, inside the grace, exactly as `prompt/pane-input/034`
+        // The hand-over, inside the grace, exactly as `prompt/pane-input/039`
         // stages it — but with a seed the successor can be asked for afterwards
         // by content, so "its own seed survived" is distinguishable from "the
         // original's seed was left lying in its slot".

@@ -4686,7 +4686,7 @@ mod tests {
         let agent_id = spawn_byte_target(&registry, PANE_ID);
         assert_eq!(
             registry
-                .write_and_submit_guarded(PANE_ID, PROMPT, Some(&agent_id), || async { true })
+                .write_and_submit_guarded(PANE_ID, PROMPT, &agent_id, || async { true })
                 .await
                 .expect("initial detached delivery"),
             GuardedSend::Applied

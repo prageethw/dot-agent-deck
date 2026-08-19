@@ -13881,9 +13881,9 @@ clear = false
     /// because prompt bytes may still be sitting un-submitted in its input box,
     /// while the applied pane still admits it.
     #[cfg(unix)]
-    #[spec("scheduler/idle-worker/019")]
+    #[spec("scheduler/idle-worker/023")]
     #[tokio::test]
-    async fn idle_worker_019_an_ambiguous_idle_prompt_keeps_its_payload_record() {
+    async fn idle_worker_023_an_ambiguous_idle_prompt_keeps_its_payload_record() {
         // Issue #715: `arm_idle_worker_watch`'s release was
         // `Ok(Applied | Ambiguous)` — verbatim the shape PR #713 narrowed on the
         // silence report, left alone only to keep that PR's blast radius
