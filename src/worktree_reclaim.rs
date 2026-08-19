@@ -4935,8 +4935,22 @@ mod tests {
         let from_subdir = examine_worktrees(&subdir)
             .expect("examine_worktrees must succeed from a subdirectory of the root");
 
+        // Matched via `paths_refer_to_same_dir`, not raw `==` (this module's
+        // own `discover_isolated_clones` doc comment, "M4a Windows/macOS
+        // fix"): the subdirectory case's anchor comes from
+        // `resolve_common_dir`'s git-resolved spelling, while `clone_dir`
+        // here is built via plain `Path::join` on the caller's own
+        // unresolved `scratch.path()` -- on macOS `/var/folders/...` is
+        // itself a symlink to `/private/var/folders/...`, so the two
+        // spellings differ even though they name the same directory.
+        // Reproduced directly in CI: this test failed on `build-macos`
+        // with a raw `==` comparison, passed on `build`/`build-windows`,
+        // exactly the platform split that doc comment predicts.
         let find = |reports: &[WorktreeReport]| -> Option<WorktreeReport> {
-            reports.iter().find(|r| r.real_path == clone_dir).cloned()
+            reports
+                .iter()
+                .find(|r| paths_refer_to_same_dir(&r.real_path, &clone_dir))
+                .cloned()
         };
         let root_entry = find(&from_root).expect(
             "sanity: the isolated clone must be discovered when examine_worktrees is called \
