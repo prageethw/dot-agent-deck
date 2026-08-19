@@ -548,10 +548,11 @@ pub(crate) fn mint_nonce_seq(nonce_cell: &std::sync::OnceLock<u64>, seq: &Atomic
 /// TUI-attached `StartAgent` spawn. Same recipe as [`mint_orchestration_id`]
 /// (a per-process nonce hashed from PID + epoch nanos, combined with a
 /// monotonic per-process sequence) — chosen over a bare counter because
-/// `spawn.rs`'s `next_pane_id` already demonstrates that shape's failure
-/// mode: its `PANE_COUNTER` resets to 0 on every daemon restart, which is
-/// exactly the recycling CLAUDE.md rule 23 named as unsafe to anchor
-/// identity on. The nonce makes two daemon processes — including two runs
+/// `spawn.rs`'s `next_pane_id` used to demonstrate that shape's failure
+/// mode before it was fixed as issue #430: its old bare counter reset to 0
+/// on every daemon restart, which is exactly the recycling CLAUDE.md rule 23
+/// named as unsafe to anchor identity on. The nonce makes two daemon
+/// processes — including two runs
 /// of the same daemon across a restart — astronomically unlikely to mint
 /// the same value, while the sequence guarantees no two mints within one
 /// daemon process collide.

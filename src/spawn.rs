@@ -48,7 +48,7 @@ use chrono::{DateTime, Utc};
 use crate::agent_pty::{
     AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
     DOT_AGENT_DECK_REGISTRATION_GENERATION, DeliveryNotice, GuardedSend, GuardedSendDetail,
-    SpawnOptions, TabMembership, command_needs_shell_wrap,
+    PANE_ID_ENV_MAX_LEN, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
@@ -2191,7 +2191,12 @@ fn surface_spawned_orchestration(
 /// task name to the allowed charset and appends a restart-resistant
 /// nonce+sequence (+ role index for orchestration panes) so concurrent fires
 /// never collide — and, per issue #430, so two fires of the same task never
-/// collide across a daemon restart either.
+/// collide across a daemon restart either. The sanitized name is clamped to
+/// whatever room is left under [`PANE_ID_ENV_MAX_LEN`] after the fixed
+/// suffix (fork#430 F2): task names can reach `DISPLAY_NAME_MAX_LEN` (128
+/// bytes), well past the ~39/36-byte budget the nonce+seq suffix leaves, and
+/// an over-cap id is silently dropped by `capture_pane_id_env` rather than
+/// rejected loudly.
 fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
     let (nonce, seq) = crate::agent_pty::mint_nonce_seq(&PANE_NONCE, &PANE_SEQ);
     let sanitized: String = task_name
@@ -2204,10 +2209,22 @@ fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
             }
         })
         .collect();
-    match role_index {
-        Some(idx) => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{nonce:016x}-{seq}-r{idx}"),
-        None => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{nonce:016x}-{seq}"),
-    }
+    let suffix = match role_index {
+        Some(idx) => format!("-{nonce:016x}-{seq}-r{idx}"),
+        None => format!("-{nonce:016x}-{seq}"),
+    };
+    let max_sanitized_len = PANE_ID_ENV_MAX_LEN
+        .saturating_sub(SCHEDULE_PANE_ID_PREFIX.len())
+        .saturating_sub(suffix.len());
+    // `sanitized` is built entirely from ASCII (either an original
+    // ASCII-safe char or a `-` substitute), so a byte-index truncation is
+    // always on a char boundary.
+    let sanitized = if sanitized.len() > max_sanitized_len {
+        &sanitized[..max_sanitized_len]
+    } else {
+        sanitized.as_str()
+    };
+    format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}{suffix}")
 }
 
 // ---------------------------------------------------------------------------

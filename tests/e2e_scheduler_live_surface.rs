@@ -358,8 +358,9 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
          'morning-digest' (a disconnect/reconnect already shows it so).\nGrid:\n{grid}"
     );
 
-    // ...and must NOT fall back to the truncated pane id (`sched-morning-digest-0`
-    // → its 11-char `id_display` prefix `sched-morni`). This is the load-bearing
+    // ...and must NOT fall back to the truncated pane id
+    // (`sched-morning-digest-<nonce>-<seq>` → its 11-char `id_display` prefix
+    // `sched-morni`). This is the load-bearing
     // pin: `sched-morni` reaches the grid ONLY through the fallback pane-id
     // `id_display`, so its presence means the card is showing the pane id
     // instead of the schedule name.
