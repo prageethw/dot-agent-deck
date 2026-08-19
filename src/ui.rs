@@ -35937,6 +35937,119 @@ mod tests {
         }
     }
 
+    /// Scenario: Issue #422 regression guard. After an orchestrator prompt write goes provisional, a Codex-typed `EventType::Thinking` event carrying `user_prompt: None` — exactly the shape `src/wrap.rs`'s generic stdout classifier emits — arrives on the same pane/agent. The delivery must stay provisional exactly as it was before the event; only a subsequent event that actually carries the matching submitted text may finalize it.
+    #[spec("prompt/pane-input/034")]
+    #[test]
+    fn pane_input_034_wrapper_generic_thinking_event_without_user_prompt_does_not_confirm() {
+        const PANE_ID: &str = "no-attribution-thinking-pane";
+        const AGENT_ID: &str = "no-attribution-thinking-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let now = std::time::Instant::now();
+        let tab_id: TabId = 34;
+        let mut ui = default_ui();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some(PROMPT),
+            "the initial write must remain provisional before any confirming event"
+        );
+
+        // The wrapper's own generic stdout classifier (`emit_with_metadata`,
+        // `src/wrap.rs`): same pane, same agent identity, `EventType::Thinking`,
+        // `user_prompt: None`. #422 claimed this shape alone could finalize a
+        // Codex delivery via the old fixed-grace-period fallback.
+        apply_generation_event(
+            &mut snapshot,
+            PANE_ID,
+            AGENT_ID,
+            "wrapper-generic-thinking-no-attribution",
+            EventType::Thinking,
+        );
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            now.checked_add(std::time::Duration::from_millis(1))
+                .expect("post-fake-event timestamp"),
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some(PROMPT),
+            "#422: a no-attribution Thinking event (user_prompt: None) must NOT finalize the delivery"
+        );
+        assert!(
+            ui.prompt_delivery.contains_key(PANE_ID),
+            "the delivery identity must remain armed after the no-attribution event"
+        );
+        assert_ne!(
+            role_statuses[0],
+            OrchestrationRoleStatus::Working,
+            "the role must not become Working off a no-attribution event"
+        );
+        assert!(
+            !ui.orchestration_prompted.contains(&tab_id),
+            "the orchestration must not be marked prompted off a no-attribution event"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the false signal must not itself trigger a retry write"
+        );
+
+        // Only genuine matching evidence — an event actually carrying the
+        // submitted prompt text — may finalize the delivery.
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            now.checked_add(std::time::Duration::from_millis(2))
+                .expect("confirmation timestamp"),
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(
+            prompt.is_none(),
+            "a genuine matching UserPromptSubmit-derived event must still finalize the delivery"
+        );
+        assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+        assert!(ui.orchestration_prompted.contains(&tab_id));
+    }
+
     /// Scenario: Queue seed prompts for reporting, non-reporting, and unidentifiable consumers, including swallowed-CR duplicate submissions joined by a newline or no separator. Reporting panes stay provisional until matching submission evidence arrives, while Pi and identity-less panes write once without arming retries, and every doubled submitted seed clears retry state before a third write.
     #[spec("prompt/pane-input/024")]
     #[test]

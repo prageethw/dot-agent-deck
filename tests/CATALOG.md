@@ -1683,6 +1683,13 @@ Round 3 (PRD fork#235, re-scoped TWICE after review): identity is the caller's W
 - **Does not assert:** the TUI-owned seed delivery path (covered by `prompt/pane-input/030`/`032`) or the daemon-owned spawn delivery in `src/spawn.rs` (out of this layer's reach).
 - **Platform coverage:** mac+linux+windows.
 
+##### prompt/pane-input/034 — Issue #422 regression guard: a Codex-typed, no-attribution `Thinking` event (`user_prompt: None`) never finalizes a provisional delivery.
+- **Layer:** L1 (in-process orchestrator prompt consumer with a controllable `PaneController` and hook-derived state snapshot).
+- **Agent:** none.
+- **Asserts:** after a provisional write, an `EventType::Thinking` event on the same pane/agent carrying `user_prompt: None` — the exact shape `src/wrap.rs`'s generic stdout classifier emits (`emit_with_metadata`) — leaves the prompt, delivery identity, retry state, role status, and prompted flag unchanged; only a later event that actually carries the matching submitted text finalizes the delivery.
+- **Does not assert:** `src/wrap.rs`'s own classification logic in isolation, or the daemon-owned `spawn::spawn` / seed-prompt delivery paths, both of which route through the same `user_prompt`-gated evidence functions but are out of this layer's reach.
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
