@@ -55,7 +55,13 @@ TYPES=(breaking feature bugfix doc misc)
 # [[tool.towncrier.type]] blocks; pyproject.toml's own TYPES order and its
 # `name` fields (Features/Bug Fixes/…) are NOT authoritative here — taking
 # either would silently reorder or re-title every future changelog.
-PYPROJECT_TOML="pyproject.toml"
+#
+# Resolved relative to this script's own location, NOT the cwd: unlike
+# CHANGELOG_DIR/CHANGELOG_FILE below (which are deliberately cwd-relative so
+# a scratch directory can stand in for a checkout in tests), pyproject.toml
+# is always the repo's own declared vocabulary, never a test fixture.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYPROJECT_TOML="$SCRIPT_DIR/../pyproject.toml"
 pyproject_types=()
 while IFS= read -r t; do
   [[ -n "$t" ]] && pyproject_types+=("$t")
