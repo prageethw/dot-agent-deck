@@ -341,18 +341,12 @@ pub async fn handle_dispatch(
                 ),
             };
         }
-        // Issue #541: the async `create_worktree`'s own retry loop only ever
-        // produces `Created`/`AlreadyClaimed`/`Err` — it has no bounded wait
-        // of its own, so `TimedOut` is unreachable from this call site today
-        // (see `create_worktree`'s doc comment). Kept as an explicit arm
-        // rather than a wildcard so a future change that gives this path a
-        // bound fails loudly here instead of silently falling through.
+        // Fork #282: the async `create_worktree` now bounds its `git worktree
+        // add` on `WORKTREE_GIT_TIMEOUT` and reports `TimedOut` when it fires,
+        // so this arm is genuinely reachable from this call site.
         Ok(WorktreeCreation::TimedOut { cleaned_up_by }) => {
-            let detail = if let Some(remover) = cleaned_up_by {
-                format!(
-                    "the half-created directory was removed automatically by {remover} — try \
-                     again"
-                )
+            let detail = if cleaned_up_by.is_some() {
+                "the half-created directory was removed automatically — try again".to_string()
             } else {
                 format!(
                     "run `git -C {} worktree remove --force {}` to clear it, then try again",
