@@ -23,7 +23,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, find_pane_box_left_edge};
+use common::{TuiDeck, commit_fixture, find_pane_box_left_edge, open_orchestration_with_slug};
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
@@ -63,6 +63,11 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
     let deck = TuiDeck::builder()
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");
+    // Issue #489: tab B below opens with a TYPED Worktree slug rather than
+    // sharing tab A's exact cwd — `git worktree add`/the isolated-clone arm
+    // it goes through both need a ref to branch from, which an unborn HEAD
+    // (the harness's own bare `git init`) does not provide.
+    commit_fixture(deck.workdir());
     deck.wait_for_string("No active sessions");
 
     open_orchestration(&deck);
@@ -118,11 +123,15 @@ fn orchestration_006_ctrl_l_cycles_pane_column_split_stages() {
         deck.snapshot_grid()
     );
 
-    // Open a SECOND orchestration tab (tab B) in the same directory. PRD
-    // #387 decision 2: a fresh tab now ADOPTS the current deck-global stage
-    // — tab B must open already-Narrow, matching tab A's toggled stage, not
-    // its own untoggled Default.
-    open_orchestration(&deck);
+    // Open a SECOND orchestration tab (tab B) against the same directory
+    // PICKED in the form, via a TYPED Worktree slug — issue #489 refuses a
+    // second BLANK-slug open that exactly collides with tab A's own live
+    // directory, so tab B must go through the unaffected typed-slug arm
+    // instead (unrelated to this test's own point: PRD #387 decision 2, a
+    // fresh tab now ADOPTS the current deck-global stage — tab B must open
+    // already-Narrow, matching tab A's toggled stage, not its own untoggled
+    // Default).
+    open_orchestration_with_slug(&deck, "paneb");
     deck.wait_for_absence("New Agent"); // new-pane form closed -> tab B is up
     // Deliberately unguarded: three separate guard attempts here were each
     // satisfiable by a stale tab-A frame instead of tab B's real one (any

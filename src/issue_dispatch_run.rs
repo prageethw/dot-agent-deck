@@ -3006,10 +3006,17 @@ pub(crate) fn create_worktree_sync(
     branch: &str,
     creator: &str,
 ) -> Result<WorktreeCreation, String> {
-    ensure_worktree_parent_dir(worktree_dir)?;
-
+    // Issue #489 fix round (auditor A2, nit): resolve the lock path — which
+    // re-derives `clone_dir`'s `git_common_dir` and fails if `clone_dir`
+    // isn't a git repository — BEFORE `ensure_worktree_parent_dir` creates
+    // anything on disk. A non-git `clone_dir` now refuses cleanly with no
+    // stray directory left behind, instead of creating `worktree_dir`'s
+    // parent first and only then hitting this same failure.
     let lock_path = worktree_attach_lock_path(clone_dir, worktree_dir)
         .map_err(|e| format!("failed to resolve worktree lock path: {e}"))?;
+
+    ensure_worktree_parent_dir(worktree_dir)?;
+
     if let Some(parent) = lock_path.parent() {
         crate::platform::fsperm::ensure_owner_only_dir(parent).map_err(|e| {
             format!(
