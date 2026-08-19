@@ -4100,6 +4100,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the broader idle-worker detection policy or the exact diagnostic prose, only that the production notice caller cannot reauthorize a blind probe.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/016 — A delegated worker whose PROCESS exits on its own — no `work-done`, no SIGTERM, no `StopAgent` — has its armed `OutstandingDelegation`/`SilenceWatchRecord` retired immediately by `pump_reader`'s EOF branch, and the orchestrator sees the new "exited without work-done" notice promptly instead of either older timeout-based notice.
+- **Layer:** fast integration; the worker stub is a raw-mode shell that prints a readiness marker and exits on its own via a fixed short sleep — a genuine process exit, not a signalled close. Both timeout watches are configured to windows (60s / 30s) far longer than the test's own runtime, so a notice landing within the test's few-second bound can only have come from the EOF-triggered sweep.
+- **Agent:** none (worker stand-in; the orchestrator is a raw/no-echo `cat` so the notice is directly observable in its scrollback).
+- **Asserts:** after the delegate lands and the worker's process ends on its own, the worker pane is confirmed NOT in a close transition (so the close-time sweep is provably not what retired the records), the new EOF-triggered notice appears in the orchestrator's pane within 5s and names the exited worker's pane id, and neither the older idle-timeout prompt nor the older delegate-possibly-not-delivered silence notice appears at all.
+- **Does not assert:** the exact daemon log wording; the identity-bound worker-side match's own race-closing behavior (a delegation whose worker identity has not yet resolved falling through to its own timer instead of being mistaken for a stranger's exit) — that is a `src/agent_pty.rs` unit-test concern, not this integration harness's.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
