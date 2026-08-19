@@ -7529,6 +7529,37 @@ mod tests {
             );
         }
     }
+
+    /// Scenario: simulates two daemon restarts by handing [`mint_nonce_seq`]
+    /// two independent, freshly-initialized `OnceLock`/`AtomicU64` pairs —
+    /// exactly what two daemon processes have, since a real restart can't be
+    /// triggered inside one test process. Both "restarts" mint their first
+    /// id with the sequence starting at zero, which is what a real restart
+    /// actually resets, so the nonce is the only thing left that can tell
+    /// them apart. Asserts both sequences are 0 while the nonces differ,
+    /// pinning that the nonce — not the sequence — is what prevents issue
+    /// #430's collision (a spawn-level test can't pin this: it would have to
+    /// reset a real `OnceLock`, which can't be re-seeded once cached).
+    #[test]
+    fn mint_nonce_seq_nonce_differs_across_two_simulated_restarts() {
+        let (cell1, seq1) = (std::sync::OnceLock::new(), AtomicU64::new(0));
+        let (cell2, seq2) = (std::sync::OnceLock::new(), AtomicU64::new(0));
+        let (nonce1, q1) = mint_nonce_seq(&cell1, &seq1);
+        // A tiny delay so the two nonces can't land on the same nanosecond
+        // reading even on a coarse clock — removes doubt without weakening
+        // what the assertion below pins (see mint_nonce_seq's doc comment).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let (nonce2, q2) = mint_nonce_seq(&cell2, &seq2);
+        assert_eq!(
+            (q1, q2),
+            (0, 0),
+            "both simulated restarts must start their sequence at zero"
+        );
+        assert_ne!(
+            nonce1, nonce2,
+            "only the nonce can tell two restarts apart once their sequences both start at zero"
+        );
+    }
 }
 
 // PRD #42 M8/review B1: these tests spawn real PTYs running `/bin/sh` / `sh -c`

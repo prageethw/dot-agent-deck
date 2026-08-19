@@ -38,8 +38,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,23 +78,18 @@ const DELIVER_BUFFER_DELAY: std::time::Duration = std::time::Duration::from_mill
 /// spawned agent that happens to share a display name.
 pub const SCHEDULE_PANE_ID_PREFIX: &str = "sched-";
 
-/// Retained solely so `next_pane_id_does_not_collide_across_a_simulated_daemon_restart`
-/// (issue #430) can reset something mid-test to stand in for a daemon
-/// restart — no longer read by [`next_pane_id`] itself, which is why this is
-/// `#[cfg(test)]`-only. It used to be the pane id's only source of entropy,
-/// which was exactly the bug: a bare counter starting back at 0 on every
-/// real restart, so a task fired once before and once after a restart
-/// minted the identical id. See [`PANE_NONCE`]/[`PANE_SEQ`].
-#[cfg(test)]
-static PANE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Per-process nonce (hashed from the pid + epoch nanos at first use) and
 /// monotonic sequence backing [`next_pane_id`]'s numeric component — the
 /// same restart-resistant recipe [`crate::agent_pty::mint_pane_id`] uses via
 /// the shared [`crate::agent_pty::mint_nonce_seq`] helper (issue #430).
-/// Unlike [`PANE_COUNTER`], `PANE_NONCE` is computed once and cached for the
-/// life of the process, so it differs across a daemon restart even though a
-/// reused pid could otherwise recreate the same counter value.
+/// Before this fix `next_pane_id` drew its numeric component from a bare
+/// counter starting back at 0 on every real restart, so a task fired once
+/// before and once after a restart minted the identical id. `PANE_NONCE` is
+/// computed once and cached for the life of the process, so it differs
+/// across a daemon restart even though a reused pid could otherwise
+/// recreate the same counter value; see
+/// [`crate::agent_pty::mint_nonce_seq`]'s tests for the property pinned at
+/// the level that's actually testable in-process.
 static PANE_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PANE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -4310,9 +4303,19 @@ mod tests {
         assert_eq!(orchestrator_role_index(&neither), 0);
     }
 
+    /// Scenario: mints a handful of pane ids from short task names and one
+    /// role-indexed id, and checks each is a valid `DOT_AGENT_DECK_PANE_ID`
+    /// and that repeated calls for the same task name don't collide. Also
+    /// mints one id from an 80-byte task name — well within
+    /// `DISPLAY_NAME_MAX_LEN` (128), which the deck's own name field accepts
+    /// — and asserts it too stays valid (fork#430 F2): `next_pane_id` never
+    /// truncates the sanitized name, and the nonce+seq suffix this PR added
+    /// leaves only ~39 bytes of headroom under `PANE_ID_ENV_MAX_LEN` (64),
+    /// so an uncapped long name now silently drops the pane id from the
+    /// registry mirror on capture instead of being minted validly.
     #[test]
     fn next_pane_id_is_valid_and_unique() {
-        use crate::agent_pty::is_valid_pane_id_env;
+        use crate::agent_pty::{PANE_ID_ENV_MAX_LEN, is_valid_pane_id_env};
         let a = next_pane_id("morning digest!", None);
         let b = next_pane_id("morning digest!", None);
         let r = next_pane_id("orch", Some(2));
@@ -4321,24 +4324,13 @@ mod tests {
         assert!(is_valid_pane_id_env(&r));
         assert_ne!(a, b, "pane ids must be unique across calls");
         assert!(r.ends_with("-r2"));
-    }
 
-    /// Scenario: mints a pane id, then resets `PANE_COUNTER` back to zero
-    /// (standing in for a daemon restart, which a unit test can't otherwise
-    /// trigger) and mints a second pane id for the same task name and role
-    /// index. The two ids must still differ — issue #430 is that they don't,
-    /// because `next_pane_id`'s only entropy is the bare restart-vulnerable
-    /// `PANE_COUNTER`, so two fires of the same scheduled task separated by
-    /// a real daemon restart mint the identical id and collide on
-    /// `pane_digest_hex` / the work-done report path.
-    #[test]
-    fn next_pane_id_does_not_collide_across_a_simulated_daemon_restart() {
-        let before_restart = next_pane_id("digest", None);
-        PANE_COUNTER.store(0, Ordering::SeqCst);
-        let after_restart = next_pane_id("digest", None);
-        assert_ne!(
-            before_restart, after_restart,
-            "next_pane_id must not mint the same id across a daemon restart"
+        let long_name = "a".repeat(80);
+        let long = next_pane_id(&long_name, None);
+        assert!(
+            is_valid_pane_id_env(&long),
+            "{long} (len {}) must satisfy PANE_ID_ENV_MAX_LEN ({PANE_ID_ENV_MAX_LEN}) even for an 80-byte task name",
+            long.len()
         );
     }
 
