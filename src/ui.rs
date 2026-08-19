@@ -1236,6 +1236,17 @@ pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, 
     Ok(false)
 }
 
+/// Shared wording for both `root_checkout_has_live_sibling` call sites'
+/// `Err` arm (the `Some(worktree_path)` and `None`-slug branches) — they
+/// previously duplicated this string verbatim.
+fn live_sibling_check_failed_message(target_dir: &Path, reason: &str) -> String {
+    format!(
+        "Orchestration failed: could not confirm no other live orchestration \
+         already shares {} — {reason}",
+        target_dir.display()
+    )
+}
+
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
 /// in [`Action::FormFocusField`] (a click on a field's row focuses it, the
 /// same as Tab landing there).
@@ -10537,11 +10548,7 @@ fn dispatch_action(
                             match root_checkout_has_live_sibling(&req.dir) {
                                 Err(reason) => {
                                     ui.status_message = Some((
-                                        format!(
-                                            "Orchestration failed: could not confirm no other \
-                                             live orchestration already shares {} — {reason}",
-                                            req.dir.display()
-                                        ),
+                                        live_sibling_check_failed_message(&req.dir, &reason),
                                         std::time::Instant::now(),
                                     ));
                                     return Flow::Continue;
@@ -10761,11 +10768,7 @@ fn dispatch_action(
                         None => match root_checkout_has_live_sibling(&req.dir) {
                             Err(reason) => {
                                 ui.status_message = Some((
-                                    format!(
-                                        "Orchestration failed: could not confirm no other \
-                                         live orchestration already shares {} — {reason}",
-                                        req.dir.display()
-                                    ),
+                                    live_sibling_check_failed_message(&req.dir, &reason),
                                     std::time::Instant::now(),
                                 ));
                                 return Flow::Continue;
@@ -33858,9 +33861,11 @@ mod tests {
     /// dispatches a blank-slug `Action::SpawnPane` against a real git repo
     /// while a stubbed daemon reports a live sibling orchestration whose
     /// `orchestration_cwd` is that same repo, and asserts the spawn is
-    /// refused — no orchestration tab opens, no role pane spawns, and a
-    /// status message surfaces the refusal — rather than silently rooting a
-    /// second orchestration in the already-live shared checkout.
+    /// refused — no orchestration tab opens, no role pane spawns, and the
+    /// status message carries wording unique to the `Ok(true)` (sibling
+    /// found) refusal, distinguishing it from `worktree_015`'s `Err(reason)`
+    /// (daemon-unreachable) refusal — rather than silently rooting a second
+    /// orchestration in the already-live shared checkout.
     #[spec("orchestration/worktree/016")]
     #[test]
     fn worktree_016_blank_slug_refuses_when_root_checkout_has_live_sibling() {
@@ -33937,15 +33942,21 @@ mod tests {
              orchestration — the blank-slug path must consult the same gate the typed-slug path \
              (`orchestration/worktree/014`) already does"
         );
-        // ...and the refusal surfaces to the user.
+        // ...and the refusal surfaces to the user with wording unique to the
+        // `Ok(true)` arm — a live sibling was genuinely found, distinguishing
+        // this from `worktree_015`'s `Err(reason)` (daemon-unreachable)
+        // refusal, which is worded differently and would otherwise satisfy
+        // an `!is_empty()` check identically.
         let message = ui
             .status_message
             .as_ref()
             .map(|(m, _)| m.clone())
             .unwrap_or_default();
         assert!(
-            !message.is_empty(),
-            "the fail-closed refusal must surface a status message, not fail silently"
+            message.contains("another live orchestration already uses this root checkout"),
+            "the refusal must be worded for the Ok(true) live-sibling-found case, not merely \
+             non-empty (which the Err(reason) daemon-unreachable path would also satisfy); got \
+             {message:?}"
         );
     }
 
