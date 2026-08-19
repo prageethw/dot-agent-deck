@@ -1098,12 +1098,27 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// refusal caused by a daemon that is merely slow rather than actually down.
 ///
 /// The one exception to "fails closed" is deliberate and local, not a gap:
-/// issue #489, if `target_dir` itself isn't a git repository at all (its
-/// `git_common_dir` resolution fails), this returns `Ok(false)` rather than
-/// `Err` — a non-git directory has no git object store to collide over, so
-/// the collision this function exists to detect cannot apply to it. This is
-/// distinct from every daemon-communication failure below, which still fails
-/// closed exactly as described above.
+/// issue #489, if `target_dir` itself is genuinely not a git repository —
+/// `git_common_dir`'s own diagnostic contains git's stable `"not a git
+/// repository"` fatal message — this returns `Ok(false)` rather than `Err`:
+/// a non-git directory has no git object store to collide over, so the
+/// collision this function exists to detect cannot apply to it. Every OTHER
+/// `git_common_dir` failure (git unspawnable, a `safe.directory`
+/// dubious-ownership refusal against a genuine repo, empty stdout) is NOT
+/// evidence there is no object store to collide over — it is evidence we
+/// could not find out — and still propagates as `Err`, failing closed
+/// exactly as described above (fix round, auditor A1 / reviewer
+/// SUGGESTION 1: the original `Err(_) => Ok(false)` collapsed all of these
+/// into the narrow case).
+///
+/// PRD fork#325 fix round (issue #489 fix round, reviewer BLOCKER 2): the
+/// per-record loop below is additionally scoped by [`SiblingScope`] — the
+/// blank-slug caller (no typed Worktree slug to isolate into, so its only
+/// remedy is refusal) asks a narrower question than the typed-slug caller
+/// (which isolates into its own clone): does a live orchestration's cwd
+/// literally EQUAL `target_dir`, not merely share its `--git-common-dir`.
+/// See [`SiblingScope`]'s own doc comment for why the two callers need
+/// different answers to what looks like the same question.
 ///
 /// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
 /// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
@@ -1160,20 +1175,26 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// pattern (the file's other correctness-sensitive blocking daemon call)
 /// rather than [`live_orchestration_cwds_and_titles`]'s fail-open-hint idiom
 /// this function's `agent_records.unwrap_or_default()` was copied from.
-pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
+pub(crate) fn root_checkout_has_live_sibling(
+    target_dir: &Path,
+    scope: SiblingScope,
+) -> Result<bool, String> {
     // Issue #325 reviewer nit: resolve the LOCAL, knowable-in-milliseconds
     // answer before paying for the daemon round trip — a non-git `target_dir`
     // now fails fast instead of waiting up to `DAEMON_REQUEST_TIMEOUT` (5s)
     // first for an answer this check never needed.
     //
-    // Issue #489 regression fix: a `target_dir` that isn't a git repository
-    // at all is treated as "no live sibling" (`Ok(false)`), not a fail-closed
-    // `Err` — there is no git object store to collide over, so the entire
-    // premise of this check doesn't apply. This is distinct from a
-    // daemon-communication failure below, which still fails closed.
+    // Issue #489 fix round (auditor A1 / reviewer SUGGESTION 1): only "git
+    // ran and said this is not a repository" is treated as "no live sibling"
+    // (`Ok(false)`) — matched on git's own stable diagnostic substring rather
+    // than collapsing every `git_common_dir` failure. Every other cause
+    // (unspawnable git, a dubious-ownership refusal against a genuine repo,
+    // empty stdout) still fails closed via `?`-propagation below, matching
+    // this function's contract for every other error path.
     let target_common = match crate::issue_dispatch_run::git_common_dir(target_dir) {
         Ok(common) => common,
-        Err(_) => return Ok(false),
+        Err(e) if e.contains("not a git repository") => return Ok(false),
+        Err(e) => return Err(e),
     };
     let target_common = std::fs::canonicalize(&target_common).unwrap_or(target_common);
 
@@ -1225,6 +1246,15 @@ pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, 
         if cwd_canon == target_dir_canon {
             return Ok(true);
         }
+        // Issue #489 fix round (reviewer BLOCKER 2): `ExactCwdOnly` stops
+        // here — it never falls through to the shared-`--git-common-dir`
+        // comparison below, so a live orchestration running in a WORKTREE
+        // carved off `target_dir` (this repo's own everyday model) does not
+        // count as a collision for the blank-slug caller. Only
+        // `AnySharedCommonDir` (the typed-slug caller) reaches it.
+        if scope == SiblingScope::ExactCwdOnly {
+            continue;
+        }
         let Ok(live_common) = crate::issue_dispatch_run::git_common_dir(Path::new(&cwd)) else {
             continue;
         };
@@ -1234,6 +1264,33 @@ pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, 
         }
     }
     Ok(false)
+}
+
+/// Issue #489 fix round (reviewer BLOCKER 2): [`root_checkout_has_live_sibling`]
+/// answers two different questions depending on which caller asks it, and
+/// conflating them was the defect — the blank-slug arm's remedy is an
+/// outright refusal, so it must only refuse on the narrow collision it can't
+/// route around (a live orchestration whose cwd literally IS `target_dir`);
+/// the typed-slug arm's remedy is an isolated clone, so it can safely treat
+/// the broader "shares a `--git-common-dir`" signal as a collision, because
+/// isolating into a clone is always a safe response to that signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiblingScope {
+    /// The blank-slug (`None`) arm: only a live orchestration whose own cwd
+    /// equals `target_dir` counts. A live orchestration in a linked worktree
+    /// of `target_dir` (CLAUDE.md rule 1's every-fix-gets-its-own-worktree
+    /// model) does NOT — refusing on that shape blocked a brand-new,
+    /// unrelated blank-slug orchestration in the root checkout for as long
+    /// as any worker orchestration held a worktree, a real regression
+    /// (`orchestration_dispatch_001`'s e2e failure).
+    ExactCwdOnly,
+    /// The typed-slug (`Some(worktree_path)`) arm: today's pre-#489
+    /// behavior, unchanged — any live orchestration sharing `target_dir`'s
+    /// `--git-common-dir`, whether its own cwd IS `target_dir` or a
+    /// worktree carved off it, counts, so the slug is provisioned as an
+    /// isolated clone rather than a `git worktree add` sibling that would
+    /// race the shared object store (issue #325's original incident shape).
+    AnySharedCommonDir,
 }
 
 /// Shared wording for both `root_checkout_has_live_sibling` call sites'
@@ -10545,7 +10602,10 @@ fn dispatch_action(
                             // `--git-common-dir`, not raw cwd equality) and
                             // the fail-closed decision on a daemon query
                             // failure this branches on.
-                            match root_checkout_has_live_sibling(&req.dir) {
+                            match root_checkout_has_live_sibling(
+                                &req.dir,
+                                SiblingScope::AnySharedCommonDir,
+                            ) {
                                 Err(reason) => {
                                     ui.status_message = Some((
                                         live_sibling_check_failed_message(&req.dir, &reason),
@@ -10765,7 +10825,10 @@ fn dispatch_action(
                         // fail closed the same way: refuse rather than
                         // auto-isolate, so the user re-submits with a typed
                         // slug instead.
-                        None => match root_checkout_has_live_sibling(&req.dir) {
+                        None => match root_checkout_has_live_sibling(
+                            &req.dir,
+                            SiblingScope::ExactCwdOnly,
+                        ) {
                             Err(reason) => {
                                 ui.status_message = Some((
                                     live_sibling_check_failed_message(&req.dir, &reason),
@@ -34285,7 +34348,7 @@ mod tests {
             crate::daemon_protocol::AttachResponse::err("simulated daemon-side failure"),
         );
 
-        let result = root_checkout_has_live_sibling(&dir);
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
         assert!(
             result.is_err(),
             "an `ok: false` daemon response must fail the gate closed, not read as \
@@ -34313,7 +34376,7 @@ mod tests {
             crate::daemon_protocol::AttachResponse::agents(vec!["agent-1".to_string()]),
         );
 
-        let result = root_checkout_has_live_sibling(&dir);
+        let result = root_checkout_has_live_sibling(&dir, SiblingScope::AnySharedCommonDir);
         assert!(
             result.is_err(),
             "an older-daemon-shaped response (agent_records: None) must fail the \
