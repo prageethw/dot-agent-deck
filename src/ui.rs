@@ -1090,19 +1090,32 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// not a best-effort one, so refusing to spawn is preferred over a false
 /// refusal caused by a daemon that is merely slow rather than actually down.
 ///
-/// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1), not yet fixed:
-/// the fail-closed guarantee above does NOT extend to a live orchestration
-/// reported by an OLDER CLIENT whose record omits `orchestration_cwd`
-/// (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
-/// pre-#325 client's record deserializes with it as `None` rather than
-/// failing to parse at all). The per-record loop below matches only
-/// `orchestration_cwd: Some(cwd)`, so such a record silently falls through
-/// the `else { continue; }` arm — it is invisible to this gate and treated
-/// exactly like "no live sibling" for that entry, even though a genuine live
-/// orchestration sits behind it. This is a real, tracked gap on that one
-/// axis (older-client visibility), not a claim that the whole function fails
-/// open; every other failure mode this doc comment describes still fails
-/// closed as stated.
+/// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
+/// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
+/// guarantee above does NOT extend to a live orchestration whose record
+/// reaches this loop with `tab_membership: None`. Two distinct routes
+/// produce that shape, both silently falling through the per-record loop's
+/// `else { continue; }` arm below — invisible to this gate, treated exactly
+/// like "no live sibling" for that entry, even though a genuine live
+/// orchestration sits behind it:
+///
+/// 1. An OLDER CLIENT whose record omits `orchestration_cwd` altogether
+///    (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
+///    pre-#325 client's record deserializes with it as `None` rather than
+///    failing to parse at all).
+/// 2. `sanitize_record_tab_membership` (`src/daemon_client.rs`) clamping the
+///    WHOLE `tab_membership` to `None` when
+///    [`crate::agent_pty::validate_tab_membership`] rejects it — which it
+///    does unconditionally on an invalid `orchestration_cwd`, not just that
+///    one field. Reachable by a same-uid peer sending an oversized or
+///    control-byte-bearing `orchestration_cwd` in `StartAgent`; not a
+///    boundary crossing (a same-uid peer already has arbitrary code
+///    execution in this model), which is why this is tracked rather than
+///    treated as a blocker.
+///
+/// This is a real, tracked gap on these two axes, not a claim that the whole
+/// function fails open; every other failure mode this doc comment describes
+/// still fails closed as stated.
 ///
 /// A single LIVE entry whose own `git-common-dir` fails to resolve (e.g. its
 /// worktree was removed after the daemon's record went stale) is skipped

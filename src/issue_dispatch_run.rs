@@ -1617,12 +1617,28 @@ fn handle_isolated_clone_add_error(
 /// reviewer C1 / auditor C1). Git's own message for the first case is
 /// stable and distinctive: `fatal: destination path '<dir>' already exists
 /// and is not an empty directory.` — matched on the two substrings rather
-/// than the whole sentence so a quoted path or a locale-shifted preamble
-/// doesn't defeat it. Only this case must never be `remove_dir_all`'d — see
+/// than the whole sentence so a quoted path doesn't defeat it. Only this
+/// case must never be `remove_dir_all`'d — see
 /// [`handle_isolated_clone_add_error`]'s doc comment for why (a manual `git
 /// worktree add` racing into the same path is exactly this shape, and
 /// deleting it would be strictly worse than round 1's non-destructive
 /// `AlreadyClaimed`).
+///
+/// PRD fork#325 fix round 4 (auditor D1): a *locale*-shifted message DOES
+/// defeat this — git's translation catalogs (installed for German, French,
+/// and others on a stock Debian/Ubuntu `git` package) replace the whole
+/// sentence, and neither translated wording contains either English
+/// substring, so this predicate returned `false` (the destructive answer)
+/// for a non-English user hitting exactly the collision it exists to
+/// recognize. This is intentionally NOT fixed here by widening the match to
+/// more translations — that only ever covers the languages someone thought
+/// to add. It is fixed one layer up, in [`spawn_git_status_child`]'s
+/// `.env("LC_ALL", "C")`: that pins every git child this predicate's input
+/// can come from to the untranslated English locale, so matching hardcoded
+/// English substrings here is safe again. If a caller is ever added that
+/// feeds this predicate text from a `git` invocation NOT spawned through
+/// `spawn_git_status_child`, that caller inherits this same locale hazard
+/// and needs the same override.
 fn clone_destination_predates_attempt(error_text: &str) -> bool {
     error_text.contains("destination path") && error_text.contains("already exists")
 }
@@ -1657,7 +1673,24 @@ fn read_source_origin_url(source_dir: &Path) -> Option<String> {
 /// origin` against it fails LOUDLY ("does not appear to be a git
 /// repository") instead of landing anywhere, the same safety property the
 /// eventual `remote remove` gives, just available one step earlier.
-const ISOLATED_CLONE_NO_ORIGIN_SENTINEL: &str = "dot-agent-deck-no-origin-configured";
+///
+/// PRD fork#325 fix round 4 (auditor D3): that safety property held only
+/// contingently. The original value, `dot-agent-deck-no-origin-configured`,
+/// carries no URL scheme, so git resolves it as a RELATIVE LOCAL PATH
+/// against the invoking directory rather than an unreachable remote —
+/// verified: `git push origin` against it fails loudly only while nothing
+/// exists at that relative path, and SILENTLY SUCCEEDS into a bare repo
+/// created there (`git init --bare
+/// dot-agent-deck-no-origin-configured`). The window this sentinel exists to
+/// cover is precisely the one where such a repo could persist (this process
+/// dying before the deferred real removal runs), so the failure mode is
+/// exactly backwards from what the doc comment above promises: silent
+/// success into an unintended nearby repo instead of a loud, obvious
+/// failure. Fixed by giving it a scheme no git transport implements —
+/// `dot-agent-deck://…` — which fails unconditionally regardless of what
+/// exists on disk (verified: `remote helper 'dot-agent-deck' aborted
+/// session`), making the doc comment's claim true rather than contingent.
+const ISOLATED_CLONE_NO_ORIGIN_SENTINEL: &str = "dot-agent-deck://no-origin-configured";
 
 /// Point a freshly cloned `clone_dir`'s `origin` at `url` — either
 /// `source_dir`'s own origin URL, or (fix round 3, reviewer P3-1)
@@ -3033,6 +3066,25 @@ const WORKTREE_GIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// `CREATE_SUSPENDED` plus a resume after `adopt()`, which is out of scope
 /// here; the window is small (no code runs between the two calls below) and
 /// unchanged from today's behavior.
+///
+/// PRD fork#325 fix round 4 (auditor D1): `.env("LC_ALL", "C")` pins the
+/// child's message locale regardless of what the daemon's own process
+/// environment carries. Without it, [`clone_destination_predates_attempt`]'s
+/// English-substring match on `git clone`'s stderr fails OPEN — under a
+/// non-English `LANG` (verified: German, French — git ships translation
+/// catalogs and neither wording contains `"destination path"` or `"already
+/// exists"`), the predicate returns `false` for the exact "destination
+/// predates this attempt" shape it exists to recognize, and that `false`
+/// answer routes straight into `remove_dir_all` — C1's destructive path,
+/// reopened for any non-English user. `LC_ALL` takes priority over
+/// `LANGUAGE`/`LANG` in gettext's own resolution order, so this defeats
+/// either override; verified directly (`LC_ALL=C LANGUAGE=de git clone …`
+/// still produces the English wording). Chosen over widening the predicate
+/// to recognize translated wordings too: that only ever covers the
+/// languages someone thought to add, where normalizing the child's locale
+/// closes the whole class at once. See
+/// [`clone_destination_predates_attempt`]'s doc comment for why matching
+/// hardcoded English substrings is safe given this override.
 fn spawn_git_status_child(
     program: &str,
     args: &[&str],
@@ -3048,7 +3100,8 @@ fn spawn_git_status_child(
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "");
+        .env("SSH_ASKPASS", "")
+        .env("LC_ALL", "C");
 
     #[cfg(unix)]
     {
@@ -3229,10 +3282,66 @@ mod tests {
     use crate::issue_dispatch::parse_claim_fields;
     use spec::spec;
 
-    /// Test mutex covering temporary `GIT_CONFIG_GLOBAL` mutation
+    /// Test mutex covering temporary process-global env var mutation
     /// (`std::env::set_var` is process-global) — matches `agent_pty.rs`'s
-    /// `ENV_TEST_LOCK` precedent for this exact class of test.
+    /// `ENV_TEST_LOCK` precedent for this exact class of test. Named for its
+    /// original use (`GIT_CONFIG_GLOBAL` scoping); [`ScopedEnvVar`] now
+    /// also serializes non-`GIT_CONFIG_GLOBAL` mutations (e.g. `LANG`)
+    /// through the same lock, since any two tests mutating process env
+    /// concurrently — regardless of which var — need to be serialized
+    /// against each other under a plain `cargo test`, not just against
+    /// other users of the same var.
     static GIT_CONFIG_GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard for a scoped `std::env` mutation in tests — restores the
+    /// previous value (or removes the var entirely if it was unset) on
+    /// drop, including when the guarded call panics (PRD fork#325 fix round
+    /// 4, auditor D6): the straight-line set-then-restore code this
+    /// replaces left the override in place for the rest of the test binary
+    /// process under a plain `cargo test` if anything between the two
+    /// panicked. Holds [`GIT_CONFIG_GLOBAL_TEST_LOCK`] for its whole
+    /// lifetime, so the mutation stays serialized against any other test in
+    /// this module doing the same — inert under nextest, which this project
+    /// uses (one process per test, so no sibling test ever shares the
+    /// mutation), but real under a bare `cargo test` run.
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = GIT_CONFIG_GLOBAL_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var(key).ok();
+            // SAFETY: serialized by GIT_CONFIG_GLOBAL_TEST_LOCK for this
+            // guard's entire lifetime; restored on drop below, including on
+            // an unwinding panic, so no other test in this process ever
+            // observes the override.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            // SAFETY: see `set` above — still holding the lock.
+            unsafe {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_open_issues_reads_number_and_labels_in_order() {
@@ -4999,10 +5108,13 @@ exit 0
     /// same shape the preceding test sets up). Sets `checkout.guess = false`
     /// via a SCOPED `GIT_CONFIG_GLOBAL` override (git >= 2.32; never the
     /// real user's `~/.gitconfig`) for the duration of the
-    /// `provision_isolated_clone_sync` call, restoring the previous value
-    /// (or removing the var entirely) immediately after, all while holding
-    /// [`GIT_CONFIG_GLOBAL_TEST_LOCK`] — `std::env::set_var` mutates
-    /// PROCESS-global state (matching `agent_pty.rs`'s own
+    /// `provision_isolated_clone_sync` call through [`ScopedEnvVar`], which
+    /// restores the previous value (or removes the var entirely)
+    /// panic-safely on drop (fix round 4, auditor D6 — the straight-line
+    /// set/restore this used before left the override in place for the rest
+    /// of the process if `provision_isolated_clone_sync` itself panicked)
+    /// while holding [`GIT_CONFIG_GLOBAL_TEST_LOCK`] — `std::env::set_var`
+    /// mutates PROCESS-global state (matching `agent_pty.rs`'s own
     /// `ENV_TEST_LOCK` precedent for this exact class of test), so without
     /// serializing this override could otherwise leak into a sibling test's
     /// git invocations that happen to run in the same test binary process.
@@ -5050,28 +5162,13 @@ exit 0
         let scoped_global_config = ws.path().join("scoped-gitconfig");
         std::fs::write(&scoped_global_config, "[checkout]\n\tguess = false\n").unwrap();
 
-        let _env_guard = GIT_CONFIG_GLOBAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let previous_override = std::env::var("GIT_CONFIG_GLOBAL").ok();
-        // SAFETY: serialized by GIT_CONFIG_GLOBAL_TEST_LOCK, and the prior
-        // value is restored before the lock guard is dropped below, so this
-        // process-global mutation is invisible to any other test.
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &scoped_global_config);
-        }
+        let _env_guard =
+            ScopedEnvVar::set("GIT_CONFIG_GLOBAL", &scoped_global_config.to_string_lossy());
 
         let clone_dir = ws.path().join("source-clonegate-guess");
         let result =
             provision_isolated_clone_sync(&source, &clone_dir, "clonegate-guess", "tester");
 
-        // SAFETY: see the set_var call above — same guard, still held.
-        unsafe {
-            match previous_override {
-                Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
-                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
-            }
-        }
         drop(_env_guard);
 
         assert!(
@@ -5277,16 +5374,34 @@ exit 0
     /// `git worktree add` racing into the same destination path produces
     /// (CLAUDE.md rule 1 / `/worktree-prd`'s own convention), and
     /// `remove_dir_all`ing it would delete their real worktree. Simulates
-    /// that race directly — create a directory with unrelated content (no
-    /// `.git` at all, standing in for "not ours"), fail with git's actual
-    /// "destination path already exists" wording, and assert the directory
-    /// survives untouched and the outcome is the non-destructive
+    /// that race directly — fail with git's actual "destination path
+    /// already exists" wording against a directory carrying `.git` as a
+    /// PLAIN FILE (fix round 4, auditor D5: `git worktree add`'s real
+    /// on-disk shape, and the exact reason `attempt_isolated_clone_cleanup`'s
+    /// P3-E `.git`-presence guard does NOT catch this case — a directory
+    /// engineered so P3-E alone can't save it, so the assertions below
+    /// actually exercise `clone_destination_predates_attempt` rather than
+    /// being made to pass by the unrelated guard) — and assert the
+    /// directory survives untouched and the outcome is the non-destructive
     /// `AlreadyClaimed`, round 1's original behavior for this shape.
     #[test]
     fn handle_isolated_clone_add_error_never_deletes_a_preexisting_destination() {
         let ws = tempfile::tempdir().unwrap();
         let preexisting_dir = ws.path().join("someone-elses-worktree");
         std::fs::create_dir_all(&preexisting_dir).unwrap();
+        // `git worktree add` writes `.git` as a plain FILE (`gitdir: …`),
+        // not a directory — without this, P3-E's `.git`-presence guard in
+        // `attempt_isolated_clone_cleanup` would preserve the directory on
+        // its own even if `clone_destination_predates_attempt` regressed,
+        // making the two assertions below inert (auditor D5).
+        std::fs::write(
+            preexisting_dir.join(".git"),
+            format!(
+                "gitdir: {}/.git/worktrees/someone-elses-worktree\n",
+                ws.path().display()
+            ),
+        )
+        .unwrap();
         let sentinel = preexisting_dir.join("sentinel.txt");
         std::fs::write(&sentinel, b"do not delete me").unwrap();
 
@@ -5312,6 +5427,165 @@ exit 0
             std::fs::read(&sentinel).unwrap(),
             b"do not delete me",
             "the pre-existing directory's contents must be untouched"
+        );
+    }
+
+    /// Scenario: PRD fork#325 fix round 4 (auditor D1) — the locale
+    /// regression this round exists to fix, reproducing the auditor's own
+    /// empirical measurement against the installed git (2.55.0): under a
+    /// non-English `LANG`, `git clone`'s stderr for a pre-existing,
+    /// non-empty destination is entirely translated and contains neither
+    /// English substring `clone_destination_predates_attempt` matches on.
+    /// Runs a REAL `git clone` (not a hand-written error string, unlike the
+    /// preceding test) against a genuinely non-empty destination with the
+    /// TEST PROCESS's `LANG` set to German, and asserts the captured stderr
+    /// still satisfies `clone_destination_predates_attempt` — proving
+    /// `spawn_git_status_child`'s `.env("LC_ALL", "C")` override reaches the
+    /// child and defeats the parent's locale, rather than merely asserting
+    /// the predicate accepts hand-picked English text. Deliberately does
+    /// NOT assert on the literal translated wording: a machine with no
+    /// German git catalog installed would make git fall back to English
+    /// regardless of this fix, which would make an assertion on the
+    /// TRANSLATED text itself flaky across machines — the property this
+    /// test actually needs (and gets, on any machine, catalog or not) is
+    /// that the captured text is the ENGLISH wording, which is exactly what
+    /// `LC_ALL=C` guarantees unconditionally.
+    #[test]
+    fn run_status_sync_clone_error_text_stays_english_under_non_english_locale() {
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let source = ws.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "--initial-branch=main", "--quiet"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        git(&source, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(source.join("README.md"), "seed\n").unwrap();
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "--quiet", "-m", "seed"]);
+
+        let dest = ws.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("sentinel.txt"), b"not empty").unwrap();
+
+        let _lang_guard = ScopedEnvVar::set("LANG", "de_DE.UTF-8");
+        let result = run_status_sync(
+            "git",
+            &[
+                "clone".to_string(),
+                "--".to_string(),
+                source.to_string_lossy().into_owned(),
+                dest.to_string_lossy().into_owned(),
+            ],
+            WORKTREE_GIT_TIMEOUT,
+        );
+        drop(_lang_guard);
+
+        let text = match result {
+            Err(AddError::Failed(e)) => e,
+            other => panic!(
+                "cloning into a non-empty destination must fail without timing out, got {other:?}"
+            ),
+        };
+        assert!(
+            clone_destination_predates_attempt(&text),
+            "spawn_git_status_child's LC_ALL=C override must keep git's stderr in English \
+             regardless of the parent process's LANG — auditor D1's non-English repro, got: \
+             {text:?}"
+        );
+    }
+
+    /// Scenario: PRD fork#325 fix round 4 (auditor D3) — the no-origin
+    /// sentinel `ISOLATED_CLONE_NO_ORIGIN_SENTINEL` must fail `git push`
+    /// unconditionally, not merely while nothing happens to exist at its
+    /// old bare-relative-path spelling. Reproduces the auditor's own
+    /// measurement: pointing `origin` at the sentinel and pushing must fail
+    /// even when a real bare repo sits at the exact relative path the OLD
+    /// (pre-fix) sentinel value would have resolved to — proving the fix is
+    /// the sentinel's scheme, not an accident of what happened to be absent
+    /// from the filesystem.
+    #[test]
+    fn isolated_clone_no_origin_sentinel_rejects_push_unconditionally() {
+        fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"))
+        }
+
+        let ws = tempfile::tempdir().unwrap();
+        let repo = ws.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let out = git(&repo, &["init", "--initial-branch=main", "--quiet"]);
+        assert!(out.status.success());
+        assert!(
+            git(&repo, &["config", "user.email", "test@example.com"])
+                .status
+                .success()
+        );
+        assert!(
+            git(&repo, &["config", "user.name", "Test"])
+                .status
+                .success()
+        );
+        assert!(
+            git(&repo, &["config", "commit.gpgsign", "false"])
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        assert!(git(&repo, &["add", "README.md"]).status.success());
+        assert!(
+            git(&repo, &["commit", "--quiet", "-m", "seed"])
+                .status
+                .success()
+        );
+
+        // Simulate the OLD sentinel value's exact hazard: a bare repo
+        // sitting at the plain-relative-path spelling. Even with this
+        // present, the current (scheme-qualified) sentinel must still fail.
+        let old_style_relative_path = repo.join("dot-agent-deck-no-origin-configured");
+        let out = git(
+            &repo,
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                old_style_relative_path.to_string_lossy().as_ref(),
+            ],
+        );
+        assert!(out.status.success());
+
+        assert!(
+            git(
+                &repo,
+                &["remote", "add", "origin", ISOLATED_CLONE_NO_ORIGIN_SENTINEL],
+            )
+            .status
+            .success()
+        );
+
+        let push = git(&repo, &["push", "origin", "HEAD"]);
+        assert!(
+            !push.status.success(),
+            "git push against ISOLATED_CLONE_NO_ORIGIN_SENTINEL must fail unconditionally — \
+             the old bare-relative-path spelling could silently succeed into a repo sitting at \
+             that path (auditor D3); this one must not, even with such a repo present, stderr: \
+             {}",
+            String::from_utf8_lossy(&push.stderr)
         );
     }
 
