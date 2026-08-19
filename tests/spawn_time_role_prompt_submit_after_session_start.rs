@@ -328,10 +328,17 @@ async fn spawn_time_role_prompt_submits_after_input_readiness_buffer() {
     let controller_for_write = controller.clone();
     let pane_for_write = pane_id.clone();
     let prompt_for_write = role_prompt.to_string();
+    let agent_id_for_write = agent_id.clone();
     tokio::task::spawn_blocking(move || {
         controller_for_write
-            .write_and_submit_to_pane(&pane_for_write, &prompt_for_write)
-            .expect("write_and_submit_to_pane")
+            .write_and_submit_to_pane_with_identity(
+                &pane_for_write,
+                &prompt_for_write,
+                Some(agent_id_for_write.as_str()),
+                None,
+                None,
+            )
+            .expect("write_and_submit_to_pane_with_identity")
     })
     .await
     .expect("join write task");
