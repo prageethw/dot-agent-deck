@@ -5549,20 +5549,43 @@ async fn dispatch_one_owned(
     // `DOT_AGENT_DECK_LOG` is set — a delegated task lost with nothing on the
     // card to say so, which is the shape of issue #424 itself.
     //
-    // `expected_worker_agent_id` is only ever `None` here for
-    // the non-`clear = true` path, whose fallback resolution above
-    // (`registry.pane_current_agent_id(&pane_id)`) can observe the pane in a
-    // gap opened by pane-id REUSE: the worker's agent exits or is closed
-    // (`close_agent`, a crash, a natural process exit), freeing its
+    // Issue #465 F2/F3 (fixing #465 F3's own test 019): `expected_worker_agent_id`
+    // is only ever `None` here for the non-`clear = true` path, whose fallback
+    // resolution above (`registry.pane_current_agent_id(&pane_id)`) can observe
+    // the pane in a gap opened by pane-id REUSE: the worker's agent exits or is
+    // closed (`close_agent`, a crash, a natural process exit), freeing its
     // `pane_id_env`, and a brand-new, unrelated agent then inherits that same
-    // pane id before this dispatch reaches its write.
+    // pane id before this dispatch reaches its write. `idle_worker_014`/`_018`
+    // (`tests/idle_worker_detector.rs`) demonstrate this reuse mechanism is real
+    // and fast enough to matter — measured against `ORCH_PANE` (both tests
+    // reuse the ORCHESTRATOR pane, not a worker pane), but the underlying
+    // primitive (`pane_id_env` being freed and reassigned on agent exit) is the
+    // same one for any pane, worker panes included.
     //
     // In PRODUCTION this is NOT a concurrent respawn of THIS pane racing this
     // dispatch: `dispatch_one_owned` is the only production caller of
     // `respawn_agent_for_pane`, and it runs under `registry.pane_dispatch_lock`,
     // which serializes every dispatch on a pane (a `clear = true` respawn always
     // resolves `expected_worker_agent_id` to its own fresh `new_agent_id` above,
-    // never `None`). Calling `write_and_submit_guarded_detailed` with
+    // never `None`). Issue #465 F4/F7: an earlier version of this comment
+    // claimed `idle_worker_019` reaches this same `None` branch, by calling
+    // `respawn_agent_for_pane` directly on the worker pane outside
+    // `pane_dispatch_lock`, racing the detached task `handle_delegate` spawns
+    // for this very dispatch. That was true, but it was a defect in the
+    // test's own construction rather than a route worth documenting here:
+    // `handle_delegate` returns once its dispatches are QUEUED (`tokio::spawn`,
+    // not awaited), so `idle_worker_019`'s own `harness.delegate(...)` call
+    // could return before this function had resolved `expected_worker_agent_id`
+    // at all, letting the test's very next line — its own direct
+    // `respawn_agent_for_pane` call — race this resolution and occasionally
+    // drive it down the `None` path, canceling the silence watch the test
+    // meant to check for survival (issue #465 F4) for a reason unrelated to
+    // what the test claims to isolate. `idle_worker_019` now waits for the
+    // task pointer to land on the pre-respawn agent before respawning, which
+    // closes that race at the test's own construction; this identity-unresolved
+    // path stays reachable in production only via genuine pane-id reuse (the
+    // paragraph above), never via a same-dispatch concurrent respawn. Calling
+    // `write_and_submit_guarded_detailed` with
     // `expected_agent_id = None` in that gap is NOT a safe no-op: its pre-lock
     // identity gate only compares `expected` against the pane's current owner
     // when `expected` is `Some` — so `None` skips the gate entirely and the call
@@ -5705,6 +5728,27 @@ async fn dispatch_one_owned(
     // Nothing was delivered, so there is nothing to be silent about: disarm the
     // record we registered before the write rather than leaving it to be swept
     // by the next delegate or close.
+    //
+    // Issue #465 F4 (reviewer, PR #477): an earlier version of this comment kept
+    // the record ARMED when `expected_worker_agent_id` was `None`, reasoning by
+    // analogy to `OutstandingDelegation`'s "an unbound record carries forward
+    // across a respawn" contract (issue #465 F3). That analogy does not hold
+    // here. `OutstandingDelegation::worker_agent_id` is deliberately
+    // late-bindable — `bind_delegation_worker_agent_id` can still fill it in
+    // after arm time, so leaving an unbound record alive lets it become useful
+    // later. `SilenceWatchRecord::worker_agent_id` has no such late-binding
+    // path: it is set once, at `arm_silence_watch` call time, and never updated
+    // again — this call is the only writer. A record armed here with
+    // `worker_agent_id = None` can therefore never become useful; of "superseded,
+    // closed, or retired by whatever inherits the pane," closed/retired are
+    // inert for a record with no watch task, and superseded is actively
+    // harmful: the next `arm_silence_watch` on this pane reads the leftover
+    // record as a predecessor and increments `superseded`
+    // (`AgentPtyRegistry::arm_silence_watch`), so `retire_silence_watch` later
+    // spends that credit on the NEXT delegation's genuine `work-done` instead of
+    // retiring it — letting that next watch run to its timeout and emit a
+    // spurious silent-worker notice for work that actually completed. Cancel
+    // unconditionally instead.
     if !delivered {
         registry.cancel_silence_watch_if(&pane_id, armed.seq);
         return;
@@ -10030,6 +10074,146 @@ clear = false
         );
     }
 
+    /// Issue #465 auditor confirmation, finding M1: pin `dispatch_one_owned`'s
+    /// OWN refusal — the fix itself, at `src/state.rs:3348-3377` — not merely the
+    /// primitive's permissive-on-`None` default pinned from the other side by
+    /// `guarded_send_with_no_expected_identity_writes_to_the_live_pane` in
+    /// `agent_pty.rs`. When the worker identity cannot be resolved (no live
+    /// agent owns the pane, and no `clear = true` respawn ran to mint one),
+    /// `dispatch_one_owned` must take the `else` arm and synthesize
+    /// `GuardedSend::NoLiveTarget` itself — WITHOUT ever calling
+    /// `AgentPtyRegistry::write_and_submit_guarded_detailed` and handing the
+    /// permissive primitive a bare `None`.
+    ///
+    /// A regression that "simplified" the `if let Some(worker_agent_id) = ...
+    /// else { .. }` guard back to calling the primitive with
+    /// `expected_worker_agent_id.as_deref()` straight through would reach the
+    /// SAME final `NoLiveTarget`-shaped outcome in this no-agent scenario —
+    /// there is nothing to write to either way — so the outcome alone cannot
+    /// tell "refused before calling the primitive" apart from "called the
+    /// primitive, which itself found nothing". Only the `else` arm's own
+    /// `tracing::debug!` distinguishes the two, so this test captures the real
+    /// log output through a genuine `tracing` subscriber rather than inferring
+    /// it, and a rewording of that line fails the test loudly instead of
+    /// silently losing coverage of which branch ran.
+    #[tokio::test]
+    async fn dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // A registry with no agent ever spawned onto this pane: the ordinary,
+        // non-racy production shape of "identity unresolved". `cwd: None` makes
+        // the `(cwd.as_deref(), orchestration.as_ref())` role lookup miss (so no
+        // `clear = true` respawn is attempted), and the `pane_current_agent_id`
+        // fallback then finds no live agent either — exactly the same "role
+        // config went missing" shape `dispatch_one_owned`'s own `warn!` guards
+        // against when `cwd`/`orchestration` ARE present, minus that unrelated
+        // log line.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            None,
+            "orch-pane".to_string(),
+            "worker-role".to_string(),
+            "worker-pane-no-agent".to_string(),
+            "probe task".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        drop(subscriber_guard);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        assert!(
+            log.contains("delegate: worker identity could not be resolved"),
+            "dispatch_one_owned must take the else arm and refuse the write itself, rather \
+             than ever handing the primitive a bare None; captured log = {log:?}"
+        );
+    }
+
+    /// Issue #465 F4 (reviewer, PR #477): when the worker identity cannot be
+    /// resolved, `dispatch_one_owned` must not leave the silence-watch record it
+    /// armed before the write ARMED afterward. A record left armed here has no
+    /// watch task — nothing on this path ever spawns one — so it can never emit
+    /// a notice itself; its only observable effect is on the NEXT watch armed
+    /// for this pane, which reads the leftover record as a predecessor and
+    /// increments `superseded`. That inflated count is then spent retiring a
+    /// LATER, genuine `work-done`, leaving the real watch armed to run to its
+    /// timeout and emit a spurious silent-worker notice for work that actually
+    /// completed. Pin the fix by confirming nothing is left in the map: a
+    /// `retire_silence_watch` on the same pane immediately after the refusal
+    /// must see `Nothing`, not a record to spend a retirement on.
+    #[tokio::test]
+    async fn dispatch_one_owned_cancels_silence_watch_when_worker_identity_is_unresolved() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let worker_pane = "worker-pane-no-agent-silence-watch";
+
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            None,
+            "orch-pane".to_string(),
+            "worker-role".to_string(),
+            worker_pane.to_string(),
+            "probe task".to_string(),
+            None,
+            Some(SilenceWatch {
+                window: std::time::Duration::from_secs(60),
+                target: SilenceReportTarget {
+                    pane_id: "orch-pane".to_string(),
+                    agent_id: None,
+                    orchestration: None,
+                },
+            }),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                registry.retire_silence_watch(worker_pane),
+                crate::agent_pty::SilenceWatchRetirement::Nothing
+            ),
+            "an identity-unresolved refusal must cancel the silence watch it armed, not leave \
+             a taskless record behind to inflate the next watch's `superseded` counter"
+        );
+    }
+
     /// The dispatched spawn path registers its orchestrator by `orch_idx`, not
     /// by the raw `start = true` flag — which is the whole point, because
     /// `orchestrator_role_index` falls back (role named `orchestrator` → any
@@ -10574,7 +10758,7 @@ clear = false
             daemon_boot_id: state.daemon_boot_id().to_string(),
         };
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         state.handle_work_done(stale_signal, &registry).await;
 
         let file_name = work_done_file_name("coder", "P");
@@ -10685,7 +10869,7 @@ clear = false
              alone cannot"
         );
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         state_after.handle_work_done(stale_signal, &registry).await;
 
         let file_name = work_done_file_name("coder", "P");
@@ -10800,7 +10984,7 @@ clear = false
             reserved,
         );
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let armed_watch = registry
             .arm_silence_watch("P", "orchestrator-pane", None)
             .expect("pane P is not mid-close, arming must succeed");
@@ -11398,139 +11582,6 @@ clear = false
         assert!(
             body.ends_with('\u{2026}'),
             "a truncated screen must be visibly truncated: {body:?}"
-        );
-    }
-
-    /// Pin `dispatch_one_owned`'s OWN refusal — when the worker
-    /// identity cannot be resolved (no live agent owns the pane, and no
-    /// `clear = true` respawn ran to mint one), it must take the `else` arm
-    /// and synthesize a `NoLiveTarget`-shaped outcome itself — WITHOUT ever
-    /// calling `AgentPtyRegistry::write_and_submit_guarded_detailed` and
-    /// handing the permissive primitive a bare `None` (that primitive treats
-    /// `None` as "no check", not "refuse" — the identity gate has to sit in
-    /// front of it, not rely on it).
-    ///
-    /// A regression that "simplified" the `if let Some(worker_agent_id) = ...
-    /// else { .. }` guard back to calling the primitive with
-    /// `expected_worker_agent_id.as_deref()` straight through would reach the
-    /// SAME final outcome in this no-agent scenario — there is nothing to
-    /// write to either way — so the outcome alone cannot tell "refused before
-    /// calling the primitive" apart from "called the primitive, which itself
-    /// found nothing". Only the `else` arm's own `tracing::debug!`
-    /// distinguishes the two, so this test captures the real log output
-    /// through a genuine `tracing` subscriber rather than inferring it.
-    #[tokio::test]
-    async fn dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved() {
-        use std::sync::Mutex;
-
-        #[derive(Clone, Default)]
-        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLog {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-            type Writer = CapturedLog;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
-            .with_ansi(false)
-            .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
-
-        // A registry with no agent ever spawned onto this pane: the ordinary,
-        // non-racy production shape of "identity unresolved". `cwd: None`
-        // makes the `(cwd.as_deref(), orchestration.as_ref())` role lookup
-        // miss (so no `clear = true` respawn is attempted), and the
-        // `pane_current_agent_id` fallback then finds no live agent either.
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let (event_tx, _event_rx) = broadcast::channel(16);
-
-        dispatch_one_owned(
-            registry.clone(),
-            event_tx,
-            None,
-            "orch-pane".to_string(),
-            "worker-role".to_string(),
-            "worker-pane-no-agent".to_string(),
-            "probe task".to_string(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
-
-        drop(subscriber_guard);
-        let log = String::from_utf8(captured.0.lock().unwrap().clone())
-            .expect("captured log must be valid UTF-8");
-        assert!(
-            log.contains("delegate: worker identity could not be resolved"),
-            "dispatch_one_owned must take the else arm and refuse the write itself, rather than \
-             ever handing the primitive a bare None; captured log = {log:?}"
-        );
-    }
-
-    /// When the worker identity cannot be resolved,
-    /// `dispatch_one_owned` must not leave the silence-watch record it armed
-    /// before the write ARMED afterward. A record left armed here has no
-    /// watch task — nothing on this path ever spawns one — so it can never
-    /// emit a notice itself; its only observable effect is on the NEXT watch
-    /// armed for this pane, which reads the leftover record as a predecessor
-    /// and increments `superseded`. That inflated count is then spent
-    /// retiring a LATER, genuine `work-done`, leaving the real watch armed to
-    /// run to its timeout and emit a spurious silent-worker notice for work
-    /// that actually completed. Pin the fix by confirming nothing is left in
-    /// the map: a `retire_silence_watch` on the same pane immediately after
-    /// the refusal must see `Nothing`, not a record to spend a retirement on.
-    #[tokio::test]
-    async fn dispatch_one_owned_cancels_silence_watch_when_worker_identity_is_unresolved() {
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let (event_tx, _event_rx) = broadcast::channel(16);
-        let worker_pane = "worker-pane-no-agent-silence-watch";
-
-        dispatch_one_owned(
-            registry.clone(),
-            event_tx,
-            None,
-            "orch-pane".to_string(),
-            "worker-role".to_string(),
-            worker_pane.to_string(),
-            "probe task".to_string(),
-            None,
-            Some(SilenceWatch {
-                window: std::time::Duration::from_secs(60),
-                target: SilenceReportTarget {
-                    pane_id: "orch-pane".to_string(),
-                    agent_id: None,
-                    orchestration: None,
-                },
-            }),
-            None,
-            None,
-        )
-        .await;
-
-        assert!(
-            matches!(
-                registry.retire_silence_watch(worker_pane),
-                crate::agent_pty::SilenceWatchRetirement::Nothing
-            ),
-            "an identity-unresolved refusal must cancel the silence watch it armed, not leave a \
-             taskless record behind to inflate the next watch's `superseded` counter"
         );
     }
 
