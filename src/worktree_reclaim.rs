@@ -954,6 +954,23 @@ fn resolve_common_dir(repo_dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
+/// Best-effort "do these two paths name the same directory" check, via
+/// `std::fs::canonicalize` on both sides — used only to decide which of two
+/// equally-correct path SPELLINGS to prefer (see
+/// [`discover_isolated_clones`]'s own doc comment), never to produce a value
+/// that is itself returned or displayed: `canonicalize` resolves symlinks
+/// (macOS's `/var` -> `/private/var`) and, on Windows, produces a
+/// `\\?\`-prefixed extended-length path that some `git` commands reject
+/// outright, so its result is only ever safe to compare, not to keep.
+/// `false` whenever either side fails to canonicalize (e.g. it does not
+/// exist) — unknown must never resolve to "same directory".
+fn paths_refer_to_same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Resolve `worktree_path`'s own git metadata dir and containment-check it
 /// against `repo_dir`'s common dir (`<common-dir>/worktrees/<name>` — issue
 /// #144 finding 2's containment check), returning it only if contained.
@@ -1685,6 +1702,29 @@ fn candidate_shares_history_with(repo_dir: &Path, candidate: &Path) -> bool {
 /// touched for A1/A2/A3 in this same round, so it is left as a known,
 /// documented cost rather than fixed speculatively; revisit if this scales
 /// beyond a handful of siblings in practice.
+///
+/// M4a Windows/macOS fix: [`resolve_common_dir`]'s `git rev-parse
+/// --path-format=absolute` goes through the OS's own realpath resolution at
+/// the point `git` calls `getcwd()` after `chdir`ing into `repo_dir` —
+/// confirmed directly (`git -C <dir-under-a-symlink> rev-parse
+/// --path-format=absolute --git-common-dir` returns the `/private/var/...`
+/// form on macOS even when invoked against the unresolved `/var/...` path).
+/// A candidate path built by joining onto that resolved anchor therefore
+/// mixes a git-resolved fragment with a plain `Path::join`ed one: on macOS
+/// this yields a `/private/var/...` `real_path` a caller who never resolved
+/// `/var` itself will never match; on Windows the equivalent short-name
+/// resolution combines with a `Path::join`-appended component to leave a
+/// forward-slash-formatted prefix followed by a backslash-joined suffix in
+/// the same string. Neither is a bug `Path`/`PathBuf` construction alone
+/// fixes, since both fragments already go through `Path::join` — the
+/// mismatch is that they resolve through two different means (the OS via
+/// `git`, vs. none at all via `Path`). When `repo_dir` already names the
+/// same directory as the derived root checkout (the common case — `repo_dir`
+/// was not called against a linked worktree), anchoring on `repo_dir` itself
+/// keeps every sibling path in the caller's own, unresolved spelling instead
+/// of git's resolved one; the derived `root_checkout` remains the fallback
+/// anchor for the case this function exists to handle (`repo_dir` being a
+/// subdirectory or a linked worktree), so A2's own fix is unaffected.
 fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
     let Some(root_checkout) = resolve_common_dir(repo_dir)
         .as_deref()
@@ -1693,7 +1733,12 @@ fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
     else {
         return Vec::new();
     };
-    let Some(parent) = root_checkout.parent() else {
+    let anchor = if paths_refer_to_same_dir(repo_dir, &root_checkout) {
+        repo_dir.to_path_buf()
+    } else {
+        root_checkout
+    };
+    let Some(parent) = anchor.parent() else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -1711,7 +1756,7 @@ fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
             continue;
         }
         let path = entry.path();
-        if path == root_checkout || !path.is_dir() {
+        if path == anchor || !path.is_dir() {
             continue;
         }
         let git_dir = path.join(".git");
