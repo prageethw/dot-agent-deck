@@ -2249,7 +2249,7 @@ mod tests {
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(parsed["schema_version"], 3);
         assert!(json.contains("wt-a"));
     }
 
@@ -4269,6 +4269,30 @@ mod tests {
         );
     }
 
+    /// Repoint `dir`'s `origin` remote at a URL `parse_github_owner_repo`
+    /// cannot parse (reviewer F6): `derive_repo_slug` then returns `None`
+    /// and `resolve_pr_state` fails closed to `PrState::Unresolvable`
+    /// without ever spawning the real, ambient `gh` -- for a test whose
+    /// assertions don't depend on the PR-state verdict, this is cheaper and
+    /// more hermetic than `write_merged_gh_stub`'s `PATH`-scoped stub.
+    fn set_non_github_origin(dir: &Path) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/test-org/test-repo.git",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote set-url failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
     /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
     /// own script shape.
@@ -4302,6 +4326,10 @@ mod tests {
 
         let clone_dir = scratch.path().join("repo-isolated-issue-999");
         clone_repo_with_github_origin(&repo, &clone_dir);
+        // Reviewer F6: this test's assertions don't depend on the PR-state
+        // verdict, so a non-GitHub origin keeps `resolve_pr_state` from
+        // spawning the real, ambient `gh`.
+        set_non_github_origin(&clone_dir);
         mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-999#999")
             .expect("mark_worktree_owned must succeed against a real independent clone");
 
@@ -4349,6 +4377,12 @@ mod tests {
         // The one genuine positive: a deck-owned isolated clone.
         let owned_clone = scratch.path().join("repo-isolated-owned");
         clone_repo_with_github_origin(&repo, &owned_clone);
+        // Reviewer F6: `owned_clone` is the only candidate here that reaches
+        // `resolve_pr_state` (the others are filtered by discovery before
+        // that point), and this test's assertions don't depend on its
+        // PR-state verdict -- a non-GitHub origin keeps `resolve_pr_state`
+        // from spawning the real, ambient `gh`.
+        set_non_github_origin(&owned_clone);
         mark_worktree_owned(&owned_clone, "issue-dispatch:isolated-owned#1000")
             .expect("mark_worktree_owned must succeed");
 
@@ -4406,6 +4440,12 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         init_repo_with_origin(&repo);
+        // Reviewer F6: `linked_wt` below shares `repo`'s remotes (a linked
+        // worktree, not a clone), so `resolve_pr_state` would otherwise
+        // resolve `repo`'s GitHub-shaped origin and spawn the real, ambient
+        // `gh` for it too -- this test's assertions don't depend on either
+        // row's PR-state verdict.
+        set_non_github_origin(&repo);
 
         let linked_wt = scratch.path().join("repo-linked");
         add_worktree(&repo, &linked_wt, "feat/linked");
@@ -4413,6 +4453,7 @@ mod tests {
 
         let clone_dir = scratch.path().join("repo-isolated-distinguish");
         clone_repo_with_github_origin(&repo, &clone_dir);
+        set_non_github_origin(&clone_dir);
         mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-distinguish#1001")
             .expect("mark_worktree_owned must succeed");
 
