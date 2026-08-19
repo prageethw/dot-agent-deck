@@ -194,6 +194,17 @@ pub fn arm_seed_fallback(
                 // again under the held writer immediately before writing —
                 // mirroring `deliver_worker_exited_notice`.
                 let expected_agent_id = registry.authorized_occupant(&pane_id);
+                // Issue #492 A1: an absent `expected_agent_id` means no
+                // occupant has ever been recorded for this pane — refuse
+                // explicitly rather than letting `write_and_submit_guarded`'s
+                // internal `Option` short-circuit silently write ungated.
+                let Some(expected_agent_id) = expected_agent_id else {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        "seed fallback: refusing — no authorized occupant recorded for this pane"
+                    );
+                    return;
+                };
                 // Issue #424 S3: this fallback fires because the native pull
                 // did not happen — it is not a retry of anything, but a
                 // stale, unsettled record from an earlier delivery of
@@ -202,12 +213,21 @@ pub fn arm_seed_fallback(
                 // repeat-guard read this delivery as a retry clobbering a
                 // user's draft. Release it proactively so it can never
                 // refuse this delivery.
+                //
+                // Issue #343: this release opts this site out of #424's
+                // repeat-guard for the ordinary case, harmlessly today only
+                // because `MAX_PAYLOAD_SUBMISSIONS == 1` makes a second,
+                // concurrent write unreachable. If #343 raises that limit,
+                // this before-release can disarm a still-in-flight
+                // concurrent delivery's own record (see
+                // `Self::note_payload_settled`'s doc) — revisit this
+                // pattern before that lands.
                 registry.note_payload_settled(&pane_id, &seed);
                 let outcome = registry
                     .write_and_submit_guarded(
                         &pane_id,
                         &seed,
-                        expected_agent_id.as_deref(),
+                        Some(expected_agent_id.as_str()),
                         || async { true },
                     )
                     .await;
@@ -232,12 +252,19 @@ pub fn arm_seed_fallback(
                             "seed fallback: delivered seed via PTY injection (native pull did not occur)"
                         );
                     }
+                    Ok(GuardedSend::Ambiguous) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            "seed fallback: partial write — some bytes landed in the PTY but \
+                             the write+submit sequence did not complete"
+                        );
+                    }
                     Ok(outcome) => {
                         tracing::warn!(
                             pane_id = %pane_id,
                             outcome = ?outcome,
                             "seed fallback: refusing — no live occupant, or the pane changed \
-                             hands since the seed was stashed"
+                             hands since first spawn or last respawn"
                         );
                     }
                     Err(e) => {

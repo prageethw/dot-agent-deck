@@ -2393,16 +2393,22 @@ pub async fn spawn_or_reuse(
 /// skipped, and since a static schedule's prompt is identical each fire the
 /// delivered prompt is the same regardless.
 ///
-/// Issue #492: this has no caller-supplied identity to verify the eventual
-/// write against — `spawn_or_reuse`'s `ReuseDecision::Reuse { pane_id }` names
-/// only the pane, not the agent it was decided for — so the debounce wait (up
-/// to `REUSE_DELIVERY_HARD_TIMEOUT` of drift) leaves a window where the pane
-/// changes hands before this delivers. Bind the write to `pane_id`'s
-/// currently-authorized occupant instead — see
+/// Issue #492: `spawn_or_reuse`'s `ReuseDecision::Reuse { pane_id }` names
+/// only the pane, not the agent it was decided for, at the call site this
+/// function receives it — though the identity isn't literally unavailable:
+/// `ReuseEntry.agent_ids`, recorded under the reuse lock, does carry it. The
+/// registry is used instead of threading that through because it also
+/// survives a respawn without teaching this caller about respawns — see
 /// [`AgentPtyRegistry::authorized_occupant`], which a legitimate respawn
 /// keeps up to date (so a respawned pane keeps delivering) while a fresh,
 /// unrelated `spawn_agent` reusing the same `pane_id_env` after a close does
-/// not (so a stranger is refused).
+/// not (so a stranger is refused). The debounce wait (up to
+/// `REUSE_DELIVERY_HARD_TIMEOUT` of drift) leaves a window where the pane
+/// changes hands before this delivers; binding to the registry's
+/// currently-authorized occupant closes it. Unlike the other three guarded
+/// sites, a respawn landing during this wait is unreachable in production —
+/// `ReuseEntry.delivery_pane_id` is never a delegate target — so the "changed
+/// hands since" wording below is conservative rather than exact here.
 async fn deliver_on_idle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -2431,6 +2437,17 @@ async fn deliver_on_idle(
         }
     }
     let expected_agent_id = registry.authorized_occupant(pane_id);
+    // Issue #492 A1: an absent `expected_agent_id` means no occupant has
+    // ever been recorded for this pane — refuse explicitly rather than
+    // letting `write_and_submit_guarded`'s internal `Option` short-circuit
+    // silently write ungated.
+    let Some(expected_agent_id) = expected_agent_id else {
+        tracing::warn!(
+            pane_id,
+            "deliver_on_idle: refusing — no authorized occupant recorded for this pane"
+        );
+        return;
+    };
     // Issue #424 S3: a recurring scheduled task delivers the SAME fixed
     // prompt text on every fire, by design — including the very first,
     // spawn-time delivery, which may still be an unsettled record here (its
@@ -2443,11 +2460,22 @@ async fn deliver_on_idle(
     // already resolved by waiting for the user to go idle. Release it
     // proactively so an earlier delivery's bookkeeping can never refuse
     // this one.
+    //
+    // Issue #343: this release opts this site out of #424's repeat-guard
+    // for the ordinary case, harmlessly today only because
+    // `MAX_PAYLOAD_SUBMISSIONS == 1` makes a second, concurrent write
+    // unreachable. If #343 raises that limit, this before-release can
+    // disarm a still-in-flight concurrent delivery's own record (see
+    // `AgentPtyRegistry::note_payload_settled`'s doc) — revisit this
+    // pattern before that lands.
     registry.note_payload_settled(pane_id, prompt);
     let outcome = registry
-        .write_and_submit_guarded(pane_id, prompt, expected_agent_id.as_deref(), || async {
-            true
-        })
+        .write_and_submit_guarded(
+            pane_id,
+            prompt,
+            Some(expected_agent_id.as_str()),
+            || async { true },
+        )
         .await;
     // Same reasoning in the other direction: release the record THIS write
     // just left, so a later fire of the same recurring prompt isn't refused
@@ -2461,12 +2489,19 @@ async fn deliver_on_idle(
     }
     match outcome {
         Ok(GuardedSend::Applied) => {}
+        Ok(GuardedSend::Ambiguous) => {
+            tracing::warn!(
+                pane_id,
+                "deliver_on_idle: partial write — some bytes landed in the PTY but the \
+                 write+submit sequence did not complete"
+            );
+        }
         Ok(outcome) => {
             tracing::warn!(
                 pane_id,
                 outcome = ?outcome,
                 "deliver_on_idle: refusing — no live occupant, or the pane changed hands \
-                 since the reuse decision was made"
+                 since first spawn or last respawn"
             );
         }
         Err(e) => {

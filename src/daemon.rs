@@ -2094,6 +2094,24 @@ async fn run_hook_loop(
                                         state: Some(state.clone()),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
+                                    // Issue #492 (fix round 4, F1): capture the caller
+                                    // pane's authorized occupant BEFORE
+                                    // `handle_dispatch`'s worktree/spawn I/O below, not
+                                    // after. `signal.pane_id` names only the pane that
+                                    // issued the dispatch, not the agent — and that I/O
+                                    // is slow enough for the pane to change hands before
+                                    // this result comes back. Reading late meant a
+                                    // respawn landing DURING the I/O became the new
+                                    // authorized occupant, so the reply to the
+                                    // PREVIOUS agent's request would be delivered — and
+                                    // submitted as a prompt — into a fresh agent that
+                                    // never asked for it. Reading here instead means a
+                                    // respawn during the I/O is refused just like a
+                                    // respawn any time before it, matching
+                                    // `AgentPtyRegistry::authorized_occupant`'s contract
+                                    // at the other three guarded-write sites.
+                                    let expected_agent_id =
+                                        pty_registry.authorized_occupant(&signal.pane_id);
                                     let result = dispatch::handle_dispatch(
                                         &ctx,
                                         &signal.name,
@@ -2104,21 +2122,19 @@ async fn run_hook_loop(
 
                                     // Deliver result to the caller pane (doesn't need
                                     // any AppState lock — uses the PTY registry).
-                                    //
-                                    // Issue #492: `signal.pane_id` names only the pane
-                                    // that issued the dispatch, not the agent — and
-                                    // `handle_dispatch`'s worktree/spawn I/O above is
-                                    // slow enough for the caller's pane to have changed
-                                    // hands by the time this result comes back. Bind the
-                                    // write to the pane's currently-authorized occupant
-                                    // instead — see
-                                    // `AgentPtyRegistry::authorized_occupant`, which a
-                                    // legitimate respawn (including one landing during
-                                    // the I/O above) keeps up to date, while a fresh,
-                                    // unrelated `spawn_agent` reusing the same
-                                    // `pane_id_env` after a close does not.
-                                    let expected_agent_id =
-                                        pty_registry.authorized_occupant(&signal.pane_id);
+                                    // Issue #492 A1: an absent `expected_agent_id` means
+                                    // no occupant has ever been recorded for this pane —
+                                    // refuse explicitly rather than letting
+                                    // `write_and_submit_guarded`'s internal `Option`
+                                    // short-circuit silently write ungated.
+                                    let Some(expected_agent_id) = expected_agent_id else {
+                                        warn!(
+                                            pane_id = %signal.pane_id,
+                                            "dispatch: refusing to write result — no \
+                                             authorized occupant recorded for this pane"
+                                        );
+                                        continue;
+                                    };
                                     // Issue #424 S3: this dispatch result is a
                                     // NEW, independent delivery, not a retry —
                                     // but a stale, unsettled record from an
@@ -2129,13 +2145,26 @@ async fn run_hook_loop(
                                     // one as a retry clobbering a user's
                                     // draft. Release it proactively so it can
                                     // never refuse this delivery.
+                                    //
+                                    // Issue #343: this release opts this site
+                                    // out of #424's repeat-guard for the
+                                    // ordinary case, harmlessly today only
+                                    // because `MAX_PAYLOAD_SUBMISSIONS == 1`
+                                    // makes a second, concurrent write
+                                    // unreachable. If #343 raises that limit,
+                                    // this before-release can disarm a
+                                    // still-in-flight concurrent delivery's
+                                    // own record (see
+                                    // `AgentPtyRegistry::note_payload_settled`'s
+                                    // doc) — revisit this pattern before that
+                                    // lands.
                                     pty_registry
                                         .note_payload_settled(&signal.pane_id, &result.message);
                                     let outcome = pty_registry
                                         .write_and_submit_guarded(
                                             &signal.pane_id,
                                             &result.message,
-                                            expected_agent_id.as_deref(),
+                                            Some(expected_agent_id.as_str()),
                                             || async { true },
                                         )
                                         .await;
@@ -2163,13 +2192,21 @@ async fn run_hook_loop(
                                     }
                                     match outcome {
                                         Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                                        Ok(crate::agent_pty::GuardedSend::Ambiguous) => {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                "dispatch: partial write — some bytes landed \
+                                                 in the caller pane but the write+submit \
+                                                 sequence did not complete"
+                                            );
+                                        }
                                         Ok(outcome) => {
                                             warn!(
                                                 pane_id = %signal.pane_id,
                                                 outcome = ?outcome,
                                                 "dispatch: refusing to write result — no live \
                                                  occupant, or the caller pane changed hands \
-                                                 since the request"
+                                                 since first spawn or last respawn"
                                             );
                                         }
                                         Err(e) => {

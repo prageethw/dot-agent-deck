@@ -5337,6 +5337,19 @@ impl AppState {
         // `spawn_agent` reusing the same `pane_id_env` after a close does
         // not.
         let expected_agent_id = registry.authorized_occupant(&orch_pane_id);
+        // Issue #492 A1: an absent `expected_agent_id` means no occupant has
+        // ever been recorded for this pane — refuse explicitly rather than
+        // letting `write_and_submit_guarded`'s internal `Option`
+        // short-circuit silently write ungated.
+        let Some(expected_agent_id) = expected_agent_id else {
+            warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                "work-done: refusing to write feedback — no authorized occupant recorded \
+                 for this pane"
+            );
+            return;
+        };
         // Issue #424 S3: this report is triggered by a NEW, independent
         // work-done signal, not a retry of an earlier one — but if an
         // earlier, unrelated delivery happened to compose byte-identical
@@ -5345,12 +5358,21 @@ impl AppState {
         // read this genuinely new report as a retry clobbering a user's
         // draft. Release any such stale record proactively so it can never
         // refuse this one.
+        //
+        // Issue #343: this release opts this site out of #424's
+        // repeat-guard for the ordinary case, harmlessly today only
+        // because `MAX_PAYLOAD_SUBMISSIONS == 1` makes a second,
+        // concurrent write unreachable. If #343 raises that limit, this
+        // before-release can disarm a still-in-flight concurrent
+        // delivery's own record (see
+        // `crate::agent_pty::AgentPtyRegistry::note_payload_settled`'s
+        // doc) — revisit this pattern before that lands.
         registry.note_payload_settled(&orch_pane_id, &feedback);
         let outcome = registry
             .write_and_submit_guarded(
                 &orch_pane_id,
                 &feedback,
-                expected_agent_id.as_deref(),
+                Some(expected_agent_id.as_str()),
                 || async { true },
             )
             .await;
@@ -5370,13 +5392,21 @@ impl AppState {
         }
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => {}
+            Ok(crate::agent_pty::GuardedSend::Ambiguous) => {
+                warn!(
+                    pane_id = %orch_pane_id,
+                    role = %role_name,
+                    "work-done: partial write — some bytes landed in the orchestrator pane \
+                     but the write+submit sequence did not complete"
+                );
+            }
             Ok(outcome) => {
                 warn!(
                     pane_id = %orch_pane_id,
                     role = %role_name,
                     outcome = ?outcome,
                     "work-done: refusing to write feedback — no live occupant, or the \
-                     orchestrator pane changed hands since the delegation"
+                     orchestrator pane changed hands since first spawn or last respawn"
                 );
             }
             Err(e) => {
