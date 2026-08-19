@@ -3293,6 +3293,7 @@ mod tests {
                 delivery_id: "deck-spawned-late-capability".into(),
                 generation: None,
                 can_report_prompts: false,
+                codex_hook_trust_failed: false,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         ));
