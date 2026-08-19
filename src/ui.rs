@@ -10735,7 +10735,41 @@ fn dispatch_action(
                                 },
                             }
                         }
-                        None => dir_str,
+                        // Issue #489: a blank Worktree slug used to skip the
+                        // live-sibling gate entirely and fall straight
+                        // through to `req.dir` — the exact collision this
+                        // gate exists to prevent, just reached via the
+                        // default (unnamed-slug) path instead of a typed
+                        // one. Consult the same
+                        // `root_checkout_has_live_sibling` check the
+                        // `Some(worktree_path)` arm above already runs, and
+                        // fail closed the same way: refuse rather than
+                        // auto-isolate, so the user re-submits with a typed
+                        // slug instead.
+                        None => match root_checkout_has_live_sibling(&req.dir) {
+                            Err(reason) => {
+                                ui.status_message = Some((
+                                    format!(
+                                        "Orchestration failed: could not confirm no other \
+                                         live orchestration already shares {} — {reason}",
+                                        req.dir.display()
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                                return Flow::Continue;
+                            }
+                            Ok(true) => {
+                                ui.status_message = Some((
+                                    "Orchestration failed: another live orchestration already \
+                                     uses this root checkout — type a Worktree slug to isolate \
+                                     this one."
+                                        .to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                                return Flow::Continue;
+                            }
+                            Ok(false) => dir_str,
+                        },
                     };
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
