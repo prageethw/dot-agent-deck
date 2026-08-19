@@ -1008,6 +1008,21 @@ fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[St
 /// added to either returned list inherits an unvalidated string — compare
 /// only, never render, without first routing through the same sanitizers
 /// the other two paths use.
+///
+/// PRD fork#325 fix round (auditor A5): that "future consumer" arrived —
+/// [`root_checkout_has_live_sibling`] — and does something this warning did
+/// not anticipate: it passes the daemon-supplied `cwd` to
+/// [`crate::issue_dispatch_run::git_common_dir`], i.e.
+/// `Command::current_dir(cwd)`. The string now selects a SUBPROCESS WORKING
+/// DIRECTORY, not merely a comparand. Still safe under this product's
+/// same-uid trust model (a peer that can reach the `0o600` attach socket at
+/// all can already exec arbitrary code as this user via `StartAgent`, which
+/// is strictly worse), and a nonexistent directory just fails that one
+/// `git` spawn, which the caller correctly skips rather than treating as
+/// fatal — but "compare only, never render" was already an incomplete
+/// description of what stays safe, so update this invariant at the next
+/// consumer added here rather than assuming the warning above still covers
+/// every shape a future one might take.
 fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
     let Ok(resp) = send_daemon_request_blocking_with_timeout(
         &crate::daemon_protocol::AttachRequest::ListAgents,
@@ -1040,6 +1055,166 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
         }
     }
     (cwds, titles)
+}
+
+/// PRD fork#325 M3: the Nth-concurrent-orchestration GATE — does
+/// `target_dir` (the root checkout `Action::SpawnPane` is about to provision
+/// against) already share its `.git` object store with a LIVE
+/// orchestration's working directory? This is the correctness signal M3
+/// decides worktree-vs-isolated-clone provisioning on.
+///
+/// Deliberately NOT [`live_orchestration_in_same_cwd`]'s raw path-equality
+/// compare, which only catches two orchestrations sharing the exact same
+/// pane cwd (the no-worktree-slug case). The actual #325 incident shape is N
+/// orchestrations each carving their OWN worktree sibling off one shared
+/// checkout — `orchestration_cwd` for each of those is the WORKTREE path,
+/// never `target_dir` itself (see [`crate::tab::TabManager::open_orchestration_tab`],
+/// which stamps `orchestration_cwd: Some(cwd.to_string())` where `cwd` is
+/// the already-resolved worktree dir) — so raw equality against `target_dir`
+/// can't see the collision at all. Comparing `--git-common-dir` can: for any
+/// worktree `git worktree add` carved off `target_dir`, its common dir
+/// resolves to `target_dir`'s own `.git`, which is exactly the signal that
+/// matters for the actual risk (concurrent git operations against one
+/// shared object store) regardless of where each sibling's working
+/// directory happens to sit on disk.
+///
+/// Fails CLOSED (`Err`) on ANY daemon-unreachable problem, and on a
+/// malformed or absent response — unlike every other consumer of
+/// `ListAgents` on this same seam ([`live_orchestration_cwds_and_titles`],
+/// a best-effort HINT that fails open by design): this is a correctness
+/// GATE, and a down/wedged daemon silently reporting "nothing live" would
+/// reintroduce #325's exact race under ambiguous state. Bounded by
+/// [`DAEMON_REQUEST_TIMEOUT`] (the same default every other correctness-
+/// sensitive blocking daemon round-trip in this file uses), not
+/// [`DAEMON_HINT_TIMEOUT`]'s much tighter 250ms — a gate needs a real answer,
+/// not a best-effort one, so refusing to spawn is preferred over a false
+/// refusal caused by a daemon that is merely slow rather than actually down.
+///
+/// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
+/// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
+/// guarantee above does NOT extend to a live orchestration whose record
+/// reaches this loop with `tab_membership: None`. Two distinct routes
+/// produce that shape, both silently falling through the per-record loop's
+/// `else { continue; }` arm below — invisible to this gate, treated exactly
+/// like "no live sibling" for that entry, even though a genuine live
+/// orchestration sits behind it:
+///
+/// 1. An OLDER CLIENT whose record omits `orchestration_cwd` altogether
+///    (`TabMembership::Orchestration`'s field is `#[serde(default)]`, so a
+///    pre-#325 client's record deserializes with it as `None` rather than
+///    failing to parse at all).
+/// 2. `sanitize_record_tab_membership` (`src/daemon_client.rs`) clamping the
+///    WHOLE `tab_membership` to `None` when
+///    [`crate::agent_pty::validate_tab_membership`] rejects it — which it
+///    does unconditionally on an invalid `orchestration_cwd`, not just that
+///    one field. Reachable by a same-uid peer sending an oversized or
+///    control-byte-bearing `orchestration_cwd` in `StartAgent`; not a
+///    boundary crossing (a same-uid peer already has arbitrary code
+///    execution in this model), which is why this is tracked rather than
+///    treated as a blocker.
+///
+/// This is a real, tracked gap on these two axes, not a claim that the whole
+/// function fails open; every other failure mode this doc comment describes
+/// still fails closed as stated.
+///
+/// A single LIVE entry whose own `git-common-dir` fails to resolve (e.g. its
+/// worktree was removed after the daemon's record went stale) is skipped
+/// rather than failing the whole gate closed — `git rev-parse
+/// --git-common-dir` takes no lock and does no network I/O, so a failure
+/// there reflects a genuinely gone directory, not contention; the daemon
+/// being unreachable at all (the actual failure mode #325's race depends on)
+/// is what closes the gate, not one stale record among possibly several
+/// live ones.
+///
+/// PRD fork#325 fix round (reviewer P2-1 / auditor A1): the "fails CLOSED on
+/// ANY daemon-query problem" claim above did not actually hold for a
+/// *successful* round trip that answers with no usable data. Two shapes
+/// read straight through `resp.agent_records.unwrap_or_default()` as "no
+/// live sibling" (`Ok(false)`) — silently reinstating the shared-checkout
+/// path this gate exists to refuse: `{ok: false, agent_records: None}`,
+/// which `serve_attach` emits for a malformed request today and a wedged
+/// daemon could emit for any other reason; and `{ok: true, agent_records:
+/// None}`, the documented shape an OLDER daemon sends (`agent_records`'s own
+/// doc comment: "Older daemons omit this field; newer clients fall back to
+/// `agents` when it's `None`") — a shape rule 12's cross-version support
+/// makes routine, not hypothetical. Every OTHER `ListAgents` consumer
+/// correctly falls back to `agents` on `None`; this one cannot, because a
+/// legacy `agents` list carries only ids, no `tab_membership`, so it cannot
+/// answer the question this gate exists to ask. Both are now refused
+/// explicitly, matching `Action::ScheduleRunNow`'s `Ok(resp) if resp.ok`
+/// pattern (the file's other correctness-sensitive blocking daemon call)
+/// rather than [`live_orchestration_cwds_and_titles`]'s fail-open-hint idiom
+/// this function's `agent_records.unwrap_or_default()` was copied from.
+fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
+    // Issue #325 reviewer nit: resolve the LOCAL, knowable-in-milliseconds
+    // answer before paying for the daemon round trip — a non-git `target_dir`
+    // now fails fast instead of waiting up to `DAEMON_REQUEST_TIMEOUT` (5s)
+    // first for an answer this check never needed.
+    let target_common = crate::issue_dispatch_run::git_common_dir(target_dir).map_err(|e| {
+        format!(
+            "could not resolve {}'s git common dir: {e}",
+            target_dir.display()
+        )
+    })?;
+    let target_common = std::fs::canonicalize(&target_common).unwrap_or(target_common);
+
+    let resp = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
+        .map_err(|e| format!("could not reach the daemon to check for live orchestrations: {e}"))?;
+    if !resp.ok {
+        return Err(format!(
+            "the daemon rejected the request: {}",
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    let Some(agent_records) = resp.agent_records else {
+        return Err(
+            "this daemon is too old to report orchestration tab membership — \
+             restart it before opening a second orchestration"
+                .to_string(),
+        );
+    };
+
+    // Issue #325 reviewer P3-B, corrected by fix round 3 (reviewer P3-3):
+    // the cheapest and most common instance of a live sibling — this
+    // orchestration's own cwd literally IS `target_dir` — is answerable
+    // without consulting git at all. This does NOT close the fail-open gap
+    // below (an unresolvable `cwd` is skipped, by design), as the original
+    // comment claimed: `target_common` above is already resolved
+    // successfully via `?`-propagation, so `git_common_dir` on this SAME
+    // path cannot fail differently here absent a TOCTOU where the directory
+    // is deleted mid-function — the loop's fallthrough would reach `Ok(true)`
+    // for this record either way. The real, and only, benefit is saving one
+    // `git_common_dir` subprocess call in the common case where a live
+    // sibling's cwd equals `target_dir` exactly.
+    let target_dir_canon =
+        std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
+
+    let mut seen_cwds: HashSet<String> = HashSet::new();
+    for r in agent_records {
+        let Some(TabMembership::Orchestration {
+            orchestration_cwd: Some(cwd),
+            ..
+        }) = r.tab_membership
+        else {
+            continue;
+        };
+        if !seen_cwds.insert(cwd.clone()) {
+            continue;
+        }
+        let cwd_path = Path::new(&cwd);
+        let cwd_canon = std::fs::canonicalize(cwd_path).unwrap_or_else(|_| cwd_path.to_path_buf());
+        if cwd_canon == target_dir_canon {
+            return Ok(true);
+        }
+        let Ok(live_common) = crate::issue_dispatch_run::git_common_dir(Path::new(&cwd)) else {
+            continue;
+        };
+        let live_common = std::fs::canonicalize(&live_common).unwrap_or(live_common);
+        if live_common == target_common {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
@@ -10261,6 +10436,16 @@ fn dispatch_action(
                     // so it survives past the `match` arm into the final
                     // status message set after `open_orchestration_tab`.
                     let mut worktree_marker_warning: Option<String> = None;
+                    // PRD fork#325 fix round 3 (reviewer C0 / auditor P2-3):
+                    // only ever set by the isolated-clone arm below — the
+                    // shared-checkout arm has no origin-fixup step at all.
+                    // Kept separate from `worktree_marker_warning` rather
+                    // than folded into it: the final status message below
+                    // renders `worktree_marker_warning` via
+                    // `format_marker_warning`, a fixed template built for the
+                    // ownership-marker failure, which would misdescribe an
+                    // origin-fixup failure entirely.
+                    let mut worktree_origin_warning: Option<String> = None;
                     let dir_str = match req.orchestration_worktree_path.as_ref() {
                         Some(worktree_path) => {
                             // Fork #122 audit (P1): use the validated raw
@@ -10323,94 +10508,224 @@ fn dispatch_action(
                             // shared computation the restore path also calls,
                             // so the two can't drift apart.
                             creator = Some(orchestration_creator_string(typed_name));
-                            match crate::issue_dispatch_run::create_worktree_sync(
-                                &req.dir,
-                                worktree_path,
-                                &branch,
-                                creator.as_deref().expect("just assigned above"),
-                            ) {
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::Created {
-                                    marker_warning,
-                                }) => {
-                                    worktree_marker_warning = marker_warning;
-                                    worktree_path.display().to_string()
-                                }
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed) => {
+                            // PRD fork#325 M3: decide SHARED vs ISOLATED
+                            // before touching disk. See
+                            // `root_checkout_has_live_sibling`'s doc comment
+                            // for the collision signal (a shared
+                            // `--git-common-dir`, not raw cwd equality) and
+                            // the fail-closed decision on a daemon query
+                            // failure this branches on.
+                            match root_checkout_has_live_sibling(&req.dir) {
+                                Err(reason) => {
                                     ui.status_message = Some((
                                         format!(
-                                            "Orchestration failed: worktree already exists at {}",
-                                            worktree_path.display()
+                                            "Orchestration failed: could not confirm no other \
+                                             live orchestration already shares {} — {reason}",
+                                            req.dir.display()
                                         ),
                                         std::time::Instant::now(),
                                     ));
                                     return Flow::Continue;
                                 }
-                                // Fork #122/#123 re-audit (P2): distinct from
-                                // `AlreadyClaimed` above — `git worktree add`
-                                // was killed for taking too long, not beaten
-                                // by another actor, and it may have left a
-                                // half-created directory behind that
-                                // permanently wedges this slug unless
-                                // cleared. Name the exact path and exact
-                                // command rather than falling back to the
-                                // deck's cwd.
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
-                                    cleaned_up_by,
-                                }) => {
-                                    let detail = if let Some(remover) = cleaned_up_by.as_deref() {
-                                        // Issue #325 reviewer P2-2: the identity
-                                        // is always the same `creator` this
-                                        // request just supplied, so it carries
-                                        // no NEW information for the status
-                                        // line -- but it is still worth a log
-                                        // line for a post-incident reader
-                                        // grepping DOT_AGENT_DECK_LOG, and it
-                                        // was previously discarded entirely.
-                                        tracing::info!(
-                                            path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
-                                            remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                                            "worktree add timed out; half-created directory removed automatically"
-                                        );
-                                        "the half-created directory was removed automatically — try again".to_string()
-                                    } else {
-                                        format!(
-                                            "run `git -C {} worktree remove --force {}` to clear it, then try again",
-                                            req.dir.display(),
-                                            worktree_path.display()
-                                        )
-                                    };
-                                    ui.status_message = Some((
-                                        format!(
-                                            "Orchestration failed: worktree add timed out at {} — {detail}",
-                                            worktree_path.display()
-                                        ),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
-                                // `create_worktree_sync` always attaches an
-                                // existing branch rather than refusing it, so
-                                // this variant is structurally unreachable
-                                // from this call site — kept only because the
-                                // match must stay exhaustive against the
-                                // shared `WorktreeCreation` enum.
-                                Ok(crate::issue_dispatch_run::WorktreeCreation::BranchExists) => {
-                                    ui.status_message = Some((
-                                        format!(
-                                            "Orchestration failed: branch already exists for {}",
-                                            worktree_path.display()
-                                        ),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
-                                Err(e) => {
-                                    ui.status_message = Some((
-                                        format!("Orchestration failed: {e}"),
-                                        std::time::Instant::now(),
-                                    ));
-                                    return Flow::Continue;
-                                }
+                                // 1st orchestration against this root
+                                // checkout — unaffected, exactly today's
+                                // `git worktree add` sibling path.
+                                Ok(false) => match crate::issue_dispatch_run::create_worktree_sync(
+                                    &req.dir,
+                                    worktree_path,
+                                    &branch,
+                                    creator.as_deref().expect("just assigned above"),
+                                ) {
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::Created {
+                                        marker_warning,
+                                    }) => {
+                                        worktree_marker_warning = marker_warning;
+                                        worktree_path.display().to_string()
+                                    }
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::AlreadyClaimed) => {
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: worktree already exists at {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // Fork #122/#123 re-audit (P2): distinct from
+                                    // `AlreadyClaimed` above — `git worktree add`
+                                    // was killed for taking too long, not beaten
+                                    // by another actor, and it may have left a
+                                    // half-created directory behind that
+                                    // permanently wedges this slug unless
+                                    // cleared. Name the exact path and exact
+                                    // command rather than falling back to the
+                                    // deck's cwd.
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::TimedOut {
+                                        cleaned_up_by,
+                                    }) => {
+                                        let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                            // Issue #325 reviewer P2-2: the identity
+                                            // is always the same `creator` this
+                                            // request just supplied, so it carries
+                                            // no NEW information for the status
+                                            // line -- but it is still worth a log
+                                            // line for a post-incident reader
+                                            // grepping DOT_AGENT_DECK_LOG, and it
+                                            // was previously discarded entirely.
+                                            tracing::info!(
+                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                                "worktree add timed out; half-created directory removed automatically"
+                                            );
+                                            "the half-created directory was removed automatically — try again".to_string()
+                                        } else {
+                                            format!(
+                                                "run `git -C {} worktree remove --force {}` to clear it, then try again",
+                                                req.dir.display(),
+                                                worktree_path.display()
+                                            )
+                                        };
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: worktree add timed out at {} — {detail}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // `create_worktree_sync` always attaches an
+                                    // existing branch rather than refusing it, so
+                                    // this variant is structurally unreachable
+                                    // from this call site — kept only because the
+                                    // match must stay exhaustive against the
+                                    // shared `WorktreeCreation` enum.
+                                    Ok(crate::issue_dispatch_run::WorktreeCreation::BranchExists) => {
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: branch already exists for {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Orchestration failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                },
+                                // Nth-concurrent orchestration against a root
+                                // checkout a live sibling already shares —
+                                // isolate via its own clone instead of a
+                                // `git worktree add` sibling of the shared
+                                // checkout. Same resolved sibling PATH
+                                // (`worktree_path`) as the shared case above
+                                // — only the provisioning mechanism differs.
+                                Ok(true) => match crate::issue_dispatch_run::provision_isolated_clone_sync(
+                                    &req.dir,
+                                    worktree_path,
+                                    &branch,
+                                    creator.as_deref().expect("just assigned above"),
+                                ) {
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                                        marker_warning,
+                                        origin_warning,
+                                    }) => {
+                                        worktree_marker_warning = marker_warning;
+                                        worktree_origin_warning = origin_warning;
+                                        worktree_path.display().to_string()
+                                    }
+                                    // Issue #325 reviewer P3-1: say "clone",
+                                    // not "worktree" — `git worktree remove`
+                                    // does not apply to this path at all.
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::AlreadyClaimed) => {
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: clone already exists at {}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // Issue #325 auditor A4: mirrors the
+                                    // shared-checkout `WorktreeCreation::TimedOut`
+                                    // arm above, but the recovery command is a
+                                    // plain `rm -rf` — this directory is an
+                                    // independent clone, not a linked worktree,
+                                    // so `git worktree remove` does not apply.
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::TimedOut {
+                                        cleaned_up_by,
+                                    }) => {
+                                        let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                            tracing::info!(
+                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                                "isolated clone timed out; half-created directory removed automatically"
+                                            );
+                                            "the half-created directory was removed automatically — try again".to_string()
+                                        } else {
+                                            format!(
+                                                "run `rm -rf {}` to clear it, then try again",
+                                                worktree_path.display()
+                                            )
+                                        };
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: isolated clone timed out at {} — {detail}",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    // Issue #325 fix round 3 (reviewer C2 /
+                                    // auditor C2): a genuine (non-timeout)
+                                    // clone/checkout failure used to be
+                                    // reported through the SAME "timed out"
+                                    // arm above, discarding git's actual
+                                    // error text. This arm shows it instead —
+                                    // reserving the "timed out" wording for
+                                    // a genuine timeout only.
+                                    Ok(crate::issue_dispatch_run::IsolatedCloneOutcome::Failed {
+                                        error,
+                                        cleaned_up_by,
+                                    }) => {
+                                        let detail = if let Some(remover) = cleaned_up_by.as_deref() {
+                                            tracing::info!(
+                                                path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_path),
+                                                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                                                "isolated clone failed; half-created directory removed automatically"
+                                            );
+                                            "the half-created directory was removed automatically — try again".to_string()
+                                        } else {
+                                            format!(
+                                                "run `rm -rf {}` to clear it, then try again",
+                                                worktree_path.display()
+                                            )
+                                        };
+                                        ui.status_message = Some((
+                                            format!(
+                                                "Orchestration failed: isolated clone failed at {} — {error} ({detail})",
+                                                worktree_path.display()
+                                            ),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Orchestration failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                        return Flow::Continue;
+                                    }
+                                },
                             }
                         }
                         None => dir_str,
@@ -10610,31 +10925,62 @@ fn dispatch_action(
                             // in the agent's stdin, polluting the prompt buffer.
 
                             ui.status_message = Some((
-                                // Show the same name as the tab title (PRD #107
-                                // display intent): the user's form name when
-                                // typed, else the canonical config name. This is
-                                // display-only and does not affect identity.
-                                //
-                                // Issue #164: when `create_worktree_sync` above
-                                // created the worktree but its ownership marker
-                                // write failed, append that warning here — this
-                                // is the ONE status message this whole flow
-                                // sets on success, so it is the only place a
-                                // caller can still tell the user at creation
-                                // time (the moment this fact is known) rather
-                                // than only via a daemon trace.
-                                match &worktree_marker_warning {
-                                    Some(error) => format!(
-                                        "Activated orchestration: {} — {}",
-                                        display_title.as_deref().unwrap_or(&orch_config.name),
-                                        crate::worktree_reclaim::format_marker_warning(
-                                            &dir_str, error
-                                        )
-                                    ),
-                                    None => format!(
+                                {
+                                    // Show the same name as the tab title (PRD #107
+                                    // display intent): the user's form name when
+                                    // typed, else the canonical config name. This is
+                                    // display-only and does not affect identity.
+                                    let title = format!(
                                         "Activated orchestration: {}",
                                         display_title.as_deref().unwrap_or(&orch_config.name)
-                                    ),
+                                    );
+                                    // Issue #164: when `create_worktree_sync`
+                                    // above created the worktree but its
+                                    // ownership marker write failed, append
+                                    // that warning here — this is the ONE
+                                    // status message this whole flow sets on
+                                    // success, so it is the only place a
+                                    // caller can still tell the user at
+                                    // creation time (the moment this fact is
+                                    // known) rather than only via a daemon
+                                    // trace.
+                                    //
+                                    // PRD fork#325 fix round 3 (reviewer C0 /
+                                    // auditor P2-3): `worktree_origin_warning`
+                                    // (isolated-clone arm only) gets its OWN
+                                    // message here rather than being folded
+                                    // into `worktree_marker_warning` and run
+                                    // through `format_marker_warning` — that
+                                    // template names the ownership-marker
+                                    // hazard ("a later `reclaim` … will need
+                                    // `--yes`"), which is simply wrong for an
+                                    // origin-fixup failure. The real hazard
+                                    // there is that the clone still points
+                                    // `origin` at the user's OWN root
+                                    // checkout, so `git push origin` from
+                                    // inside it lands there silently instead
+                                    // of reaching the real remote.
+                                    let mut warnings: Vec<String> = Vec::new();
+                                    if let Some(error) = &worktree_origin_warning {
+                                        warnings.push(format!(
+                                            "this clone's `origin` could not be pointed at the \
+                                             real remote ({error}) — manually run `git remote \
+                                             set-url origin <url>` (or `git remote remove origin` \
+                                             if none exists) before pushing from inside it"
+                                        ));
+                                    }
+                                    if let Some(error) = &worktree_marker_warning {
+                                        warnings.push(
+                                            crate::worktree_reclaim::format_marker_warning(
+                                                &dir_str, error,
+                                            ),
+                                        );
+                                    }
+                                    if warnings.is_empty() {
+                                        title
+                                    } else {
+                                        format!("{title} — {}", warnings.join("; "))
+                                    }
                                 },
                                 std::time::Instant::now(),
                             ));
@@ -33658,6 +34004,128 @@ mod tests {
         );
     }
 
+    /// Scenario: Submit an orchestration form with a typed worktree slug
+    /// against a directory that IS a genuine, valid git repository (unlike
+    /// `worktree_002`'s deliberately-broken one — the only thing standing
+    /// between this spawn and success is the gate itself), but with the
+    /// daemon's attach socket redirected to a path nothing is listening on —
+    /// a stand-in for a down/wedged daemon. Dispatch the real
+    /// `Action::SpawnPane`. PRD fork#325 M3's Nth-concurrent-orchestration
+    /// gate must FAIL CLOSED: refuse the spawn through the same status-
+    /// message-driven refusal path `worktree_002` exercises for a plain
+    /// `git worktree add` failure, never silently proceed as if no live
+    /// sibling orchestration exists — which would reintroduce #325's exact
+    /// race under exactly the ambiguous state (daemon down/unreachable) the
+    /// PRD's own Design step 4 flags as the danger of failing open here.
+    #[spec("orchestration/worktree/015")]
+    #[test]
+    fn worktree_015_daemon_unreachable_refuses_spawn_fail_closed() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&dir)
+            .status()
+            .expect("run git init");
+        assert!(
+            status.success(),
+            "git init must succeed for this test's precondition repo"
+        );
+
+        // Point the attach socket at a path nothing is listening on — the
+        // same env-var override technique `platform::paths` tests already
+        // use for this, guarded by the same process-wide lock since env
+        // vars are process-global state shared across parallel tests.
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+        let no_daemon_here = tmp.path().join("no-daemon-here.sock");
+        // SAFETY: env-var lock held above; the previous value is restored
+        // before this guard is dropped, below.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &no_daemon_here);
+        }
+
+        let mut form = NewPaneFormState::new(
+            dir.clone(),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        )
+        .with_worktree_slug("my-feature".to_string());
+        form.selection_index = 1;
+
+        let req = build_new_pane_request(&form, "claude");
+        assert!(
+            req.orchestration_worktree_path.is_some(),
+            "precondition: the form must resolve a worktree path to attempt creating"
+        );
+        let worktree_path = req
+            .orchestration_worktree_path
+            .clone()
+            .expect("just asserted Some above");
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // SAFETY: same lock still held; restoring the previous value.
+        unsafe {
+            match prev_attach {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+            }
+        }
+
+        // Fail-closed: no tab was created...
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "a down/unreachable daemon must refuse the spawn (fail closed), never silently \
+             open the orchestration tab as if no live sibling orchestration exists"
+        );
+        // ...no role pane was spawned...
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "no role pane should be spawned when the gate can't confirm no live sibling exists"
+        );
+        // ...the error surfaces to the user...
+        let message = ui
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !message.is_empty(),
+            "the fail-closed refusal must surface a status message, not fail silently"
+        );
+        // ...and nothing was created on disk — the gate must refuse BEFORE
+        // any git operation (shared or isolated) runs against the target.
+        assert!(
+            !worktree_path.exists(),
+            "the fail-closed refusal must happen before any provisioning attempt touches disk, \
+             found {} unexpectedly present",
+            worktree_path.display()
+        );
+    }
+
     /// Scenario: Submit a new-pane orchestration request whose `dir` is
     /// ALREADY the resolved worktree path (simulating that a worktree was
     /// created and its path threaded into the request), and dispatch the
@@ -33728,6 +34196,297 @@ mod tests {
         }
     }
 
+    /// PRD fork#325 M3 test support: since `Action::SpawnPane`'s worktree-
+    /// creation branch now consults `root_checkout_has_live_sibling` (a real
+    /// daemon `ListAgents` round trip) before provisioning ANY worktree, a
+    /// unit test that dispatches that path with no daemon running would have
+    /// the gate fail closed and refuse the spawn — even though these tests
+    /// predate M3 and are about `create_worktree_sync`/marker/pane-cwd
+    /// mechanics the gate is orthogonal to. This spins up a REAL, in-process
+    /// attach-socket server (production [`crate::daemon_protocol::serve_attach`]
+    /// against a fresh, empty [`crate::agent_pty::AgentPtyRegistry`]) so the
+    /// gate's daemon round trip succeeds and resolves "no live orchestrations"
+    /// (`Ok(false)`) — never touched by anything else in this codebase's
+    /// pure-unit-test `Action::SpawnPane` dispatches, since
+    /// `CapturingPaneController` spawns panes purely in-memory and never
+    /// registers them with any daemon, so the registry this stub serves stays
+    /// empty for the whole test regardless of how many orchestrations a test
+    /// spawns.
+    ///
+    /// Mirrors `daemon_client.rs`'s own `spawn_test_server` harness (the same
+    /// `bind_attach_listener` + `serve_attach` shape) but is NOT
+    /// `#[cfg(unix)]`-only the way that one is: that harness also spawns
+    /// `/bin/sh`, which is what makes it Unix-only, but binding and serving
+    /// the attach protocol itself has no such dependency — and the three
+    /// tests this helper serves must keep passing on Windows too, so a
+    /// Windows-legal named-pipe address is used there instead of a
+    /// filesystem socket path (`IpcListener::bind` on Windows takes the
+    /// whole path as the literal pipe name, and a tempdir-based filesystem
+    /// path is not one).
+    ///
+    /// Returns an RAII guard: `DOT_AGENT_DECK_ATTACH_SOCKET` is restored to
+    /// its previous value when the guard drops, under the same
+    /// `STATE_DIR_ENV_LOCK` env-var-mutation lock `worktree_015`'s test uses,
+    /// held for the guard's whole lifetime. The server's own background
+    /// thread is intentionally never joined — it runs for the life of the
+    /// test process, which tears it down on exit.
+    struct EmptyAgentsDaemonGuard {
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+        prev_attach: Option<String>,
+    }
+
+    impl Drop for EmptyAgentsDaemonGuard {
+        fn drop(&mut self) {
+            // SAFETY: `_env_lock` is held for this guard's entire lifetime.
+            unsafe {
+                match self.prev_attach.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+                }
+            }
+        }
+    }
+
+    fn with_empty_agents_daemon(unique_dir: &std::path::Path) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        // `bind_attach_listener` constructs a `tokio::net::UnixListener`,
+        // which registers with tokio's I/O driver at BIND time and so needs
+        // an ACTIVE runtime context to even construct — not merely to run
+        // async operations on later — so the bind must happen INSIDE the
+        // spawned thread's `block_on`, not synchronously on this (plain,
+        // non-tokio) test thread. A readiness handshake over this channel is
+        // what lets this function still return only once the socket is
+        // actually bound and ready to accept, matching what the synchronous
+        // `bind_attach_listener` call in `daemon_client.rs`'s own
+        // `spawn_test_server` harness gets for free there (that harness runs
+        // inside `#[tokio::test]`, so a runtime is already current).
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("build stub attach-daemon runtime: {e}")));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("bind stub attach listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+                let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+                let _ = crate::daemon_protocol::serve_attach(listener, registry, event_tx).await;
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub attach daemon must report readiness within 10s")
+            .expect("stub attach daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// PRD fork#325 fix round (reviewer P2-1 / auditor A1) test support:
+    /// like [`with_empty_agents_daemon`], but instead of routing every
+    /// `ListAgents` through the real [`crate::daemon_protocol::serve_attach`]
+    /// handler — which, against an empty registry, can only ever answer
+    /// `{ok: true, agent_records: Some(vec![])}` — this hand-rolls the
+    /// minimal frame exchange so the stub answers with a CALLER-SUPPLIED
+    /// [`crate::daemon_protocol::AttachResponse`]. That is what lets a test
+    /// construct the two well-formed-but-empty shapes this fix round closes:
+    /// `AttachResponse::err(_)` (`ok: false`, `agent_records: None` — what a
+    /// malformed request or a wedged daemon answers with today) and
+    /// `AttachResponse::agents(_)` (`ok: true`, `agents: Some(_)`,
+    /// `agent_records: None` — the documented older-daemon shape). Loops
+    /// accepting connections for the life of the test process, same as its
+    /// sibling; every request received is drained and discarded, since the
+    /// stub answers identically regardless of which `AttachRequest` variant
+    /// arrives.
+    fn with_crafted_response_daemon(
+        unique_dir: &std::path::Path,
+        response: crate::daemon_protocol::AttachResponse,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub crafted-response daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx
+                                .send(Err(format!("bind stub crafted-response listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let payload =
+                    serde_json::to_vec(&response).expect("serialize crafted AttachResponse");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let _ = crate::daemon_protocol::read_frame(&mut stream).await;
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub crafted-response daemon must report readiness within 10s")
+            .expect("stub crafted-response daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
+    /// Precondition helper shared by the two tests below: a minimal, valid
+    /// git repository with no commits needed (`root_checkout_has_live_sibling`
+    /// resolves the common dir via `git rev-parse`, which needs no commit).
+    /// Issue #325 reviewer P3-C: renamed from `init_bare_git_repo` — `git
+    /// init --quiet` creates an ordinary (non-`--bare`) repository, and the
+    /// old name was a misnomer in a codebase this documentation-heavy.
+    fn init_git_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("create dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(dir)
+            .status()
+            .expect("run git init");
+        assert!(status.success(), "git init must succeed");
+    }
+
+    /// Scenario: PRD fork#325 fix round (reviewer P2-1 / auditor A1). Point
+    /// the M3 gate at a stub daemon answering `ListAgents` with a well-formed
+    /// ERROR response (`ok: false`, `agent_records: None`) — the shape
+    /// `serve_attach` emits for a malformed request today, and a
+    /// wedged/half-upgraded daemon that still accepts connections could emit
+    /// for any other reason. Before this fix round,
+    /// `resp.agent_records.unwrap_or_default()` flattened this straight to
+    /// an empty vec and the gate read it as "no live sibling" (`Ok(false)`)
+    /// — silently reinstating the shared-checkout path this gate exists to
+    /// refuse. Assert `Err`.
+    #[test]
+    fn root_checkout_has_live_sibling_fails_closed_on_daemon_error_response() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::err("simulated daemon-side failure"),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir);
+        assert!(
+            result.is_err(),
+            "an `ok: false` daemon response must fail the gate closed, not read as \
+             'no live sibling'; got {result:?}"
+        );
+    }
+
+    /// Scenario: same gate, same fix round, the SECOND fail-open shape
+    /// (auditor A1 point 2): a well-formed response with `ok: true` but
+    /// `agent_records: None` — the documented shape an OLDER daemon sends
+    /// (it only ever populated the legacy `agents` field).
+    /// `agent_records`'s own doc comment says every OTHER consumer falls
+    /// back to `agents` when this is `None`; this gate cannot answer "no
+    /// live sibling" from a legacy list that carries no `tab_membership` at
+    /// all, so it must refuse rather than silently assume nothing is live.
+    /// Assert `Err`.
+    #[test]
+    fn root_checkout_has_live_sibling_fails_closed_on_legacy_agents_only_response() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("repo");
+        init_git_repo(&dir);
+
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agents(vec!["agent-1".to_string()]),
+        );
+
+        let result = root_checkout_has_live_sibling(&dir);
+        assert!(
+            result.is_err(),
+            "an older-daemon-shaped response (agent_records: None) must fail the \
+             gate closed, not read as 'no live sibling'; got {result:?}"
+        );
+    }
+
     /// Scenario: Build a `NewPaneRequest` whose `dir` is a real git repository
     /// and whose `orchestration_worktree_path` is `Some(<sibling path>)` —
     /// the shape `001` proves the form produces, `002` proves fails loud, and
@@ -33783,6 +34542,7 @@ mod tests {
             "precondition: req.dir must differ from the worktree path"
         );
         let worktree_str = worktree.display().to_string();
+        let _daemon = with_empty_agents_daemon(tmp.path());
 
         let config = make_orchestration("review");
         let req = NewPaneRequest {
@@ -33945,6 +34705,7 @@ mod tests {
             "init",
         ]);
 
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let owner_a =
             spawn_and_read_owner(tmp.path(), &repo, "instance-a", "review-orchestrator-1");
         let owner_b =
@@ -34061,6 +34822,7 @@ mod tests {
         ]);
 
         let worktree = tmp.path().join("repo-identity-008");
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let config = make_orchestration("review");
         let req = NewPaneRequest {
             dir: repo.clone(),
