@@ -180,19 +180,36 @@ pub fn arm_seed_fallback(
         tokio::time::sleep(grace).await;
         match registry.take_pending_seed_fallback(&pane_id) {
             Some(seed) => {
-                // Native pull did not happen within the grace window — deliver
-                // via the legacy PTY injection so the pane still works.
-                if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &seed).await {
-                    tracing::warn!(
-                        pane_id = %pane_id,
-                        error = %e,
-                        "seed fallback: PTY injection failed"
-                    );
-                } else {
-                    tracing::debug!(
-                        pane_id = %pane_id,
-                        "seed fallback: delivered seed via PTY injection (native pull did not occur)"
-                    );
+                // Issue #492: `take_pending_seed_fallback` already filters
+                // `!exited`, but this write lands after that check, and the
+                // gap is exactly the window a respawn can land in. Re-check
+                // the current occupant's identity immediately before writing
+                // rather than trusting the pane id alone.
+                match registry.pane_current_agent_id(&pane_id) {
+                    Some(agent_id) if !registry.is_respawn_successor(&agent_id) => {
+                        // Native pull did not happen within the grace window —
+                        // deliver via the legacy PTY injection so the pane
+                        // still works.
+                        if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &seed).await {
+                            tracing::warn!(
+                                pane_id = %pane_id,
+                                error = %e,
+                                "seed fallback: PTY injection failed"
+                            );
+                        } else {
+                            tracing::debug!(
+                                pane_id = %pane_id,
+                                "seed fallback: delivered seed via PTY injection (native pull did not occur)"
+                            );
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            "seed fallback: refusing — no live occupant, or the pane changed \
+                             hands (respawn) since the seed was stashed"
+                        );
+                    }
                 }
             }
             None => {
@@ -2760,6 +2777,23 @@ pub struct AgentPtyRegistry {
     /// delivery. Grows by agents spawned in one daemon's lifetime, like
     /// [`Self::user_input_at`] (negligible: one short string each).
     launcher_handoff_agents: Mutex<HashSet<String>>,
+    /// Issue #492: agents that took over their pane via [`Self::respawn_agent_for_pane`]
+    /// rather than an original [`Self::spawn_agent`] call. A handful of automated
+    /// background writers resolve their target purely by `pane_id_env`, with no
+    /// caller-supplied identity to verify against — a scheduled task's
+    /// `deliver_on_idle`, `handle_work_done`'s orchestrator feedback, the daemon's
+    /// `Dispatch` result arm, and the seed-injection fallback. None of them can name
+    /// who the write was originally queued for, so "the current occupant is a
+    /// respawn successor" is the only signal available that the pane may have
+    /// changed hands since whatever decision queued the write — and they refuse
+    /// rather than risk delivering into a stranger. See [`Self::is_respawn_successor`].
+    ///
+    /// Keyed by AGENT id, like [`Self::launcher_handoff_agents`] — never cleared, and
+    /// for the same reason: bounded by agents spawned in one daemon's lifetime
+    /// (negligible), and a previous occupant's entry must not grant standing to a
+    /// later, unrelated agent that reuses the same `pane_id_env` via a fresh
+    /// `spawn_agent` (that path never inserts here).
+    respawn_successor_agents: Mutex<HashSet<String>>,
     /// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger
     /// for guarded write-and-submit. Keyed by the caller's stable `delivery_id`;
     /// each record binds the id to a fingerprint of the target agent identity,
@@ -3249,6 +3283,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             launcher_handoff_agents: Mutex::new(HashSet::new()),
+            respawn_successor_agents: Mutex::new(HashSet::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
             delivery_notice_sink: Mutex::new(None),
@@ -4313,6 +4348,26 @@ impl AgentPtyRegistry {
     /// [`Self::agent_spawned_as_reporting_agent`].
     pub fn agent_declared_launcher_handoff(&self, agent_id: &str) -> bool {
         self.launcher_handoff_agents
+            .lock()
+            .unwrap()
+            .contains(agent_id)
+    }
+
+    /// Issue #492: record that `agent_id` took over its pane via
+    /// [`Self::respawn_agent_for_pane`], never a fresh [`Self::spawn_agent`]. See
+    /// [`Self::respawn_successor_agents`] and [`Self::is_respawn_successor`].
+    fn mark_respawn_successor(&self, agent_id: &str) {
+        self.respawn_successor_agents
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string());
+    }
+
+    /// Issue #492: whether `agent_id` took over its pane via a respawn rather than
+    /// an original spawn — see [`Self::respawn_successor_agents`] for why the
+    /// automated background writers this guards check it before delivering.
+    pub fn is_respawn_successor(&self, agent_id: &str) -> bool {
+        self.respawn_successor_agents
             .lock()
             .unwrap()
             .contains(agent_id)
@@ -5731,6 +5786,9 @@ impl AgentPtyRegistry {
             agent_type: respawn_agent_type,
         };
         let new_agent_id = self.spawn_agent(opts)?;
+        // Issue #492: this occupant took over `pane_id_env` from a prior one —
+        // see [`Self::respawn_successor_agents`].
+        self.mark_respawn_successor(&new_agent_id);
         // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
         // card keeps the agent label the previous child taught us (`list_agents`
         // → `AgentRecord.agent_type`) instead of reverting to "No agent" until
@@ -6245,11 +6303,9 @@ impl AgentPtyRegistry {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        if let Some(agent) = inner
-            .agents
-            .values_mut()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
-        {
+        if let Some(agent) = inner.agents.values_mut().find(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        }) {
             agent.pending_seed = Some(seed.to_string());
             agent.seed_delivered_native = false;
         }
@@ -6278,10 +6334,9 @@ impl AgentPtyRegistry {
     /// exactly when (and only when) native delivery did not happen.
     pub fn take_pending_seed_fallback(&self, pane_id_env: &str) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
-        let agent = inner
-            .agents
-            .values_mut()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))?;
+        let agent = inner.agents.values_mut().find(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        })?;
         agent.pending_seed.take()
     }
 

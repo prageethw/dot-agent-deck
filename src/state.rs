@@ -5326,16 +5326,35 @@ impl AppState {
             &collision_note,
             &signal.task,
         );
-        if let Err(e) = registry
-            .write_to_pane_and_submit(&orch_pane_id, &feedback)
-            .await
-        {
-            warn!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                error = %e,
-                "work-done: failed to write feedback into orchestrator pane"
-            );
+        // Issue #492: `orch_pane_id` names only the pane, not the agent the
+        // worker was delegated under — a respawn (`clear = true` delegate or a
+        // manual respawn) between the delegation and this report changes hands
+        // on the SAME pane id, and the ungated write below would land in the
+        // new occupant's PTY instead of refusing. Refuse when the current
+        // occupant took over via a respawn — see
+        // [`crate::agent_pty::AgentPtyRegistry::is_respawn_successor`].
+        match registry.pane_current_agent_id(&orch_pane_id) {
+            Some(agent_id) if !registry.is_respawn_successor(&agent_id) => {
+                if let Err(e) = registry
+                    .write_to_pane_and_submit(&orch_pane_id, &feedback)
+                    .await
+                {
+                    warn!(
+                        pane_id = %orch_pane_id,
+                        role = %role_name,
+                        error = %e,
+                        "work-done: failed to write feedback into orchestrator pane"
+                    );
+                }
+            }
+            _ => {
+                warn!(
+                    pane_id = %orch_pane_id,
+                    role = %role_name,
+                    "work-done: refusing to write feedback — no live occupant, or the \
+                     orchestrator pane changed hands (respawn) since the delegation"
+                );
+            }
         }
     }
 

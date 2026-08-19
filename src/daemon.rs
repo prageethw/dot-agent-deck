@@ -2104,15 +2104,41 @@ async fn run_hook_loop(
 
                                     // Deliver result to the caller pane (doesn't need
                                     // any AppState lock — uses the PTY registry).
-                                    if let Err(e) = pty_registry
-                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
-                                        .await
-                                    {
-                                        warn!(
-                                            pane_id = %signal.pane_id,
-                                            error = %e,
-                                            "dispatch: failed to write result into caller pane"
-                                        );
+                                    //
+                                    // Issue #492: `signal.pane_id` names only the pane
+                                    // that issued the dispatch, not the agent — and
+                                    // `handle_dispatch`'s worktree/spawn I/O above is
+                                    // slow enough for the caller's pane to have changed
+                                    // hands (a respawn) by the time this result comes
+                                    // back. Refuse rather than write into whichever
+                                    // agent now occupies the pane — see
+                                    // `AgentPtyRegistry::is_respawn_successor`.
+                                    match pty_registry.pane_current_agent_id(&signal.pane_id) {
+                                        Some(agent_id)
+                                            if !pty_registry.is_respawn_successor(&agent_id) =>
+                                        {
+                                            if let Err(e) = pty_registry
+                                                .write_to_pane_and_submit(
+                                                    &signal.pane_id,
+                                                    &result.message,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    pane_id = %signal.pane_id,
+                                                    error = %e,
+                                                    "dispatch: failed to write result into caller pane"
+                                                );
+                                            }
+                                        }
+                                        _ => {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                "dispatch: refusing to write result — no live \
+                                                 occupant, or the caller pane changed hands \
+                                                 (respawn) since the request"
+                                            );
+                                        }
                                     }
                                 }
                                 DaemonMessage::WorkDone(signal) => {

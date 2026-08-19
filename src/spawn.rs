@@ -2387,11 +2387,19 @@ pub async fn spawn_or_reuse(
 
 /// Deliver `prompt` into `pane_id`, waiting out the deliver-on-idle debounce:
 /// if the user keeps typing the window keeps resetting; once the pane is idle
-/// (no keystroke within `debounce`) the prompt is written via the ungated
+/// (no keystroke within `debounce`) the prompt is written via
 /// `write_to_pane_and_submit`. Skip-if-prior-run-still-active (Phase 1) gives
 /// this single-slot semantics per task — a newer fire while one is queued is
 /// skipped, and since a static schedule's prompt is identical each fire the
 /// delivered prompt is the same regardless.
+///
+/// Issue #492: this has no caller-supplied identity to verify the eventual
+/// write against — `spawn_or_reuse`'s `ReuseDecision::Reuse { pane_id }` names
+/// only the pane, not the agent it was decided for — so the debounce wait (up
+/// to `REUSE_DELIVERY_HARD_TIMEOUT` of drift) leaves a window where the pane
+/// changes hands (a `clear = true` delegate or a manual respawn) before this
+/// delivers. Refuse rather than write when the pane's current occupant took
+/// over via a respawn — see [`AgentPtyRegistry::is_respawn_successor`].
 async fn deliver_on_idle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -2419,8 +2427,19 @@ async fn deliver_on_idle(
             }
         }
     }
-    if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
-        tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
+    match registry.pane_current_agent_id(pane_id) {
+        Some(agent_id) if !registry.is_respawn_successor(&agent_id) => {
+            if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
+                tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
+            }
+        }
+        _ => {
+            tracing::warn!(
+                pane_id,
+                "deliver_on_idle: refusing — no live occupant, or the pane changed hands \
+                 (respawn) since the reuse decision was made"
+            );
+        }
     }
 }
 
