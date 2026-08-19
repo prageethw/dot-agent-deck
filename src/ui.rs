@@ -33929,9 +33929,9 @@ mod tests {
     /// found) refusal, distinguishing it from `worktree_015`'s `Err(reason)`
     /// (daemon-unreachable) refusal — rather than silently rooting a second
     /// orchestration in the already-live shared checkout.
-    #[spec("orchestration/worktree/016")]
+    #[spec("orchestration/worktree/017")]
     #[test]
-    fn worktree_016_blank_slug_refuses_when_root_checkout_has_live_sibling() {
+    fn worktree_017_blank_slug_refuses_when_root_checkout_has_live_sibling() {
         let tmp = tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         init_git_repo(&repo);

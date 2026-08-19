@@ -52,7 +52,36 @@ use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_
 /// changed. `warnings` and `owner_kind`, added in the same PRD, are additive
 /// and need no bump on their own; `owner`'s meaning change is what forces
 /// this one.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// `kind` (fork#325 M4a) is likewise additive: every pre-existing field
+/// keeps its exact pre-M4a meaning for a pre-existing (linked-worktree) row
+/// — `kind` is simply new, always `"linked"` for such a row. The new
+/// `"isolated_clone"` rows it also introduces are not a meaning change of
+/// anything a consumer could have depended on before this milestone either
+/// — array cardinality was never part of this version's contract (running
+/// `git worktree add` between two `worktree list` calls already changes row
+/// count with no version bump), only field shapes/meanings are.
+///
+/// Bumped to 3 by fork#325 M4a (reviewer F2): `verdict` gains a fourth
+/// value, `"isolated_clone"`. The released `CHANGELOG.md` documents
+/// `verdict` as exactly `remove`/`ask`/`keep` — the same kind of documented
+/// consumer contract the v2 bump above exists to protect — so a consumer
+/// filtering or matching against that three-value domain now sees a value
+/// it didn't previously account for. An earlier round of this milestone
+/// weighed a no-bump reading instead, on the argument that no pre-existing
+/// (linked-worktree) row's `verdict` can ever become `"isolated_clone"` —
+/// only a wholly new row kind carries the new value, so no consumer's
+/// assumption about an EXISTING row is ever contradicted, unlike the
+/// `owner` case above. That distinction doesn't survive contact with what
+/// the v2 precedent actually bumped on: a documented value set gaining a
+/// member a consumer's filter didn't previously expect, full stop — v2 did
+/// not require the changed field to belong to a pre-existing row either,
+/// only that a consumer relying on the documented domain could now be
+/// surprised by it. `verdict` is exactly that: a real, documented API
+/// contract, not an implementation detail whose row-provenance nuance a
+/// consumer could reasonably be expected to track. Bump on the value-set
+/// change itself.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
 /// in the worktree's OWN git metadata dir (`<repo>/.git/worktrees/<name>/`,
@@ -63,6 +92,54 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// (`issue_dispatch_run::create_worktree` / `create_worktree_sync`), read by
 /// [`ownership_of`].
 pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
+
+/// The name of fork#325 M4b's isolated-clone-specific provenance artifact,
+/// and the sub-directory name it is written under. Written by
+/// `provision_isolated_clone_sync` at
+/// [`crate::issue_dispatch_run::isolated_clone_provenance_path`]'s resolved
+/// location — OUTSIDE every candidate, under
+/// [`crate::platform::paths::state_dir`] — immediately after the clone
+/// itself succeeds and only for a call that has just confirmed `clone_dir`
+/// did not already exist — never vouching for a directory this call did
+/// not itself create. Deliberately a separate namespace and a separate
+/// location from [`OWNER_MARKER_FILENAME`] (which a same-uid attacker can
+/// forge into any `.git` directory, including a fake one) and from the
+/// shared attach-lock file `create_worktree_sync` and
+/// `provision_isolated_clone_sync` both still write for cross-process
+/// mutual exclusion (`issue_dispatch_run::worktree_attach_lock_path*`,
+/// under the ROOT checkout's common dir) — see `candidate_has_attach_lock`'s
+/// own doc comment for why conflating the two was the exact residual this
+/// closes.
+///
+/// **Fix round 2 (reviewer R1 / auditor D1, blocker, PR #515):** M4b's
+/// first attempt wrote this file directly into the candidate's OWN `.git`
+/// directory, reasoning that being self-contained there meant checking it
+/// needed no knowledge of where the root checkout's common dir is. That
+/// reasoning was correct about the F2 problem (reviewer F2:
+/// `discover_isolated_clones` invoked from inside an isolated clone itself)
+/// but wrong about the security property it traded away: a same-uid
+/// attacker able to plant a sibling `.git` directory at all can, by
+/// definition, write into that `.git` — so evidence living there is
+/// forgeable with a bare `touch`, reopening auditor A1/B1's exact
+/// misattribution. `state_dir()` gets BOTH properties at once: it resolves
+/// identically regardless of where the caller is rooted (no `common_dir`
+/// resolution needed), and it is a directory no candidate — genuine or
+/// forged — ever controls.
+pub(crate) const ISOLATED_CLONE_PROVENANCE_FILENAME: &str =
+    "dot-agent-deck-isolated-clone-provenance";
+
+/// `WorktreeReport::kind` value for an ordinary `git worktree list`-visible
+/// row (fork#325 M4a).
+const KIND_LINKED: &str = "linked";
+
+/// `WorktreeReport::kind` value for a deck-owned isolated clone discovered
+/// as a sibling of the enumerating repo (fork#325 M4a — see
+/// [`discover_isolated_clones`]). Deliberately reused verbatim as this
+/// row's `verdict` too (see [`isolated_clone_report`]): a human scanning
+/// `worktree list`'s VERDICT column — which already exists, unlike a new
+/// dedicated table column — sees `isolated_clone` immediately, distinct
+/// from `remove`/`ask`/`keep`, with no separate lookup needed.
+const KIND_ISOLATED_CLONE: &str = "isolated_clone";
 
 /// Resolved PR state for a worktree's branch, or why it could not be
 /// resolved. `Unresolvable` and `NoPr` both keep — the distinction is only
@@ -186,6 +263,40 @@ impl WorktreeOwner {
 /// with no `created-by:` line.
 const LEGACY_MARKER_UNKNOWN_REASON: &str = "ownership marker predates fork #166's identity tracking (bare \"deck\\n\", no `created-by:` \
      line) -- it proves deck-creation but names no identity to attribute it to (fork issue #231)";
+
+/// The isolated-clone-path analogue of [`LEGACY_MARKER_UNKNOWN_REASON`]
+/// above (fork#325 M4a, auditor A4). That text asserts "it proves
+/// deck-creation" -- true on the linked-worktree path, where
+/// `resolve_worktree_owner` only ever reaches this reason after
+/// [`owned_git_dir`] has already containment-checked the git-dir the marker
+/// lives in. `isolated_clone_report` reaches this reason only after
+/// `candidate_has_attach_lock` (final round -- see that function's own doc
+/// comment) has already confirmed the deck's own attach-lock artifact
+/// exists for this candidate -- so the marker itself, once read, is trusted
+/// exactly as much as a linked worktree's, and is still just as capable of
+/// being malformed/oversized/non-UTF-8/legacy-content on its own terms.
+const ISOLATED_CLONE_MARKER_UNKNOWN_REASON: &str = "this sibling directory's ownership marker exists but could not be read as a `created-by:` \
+     identity (oversized, non-UTF-8, unreadable, or legacy content with no identity line) -- \
+     the deck's own provenance artifact for this candidate does exist, so this is treated the \
+     same as a linked worktree's legacy marker (fork#325 M4a, auditor A4)";
+
+/// A marker file exists for this candidate, but no matching provenance
+/// artifact does (fork#325 M4a, final round -- auditor A1/B1; artifact
+/// relocated under `state_dir()` in M4b fix round 2 -- see
+/// `ISOLATED_CLONE_PROVENANCE_FILENAME`'s doc comment). Either the deck
+/// never attached this clone (a hand-planted or forged marker, auditor
+/// B1's exact scenario), or it genuinely was deck-created by a build
+/// predating this check, or was moved/renamed since. Discovery still lists
+/// the row (structural criteria alone gate inclusion -- see
+/// `discover_isolated_clones`'s own doc comment), but the marker's content
+/// is deliberately never read in this case: without the provenance
+/// artifact there is nothing to trust it against, so treating an unread
+/// marker as evidence would reopen exactly the misattribution auditor B1
+/// demonstrated.
+const ISOLATED_CLONE_NO_ATTACH_LOCK_REASON: &str = "no matching isolated-clone provenance artifact exists for this candidate -- its ownership \
+     marker (if any) is not read, since without that artifact there is nothing to trust the \
+     marker's content against (fork#325 M4a, auditor A1/B1; M4b reviewer P1/auditor C1; \
+     fix round 2 reviewer R1/auditor D1)";
 
 /// The worktree's own git metadata directory could not be resolved, or
 /// failed the containment check against the enumerating repo's common dir
@@ -356,6 +467,15 @@ pub struct WorktreeReport {
     pub clean: bool,
     pub owned: bool,
     pub pr_state: String,
+    /// One of `"remove"` / `"ask"` / `"keep"` (from [`Verdict::label`], via
+    /// [`decide`]) for a `kind == "linked"` row, or the literal
+    /// `"isolated_clone"` (from [`isolated_clone_report`], never through
+    /// [`decide`] at all) for a `kind == "isolated_clone"` row — see
+    /// [`SCHEMA_VERSION`]'s own doc comment (reviewer F2) for why this
+    /// fourth value forced the bump to `SCHEMA_VERSION` 3. Two independent
+    /// producers, both of which this doc comment names, is why this field
+    /// needs one where every sibling field's own doc comment already has
+    /// one.
     pub verdict: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -387,6 +507,25 @@ pub struct WorktreeReport {
     /// (`owned` above), so a `Human`-owned worktree can never become
     /// removable by a bare `reclaim`.
     pub owner_kind: String,
+    /// `"linked"` for an ordinary `git worktree list`-visible row (existing
+    /// rows, unchanged behavior) or `"isolated_clone"` for a deck-owned
+    /// isolated clone discovered as a sibling of the enumerating repo (fork
+    /// #325 M4a — see [`discover_isolated_clones`]). Always present, like
+    /// `owner_kind` above: every examined entry is exactly one of the two.
+    /// Additive, same justification as `owner_kind`/`owner_reason` — no
+    /// `SCHEMA_VERSION` bump for this field alone (see that constant's own
+    /// doc comment for `owner`, the case that DID force a bump at v2, and
+    /// `verdict`, the case that forced the bump to v3 — and why `kind` isn't
+    /// either: it introduces no new meaning for any
+    /// pre-existing field or row, only a new, always-"linked" field on rows
+    /// that already existed, plus new rows of a kind no consumer could have
+    /// been relying on before this milestone). Auditor A1: `owned` and
+    /// `owner_kind` mean something WEAKER on a `kind == "isolated_clone"`
+    /// row than on a `"linked"` one — see [`isolated_clone_report`]'s own
+    /// doc comment for exactly what evidence backs them there and why it
+    /// isn't as strong as the linked case's `owned_git_dir` containment
+    /// check.
+    pub kind: String,
     /// Why `owner_kind` is `"unknown"` (review F3 / audit F2) — `None` for
     /// `Agent`/`Human`, which need no explaining. Additive (same
     /// justification as `owner_kind`; no `SCHEMA_VERSION` bump needed for
@@ -755,9 +894,18 @@ pub enum Cleanliness {
     Unresolvable(String),
 }
 
+/// Shared by both a linked worktree's row and a discovered isolated clone's
+/// (`isolated_clone_report`) — always run via [`git_in_untrusted_dir`]
+/// (fork#325 M4a, auditor A3): `-c core.fsmonitor=` is a CORRECTNESS no-op
+/// for a linked worktree (fsmonitor is genuinely still disabled for that
+/// call; it simply doesn't matter there, since a linked worktree is already
+/// reachable only via `git worktree list`, never a directory an outside
+/// party could plant), and is the exact vector the
+/// audit's own lab reproduced arbitrary code execution through for a
+/// discovered isolated-clone candidate, whose directory this process did
+/// not create.
 fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
-    let out = Command::new("git")
-        .current_dir(worktree_path)
+    let out = git_in_untrusted_dir(worktree_path)
         .args(["status", "--porcelain"])
         .output();
     match out {
@@ -857,6 +1005,23 @@ fn resolve_common_dir(repo_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(raw))
+}
+
+/// Best-effort "do these two paths name the same directory" check, via
+/// `std::fs::canonicalize` on both sides — used only to decide which of two
+/// equally-correct path SPELLINGS to prefer (see
+/// [`discover_isolated_clones`]'s own doc comment), never to produce a value
+/// that is itself returned or displayed: `canonicalize` resolves symlinks
+/// (macOS's `/var` -> `/private/var`) and, on Windows, produces a
+/// `\\?\`-prefixed extended-length path that some `git` commands reject
+/// outright, so its result is only ever safe to compare, not to keep.
+/// `false` whenever either side fails to canonicalize (e.g. it does not
+/// exist) — unknown must never resolve to "same directory".
+fn paths_refer_to_same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Resolve `worktree_path`'s own git metadata dir and containment-check it
@@ -1203,9 +1368,17 @@ pub fn sanitize_marker_creator(name: &str) -> String {
 /// that doesn't parse as `owner/name`, or a host other than `github.com`
 /// (`gh` only ever talks to GitHub, so a non-GitHub remote must never resolve
 /// to a slug `gh` would misinterpret rather than reject).
+///
+/// Runs via [`git_in_untrusted_dir`] (fork#325 M4a final round, auditor
+/// B3), even though `remote get-url` is a pure config read that cannot
+/// reach `core.fsmonitor`: this function is called with `repo_dir` set to
+/// an isolated-clone candidate as often as to a trusted checkout, and
+/// routing every candidate-directory invocation through the same helper —
+/// rather than reasoning per call site about which ones need it — is the
+/// isolation this module already commits to for [`check_cleanliness`] and
+/// [`resolve_isolated_clone_branch`].
 pub(crate) fn derive_repo_slug(repo_dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .current_dir(repo_dir)
+    let out = git_in_untrusted_dir(repo_dir)
         .args(["remote", "get-url", "origin"])
         .output()
         .ok()?;
@@ -1436,9 +1609,507 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             owner_reason,
             real_path,
             removed_by: None,
+            kind: KIND_LINKED.to_string(),
         });
     }
+
+    // Fork#325 M4a: sibling deck-owned isolated clones, invisible to
+    // `list_linked_worktrees` above (`git worktree list` structurally
+    // cannot see a directory that is not a linked worktree of `repo_dir` at
+    // all — see `discover_isolated_clones`'s own doc comment).
+    let isolated_candidates = discover_isolated_clones(repo_dir);
+    if !isolated_candidates.is_empty() {
+        // Resolved once per `examine_worktrees` call, not once per
+        // candidate (auditor B3, final round) — every candidate's derived
+        // slug is compared against this same value in
+        // `isolated_clone_report`.
+        let repo_slug = derive_repo_slug(repo_dir);
+        for candidate in isolated_candidates {
+            reports.push(isolated_clone_report(repo_slug.as_deref(), candidate));
+        }
+    }
+
     Ok(reports)
+}
+
+/// A sibling directory of the root checkout recognized as a deck-owned
+/// isolated clone (fork#325 M4a): a genuine independent repository — its
+/// own `.git` as a DIRECTORY, matching `provision_isolated_clone_sync`'s
+/// on-disk shape and the same `clone_dir.join(".git").is_dir()` guard
+/// `attempt_isolated_clone_cleanup` already uses (deliberately `is_dir()`,
+/// not `exists()`: a linked worktree's `.git` is a FILE redirect, which
+/// this excludes for free, structurally, with no separate check needed) —
+/// carrying a readable ownership marker at `<path>/.git/dot-agent-deck-owner`.
+///
+/// Final round (reviewer F13 / auditor A1/B1): earlier rounds additionally
+/// required the candidate's checked-out commit to be an object the
+/// enumerating repo already had ([`candidate_shares_history_with`], since
+/// removed). That check is gone — see [`discover_isolated_clones`]'s own
+/// doc comment for why — so DISCOVERY (whether a candidate appears in the
+/// report at all) is now purely structural, exactly as it was before that
+/// check existed. What replaces it is `has_attach_lock` below, resolved
+/// once per candidate here rather than left to be recomputed by every
+/// consumer: whether ownership (`owned` on the resulting
+/// [`WorktreeReport`]) is genuinely provable via the deck's own attach-lock
+/// artifact — see [`candidate_has_attach_lock`]'s doc comment for what that
+/// does and does not prove.
+struct IsolatedCloneCandidate {
+    path: PathBuf,
+    git_dir: PathBuf,
+    has_attach_lock: bool,
+}
+
+/// A `git` invocation scoped to run inside a directory this process did not
+/// create and does not otherwise trust (fork#325 M4a auditor A3): a
+/// candidate sibling directory [`discover_isolated_clones`] is examining,
+/// before (and regardless of whether) it turns out to be a genuine
+/// deck-owned isolated clone. Git honours that directory's own
+/// `.git/config`, and the audit's own lab reproduced arbitrary code
+/// execution via a forged `core.fsmonitor` merely by running `git status`
+/// there — `-c core.fsmonitor=` blocks exactly that vector for every
+/// command this module runs against such a directory. This is NOT full
+/// hardening: the audit's final round reproduced arbitrary code execution
+/// through a DIFFERENT config key, `filter.<driver>.clean` declared via a
+/// candidate's own `.gitattributes`, triggered by the exact `git status`
+/// call this helper exists to protect (auditor B2) — the residual is not
+/// confined to subcommands this module doesn't issue; it is reachable
+/// through the very subcommand this module does issue, via a different
+/// config surface than the one already closed. (`core.hooksPath`,
+/// `diff.external`, etc. remain reachable too, by subcommands this module
+/// genuinely doesn't run.) See the audit's A3/B2 findings for the full
+/// scoping and why both are accepted as a same-uid, non-blocker risk
+/// regardless — closing the clean-filter vector would mean not running
+/// `git status` in an untrusted directory at all, an M4b design question.
+fn git_in_untrusted_dir(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(["-c", "core.fsmonitor="]);
+    cmd
+}
+
+/// Whether a persistent provenance artifact exists for `candidate`
+/// (fork#325 M4a, final round — reviewer F13 / auditor A1/B1, replacing
+/// the earlier `candidate_shares_history_with`, since removed; M4b —
+/// reviewer P1 / auditor C1 / reviewer F2 — replaced the M4a mechanism
+/// with a first version of the one this function now checks; fix round 2
+/// — reviewer R1 / auditor D1, blocker, PR #515 — relocated it again, to
+/// the location described below).
+///
+/// `provision_isolated_clone_sync` writes
+/// [`ISOLATED_CLONE_PROVENANCE_FILENAME`] at
+/// [`crate::issue_dispatch_run::isolated_clone_provenance_path`]'s resolved
+/// location — under [`crate::platform::paths::state_dir`], keyed by a hash
+/// of `candidate`'s own canonical path — immediately after the clone
+/// itself succeeds. This function recomputes that same path and checks for
+/// the file's presence; nothing else to do, since [`canonicalize_best_effort`]
+/// makes write time and check time agree on the path by construction (see
+/// [`isolated_clone_provenance_path`]'s own doc comment).
+///
+/// [`canonicalize_best_effort`]: crate::issue_dispatch_run::canonicalize_best_effort
+/// [`isolated_clone_provenance_path`]: crate::issue_dispatch_run::isolated_clone_provenance_path
+///
+/// This is a stronger binding than the shared-history check M4a replaced,
+/// for the same reason [`owned_git_dir`]'s containment check is strong for
+/// a linked worktree: the evidence lives at a path only
+/// `provision_isolated_clone_sync` itself ever writes to, and — critically,
+/// unlike M4b's first attempt — a path outside every candidate's own
+/// control (see [`ISOLATED_CLONE_PROVENANCE_FILENAME`]'s own doc comment
+/// for the fix-round-2 history). A `same-uid` attacker able only to plant a
+/// sibling directory cannot forge this file's presence, closing auditor
+/// B1's 4-file/1-SHA forgery (which the shared-history check could not — it
+/// only checked that the candidate NAMED a commit `repo_dir` had, never
+/// that it HELD one) and closing reviewer R1/auditor D1's bare 3-file
+/// forgery of M4b's first attempt (`worktree/reclaim/061`). And like the
+/// M4a mechanism, this has no dependency on the candidate's current `HEAD`
+/// at all — a genuine clone that has since committed real, local-only work
+/// is still recognized, closing reviewer F13.
+///
+/// **M4a's two residuals, both closed here:**
+/// - **Reviewer P1 — shared namespace with ordinary linked worktrees.**
+///   M4a's mechanism was the SAME attach-lock file [`create_worktree_sync`]
+///   writes for an ordinary linked worktree, so a deck-created-then-removed
+///   linked worktree's leftover lock file could be inherited by a later
+///   forged occupant of the same path. [`ISOLATED_CLONE_PROVENANCE_FILENAME`]
+///   is a wholly separate namespace and location — under `state_dir()`,
+///   never under any repository's `.git` at all — that
+///   [`create_worktree_sync`] never writes into under any circumstance, so
+///   there is nothing left for a forged occupant to inherit
+///   (`worktree/reclaim/056`).
+/// - **Auditor C1 — the old lock was acquired before `clone_dir.exists()`
+///   was checked.** `provision_isolated_clone_sync`'s attach lock (still
+///   used, unchanged, for cross-process mutual exclusion — see
+///   `worktree_attach_lock_path`'s own doc comment) is still acquired
+///   before the `clone_dir.exists()` check, and that ordering is
+///   deliberately preserved (moving the check earlier would reopen the
+///   `clone_dir.exists()` -> `git clone` TOCTOU fork#325 auditor A3 closed
+///   — fork #282's TOCTOU family). But [`ISOLATED_CLONE_PROVENANCE_FILENAME`]
+///   is written only afterward, once the clone this call performed has
+///   actually succeeded — a pre-planted directory hits
+///   `IsolatedCloneOutcome::AlreadyClaimed` and returns before that write is
+///   ever reached, so it is never vouched for (`worktree/reclaim/057`).
+///
+/// **Bonus, from the same design (reviewer F2, `worktree/reclaim/058`):**
+/// M4a's mechanism required knowing the enumerating repo's own common
+/// `.git` dir to build the lookup path, which — when
+/// `discover_isolated_clones` runs from inside an isolated clone itself,
+/// exactly what the Nth-concurrent-orchestration gate this milestone
+/// serves does — resolved to the CLONE's own common dir, not the root
+/// checkout's, so a sibling clone's genuine artifact (written under the
+/// ROOT's `.git`) was never found. `state_dir()` needs no such resolution
+/// at all: it works identically whether the caller is the root checkout, a
+/// subdirectory of it, or another isolated clone entirely.
+///
+/// Other honest limits, stated plainly rather than overclaimed:
+/// - **Same-uid still wins.** An attacker with write access to this
+///   process's own `state_dir()` (e.g. this very uid, or having compromised
+///   an agent running under it) defeats this exactly as a same-uid attacker
+///   defeats `owned_git_dir`'s containment check for a linked worktree —
+///   this is categorically as strong as the linked-worktree case, not
+///   stronger, and never absolute. What it no longer grants is the WEAKER
+///   capability M4b's first attempt granted: an attacker able only to plant
+///   a sibling directory, with no access to this process's own `state_dir()`
+///   at all, could forge the M4b-round-1 artifact directly. That gap is
+///   exactly what this fix closes.
+/// - **Best-effort provenance, not proof of current identity.** A clone
+///   made by a build predating this check, or one whose write genuinely
+///   failed (best-effort, logged and continued — see
+///   `write_isolated_clone_provenance`'s own doc comment), has no matching
+///   artifact and correctly reports `owned: false` rather than being
+///   hidden — mirroring how `owned_git_dir` returning `None` yields
+///   `owned: false`, never a dropped row.
+/// - **Stale entries.** The artifact is never removed when a clone is
+///   later deleted, so it would vouch for an unrelated directory recreated
+///   at the same path afterward, if that later directory canonicalizes to
+///   the identical clone-dir path the hash was computed from — in practice
+///   this requires reusing the exact same `clone_dir` path after a prior
+///   clone there was destroyed. Broader than a naive per-clone-tree
+///   artifact would be (this one outlives the clone's own deletion by
+///   design), but no broader than M4a's own shared-namespace staleness, and
+///   nothing else in the deck ever writes into this directory.
+/// - **Path-bound, same as M4a (reviewer R2, PR #515).** Because the key is
+///   the clone's own canonical PATH rather than anything stored inside the
+///   clone's tree, `cp -r`/`mv` of a genuine clone to a different sibling
+///   path carries no attribution with it — the copy's canonical path hashes
+///   to a different (empty) entry, so it correctly reports `owned: false`
+///   until the deck itself provisions something there. M4b's first attempt
+///   (the candidate-local artifact) had temporarily inverted this, since a
+///   file living inside the clone's own tree travels with a `cp -r` for
+///   free; this restores M4a's original, narrower staleness window.
+fn candidate_has_attach_lock(candidate_path: &Path) -> bool {
+    crate::issue_dispatch_run::isolated_clone_provenance_path(candidate_path).is_file()
+}
+
+/// Enumerate deck-owned isolated clones sitting as siblings of the ROOT
+/// CHECKOUT — not of `repo_dir` itself, and not of the process's current
+/// working directory (fork#325 M4a — `provision_isolated_clone_sync`
+/// creates them as siblings of the source repo, and its own doc comment
+/// names this exact scan as the deferred M4 follow-up).
+///
+/// Auditor A2: the root checkout is DERIVED via [`resolve_common_dir`] —
+/// the same `git rev-parse --path-format=absolute --git-common-dir` CLAUDE.md
+/// rule 15 uses to resolve a root checkout from any linked worktree — never
+/// assumed to already equal `repo_dir`. `repo_dir` is `std::env::current_dir()`
+/// at the CLI layer (`main.rs`), which is whatever subdirectory the
+/// invoking shell happens to be in; anchoring the scan on ITS parent (the
+/// original defect) silently misses every real isolated clone when run from
+/// a subdirectory, AND can misreport a directory genuinely inside the repo
+/// (an interrupted e2e temp root, a vendored fixture) as an isolated clone
+/// of it. Deriving the root checkout first, and requiring candidates to be
+/// its siblings, makes the self-exclusion (`path == root_checkout`) correct
+/// by construction rather than by the coincidence that `current_dir()`
+/// happened to already be the root.
+///
+/// Anything else — a plain directory, an unrelated independent repo, a
+/// linked worktree of `repo_dir` or of any other repo (its `.git` is a
+/// FILE, never a DIRECTORY), a symlink (auditor A1 item 2 — `Path::is_dir()`
+/// follows symlinks, so an unfiltered symlinked sibling could point
+/// anywhere, including outside `parent` entirely), or a genuine clone
+/// carrying no marker at all — is silently skipped, never reported, never
+/// an error: discovery is best-effort scanning, not a precondition
+/// `worktree list`/`reclaim` can fail on.
+///
+/// **Final round (reviewer F13 / auditor A1/B1): DISCOVERY no longer
+/// requires the candidate's checked-out commit to share history with
+/// `repo_dir`.** Earlier rounds gated inclusion on exactly that
+/// (`candidate_shares_history_with`, since removed), which was wrong in two
+/// independent ways. Reviewer F13: `provision_isolated_clone_sync` checks
+/// the clone out onto its work branch, so the dispatched agent's first real
+/// commit moves `HEAD` off anything `repo_dir` holds — the check then
+/// failed for exactly the clones this milestone exists to surface, the ones
+/// holding local-only work. Auditor A1/B1: the check only verified the
+/// candidate NAMED a commit `repo_dir` had (a public, non-secret value),
+/// never that it HELD one — a 4-file forgery with no git invocation at all
+/// passed it. Discovery is therefore purely structural again, the same
+/// shape it had before that check existed: `.git` is a directory, and the
+/// marker file is readable. What used to be a discovery gate is now
+/// `candidate_has_attach_lock`'s job instead, resolved once per candidate
+/// below and carried on [`IsolatedCloneCandidate`] — but that check decides
+/// `owned` on the eventual [`WorktreeReport`], not whether the row is
+/// reported at all. This mirrors [`owned_git_dir`]'s role for a LINKED
+/// worktree: `git worktree list` alone decides which linked rows are
+/// reported, and `owned_git_dir`'s containment check only ever decides
+/// `owned`/`owner` on rows already known to exist. A directory carrying
+/// only a forged marker (no genuine attach lock) is therefore still listed
+/// — same as a foreign linked worktree is still listed — but reports
+/// `owned: false`, so it can never be misattributed to a victim identity
+/// via `worktree list --mine` the way auditor B1 demonstrated. Nothing on
+/// this path can ever reach a deletion regardless (see
+/// [`isolated_clone_report`]'s own doc comment and [`run_reclaim`]'s
+/// exhaustive match trace), so a bogus row surviving discovery is a display
+/// nuisance, never a safety issue.
+///
+/// Auditor A5 (not fixed here, deliberately): per-sibling work is uncapped.
+/// [`isolated_clone_report`] spawns 3-5 `git`/`gh` processes per accepted
+/// clone (slug, branch, clean, PR state, and `gh pr list`'s network round
+/// trip when a branch resolves — the slug spawn is new as of auditor B3's
+/// final-round fix, up from the 2-4 this paragraph originally measured) —
+/// this function itself no longer spawns
+/// anything extra per marked candidate, since `candidate_has_attach_lock`
+/// is a filesystem check, not a subprocess (strictly cheaper than the
+/// two-spawn check it replaces). The auditor's 2.08s/43-sibling measurement
+/// predates that removal, so the real cost today is lower, not higher; a
+/// cap/early-exit remains left as a known, documented cost rather than
+/// fixed speculatively, revisit if this scales beyond a handful of
+/// siblings in practice.
+///
+/// M4a Windows/macOS fix: [`resolve_common_dir`]'s `git rev-parse
+/// --path-format=absolute` goes through the OS's own realpath resolution at
+/// the point `git` calls `getcwd()` after `chdir`ing into `repo_dir` —
+/// confirmed directly (`git -C <dir-under-a-symlink> rev-parse
+/// --path-format=absolute --git-common-dir` returns the `/private/var/...`
+/// form on macOS even when invoked against the unresolved `/var/...` path).
+/// A candidate path built by joining onto that resolved anchor therefore
+/// mixes a git-resolved fragment with a plain `Path::join`ed one: on macOS
+/// this yields a `/private/var/...` `real_path` a caller who never resolved
+/// `/var` itself will never match; on Windows the equivalent short-name
+/// resolution combines with a `Path::join`-appended component to leave a
+/// forward-slash-formatted prefix followed by a backslash-joined suffix in
+/// the same string. Neither is a bug `Path`/`PathBuf` construction alone
+/// fixes, since both fragments already go through `Path::join` — the
+/// mismatch is that they resolve through two different means (the OS via
+/// `git`, vs. none at all via `Path`). When `repo_dir` already names the
+/// same directory as the derived root checkout (the common case — `repo_dir`
+/// was not called against a linked worktree), anchoring on `repo_dir` itself
+/// keeps every sibling path in the caller's own, unresolved spelling instead
+/// of git's resolved one; the derived `root_checkout` remains the fallback
+/// anchor for the case this function exists to handle (`repo_dir` being a
+/// subdirectory or a linked worktree), so A2's own fix is unaffected.
+///
+/// **M4b (reviewer F2): `repo_dir` being an isolated clone itself.** When
+/// `repo_dir` is an isolated clone, `common_dir`/`root_checkout` above
+/// resolve to the CLONE's own `.git`/directory, not the actual root
+/// checkout's — but that only matters for the anchor/parent computation
+/// above, and the clone's parent directory already IS the root checkout's
+/// parent (M4a provisions every isolated clone as a sibling of its source),
+/// so sibling PATHS are still found correctly by construction. What used to
+/// break was `has_attach_lock`'s check, resolved against the wrong
+/// `common_dir` — fixed by keying that check off `state_dir()` instead of
+/// any repository's own `.git` (see [`ISOLATED_CLONE_PROVENANCE_FILENAME`]'s
+/// and [`candidate_has_attach_lock`]'s own doc comments), so it needs no
+/// `common_dir` at all any more.
+fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
+    let Some(common_dir) = resolve_common_dir(repo_dir) else {
+        return Vec::new();
+    };
+    let Some(root_checkout) = common_dir.parent().map(Path::to_path_buf) else {
+        return Vec::new();
+    };
+    let anchor = if paths_refer_to_same_dir(repo_dir, &root_checkout) {
+        repo_dir.to_path_buf()
+    } else {
+        root_checkout
+    };
+    let Some(parent) = anchor.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        // Auditor A1 item 2: checked via `file_type()`, which does NOT
+        // traverse the symlink (unlike the `path.is_dir()` probe below),
+        // before anything that would.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if path == anchor || !path.is_dir() {
+            continue;
+        }
+        let git_dir = path.join(".git");
+        if !git_dir.is_dir() {
+            continue;
+        }
+        if !git_dir.join(OWNER_MARKER_FILENAME).is_file() {
+            continue;
+        }
+        // Final round: the attach-lock check is a filesystem stat, not a
+        // `git` spawn, so resolving it for every marked candidate (rather
+        // than gating on it) costs nothing extra — see this function's own
+        // doc comment for why it no longer gates inclusion. Keyed off the
+        // candidate's own PATH, not its `.git` dir (fix round 2 -- the
+        // artifact no longer lives anywhere under the candidate at all).
+        let has_attach_lock = candidate_has_attach_lock(&path);
+        found.push(IsolatedCloneCandidate {
+            path,
+            git_dir,
+            has_attach_lock,
+        });
+    }
+    found
+}
+
+/// Resolve an isolated clone's current branch via `git symbolic-ref --short
+/// -q HEAD`, run inside the clone itself — `None` for a detached HEAD (a
+/// non-zero exit; `-q` suppresses the stderr message but not the exit
+/// code) or any spawn/parse failure, matching `RawWorktree::branch`'s own
+/// "no branch to report" meaning closely enough for [`resolve_pr_state`] to
+/// treat the two identically. Runs via [`git_in_untrusted_dir`] (auditor
+/// A3), consistently with every other `git` invocation this module makes
+/// with `current_dir` set inside a candidate — [`check_cleanliness`] and,
+/// as of the final round, [`derive_repo_slug`] too (auditor B3). `gh pr
+/// list` is a different binary this helper was never scoped to; see
+/// [`isolated_clone_report`]'s own doc comment for how that call is gated
+/// instead (requiring the candidate's derived slug to match the root
+/// checkout's own before it is ever spent).
+fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
+    let out = git_in_untrusted_dir(clone_dir)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = trim_trailing_newline(&out.stdout);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(raw).into_owned())
+}
+
+/// Build the report row for one discovered isolated clone (fork#325 M4a).
+/// Cleanliness and PR state ARE probed — real signals, useful to a human
+/// scanning `worktree list`'s CLEAN/PR columns — but neither one, nor any
+/// combination of them, is ever allowed to decide removal: unlike
+/// `list_linked_worktrees`'s rows, this bypasses [`decide`] entirely and
+/// hard-codes `verdict`/`reason`, mirroring
+/// [`crate::issue_dispatch_run::RemovalPolicy::IsolatedClone`]'s daemon-side
+/// precedent (`remove_worktree`'s own doc: "the entry is kept
+/// unconditionally... a clean working tree does not prove it is safe to
+/// remove_dir_all — this clone's `.git` may hold the only copy of commits
+/// made on its local branch"). Deliberately never routes through
+/// `Verdict::Ask` either (the task's own explicit call): `--yes` would
+/// otherwise reach [`run_reclaim`]'s `remove_worktree_dir`, which shells out
+/// to `git worktree remove` — a command that fails loudly (exit 128)
+/// against something that isn't a linked worktree at all, rather than
+/// cleanly declining. `verdict` is set to [`KIND_ISOLATED_CLONE`] itself —
+/// a value distinct from `"remove"`/`"ask"` — so [`run_reclaim`]'s string
+/// match falls through to its `_ => kept.push(r)` arm unconditionally,
+/// with no new match arm needed there at all.
+///
+/// Final round (reviewer F13 / auditor A1/B1): `owned` and `owner`/
+/// `owner_kind` below are now backed by `candidate.has_attach_lock` —
+/// whether [`candidate_has_attach_lock`] found the deck's own provenance
+/// artifact for this candidate under `state_dir()` (fix round 2 — see that
+/// function's own doc comment for why it is no longer looked up under any
+/// repository's `.git` at all) — resolved once in
+/// [`discover_isolated_clones`] and carried on
+/// [`IsolatedCloneCandidate`], mirroring how [`owned_git_dir`]'s
+/// containment check backs a linked row's `owned`. See
+/// `candidate_has_attach_lock`'s own doc comment for exactly what that
+/// artifact proves and its honest limits (same-uid still wins; best-effort
+/// provenance, not proof of current identity; a stale lock can outlive the
+/// clone it named). The marker's content is trusted — read at all — only
+/// when the attach lock is present; without it, `owner`/`owner_kind`
+/// report `"unknown"` with [`ISOLATED_CLONE_NO_ATTACH_LOCK_REASON`] rather
+/// than surfacing an unread, potentially forged claim (auditor B1's
+/// demonstrated attack). No removal decision is ever taken on any of this
+/// regardless — this function never calls [`decide`].
+fn isolated_clone_report(
+    repo_slug: Option<&str>,
+    candidate: IsolatedCloneCandidate,
+) -> WorktreeReport {
+    let IsolatedCloneCandidate {
+        path,
+        git_dir,
+        has_attach_lock,
+    } = candidate;
+    let branch = resolve_isolated_clone_branch(&path);
+    let cleanliness = check_cleanliness(&path);
+    let clean = cleanliness == Cleanliness::Clean;
+    // Auditor B3 (final round): `derive_repo_slug`/`gh pr list` are steered
+    // entirely by the candidate's own `origin`, which
+    // `provision_isolated_clone_sync` deliberately points at the SOURCE's
+    // origin rather than a local path (reviewer P1-1's prior decision) —
+    // but an untrusted candidate's `origin` can still be repointed by
+    // whoever wrote it. Requiring the candidate's derived slug to equal the
+    // root checkout's own before ever spending a `gh` call rejects that for
+    // (almost) free: a genuine deck-provisioned clone always matches, and a
+    // mismatch is itself a strong signal the candidate isn't one.
+    let pr_state = match &branch {
+        Some(b) if repo_slug.is_some() && derive_repo_slug(&path).as_deref() == repo_slug => {
+            resolve_pr_state(&path, b)
+        }
+        Some(_) => PrState::Unresolvable(
+            "isolated clone's derived repo slug does not match the root checkout's own -- gh is \
+             never queried against a repository this candidate's own (untrusted) origin chose \
+             (fork#325 M4a, auditor B3)"
+                .to_string(),
+        ),
+        None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
+    };
+    // Discovery already required this marker to be `is_file()`, but its
+    // content is only trusted once `has_attach_lock` has confirmed the
+    // deck's own attach-lock artifact for this candidate (final round —
+    // see `ISOLATED_CLONE_NO_ATTACH_LOCK_REASON`'s own doc comment for why
+    // an unread marker is safer than a read-but-unverified one).
+    let identity = if has_attach_lock {
+        read_marker_owner(&git_dir.join(OWNER_MARKER_FILENAME))
+    } else {
+        None
+    };
+    let (owner, owner_kind, owner_reason) = match identity {
+        Some(id) => (Some(id), "agent".to_string(), None),
+        None if has_attach_lock => (
+            // Auditor A4: this path's own reason, not the linked path's
+            // `LEGACY_MARKER_UNKNOWN_REASON` — that text asserts "it proves
+            // deck-creation," which this path cannot back up (see
+            // `ISOLATED_CLONE_MARKER_UNKNOWN_REASON`'s own doc comment).
+            None,
+            "unknown".to_string(),
+            Some(ISOLATED_CLONE_MARKER_UNKNOWN_REASON.to_string()),
+        ),
+        None => (
+            None,
+            "unknown".to_string(),
+            Some(ISOLATED_CLONE_NO_ATTACH_LOCK_REASON.to_string()),
+        ),
+    };
+    let real_path = path.clone();
+    WorktreeReport {
+        path,
+        branch,
+        clean,
+        owned: has_attach_lock,
+        pr_state: pr_state.label().to_string(),
+        verdict: KIND_ISOLATED_CLONE.to_string(),
+        reason: Some(
+            "isolated clone: automatic reclaim is deferred to a documented follow-up \
+             milestone -- never auto-removed by `worktree reclaim`, with or without --yes, \
+             regardless of PR state or cleanliness (mirrors RemovalPolicy::IsolatedClone's \
+             daemon-side precedent; fork#325 M4a)"
+                .to_string(),
+        ),
+        owner,
+        owner_kind,
+        owner_reason,
+        real_path,
+        removed_by: None,
+        kind: KIND_ISOLATED_CLONE.to_string(),
+    }
 }
 
 const DASH: &str = "-";
@@ -1502,9 +2173,17 @@ pub fn format_list_error_for_cli(e: &str) -> String {
 /// `--force`, since [`examine_worktrees`] already gated on cleanliness; git's
 /// own refusal on an unexpectedly dirty tree is a second line of defense
 /// rather than something to override. The `--` separator (issue #144 finding
-/// 4) is not reachable today — every path here came from `git worktree list`,
-/// which always emits absolute paths, so none can start with `-` — but it
-/// costs nothing and removes the assumption.
+/// 4) is not reachable today — not every [`WorktreeReport::real_path`] comes
+/// from `git worktree list` any more (fork#325 M4a's isolated-clone rows
+/// come from `read_dir` instead), but every path THIS function actually
+/// receives still does: [`run_reclaim`]'s match sends `kind ==
+/// "isolated_clone"` rows to its `kept` arm unconditionally and never calls
+/// this function for them (see [`isolated_clone_report`]'s own doc
+/// comment), so the conclusion holds even though its old justification —
+/// "every path here" — no longer describes every row this crate examines.
+/// `git worktree list` still always emits absolute paths, so none of the
+/// paths reaching this function can start with `-` — but the separator
+/// costs nothing and removes the assumption regardless.
 ///
 /// Takes the real `Path`, never a lossily-converted string (issue #144
 /// finding 4): `git worktree remove` realpath/symlink-resolves its argument
@@ -1834,12 +2513,17 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            // fork#325 M4a: `WorktreeReport` grows a `kind` field -- same
+            // reasoning as `owner`/`owner_kind` above, updated only so this
+            // pre-existing test keeps compiling; not itself coverage for
+            // the field (see `worktree_reclaim_049`-`052` for that).
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-a"),
             removed_by: None,
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(parsed["schema_version"], 3);
         assert!(json.contains("wt-a"));
     }
 
@@ -2692,6 +3376,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-owned"),
                 removed_by: None,
             },
@@ -2706,6 +3391,7 @@ mod tests {
                 pr_state: "merged".to_string(),
                 verdict: "remove".to_string(),
                 reason: Some("ready to remove".to_string()),
+                kind: KIND_LINKED.to_string(),
                 real_path: PathBuf::from("/repo/wt-legacy"),
                 removed_by: None,
             },
@@ -2776,6 +3462,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-disagree"),
             removed_by: None,
         };
@@ -2790,6 +3477,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-owned"),
             removed_by: None,
         };
@@ -2804,6 +3492,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-other"),
             removed_by: None,
         };
@@ -2824,6 +3513,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-foreign-marked"),
             removed_by: None,
         };
@@ -2838,6 +3528,7 @@ mod tests {
             pr_state: "unknown".to_string(),
             verdict: "keep".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: PathBuf::from("/repo/wt-unmarked"),
             removed_by: None,
         };
@@ -3015,6 +3706,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3064,6 +3756,7 @@ mod tests {
                  it created this worktree"
                     .to_string(),
             ),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         };
@@ -3108,6 +3801,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         };
@@ -3156,6 +3850,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: Some(remover),
         };
@@ -3204,6 +3899,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason.to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         };
@@ -3256,6 +3952,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: None,
+            kind: KIND_LINKED.to_string(),
             real_path: path.clone(),
             removed_by: None,
         }];
@@ -3395,6 +4092,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3444,6 +4142,7 @@ mod tests {
             pr_state: "unresolvable".to_string(),
             verdict: "keep".to_string(),
             reason: Some(reason),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3515,6 +4214,7 @@ mod tests {
             pr_state: "merged".to_string(),
             verdict: "remove".to_string(),
             reason: Some("ready to remove".to_string()),
+            kind: KIND_LINKED.to_string(),
             real_path: path,
             removed_by: None,
         }];
@@ -3782,6 +4482,1005 @@ mod tests {
             out.contains("could not be written"),
             "expected the warning's own wording to survive alongside the sanitized content, \
              got {out:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Fork #325 M4a: isolated-clone discovery (RED — no production code
+    // exists yet). An isolated clone (`provision_isolated_clone_sync`) is a
+    // fully independent `git clone` sibling of the repo, not a linked
+    // worktree -- `list_linked_worktrees`/`examine_worktrees` structurally
+    // cannot see it today, since it never appears in `git worktree list`'s
+    // output run from `repo_dir`. These tests pin the discovery surface
+    // this milestone slice adds: `examine_worktrees` must also enumerate
+    // deck-owned isolated clones sitting as siblings of `repo_dir`,
+    // distinguish them from an ordinary linked worktree in the report, and
+    // never assign one an automatic-removal verdict.
+    // -------------------------------------------------------------------
+
+    /// A genuine, independent `git clone` of `repo` at `clone_dir` -- the
+    /// same on-disk shape `provision_isolated_clone_sync` produces
+    /// (fork#325 M3): a real `.git` DIRECTORY, never a linked worktree's
+    /// `.git` FILE redirect. `origin` is repointed at the same GitHub URL
+    /// `init_repo_with_origin` gives `repo`, mirroring
+    /// `point_isolated_clone_origin`'s real behavior when the source has an
+    /// origin (fork#325 M3) -- a plain `git clone`'s default `origin`
+    /// (repo's own local filesystem path) would make `derive_repo_slug`
+    /// fail to parse a GitHub owner/repo, and every PR-state-dependent
+    /// assertion below would then be vacuous (`Unresolvable` already never
+    /// removes, so it would prove nothing about the isolated-clone-specific
+    /// gate under test).
+    fn clone_repo_with_github_origin(repo: &Path, clone_dir: &Path) {
+        let out = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--",
+                &repo.display().to_string(),
+                &clone_dir.display().to_string(),
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git clone failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = std::process::Command::new("git")
+            .current_dir(clone_dir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/test-org/test-repo.git",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote set-url failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Repoint `dir`'s `origin` remote at a URL `parse_github_owner_repo`
+    /// cannot parse (reviewer F6): `derive_repo_slug` then returns `None`
+    /// and `resolve_pr_state` fails closed to `PrState::Unresolvable`
+    /// without ever spawning the real, ambient `gh` -- for a test whose
+    /// assertions don't depend on the PR-state verdict, this is cheaper and
+    /// more hermetic than `write_merged_gh_stub`'s `PATH`-scoped stub.
+    fn set_non_github_origin(dir: &Path) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/test-org/test-repo.git",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote set-url failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
+    /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
+    /// own script shape.
+    #[cfg(unix)]
+    fn write_merged_gh_stub(bindir: &Path, branch: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Scenario: A real, deck-owned isolated clone (a genuine `git clone`
+    /// sibling of the repo, its own `.git` DIRECTORY, marked owned via the
+    /// same `mark_worktree_owned` call `provision_isolated_clone_sync` uses)
+    /// sits next to `repo`. `examine_worktrees(repo)` must report it --
+    /// today it is silently absent, since `list_linked_worktrees` (`git
+    /// worktree list`) structurally cannot see a directory that is not a
+    /// linked worktree of `repo` at all.
+    #[spec("worktree/reclaim/049")]
+    #[test]
+    fn worktree_reclaim_049_isolated_clone_is_discovered() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-issue-999");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        // Reviewer F6: this test's assertions don't depend on the PR-state
+        // verdict, so a non-GitHub origin keeps `resolve_pr_state` from
+        // spawning the real, ambient `gh`.
+        set_non_github_origin(&clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-999#999")
+            .expect("mark_worktree_owned must succeed against a real independent clone");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        assert!(
+            reports.iter().any(|r| r.real_path == clone_dir),
+            "a deck-owned isolated clone sitting as a sibling of the repo must be discoverable \
+             by examine_worktrees, got reports for paths: {:?}",
+            reports.iter().map(|r| &r.real_path).collect::<Vec<_>>()
+        );
+    }
+
+    /// Scenario: three sibling directories that must each NEVER be reported
+    /// as a discovered isolated clone: a plain directory with no `.git` at
+    /// all; an unrelated, independently-`git init`ed repo (its own `.git`
+    /// DIRECTORY, structurally identical to a real isolated clone) with no
+    /// marker; and a genuine `git clone` OF `repo` that carries no
+    /// ownership marker at all (a clone the deck did not make, or whose
+    /// marker write failed) -- alongside one genuine deck-owned isolated
+    /// clone that MUST appear. Discovery must never mistake "has a `.git`
+    /// directory" for "is a deck-owned isolated clone".
+    #[spec("worktree/reclaim/050")]
+    #[test]
+    fn worktree_reclaim_050_only_owned_isolated_clones_are_discovered() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        // (a) plain directory, no `.git` at all.
+        let plain_dir = scratch.path().join("repo-plain-sibling");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+
+        // (b) an unrelated, independent repo -- its own `.git` DIRECTORY,
+        // structurally identical to a real isolated clone, but not derived
+        // from `repo` and carrying no marker.
+        let unrelated_repo = scratch.path().join("repo-unrelated-sibling");
+        init_repo_with_origin(&unrelated_repo);
+
+        // (c) a genuine clone OF `repo`, but never marked owned -- the
+        // shape a clone the deck didn't create (or whose marker write
+        // failed) would have.
+        let unmarked_clone = scratch.path().join("repo-isolated-unmarked");
+        clone_repo_with_github_origin(&repo, &unmarked_clone);
+
+        // The one genuine positive: a deck-owned isolated clone.
+        let owned_clone = scratch.path().join("repo-isolated-owned");
+        clone_repo_with_github_origin(&repo, &owned_clone);
+        // Reviewer F6: `owned_clone` is the only candidate here that reaches
+        // `resolve_pr_state` (the others are filtered by discovery before
+        // that point), and this test's assertions don't depend on its
+        // PR-state verdict -- a non-GitHub origin keeps `resolve_pr_state`
+        // from spawning the real, ambient `gh`.
+        set_non_github_origin(&owned_clone);
+        mark_worktree_owned(&owned_clone, "issue-dispatch:isolated-owned#1000")
+            .expect("mark_worktree_owned must succeed");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let all_paths = || reports.iter().map(|r| &r.real_path).collect::<Vec<_>>();
+
+        assert!(
+            !reports.iter().any(|r| r.real_path == plain_dir),
+            "a plain sibling directory with no .git at all must never be reported, got \
+             paths: {:?}",
+            all_paths()
+        );
+        assert!(
+            !reports.iter().any(|r| r.real_path == unrelated_repo),
+            "an unrelated independent repo (its own .git directory, no marker) must never be \
+             reported, got paths: {:?}",
+            all_paths()
+        );
+        assert!(
+            !reports.iter().any(|r| r.real_path == unmarked_clone),
+            "a genuine clone of the repo carrying NO ownership marker must never be reported, \
+             got paths: {:?}",
+            all_paths()
+        );
+        assert!(
+            reports.iter().any(|r| r.real_path == owned_clone),
+            "the one genuine deck-owned isolated clone must still be reported alongside the \
+             exclusions above, got paths: {:?}",
+            all_paths()
+        );
+    }
+
+    /// Scenario: one ordinary linked worktree and one deck-owned isolated
+    /// clone are examined together. A consumer of the report (a human
+    /// table, or the `--json` document) must be able to tell them apart --
+    /// this is the whole reason M4a exists as discovery, not just presence:
+    /// treating an isolated clone as an ordinary worktree in the report
+    /// would make `worktree reclaim` reason about it exactly like a linked
+    /// worktree, which is the safety property M4a exists to prevent.
+    /// Checked through the `--json` document as `serde_json::Value`
+    /// (mirroring `worktree_reclaim_037`'s own precedent for a
+    /// not-yet-existing field) rather than a `WorktreeReport` struct field,
+    /// so this test's own RED signature is an assertion failure, not a
+    /// build break: today both rows are missing whatever field
+    /// distinguishes them, since neither the isolated clone (see
+    /// `worktree_reclaim_049`) nor a `kind` discriminator exists yet.
+    ///
+    /// Design decision (flagged for coder, see the work-done report): the
+    /// discriminator is a new `kind` field on `WorktreeReport`/the `--json`
+    /// document, `"linked"` for an ordinary worktree and `"isolated_clone"`
+    /// for a discovered isolated clone.
+    #[spec("worktree/reclaim/051")]
+    #[test]
+    fn worktree_reclaim_051_isolated_clone_report_is_distinguishable_from_linked_worktree() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+        // Reviewer F6: `linked_wt` below shares `repo`'s remotes (a linked
+        // worktree, not a clone), so `resolve_pr_state` would otherwise
+        // resolve `repo`'s GitHub-shaped origin and spawn the real, ambient
+        // `gh` for it too -- this test's assertions don't depend on either
+        // row's PR-state verdict.
+        set_non_github_origin(&repo);
+
+        let linked_wt = scratch.path().join("repo-linked");
+        add_worktree(&repo, &linked_wt, "feat/linked");
+        mark_worktree_owned(&linked_wt, "orch-linked").expect("mark_worktree_owned must succeed");
+
+        let clone_dir = scratch.path().join("repo-isolated-distinguish");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        set_non_github_origin(&clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-distinguish#1001")
+            .expect("mark_worktree_owned must succeed");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let worktrees = parsed["worktrees"]
+            .as_array()
+            .expect("worktrees must be a JSON array");
+
+        let find_kind = |path: &Path| -> Option<String> {
+            let path_str = path.to_string_lossy().into_owned();
+            worktrees
+                .iter()
+                .find(|w| w["path"].as_str() == Some(path_str.as_str()))
+                .map(|w| w["kind"].to_string())
+        };
+
+        let linked_kind = find_kind(&linked_wt);
+        let clone_kind = find_kind(&clone_dir);
+
+        assert_ne!(
+            linked_kind, clone_kind,
+            "an isolated clone's report must carry a `kind` distinguishable from an ordinary \
+             linked worktree's report -- got linked={linked_kind:?} isolated_clone={clone_kind:?}"
+        );
+        // The RED assertion: today no discriminator field exists at all, and
+        // the isolated clone isn't even reported (see worktree_reclaim_049),
+        // so `clone_kind` is `None` -- this fails until both land.
+        assert_eq!(
+            clone_kind.as_deref(),
+            Some("\"isolated_clone\""),
+            "the isolated clone's `kind` field must read exactly \"isolated_clone\" in the \
+             --json document, got {clone_kind:?}"
+        );
+    }
+
+    /// Scenario: a deck-owned isolated clone that is CLEAN and whose branch
+    /// has a MERGED PR -- the exact combination that makes an ordinary
+    /// linked worktree `Verdict::Remove` -- must never be automatically
+    /// removed by `worktree reclaim`, with or without `--yes`. This is
+    /// M4a's deliberate, conservative stopping point: whether an isolated
+    /// clone ever becomes safely auto-reclaimable (and under what stricter
+    /// condition) is left to a documented follow-up, not implemented here.
+    #[spec("worktree/reclaim/052")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_052_isolated_clone_never_gets_an_automatic_removal_verdict() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-never-removed");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-never-removed#1002")
+            .expect("mark_worktree_owned must succeed");
+
+        // `git clone` checks out the source's HEAD branch ("main") with no
+        // local changes -- clean by construction. The gh stub answers
+        // MERGED for that exact branch, so every gate an ordinary linked
+        // worktree would need to reach `Verdict::Remove` is satisfied here.
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub(&bindir, "main");
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+        assert_ne!(
+            clone_report.verdict.as_str(),
+            "remove",
+            "a clean, PR-merged isolated clone must never get an automatic-removal verdict, \
+             got {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Neither a bare reclaim nor `--yes` may actually delete it.
+        let bare = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !bare.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` must never remove an isolated clone, got removed: {:?}",
+            bare.removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the isolated clone directory must still exist on disk after a bare reclaim"
+        );
+
+        let confirmed = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !confirmed.removed.iter().any(|r| r.real_path == clone_dir),
+            "`worktree reclaim --yes` must never remove an isolated clone either -- M4a defers \
+             automatic isolated-clone reclaim to a documented follow-up, got removed: {:?}",
+            confirmed
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the isolated clone directory must still exist on disk after `reclaim --yes`"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4 final round (reviewer F13 / auditor
+    /// A1/B1) -- the gap coder flagged after replacing
+    /// `candidate_shares_history_with` with `candidate_has_attach_lock`.
+    /// None of `worktree_reclaim_049`-`052` build their fixture through the
+    /// real `provision_isolated_clone_sync`, so none of them ever produce a
+    /// genuine attach-lock artifact and the new `owned: true` path had zero
+    /// coverage. This test calls the real production provisioner directly
+    /// against a real source repo, then asserts `examine_worktrees` reports
+    /// the resulting clone with `owned: true` and the exact `owner`/
+    /// `owner_kind` the provisioner's own marker write recorded --
+    /// `candidate_has_attach_lock` recognizing a clone the deck's own code
+    /// actually created is the security fix this round exists for.
+    #[spec("worktree/reclaim/053")]
+    #[test]
+    fn worktree_reclaim_053_isolated_clone_with_real_attach_lock_reports_owned_true() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-real-lock");
+        let creator = "issue-dispatch:real-lock#1003";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "real-lock-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+        // Reviewer F6: this test's assertions don't depend on the PR-state
+        // verdict, so a non-GitHub origin (set only AFTER provisioning has
+        // already written the attach lock and the marker) keeps
+        // `resolve_pr_state` from spawning the real, ambient `gh`.
+        set_non_github_origin(&clone_dir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "a clone provisioned through the real provision_isolated_clone_sync must be \
+             discovered by examine_worktrees",
+        );
+
+        assert!(
+            clone_report.owned,
+            "a genuine isolated clone carrying the real attach-lock artifact \
+             provision_isolated_clone_sync writes must report owned: true -- if this is ever \
+             false, candidate_has_attach_lock no longer recognizes the deck's own real \
+             provisioning output, and this security fix has zero coverage; got {clone_report:?}"
+        );
+        assert_eq!(
+            clone_report.owner.as_deref(),
+            Some(creator),
+            "owner must read back the exact creator identity the real marker write recorded, \
+             got {:?}",
+            clone_report.owner
+        );
+        assert_eq!(
+            clone_report.owner_kind, "agent",
+            "a marker-backed isolated clone's owner_kind must be \"agent\", got {:?}",
+            clone_report.owner_kind
+        );
+        assert_eq!(clone_report.kind, KIND_ISOLATED_CLONE);
+        assert!(
+            clone_report.owner_reason.is_none(),
+            "an agent-owned row carries no owner_reason, got {:?}",
+            clone_report.owner_reason
+        );
+    }
+
+    /// Scenario: fork issue #325 M4 final round, auditor A1/B1's exact
+    /// forgery -- a sibling directory whose `.git` is a plain directory
+    /// (no real git objects, refs, or config), a `HEAD` file containing a
+    /// REAL but unrelated-to-this-candidate commit SHA as plain text (the
+    /// shape the earlier, since-removed `candidate_shares_history_with`
+    /// check could not distinguish from a genuine clone), and a
+    /// hand-planted `dot-agent-deck-owner` marker claiming an arbitrary
+    /// identity -- but no attach-lock artifact, since a same-uid attacker
+    /// able only to plant a sibling directory cannot write into this
+    /// process's own `state_dir()`. `examine_worktrees` must still discover it
+    /// (discovery stays purely structural) but must report `owned: false`
+    /// / `owner_kind: "unknown"` with `ISOLATED_CLONE_NO_ATTACH_LOCK_REASON`,
+    /// and it must never satisfy `is_mine` for any identity -- including
+    /// the exact one the forged, unread marker claims.
+    #[spec("worktree/reclaim/054")]
+    #[test]
+    fn worktree_reclaim_054_forged_isolated_clone_without_attach_lock_reports_owned_false() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        // A real commit SHA the repo genuinely has -- unrelated to the
+        // forged candidate below, which never actually holds it as a git
+        // object of its own.
+        let head_sha_out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse HEAD must spawn");
+        assert!(
+            head_sha_out.status.success(),
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&head_sha_out.stderr)
+        );
+        let head_sha = String::from_utf8_lossy(&head_sha_out.stdout)
+            .trim()
+            .to_string();
+
+        let forged = scratch.path().join("repo-isolated-forged");
+        let forged_git_dir = forged.join(".git");
+        std::fs::create_dir_all(&forged_git_dir).unwrap();
+        // No real git objects/refs/config anywhere -- a 2-file forgery
+        // (HEAD + the owner marker), exactly auditor B1's reproduction:
+        // no git invocation at all was needed to build this.
+        std::fs::write(forged_git_dir.join("HEAD"), format!("{head_sha}\n")).unwrap();
+        std::fs::write(
+            forged_git_dir.join(OWNER_MARKER_FILENAME),
+            "deck\ncreated-by: attacker-forged-identity\n",
+        )
+        .unwrap();
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let forged_report = reports.iter().find(|r| r.real_path == forged).expect(
+            "a structurally-present sibling (.git directory + owner marker) must still be \
+             discovered even with no attach lock at all -- discovery stays purely structural, \
+             only `owned` is affected",
+        );
+
+        assert!(
+            !forged_report.owned,
+            "a forged marker with no matching attach-lock artifact must never report \
+             owned: true, got {forged_report:?}"
+        );
+        assert_eq!(
+            forged_report.owner_kind, "unknown",
+            "got owner_kind {:?}",
+            forged_report.owner_kind
+        );
+        assert_eq!(
+            forged_report.owner, None,
+            "the forged marker's content must never be read/trusted absent a matching attach \
+             lock, got owner {:?}",
+            forged_report.owner
+        );
+        assert_eq!(
+            forged_report.owner_reason.as_deref(),
+            Some(ISOLATED_CLONE_NO_ATTACH_LOCK_REASON),
+            "got owner_reason {:?}",
+            forged_report.owner_reason
+        );
+        assert!(
+            !is_mine(forged_report, "attacker-forged-identity"),
+            "the forged row must never satisfy --mine, even for the exact identity its own \
+             (untrusted, unread) marker claims"
+        );
+        assert!(
+            !is_mine(forged_report, "test-remover"),
+            "the forged row must never satisfy --mine for any other identity either"
+        );
+    }
+
+    /// Scenario: auditor B4 -- `examine_worktrees` invoked from a
+    /// SUBDIRECTORY of the root checkout (not the checkout root itself)
+    /// must still discover a sibling isolated clone. `discover_isolated_clones`
+    /// derives its scan anchor via `resolve_common_dir`, never assumes
+    /// `repo_dir` already IS the root checkout -- reviewer/auditor manually
+    /// re-verified this in the fix round, but nothing in the test suite
+    /// pinned it, so a regression back to anchoring on `repo_dir`'s own
+    /// parent (auditor A2's original defect) would silently miss every real
+    /// isolated clone whenever `examine_worktrees` is invoked from a
+    /// subdirectory, with every other test in this file still passing.
+    /// Reuses `worktree_reclaim_049`'s exact fixture shape, only calling
+    /// `examine_worktrees` against a real subdirectory of `repo` instead of
+    /// `repo` itself, and compares the two resulting reports directly.
+    #[spec("worktree/reclaim/055")]
+    #[test]
+    fn worktree_reclaim_055_subdirectory_anchor_still_discovers_sibling_isolated_clone() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let subdir = repo.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let clone_dir = scratch.path().join("repo-isolated-subdir-anchor");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        // Reviewer F6: this test's assertions don't depend on the PR-state
+        // verdict, so a non-GitHub origin keeps `resolve_pr_state` from
+        // spawning the real, ambient `gh`.
+        set_non_github_origin(&clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:subdir-anchor#1004")
+            .expect("mark_worktree_owned must succeed against a real independent clone");
+
+        let from_root =
+            examine_worktrees(&repo).expect("examine_worktrees must succeed from the root");
+        let from_subdir = examine_worktrees(&subdir)
+            .expect("examine_worktrees must succeed from a subdirectory of the root");
+
+        // Matched via `paths_refer_to_same_dir`, not raw `==` (this module's
+        // own `discover_isolated_clones` doc comment, "M4a Windows/macOS
+        // fix"): the subdirectory case's anchor comes from
+        // `resolve_common_dir`'s git-resolved spelling, while `clone_dir`
+        // here is built via plain `Path::join` on the caller's own
+        // unresolved `scratch.path()` -- on macOS `/var/folders/...` is
+        // itself a symlink to `/private/var/folders/...`, so the two
+        // spellings differ even though they name the same directory.
+        // Reproduced directly in CI: this test failed on `build-macos`
+        // with a raw `==` comparison, passed on `build`/`build-windows`,
+        // exactly the platform split that doc comment predicts.
+        let find = |reports: &[WorktreeReport]| -> Option<WorktreeReport> {
+            reports
+                .iter()
+                .find(|r| paths_refer_to_same_dir(&r.real_path, &clone_dir))
+                .cloned()
+        };
+        let root_entry = find(&from_root).expect(
+            "sanity: the isolated clone must be discovered when examine_worktrees is called \
+             against the root checkout itself -- see worktree_reclaim_049",
+        );
+        let subdir_entry = find(&from_subdir).expect(
+            "the isolated clone must be discovered identically when examine_worktrees is \
+             called from a SUBDIRECTORY of the root checkout -- this is exactly the case \
+             auditor A2's fix was for; a regression back to anchoring on repo_dir's own parent \
+             would silently miss this row from a subdirectory while every root-anchored test \
+             in this file kept passing",
+        );
+
+        assert_eq!(
+            root_entry.kind, subdir_entry.kind,
+            "kind must be identical whether examine_worktrees is invoked from the root or a \
+             subdirectory"
+        );
+        assert_eq!(
+            root_entry.owned, subdir_entry.owned,
+            "owned must be identical whether examine_worktrees is invoked from the root or a \
+             subdirectory"
+        );
+        assert_eq!(
+            root_entry.owner, subdir_entry.owner,
+            "owner must be identical whether examine_worktrees is invoked from the root or a \
+             subdirectory"
+        );
+        assert_eq!(
+            root_entry.owner_kind, subdir_entry.owner_kind,
+            "owner_kind must be identical whether examine_worktrees is invoked from the root \
+             or a subdirectory"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4b (reviewer P1) -- the attach-lock
+    /// namespace `candidate_has_attach_lock` checks is the SAME one
+    /// `create_worktree_sync` writes into for an ordinary linked worktree,
+    /// not isolated-clone-specific. A linked worktree is created through
+    /// the real production path (writing a genuine attach-lock artifact),
+    /// removed normally via `git worktree remove`, and a same-uid attacker
+    /// then plants a forged `.git` directory plus a forged ownership
+    /// marker at that exact now-vacant path -- no attach lock forged at
+    /// all, since it inherits the genuine, already-written one. This
+    /// asserts the CORRECT, not-yet-shipped behavior (the forged occupant
+    /// must never report `owned: true`), so it is RED today: the inherited
+    /// lock currently makes it pass.
+    #[spec("worktree/reclaim/056")]
+    #[test]
+    fn worktree_reclaim_056_forged_directory_inherits_a_vacated_linked_worktree_lock() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let worktree_dir = scratch.path().join("wt-later-forged");
+        let creation = crate::issue_dispatch_run::create_worktree_sync(
+            &repo,
+            &worktree_dir,
+            "feat/later-forged",
+            "test-creator",
+        )
+        .expect("create_worktree_sync must succeed against a real git repo");
+        assert!(
+            matches!(
+                creation,
+                crate::issue_dispatch_run::WorktreeCreation::Created {
+                    marker_warning: None
+                }
+            ),
+            "sanity: the linked worktree must be created cleanly, got {creation:?}"
+        );
+
+        // Remove it normally -- the attach-lock artifact `create_worktree_sync`
+        // wrote is never cleaned up on this path, which is the whole
+        // residual under test.
+        let remove = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(&worktree_dir)
+            .output()
+            .expect("git worktree remove must spawn");
+        assert!(
+            remove.status.success(),
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&remove.stderr)
+        );
+        assert!(
+            !worktree_dir.exists(),
+            "sanity: the worktree directory must actually be gone after removal"
+        );
+
+        // Same-uid attacker plants a forged `.git` dir + forged ownership
+        // marker at the exact now-vacant path.
+        let forged_git_dir = worktree_dir.join(".git");
+        std::fs::create_dir_all(&forged_git_dir).unwrap();
+        std::fs::write(
+            forged_git_dir.join(OWNER_MARKER_FILENAME),
+            "deck\ncreated-by: attacker-forged-identity\n",
+        )
+        .unwrap();
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let forged_report = reports.iter().find(|r| r.real_path == worktree_dir).expect(
+            "a structurally-present forged directory (.git dir + owner marker) must still \
+                 be discovered -- discovery stays purely structural",
+        );
+
+        assert!(
+            !forged_report.owned,
+            "a forged directory occupying a path whose attach-lock artifact was written for a \
+             PRIOR, now-removed linked worktree must never report owned: true merely by \
+             inheriting that lock -- fork#325 M4b (reviewer P1); got {forged_report:?}"
+        );
+        assert!(
+            !is_mine(forged_report, "attacker-forged-identity"),
+            "the forged row must never satisfy --mine for the identity its own forged marker \
+             claims"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4b (auditor C1) -- `provision_isolated_clone_sync`
+    /// acquires the attach lock (writing the artifact unconditionally)
+    /// BEFORE checking whether `clone_dir` already exists. A same-uid
+    /// attacker who pre-plants a forged `.git` dir plus a forged ownership
+    /// marker at the fully deterministic dispatch path gets the deck's own
+    /// provisioner to write a genuine attach-lock artifact vouching for it,
+    /// even though the dispatch itself then visibly fails as
+    /// `AlreadyClaimed` and nothing ever actually attaches into the
+    /// planted directory. Asserts the CORRECT, not-yet-shipped behavior --
+    /// RED today.
+    #[spec("worktree/reclaim/057")]
+    #[test]
+    fn worktree_reclaim_057_pre_planted_directory_survives_already_claimed_as_owned() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let target_dir = scratch.path().join("repo-isolated-preplanted");
+        let forged_git_dir = target_dir.join(".git");
+        std::fs::create_dir_all(&forged_git_dir).unwrap();
+        std::fs::write(
+            forged_git_dir.join(OWNER_MARKER_FILENAME),
+            "deck\ncreated-by: attacker-forged-identity\n",
+        )
+        .unwrap();
+
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &target_dir,
+            "real-branch",
+            "legit-dispatcher",
+        )
+        .expect(
+            "provision_isolated_clone_sync must not hard-error against a pre-existing directory",
+        );
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::AlreadyClaimed
+            ),
+            "sanity: a pre-existing directory at the deterministic dispatch path must be \
+             reported as AlreadyClaimed, not silently cloned into, got {outcome:?}"
+        );
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let forged_report = reports.iter().find(|r| r.real_path == target_dir).expect(
+            "the pre-planted directory must still be discovered -- discovery stays purely \
+             structural",
+        );
+
+        assert!(
+            !forged_report.owned,
+            "a directory that merely happened to occupy a path BEFORE a legitimate dispatch \
+             attempt acquired the lock for it (bounded by AlreadyClaimed) must never report \
+             owned: true -- fork#325 M4b (auditor C1); got {forged_report:?}"
+        );
+        assert!(
+            !is_mine(forged_report, "attacker-forged-identity"),
+            "the forged row must never satisfy --mine for the identity its own forged marker \
+             claims"
+        );
+        assert!(
+            target_dir.exists(),
+            "sanity: AlreadyClaimed must never delete or modify the pre-existing directory"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4b (reviewer F2) -- `discover_isolated_clones`
+    /// anchors its scan on the INVOKING repo's own common `.git` dir
+    /// (`resolve_common_dir(repo_dir)`), so calling `examine_worktrees`
+    /// with `repo_dir` set to an isolated clone's OWN directory resolves
+    /// `common_dir` to the CLONE's own `.git`, not the root checkout's --
+    /// where every attach-lock artifact this milestone relies on actually
+    /// lives. The Nth-concurrent-orchestration gate this milestone exists
+    /// to serve runs, by definition, FROM inside an isolated clone, so a
+    /// sibling clone the SAME identity owns currently reports owned: false
+    /// from there. Asserts the CORRECT, not-yet-shipped behavior -- RED
+    /// today.
+    #[spec("worktree/reclaim/058")]
+    #[test]
+    fn worktree_reclaim_058_mine_discoverable_from_inside_a_sibling_isolated_clone() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let creator = "issue-dispatch:from-inside-clone#1006";
+        let clone_a = scratch.path().join("repo-isolated-a");
+        crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo, &clone_a, "branch-a", creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed for clone A");
+        set_non_github_origin(&clone_a);
+
+        let clone_b = scratch.path().join("repo-isolated-b");
+        crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo, &clone_b, "branch-b", creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed for clone B");
+        set_non_github_origin(&clone_b);
+
+        // Invoked with repo_dir set to clone A's OWN directory -- exactly
+        // what the Nth-concurrent-orchestration gate does when it runs
+        // `worktree list --mine` from inside its own isolated clone.
+        let reports_from_a = examine_worktrees(&clone_a)
+            .expect("examine_worktrees must succeed from inside clone A");
+
+        let clone_b_report = reports_from_a
+            .iter()
+            .find(|r| r.real_path == clone_b)
+            .expect(
+                "sibling clone B must be discovered when examine_worktrees runs from inside \
+                 clone A -- both are siblings of the same root checkout",
+            );
+
+        assert!(
+            is_mine(clone_b_report, creator),
+            "a sibling isolated clone owned by the SAME identity must satisfy --mine when \
+             examine_worktrees runs from inside another isolated clone, not just from the root \
+             checkout -- fork#325 M4b (reviewer F2); got {clone_b_report:?}"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4b (auditor B4, automating auditor A1
+    /// item 2's original manual finding) -- `discover_isolated_clones`
+    /// checks `entry.file_type().is_symlink()` (which does NOT traverse
+    /// the symlink) before ever treating a sibling as a candidate, so a
+    /// symlinked sibling pointing at a genuine, owned isolated clone is
+    /// skipped rather than followed and reported under the symlink's own
+    /// path. No automated test pinned this before -- it was only
+    /// re-verified by hand.
+    #[spec("worktree/reclaim/059")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_059_symlinked_sibling_is_skipped_not_followed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let real_clone = scratch.path().join("repo-isolated-real");
+        clone_repo_with_github_origin(&repo, &real_clone);
+        set_non_github_origin(&real_clone);
+        mark_worktree_owned(&real_clone, "issue-dispatch:symlink-real#1007")
+            .expect("mark_worktree_owned must succeed");
+
+        let symlinked_sibling = scratch.path().join("repo-isolated-symlink");
+        std::os::unix::fs::symlink(&real_clone, &symlinked_sibling)
+            .expect("create symlink sibling pointing at the real clone");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+
+        assert!(
+            reports.iter().any(|r| r.real_path == real_clone),
+            "sanity: the real, owned isolated clone must be discovered directly"
+        );
+        assert!(
+            !reports.iter().any(|r| r.real_path == symlinked_sibling),
+            "a symlinked sibling must be SKIPPED, never followed and reported under the \
+             symlink's own path -- fork#325 M4b / auditor A1 item 2 (previously only manually \
+             verified), got paths: {:?}",
+            reports.iter().map(|r| &r.real_path).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reports.iter().filter(|r| r.real_path == real_clone).count(),
+            1,
+            "the real clone must be reported exactly once, not once per alias"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4b (auditor B4, automating auditor A3's
+    /// original manual PoC) -- `git_in_untrusted_dir` passes `-c
+    /// core.fsmonitor=` on every git invocation against a discovery
+    /// candidate, closing the code-execution vector auditor's own lab
+    /// demonstrated by setting `core.fsmonitor` to an arbitrary program and
+    /// observing it run during `worktree list`. This plants the same
+    /// payload (`git -C <candidate> config core.fsmonitor <payload>`)
+    /// against a real clone sibling and proves the payload's sentinel file
+    /// is never created when `examine_worktrees` runs.
+    #[spec("worktree/reclaim/060")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_060_forged_core_fsmonitor_payload_never_executes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let hostile_clone = scratch.path().join("repo-isolated-hostile");
+        clone_repo_with_github_origin(&repo, &hostile_clone);
+        set_non_github_origin(&hostile_clone);
+        mark_worktree_owned(&hostile_clone, "issue-dispatch:fsmonitor-poc#1008")
+            .expect("mark_worktree_owned must succeed");
+
+        let sentinel = scratch.path().join("pwned.txt");
+        let payload_path = scratch.path().join("payload.sh");
+        std::fs::write(
+            &payload_path,
+            format!("#!/bin/sh\nprintf 'PWNED\\n' >> '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&payload_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Mirrors auditor A3's own PoC exactly: `git -C hostile-clone
+        // config core.fsmonitor <payload>`, the shape `git status` (run by
+        // `check_cleanliness` inside `isolated_clone_report`) would honour
+        // absent the `-c core.fsmonitor=` override.
+        let out = std::process::Command::new("git")
+            .current_dir(&hostile_clone)
+            .args([
+                "config",
+                "core.fsmonitor",
+                &payload_path.display().to_string(),
+            ])
+            .output()
+            .expect("git config must spawn");
+        assert!(
+            out.status.success(),
+            "git config core.fsmonitor failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        assert!(
+            reports.iter().any(|r| r.real_path == hostile_clone),
+            "sanity: the hostile clone must still be discovered and processed \
+             (check_cleanliness runs against it)"
+        );
+
+        assert!(
+            !sentinel.exists(),
+            "a forged core.fsmonitor payload on a discovery candidate must NEVER execute \
+             during examine_worktrees -- fork#325 M4a auditor A3 / M4b B4 (previously only \
+             manually verified)"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4b reviewer R1 / auditor D1 (blocker,
+    /// PR #515) -- the bare 3-file forgery, with NO `git clone` and NO
+    /// call into `provision_isolated_clone_sync` anywhere in the chain: a
+    /// sibling `.git` directory, a hand-planted `dot-agent-deck-owner`
+    /// marker claiming an arbitrary identity, and a self-planted, empty
+    /// [`ISOLATED_CLONE_PROVENANCE_FILENAME`] file -- exactly auditor D1's
+    /// Lab A reproduction. `candidate_has_attach_lock` currently checks
+    /// only `.is_file()` on that last path, a path fully inside the
+    /// candidate's own (attacker-controlled) `.git`, so today's forgery
+    /// costs one extra `touch` over test 054's and currently reports
+    /// `owned: true`, attributing the forged identity and satisfying
+    /// `--mine` for it. Asserts the CORRECT, not-yet-shipped behavior --
+    /// RED today.
+    #[spec("worktree/reclaim/061")]
+    #[test]
+    fn worktree_reclaim_061_bare_three_file_forgery_of_provenance_artifact_itself_reports_owned_false()
+     {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let forged = scratch.path().join("repo-isolated-bare-forged");
+        let forged_git_dir = forged.join(".git");
+        std::fs::create_dir_all(&forged_git_dir).unwrap();
+        std::fs::write(
+            forged_git_dir.join(OWNER_MARKER_FILENAME),
+            "deck\ncreated-by: orchestration:victim\n",
+        )
+        .unwrap();
+        // The whole point: the attacker plants the provenance artifact
+        // itself -- no git invocation, no real provisioning call, nothing
+        // outside these three attacker-written files.
+        std::fs::write(forged_git_dir.join(ISOLATED_CLONE_PROVENANCE_FILENAME), b"").unwrap();
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let forged_report = reports.iter().find(|r| r.real_path == forged).expect(
+            "a structurally-present sibling (.git directory + owner marker) must still be \
+             discovered -- discovery stays purely structural",
+        );
+
+        assert!(
+            !forged_report.owned,
+            "a bare 3-file forgery -- .git dir, owner marker, and a self-planted provenance \
+             artifact, with no git clone and no provisioning call involved at all -- must never \
+             report owned: true; fork#325 M4b reviewer R1 / auditor D1, got {forged_report:?}"
+        );
+        assert_eq!(
+            forged_report.owner, None,
+            "the forged marker's content must never be read/trusted off a self-planted \
+             provenance artifact, got owner {:?}",
+            forged_report.owner
+        );
+        assert!(
+            !is_mine(forged_report, "orchestration:victim"),
+            "the forged row must never satisfy --mine, even for the exact identity its own \
+             self-planted marker claims"
+        );
+        assert!(
+            !is_mine(forged_report, "test-remover"),
+            "the forged row must never satisfy --mine for any other identity either"
         );
     }
 }

@@ -1436,6 +1436,31 @@ pub(crate) fn provision_isolated_clone_sync(
         return handle_isolated_clone_add_error(err, clone_dir, creator);
     }
 
+    // Fork#325 M4b (reviewer P1 / auditor C1): write the isolated-clone-
+    // specific provenance artifact now — the `clone_dir.exists()` check
+    // above already ruled out a pre-planted directory (auditor C1's
+    // residual: a call that hits `AlreadyClaimed` returns before this line
+    // and never writes it), and the `git clone` immediately above just
+    // succeeded, so `clone_dir` genuinely is a fresh clone this call itself
+    // created. Deliberately a separate location/namespace from the
+    // attach-lock file above, which `create_worktree_sync` also writes into
+    // for an ordinary linked worktree (reviewer P1's residual: that shared
+    // namespace let a forged occupant of a since-removed linked worktree's
+    // path inherit its leftover lock) — see
+    // `ISOLATED_CLONE_PROVENANCE_FILENAME`'s doc comment in
+    // `worktree_reclaim.rs` for the full reasoning. Best-effort: a write
+    // failure here does not fail the whole provisioning call, since the
+    // clone itself is already fully usable — it only means this clone will
+    // never report `owned: true` from `worktree list`.
+    if let Err(e) = write_isolated_clone_provenance(clone_dir) {
+        tracing::warn!(
+            clone = %clone_dir.display(),
+            error = %e,
+            "issue-dispatch: could not write isolated-clone provenance artifact; this clone \
+             will never report owned: true from `worktree list`"
+        );
+    }
+
     // Issue #325 reviewer P1 (fix round 2): read the source's own origin URL
     // now — a pure, side-effect-free read — and, when the source HAS an
     // origin, point the clone's `origin` at it IMMEDIATELY, before the
@@ -2471,6 +2496,102 @@ fn mark_worktree_owned_best_effort(worktree_dir: &Path, creator: &str) -> Option
     }
 }
 
+/// Filesystem location of fork#325 M4b's isolated-clone-specific provenance
+/// artifact ([`crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME`]'s
+/// doc comment). M4b's first attempt put this inside `clone_dir`'s own
+/// `.git` directory — reviewer R1 / auditor D1 (blocker, PR #515) reopened
+/// auditor A1/B1's forgery on that: a same-uid attacker who can plant a
+/// sibling directory at all can, by definition, write into a `.git` it
+/// created itself, so evidence living there is forgeable with a bare
+/// `touch`. This fix moves the artifact OUTSIDE every candidate entirely,
+/// into [`crate::platform::paths::state_dir`] — a directory only this
+/// process's own uid can write, never a directory any candidate controls —
+/// keyed by [`crate::platform::lock::fnv1a64`] of the canonical clone path,
+/// the exact same keying scheme [`worktree_attach_lock_path_from_common_dir`]
+/// already uses for the (unrelated) cross-process attach lock; reused here
+/// rather than reinvented.
+///
+/// Resolves identically at write time ([`write_isolated_clone_provenance`],
+/// called once `clone_dir` genuinely exists) and at check time
+/// ([`crate::worktree_reclaim::candidate_has_attach_lock`], called on a
+/// directory `discover_isolated_clones` already found on disk), because
+/// [`canonicalize_best_effort`] always resolves through the PARENT and
+/// rejoins the file name regardless of whether the full path exists yet —
+/// see that function's own doc comment for the write-time/check-time
+/// divergence this exact pattern once caused on Windows (fork #331 audit
+/// B2), deliberately avoided here too rather than reintroduced.
+///
+/// This also serves reviewer F2 (`discover_isolated_clones` invoked from
+/// inside an isolated clone itself) better than the candidate-local design
+/// did: `state_dir()` resolves identically regardless of where the caller
+/// is rooted — the root checkout, a subdirectory of it, or another isolated
+/// clone entirely — so no `common_dir` resolution is needed at all, and no
+/// trust is placed in the candidate to find it.
+pub(crate) fn isolated_clone_provenance_path(clone_dir: &Path) -> PathBuf {
+    let canonical_clone_dir = canonicalize_best_effort(clone_dir);
+    let hash = crate::platform::lock::fnv1a64(canonical_clone_dir.to_string_lossy().as_bytes());
+    let basename = canonical_clone_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("clone");
+    crate::platform::paths::state_dir()
+        .join(crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME)
+        .join(format!("{basename}-{hash:016x}"))
+}
+
+/// Write fork#325 M4b's isolated-clone-specific provenance artifact at
+/// [`isolated_clone_provenance_path`]'s resolved location. Called only from
+/// [`provision_isolated_clone_sync`], only once its own `clone_dir.exists()`
+/// check and the `git clone` immediately above have both already
+/// succeeded, so this genuinely vouches for a clone this call itself just
+/// created.
+///
+/// Atomic write-then-rename, mirroring [`mark_worktree_owned`]'s own
+/// pattern in `worktree_reclaim.rs` for the identical reason: on ENOSPC or
+/// a process kill mid-write, a plain `std::fs::write` could leave a
+/// partially-written file at the final path, which `candidate_has_attach_lock`
+/// checks via presence alone (`Path::is_file`) — a half-written file would
+/// resolve exactly as a complete one. The pid-suffixed temp name lives in
+/// the same directory (same filesystem, so `rename(2)` is atomic) and is
+/// cleaned up on every error path, so the final path is only ever created
+/// by a rename of a fully-written file.
+///
+/// The containing directory is created owner-only (`ensure_owner_only_dir`,
+/// the same helper [`worktree_attach_lock_path`]'s own callers already use
+/// for the sibling lock directory) — this is now a directory outside any
+/// candidate's control, so nothing else needs to defend it, but an
+/// attacker with same-uid access to this process's own `state_dir()` was
+/// never in scope for any check on this path (the honest same-uid ceiling
+/// every mechanism here shares with [`crate::worktree_reclaim::owned_git_dir`]).
+///
+/// [`mark_worktree_owned`]: crate::worktree_reclaim::mark_worktree_owned
+fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
+    let marker_path = isolated_clone_provenance_path(clone_dir);
+    let parent = marker_path.parent().expect(
+        "isolated_clone_provenance_path always nests under state_dir(), which has a parent",
+    );
+    crate::platform::fsperm::ensure_owner_only_dir(parent).map_err(|e| {
+        format!(
+            "failed to prepare isolated-clone provenance directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    let file_name = marker_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("provenance");
+    let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
+
+    std::fs::write(&tmp_path, b"deck\n").map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to write isolated-clone provenance artifact: {e}")
+    })?;
+    std::fs::rename(&tmp_path, &marker_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to finalize isolated-clone provenance artifact: {e}")
+    })
+}
+
 /// Issue #164: surface a [`WorktreeCreation::Created`] marker-write warning
 /// through the [`Notifier`] seam, if there is one — called only from
 /// [`dispatch_one_issue`], the scheduled-dispatch caller of the async
@@ -2575,7 +2696,23 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<Pa
 /// the bounded [`git_common_dir_async`] instead of going through the
 /// unbounded sync [`git_common_dir`]. Pure and infallible: everything that
 /// can fail already happened in resolving `common_dir`.
-fn worktree_attach_lock_path_from_common_dir(common_dir: &Path, worktree_dir: &Path) -> PathBuf {
+///
+/// `pub(crate)`, not private: [`create_worktree`]'s async prologue needs it
+/// directly (see the doc comment above). Fork#325 M4a's final round
+/// additionally had `crate::worktree_reclaim::candidate_has_attach_lock`
+/// recompute this exact path for a discovered isolated-clone candidate, so
+/// that discovery's ownership check and this function's own lock-
+/// acquisition path could never silently drift apart on the lock's
+/// filename — M4b replaced that mechanism with a dedicated provenance
+/// artifact under [`crate::platform::paths::state_dir`] instead (see
+/// [`isolated_clone_provenance_path`] and
+/// [`crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME`]'s doc
+/// comment for why), so `candidate_has_attach_lock` no longer calls this
+/// function at all; this remains `pub(crate)` for the async caller alone.
+pub(crate) fn worktree_attach_lock_path_from_common_dir(
+    common_dir: &Path,
+    worktree_dir: &Path,
+) -> PathBuf {
     let canonical_worktree_dir = canonicalize_best_effort(worktree_dir);
 
     let hash = crate::platform::lock::fnv1a64(canonical_worktree_dir.to_string_lossy().as_bytes());
@@ -2747,22 +2884,58 @@ async fn git_common_dir_async(clone_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Best-effort canonicalization for hashing purposes only (fork #331 audit
-/// B2): if `path` exists, canonicalize it directly; otherwise canonicalize
-/// its parent (which must already exist — see the caller) and rejoin the
-/// original file name, so a not-yet-created `worktree_dir` still collapses
-/// symlinks/relative components in the part of the path that DOES exist.
-/// Falls back to `path` unchanged if neither succeeds — never fatal, since
-/// this only affects whether two spellings of one target collide onto the
-/// same lock file, not whether the lock is taken at all. Logs on the
-/// fallback (fork #331 audit F5): the parent that reaches this branch was
-/// just created by `ensure_worktree_parent_dir` moments earlier, so failing
-/// to canonicalize it is genuinely anomalous, and this is a mutual-exclusion
-/// primitive silently under-serializing — worth a greppable trace even
-/// though it is not worth making fatal.
+/// B2): canonicalize `path`'s parent (which must already exist — see the
+/// caller) and rejoin the original file name, so a not-yet-created
+/// `worktree_dir` still collapses symlinks/relative components in the part
+/// of the path that DOES exist. Falls back to `path` unchanged if that
+/// fails — never fatal, since this only affects whether two spellings of
+/// one target collide onto the same lock file, not whether the lock is
+/// taken at all. Logs on the fallback (fork #331 audit F5): the parent that
+/// reaches this branch was just created by `ensure_worktree_parent_dir`
+/// moments earlier, so failing to canonicalize it is genuinely anomalous,
+/// and this is a mutual-exclusion primitive silently under-serializing —
+/// worth a greppable trace even though it is not worth making fatal.
+///
+/// PRD fork#325 M4: this used to try `path.canonicalize()` FIRST — the
+/// primary branch below — and fall back to `parent.canonicalize().join(name)`
+/// only when the whole path did not yet exist. Those are two genuinely
+/// different algorithms, and WHICH one a given call took was decided
+/// entirely by the caller's timing, never by anything about the path
+/// itself: [`worktree_attach_lock_path`] calls this before `clone_dir`
+/// exists (write time, inside `provision_isolated_clone_sync`), so it
+/// always took the fallback branch; `worktree_reclaim::candidate_has_attach_lock`
+/// calls it on a directory `discover_isolated_clones` just found on disk
+/// (check time), so it always took the primary branch. On the GitHub
+/// Actions Windows runner the two branches disagreed for the SAME literal
+/// `worktree_dir` — an 8.3 short-name component (`RUNNER~1`, the alias
+/// Windows itself substitutes into `%TEMP%` for the runner's account) was
+/// in the panic output — so the lock file written at provisioning time and
+/// the path hashed at discovery time resolved to two different final
+/// spellings of the identical clone, and `worktree_reclaim_053_isolated_clone_with_real_attach_lock_reports_owned_true`
+/// reproduced it identically across two consecutive CI runs. Always
+/// resolving through the parent, never through the full path directly,
+/// makes this ONE algorithm regardless of when it runs — write time and
+/// check time can no longer diverge on which branch they took, only
+/// (unchanged, and already logged) on whether the parent itself fails to
+/// canonicalize.
+///
+/// A second, independent reason not to reintroduce the full-path branch:
+/// the two-branch version could make racing callers hash the SAME target
+/// to two DIFFERENT lock paths, not only a write-time/check-time caller
+/// pair. Two callers racing to provision the identical `clone_dir` both run
+/// at write time (`worktree_attach_lock_path`, before `clone_dir` exists),
+/// so both would take the fallback branch and hash identically today — but
+/// that agreement held only because both callers happened to observe the
+/// path in the same not-yet-created state; anything that let one of them
+/// observe it as already-existing (a slow racer landing after the other's
+/// `AlreadyClaimed` check, for instance) would flip it onto the primary
+/// branch while the other stayed on the fallback, hashing the same real
+/// directory to two different lock files and defeating the mutual
+/// exclusion the lock exists for. Resolving through the parent
+/// unconditionally removes that branch entirely, so no ordering of
+/// concurrent `AlreadyClaimed` checks can make two callers disagree on
+/// which lock file guards a given target.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {
             parent
@@ -2779,7 +2952,12 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
                     path.to_path_buf()
                 })
         }
-        _ => path.to_path_buf(),
+        // No parent (e.g. a filesystem root) or no file name to rejoin:
+        // fall back to canonicalizing the whole path if it exists, else
+        // give up on the raw path. Neither call site above can ever pass a
+        // path shaped like this — `clone_dir`/`candidate` are always a
+        // sibling of the root checkout, never a root themselves.
+        _ => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
     }
 }
 

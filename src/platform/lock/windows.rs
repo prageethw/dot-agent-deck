@@ -14,8 +14,27 @@
 //! the mutex name is derived from (see
 //! [`crate::platform::lock::spawn_mutex_name`], which also documents why the name
 //! is per-path and how this object doubles as the singleton-daemon guard). No file
-//! is created: a kernel object needs no on-disk artifact, and the Unix
-//! `spawn.lock` file has no readers other than `flock` itself.
+//! is created: a kernel object needs no on-disk artifact, and at the time this was
+//! written (PRD #163) the Unix `spawn.lock` file had no readers other than `flock`
+//! itself.
+//!
+//! **That "no readers" premise held only temporarily, and holds again now.**
+//! Fork#325 M4a added [`crate::worktree_reclaim::candidate_has_attach_lock`],
+//! which for one round of this milestone treated the Unix `flock` file's mere
+//! ON-DISK EXISTENCE at
+//! [`crate::issue_dispatch_run::worktree_attach_lock_path_from_common_dir`]'s
+//! resolved path as ownership provenance — a reader this module's original
+//! design never anticipated. Since `acquire_path_lock_sync_bounded` below
+//! creates only the named mutex (no file), that round added a matching
+//! best-effort on-disk touch here to restore Windows parity with the Unix
+//! backend's incidental file. M4b (fix round 2, reviewer R1 / auditor D1,
+//! PR #515) moved ownership provenance to its own dedicated artifact under
+//! [`crate::platform::paths::state_dir`] instead of any lock file's mere
+//! existence — see [`crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME`]'s
+//! doc comment — so `candidate_has_attach_lock` no longer reads this path at
+//! all, and the touch this paragraph used to describe was removed along with
+//! it. The "no readers other than `flock` itself" premise from PRD #163 is
+//! therefore accurate again.
 //!
 //! **Thread affinity is the one place this cannot be a naive translation.** A
 //! Win32 mutex is owned by the *thread* that waited on it: `ReleaseMutex` from any
@@ -260,13 +279,17 @@ impl Drop for PathLock {
 ///
 /// Bounded (fork #331 audit S1): waits at most `timeout` rather than
 /// `INFINITE`, refusing with an `ErrorKind::TimedOut` error on expiry rather
-/// than blocking the caller forever. The sole caller,
-/// [`crate::issue_dispatch_run::create_worktree_sync`], runs directly on the
-/// TUI's synchronous render/event loop, so an unbounded wait here would
-/// reopen the freeze `WORKTREE_GIT_TIMEOUT` exists to prevent on the `git`
-/// calls either side of it. [`acquire_spawn_lock`] above stays unbounded —
-/// the daemon-start/lazy-spawn callers deliberately wait for the in-flight
-/// spawn to finish.
+/// than blocking the caller forever. Callers —
+/// [`crate::issue_dispatch_run::create_worktree_sync`], called directly on
+/// the TUI's synchronous render/event loop, and
+/// [`crate::issue_dispatch_run::provision_isolated_clone_sync`], called both
+/// from there (`src/ui.rs`) and from `src/dispatch.rs`'s CLI path via
+/// `tokio::task::spawn_blocking` — an unbounded wait here would reopen the
+/// freeze `WORKTREE_GIT_TIMEOUT` exists to prevent on the `git` calls either
+/// side of it, or park a blocking-pool thread indefinitely on the
+/// `spawn_blocking` path. [`acquire_spawn_lock`] above stays unbounded — the
+/// daemon-start/lazy-spawn callers deliberately wait for the in-flight spawn
+/// to finish.
 pub fn acquire_path_lock_sync_bounded(path: &Path, timeout: Duration) -> std::io::Result<PathLock> {
     let user = crate::platform::paths::endpoint_user_suffix();
     let name = super::spawn_mutex_name(&user, path);
@@ -275,6 +298,13 @@ pub fn acquire_path_lock_sync_bounded(path: &Path, timeout: Duration) -> std::io
     // opposite of this function's contract. Clamp one below it instead.
     let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
     let held = create_and_acquire(&name, &user, timeout_ms)?;
+    // fork#325 M4b fix round 2: this used to also best-effort-touch an
+    // on-disk file at `path` here, restoring parity with the Unix `flock`
+    // file's incidental on-disk existence for `candidate_has_attach_lock`'s
+    // old (now-replaced) reader -- see this module's own doc comment.
+    // `candidate_has_attach_lock` no longer reads this path at all, so
+    // there is nothing left for a touch here to serve; removed rather than
+    // left as a write with no consumer.
     Ok(PathLock { held, name })
 }
 
