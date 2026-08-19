@@ -93,7 +93,7 @@ This ordering governs **draining the historical backlog** below. It does **not**
 
 Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s stack table, and cross-referenced against every upstream PR ever opened from this fork: these have **no upstream PR at all**. Recorded here so it does not have to be re-derived.
 
-**This document is not yet a complete enumeration of the stack table's `UPSTREAM-WORTHY` tags.** The stack table currently carries 35; after the two rows added below, 22 appear somewhere in this document (this backlog, "offered and awaiting review", or "offered but closed without merging") — `0b44349`, `185bd68`, `1c44794`, `2a7d7c6`, `407570ce`, `4252bd30`, `488b713`, `4b9d2c4e`, `87b74d7`, `91a6331`, `946bd272`, `c814220` and `f6d2b1c` (13) appear in neither this table nor either of the other two sections. A reader should not read a SHA's absence from this document as "already offered" — it may simply not have been reconciled here yet. Filing a follow-up issue to close the gap is the right next step; reconciling it in this pass is its own piece of work and out of scope for a docs-only fix round.
+**This document is not yet a complete enumeration of the stack table's `UPSTREAM-WORTHY` tags.** The stack table carried 35 as of the last reconciliation; this pass (sync-421819's re-curation) added five more (`9d72de96`, `4090985f`, `444de809` to Product code; `7ec64fe8`, `fc2b0fde` to Test/CI determinism) without re-walking the full cross-reference against "offered and awaiting review"/"offered but closed without merging" below — treat the count as a floor, not a ceiling, until the next full reconciliation. A reader should not read a SHA's absence from this document as "already offered" — it may simply not have been reconciled here yet. Filing a follow-up issue to close the gap is the right next step; reconciling it in this pass is its own piece of work and out of scope for a docs-only fix round.
 
 ### Product code
 
@@ -110,10 +110,13 @@ Tagged **UPSTREAM-WORTHY** in [`fork-sync-workflow.md`](fork-sync-workflow.md)'s
 | `4b7ee26` | Observe agent exit without reaping so shutdown cannot signal a recycled pid — same `agent_pty.rs`/`platform/proc` plumbing as `bafe103` (fork #163, #207) |
 | `f44b13c5` | Bound the shutdown grace-window's EINTR retry against the deadline, restore the ECHILD alarm, and bound the hook CLI's stdin read (fork #145, #217) — offer after `4b7ee26`/`bafe103`, whose symbols it extends |
 | `fb81d36b` | `register_orchestration_role` never removed a stale `orchestrator_pane_ids` flag when a pane_id was reused for a worker role, wrongly excluding it as a delegate candidate (fork #361) — verified identical on `upstream/main` |
+| `9d72de96` | Position-aware `cmd.exe` quoting for the watch-pane and hook-shell invocations (fork #283, #238) — `src/mode_manager.rs`/`src/platform/shell.rs` are upstream's own files |
+| `4090985f` | Jointly fit column count and card density (`fit_grid`) instead of picking each axis independently, so a narrow-AND-short terminal no longer silently drops cards (fork #437, tracks upstream vfarcic/dot-agent-deck#588 explicitly) |
+| `444de809` | `init_logging_from_env`'s default log path resolves under `/tmp` instead of the resolved state dir (fork #467) |
 
 ### Test and CI determinism
 
-`9dd02ee` (delegate_011 clock-independence), `4b35b48` (fixed-budget PTY/grid flake class), `fa038c1` (manager_016 side-pane settle), `70b3eca` (ingest_event broadcast/apply atomicity), `3ced4ba` and `ad9c20c` (idle_worker_011), `8841019` (lint the e2e-gated test files instead of compiling them away — upstream's CI has the same blind spot).
+`9dd02ee` (delegate_011 clock-independence), `4b35b48` (fixed-budget PTY/grid flake class), `fa038c1` (manager_016 side-pane settle), `70b3eca` (ingest_event broadcast/apply atomicity), `3ced4ba` and `ad9c20c` (idle_worker_011), `8841019` (lint the e2e-gated test files instead of compiling them away — upstream's CI has the same blind spot), `7ec64fe8` (lock_017 paste-gate assertion determinism, fork #390), `fc2b0fde` (lock_017 Part 2 scroll-reset flake, fork #414).
 
 ### Docs
 
