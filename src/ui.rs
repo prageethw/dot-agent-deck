@@ -33804,6 +33804,105 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #489 — `Action::SpawnPane`'s worktree-resolution
+    /// match consults `root_checkout_has_live_sibling` only in the
+    /// `Some(worktree_path)` arm (a typed slug); the `None` arm (a blank
+    /// Worktree field, the default most orchestrations use) falls straight
+    /// through to `req.dir` with no daemon consultation at all. This
+    /// dispatches a blank-slug `Action::SpawnPane` against a real git repo
+    /// while a stubbed daemon reports a live sibling orchestration whose
+    /// `orchestration_cwd` is that same repo, and asserts the spawn is
+    /// refused — no orchestration tab opens, no role pane spawns, and a
+    /// status message surfaces the refusal — rather than silently rooting a
+    /// second orchestration in the already-live shared checkout.
+    #[spec("orchestration/worktree/016")]
+    #[test]
+    fn worktree_016_blank_slug_refuses_when_root_checkout_has_live_sibling() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+
+        let sibling_record = crate::agent_pty::AgentRecord {
+            id: "sibling-agent".to_string(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "other-orchestration".to_string(),
+                role_index: 0,
+                role_name: "orchestrator".to_string(),
+                is_start_role: true,
+                orchestration_cwd: Some(repo.display().to_string()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+        };
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![sibling_record]),
+        );
+
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir: repo.clone(),
+            name: String::new(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // Fail-closed: no orchestration tab was opened...
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "a blank-slug spawn against a root checkout with a live sibling orchestration must \
+             be refused (fail closed), not silently open a second orchestration tab rooted in \
+             the same shared checkout"
+        );
+        // ...no role pane was spawned...
+        assert!(
+            pc.recorded_orchestration_names().is_empty(),
+            "no role pane should be spawned when the root checkout already has a live sibling \
+             orchestration — the blank-slug path must consult the same gate the typed-slug path \
+             (`orchestration/worktree/014`) already does"
+        );
+        // ...and the refusal surfaces to the user.
+        let message = ui
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !message.is_empty(),
+            "the fail-closed refusal must surface a status message, not fail silently"
+        );
+    }
+
     /// Scenario: Submit a new-pane orchestration request whose `dir` is
     /// ALREADY the resolved worktree path (simulating that a worktree was
     /// created and its path threaded into the request), and dispatch the

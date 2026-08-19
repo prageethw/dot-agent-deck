@@ -3876,6 +3876,13 @@ without depending on the config struct API.
 - **Does not assert:** the up-daemon collision-detection path itself (that's `014`'s job); which specific status-message wording is shown (only that one is set); Model B (`dispatch.rs`)'s equivalent gate, which has no live-orchestration query today.
 - **Platform coverage:** mac+linux+windows (no `#[cfg(unix)]` — a nonexistent local IPC endpoint fails connect immediately on both platform backends; no shell substitution or real subprocess involved).
 
+##### orchestration/worktree/016 — A blank-slug orchestration spawn (the default — no typed Worktree field) against a root checkout that already has a live sibling orchestration is refused, exactly like a typed-slug spawn is (issue #489: `Action::SpawnPane`'s `req.orchestration_worktree_path` match calls `root_checkout_has_live_sibling` only in its `Some(worktree_path)` arm — the `None` arm, taken by the blank-slug default most orchestrations use, fell straight through to `req.dir` with no daemon consultation at all, silently rooting a second concurrent orchestration in the same shared checkout).
+- **Layer:** L1 (pure — `Action::SpawnPane` dispatched directly against a real `CapturingPaneController`/`TabManager`/`AppState`, no PTY, no real daemon process; a stubbed daemon answers `ListAgents` with a crafted `AgentRecord` whose `TabMembership::Orchestration::orchestration_cwd` equals the test's own repo dir).
+- **Agent:** none.
+- **Asserts:** submitting a blank-slug (`orchestration_worktree_path: None`) orchestration form against a genuine git repo, while a stubbed daemon reports a live sibling orchestration whose `orchestration_cwd` is that same repo: the orchestration tab is never opened (`tm.active_tab()` stays `Tab::Dashboard`), no role pane is spawned, and a non-empty status message surfaces the refusal.
+- **Does not assert:** which specific status-message wording is shown (only that one is set); the typed-slug collision path itself (that's `014`'s job); the daemon-unreachable fail-closed path (that's `015`'s job).
+- **Platform coverage:** mac+linux+windows (no `#[cfg(unix)]` — the in-process stub attach server and its Windows named-pipe fallback are shared with `014`/`015`'s helpers; no shell substitution or real subprocess involved).
+
 #### orchestration/remit
 
 ##### orchestration/remit/001 — A `Compacting` event on the orchestrator start-role pane re-delivers the remit pointer a second time (upstream issue #423).
