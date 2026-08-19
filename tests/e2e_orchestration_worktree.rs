@@ -453,3 +453,382 @@ fn worktree_014_nth_concurrent_orchestration_gets_isolated_clone() {
         work.display()
     );
 }
+
+/// Read `dir`'s HEAD commit SHA via `git rev-parse HEAD` — used to prove a
+/// directory's git state is byte-identical before and after an operation
+/// performed against a DIFFERENT orchestration's directory.
+fn head_sha(dir: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse HEAD must spawn");
+    assert!(
+        out.status.success(),
+        "git rev-parse HEAD failed in {dir:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Read whether `dir` is currently a shallow repository via `git rev-parse
+/// --is-shallow-repository` — the exact observable signature issue #325's
+/// own repro used (`$ git rev-parse --is-shallow-repository` / `true`) to
+/// detect the shared-object-store corruption from failure #2.
+fn is_shallow_repository(dir: &std::path::Path) -> bool {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .output()
+        .expect("git rev-parse --is-shallow-repository must spawn");
+    assert!(
+        out.status.success(),
+        "git rev-parse --is-shallow-repository failed in {dir:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim() == "true"
+}
+
+/// Attempt `git worktree remove --force <target>` FROM `from_dir` — i.e.
+/// against whichever repository `from_dir` itself belongs to. This is the
+/// exact shape of issue #325 failure #1 ("something else ran a plain `git
+/// worktree remove` … against paths it had no ownership claim on"). Returns
+/// the exit status and captured stderr rather than panicking either way: a
+/// SUCCESSFUL removal here would itself be the regression this test exists
+/// to catch, so the caller decides what the result means.
+fn attempt_worktree_remove(from_dir: &std::path::Path, target: &std::path::Path) -> (bool, String) {
+    let out = std::process::Command::new("git")
+        .current_dir(from_dir)
+        .args(["worktree", "remove", "--force"])
+        .arg(target)
+        .output()
+        .expect("git worktree remove must spawn");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Navigate from the currently active tab back to the Dashboard (index 0).
+/// `Ctrl+D` enters Normal mode; `Left` (`Action::CycleTabPrev`) steps the
+/// active tab index back by exactly one, wrapping — it is NOT a direct jump
+/// to Dashboard (`src/ui.rs`'s `CycleTabPrev` handler:
+/// `(prev_idx + count - 1) % count`) — so reaching Dashboard from the Nth
+/// tab (tabs are strictly appended, never reordered — `src/tab.rs`'s three
+/// `self.tabs.push` call sites) needs exactly `steps_back` presses: 1 from
+/// the 1st-opened orchestration tab, 2 from the 2nd, etc.
+fn go_to_dashboard(deck: &TuiDeck, steps_back: usize) {
+    deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode (still on the current tab)
+    for _ in 0..steps_back {
+        deck.send_keys(b"\x1b[D"); // Left -> CycleTabPrev, one step back
+    }
+    deck.wait_for_string("session(s)");
+}
+
+/// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
+/// one orchestration THREE times against the SAME directory — with distinct
+/// typed worktree slugs, the 2nd and 3rd each while an earlier one is still
+/// live — reproducing issue #325's own original incident shape verbatim
+/// (the issue's own words: "three-plus concurrent orchestrations... on one
+/// deck"), not `014`'s reduced 2-orchestration starting case. First proves
+/// the PRD fork#325 M3 gate holds at N=3: the 1st shares the launch dir's
+/// git common dir exactly as today, the 2nd and 3rd each land on their OWN
+/// distinct common dir — no two of the three sharing one, so the 2nd and
+/// 3rd are isolated from EACH OTHER too, not just from the 1st. Then
+/// reproduces the issue's own two concrete failures directly and proves
+/// neither can recur: (1) with all three live, attempts `git worktree
+/// remove` from one orchestration's repository targeting another's
+/// directory — cross-repo, this must now fail outright (the target isn't
+/// even registered in the attacking repo's worktree list), leaving the
+/// target's directory, branch, and HEAD commit completely undisturbed; (2)
+/// a `git fetch --depth 1` performed in the 1st (shared-checkout)
+/// orchestration's directory makes the LAUNCH DIRECTORY'S shared object
+/// store shallow, exactly as the issue reported, while the 2nd and 3rd
+/// orchestrations' isolated clones — genuinely separate object stores now —
+/// remain unaffected and their HEAD commits stay byte-identical to before
+/// the fetch.
+#[spec("orchestration/worktree/016")]
+#[test]
+fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_without_colliding() {
+    let deck = TuiDeck::launch_with_fixture("orch-clone-gate");
+    let work = deck.workdir().to_path_buf();
+    commit_fixture(&work);
+    let fake_origin = "https://example.invalid/orch-clone-gate-fixture.git";
+    run_git(&work, &["remote", "add", "origin", fake_origin]);
+
+    deck.wait_for_string("No active sessions");
+
+    let launch_dir_basename = work
+        .file_name()
+        .expect("launch dir must have a basename")
+        .to_string_lossy()
+        .into_owned();
+    let owner_1 = format!("orchestration:{launch_dir_basename}-orchestrator-1");
+    let owner_2 = format!("orchestration:{launch_dir_basename}-orchestrator-2");
+    let owner_3 = format!("orchestration:{launch_dir_basename}-orchestrator-3");
+    let second_label = format!(" {launch_dir_basename}-orchestrator-2 ");
+    let third_label = format!(" {launch_dir_basename}-orchestrator-3 ");
+
+    // 1st orchestration: shares the launch dir's checkout, as today.
+    open_orchestration_with_slug(&deck, "clonegate1");
+    deck.wait_for_absence("New Agent");
+    go_to_dashboard(&deck, 1); // orch1 (index 1) -> Dashboard (index 0)
+
+    // 2nd, while the 1st is still live: must get its own isolated clone.
+    open_orchestration_with_slug(&deck, "clonegate2");
+    deck.wait_for_string(&second_label);
+    go_to_dashboard(&deck, 2); // orch2 (index 2) -> orch1 (1) -> Dashboard (0)
+
+    // 3rd, while BOTH the 1st and 2nd are still live: this is #325's own
+    // actual incident shape (three-plus concurrent, not two).
+    open_orchestration_with_slug(&deck, "clonegate3");
+    deck.wait_for_string(&third_label);
+
+    let log_path = deck.home_dir().join("clone-gate-pwd.log");
+    common::wait_for_file_lines(&log_path, 3, Duration::from_secs(15)).unwrap_or_else(|e| {
+        panic!(
+            "all three role panes must have appended their owner+pwd line to \
+             {log_path:?}: {e}\n=== rendered grid ===\n{}",
+            deck.snapshot_grid()
+        )
+    });
+
+    let contents =
+        std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read {log_path:?}: {e}"));
+    let mut pwd_by_owner: HashMap<String, PathBuf> = HashMap::new();
+    for line in contents.lines() {
+        if let Some((owner, pwd)) = line.split_once(' ') {
+            pwd_by_owner.insert(owner.to_string(), PathBuf::from(pwd));
+        }
+    }
+
+    let pwd_1 = pwd_by_owner.get(&owner_1).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner_1:?}; got: {contents:?}")
+    });
+    let pwd_2 = pwd_by_owner.get(&owner_2).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner_2:?}; got: {contents:?}")
+    });
+    let pwd_3 = pwd_by_owner.get(&owner_3).unwrap_or_else(|| {
+        panic!("no line in {log_path:?} for owner {owner_3:?}; got: {contents:?}")
+    });
+
+    // --- Structural proof: no two of the three share a git common dir,
+    // except the 1st, which shares the launch dir's exactly as intended. ---
+    let work_common = git_common_dir(&work);
+    let pwd_1_common = git_common_dir(pwd_1);
+    let pwd_2_common = git_common_dir(pwd_2);
+    let pwd_3_common = git_common_dir(pwd_3);
+
+    assert_eq!(
+        pwd_1_common, work_common,
+        "the 1ST orchestration must be unaffected — it shares the launch \
+         dir's git common dir exactly as today"
+    );
+    assert_ne!(
+        pwd_2_common,
+        work_common,
+        "the 2ND orchestration must provision its OWN isolated clone, not \
+         share the launch dir's ({}) object store",
+        work.display()
+    );
+    assert_ne!(
+        pwd_3_common,
+        work_common,
+        "the 3RD orchestration must provision its OWN isolated clone too, \
+         not share the launch dir's ({}) object store",
+        work.display()
+    );
+    assert_ne!(
+        pwd_2_common, pwd_3_common,
+        "the 2ND and 3RD orchestrations must NOT share each other's \
+         isolated clone either — each gets its own separate object store"
+    );
+
+    assert_eq!(
+        current_branch(pwd_1),
+        "clonegate1",
+        "the 1st (shared-worktree) orchestration must be on its typed slug's branch"
+    );
+    assert_eq!(
+        current_branch(pwd_2),
+        "clonegate2",
+        "the 2nd (isolated-clone) orchestration must be on its typed slug's branch"
+    );
+    assert_eq!(
+        current_branch(pwd_3),
+        "clonegate3",
+        "the 3rd (isolated-clone) orchestration must be on its typed slug's branch"
+    );
+    assert_eq!(
+        remote_origin_url(pwd_2).as_deref(),
+        Some(fake_origin),
+        "the 2nd orchestration's isolated clone must carry the source's own origin URL"
+    );
+    assert_eq!(
+        remote_origin_url(pwd_3).as_deref(),
+        Some(fake_origin),
+        "the 3rd orchestration's isolated clone must carry the source's own origin URL"
+    );
+
+    let pwd_2_head_baseline = head_sha(pwd_2);
+    let pwd_3_head_baseline = head_sha(pwd_3);
+
+    // --- Behavioral proof of failure #1: "an orchestration deleted five
+    // worktrees it did not own, mid-use". Attempt cross-repo `git worktree
+    // remove` in both directions — from the shared worktree against an
+    // isolated clone, and from one isolated clone against another. Every
+    // attempt must fail outright (the target is not even registered in the
+    // attacking repo's worktree list), and every target must remain
+    // completely intact afterward. ---
+    let (removed_2_from_1, stderr_2_from_1) = attempt_worktree_remove(pwd_1, pwd_2);
+    assert!(
+        !removed_2_from_1,
+        "`git worktree remove` run from the 1st (shared-checkout) \
+         orchestration's directory must NOT be able to remove the 2nd's \
+         isolated clone at {} — this is issue #325 failure #1, and it \
+         succeeding here would mean the isolation regressed\nstderr: {}",
+        pwd_2.display(),
+        stderr_2_from_1
+    );
+
+    let (removed_3_from_1, stderr_3_from_1) = attempt_worktree_remove(pwd_1, pwd_3);
+    assert!(
+        !removed_3_from_1,
+        "`git worktree remove` run from the 1st orchestration's directory \
+         must NOT be able to remove the 3rd's isolated clone at {}\nstderr: {}",
+        pwd_3.display(),
+        stderr_3_from_1
+    );
+
+    let (removed_3_from_2, stderr_3_from_2) = attempt_worktree_remove(pwd_2, pwd_3);
+    assert!(
+        !removed_3_from_2,
+        "`git worktree remove` run from the 2nd orchestration's isolated \
+         clone must NOT be able to remove the 3rd's isolated clone at {} — \
+         two Nth-concurrent orchestrations must be isolated from EACH \
+         OTHER, not just from the 1st\nstderr: {}",
+        pwd_3.display(),
+        stderr_3_from_2
+    );
+
+    for (label, pwd, expected_branch, expected_head) in [
+        ("2nd", pwd_2, "clonegate2", &pwd_2_head_baseline),
+        ("3rd", pwd_3, "clonegate3", &pwd_3_head_baseline),
+    ] {
+        assert!(
+            pwd.is_dir(),
+            "the {label} orchestration's directory at {} must still exist \
+             after the failed removal attempts targeting it",
+            pwd.display()
+        );
+        assert_eq!(
+            &current_branch(pwd),
+            expected_branch,
+            "the {label} orchestration's checked-out branch must be \
+             undisturbed by the failed removal attempts"
+        );
+        assert_eq!(
+            &head_sha(pwd),
+            expected_head,
+            "the {label} orchestration's HEAD commit must be byte-identical \
+             to before the failed removal attempts — nothing in its git \
+             state was disturbed"
+        );
+    }
+
+    // --- Behavioral proof of failure #2: "an orchestration made the shared
+    // repository shallow, breaking merges in every worktree". Perform a
+    // real `git fetch --depth 1` in the 1st (shared-checkout) orchestration's
+    // directory — the exact operation the issue reported (a shallow fetch
+    // against the shared object store) — and confirm the 2nd and 3rd
+    // orchestrations' isolated clones, genuinely separate object stores now,
+    // are structurally unable to be affected. ---
+    let fake_upstream_root = common::race_safe_tempdir();
+    let fake_upstream = fake_upstream_root.path().join("fake-upstream");
+    run_git(
+        fake_upstream_root.path(),
+        &[
+            "clone",
+            "-q",
+            work.to_str().expect("work path must be valid UTF-8"),
+            fake_upstream
+                .to_str()
+                .expect("fake upstream path must be valid UTF-8"),
+        ],
+    );
+    // Extra commits so the depth-1 fetch below actually truncates real
+    // history, mirroring the issue's own upstream/main having far more
+    // history than a depth-1 fetch would carry over.
+    for msg in ["extra-upstream-1", "extra-upstream-2"] {
+        run_git(
+            &fake_upstream,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                msg,
+            ],
+        );
+    }
+
+    assert!(
+        !is_shallow_repository(&work),
+        "the launch directory's checkout must not already be shallow before \
+         the reproduction fetch"
+    );
+    run_git(
+        pwd_1,
+        &[
+            "fetch",
+            "--depth",
+            "1",
+            fake_upstream
+                .to_str()
+                .expect("fake upstream path must be valid UTF-8"),
+            "HEAD",
+        ],
+    );
+
+    assert!(
+        is_shallow_repository(pwd_1),
+        "the depth-1 fetch performed in the 1st orchestration's own \
+         directory must have made ITS repository shallow — otherwise this \
+         reproduction never exercised the issue's own failure mode at all"
+    );
+    assert!(
+        is_shallow_repository(&work),
+        "because the 1st orchestration shares the launch directory's git \
+         common dir, the shallow fetch must be visible from the launch \
+         directory too — exactly as issue #325 reported \
+         (`$ git rev-parse --is-shallow-repository` / `true`, observed from \
+         a DIFFERENT worktree than the one that ran the fetch)"
+    );
+
+    for (label, pwd, expected_head) in [
+        ("2nd", pwd_2, &pwd_2_head_baseline),
+        ("3rd", pwd_3, &pwd_3_head_baseline),
+    ] {
+        assert!(
+            !is_shallow_repository(pwd),
+            "the {label} orchestration's isolated clone at {} must remain a \
+             FULL, non-shallow repository — the shallow fetch performed \
+             against the 1st orchestration's shared checkout must be \
+             structurally unable to reach a separate object store",
+            pwd.display()
+        );
+        assert_eq!(
+            &head_sha(pwd),
+            expected_head,
+            "the {label} orchestration's HEAD commit must be byte-identical \
+             to before the shallow fetch — nothing in its git state was \
+             disturbed"
+        );
+    }
+}
