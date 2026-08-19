@@ -2397,9 +2397,12 @@ pub async fn spawn_or_reuse(
 /// write against — `spawn_or_reuse`'s `ReuseDecision::Reuse { pane_id }` names
 /// only the pane, not the agent it was decided for — so the debounce wait (up
 /// to `REUSE_DELIVERY_HARD_TIMEOUT` of drift) leaves a window where the pane
-/// changes hands (a `clear = true` delegate or a manual respawn) before this
-/// delivers. Refuse rather than write when the pane's current occupant took
-/// over via a respawn — see [`AgentPtyRegistry::is_respawn_successor`].
+/// changes hands before this delivers. Bind the write to `pane_id`'s
+/// currently-authorized occupant instead — see
+/// [`AgentPtyRegistry::authorized_occupant`], which a legitimate respawn
+/// keeps up to date (so a respawned pane keeps delivering) while a fresh,
+/// unrelated `spawn_agent` reusing the same `pane_id_env` after a close does
+/// not (so a stranger is refused).
 async fn deliver_on_idle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -2427,18 +2430,24 @@ async fn deliver_on_idle(
             }
         }
     }
-    match registry.pane_current_agent_id(pane_id) {
-        Some(agent_id) if !registry.is_respawn_successor(&agent_id) => {
-            if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
-                tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
-            }
-        }
-        _ => {
+    let expected_agent_id = registry.authorized_occupant(pane_id);
+    match registry
+        .write_and_submit_guarded(pane_id, prompt, expected_agent_id.as_deref(), || async {
+            true
+        })
+        .await
+    {
+        Ok(GuardedSend::Applied) => {}
+        Ok(outcome) => {
             tracing::warn!(
                 pane_id,
+                outcome = ?outcome,
                 "deliver_on_idle: refusing — no live occupant, or the pane changed hands \
-                 (respawn) since the reuse decision was made"
+                 since the reuse decision was made"
             );
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
         }
     }
 }

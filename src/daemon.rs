@@ -2109,34 +2109,40 @@ async fn run_hook_loop(
                                     // that issued the dispatch, not the agent — and
                                     // `handle_dispatch`'s worktree/spawn I/O above is
                                     // slow enough for the caller's pane to have changed
-                                    // hands (a respawn) by the time this result comes
-                                    // back. Refuse rather than write into whichever
-                                    // agent now occupies the pane — see
-                                    // `AgentPtyRegistry::is_respawn_successor`.
-                                    match pty_registry.pane_current_agent_id(&signal.pane_id) {
-                                        Some(agent_id)
-                                            if !pty_registry.is_respawn_successor(&agent_id) =>
-                                        {
-                                            if let Err(e) = pty_registry
-                                                .write_to_pane_and_submit(
-                                                    &signal.pane_id,
-                                                    &result.message,
-                                                )
-                                                .await
-                                            {
-                                                warn!(
-                                                    pane_id = %signal.pane_id,
-                                                    error = %e,
-                                                    "dispatch: failed to write result into caller pane"
-                                                );
-                                            }
-                                        }
-                                        _ => {
+                                    // hands by the time this result comes back. Bind the
+                                    // write to the pane's currently-authorized occupant
+                                    // instead — see
+                                    // `AgentPtyRegistry::authorized_occupant`, which a
+                                    // legitimate respawn (including one landing during
+                                    // the I/O above) keeps up to date, while a fresh,
+                                    // unrelated `spawn_agent` reusing the same
+                                    // `pane_id_env` after a close does not.
+                                    let expected_agent_id =
+                                        pty_registry.authorized_occupant(&signal.pane_id);
+                                    match pty_registry
+                                        .write_and_submit_guarded(
+                                            &signal.pane_id,
+                                            &result.message,
+                                            expected_agent_id.as_deref(),
+                                            || async { true },
+                                        )
+                                        .await
+                                    {
+                                        Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                                        Ok(outcome) => {
                                             warn!(
                                                 pane_id = %signal.pane_id,
+                                                outcome = ?outcome,
                                                 "dispatch: refusing to write result — no live \
                                                  occupant, or the caller pane changed hands \
-                                                 (respawn) since the request"
+                                                 since the request"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                error = %e,
+                                                "dispatch: failed to write result into caller pane"
                                             );
                                         }
                                     }

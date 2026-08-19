@@ -5327,32 +5327,41 @@ impl AppState {
             &signal.task,
         );
         // Issue #492: `orch_pane_id` names only the pane, not the agent the
-        // worker was delegated under — a respawn (`clear = true` delegate or a
-        // manual respawn) between the delegation and this report changes hands
-        // on the SAME pane id, and the ungated write below would land in the
-        // new occupant's PTY instead of refusing. Refuse when the current
-        // occupant took over via a respawn — see
-        // [`crate::agent_pty::AgentPtyRegistry::is_respawn_successor`].
-        match registry.pane_current_agent_id(&orch_pane_id) {
-            Some(agent_id) if !registry.is_respawn_successor(&agent_id) => {
-                if let Err(e) = registry
-                    .write_to_pane_and_submit(&orch_pane_id, &feedback)
-                    .await
-                {
-                    warn!(
-                        pane_id = %orch_pane_id,
-                        role = %role_name,
-                        error = %e,
-                        "work-done: failed to write feedback into orchestrator pane"
-                    );
-                }
-            }
-            _ => {
+        // worker was delegated under — the orchestrator's pane can change
+        // hands between the delegation and this report, and the ungated
+        // write below would land in the new occupant's PTY instead of
+        // refusing. Bind the write to the pane's currently-authorized
+        // occupant instead — see
+        // [`crate::agent_pty::AgentPtyRegistry::authorized_occupant`], which
+        // a legitimate respawn keeps up to date while a fresh, unrelated
+        // `spawn_agent` reusing the same `pane_id_env` after a close does
+        // not.
+        let expected_agent_id = registry.authorized_occupant(&orch_pane_id);
+        match registry
+            .write_and_submit_guarded(
+                &orch_pane_id,
+                &feedback,
+                expected_agent_id.as_deref(),
+                || async { true },
+            )
+            .await
+        {
+            Ok(crate::agent_pty::GuardedSend::Applied) => {}
+            Ok(outcome) => {
                 warn!(
                     pane_id = %orch_pane_id,
                     role = %role_name,
+                    outcome = ?outcome,
                     "work-done: refusing to write feedback — no live occupant, or the \
-                     orchestrator pane changed hands (respawn) since the delegation"
+                     orchestrator pane changed hands since the delegation"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pane_id = %orch_pane_id,
+                    role = %role_name,
+                    error = %e,
+                    "work-done: failed to write feedback into orchestrator pane"
                 );
             }
         }
