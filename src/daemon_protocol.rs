@@ -2660,6 +2660,133 @@ mod tests {
         reg.shutdown_all();
     }
 
+    /// Issue #494: `compute_write_and_submit_outcome`'s **paned** branch forwards
+    /// `extras.expected_agent_id.as_deref()` straight into
+    /// `write_and_submit_guarded` with no gate of its own — when it is `None`,
+    /// `write_and_submit_guarded`'s pre-lock identity check
+    /// (`if let Some(expected) = expected_agent_id && expected != target.agent_id`)
+    /// is skipped entirely, and the paned re-resolution afterwards only compares
+    /// the pane's CURRENT agent against ITSELF (there is no separate "did the
+    /// caller name an agent at all" gate), so the write proceeds keyed by
+    /// `pane_id` alone. Contrast the **paneless** branch a few lines earlier in
+    /// the same function: `Writable::Live` there is reachable ONLY when
+    /// `extras.expected_agent_id` is `Some` (`None => Writable::None` at the
+    /// `pane_writable`/`agent_writable` match), so an absent agent id fails
+    /// closed before the guarded send is ever reached. The paned branch has no
+    /// equivalent upstream gate. This pins the gap: a live pane with a
+    /// registered agent, written to with `expected_agent_id: None`, must be
+    /// REFUSED (never `SendResult::Applied`) — mirroring the `let Some(...) else
+    /// { return ... }` shape PR #477 established for issue #465's identical bug
+    /// class at a different call site.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paned_write_refuses_missing_expected_agent_id() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-494-no-expected-agent-id";
+        let _id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // No `expected_session_id` either, so the (separately buggy, separately
+        // pinned below) session gate can never be the reason this is refused —
+        // isolates the agent-id axis.
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: None,
+            expected_session_id: None,
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'SHOULD-NOT-BE-DELIVERED\\n'",
+            &extras,
+        )
+        .await;
+
+        assert_ne!(
+            result,
+            Ok(crate::event::SendResult::Applied),
+            "a paned write-and-submit with NO expected_agent_id must fail closed, not deliver \
+             (got {result:?}) — the caller named no target identity at all, so the write must \
+             not proceed keyed by pane_id alone"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #494: `compute_write_and_submit_outcome`'s **paned** branch only
+    /// performs its session re-validation `if let Some(expected) =
+    /// expected_session.as_deref()` — when the CALLER'S `expected_session_id` is
+    /// `None`, that whole `match` is skipped, so the "a `None` current-session ...
+    /// is refused too on an attached, live-interactive pane" rule the code's own
+    /// comment describes is never reached. This pins the gap the comment claims
+    /// is already closed: an attached (live-interactive) pane, written to with
+    /// `expected_session_id: None` — but a correctly-named `expected_agent_id`,
+    /// so the agent-id axis pinned above is not the reason for any refusal here —
+    /// must be REFUSED (never `SendResult::Applied`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paned_write_refuses_missing_expected_session_on_attached_pane() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-494-no-expected-session";
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // Keep the subscription alive so `pane_has_live_attach` reads `true` —
+        // an attached, live-interactive pane, exactly the case the code's own
+        // comment says a `None` current-session is "refused too" on.
+        let _attach = reg
+            .subscribe(&id)
+            .expect("attach for live-interactive pane");
+        assert!(
+            reg.pane_has_live_attach(pane_id),
+            "precondition: pane must read as ATTACHED"
+        );
+
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: Some(id.clone()),
+            expected_session_id: None,
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'SHOULD-NOT-BE-DELIVERED\\n'",
+            &extras,
+        )
+        .await;
+
+        assert_ne!(
+            result,
+            Ok(crate::event::SendResult::Applied),
+            "a paned write-and-submit on an ATTACHED pane with NO expected_session_id must fail \
+             closed, not deliver (got {result:?}) — the caller named no session generation at \
+             all, and the pane is live-interactive, so a stale/unnamed prompt must not proceed"
+        );
+
+        drop(_attach);
+        reg.shutdown_all();
+    }
+
     #[tokio::test]
     async fn frame_round_trip() {
         let mut buf: Vec<u8> = Vec::new();
