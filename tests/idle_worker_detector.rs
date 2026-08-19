@@ -1654,15 +1654,21 @@ fn idle_worker_019_respawn_carries_forward_armed_delegation_and_silence_watch() 
         // dispatch has fully resolved, bound both records to a real agent id,
         // and armed a real watch task does the test drive the respawn it
         // means to isolate.
+        // `resolve_delegate_task_body` writes the raw task text to
+        // `.dot-agent-deck/worker-task-<role>.md` and delegates only the
+        // one-line pointer to it (`compose_delegate_prompt`), so the pane
+        // itself never sees "Perform the delegated test task." literally —
+        // it sees this fixed pointer line instead.
+        let pointer = "Read .dot-agent-deck/worker-task-respawning-worker.md for your task.";
         let delivered = harness
             .wait_for_snapshot_of(
                 &pre_respawn_agent_id,
-                |snapshot| snapshot.contains("Perform the delegated test task."),
+                |snapshot| snapshot.contains(pointer),
                 Duration::from_secs(5),
             )
             .await;
         assert!(
-            delivered.contains("Perform the delegated test task."),
+            delivered.contains(pointer),
             "the delegated task pointer never landed on the pre-respawn worker agent, so the \
              respawn below would not be racing a settled dispatch; snapshot = {delivered:?}"
         );
