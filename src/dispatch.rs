@@ -1235,6 +1235,393 @@ mod tests {
         );
     }
 
+    // --- issue #490 (PRD fork#325 M3, Model B): the live-sibling clone gate ---
+    //
+    // Model A's equivalent (`src/ui.rs`'s `Action::SpawnPane` handler) consults
+    // `root_checkout_has_live_sibling` -- a daemon `ListAgents` round trip -- and
+    // branches: no live sibling => ordinary shared-checkout worktree; a live
+    // sibling already sharing the target's `--git-common-dir` => an isolated
+    // clone instead (`provision_isolated_clone_sync`); the daemon query itself
+    // failing or answering untrustworthily => fail CLOSED, refuse to provision
+    // at all. `handle_dispatch` has no equivalent check today, so all three
+    // cases below currently collapse onto the first: the worktree is always a
+    // shared-checkout sibling, regardless of what a live sibling or a failing
+    // daemon would otherwise imply.
+
+    /// RAII guard, restoring `DOT_AGENT_DECK_ATTACH_SOCKET` and
+    /// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` to their previous values on drop
+    /// -- held under `crate::config::STATE_DIR_ENV_LOCK` for its whole
+    /// lifetime, same env-var-mutation lock every other env-mutating test in
+    /// this codebase uses.
+    struct CraftedAttachDaemonGuard {
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+        prev_attach: Option<String>,
+        prev_session_start_wait: Option<String>,
+    }
+
+    impl Drop for CraftedAttachDaemonGuard {
+        fn drop(&mut self) {
+            // SAFETY: `_env_lock` is held for this guard's entire lifetime.
+            unsafe {
+                match self.prev_attach.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET"),
+                }
+                match self.prev_session_start_wait.take() {
+                    Some(v) => std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", v),
+                    None => std::env::remove_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS"),
+                }
+            }
+        }
+    }
+
+    /// Stand up a stub attach daemon that answers every `ListAgents` request
+    /// with a CALLER-SUPPLIED `AttachResponse`, and point
+    /// `DOT_AGENT_DECK_ATTACH_SOCKET` at it -- the same hand-rolled
+    /// frame-exchange pattern `src/ui.rs`'s `with_crafted_response_daemon`
+    /// uses (copied rather than reused: that helper is private to `ui.rs`'s
+    /// own test module). Also pins
+    /// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` to its documented floor (100ms)
+    /// so a real `cat`-backed dispatch through this daemon does not pay the
+    /// production 30s no-hook fallback -- the same override
+    /// `tests/delegate_prompt_injection.rs` already relies on to keep a real
+    /// `cat` spawn in the fast tier.
+    fn with_crafted_attach_daemon(
+        unique_dir: &Path,
+        response: crate::daemon_protocol::AttachResponse,
+    ) -> CraftedAttachDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+        let prev_session_start_wait = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub crafted-response daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx
+                                .send(Err(format!("bind stub crafted-response listener: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let payload =
+                    serde_json::to_vec(&response).expect("serialize crafted AttachResponse");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let _ = crate::daemon_protocol::read_frame(&mut stream).await;
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        &payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub crafted-response daemon must report readiness within 10s")
+            .expect("stub crafted-response daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `CraftedAttachDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+            std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", "100");
+        }
+
+        CraftedAttachDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+            prev_session_start_wait,
+        }
+    }
+
+    /// An `AgentRecord` naming a live orchestration whose tab is rooted at
+    /// `orchestration_cwd` -- the shape `root_checkout_has_live_sibling`
+    /// reads out of `ListAgents`. Every other field is the harmless default a
+    /// real record would carry when unset.
+    fn live_orchestration_record(orchestration_cwd: &Path) -> crate::agent_pty::AgentRecord {
+        crate::agent_pty::AgentRecord {
+            id: "live-sibling-agent".to_string(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                name: "live-sibling".to_string(),
+                role_index: 0,
+                role_name: "orchestrator".to_string(),
+                is_start_role: true,
+                orchestration_cwd: Some(orchestration_cwd.to_string_lossy().into_owned()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 0,
+            cols: 0,
+            live: None,
+        }
+    }
+
+    /// Scenario: issue #490, case 1 -- regression guard. No live orchestration
+    /// shares the target root checkout (the stub daemon answers `ListAgents`
+    /// with an empty `agent_records`), so `handle_dispatch` must provision the
+    /// worktree exactly as it does today: an ordinary `git worktree add`
+    /// sibling of `ctx.working_dir`, sharing its git common dir. Uses a real
+    /// (fast, `cat`-backed) spawn so the resulting worktree survives on disk
+    /// to inspect, rather than a deliberately-failed one that would trigger
+    /// `handle_dispatch`'s own rollback and remove it.
+    #[tokio::test]
+    async fn dispatch_shares_the_checkout_when_no_live_sibling_exists() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "gate-none-unit", "task", None).await;
+
+        assert!(
+            result.success,
+            "with no live sibling, dispatch must still succeed: {}",
+            result.message
+        );
+        assert!(
+            result.worktree_dir.exists(),
+            "with no live sibling, the worktree must be provisioned: {}",
+            result.message
+        );
+        let repo_common = crate::issue_dispatch_run::git_common_dir(&repo)
+            .expect("resolve the shared checkout's own common dir");
+        let worktree_common = crate::issue_dispatch_run::git_common_dir(&result.worktree_dir)
+            .expect("resolve the new worktree's common dir");
+        assert_eq!(
+            worktree_common, repo_common,
+            "with no live sibling, the worktree must be an ordinary `git worktree add` \
+             sibling sharing the checkout's own common dir -- an unaffected regression \
+             guard, not new behavior"
+        );
+    }
+
+    /// Scenario: issue #490, case 2 -- the actual gate. A live orchestration
+    /// already has its OWN sibling worktree open against the same root
+    /// checkout (mirroring the real #325 incident shape: `orchestration_cwd`
+    /// is the live sibling's WORKTREE path, not `ctx.working_dir` itself, so
+    /// only a `--git-common-dir` compare -- not raw path equality -- can see
+    /// the collision). `handle_dispatch` must NOT create a second plain
+    /// sibling of the shared checkout; it must isolate this dispatch into its
+    /// own fresh clone instead, mirroring Model A's `Ok(true)` branch
+    /// (`provision_isolated_clone_sync`). This is genuinely RED right now:
+    /// `handle_dispatch` has no such check at all, so it always creates a
+    /// plain sibling regardless of what the daemon reports, and the two
+    /// common dirs below will incorrectly compare EQUAL.
+    #[tokio::test]
+    async fn dispatch_isolates_into_a_fresh_clone_when_a_live_sibling_shares_the_checkout() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        // The already-live sibling: a distinct `git worktree add` off `repo`,
+        // exactly the shape an earlier orchestration's own dispatch/SpawnPane
+        // would have produced.
+        let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
+        create_worktree(
+            &repo,
+            &live_sibling_dir,
+            "agent/existing-live-orchestration",
+            false,
+            "test:existing-live-orchestration",
+        )
+        .await
+        .expect("provision the pre-existing live sibling worktree");
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
+                &live_sibling_dir,
+            )]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "gate-live-unit", "task", None).await;
+
+        let repo_common = crate::issue_dispatch_run::git_common_dir(&repo)
+            .expect("resolve the shared checkout's own common dir");
+        let worktree_common = crate::issue_dispatch_run::git_common_dir(&result.worktree_dir)
+            .expect(
+                "resolve the new dispatch's own common dir -- it must exist as SOME kind of \
+                 git repository regardless of which provisioning mechanism ran",
+            );
+        assert_ne!(
+            worktree_common,
+            repo_common,
+            "a live sibling already sharing the target root checkout must make this \
+             dispatch isolate into its OWN fresh clone -- a distinct git common dir/object \
+             store -- instead of sharing {}'s via a `git worktree add` sibling, matching \
+             Model A's Ok(true) branch: {}",
+            repo.display(),
+            result.message
+        );
+    }
+
+    /// Scenario: issue #490, case 3a -- fail closed on a well-formed daemon
+    /// ERROR response (`ok: false`). Mirrors
+    /// `root_checkout_has_live_sibling_fails_closed_on_daemon_error_response`
+    /// in `src/ui.rs`: this is the shape `serve_attach` emits for a malformed
+    /// request today, and a wedged/half-upgraded daemon that still accepts
+    /// connections could emit for any other reason. `handle_dispatch` must
+    /// refuse to provision at all -- no worktree, no branch -- matching Model
+    /// A's `Err(reason)` branch, rather than falling back to the ordinary
+    /// shared-sibling path. This is genuinely RED right now: `handle_dispatch`
+    /// ignores the daemon response entirely and provisions successfully
+    /// regardless.
+    #[tokio::test]
+    async fn dispatch_fails_closed_on_daemon_error_response() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::err("simulated daemon-side failure"),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+        let paths = derive_dispatch_paths(&repo, "gate-err-unit");
+
+        let result = handle_dispatch(&ctx, "gate-err-unit", "task", None).await;
+
+        assert!(
+            !result.success,
+            "an `ok: false` daemon response must fail dispatch CLOSED, not silently fall \
+             back to the ordinary shared-sibling path: {}",
+            result.message
+        );
+        assert!(
+            !paths.worktree_dir.exists(),
+            "a fail-closed refusal must not leave a worktree behind: {}",
+            result.message
+        );
+        assert!(
+            !branch_exists(&repo, &paths.branch),
+            "a fail-closed refusal must not leave a branch behind either: {}",
+            result.message
+        );
+    }
+
+    /// Scenario: issue #490, case 3b -- fail closed on the OTHER untrustworthy
+    /// shape: `ok: true` but `agent_records: None`, the documented OLDER-daemon
+    /// shape (`agent_records`'s own doc comment: "Older daemons omit this
+    /// field"). Mirrors
+    /// `root_checkout_has_live_sibling_fails_closed_on_legacy_agents_only_response`
+    /// in `src/ui.rs`: a legacy `agents` list carries only ids, no
+    /// `tab_membership`, so it cannot answer whether a live sibling shares
+    /// this root checkout -- `handle_dispatch` must refuse rather than assume
+    /// "no live sibling". Same RED reason as the sibling `_daemon_error_`
+    /// test above: no gate exists yet, so this is silently treated as "no live
+    /// sibling" today.
+    #[tokio::test]
+    async fn dispatch_fails_closed_on_legacy_agents_only_response() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agents(vec!["agent-1".to_string()]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+        let paths = derive_dispatch_paths(&repo, "gate-legacy-unit");
+
+        let result = handle_dispatch(&ctx, "gate-legacy-unit", "task", None).await;
+
+        assert!(
+            !result.success,
+            "an older-daemon-shaped response (agent_records: None) must fail dispatch \
+             CLOSED, not silently fall back to the ordinary shared-sibling path: {}",
+            result.message
+        );
+        assert!(
+            !paths.worktree_dir.exists(),
+            "a fail-closed refusal must not leave a worktree behind: {}",
+            result.message
+        );
+        assert!(
+            !branch_exists(&repo, &paths.branch),
+            "a fail-closed refusal must not leave a branch behind either: {}",
+            result.message
+        );
+    }
+
     /// The wire choice maps onto the spawn override, and ABSENT stays absent —
     /// that is what preserves the pre-selector behaviour for an older CLI.
     #[test]
