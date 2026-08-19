@@ -254,6 +254,49 @@ fn shape_override_of(shape: Option<&crate::event::DispatchShape>) -> Option<Spaw
     }
 }
 
+/// Shared failure reporting for `IsolatedCloneOutcome::TimedOut` and
+/// `::Failed`: both tell the caller to retry, log automatic cleanup when it
+/// already happened (Model A parity, `src/ui.rs`'s matching arm -- P3-2),
+/// and name the worktree path rather than just "try again" (P3-2). They
+/// differ only in the outcome name spliced into the message/log line and in
+/// whether git's own captured error text is present.
+///
+/// `error` is git's own captured stderr where present -- a lower-trust
+/// source than the same-uid processes the rest of `handle_dispatch`'s
+/// messages come from (repo content can end up in it), so it is sanitized
+/// like any other untrusted text written into the caller's pane (issue #325
+/// auditor C1).
+fn isolated_clone_failure_result(
+    worktree_dir: &Path,
+    reason: &str,
+    error: Option<&str>,
+    cleaned_up_by: Option<&str>,
+) -> DispatchResult {
+    let path = crate::terminal_sanitize::sanitize_path_for_terminal_display(worktree_dir);
+    let detail = if let Some(remover) = cleaned_up_by {
+        tracing::info!(
+            path = %path,
+            remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+            "dispatch: isolated clone {reason}; half-created directory removed automatically"
+        );
+        "the half-created directory was removed automatically — try again".to_string()
+    } else {
+        format!("run `rm -rf {path}` to clear it, then try again")
+    };
+    let message = match error {
+        Some(error) => format!(
+            "dispatch: isolated clone {reason} at {path} — {} ({detail})",
+            crate::terminal_sanitize::sanitize_for_terminal_display(error)
+        ),
+        None => format!("dispatch: isolated clone {reason} at {path} — {detail}"),
+    };
+    DispatchResult {
+        worktree_dir: worktree_dir.to_path_buf(),
+        success: false,
+        message,
+    }
+}
+
 pub async fn handle_dispatch(
     ctx: &DispatchContext,
     name: &str,
@@ -417,34 +460,12 @@ pub async fn handle_dispatch(
                 };
             }
             Ok(Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })) => {
-                let detail = if let Some(remover) = cleaned_up_by.as_deref() {
-                    // Model A parity (`src/ui.rs`'s matching arm) --
-                    // originally missing here (P3-2).
-                    tracing::info!(
-                        path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(&paths.worktree_dir),
-                        remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                        "dispatch: isolated clone timed out; half-created directory removed automatically"
-                    );
-                    "the half-created directory was removed automatically — try again".to_string()
-                } else {
-                    format!(
-                        "run `rm -rf {}` to clear it, then try again",
-                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                            &paths.worktree_dir
-                        )
-                    )
-                };
-                return DispatchResult {
-                    worktree_dir: paths.worktree_dir.clone(),
-                    success: false,
-                    // Model A parity (P3-2): name the path, not just "try again".
-                    message: format!(
-                        "dispatch: isolated clone timed out at {} — {detail}",
-                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                            &paths.worktree_dir
-                        )
-                    ),
-                };
+                return isolated_clone_failure_result(
+                    &paths.worktree_dir,
+                    "timed out",
+                    None,
+                    cleaned_up_by.as_deref(),
+                );
             }
             // Issue #325 fix round 3 parity (reviewer C2 / auditor C2): a
             // genuine (non-timeout) clone/checkout failure is reported
@@ -454,40 +475,12 @@ pub async fn handle_dispatch(
                 error,
                 cleaned_up_by,
             })) => {
-                let detail = if let Some(remover) = cleaned_up_by.as_deref() {
-                    // Model A parity (`src/ui.rs`'s matching arm) --
-                    // originally missing here (P3-2).
-                    tracing::info!(
-                        path = %crate::terminal_sanitize::sanitize_path_for_terminal_display(&paths.worktree_dir),
-                        remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                        "dispatch: isolated clone failed; half-created directory removed automatically"
-                    );
-                    "the half-created directory was removed automatically — try again".to_string()
-                } else {
-                    format!(
-                        "run `rm -rf {}` to clear it, then try again",
-                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                            &paths.worktree_dir
-                        )
-                    )
-                };
-                // `error` is git's own captured stderr -- a lower-trust
-                // source than the same-uid processes the rest of this
-                // function's messages come from (repo content can end up in
-                // it), so it is sanitized like any other untrusted text
-                // written into the caller's pane (issue #325 auditor C1).
-                return DispatchResult {
-                    worktree_dir: paths.worktree_dir.clone(),
-                    success: false,
-                    // Model A parity (P3-2): name the path, not just "try again".
-                    message: format!(
-                        "dispatch: isolated clone failed at {} — {} ({detail})",
-                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                            &paths.worktree_dir
-                        ),
-                        crate::terminal_sanitize::sanitize_for_terminal_display(&error)
-                    ),
-                };
+                return isolated_clone_failure_result(
+                    &paths.worktree_dir,
+                    "failed",
+                    Some(&error),
+                    cleaned_up_by.as_deref(),
+                );
             }
             Ok(Err(e)) => {
                 return DispatchResult {
