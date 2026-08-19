@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -317,6 +317,63 @@ pub fn resolve_display_name(form_name: Option<&str>, command: Option<&str>) -> S
 /// stays valid (paths are UTF-8 and legitimately contain accented bytes).
 pub fn is_valid_cwd(value: &str) -> bool {
     !value.is_empty() && value.len() <= CWD_MAX_LEN && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
+}
+
+/// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
+/// complexity): validate a caller-supplied `DOT_AGENT_DECK_PANE_ID` for
+/// retention in the registry, dropping (and logging) anything that fails
+/// [`is_valid_pane_id_env`]. The spawned child still sees the caller's
+/// verbatim value via `opts.env` — only the registry's retained mirror
+/// goes through this filter (see the doc comment at the `spawn_agent` call
+/// site for why that mirror needs scrubbing).
+fn capture_pane_id_env(opts: &SpawnOptions<'_>) -> Option<String> {
+    let value = opts
+        .env
+        .iter()
+        .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
+        .map(|(_, v)| v.clone())?;
+    if is_valid_pane_id_env(&value) {
+        Some(value)
+    } else {
+        tracing::debug!(
+            len = value.len(),
+            "spawn_agent: dropping caller-supplied DOT_AGENT_DECK_PANE_ID — fails validation, child still sees it but registry won't echo it"
+        );
+        None
+    }
+}
+
+/// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
+/// complexity): validate a caller-supplied display name via
+/// [`is_valid_display_name`], dropping (and logging) anything that fails.
+fn capture_display_name(display_name: Option<&str>) -> Option<String> {
+    let value = display_name?;
+    if is_valid_display_name(value) {
+        Some(value.to_string())
+    } else {
+        tracing::debug!(
+            len = value.len(),
+            "spawn_agent: dropping caller-supplied display_name — fails validation"
+        );
+        None
+    }
+}
+
+/// Extracted from [`AgentPtyRegistry::spawn_agent`] (SonarCloud cognitive
+/// complexity): validate a caller-supplied cwd via [`is_valid_cwd`],
+/// dropping (and logging) anything that fails. The child still sees the
+/// caller's verbatim cwd; only the registry's retained copy is scrubbed.
+fn capture_cwd(cwd: Option<&str>) -> Option<String> {
+    let value = cwd?;
+    if is_valid_cwd(value) {
+        Some(value.to_string())
+    } else {
+        tracing::debug!(
+            len = value.len(),
+            "spawn_agent: dropping caller-supplied cwd from registry — fails validation (child still sees it)"
+        );
+        None
+    }
 }
 
 /// Which tab a daemon-tracked agent pane belonged to at spawn time
@@ -1416,11 +1473,77 @@ impl AgentBus {
 /// stops pinning the daemon up past its idle window (PRD #93 round-2
 /// reviewer REV-3 — `len()` on its own counted exited entries and broke
 /// idle shutdown).
+///
+/// Issue #465 M1: loop exit is also the daemon's earliest, unconditional
+/// "this process is gone" signal, so — for a process that died WITHOUT the
+/// daemon's own doing — it retires any armed
+/// `OutstandingDelegation`/`SilenceWatchRecord` for this pane via
+/// [`AgentPtyRegistry::sweep_delegations_on_exit`] — instead of leaving
+/// either record armed for its full timeout window when the pane's process
+/// exited on its own, without ever calling `work-done` or going through an
+/// explicit `StopAgent` close. `pane_id_env` is `None` for a spawn that
+/// never carried one (most unit-test fixtures), in which case there is
+/// nothing in the tracker keyed by it and the sweep is skipped.
+///
+/// Issue #465 M2: when the sweep returns a non-empty `Vec<OutstandingDelegation>`,
+/// each record for which `pane_id` (the pane that just reached EOF) was the
+/// **worker** side — i.e. `record.orchestrator_pane_id != pane_id`, which rules
+/// out records this pane only touched as the *orchestrator* that issued them —
+/// gets [`AgentPtyRegistry::deliver_worker_exited_notice`]'s "exited without
+/// work-done" notice delivered to its orchestrator pane. That delivery is
+/// `async` (it goes through the identity-guarded
+/// [`AgentPtyRegistry::write_notice_guarded`]), but this function runs on a
+/// bare `std::thread` with no `tokio` runtime context of its own, so it cannot
+/// simply `.await` it. `runtime_handle` is a [`tokio::runtime::Handle`]
+/// captured with `try_current()` (never `current()`, which panics outside a
+/// runtime) at the SAME moment this thread was spawned — see
+/// [`AgentPtyRegistry::spawn_agent`]'s call site — and used here to
+/// `handle.spawn` the notice delivery onto that runtime instead. A `None`
+/// handle means `spawn_agent` itself ran with no runtime in scope (every
+/// production spawn happens inside the daemon's async request handling or a
+/// `tokio::spawn`ed dispatch task, so this is a synchronous unit-test fixture
+/// that never exercises this path) — in that case the notice cannot be
+/// delivered at all, which is logged rather than attempted.
+///
+/// "Without the daemon's own doing" is load-bearing: [`AgentPtyRegistry::close_agent`]
+/// and [`AgentPtyRegistry::respawn_agent_for_pane`] BOTH remove the agent's
+/// entry from the registry BEFORE killing its child, so by the time THIS
+/// thread's `read` unblocks on the resulting EOF, `agent_id` no longer names
+/// a live entry — checked via [`AgentPtyRegistry::is_agent_still_registered`]
+/// — and the sweep is skipped. Both of those callers already own the sweep
+/// decision for their own kill: `close_agent` deliberately performs none on
+/// its own (a bare call is the documented no-sweep primitive a rebound
+/// successor on the same pane relies on — see
+/// `delegate_rebound_worker_event_does_not_suppress_original_watch`), the
+/// `StopAgent` daemon-protocol handler wraps it with an explicit
+/// `begin_pane_close`/`finish_pane_close` when IT wants one, and respawn
+/// deliberately lets an outstanding delegation carry forward to whichever
+/// agent next occupies the pane. Only a still-registered entry — nothing
+/// else has removed it, so nothing else has decided what to do about its
+/// death yet — is this thread's own natural-exit signal to act on.
+///
+/// `registry` is a [`Weak`] reference, deliberately NOT an owned `Arc`: this
+/// thread is detached and only exits once the child's PTY reaches EOF, so an
+/// owned `Arc<AgentPtyRegistry>` held here would keep the registry alive for
+/// as long as the thread runs — which is exactly backwards, since
+/// `AgentPtyRegistry`'s own `Drop` is what calls `shutdown_all` to kill any
+/// still-live children in the first place (`registry_drop_kills_agents`
+/// caught this the hard way: an owned `Arc` here means the registry's strong
+/// count never reaches zero while any spawned agent's reader thread is still
+/// blocked on `read`, so `Drop` never runs, so the child is never killed, so
+/// the thread never unblocks). A `Weak` upgrade fails harmlessly if the
+/// registry has already been dropped by the time EOF is observed — there is
+/// nothing left to sweep in that case either way.
+#[allow(clippy::too_many_arguments)]
 fn pump_reader(
     mut reader: Box<dyn std::io::Read + Send>,
     bus: Arc<AgentBus>,
     exited: Arc<AtomicBool>,
     change_notify: Arc<Notify>,
+    registry: Weak<AgentPtyRegistry>,
+    agent_id: String,
+    pane_id_env: Option<String>,
+    runtime_handle: Option<tokio::runtime::Handle>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -1431,6 +1554,46 @@ fn pump_reader(
         }
     }
     exited.store(true, Ordering::SeqCst);
+    if let Some(pane_id) = pane_id_env.as_deref()
+        && let Some(registry) = registry.upgrade()
+        && registry.is_agent_still_registered(&agent_id)
+    {
+        let swept = registry.sweep_delegations_on_exit(pane_id, &agent_id);
+        // Issue #465 M2: only the records for which THIS pane was the WORKER
+        // side warrant an "exited without work-done" notice — a record this
+        // pane touched only as the orchestrator that issued it (its own
+        // `orchestrator_pane_id == pane_id`) means a DIFFERENT, still-live
+        // worker pane's delegation, and the orchestrator that would receive
+        // the notice is the pane that just exited, so there is nobody to
+        // notify.
+        let worker_exits: Vec<OutstandingDelegation> = swept
+            .into_iter()
+            .filter(|delegation| delegation.orchestrator_pane_id != pane_id)
+            .collect();
+        if !worker_exits.is_empty() {
+            match runtime_handle {
+                Some(handle) => {
+                    let pane_id = pane_id.to_string();
+                    let registry = registry.clone();
+                    handle.spawn(async move {
+                        for delegation in worker_exits {
+                            registry
+                                .deliver_worker_exited_notice(&pane_id, delegation)
+                                .await;
+                        }
+                    });
+                }
+                None => {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        count = worker_exits.len(),
+                        "pane EOF: a worker exited without work-done, but no tokio runtime \
+                         handle was captured at spawn time, so its notice could not be delivered"
+                    );
+                }
+            }
+        }
+    }
     change_notify.notify_one();
 }
 
@@ -2726,6 +2889,13 @@ struct SilenceWatchRecord {
     /// ORCHESTRATOR cancels the watch too — its notice would otherwise be aimed
     /// at a pane id a later, unrelated agent can inherit.
     orchestrator_pane_id: String,
+    /// Issue #465 F2: mirrors [`OutstandingDelegation::worker_agent_id`] — the
+    /// worker's registry agent id, when known at arm time. Unlike the idle
+    /// delegation, [`AgentPtyRegistry::arm_silence_watch`] is called from
+    /// `dispatch_one_owned` AFTER any `clear = true` respawn has already
+    /// resolved the worker's identity, so this is set directly at arm time
+    /// rather than bound later.
+    worker_agent_id: Option<String>,
     /// The live end of the watch task's cancellation channel. Never *sent* on:
     /// the task selects on it and exits as soon as it resolves, which happens
     /// when this record leaves the map (work-done, supersede, pane close, or the
@@ -2842,6 +3012,20 @@ pub struct OutstandingDelegation {
     /// clobbering delegation #2's still-live record — which used to leave the
     /// newest delegation silent forever with no nudge.
     superseded: u32,
+    /// Issue #465 F2: the worker's registry agent id, bound once it is known
+    /// rather than at arm time — `None` until [`AgentPtyRegistry::bind_delegation_worker_agent_id`]
+    /// sets it. This record is armed synchronously in `AppState::handle_delegate`,
+    /// BEFORE the dispatch task that may respawn the worker pane even starts
+    /// running, so the eventual worker identity (the respawn's fresh agent, or
+    /// whoever already owns the pane on a `clear = false` delegate) is not yet
+    /// knowable at arm time. `pump_reader`'s EOF sweep only retires a record
+    /// via its WORKER-side match when this field is bound AND matches the
+    /// agent that just exited — an unbound record belongs to a delegation
+    /// whose identity has not resolved yet, so the exiting agent (necessarily
+    /// some OTHER, previous occupant of the pane) cannot be it. Left unmatched
+    /// this way, an unbound record simply falls through to its own timer
+    /// instead of being drained by a stranger's death.
+    worker_agent_id: Option<String>,
     /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
     /// watch task's cancellation channel. Never *sent* on — the watch task
     /// selects on it and exits as soon as it resolves, which happens when this
@@ -3183,6 +3367,7 @@ impl AgentPtyRegistry {
                 orchestration: orchestration.cloned(),
                 armed_at: Instant::now(),
                 superseded,
+                worker_agent_id: None,
                 _watch_cancel: cancel_tx,
             },
         );
@@ -3190,6 +3375,29 @@ impl AgentPtyRegistry {
             seq,
             cancel: cancel_rx,
         })
+    }
+
+    /// Issue #465 F2: bind the worker's registry agent id onto an already-armed
+    /// [`OutstandingDelegation`] once it becomes known — after a `clear = true`
+    /// respawn resolves, or immediately for a `clear = false` delegate. `seq`
+    /// guards against binding a DIFFERENT (superseded, or already-retired)
+    /// delegation than the one the caller resolved this identity for: if the
+    /// record for `worker_pane_id` no longer exists, or a newer delegation has
+    /// since replaced it, this is a no-op. See [`OutstandingDelegation::worker_agent_id`]
+    /// for why the sweep needs this bound before it will ever act on a
+    /// worker-side match.
+    pub fn bind_delegation_worker_agent_id(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+        worker_agent_id: &str,
+    ) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.records.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.worker_agent_id = Some(worker_agent_id.to_string());
+        }
     }
 
     /// PRD #249 M3 review (finding B4/S4): register the silent-worker watch for
@@ -3210,10 +3418,14 @@ impl AgentPtyRegistry {
     /// round-6 review; see [`SilenceWatchRecord::superseded`]), because the
     /// `work-done` that belonged to the superseded delegation may still be in
     /// flight and must not be credited to this new watch.
+    ///
+    /// Issue #465 F2: `worker_agent_id` is the worker's registry agent id, when
+    /// the caller already knows it — see [`SilenceWatchRecord::worker_agent_id`].
     pub fn arm_silence_watch(
         &self,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
+        worker_agent_id: Option<&str>,
     ) -> Option<ArmedSilenceWatch> {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
@@ -3233,6 +3445,7 @@ impl AgentPtyRegistry {
                 seq,
                 superseded,
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
+                worker_agent_id: worker_agent_id.map(str::to_string),
                 _cancel: cancel_tx,
             },
         );
@@ -3577,6 +3790,150 @@ impl AgentPtyRegistry {
         swept
     }
 
+    /// Issue #465 M1: called from `pump_reader`'s EOF branch the moment a
+    /// pane's PTY reaches EOF — the daemon's earliest, unconditional signal
+    /// that the pane's process is gone, independent of whether it ever called
+    /// `work-done` or went through an explicit `StopAgent` close. Retires any
+    /// armed `OutstandingDelegation`/`SilenceWatchRecord` touching this pane
+    /// (as worker OR as orchestrator target, same as [`Self::begin_pane_close`])
+    /// instead of leaving either sit armed for its full timeout window.
+    ///
+    /// Deliberately does NOT call [`Self::begin_pane_close`]/
+    /// [`Self::finish_pane_close`] — those also mark `closing_panes` (with no
+    /// natural "finish" call for a process that died on its own, which would
+    /// leave the mark stuck) and drop `close_waiters` (which signal a
+    /// *deliberate* close, not a natural exit). This reuses the same
+    /// underlying drain helpers those two call, without either of their
+    /// close-transition side effects.
+    ///
+    /// Idempotent by construction: [`Self::drain_delegations_touching`]/
+    /// [`Self::drain_silence_watches_touching`] no-op on a pane with no
+    /// matching record, so a race against a near-simultaneous `work-done` or
+    /// explicit close — whichever reaches the tracker first — leaves nothing
+    /// for the other to retire twice.
+    ///
+    /// Issue #465 F2: unlike [`Self::begin_pane_close`]/[`Self::finish_pane_close`],
+    /// a WORKER-side match here is additionally gated on `exited_agent_id` —
+    /// see [`drain_delegations_touching_for_exit`]/[`drain_silence_watches_touching_for_exit`]
+    /// and [`OutstandingDelegation::worker_agent_id`] for why. The two
+    /// deliberate closes need no such gate: their sweep runs INSIDE the same
+    /// operation that decided to end the pane, with no dispatch/respawn window
+    /// in between for a fresher, not-yet-bound delegation to be mistaken for
+    /// the one being closed.
+    ///
+    /// Private: `pump_reader`, its only caller, lives in this same module —
+    /// see issue #465 review finding F7.
+    fn sweep_delegations_on_exit(
+        &self,
+        pane_id: &str,
+        exited_agent_id: &str,
+    ) -> Vec<OutstandingDelegation> {
+        let mut tracker = self.delegations.lock().unwrap();
+        let cancelled_watches =
+            Self::drain_silence_watches_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
+        let swept =
+            Self::drain_delegations_touching_for_exit(&mut tracker, pane_id, exited_agent_id);
+        if cancelled_watches > 0 || !swept.is_empty() {
+            tracing::debug!(
+                pane_id = %pane_id,
+                cancelled_watches,
+                swept_delegations = swept.len(),
+                "pane EOF: retired outstanding delegation/silence-watch records for this pane"
+            );
+        }
+        swept
+    }
+
+    /// Issue #465 M1: whether `agent_id` still names a live entry in the
+    /// registry. `pump_reader`'s EOF branch uses this to tell a process that
+    /// died NATURALLY (nothing has removed its entry yet — the death is news
+    /// to the registry) from one whose death was the daemon's own doing:
+    /// [`Self::close_agent`] and [`Self::respawn_agent_for_pane`] both
+    /// remove the entry BEFORE killing its child, so by the time that kill's
+    /// resulting EOF is observed, the entry is already gone and this
+    /// correctly answers `false`.
+    fn is_agent_still_registered(&self, agent_id: &str) -> bool {
+        self.inner.lock().unwrap().agents.contains_key(agent_id)
+    }
+
+    /// Issue #465 M2: deliver the "worker exited without work-done" notice for
+    /// one [`OutstandingDelegation`] [`Self::sweep_delegations_on_exit`] just
+    /// swept off `worker_pane_id`. Follows exactly the guarded-write path PRD
+    /// #249's silence watch already uses
+    /// ([`crate::state::arm_delegate_silence_watch`]'s tail): compose the
+    /// fixed-text notice, write it through
+    /// [`Self::write_notice_guarded`] bound to the orchestrator's registry
+    /// agent id captured when the delegation was armed, with a revalidation
+    /// closure that refuses a pane that is mid-close or has since been
+    /// re-homed into a different orchestration
+    /// ([`crate::state::orchestration_still_matches`]) — the same identity
+    /// guard every other daemon-authored notice in this file relies on, so a
+    /// pane id freed by the exit and reused by an unrelated agent cannot
+    /// receive this orchestration's diagnostics.
+    ///
+    /// Called from `pump_reader`'s EOF branch via a `tokio::runtime::Handle`
+    /// captured at spawn time, since the reader thread itself is a bare
+    /// `std::thread` with no async context of its own — see that function's
+    /// doc comment for why the handle can be absent and what happens then.
+    async fn deliver_worker_exited_notice(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        delegation: OutstandingDelegation,
+    ) {
+        let notice = crate::state::compose_worker_exited_notice(worker_pane_id);
+        let orchestrator_pane_id = delegation.orchestrator_pane_id.clone();
+        let expected_agent_id = delegation.orchestrator_agent_id.clone();
+        let orchestration = delegation.orchestration.clone();
+        let revalidate_registry = Arc::clone(self);
+        let revalidate_pane = orchestrator_pane_id.clone();
+        let outcome = self
+            .write_notice_guarded(
+                &orchestrator_pane_id,
+                &notice,
+                Some(&expected_agent_id),
+                || async move {
+                    if revalidate_registry.is_pane_closing(&revalidate_pane) {
+                        return false;
+                    }
+                    crate::state::orchestration_still_matches(
+                        orchestration.as_ref(),
+                        revalidate_registry
+                            .pane_orchestration(&revalidate_pane)
+                            .as_ref(),
+                    )
+                },
+            )
+            .await;
+        match outcome {
+            Ok(GuardedSend::Applied) => tracing::info!(
+                worker_pane_id = %worker_pane_id,
+                role = %delegation.role,
+                "pane EOF: reported a worker that exited without work-done to the orchestrator"
+            ),
+            // Some bytes reached the authorized target; a retry would
+            // duplicate a half-written line rather than repair it.
+            Ok(GuardedSend::Ambiguous) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %delegation.role,
+                "pane EOF: worker-exited notice delivery was ambiguous (partial write); not \
+                 retried"
+            ),
+            Ok(refused) => tracing::debug!(
+                pane_id = %orchestrator_pane_id,
+                role = %delegation.role,
+                expected_agent_id = %expected_agent_id,
+                outcome = ?refused,
+                "pane EOF: identity gate refused the worker-exited notice; nothing written"
+            ),
+            Err(e) => tracing::warn!(
+                pane_id = %orchestrator_pane_id,
+                role = %delegation.role,
+                error = %e,
+                "pane EOF: failed to write the worker-exited notice into the orchestrator pane"
+            ),
+        }
+    }
+
     /// PRD #126: whether `pane_id` is between [`Self::begin_pane_close`] and
     /// [`Self::finish_pane_close`]. The idle watch re-checks this immediately
     /// before writing (inside the guarded-send revalidation) so a close that
@@ -3682,6 +4039,59 @@ impl AgentPtyRegistry {
             .collect();
         keys.iter()
             .filter(|key| tracker.commissions.remove(*key).is_some())
+            .count()
+    }
+
+    /// Issue #465 F2: the [`Self::drain_delegations_touching`] counterpart used
+    /// by [`Self::sweep_delegations_on_exit`] — identical ORCHESTRATOR-side
+    /// match (that identity is always known and current, captured synchronously
+    /// at arm time), but a WORKER-side match additionally requires
+    /// `record.worker_agent_id` to be bound AND equal to `exited_agent_id`. A
+    /// record whose identity has not resolved yet (`None`) is left alone: the
+    /// agent that just exited is necessarily some OTHER, earlier occupant of
+    /// the pane, not the one this delegation is for. Caller holds the tracker
+    /// lock.
+    fn drain_delegations_touching_for_exit(
+        tracker: &mut DelegationTracker,
+        pane_id: &str,
+        exited_agent_id: &str,
+    ) -> Vec<OutstandingDelegation> {
+        let keys: Vec<String> = tracker
+            .records
+            .iter()
+            .filter(|(worker_pane, record)| {
+                (worker_pane.as_str() == pane_id
+                    && record.worker_agent_id.as_deref() == Some(exited_agent_id))
+                    || record.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter_map(|key| tracker.records.remove(key))
+            .collect()
+    }
+
+    /// Issue #465 F2: the [`Self::drain_silence_watches_touching`] counterpart
+    /// used by [`Self::sweep_delegations_on_exit`] — same identity gate as
+    /// [`Self::drain_delegations_touching_for_exit`], applied to silence
+    /// watches. Caller holds the tracker lock.
+    fn drain_silence_watches_touching_for_exit(
+        tracker: &mut DelegationTracker,
+        pane_id: &str,
+        exited_agent_id: &str,
+    ) -> usize {
+        let keys: Vec<String> = tracker
+            .silence_watches
+            .iter()
+            .filter(|(worker_pane, watch)| {
+                (worker_pane.as_str() == pane_id
+                    && watch.worker_agent_id.as_deref() == Some(exited_agent_id))
+                    || watch.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter(|key| tracker.silence_watches.remove(*key).is_some())
             .count()
     }
 
@@ -4036,7 +4446,10 @@ impl AgentPtyRegistry {
     }
 
     /// Spawn a new agent and return its registry id.
-    pub fn spawn_agent(&self, mut opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
+    pub fn spawn_agent(
+        self: &Arc<Self>,
+        mut opts: SpawnOptions<'_>,
+    ) -> Result<String, AgentPtyError> {
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard A — reject the spawn
         // immediately if the registry has already entered its shutdown
         // path. `daemon_protocol::handle_attach` already rejects an
@@ -4066,22 +4479,7 @@ impl AgentPtyRegistry {
         // `list_agents` response past `MAX_FRAME_LEN` and breaking
         // hydration for *every* agent. The child process still sees the
         // caller's verbatim value — only the registry's mirror is scrubbed.
-        let pane_id_env = opts
-            .env
-            .iter()
-            .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
-            .map(|(_, v)| v.clone())
-            .and_then(|v| {
-                if is_valid_pane_id_env(&v) {
-                    Some(v)
-                } else {
-                    tracing::debug!(
-                        len = v.len(),
-                        "spawn_agent: dropping caller-supplied DOT_AGENT_DECK_PANE_ID — fails validation, child still sees it but registry won't echo it"
-                    );
-                    None
-                }
-            });
+        let pane_id_env = capture_pane_id_env(&opts);
 
         // Point the child at THIS daemon's hook socket rather than letting it
         // re-resolve the endpoint from inherited environment at emit time.
@@ -4102,28 +4500,8 @@ impl AgentPtyRegistry {
         // (no control chars in display_name, bounded length) hold the same
         // way whether the value arrived via the initial StartAgent or via a
         // later SetAgentLabel.
-        let display_name = opts.display_name.and_then(|v| {
-            if is_valid_display_name(v) {
-                Some(v.to_string())
-            } else {
-                tracing::debug!(
-                    len = v.len(),
-                    "spawn_agent: dropping caller-supplied display_name — fails validation"
-                );
-                None
-            }
-        });
-        let cwd_stored = opts.cwd.and_then(|v| {
-            if is_valid_cwd(v) {
-                Some(v.to_string())
-            } else {
-                tracing::debug!(
-                    len = v.len(),
-                    "spawn_agent: dropping caller-supplied cwd from registry — fails validation (child still sees it)"
-                );
-                None
-            }
-        });
+        let display_name = capture_display_name(opts.display_name);
+        let cwd_stored = capture_cwd(opts.cwd);
 
         // M2.12: capture tab_membership through the same validation lens
         // (the embedded `name` must satisfy `is_valid_display_name`) so the
@@ -4332,12 +4710,43 @@ impl AgentPtyRegistry {
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
         let notify_for_thread = self.change_notify.clone();
+        // Issue #465 M1: the reader thread needs a registry handle, its own
+        // agent id, and the pane's id so its EOF branch can retire any armed
+        // OutstandingDelegation/SilenceWatchRecord — but ONLY when this
+        // agent's death is news to the registry (see `pump_reader`'s doc
+        // comment on `is_agent_still_registered`). The registry handle is
+        // WEAK, deliberately — see the same doc comment for why an owned
+        // `Arc` here deadlocks `AgentPtyRegistry`'s Drop-triggered
+        // `shutdown_all`. Clone the id and pane id BEFORE either is moved
+        // (into `inner.agents.insert` / `RunningAgent`) below.
+        let registry_for_thread = Arc::downgrade(self);
+        let agent_id_for_thread = preallocated_id.clone();
+        let pane_id_env_for_thread = pane_id_env.clone();
+        // Issue #465 M2: captured HERE, at spawn time, rather than inside
+        // `pump_reader` itself — `Handle::try_current()` must run on a
+        // thread that is currently inside a tokio runtime, and `spawn_agent`
+        // (this method) is that thread; the detached reader thread below
+        // never is. Deliberately `try_current()`, never `current()`: this
+        // method is also called from plenty of synchronous `#[test]`
+        // fixtures with no runtime in scope at all, and `current()` panics
+        // in that case instead of returning `None` — see `pump_reader`'s doc
+        // comment for what a `None` handle means at EOF time.
+        let runtime_handle_for_thread = tokio::runtime::Handle::try_current().ok();
         // Detached thread: exits when the PTY returns EOF (child killed).
         // On exit, pump_reader sets `exited` and signals `change_notify` so
         // the idle monitor learns about the death immediately instead of
         // waiting for the next poll cycle.
         std::thread::spawn(move || {
-            pump_reader(reader, bus_for_thread, exited_for_thread, notify_for_thread)
+            pump_reader(
+                reader,
+                bus_for_thread,
+                exited_for_thread,
+                notify_for_thread,
+                registry_for_thread,
+                agent_id_for_thread,
+                pane_id_env_for_thread,
+                runtime_handle_for_thread,
+            )
         });
 
         let agent = RunningAgent {
@@ -5154,7 +5563,7 @@ impl AgentPtyRegistry {
     /// [`crate::state::SESSION_START_WAIT_TIMEOUT`] for the duration and why the
     /// fallback is load-bearing.
     pub async fn respawn_agent_for_pane(
-        &self,
+        self: &Arc<Self>,
         pane_id_env: &str,
         command: &str,
     ) -> Result<String, AgentPtyError> {
@@ -6540,7 +6949,7 @@ mod tests {
     /// the guard the early return is keyed off.
     #[test]
     fn an_empty_registry_reports_no_shell_activity_without_sampling() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         assert!(
             registry
                 .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES)
@@ -7373,7 +7782,7 @@ mod spawn_tests {
 
     #[test]
     fn registry_spawn_and_close() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         assert!(registry.is_empty());
 
         let id = registry
@@ -7392,7 +7801,7 @@ mod spawn_tests {
 
     #[test]
     fn registry_resize_rejects_zero_dims() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
         for (rows, cols) in [(0u16, 80u16), (24u16, 0u16), (0u16, 0u16)] {
             let err = registry.resize(&id, rows, cols).unwrap_err();
@@ -7403,7 +7812,7 @@ mod spawn_tests {
 
     #[test]
     fn registry_resize_unknown_errors() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let err = registry.resize("nope", 50, 200).unwrap_err();
         assert!(matches!(err, AgentPtyError::NotFound(_)));
     }
@@ -7415,7 +7824,7 @@ mod spawn_tests {
         // covers that. Here we just confirm the method returns Ok for a
         // valid id and non-zero dims, i.e. the portable_pty resize ioctl
         // didn't error.
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
         registry
             .resize(&id, 50, 200)
@@ -7430,7 +7839,7 @@ mod spawn_tests {
         // that string, so a second spawn with the same id would silently misroute
         // every subsequent delegate/work-done write to whichever entry
         // `values().find(...)` happened to hand back first.
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id1 = registry
             .spawn_agent(SpawnOptions {
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-x".to_string())],
@@ -7464,7 +7873,7 @@ mod spawn_tests {
         // the registry so `agent_records` / `list_agents` reports it on a
         // fresh `connect` — but it must never overwrite a known type or
         // downgrade to `None`, matching `apply_event`'s strict upgrade.
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
@@ -7507,7 +7916,7 @@ mod spawn_tests {
     /// the native path is observably distinguished from the fallback.
     #[test]
     fn pending_seed_set_take_and_native_flag() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let _id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
@@ -7866,7 +8275,7 @@ mod spawn_tests {
     /// observable from the caller's wall clock.
     #[tokio::test]
     async fn write_to_pane_notice_skips_submit_delay() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let _id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/cat"),
@@ -7931,7 +8340,7 @@ mod spawn_tests {
     /// (no `\r`, so no early submit signal is emitted between them).
     #[tokio::test]
     async fn write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         // The shell prints `RAW-READY` *after* stty applies and *before* exec
         // into cat, so the test can poll the scrollback for that marker and
         // know the slave's termios is in raw mode before issuing the notice /
@@ -8047,7 +8456,7 @@ mod spawn_tests {
     /// against a future re-introduction of pruning.
     #[tokio::test]
     async fn close_agent_does_not_prune_dispatch_mutex_entry() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
@@ -8100,7 +8509,7 @@ mod spawn_tests {
         // We can't easily read PTY bytes from a `/bin/sh` so we
         // confirm structurally: the registry must contain both agents
         // and their `pane_id_env`s must be the values we set.
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id_a = registry
             .spawn_agent(SpawnOptions {
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
@@ -8124,7 +8533,7 @@ mod spawn_tests {
 
     #[test]
     fn registry_close_unknown_errors() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         assert!(matches!(
             registry.close_agent("does-not-exist"),
             Err(AgentPtyError::NotFound(_))
@@ -8133,7 +8542,7 @@ mod spawn_tests {
 
     #[test]
     fn registry_assigns_sequential_ids() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id1 = registry.spawn_agent(SpawnOptions::default()).unwrap();
         let id2 = registry.spawn_agent(SpawnOptions::default()).unwrap();
         let n1: u64 = id1.parse().unwrap();
@@ -8162,7 +8571,7 @@ mod spawn_tests {
     #[cfg(unix)]
     #[test]
     fn registry_shutdown_all_clears_state() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id1 = registry.spawn_agent(SpawnOptions::default()).unwrap();
         let id2 = registry.spawn_agent(SpawnOptions::default()).unwrap();
         assert_eq!(registry.len(), 2);
@@ -8295,7 +8704,7 @@ mod spawn_tests {
         // registry goes out of scope, then verify the kernel reaped it.
         let pid: u32;
         {
-            let registry = AgentPtyRegistry::new();
+            let registry = Arc::new(AgentPtyRegistry::new());
             let id = registry.spawn_agent(SpawnOptions::default()).unwrap();
             pid = registry
                 .inner
@@ -8467,7 +8876,7 @@ mod spawn_tests {
     async fn shell_foreground_busy_ignores_a_non_detached_foreground_child() {
         use std::io::Write as _;
 
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
@@ -8567,7 +8976,7 @@ mod spawn_tests {
     #[spec("status/shell-activity/009")]
     #[test]
     fn shell_activity_009_unconfirmed_names_the_specific_pane_not_just_a_count() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id_a = registry
             .spawn_agent(SpawnOptions {
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-a".to_string())],
@@ -8875,7 +9284,7 @@ mod spawn_tests {
     /// having it write the value to a file, so the assertion covers the real
     /// child environment rather than the registry's bookkeeping.
     fn child_observed_socket(
-        registry: &AgentPtyRegistry,
+        registry: &Arc<AgentPtyRegistry>,
         pane_id: &str,
         extra_env: Vec<(String, String)>,
     ) -> String {
@@ -8908,7 +9317,7 @@ mod spawn_tests {
 
     #[test]
     fn spawn_agent_injects_the_daemons_hook_socket_into_the_child() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
         let observed = child_observed_socket(&registry, "pane-inject", vec![]);
         registry.shutdown_all();
@@ -8921,7 +9330,7 @@ mod spawn_tests {
 
     #[test]
     fn spawn_agent_lets_a_caller_supplied_hook_socket_win() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
         let observed = child_observed_socket(
             &registry,
@@ -8989,7 +9398,7 @@ mod spawn_tests {
 
     #[test]
     fn spawn_at_120x40_surfaces_dims_via_agent_records() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 rows: 120,
@@ -9006,7 +9415,7 @@ mod spawn_tests {
 
     #[test]
     fn resize_updates_dims_reported_via_agent_records() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 rows: 24,
@@ -9075,7 +9484,7 @@ mod spawn_tests {
 
     #[test]
     fn resize_clears_scrollback() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 // Use `cat` so the child stays alive long enough for us
@@ -9124,7 +9533,7 @@ mod spawn_tests {
     // scrollback bytes before a fresh subscriber could observe them.
     #[test]
     fn resize_with_unchanged_dims_preserves_scrollback() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/cat"),
@@ -9168,7 +9577,7 @@ mod spawn_tests {
 
     #[test]
     fn spawn_clamps_oversized_rows_cols_in_captured_dims() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 rows: PTY_RESIZE_DIM_MAX + 1,
@@ -9185,7 +9594,7 @@ mod spawn_tests {
 
     #[test]
     fn spawn_at_u16_max_rows_cols_clamps_not_panics() {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
                 rows: u16::MAX,
@@ -9320,7 +9729,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn delivery_ledger_replays_delivered_and_ambiguous_but_retries_non_delivery() {
         use crate::event::SendResult;
-        let reg = AgentPtyRegistry::new();
+        let reg = Arc::new(AgentPtyRegistry::new());
         let fp = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), None, "pane", "text");
 
         // First admission proceeds; record a DELIVERED outcome.
@@ -9366,7 +9775,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn delivery_ledger_conflicting_fingerprint_reuse_is_refused() {
         use crate::event::SendResult;
-        let reg = AgentPtyRegistry::new();
+        let reg = Arc::new(AgentPtyRegistry::new());
         let fp_a =
             AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), None, "pane", "payload-a");
         let fp_b =
@@ -9460,6 +9869,77 @@ mod spawn_tests {
         reg.shutdown_all();
     }
 
+    /// Issue #465 auditor confirmation, finding M1: pin the PRIMITIVE's
+    /// documented-permissive `None` behavior as an asserted fact, not merely a
+    /// reader's inference from the source. `write_guarded`'s pre-lock identity
+    /// gate (`if !is_paneless && let Some(expected) = expected_agent_id && ...`)
+    /// only compares identities when `expected_agent_id` is `Some` — passing
+    /// `None` skips the gate entirely, and the call proceeds as an UNGUARDED
+    /// write to whoever currently owns the pane. That is correct at THIS layer:
+    /// the primitive is generic, and it is every caller's job never to pass
+    /// `None` when it needs verified delivery — `dispatch_one_owned`'s own
+    /// refusal (`dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`
+    /// in `state.rs`) is exactly that caller-side responsibility. Without this
+    /// test, a future reader would have to re-derive the permissive semantics
+    /// from the gate's `if let` shape rather than finding them asserted.
+    #[tokio::test]
+    async fn guarded_send_with_no_expected_identity_writes_to_the_live_pane() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        // `spawn_agent` returns the REGISTRY's own agent id — a UUID, not the
+        // `pane_id_env` string — and `AgentPtyRegistry::snapshot` reads
+        // scrollback by that agent id, so it has to be captured here rather
+        // than discarded.
+        let agent_id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-no-expected-identity".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let outcome = reg
+            .write_and_submit_guarded_detailed(
+                "pane-no-expected-identity",
+                "echo none-identity-permissive-marker",
+                None,
+                || async { true },
+            )
+            .await
+            .expect("guarded send result");
+        assert_eq!(
+            outcome,
+            GuardedSendDetail::Outcome(GuardedSend::Applied),
+            "a None expected identity must not be refused by the primitive — it is the \
+             caller's job to withhold None when it wants verification"
+        );
+
+        // Confirm bytes actually reached the live pane, not merely that the
+        // outcome claims `Applied`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let snap = reg.snapshot(&agent_id).unwrap_or_default();
+            if snap
+                .windows(b"none-identity-permissive-marker".len())
+                .any(|w| w == b"none-identity-permissive-marker")
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            found,
+            "the guarded primitive must have written the payload into the live pane when \
+             expected_agent_id was None"
+        );
+
+        reg.shutdown_all();
+    }
+
     #[test]
     fn delivery_ledger_lru_touch_and_forget() {
         let mut ledger = DeliveryLedger::default();
@@ -9496,7 +9976,7 @@ mod spawn_tests {
     /// unrelated agent could inherit.
     #[test]
     fn begin_pane_close_cancels_records_targeting_the_closing_orchestrator() {
-        let reg = AgentPtyRegistry::new();
+        let reg = Arc::new(AgentPtyRegistry::new());
         // PRD #140: the record carries the daemon's routing identity, so the
         // fixture uses the same `Instance` token shape a current client stamps.
         let orch = crate::state::OrchestrationIdentity::Instance {
@@ -9566,7 +10046,7 @@ mod spawn_tests {
     /// re-delegated worker could go silent forever with no nudge.
     #[test]
     fn retire_applies_work_done_to_the_oldest_outstanding_delegation() {
-        let reg = AgentPtyRegistry::new();
+        let reg = Arc::new(AgentPtyRegistry::new());
         let first = reg
             .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
             .expect("arm #1");
@@ -9602,10 +10082,14 @@ mod spawn_tests {
     /// exactly the case it exists to surface.
     #[test]
     fn retire_silence_watch_applies_work_done_to_the_oldest_watch() {
-        let reg = AgentPtyRegistry::new();
-        let first = reg.arm_silence_watch("worker", "orch").expect("arm #1");
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let first = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("arm #1");
         let mut first_cancel = first.cancel;
-        let second = reg.arm_silence_watch("worker", "orch").expect("arm #2");
+        let second = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("arm #2");
         let mut second_cancel = second.cancel;
         assert!(second.seq > first.seq, "seq must be monotonic");
         assert!(
@@ -9773,7 +10257,7 @@ mod spawn_tests {
     /// target is gone.
     #[test]
     fn pane_close_signal_resolves_when_the_close_begins() {
-        let reg = AgentPtyRegistry::new();
+        let reg = Arc::new(AgentPtyRegistry::new());
         let mut waiting = reg.pane_close_signal("worker");
         assert!(
             matches!(waiting.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
@@ -9831,7 +10315,7 @@ mod spawn_tests {
             .build()
             .expect("build runtime");
         rt.block_on(async {
-            let reg = AgentPtyRegistry::new();
+            let reg = Arc::new(AgentPtyRegistry::new());
             let armed = reg
                 .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
                 .expect("arm");
@@ -9855,7 +10339,7 @@ mod spawn_tests {
     /// `orchestration_cwd`, which a name-only accessor dropped.
     #[test]
     fn pane_orchestration_reports_the_instance_token_and_orchestration_cwd() {
-        let reg = AgentPtyRegistry::new();
+        let reg = Arc::new(AgentPtyRegistry::new());
         let id = reg
             .spawn_agent(SpawnOptions {
                 command: Some("cat"),
@@ -10174,7 +10658,7 @@ mod spawn_tests {
         // it entirely in phase 3 (no `wait`).
         {
             let (agent, log, pid) = real_stand_in_agent(command_exits_promptly());
-            let registry = AgentPtyRegistry::new();
+            let registry = Arc::new(AgentPtyRegistry::new());
             registry
                 .inner
                 .lock()
@@ -10216,7 +10700,7 @@ mod spawn_tests {
             let (command, _marker_dir, marker) = command_ignores_sigterm();
             let (agent, log, pid) = real_stand_in_agent(command);
             wait_for_trap_ready(&marker);
-            let registry = AgentPtyRegistry::new();
+            let registry = Arc::new(AgentPtyRegistry::new());
             registry
                 .inner
                 .lock()
@@ -10279,7 +10763,7 @@ mod spawn_tests {
             let (agent_a, log_a, pid_a) = real_stand_in_agent(command_exits_promptly());
             let (agent_b, log_b, pid_b) = real_stand_in_agent(command_b);
             wait_for_trap_ready(&marker_b);
-            let registry = AgentPtyRegistry::new();
+            let registry = Arc::new(AgentPtyRegistry::new());
             {
                 let mut inner = registry.inner.lock().unwrap();
                 inner
