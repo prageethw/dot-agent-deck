@@ -990,7 +990,10 @@ pub struct WorktreeKeptNotice {
 /// Why [`remove_worktree`](crate::issue_dispatch_run::remove_worktree) left a
 /// worktree in place instead of removing it — either
 /// [`RemovalPolicy::KeepIfDirty`](crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty)
-/// chose not to attempt removal, or removal was attempted and failed.
+/// chose not to attempt removal because the tree is dirty (or its dirtiness
+/// could not be checked), removal was attempted and failed, or the entry's
+/// policy is [`RemovalPolicy::IsolatedClone`](crate::issue_dispatch_run::RemovalPolicy::IsolatedClone),
+/// under which removal is never attempted at all, regardless of dirtiness.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KeptReason {
@@ -1004,6 +1007,14 @@ pub enum KeptReason {
     /// reached the wire at all (PRD 236 review, reproduced against a locked
     /// worktree on git 2.55.0).
     RemovalFailed,
+    /// The entry is an isolated `git clone`
+    /// ([`RemovalPolicy::IsolatedClone`](crate::issue_dispatch_run::RemovalPolicy::IsolatedClone)),
+    /// not a linked worktree of anything — kept unconditionally rather than
+    /// attempting `git worktree remove` (which does not apply to it) or a
+    /// bare `remove_dir_all` (which could discard commits that exist only
+    /// on this clone's own local branch). PRD fork#325 M3 (issue #490 fix
+    /// round); an actually-safe automatic removal is deferred to M4.
+    IsolatedClone,
     /// The `git status --porcelain` probe itself failed (not a valid worktree,
     /// `git` missing, etc.) — kept fail-safe: unknown is treated as dirty
     /// rather than assumed clean.
