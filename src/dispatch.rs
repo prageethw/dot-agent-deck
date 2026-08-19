@@ -1112,6 +1112,17 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-qm", "add orchestration"]);
 
+        // issue #490's clone gate now runs unconditionally near the top of
+        // `handle_dispatch`, before any worktree provisioning -- without a
+        // reachable daemon it fails closed and returns before the orchestrator
+        // context/delegation-protocol behavior this test pins is ever reached.
+        // Stub a daemon reporting no live sibling so the gate takes its
+        // `Ok(false)` branch and falls through to the original path.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
             working_dir: repo.clone(),
@@ -1374,6 +1385,14 @@ mod tests {
 
         assert!(!result.success);
         assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached -- every other assertion \
+             here is a negative that a fail-closed early return (creating nothing) would \
+             also satisfy, so this is the one assertion that distinguishes a genuine \
+             force-removal from the gate refusing before it ever got there: {}",
+            result.message
+        );
+        assert!(
             !paths.worktree_dir.exists(),
             "with nothing else rooted there, the worktree must still be force-removed \
              exactly as before: {}",
@@ -1400,10 +1419,10 @@ mod tests {
     // sibling already sharing the target's `--git-common-dir` => an isolated
     // clone instead (`provision_isolated_clone_sync`); the daemon query itself
     // failing or answering untrustworthily => fail CLOSED, refuse to provision
-    // at all. `handle_dispatch` has no equivalent check today, so all three
-    // cases below currently collapse onto the first: the worktree is always a
-    // shared-checkout sibling, regardless of what a live sibling or a failing
-    // daemon would otherwise imply.
+    // at all. `handle_dispatch` now has the equivalent check (this PR), so
+    // the three cases below each take their own distinct branch: an ordinary
+    // shared-checkout sibling, an isolated fresh clone, or a fail-closed
+    // refusal, matching what a live sibling or a failing daemon implies.
 
     /// RAII guard, restoring `DOT_AGENT_DECK_ATTACH_SOCKET` and
     /// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` to their previous values on drop
@@ -1611,10 +1630,9 @@ mod tests {
     /// the collision). `handle_dispatch` must NOT create a second plain
     /// sibling of the shared checkout; it must isolate this dispatch into its
     /// own fresh clone instead, mirroring Model A's `Ok(true)` branch
-    /// (`provision_isolated_clone_sync`). This is genuinely RED right now:
-    /// `handle_dispatch` has no such check at all, so it always creates a
-    /// plain sibling regardless of what the daemon reports, and the two
-    /// common dirs below will incorrectly compare EQUAL.
+    /// (`provision_isolated_clone_sync`), which this PR implements: the two
+    /// common dirs below must compare DIFFERENT, proving the isolated-clone
+    /// branch actually ran rather than the ordinary shared-sibling path.
     #[tokio::test]
     async fn dispatch_isolates_into_a_fresh_clone_when_a_live_sibling_shares_the_checkout() {
         let tmp = crate::test_temp::tempdir().unwrap();
@@ -1654,6 +1672,16 @@ mod tests {
 
         let result = handle_dispatch(&ctx, "gate-live-unit", "task", None).await;
 
+        assert!(
+            result.success,
+            "`default_command` is a real binary (`cat`), so this dispatch must actually \
+             succeed -- without this, the test also passes in the scenario where the \
+             clone is provisioned, spawn then fails, and a broken rollback leaves the \
+             clone directory behind uncleaned, which is exactly the bug class this PR's \
+             own review found elsewhere: {}",
+            result.message
+        );
+
         let repo_common = crate::issue_dispatch_run::git_common_dir(&repo)
             .expect("resolve the shared checkout's own common dir");
         let worktree_common = crate::issue_dispatch_run::git_common_dir(&result.worktree_dir)
@@ -1681,9 +1709,7 @@ mod tests {
     /// connections could emit for any other reason. `handle_dispatch` must
     /// refuse to provision at all -- no worktree, no branch -- matching Model
     /// A's `Err(reason)` branch, rather than falling back to the ordinary
-    /// shared-sibling path. This is genuinely RED right now: `handle_dispatch`
-    /// ignores the daemon response entirely and provisions successfully
-    /// regardless.
+    /// shared-sibling path, which this PR implements.
     #[tokio::test]
     async fn dispatch_fails_closed_on_daemon_error_response() {
         let tmp = crate::test_temp::tempdir().unwrap();
@@ -1734,9 +1760,8 @@ mod tests {
     /// in `src/ui.rs`: a legacy `agents` list carries only ids, no
     /// `tab_membership`, so it cannot answer whether a live sibling shares
     /// this root checkout -- `handle_dispatch` must refuse rather than assume
-    /// "no live sibling". Same RED reason as the sibling `_daemon_error_`
-    /// test above: no gate exists yet, so this is silently treated as "no live
-    /// sibling" today.
+    /// "no live sibling", the same fail-closed shape the sibling
+    /// `_daemon_error_` test above pins.
     #[tokio::test]
     async fn dispatch_fails_closed_on_legacy_agents_only_response() {
         let tmp = crate::test_temp::tempdir().unwrap();
