@@ -2119,15 +2119,37 @@ async fn run_hook_loop(
                                     // `pane_id_env` after a close does not.
                                     let expected_agent_id =
                                         pty_registry.authorized_occupant(&signal.pane_id);
-                                    match pty_registry
+                                    let outcome = pty_registry
                                         .write_and_submit_guarded(
                                             &signal.pane_id,
                                             &result.message,
                                             expected_agent_id.as_deref(),
                                             || async { true },
                                         )
-                                        .await
-                                    {
+                                        .await;
+                                    // Issue #424 S3: this delivery is
+                                    // ONE-SHOT — nothing above retries a
+                                    // dispatch result, so the record this
+                                    // write leaves behind guards no retry and
+                                    // can only refuse a LATER delivery of the
+                                    // same result text. Release it here
+                                    // rather than leaving it to the TTL,
+                                    // mirroring every other one-shot
+                                    // guarded-write caller (e.g.
+                                    // `handle_delegate`). Only when something
+                                    // actually landed — a refusal left no
+                                    // record to release.
+                                    if matches!(
+                                        outcome,
+                                        Ok(crate::agent_pty::GuardedSend::Applied)
+                                            | Ok(crate::agent_pty::GuardedSend::Ambiguous)
+                                    ) {
+                                        pty_registry.note_payload_settled(
+                                            &signal.pane_id,
+                                            &result.message,
+                                        );
+                                    }
+                                    match outcome {
                                         Ok(crate::agent_pty::GuardedSend::Applied) => {}
                                         Ok(outcome) => {
                                             warn!(

@@ -2431,12 +2431,25 @@ async fn deliver_on_idle(
         }
     }
     let expected_agent_id = registry.authorized_occupant(pane_id);
-    match registry
+    let outcome = registry
         .write_and_submit_guarded(pane_id, prompt, expected_agent_id.as_deref(), || async {
             true
         })
-        .await
-    {
+        .await;
+    // Issue #424 S3: this delivery is ONE-SHOT — nothing above retries a
+    // reuse prompt, so the record this write leaves behind guards no retry
+    // and can only refuse a LATER delivery of the same fixed prompt text
+    // (every fire of a recurring scheduled task uses the same text). Release
+    // it here rather than leaving it to the TTL, mirroring every other
+    // one-shot guarded-write caller (e.g. `handle_delegate`). Only when
+    // something actually landed — a refusal left no record to release.
+    if matches!(
+        outcome,
+        Ok(GuardedSend::Applied) | Ok(GuardedSend::Ambiguous)
+    ) {
+        registry.note_payload_settled(pane_id, prompt);
+    }
+    match outcome {
         Ok(GuardedSend::Applied) => {}
         Ok(outcome) => {
             tracing::warn!(

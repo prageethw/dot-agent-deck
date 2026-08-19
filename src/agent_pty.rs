@@ -194,15 +194,29 @@ pub fn arm_seed_fallback(
                 // again under the held writer immediately before writing —
                 // mirroring `deliver_worker_exited_notice`.
                 let expected_agent_id = registry.authorized_occupant(&pane_id);
-                match registry
+                let outcome = registry
                     .write_and_submit_guarded(
                         &pane_id,
                         &seed,
                         expected_agent_id.as_deref(),
                         || async { true },
                     )
-                    .await
-                {
+                    .await;
+                // Issue #424 S3: this delivery is ONE-SHOT — nothing above
+                // retries the seed injection, so the record this write
+                // leaves behind guards no retry and can only refuse a LATER
+                // delivery of the same seed text. Release it here rather
+                // than leaving it to the TTL, mirroring every other one-shot
+                // guarded-write caller (e.g. `handle_delegate`). Only when
+                // something actually landed — a refusal left no record to
+                // release.
+                if matches!(
+                    outcome,
+                    Ok(GuardedSend::Applied) | Ok(GuardedSend::Ambiguous)
+                ) {
+                    registry.note_payload_settled(&pane_id, &seed);
+                }
+                match outcome {
                     Ok(GuardedSend::Applied) => {
                         tracing::debug!(
                             pane_id = %pane_id,

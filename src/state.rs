@@ -5337,15 +5337,29 @@ impl AppState {
         // `spawn_agent` reusing the same `pane_id_env` after a close does
         // not.
         let expected_agent_id = registry.authorized_occupant(&orch_pane_id);
-        match registry
+        let outcome = registry
             .write_and_submit_guarded(
                 &orch_pane_id,
                 &feedback,
                 expected_agent_id.as_deref(),
                 || async { true },
             )
-            .await
-        {
+            .await;
+        // Issue #424 S3: this delivery is ONE-SHOT — nothing above retries a
+        // work-done report, so the record this write leaves behind guards no
+        // retry and can only refuse a LATER delivery of the same feedback
+        // text. Release it here rather than leaving it to the TTL, mirroring
+        // every other one-shot guarded-write caller (e.g. `handle_delegate`).
+        // Only when something actually landed — a refusal left no record to
+        // release.
+        if matches!(
+            outcome,
+            Ok(crate::agent_pty::GuardedSend::Applied)
+                | Ok(crate::agent_pty::GuardedSend::Ambiguous)
+        ) {
+            registry.note_payload_settled(&orch_pane_id, &feedback);
+        }
+        match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => {}
             Ok(outcome) => {
                 warn!(
