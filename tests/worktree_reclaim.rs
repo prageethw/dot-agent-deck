@@ -1481,10 +1481,10 @@ fn worktree_reclaim_023_non_utf8_path_is_reclaimed() {
 /// directories the follow-up `--yes` would remove, even though the removal
 /// acts on the distinct byte-exact paths. Asserts the two rendered bullets
 /// differ from each other.
-#[spec("worktree/reclaim/056")]
+#[spec("worktree/reclaim/900")]
 #[test]
 #[cfg(target_os = "linux")]
-fn worktree_reclaim_056_pending_bullets_never_alias_two_distinct_paths() {
+fn worktree_reclaim_900_pending_bullets_never_alias_two_distinct_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1592,10 +1592,10 @@ fn worktree_reclaim_056_pending_bullets_never_alias_two_distinct_paths() {
 /// is the control: it must still read as foreign. Pins issue #425, where the
 /// marker was read but never written, so the deck's own worktrees could only
 /// ever reach `ask`.
-#[spec("worktree/reclaim/057")]
+#[spec("worktree/reclaim/901")]
 #[test]
 #[cfg(unix)]
-fn worktree_reclaim_057_worktree_created_by_the_deck_reads_as_owned() {
+fn worktree_reclaim_901_worktree_created_by_the_deck_reads_as_owned() {
     let fx = Fixture::new();
 
     // The subject: created the way production creates one. Deliberately NOT
