@@ -2244,6 +2244,42 @@ fn classify_worktree_add_result(
     }
 }
 
+/// Attempts (the first included) at `git worktree add` when it fails because a
+/// concurrent add's administrative directory was only half written — issue
+/// #541's residual case. The [`worktree_attach_lock_path`] exclusive lock
+/// already serializes every add this deck itself starts, sync or async, but
+/// an add started by the user or by another tool takes no lock at all and
+/// still races us; the bounded retry below is the only thing that helps
+/// against that case. Bounded on purpose: the window is microseconds wide in
+/// the wild, so a handful of tries covers a genuine race by orders of
+/// magnitude, while a `commondir` that is permanently unreadable (a crashed
+/// add left an empty one behind) still surfaces as an error instead of being
+/// retried forever.
+const WORKTREE_ADD_ATTEMPTS: u32 = 5;
+
+/// Backoff before retry `attempt` (1-based): 100ms, 200ms, 400ms, 800ms — 1.5s
+/// of cover in total, matching upstream issue #541's fix.
+fn worktree_add_backoff(attempt: u32) -> Duration {
+    // Saturating and capped so the arithmetic stays total: at five attempts
+    // the shift never exceeds 3, but raising [`WORKTREE_ADD_ATTEMPTS`] must
+    // not be able to turn a backoff into an overflow panic.
+    Duration::from_millis(100u64 << attempt.saturating_sub(1).min(10))
+}
+
+/// Issue #541: does this `git worktree add` failure look like the reader
+/// side of a concurrent add rather than a real problem? `git worktree add`
+/// scans the repo's worktree list before creating its own entry, reading
+/// every entry's `commondir`; an add that has created its entry but not yet
+/// written that file makes the read come back short, and git turns that into
+/// `fatal: failed to read '<…>/worktrees/<name>/commondir': Success` —
+/// `strerror(errno)` for an errno nothing ever set. Keyed on the file name,
+/// not git's sentence: both the `die_errno` format string and `strerror` are
+/// localized, so the surrounding words disappear under a non-English locale
+/// while `commondir` — a path component — does not.
+fn is_worktree_scan_short_read(err: &str) -> bool {
+    err.contains("commondir")
+}
+
 /// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
 /// parent is created first so the add never trips on a missing dir.
 ///
@@ -2271,6 +2307,14 @@ fn classify_worktree_add_result(
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
 ///
+/// Fix #541 follow-up: a live worktree directory reports `AlreadyClaimed`
+/// even when the branch is also present and `reuse_existing_branch` is
+/// false — the branch-exists early return only applies while the directory
+/// is genuinely absent (see the `worktree_dir.exists()` check below), or a
+/// dispatch whose worktree is still visible on disk would be told its
+/// worktree is "already gone" and be pointed at `git branch -D` for a tree
+/// another dispatch is working in.
+///
 /// Fork #282 (async half): the whole probe→add sequence runs under the same
 /// [`worktree_attach_lock_path`] exclusive lock [`create_worktree_sync`]
 /// already holds for its own attach race — see the lock acquisition inside
@@ -2278,12 +2322,15 @@ fn classify_worktree_add_result(
 ///
 /// Issue #541 (upstream vfarcic/dot-agent-deck#541) reported a second,
 /// narrower hazard on the same call — a concurrent `git worktree add`
-/// reading another add's half-written `commondir` file mid-scan. This
-/// cross-path exclusive lock already covers it for every add this deck
-/// starts, sync or async, which upstream's own single-process, async-only
-/// lock did not; a residual case (an add started by the user or another
-/// tool, which takes no lock at all) is not retried here and would still
-/// surface as a hard `Err` naming the same `commondir` failure.
+/// reading another add's half-written `commondir` file mid-scan. Two
+/// defences, each covering what the other cannot: the exclusive lock above
+/// serializes every add this deck itself starts, sync or async (which
+/// upstream's own single-process, async-only lock did not); and the bounded
+/// retry ([`WORKTREE_ADD_ATTEMPTS`] / [`is_worktree_scan_short_read`]) is
+/// what covers the residual case — an add started by the user or another
+/// tool, which takes no lock at all. Neither defence swallows anything: a
+/// `commondir` that stays unreadable exhausts the attempts and surfaces as
+/// `Err`.
 ///
 /// Issue #425 — `creator`. This is the ONLY `git worktree add` in `src/`, so
 /// it is also the only place that can claim a worktree as the deck's own at
@@ -2383,45 +2430,91 @@ pub async fn create_worktree(
     // the sync twin's equivalent calls already use, so a wedged `git` here
     // cannot hold the shared lock indefinitely and starve every other
     // caller of this same `worktree_dir` — including the TUI.
-    let branch_exists = match tokio::time::timeout(
-        WORKTREE_GIT_TIMEOUT,
-        run_status_args(
-            "git",
-            &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
-        ),
-    )
-    .await
-    {
-        Ok(result) => result.is_ok(),
-        Err(_) => {
-            return Err(format!(
-                "timed out after {WORKTREE_GIT_TIMEOUT:?} probing for branch {branch} in {}",
-                clone_dir.display()
-            ));
-        }
-    };
-    if branch_exists && !reuse_existing_branch {
-        return Ok(WorktreeCreation::BranchExists);
-    }
-    let add: Result<(), AddError> = match tokio::time::timeout(
-        WORKTREE_GIT_TIMEOUT,
-        run_status_killable_args(
-            "git",
-            &crate::issue_dispatch::worktree_add_argv(
-                clone_dir,
-                worktree_dir,
-                branch,
-                branch_exists,
+    // Issue #541: re-probed on every attempt inside the loop below, not
+    // hoisted out here — an add that dies on the scan has already CREATED
+    // its `-b` branch (the branch survives the exit-128), so passing `-b`
+    // again on retry would fail with "a branch named … already exists" and
+    // turn a transient race into a hard one.
+    let mut attempt: u32 = 1;
+    let add: Result<(), AddError> = loop {
+        let branch_exists = match tokio::time::timeout(
+            WORKTREE_GIT_TIMEOUT,
+            run_status_args(
+                "git",
+                &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
             ),
-        ),
-    )
-    .await
-    {
-        Ok(result) => result.map_err(AddError::Failed),
-        Err(_) => Err(AddError::TimedOut(format!(
-            "`git worktree add` for {} timed out after {WORKTREE_GIT_TIMEOUT:?}",
-            worktree_dir.display()
-        ))),
+        )
+        .await
+        {
+            Ok(result) => result.is_ok(),
+            Err(_) => {
+                return Err(format!(
+                    "timed out after {WORKTREE_GIT_TIMEOUT:?} probing for branch {branch} in {}",
+                    clone_dir.display()
+                ));
+            }
+        };
+        // Only attempt 1 can report BranchExists/AlreadyClaimed off the bare
+        // branch probe. Reaching attempt 2 means the branch was PROVEN
+        // absent moments ago, so anything there now was created either by
+        // our own failed attempt or by a dispatch racing us — never the
+        // "may hold committed work from an earlier dispatch" case this
+        // guard exists for, and not re-checked on retry.
+        if branch_exists && !reuse_existing_branch && attempt == 1 {
+            // A worktree DIRECTORY that is still present is a live claim,
+            // not a leftover branch: the caller can see it, and telling
+            // them it is "already gone" (BranchExists's message) sends them
+            // to `git branch -D` for a tree another dispatch is working in.
+            // Only when the directory is genuinely absent does the branch
+            // alone mean "leftover from an earlier dispatch".
+            if worktree_dir.exists() {
+                return Ok(WorktreeCreation::AlreadyClaimed);
+            }
+            return Ok(WorktreeCreation::BranchExists);
+        }
+        let result: Result<(), AddError> = match tokio::time::timeout(
+            WORKTREE_GIT_TIMEOUT,
+            run_status_killable_args(
+                "git",
+                &crate::issue_dispatch::worktree_add_argv(
+                    clone_dir,
+                    worktree_dir,
+                    branch,
+                    branch_exists,
+                ),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(AddError::Failed),
+            Err(_) => Err(AddError::TimedOut(format!(
+                "`git worktree add` for {} timed out after {WORKTREE_GIT_TIMEOUT:?}",
+                worktree_dir.display()
+            ))),
+        };
+        match result {
+            Err(AddError::Failed(e))
+                if attempt < WORKTREE_ADD_ATTEMPTS && is_worktree_scan_short_read(&e) =>
+            {
+                let backoff = worktree_add_backoff(attempt);
+                tracing::warn!(
+                    clone = %clone_dir.display(),
+                    worktree = %worktree_dir.display(),
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %e,
+                    "git worktree add read another add's half-created administrative \
+                     directory (issue #541); retrying after a backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            // Success, a non-transient failure, or the last attempt: the
+            // retry is bounded, so a `commondir` that is genuinely
+            // unreadable (a crashed add left an empty one behind) still
+            // surfaces as an error rather than looping or being swallowed.
+            other => break other,
+        }
     };
     // `AddOutcome::TimedOut` is reachable here (unlike before this bound was
     // added). Fork #282 final-pass F1/A1: `run_status_killable`'s
