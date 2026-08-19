@@ -1,0 +1,18 @@
+# Fixture for the L2 real-binary proof of PRD fork#325 M3's
+# Nth-concurrent-orchestration clone gate (orchestration/worktree/014): ONE
+# orchestration definition, opened TWICE against the SAME directory while the
+# first instance is still live. Each instance's one role appends its own
+# `DOT_AGENT_DECK_WORKTREE_OWNER` identity plus its own `pwd` to one shared,
+# HOME-relative log file (never a worktree-relative one) — HOME is stable
+# regardless of which directory a role pane ends up rooted in, so the two
+# instances' actual working directories can be read back and told apart by
+# owner string AFTER THE FACT, without the test needing to know in advance
+# where either instance's worktree/clone lands on disk. No real LLM tokens
+# spent.
+[[orchestrations]]
+name = "clone-gate-demo"
+
+[[orchestrations.roles]]
+name = "solo"
+command = "printf '%s %s\\n' \"$DOT_AGENT_DECK_WORKTREE_OWNER\" \"$(pwd)\" >> \"$HOME/clone-gate-pwd.log\"; sleep 600"
+start = true
