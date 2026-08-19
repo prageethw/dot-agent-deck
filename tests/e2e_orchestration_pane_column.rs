@@ -23,7 +23,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, find_pane_box_left_edge};
+use common::{TuiDeck, commit_fixture, find_pane_box_left_edge, open_orchestration_with_slug};
 use spec::spec;
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
@@ -39,60 +39,6 @@ fn open_orchestration(deck: &TuiDeck) {
     deck.send_keys(b"\x1b[C"); // Right -> [Orch: demo-orch]
     deck.send_keys(b"\r"); // Mode -> Name
     deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-}
-
-/// Run a `git` subcommand against `dir`, panicking on non-zero exit — mirrors
-/// `tests/e2e_orchestration_worktree.rs::run_git`.
-fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git {args:?} failed in {dir:?}");
-}
-
-/// Commit the fixture's own `.dot-agent-deck.toml` into `dir` so a typed
-/// Worktree slug's `git worktree add`/isolated clone (issue #489's
-/// unaffected typed-slug arm) has a ref to branch from — `git worktree add`
-/// cannot create a worktree from an unborn HEAD. Mirrors
-/// `tests/e2e_orchestration_worktree.rs::commit_fixture`; identity pinned
-/// inline since CI runners carry no global git config.
-fn commit_fixture(dir: &std::path::Path) {
-    run_git(dir, &["add", ".dot-agent-deck.toml"]);
-    run_git(
-        dir,
-        &[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "init",
-        ],
-    );
-}
-
-/// Drive the new-pane dialog to open the (single) orchestration in the
-/// `orch-deck` fixture with a TYPED Worktree slug, so the request goes
-/// through issue #489's unaffected typed-slug arm (`SiblingScope::
-/// ExactCwdOnly` only gates a BLANK slug) instead of being refused as an
-/// exact-cwd collision with another live orchestration. Otherwise identical
-/// to `open_orchestration`.
-fn open_orchestration_with_slug(deck: &TuiDeck, slug: &str) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.wait_for_string("Select Directory");
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: demo-orch]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\t"); // Tab: Name -> Worktree (Command hidden for an orchestration)
-    deck.send_keys(slug.as_bytes());
-    deck.send_keys(b"\r"); // submit
 }
 
 /// Scenario: Open two real orchestration tabs (120-col PTY, tab A then tab
