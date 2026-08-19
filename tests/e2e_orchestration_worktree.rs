@@ -499,7 +499,13 @@ fn is_shallow_repository(dir: &std::path::Path) -> bool {
 fn attempt_worktree_remove(from_dir: &std::path::Path, target: &std::path::Path) -> (bool, String) {
     let out = std::process::Command::new("git")
         .current_dir(from_dir)
-        .args(["worktree", "remove", "--force"])
+        // `--` before the path matches the end-of-options separator
+        // `worktree_remove_argv` (`src/issue_dispatch.rs`) deliberately
+        // carries — issue #325 auditor A7. Not exploitable here (every
+        // path comes from `$(pwd)` and is absolute, never dash-prefixed),
+        // kept for consistency with the pattern this repo already
+        // established for this exact command.
+        .args(["worktree", "remove", "--force", "--"])
         .arg(target)
         .output()
         .expect("git worktree remove must spawn");
@@ -517,12 +523,23 @@ fn attempt_worktree_remove(from_dir: &std::path::Path, target: &std::path::Path)
 /// tab (tabs are strictly appended, never reordered — `src/tab.rs`'s three
 /// `self.tabs.push` call sites) needs exactly `steps_back` presses: 1 from
 /// the 1st-opened orchestration tab, 2 from the 2nd, etc.
+///
+/// This is a fixed-count navigation with no confirmation that it actually
+/// landed on Dashboard: `Tab::Dashboard` and `Tab::Orchestration` render
+/// through the identical `FrameContent::Cards` arm (`src/ui.rs`'s
+/// `render_frame`), so no on-screen text distinguishes them, and the active
+/// tab is marked only by cell style (`src/ui.rs`'s tab-bar rendering), which
+/// the vt100 harness's plain-text `snapshot_grid`/`wait_for_string` cannot
+/// see. A wrong step count is harmless regardless: `Ctrl+n`'s directory
+/// picker roots at the deck process's own `std::env::current_dir()`
+/// (`src/ui.rs`), not at anything tab-scoped, so `open_orchestration_with_slug`
+/// resolves to the same launch directory no matter which tab is active when
+/// it runs.
 fn go_to_dashboard(deck: &TuiDeck, steps_back: usize) {
     deck.send_keys(b"\x04"); // Ctrl+D -> Normal mode (still on the current tab)
     for _ in 0..steps_back {
         deck.send_keys(b"\x1b[D"); // Left -> CycleTabPrev, one step back
     }
-    deck.wait_for_string("session(s)");
 }
 
 /// Scenario: launch the deck in the `orch-clone-gate` fixture and open its
@@ -538,9 +555,14 @@ fn go_to_dashboard(deck: &TuiDeck, steps_back: usize) {
 /// reproduces the issue's own two concrete failures directly and proves
 /// neither can recur: (1) with all three live, attempts `git worktree
 /// remove` from one orchestration's repository targeting another's
-/// directory — cross-repo, this must now fail outright (the target isn't
-/// even registered in the attacking repo's worktree list), leaving the
-/// target's directory, branch, and HEAD commit completely undisturbed; (2)
+/// directory — in every direction the incident named, including an
+/// isolated clone attacking the SHARED checkout's own worktree, which is
+/// the exact shape issue #325 reported (worktrees belonging to the root
+/// checkout deleted by an orchestration that did not own them) — cross-repo,
+/// this must now fail outright with a `… is not a working tree` stderr (the
+/// target isn't even registered in the attacking repo's worktree list),
+/// leaving the target's directory, branch, and HEAD commit completely
+/// undisturbed; (2)
 /// a `git fetch --depth 1` performed in the 1st (shared-checkout)
 /// orchestration's directory makes the LAUNCH DIRECTORY'S shared object
 /// store shallow, exactly as the issue reported, while the 2nd and 3rd
@@ -670,13 +692,26 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         "the 3rd orchestration's isolated clone must carry the source's own origin URL"
     );
 
+    let pwd_1_head_baseline = head_sha(pwd_1);
     let pwd_2_head_baseline = head_sha(pwd_2);
     let pwd_3_head_baseline = head_sha(pwd_3);
 
+    // Any cross-repo `git worktree remove` here must fail specifically
+    // because the target is not registered in the attacking repo's
+    // worktree list — not merely fail to succeed for some unrelated reason
+    // (a lock, a permissions error, a future git tightening `--force`),
+    // which would let a genuine isolation regression still read green
+    // (issue #325 reviewer P2-2 / auditor F1).
+    const NOT_A_WORKING_TREE: &str = "is not a working tree";
+
     // --- Behavioral proof of failure #1: "an orchestration deleted five
     // worktrees it did not own, mid-use". Attempt cross-repo `git worktree
-    // remove` in both directions — from the shared worktree against an
-    // isolated clone, and from one isolated clone against another. Every
+    // remove` in every direction the incident's own report names: from the
+    // shared worktree against an isolated clone, from one isolated clone
+    // against another, AND from an isolated clone against the shared
+    // checkout's own worktree — issue #325's actual incident was
+    // orchestrations deleting worktrees belonging to the root checkout,
+    // which only this last direction reproduces (reviewer P2-3). Every
     // attempt must fail outright (the target is not even registered in the
     // attacking repo's worktree list), and every target must remain
     // completely intact afterward. ---
@@ -690,6 +725,12 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         pwd_2.display(),
         stderr_2_from_1
     );
+    assert!(
+        stderr_2_from_1.contains(NOT_A_WORKING_TREE),
+        "the removal must fail specifically because the 2nd orchestration's \
+         clone is not registered in the 1st's worktree list, got: {}",
+        stderr_2_from_1
+    );
 
     let (removed_3_from_1, stderr_3_from_1) = attempt_worktree_remove(pwd_1, pwd_3);
     assert!(
@@ -697,6 +738,12 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         "`git worktree remove` run from the 1st orchestration's directory \
          must NOT be able to remove the 3rd's isolated clone at {}\nstderr: {}",
         pwd_3.display(),
+        stderr_3_from_1
+    );
+    assert!(
+        stderr_3_from_1.contains(NOT_A_WORKING_TREE),
+        "the removal must fail specifically because the 3rd orchestration's \
+         clone is not registered in the 1st's worktree list, got: {}",
         stderr_3_from_1
     );
 
@@ -710,8 +757,37 @@ fn worktree_016_three_concurrent_orchestrations_reproduce_325_incident_shape_wit
         pwd_3.display(),
         stderr_3_from_2
     );
+    assert!(
+        stderr_3_from_2.contains(NOT_A_WORKING_TREE),
+        "the removal must fail specifically because the 3rd orchestration's \
+         clone is not registered in the 2nd's worktree list, got: {}",
+        stderr_3_from_2
+    );
+
+    // The direction issue #325 actually reported: an isolated clone
+    // attacking the SHARED checkout's own worktree, not the reverse. This
+    // is the higher-consequence direction — the target is the user's own
+    // root-checkout worktree, not a disposable clone.
+    let (removed_1_from_2, stderr_1_from_2) = attempt_worktree_remove(pwd_2, pwd_1);
+    assert!(
+        !removed_1_from_2,
+        "`git worktree remove` run from the 2nd orchestration's isolated \
+         clone must NOT be able to remove the 1st (shared-checkout) \
+         orchestration's own worktree at {} — this is the exact direction \
+         issue #325 reported: an orchestration deleting worktrees \
+         belonging to the root checkout it did not own\nstderr: {}",
+        pwd_1.display(),
+        stderr_1_from_2
+    );
+    assert!(
+        stderr_1_from_2.contains(NOT_A_WORKING_TREE),
+        "the removal must fail specifically because the 1st orchestration's \
+         worktree is not registered in the 2nd's worktree list, got: {}",
+        stderr_1_from_2
+    );
 
     for (label, pwd, expected_branch, expected_head) in [
+        ("1st", pwd_1, "clonegate1", &pwd_1_head_baseline),
         ("2nd", pwd_2, "clonegate2", &pwd_2_head_baseline),
         ("3rd", pwd_3, "clonegate3", &pwd_3_head_baseline),
     ] {
