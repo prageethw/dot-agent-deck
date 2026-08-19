@@ -605,14 +605,36 @@ pub fn mint_orchestration_id() -> String {
     format!("orch-{nonce:016x}-{seq}")
 }
 
+/// Shared mint recipe behind [`mint_pane_id`] and `spawn::next_pane_id`
+/// (issue #430): a per-process nonce hashed from `std::process::id()` +
+/// the epoch nanoseconds at first use — computed once and cached in the
+/// caller-supplied `nonce_cell`, so it survives for the life of the process
+/// regardless of any counter a caller resets — combined with a value drawn
+/// from the caller's own monotonic `seq`. Each call site keeps its own
+/// `OnceLock`/`AtomicU64` pair (never shared across callers) so unrelated id
+/// spaces don't perturb each other's sequence.
+pub(crate) fn mint_nonce_seq(nonce_cell: &std::sync::OnceLock<u64>, seq: &AtomicU64) -> (u64, u64) {
+    let nonce = *nonce_cell.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    (nonce, seq.fetch_add(1, Ordering::Relaxed))
+}
+
 /// PRD #365 M2: mint a fresh daemon-authoritative `pane_id` for a
 /// TUI-attached `StartAgent` spawn. Same recipe as [`mint_orchestration_id`]
 /// (a per-process nonce hashed from PID + epoch nanos, combined with a
 /// monotonic per-process sequence) — chosen over a bare counter because
-/// `spawn.rs`'s `next_pane_id` already demonstrates that shape's failure
-/// mode: its `PANE_COUNTER` resets to 0 on every daemon restart, which is
-/// exactly the recycling CLAUDE.md rule 23 named as unsafe to anchor
-/// identity on. The nonce makes two daemon processes — including two runs
+/// `spawn.rs`'s `next_pane_id` used to demonstrate that shape's failure
+/// mode before it was fixed as issue #430: its old bare counter reset to 0
+/// on every daemon restart, which is exactly the recycling CLAUDE.md rule 23
+/// named as unsafe to anchor identity on. The nonce makes two daemon
+/// processes — including two runs
 /// of the same daemon across a restart — astronomically unlikely to mint
 /// the same value, while the sequence guarantees no two mints within one
 /// daemon process collide.
@@ -620,7 +642,10 @@ pub fn mint_orchestration_id() -> String {
 /// Uses its own `NONCE`/`SEQ` statics rather than sharing
 /// [`mint_orchestration_id`]'s — the two id spaces (`orch-*` orchestration
 /// instance tokens, `pane-*` pane ids) are unrelated and mixing their
-/// sequences would buy nothing.
+/// sequences would buy nothing. `spawn::next_pane_id` shares this function's
+/// [`mint_nonce_seq`] recipe (issue #430 gave it the identical restart
+/// problem this function was written to avoid) but likewise keeps its own
+/// statics for the same reason.
 ///
 /// The `pane-` prefix keeps the value legible in logs, filenames and
 /// `DOT_AGENT_DECK_PANE_ID` (mirroring `spawn.rs`'s existing `sched-`
@@ -630,16 +655,7 @@ pub fn mint_orchestration_id() -> String {
 pub fn mint_pane_id() -> String {
     static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nonce = *NONCE.get_or_init(|| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            dur.as_nanos().hash(&mut h);
-        }
-        h.finish()
-    });
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (nonce, seq) = mint_nonce_seq(&NONCE, &SEQ);
     format!("pane-{nonce:016x}-{seq}")
 }
 
@@ -8675,6 +8691,37 @@ mod tests {
                 "pane id {id} must pass validation"
             );
         }
+    }
+
+    /// Scenario: simulates two daemon restarts by handing [`mint_nonce_seq`]
+    /// two independent, freshly-initialized `OnceLock`/`AtomicU64` pairs —
+    /// exactly what two daemon processes have, since a real restart can't be
+    /// triggered inside one test process. Both "restarts" mint their first
+    /// id with the sequence starting at zero, which is what a real restart
+    /// actually resets, so the nonce is the only thing left that can tell
+    /// them apart. Asserts both sequences are 0 while the nonces differ,
+    /// pinning that the nonce — not the sequence — is what prevents issue
+    /// #430's collision (a spawn-level test can't pin this: it would have to
+    /// reset a real `OnceLock`, which can't be re-seeded once cached).
+    #[test]
+    fn mint_nonce_seq_nonce_differs_across_two_simulated_restarts() {
+        let (cell1, seq1) = (std::sync::OnceLock::new(), AtomicU64::new(0));
+        let (cell2, seq2) = (std::sync::OnceLock::new(), AtomicU64::new(0));
+        let (nonce1, q1) = mint_nonce_seq(&cell1, &seq1);
+        // A tiny delay so the two nonces can't land on the same nanosecond
+        // reading even on a coarse clock — removes doubt without weakening
+        // what the assertion below pins (see mint_nonce_seq's doc comment).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let (nonce2, q2) = mint_nonce_seq(&cell2, &seq2);
+        assert_eq!(
+            (q1, q2),
+            (0, 0),
+            "both simulated restarts must start their sequence at zero"
+        );
+        assert_ne!(
+            nonce1, nonce2,
+            "only the nonce can tell two restarts apart once their sequences both start at zero"
+        );
     }
 }
 

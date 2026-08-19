@@ -5164,8 +5164,8 @@ impl AppState {
     /// the tenant that just left and misdeliver into the new tenant's
     /// worktree. M4 round-2 review (auditor §6): that specific reopening no
     /// longer applies post-M4 — within one daemon boot a pane_id is never
-    /// reused at all (`next_pane_id`'s counter and `mint_pane_id`'s
-    /// nonce+seq are both process-unique), and across a boot
+    /// reused at all (`next_pane_id` and `mint_pane_id` both mint from a
+    /// process-unique nonce+seq pair, per issue #430), and across a boot
     /// `handle_work_done`'s `daemon_boot_id` half refuses the stale signal
     /// regardless of what the generation says. Still do not "fix" this as
     /// apparent map-cleanup symmetry — the field remains the only place a
@@ -9402,10 +9402,11 @@ clear = false
     /// state reused twice). Register pane "P" for orchestration A in
     /// `state_before` via the real reserve→confirm path production spawn
     /// uses, capture the generation A's worker would carry, then build a
-    /// brand-new `state_after` — nothing carries over, exactly like
-    /// `PANE_COUNTER` resetting on a real restart — and register the SAME
-    /// pane_id "P" there for a different orchestration B, simulating the
-    /// post-restart tenant that reused it. Deliver A's pre-restart signal to
+    /// brand-new `state_after` — nothing carries over, exactly like every
+    /// in-memory registration resetting on a real daemon restart — and
+    /// register the SAME pane_id "P" there for a different orchestration B,
+    /// simulating the post-restart tenant that reused it. Deliver A's
+    /// pre-restart signal to
     /// `state_after` and assert it is refused: nothing may be written into
     /// B's worktree under B's role.
     ///
