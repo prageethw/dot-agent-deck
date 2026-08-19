@@ -4321,18 +4321,36 @@ mod tests {
     }
 
     /// Scenario: mints a handful of pane ids from short task names and one
-    /// role-indexed id, and checks each is a valid `DOT_AGENT_DECK_PANE_ID`
-    /// and that repeated calls for the same task name don't collide. Also
-    /// mints one id from an 80-byte task name — well within
-    /// `DISPLAY_NAME_MAX_LEN` (128), which the deck's own name field accepts
-    /// — and asserts it too stays valid (fork#430 F2): `next_pane_id` never
-    /// truncates the sanitized name, and the nonce+seq suffix this PR added
-    /// leaves only ~39 bytes of headroom under `PANE_ID_ENV_MAX_LEN` (64),
-    /// so an uncapped long name now silently drops the pane id from the
-    /// registry mirror on capture instead of being minted validly.
+    /// role-indexed id, and checks each is a valid `DOT_AGENT_DECK_PANE_ID`,
+    /// that repeated calls for the same task name don't collide, and that
+    /// each id's tail actually carries the nonce+seq recipe (issue #430)
+    /// rather than a bare counter. Also mints ids from an 80-byte task name
+    /// — well within `DISPLAY_NAME_MAX_LEN` (128), which the deck's own name
+    /// field accepts — in both the no-role-index and role-indexed shapes,
+    /// and asserts they too stay valid (fork#430 F2): before this fix,
+    /// `next_pane_id` never truncated the sanitized name, and the nonce+seq
+    /// suffix this PR added leaves only ~39/~36 bytes of headroom under
+    /// `PANE_ID_ENV_MAX_LEN` (64) — without the clamp added in this commit,
+    /// an uncapped long name would have been silently dropped from the
+    /// registry mirror by `capture_pane_id_env` on capture instead of being
+    /// minted validly; now it clamps to fit instead.
     #[test]
     fn next_pane_id_is_valid_and_unique() {
         use crate::agent_pty::{PANE_ID_ENV_MAX_LEN, is_valid_pane_id_env};
+        // Pins that `next_pane_id` actually mints from `mint_nonce_seq`
+        // (issue #430) rather than a bare counter: a bare-counter revert
+        // (e.g. `PANE_COUNTER.fetch_add(...)`) still produces valid, unique,
+        // `-r2`-suffixed, length-capped ids, so none of the other
+        // assertions in this test would catch that regression — only the
+        // presence of a 16-lowercase-hex-digit nonce component does.
+        let has_nonce = |id: &str| {
+            id.split('-').any(|s| {
+                s.len() == 16
+                    && s.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        };
+
         let a = next_pane_id("morning digest!", None);
         let b = next_pane_id("morning digest!", None);
         let r = next_pane_id("orch", Some(2));
@@ -4341,6 +4359,18 @@ mod tests {
         assert!(is_valid_pane_id_env(&r));
         assert_ne!(a, b, "pane ids must be unique across calls");
         assert!(r.ends_with("-r2"));
+        assert!(
+            has_nonce(&a),
+            "{a} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+        assert!(
+            has_nonce(&b),
+            "{b} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+        assert!(
+            has_nonce(&r),
+            "{r} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
 
         let long_name = "a".repeat(80);
         let long = next_pane_id(&long_name, None);
@@ -4348,6 +4378,24 @@ mod tests {
             is_valid_pane_id_env(&long),
             "{long} (len {}) must satisfy PANE_ID_ENV_MAX_LEN ({PANE_ID_ENV_MAX_LEN}) even for an 80-byte task name",
             long.len()
+        );
+        assert!(
+            has_nonce(&long),
+            "{long} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+
+        // Role-indexed long name lands on the tighter ~36-byte budget
+        // (fork#430 F2), exactly at the 64-byte cap.
+        let long_r = next_pane_id(&long_name, Some(0));
+        assert!(
+            is_valid_pane_id_env(&long_r),
+            "{long_r} (len {}) must satisfy PANE_ID_ENV_MAX_LEN ({PANE_ID_ENV_MAX_LEN}) even for an 80-byte task name with a role index",
+            long_r.len()
+        );
+        assert!(long_r.ends_with("-r0"));
+        assert!(
+            has_nonce(&long_r),
+            "{long_r} must mint from the nonce+seq recipe (issue #430), not a bare counter"
         );
     }
 
