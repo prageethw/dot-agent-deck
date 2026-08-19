@@ -4051,6 +4051,7 @@ mod tests {
     /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
     /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
     /// own script shape.
+    #[cfg(unix)]
     fn write_merged_gh_stub(bindir: &Path, branch: &str) {
         use std::os::unix::fs::PermissionsExt;
         let gh_script = format!(
