@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,7 @@ use chrono::{DateTime, Utc};
 use crate::agent_pty::{
     AgentPtyError, AgentPtyRegistry, DOT_AGENT_DECK_DAEMON_BOOT_ID, DOT_AGENT_DECK_PANE_ID,
     DOT_AGENT_DECK_REGISTRATION_GENERATION, DeliveryNotice, GuardedSend, GuardedSendDetail,
-    SpawnOptions, TabMembership, command_needs_shell_wrap,
+    PANE_ID_ENV_MAX_LEN, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{
@@ -80,9 +80,20 @@ const DELIVER_BUFFER_DELAY: std::time::Duration = std::time::Duration::from_mill
 /// spawned agent that happens to share a display name.
 pub const SCHEDULE_PANE_ID_PREFIX: &str = "sched-";
 
-/// Monotonic counter making each spawned pane's `DOT_AGENT_DECK_PANE_ID`
-/// unique within a daemon lifetime (the prompt-delivery write routes by it).
-static PANE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Per-process nonce (hashed from the pid + epoch nanos at first use) and
+/// monotonic sequence backing [`next_pane_id`]'s numeric component — the
+/// same restart-resistant recipe [`crate::agent_pty::mint_pane_id`] uses via
+/// the shared [`crate::agent_pty::mint_nonce_seq`] helper (issue #430).
+/// Before this fix `next_pane_id` drew its numeric component from a bare
+/// counter starting back at 0 on every real restart, so a task fired once
+/// before and once after a restart minted the identical id. `PANE_NONCE` is
+/// computed once and cached for the life of the process, so it differs
+/// across a daemon restart even though a reused pid could otherwise
+/// recreate the same counter value; see
+/// [`crate::agent_pty::mint_nonce_seq`]'s tests for the property pinned at
+/// the level that's actually testable in-process.
+static PANE_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PANE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What a fire needs to open a tab. Owned + `Clone` so a scheduler callback can
 /// rebuild it on each fire.
@@ -2620,8 +2631,15 @@ fn surface_spawned_orchestration(
 }
 
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
-/// task name to the allowed charset and appends a monotonic counter (+ role
-/// index for orchestration panes) so concurrent fires never collide.
+/// task name to the allowed charset and appends a restart-resistant
+/// nonce+sequence (+ role index for orchestration panes) so concurrent fires
+/// never collide — and, per issue #430, so two fires of the same task never
+/// collide across a daemon restart either. The sanitized name is clamped to
+/// whatever room is left under [`PANE_ID_ENV_MAX_LEN`] after the fixed
+/// suffix (fork#430 F2): task names can reach `DISPLAY_NAME_MAX_LEN` (128
+/// bytes), well past the ~39/36-byte budget the nonce+seq suffix leaves, and
+/// an over-cap id is silently dropped by `capture_pane_id_env` rather than
+/// rejected loudly.
 ///
 /// "Valid" means [`crate::agent_pty::is_valid_pane_id_env`] accepts it, and that
 /// includes the [`PANE_ID_ENV_MAX_LEN`] byte cap — which this function used to
@@ -2634,13 +2652,8 @@ fn surface_spawned_orchestration(
 /// and reconnect restoring `Idle`) surviving #454's fix, for every task whose
 /// name is long enough. `StopAgent` could not recover the id either, so each
 /// fire also leaked its per-pane daemon state.
-///
-/// The counter and role suffix carry the uniqueness, so it is the SANITIZED NAME
-/// that gets truncated — never the suffix. Two long task names sharing a prefix
-/// therefore produce ids that differ only in the counter, which is exactly what
-/// the counter is for.
 fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
-    let n = PANE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let (nonce, seq) = crate::agent_pty::mint_nonce_seq(&PANE_NONCE, &PANE_SEQ);
     let sanitized: String = task_name
         .chars()
         .map(|c| {
@@ -2652,22 +2665,22 @@ fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
         })
         .collect();
     let suffix = match role_index {
-        Some(idx) => format!("-{n}-r{idx}"),
-        None => format!("-{n}"),
+        Some(idx) => format!("-{nonce:016x}-{seq}-r{idx}"),
+        None => format!("-{nonce:016x}-{seq}"),
     };
-    // Every byte here is ASCII (the prefix is a literal, the counter and role
-    // index are decimal, and the sanitizer maps every non-`[A-Za-z0-9_-]` char
-    // to `-`), so a byte budget is also a char budget and truncating on it
-    // cannot split a code point.
-    let budget = crate::agent_pty::PANE_ID_ENV_MAX_LEN
-        .saturating_sub(SCHEDULE_PANE_ID_PREFIX.len() + suffix.len());
-    let sanitized = &sanitized[..sanitized.len().min(budget)];
+    // Every byte here is ASCII (the prefix is a literal, the nonce is hex,
+    // the sequence and role index are decimal, and the sanitizer maps every
+    // non-`[A-Za-z0-9_-]` char to `-`), so a byte budget is also a char
+    // budget and truncating on it cannot split a code point.
+    let max_sanitized_len = PANE_ID_ENV_MAX_LEN
+        .saturating_sub(SCHEDULE_PANE_ID_PREFIX.len())
+        .saturating_sub(suffix.len());
+    let sanitized = if sanitized.len() > max_sanitized_len {
+        &sanitized[..max_sanitized_len]
+    } else {
+        sanitized.as_str()
+    };
     let pane_id = format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}{suffix}");
-    // The budget can only underflow to zero if the fixed parts alone overflow
-    // the cap, which needs a ~50-digit counter — unreachable for a `u64` this
-    // process increments once per spawned pane. Asserted rather than truncated
-    // because truncating the SUFFIX is the one repair that would be worse than
-    // the problem: it is what makes two concurrent fires distinct.
     debug_assert!(
         crate::agent_pty::is_valid_pane_id_env(&pane_id),
         "next_pane_id must produce a valid DOT_AGENT_DECK_PANE_ID: {pane_id:?}"
@@ -5553,9 +5566,37 @@ mod tests {
         assert_eq!(orchestrator_role_index(&neither), 0);
     }
 
+    /// Scenario: mints a handful of pane ids from short task names and one
+    /// role-indexed id, and checks each is a valid `DOT_AGENT_DECK_PANE_ID`,
+    /// that repeated calls for the same task name don't collide, and that
+    /// each id's tail actually carries the nonce+seq recipe (issue #430)
+    /// rather than a bare counter. Also mints ids from an 80-byte task name
+    /// — well within `DISPLAY_NAME_MAX_LEN` (128), which the deck's own name
+    /// field accepts — in both the no-role-index and role-indexed shapes,
+    /// and asserts they too stay valid (fork#430 F2): before this fix,
+    /// `next_pane_id` never truncated the sanitized name, and the nonce+seq
+    /// suffix this PR added leaves only ~39/~36 bytes of headroom under
+    /// `PANE_ID_ENV_MAX_LEN` (64) — without the clamp added in this commit,
+    /// an uncapped long name would have been silently dropped from the
+    /// registry mirror by `capture_pane_id_env` on capture instead of being
+    /// minted validly; now it clamps to fit instead.
     #[test]
     fn next_pane_id_is_valid_and_unique() {
-        use crate::agent_pty::is_valid_pane_id_env;
+        use crate::agent_pty::{PANE_ID_ENV_MAX_LEN, is_valid_pane_id_env};
+        // Pins that `next_pane_id` actually mints from `mint_nonce_seq`
+        // (issue #430) rather than a bare counter: a bare-counter revert
+        // (e.g. `PANE_COUNTER.fetch_add(...)`) still produces valid, unique,
+        // `-r2`-suffixed, length-capped ids, so none of the other
+        // assertions in this test would catch that regression — only the
+        // presence of a 16-lowercase-hex-digit nonce component does.
+        let has_nonce = |id: &str| {
+            id.split('-').any(|s| {
+                s.len() == 16
+                    && s.bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        };
+
         let a = next_pane_id("morning digest!", None);
         let b = next_pane_id("morning digest!", None);
         let r = next_pane_id("orch", Some(2));
@@ -5564,6 +5605,44 @@ mod tests {
         assert!(is_valid_pane_id_env(&r));
         assert_ne!(a, b, "pane ids must be unique across calls");
         assert!(r.ends_with("-r2"));
+        assert!(
+            has_nonce(&a),
+            "{a} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+        assert!(
+            has_nonce(&b),
+            "{b} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+        assert!(
+            has_nonce(&r),
+            "{r} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+
+        let long_name = "a".repeat(80);
+        let long = next_pane_id(&long_name, None);
+        assert!(
+            is_valid_pane_id_env(&long),
+            "{long} (len {}) must satisfy PANE_ID_ENV_MAX_LEN ({PANE_ID_ENV_MAX_LEN}) even for an 80-byte task name",
+            long.len()
+        );
+        assert!(
+            has_nonce(&long),
+            "{long} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
+
+        // Role-indexed long name lands on the tighter ~36-byte budget
+        // (fork#430 F2), exactly at the 64-byte cap.
+        let long_r = next_pane_id(&long_name, Some(0));
+        assert!(
+            is_valid_pane_id_env(&long_r),
+            "{long_r} (len {}) must satisfy PANE_ID_ENV_MAX_LEN ({PANE_ID_ENV_MAX_LEN}) even for an 80-byte task name with a role index",
+            long_r.len()
+        );
+        assert!(long_r.ends_with("-r0"));
+        assert!(
+            has_nonce(&long_r),
+            "{long_r} must mint from the nonce+seq recipe (issue #430), not a bare counter"
+        );
     }
 
     /// Issue #600: an orchestration spawn is ALL-OR-NOTHING — an `Err` from
