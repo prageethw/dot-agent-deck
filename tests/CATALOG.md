@@ -1246,6 +1246,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the residual `filter.<driver>.clean`/`.gitattributes` vector auditor's final round separately identified (accepted, same-uid, non-blocker; out of scope here) or Windows behavior (`#[cfg(unix)]`).
 - **Platform coverage:** mac+linux.
 
+##### worktree/reclaim/061 — M4b (RED), reviewer R1 / auditor D1 (blocker, PR #515). `candidate_has_attach_lock` checks only `.is_file()` on the isolated-clone provenance artifact inside the candidate's OWN `.git` — a location fully attacker-controlled. A bare 3-file forgery (sibling `.git` dir, hand-planted owner marker, self-planted empty provenance file), with no `git clone` and no call into `provision_isolated_clone_sync` anywhere in the chain, currently reports `owned: true` and satisfies `--mine` for the forged identity. Asserts the forged occupant must never report `owned: true` (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`.
+- **Agent:** none.
+- **Asserts:** the forged directory is still discovered (discovery stays purely structural); `owned` is `false`; `owner` is `None`; `is_mine` is `false` for the forged identity and for any other identity.
+- **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/056`), or the pre-planted-dispatch-path case (`worktree/reclaim/057`) — this is the bare self-planted-artifact forgery those three do not cover.
+- **Platform coverage:** mac+linux+windows.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

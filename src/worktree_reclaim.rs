@@ -5380,4 +5380,67 @@ mod tests {
              manually verified)"
         );
     }
+
+    /// Scenario: fork issue #325 M4b reviewer R1 / auditor D1 (blocker,
+    /// PR #515) -- the bare 3-file forgery, with NO `git clone` and NO
+    /// call into `provision_isolated_clone_sync` anywhere in the chain: a
+    /// sibling `.git` directory, a hand-planted `dot-agent-deck-owner`
+    /// marker claiming an arbitrary identity, and a self-planted, empty
+    /// [`ISOLATED_CLONE_PROVENANCE_FILENAME`] file -- exactly auditor D1's
+    /// Lab A reproduction. `candidate_has_attach_lock` currently checks
+    /// only `.is_file()` on that last path, a path fully inside the
+    /// candidate's own (attacker-controlled) `.git`, so today's forgery
+    /// costs one extra `touch` over test 054's and currently reports
+    /// `owned: true`, attributing the forged identity and satisfying
+    /// `--mine` for it. Asserts the CORRECT, not-yet-shipped behavior --
+    /// RED today.
+    #[spec("worktree/reclaim/061")]
+    #[test]
+    fn worktree_reclaim_061_bare_three_file_forgery_of_provenance_artifact_itself_reports_owned_false()
+     {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let forged = scratch.path().join("repo-isolated-bare-forged");
+        let forged_git_dir = forged.join(".git");
+        std::fs::create_dir_all(&forged_git_dir).unwrap();
+        std::fs::write(
+            forged_git_dir.join(OWNER_MARKER_FILENAME),
+            "deck\ncreated-by: orchestration:victim\n",
+        )
+        .unwrap();
+        // The whole point: the attacker plants the provenance artifact
+        // itself -- no git invocation, no real provisioning call, nothing
+        // outside these three attacker-written files.
+        std::fs::write(forged_git_dir.join(ISOLATED_CLONE_PROVENANCE_FILENAME), b"").unwrap();
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let forged_report = reports.iter().find(|r| r.real_path == forged).expect(
+            "a structurally-present sibling (.git directory + owner marker) must still be \
+             discovered -- discovery stays purely structural",
+        );
+
+        assert!(
+            !forged_report.owned,
+            "a bare 3-file forgery -- .git dir, owner marker, and a self-planted provenance \
+             artifact, with no git clone and no provisioning call involved at all -- must never \
+             report owned: true; fork#325 M4b reviewer R1 / auditor D1, got {forged_report:?}"
+        );
+        assert_eq!(
+            forged_report.owner, None,
+            "the forged marker's content must never be read/trusted off a self-planted \
+             provenance artifact, got owner {:?}",
+            forged_report.owner
+        );
+        assert!(
+            !is_mine(forged_report, "orchestration:victim"),
+            "the forged row must never satisfy --mine, even for the exact identity its own \
+             self-planted marker claims"
+        );
+        assert!(
+            !is_mine(forged_report, "test-remover"),
+            "the forged row must never satisfy --mine for any other identity either"
+        );
+    }
 }
