@@ -11,7 +11,11 @@
 //! - **Do NOT bump:** additive optional fields tagged
 //!   `#[serde(default, skip_serializing_if = "Option::is_none")]` — those are
 //!   forward-compatible by design (older peer ignores the field, newer peer
-//!   tolerates its absence).
+//!   tolerates its absence). Also: an additive unit variant on an
+//!   externally-tagged enum whose last variant is `#[serde(other)]` — an
+//!   older peer decodes the new variant through the catch-all instead of
+//!   failing to parse (see [`PROTOCOL_VERSION`]'s `KeptReason::IsolatedClone`
+//!   paragraph below for the full reasoning and its preconditions).
 //!
 //! The handshake itself ([`AttachRequest::Hello`]) is enforced on BOTH attach
 //! paths: the laptop-side `connect` flow ([`crate::connect::probe_remote_protocol`],
@@ -279,6 +283,42 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// keeps minting a client-side id the new daemon never asked for and does
 /// not recognize as authoritative, which is exactly the ambiguity this PRD
 /// exists to close. See `changelog.d/365.breaking.md`.
+///
+/// PRD fork#325 M3 fix round: NOT bumped for
+/// [`crate::event::KeptReason::IsolatedClone`] (a new unit variant on an
+/// externally-tagged, `#[serde(other)]`-terminated enum — see that variant's
+/// own doc comment). Three legs, each checked in code rather than reasoned
+/// from the enum shape:
+///
+/// 1. **Every consumer enumerated.** `KeptReason` has exactly one
+///    non-test client-side consumer, `process_pending_kept_worktrees`
+///    (`src/ui.rs`), a `match` whose only product is a display string pushed
+///    into a status/warning line. Nothing branches behaviour on the reason —
+///    no retry, no removal, no registry mutation. An older client decoding
+///    `isolated_clone` through the `#[serde(other)]` catch-all instead
+///    renders the `ProbeError` text ("its status could not be checked (kept
+///    fail-safe)") and reaches no different conclusion about anything;
+///    [`crate::event::WorktreeKeptNotice::path`], the actionable half, is
+///    unaffected either way.
+/// 2. **The mixed pairing this would guard against can only exist because
+///    of the exact-equality handshake, which a bump does not soften.**
+///    [`crate::build_version_handshake::ensure_compatible_daemon_or_die`]
+///    refuses on `probe.response.server_version != Some(PROTOCOL_VERSION)`
+///    — exact equality, not a floor — on both the local attach and the SSH
+///    `probe_remote_protocol` path. Bumping would not make an old client
+///    handle the variant better; it would refuse the attach outright and
+///    force a daemon restart. For an informational status line, "benign
+///    imprecise string" beats "refuse to pair".
+/// 3. **Structural preconditions hold.** `IsolatedClone` is inserted
+///    *before* `ProbeError`, so `#[serde(other)]` remains on the last
+///    variant (serde_derive's requirement), and every `KeptReason` variant
+///    stays field-less, which is what lets the catch-all exist at all.
+///
+/// This is a genuinely new not-bump category, not a repeat of the
+/// `display_title` case above: `display_title` was an additive *optional
+/// field*, already covered by the module doc's bullet list; an additive
+/// *unit variant* on an externally-tagged enum carrying `#[serde(other)]`
+/// is a different shape and belongs on that list too (see the module doc).
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -1695,10 +1735,16 @@ async fn handle_connection(
                     // ordinary agents and for earlier sibling-role closes.
                     // PRD #220 / PRD 236: the removal POLICY travels with the
                     // registry entry, because this handler serves both
-                    // producers and sees only a path. Both now record
-                    // `KeepIfDirty` (PRD 236 unified the policy — see
-                    // `RemovalPolicy`'s doc comment), so this call can come
-                    // back `Kept` for either producer.
+                    // producers and sees only a path. A shared-checkout
+                    // sibling records `KeepIfDirty` (PRD 236 unified the
+                    // policy — see `RemovalPolicy`'s doc comment); PRD
+                    // fork#325 M3's isolated-clone arm records
+                    // `RemovalPolicy::IsolatedClone` instead (it is not a
+                    // linked worktree of anything, so `git worktree remove`
+                    // does not apply, and a clean working tree alone does
+                    // not prove it is safe to discard — see that variant's
+                    // doc comment). Either way this call can come back
+                    // `Kept` for the entry it was given.
                     //
                     // Cleanup runs DETACHED, and the close is answered without
                     // waiting for it. The agent is already stopped by this point,
