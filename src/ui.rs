@@ -1097,6 +1097,14 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// not a best-effort one, so refusing to spawn is preferred over a false
 /// refusal caused by a daemon that is merely slow rather than actually down.
 ///
+/// The one exception to "fails closed" is deliberate and local, not a gap:
+/// issue #489, if `target_dir` itself isn't a git repository at all (its
+/// `git_common_dir` resolution fails), this returns `Ok(false)` rather than
+/// `Err` — a non-git directory has no git object store to collide over, so
+/// the collision this function exists to detect cannot apply to it. This is
+/// distinct from every daemon-communication failure below, which still fails
+/// closed exactly as described above.
+///
 /// KNOWN LIMITATION (PRD fork#325 fix round 3, auditor B1; widened fix round
 /// 4, auditor D2), not yet fixed, tracked as issue #496: the fail-closed
 /// guarantee above does NOT extend to a live orchestration whose record
@@ -1157,12 +1165,16 @@ pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, 
     // answer before paying for the daemon round trip — a non-git `target_dir`
     // now fails fast instead of waiting up to `DAEMON_REQUEST_TIMEOUT` (5s)
     // first for an answer this check never needed.
-    let target_common = crate::issue_dispatch_run::git_common_dir(target_dir).map_err(|e| {
-        format!(
-            "could not resolve {}'s git common dir: {e}",
-            target_dir.display()
-        )
-    })?;
+    //
+    // Issue #489 regression fix: a `target_dir` that isn't a git repository
+    // at all is treated as "no live sibling" (`Ok(false)`), not a fail-closed
+    // `Err` — there is no git object store to collide over, so the entire
+    // premise of this check doesn't apply. This is distinct from a
+    // daemon-communication failure below, which still fails closed.
+    let target_common = match crate::issue_dispatch_run::git_common_dir(target_dir) {
+        Ok(common) => common,
+        Err(_) => return Ok(false),
+    };
     let target_common = std::fs::canonicalize(&target_common).unwrap_or(target_common);
 
     let resp = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
