@@ -4,8 +4,9 @@ use std::sync::Arc;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::event::BroadcastMsg;
 use crate::issue_dispatch_run::{
-    RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree, record_worktree,
-    remove_worktree, run_status, worktree_still_in_use,
+    IsolatedCloneOutcome, RemovalPolicy, WorktreeCreation, WorktreeRegistry, create_worktree,
+    provision_isolated_clone_sync, record_worktree, remove_worktree, run_status,
+    worktree_still_in_use,
 };
 use crate::scheduler::StderrNotifier;
 use crate::spawn::{SpawnKind, SpawnRequest, SpawnShapeOverride, spawn};
@@ -295,77 +296,211 @@ pub async fn handle_dispatch(
     // `orchestration:<name>` — `dispatch:<name>` names this command's own
     // dispatched worktree the same way.
     let creator = crate::worktree_reclaim::sanitize_marker_creator(&format!("dispatch:{name}"));
-    match create_worktree(
-        &clone_dir,
-        &paths.worktree_dir,
-        &paths.branch,
-        false,
-        &creator,
-    )
-    .await
-    {
-        // Issue #164: a marker-write warning is not surfaced on this
-        // ad hoc `dispatch` CLI path -- out of scope here, which covers
-        // only the TUI's `SpawnPane` creation and the scheduled
-        // `issue_dispatch` task (see `src/ui.rs` / `src/issue_dispatch_run.rs`).
-        // `ownership_of` still fails closed for it regardless.
-        Ok(WorktreeCreation::Created { marker_warning: _ }) => {}
-        Ok(WorktreeCreation::AlreadyClaimed) => {
+
+    // PRD fork#325 M3 "Model B" (issue #490): the same Nth-concurrent-
+    // orchestration gate Model A (`src/ui.rs`'s `Action::SpawnPane`) already
+    // applies to interactive spawns -- does `clone_dir` already share its
+    // `.git` object store with a LIVE orchestration's worktree? Answered by
+    // the SAME `root_checkout_has_live_sibling` gate Model A uses, so the
+    // fail-open/fail-closed decisions stay byte-for-byte identical rather
+    // than a second, potentially-drifting implementation. Run via
+    // `spawn_blocking`: that function does synchronous socket I/O bounded by
+    // several seconds, which must never block this tokio worker thread the
+    // way every other blocking git/socket op in this async path already
+    // avoids (see `create_worktree`'s own `spawn_blocking` use above it).
+    let live_sibling_check = {
+        let clone_dir_for_check = clone_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::ui::root_checkout_has_live_sibling(&clone_dir_for_check)
+        })
+        .await
+    };
+    let has_live_sibling = match live_sibling_check {
+        Ok(Ok(has_sibling)) => has_sibling,
+        // The daemon query failed, or answered in an untrustworthy shape --
+        // fail CLOSED, matching Model A's `Err(reason)` branch: refuse to
+        // provision at all rather than silently falling back to the
+        // ordinary shared-checkout path.
+        Ok(Err(reason)) => {
             return DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: false,
                 message: format!(
-                    "dispatch: worktree {} is already claimed by another dispatch. \
-                     Wait for it to finish, or dispatch under a different name.",
-                    paths.worktree_dir.display()
+                    "dispatch: could not confirm no other live orchestration already \
+                     shares {} — {reason}",
+                    clone_dir.display()
                 ),
             };
         }
-        // The worktree dir is GONE but its branch survived — `git worktree
-        // remove` never deletes the branch, so this is the ordinary state after a
-        // previous dispatch of the same name was cleaned up. Say so, and name
-        // both fixes: the branch is not deleted implicitly because it may hold
-        // that dispatch's committed work.
-        Ok(WorktreeCreation::BranchExists) => {
+        Err(join_err) => {
             return DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: false,
-                message: format!(
-                    "dispatch: branch {branch} already exists from an earlier dispatch named \
-                     '{name}' (its worktree is already gone). That branch may hold committed \
-                     work, so it is left alone. Dispatch under a different name, or run \
-                     `git -C {clone} branch -D {branch}` first if you are done with it.",
-                    branch = paths.branch,
-                    name = name,
-                    clone = clone_dir.display(),
-                ),
+                message: format!("dispatch: live-sibling check task panicked: {join_err}"),
             };
         }
-        // Fork #282: the async `create_worktree` now bounds its `git worktree
-        // add` on `WORKTREE_GIT_TIMEOUT` and reports `TimedOut` when it fires,
-        // so this arm is genuinely reachable from this call site.
-        Ok(WorktreeCreation::TimedOut { cleaned_up_by }) => {
-            let detail = if cleaned_up_by.is_some() {
-                "the half-created directory was removed automatically — try again".to_string()
-            } else {
-                format!(
-                    "run `git -C {} worktree remove --force {}` to clear it, then try again",
-                    clone_dir.display(),
-                    paths.worktree_dir.display()
-                )
-            };
-            return DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: false,
-                message: format!("dispatch: worktree add timed out — {detail}"),
-            };
+    };
+
+    if has_live_sibling {
+        // A live sibling already shares `clone_dir`'s git-common-dir --
+        // isolate this dispatch into its own fresh clone instead of a plain
+        // `git worktree add` sibling, mirroring Model A's `Ok(true)` branch
+        // (`provision_isolated_clone_sync`). Same resolved sibling path
+        // (`paths.worktree_dir`) as the shared-checkout arm below -- only
+        // the provisioning mechanism differs. `provision_isolated_clone_sync`
+        // is sync (no async twin exists), so it runs on the blocking pool
+        // exactly like the daemon-query gate above.
+        let source_dir = clone_dir.clone();
+        let clone_target = paths.worktree_dir.clone();
+        let branch = paths.branch.clone();
+        let creator_for_clone = creator.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            provision_isolated_clone_sync(&source_dir, &clone_target, &branch, &creator_for_clone)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(IsolatedCloneOutcome::Created {
+                marker_warning: _,
+                origin_warning: _,
+            })) => {}
+            Ok(Ok(IsolatedCloneOutcome::AlreadyClaimed)) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: isolated clone already exists at {}. Wait for it to \
+                         finish, or dispatch under a different name.",
+                        paths.worktree_dir.display()
+                    ),
+                };
+            }
+            Ok(Ok(IsolatedCloneOutcome::TimedOut { cleaned_up_by })) => {
+                let detail = if cleaned_up_by.is_some() {
+                    "the half-created directory was removed automatically — try again".to_string()
+                } else {
+                    format!(
+                        "run `rm -rf {}` to clear it, then try again",
+                        paths.worktree_dir.display()
+                    )
+                };
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!("dispatch: isolated clone timed out — {detail}"),
+                };
+            }
+            // Issue #325 fix round 3 parity (reviewer C2 / auditor C2): a
+            // genuine (non-timeout) clone/checkout failure is reported
+            // separately from `TimedOut`, with git's own captured error text
+            // rather than a generic message.
+            Ok(Ok(IsolatedCloneOutcome::Failed {
+                error,
+                cleaned_up_by,
+            })) => {
+                let detail = if cleaned_up_by.is_some() {
+                    "the half-created directory was removed automatically — try again".to_string()
+                } else {
+                    format!(
+                        "run `rm -rf {}` to clear it, then try again",
+                        paths.worktree_dir.display()
+                    )
+                };
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!("dispatch: isolated clone failed — {error} ({detail})"),
+                };
+            }
+            Ok(Err(e)) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!("dispatch: failed to provision isolated clone: {e}"),
+                };
+            }
+            Err(join_err) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: isolated-clone provisioning task panicked: {join_err}"
+                    ),
+                };
+            }
         }
-        Err(e) => {
-            return DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: false,
-                message: format!("dispatch: failed to create worktree: {e}"),
-            };
+    } else {
+        match create_worktree(
+            &clone_dir,
+            &paths.worktree_dir,
+            &paths.branch,
+            false,
+            &creator,
+        )
+        .await
+        {
+            // Issue #164: a marker-write warning is not surfaced on this
+            // ad hoc `dispatch` CLI path -- out of scope here, which covers
+            // only the TUI's `SpawnPane` creation and the scheduled
+            // `issue_dispatch` task (see `src/ui.rs` / `src/issue_dispatch_run.rs`).
+            // `ownership_of` still fails closed for it regardless.
+            Ok(WorktreeCreation::Created { marker_warning: _ }) => {}
+            Ok(WorktreeCreation::AlreadyClaimed) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: worktree {} is already claimed by another dispatch. \
+                         Wait for it to finish, or dispatch under a different name.",
+                        paths.worktree_dir.display()
+                    ),
+                };
+            }
+            // The worktree dir is GONE but its branch survived — `git worktree
+            // remove` never deletes the branch, so this is the ordinary state after a
+            // previous dispatch of the same name was cleaned up. Say so, and name
+            // both fixes: the branch is not deleted implicitly because it may hold
+            // that dispatch's committed work.
+            Ok(WorktreeCreation::BranchExists) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!(
+                        "dispatch: branch {branch} already exists from an earlier dispatch named \
+                         '{name}' (its worktree is already gone). That branch may hold committed \
+                         work, so it is left alone. Dispatch under a different name, or run \
+                         `git -C {clone} branch -D {branch}` first if you are done with it.",
+                        branch = paths.branch,
+                        name = name,
+                        clone = clone_dir.display(),
+                    ),
+                };
+            }
+            // Fork #282: the async `create_worktree` now bounds its `git worktree
+            // add` on `WORKTREE_GIT_TIMEOUT` and reports `TimedOut` when it fires,
+            // so this arm is genuinely reachable from this call site.
+            Ok(WorktreeCreation::TimedOut { cleaned_up_by }) => {
+                let detail = if cleaned_up_by.is_some() {
+                    "the half-created directory was removed automatically — try again".to_string()
+                } else {
+                    format!(
+                        "run `git -C {} worktree remove --force {}` to clear it, then try again",
+                        clone_dir.display(),
+                        paths.worktree_dir.display()
+                    )
+                };
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!("dispatch: worktree add timed out — {detail}"),
+                };
+            }
+            Err(e) => {
+                return DispatchResult {
+                    worktree_dir: paths.worktree_dir.clone(),
+                    success: false,
+                    message: format!("dispatch: failed to create worktree: {e}"),
+                };
+            }
         }
     }
 

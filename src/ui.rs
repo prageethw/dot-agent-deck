@@ -1062,6 +1062,14 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// orchestration's working directory? This is the correctness signal M3
 /// decides worktree-vs-isolated-clone provisioning on.
 ///
+/// `pub(crate)` (PRD #325 M3 / issue #490, "Model B"): `src/dispatch.rs`'s
+/// `handle_dispatch` calls this same gate for the `dispatch` CLI's own
+/// worktree-vs-isolated-clone decision, via `tokio::task::spawn_blocking` —
+/// this function does synchronous, potentially multi-second socket I/O
+/// (`send_daemon_request_blocking`, bounded by [`DAEMON_REQUEST_TIMEOUT`]),
+/// which must never run directly on a tokio worker thread that other
+/// connections share.
+///
 /// Deliberately NOT [`live_orchestration_in_same_cwd`]'s raw path-equality
 /// compare, which only catches two orchestrations sharing the exact same
 /// pane cwd (the no-worktree-slug case). The actual #325 incident shape is N
@@ -1144,7 +1152,7 @@ fn live_orchestration_cwds_and_titles() -> (Vec<String>, Vec<String>) {
 /// pattern (the file's other correctness-sensitive blocking daemon call)
 /// rather than [`live_orchestration_cwds_and_titles`]'s fail-open-hint idiom
 /// this function's `agent_records.unwrap_or_default()` was copied from.
-fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
+pub(crate) fn root_checkout_has_live_sibling(target_dir: &Path) -> Result<bool, String> {
     // Issue #325 reviewer nit: resolve the LOCAL, knowable-in-milliseconds
     // answer before paying for the daemon round trip — a non-git `target_dir`
     // now fails fast instead of waiting up to `DAEMON_REQUEST_TIMEOUT` (5s)
