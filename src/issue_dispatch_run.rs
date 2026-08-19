@@ -1436,6 +1436,31 @@ pub(crate) fn provision_isolated_clone_sync(
         return handle_isolated_clone_add_error(err, clone_dir, creator);
     }
 
+    // Fork#325 M4b (reviewer P1 / auditor C1): write the isolated-clone-
+    // specific provenance artifact now — the `clone_dir.exists()` check
+    // above already ruled out a pre-planted directory (auditor C1's
+    // residual: a call that hits `AlreadyClaimed` returns before this line
+    // and never writes it), and the `git clone` immediately above just
+    // succeeded, so `clone_dir` genuinely is a fresh clone this call itself
+    // created. Deliberately a separate location/namespace from the
+    // attach-lock file above, which `create_worktree_sync` also writes into
+    // for an ordinary linked worktree (reviewer P1's residual: that shared
+    // namespace let a forged occupant of a since-removed linked worktree's
+    // path inherit its leftover lock) — see
+    // `ISOLATED_CLONE_PROVENANCE_FILENAME`'s doc comment in
+    // `worktree_reclaim.rs` for the full reasoning. Best-effort: a write
+    // failure here does not fail the whole provisioning call, since the
+    // clone itself is already fully usable — it only means this clone will
+    // never report `owned: true` from `worktree list`.
+    if let Err(e) = write_isolated_clone_provenance(clone_dir) {
+        tracing::warn!(
+            clone = %clone_dir.display(),
+            error = %e,
+            "issue-dispatch: could not write isolated-clone provenance artifact; this clone \
+             will never report owned: true from `worktree list`"
+        );
+    }
+
     // Issue #325 reviewer P1 (fix round 2): read the source's own origin URL
     // now — a pure, side-effect-free read — and, when the source HAS an
     // origin, point the clone's `origin` at it IMMEDIATELY, before the
@@ -2471,6 +2496,46 @@ fn mark_worktree_owned_best_effort(worktree_dir: &Path, creator: &str) -> Option
     }
 }
 
+/// Write fork#325 M4b's isolated-clone-specific provenance artifact
+/// ([`crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME`])
+/// directly into `clone_dir`'s own `.git` directory. Called only from
+/// [`provision_isolated_clone_sync`], only once its own `clone_dir.exists()`
+/// check and the `git clone` immediately above have both already
+/// succeeded, so `clone_dir/.git` is known to exist and to be a directory
+/// (a fresh, non-worktree clone) rather than needing `git rev-parse
+/// --git-dir` to resolve it the way [`mark_worktree_owned`] does for a
+/// linked worktree, whose `.git` may be a redirect file elsewhere.
+///
+/// Atomic write-then-rename, mirroring [`mark_worktree_owned`]'s own
+/// pattern in `worktree_reclaim.rs` for the identical reason: on ENOSPC or
+/// a process kill mid-write, a plain `std::fs::write` could leave a
+/// partially-written file at the final path, which `candidate_has_attach_lock`
+/// checks via presence alone (`Path::is_file`) — a half-written file would
+/// resolve exactly as a complete one. The pid-suffixed temp name lives in
+/// the same directory (same filesystem, so `rename(2)` is atomic) and is
+/// cleaned up on every error path, so the final path is only ever created
+/// by a rename of a fully-written file.
+///
+/// [`mark_worktree_owned`]: crate::worktree_reclaim::mark_worktree_owned
+fn write_isolated_clone_provenance(clone_dir: &Path) -> Result<(), String> {
+    let git_dir = clone_dir.join(".git");
+    let marker_path = git_dir.join(crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME);
+    let tmp_path = git_dir.join(format!(
+        "{}.{}.tmp",
+        crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME,
+        std::process::id()
+    ));
+
+    std::fs::write(&tmp_path, b"deck\n").map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to write isolated-clone provenance artifact: {e}")
+    })?;
+    std::fs::rename(&tmp_path, &marker_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("failed to finalize isolated-clone provenance artifact: {e}")
+    })
+}
+
 /// Issue #164: surface a [`WorktreeCreation::Created`] marker-write warning
 /// through the [`Notifier`] seam, if there is one — called only from
 /// [`dispatch_one_issue`], the scheduled-dispatch caller of the async
@@ -2576,13 +2641,17 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<Pa
 /// unbounded sync [`git_common_dir`]. Pure and infallible: everything that
 /// can fail already happened in resolving `common_dir`.
 ///
-/// `pub(crate)`, not private, since fork#325 M4a's final round (reviewer
-/// F13 / auditor A1/B1): [`crate::worktree_reclaim::candidate_has_attach_lock`]
-/// recomputes this exact path for a discovered isolated-clone candidate,
-/// reusing this hash rather than reimplementing it, so that discovery's
-/// ownership check and this function's own lock-acquisition path can never
-/// silently drift apart on what the lock's filename is for the same
-/// `(common_dir, worktree_dir)` pair.
+/// `pub(crate)`, not private: [`create_worktree`]'s async prologue needs it
+/// directly (see the doc comment above). Fork#325 M4a's final round
+/// additionally had `crate::worktree_reclaim::candidate_has_attach_lock`
+/// recompute this exact path for a discovered isolated-clone candidate, so
+/// that discovery's ownership check and this function's own lock-
+/// acquisition path could never silently drift apart on the lock's
+/// filename — M4b replaced that mechanism with a self-contained,
+/// candidate-local provenance artifact instead (see
+/// [`crate::worktree_reclaim::ISOLATED_CLONE_PROVENANCE_FILENAME`]'s doc
+/// comment for why), so `candidate_has_attach_lock` no longer calls this
+/// function at all; this remains `pub(crate)` for the async caller alone.
 pub(crate) fn worktree_attach_lock_path_from_common_dir(
     common_dir: &Path,
     worktree_dir: &Path,

@@ -93,6 +93,27 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// [`ownership_of`].
 pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
 
+/// The name of fork#325 M4b's isolated-clone-specific provenance artifact.
+/// Written by `provision_isolated_clone_sync` directly into a freshly
+/// created clone's OWN `.git` directory (`<clone_dir>/.git/`), immediately
+/// after the clone itself succeeds and only for a call that has just
+/// confirmed `clone_dir` did not already exist — never into a directory
+/// this call did not itself create. Deliberately a separate namespace and a
+/// separate location from [`OWNER_MARKER_FILENAME`] (which a same-uid
+/// attacker can forge into any `.git` directory, including a fake one) and
+/// from the shared attach-lock file `create_worktree_sync` and
+/// `provision_isolated_clone_sync` both still write for cross-process
+/// mutual exclusion (`issue_dispatch_run::worktree_attach_lock_path*`,
+/// under the ROOT checkout's common dir) — see `candidate_has_attach_lock`'s
+/// own doc comment for why conflating the two was the exact residual this
+/// closes. Being self-contained inside the candidate's own git-dir also
+/// means checking for it needs no knowledge of where the root checkout's
+/// common dir is, which is what lets it be checked correctly even when
+/// `discover_isolated_clones` is invoked from inside an isolated clone
+/// itself (fork#325 M4b, reviewer F2).
+pub(crate) const ISOLATED_CLONE_PROVENANCE_FILENAME: &str =
+    "dot-agent-deck-isolated-clone-provenance";
+
 /// `WorktreeReport::kind` value for an ordinary `git worktree list`-visible
 /// row (fork#325 M4a).
 const KIND_LINKED: &str = "linked";
@@ -245,21 +266,22 @@ const ISOLATED_CLONE_MARKER_UNKNOWN_REASON: &str = "this sibling directory's own
      the deck's own attach-lock artifact for this candidate does exist, so this is treated the \
      same as a linked worktree's legacy marker (fork#325 M4a, auditor A4)";
 
-/// A marker file exists for this candidate, but no matching attach-lock
-/// artifact does (fork#325 M4a, final round -- auditor A1/B1). Either the
-/// deck never attached this clone (a hand-planted or forged marker,
-/// auditor B1's exact scenario), or it genuinely was deck-created by a
-/// build predating this check, or was moved/renamed since (the lock's
-/// filename hashes the canonical path). Discovery still lists the row
-/// (structural criteria alone gate inclusion -- see
+/// A marker file exists for this candidate, but no matching provenance
+/// artifact does (fork#325 M4a, final round -- auditor A1/B1; artifact
+/// moved to the candidate's own git-dir in M4b -- see
+/// `ISOLATED_CLONE_PROVENANCE_FILENAME`'s doc comment). Either the deck
+/// never attached this clone (a hand-planted or forged marker, auditor
+/// B1's exact scenario), or it genuinely was deck-created by a build
+/// predating this check, or was moved/renamed since. Discovery still lists
+/// the row (structural criteria alone gate inclusion -- see
 /// `discover_isolated_clones`'s own doc comment), but the marker's content
-/// is deliberately never read in this case: without the attach lock there
-/// is nothing to trust it against, so treating an unread marker as
-/// evidence would reopen exactly the misattribution auditor B1
+/// is deliberately never read in this case: without the provenance
+/// artifact there is nothing to trust it against, so treating an unread
+/// marker as evidence would reopen exactly the misattribution auditor B1
 /// demonstrated.
-const ISOLATED_CLONE_NO_ATTACH_LOCK_REASON: &str = "no matching attach-lock artifact exists for this candidate under the root checkout's own \
-     .git -- its ownership marker (if any) is not read, since without that artifact there is \
-     nothing to trust the marker's content against (fork#325 M4a, auditor A1/B1)";
+const ISOLATED_CLONE_NO_ATTACH_LOCK_REASON: &str = "no matching isolated-clone provenance artifact exists in this candidate's own .git -- its \
+     ownership marker (if any) is not read, since without that artifact there is nothing to \
+     trust the marker's content against (fork#325 M4a, auditor A1/B1; M4b reviewer P1/auditor C1)";
 
 /// The worktree's own git metadata directory could not be resolved, or
 /// failed the containment check against the enumerating repo's common dir
@@ -1649,91 +1671,94 @@ fn git_in_untrusted_dir(dir: &Path) -> Command {
     cmd
 }
 
-/// Whether a persistent attach-lock artifact exists for `candidate`, keyed
-/// by its own canonical path under the enumerating repo's common `.git` dir
+/// Whether a persistent provenance artifact exists for `candidate`
 /// (fork#325 M4a, final round — reviewer F13 / auditor A1/B1, replacing
-/// the earlier `candidate_shares_history_with`, since removed).
+/// the earlier `candidate_shares_history_with`, since removed; M4b —
+/// reviewer P1 / auditor C1 / reviewer F2 — replaced the M4a mechanism
+/// below with the one this function now checks).
 ///
-/// `provision_isolated_clone_sync` already writes this exact artifact
-/// before it ever clones: `worktree_attach_lock_path(source_dir, clone_dir)`
-/// resolves under `<root checkout's common dir>/dot-agent-deck-worktree-locks/`,
-/// created owner-only (0700/0600) and never removed on the acquire path
-/// (`src/issue_dispatch_run.rs`). This function recomputes that exact path
-/// via the SAME hash the provisioner uses
-/// ([`crate::issue_dispatch_run::worktree_attach_lock_path_from_common_dir`])
-/// and checks for its existence — nothing here reimplements the hashing.
+/// `provision_isolated_clone_sync` writes [`ISOLATED_CLONE_PROVENANCE_FILENAME`]
+/// directly into `candidate`'s OWN `.git` directory, immediately after the
+/// clone itself succeeds. This function just checks for that file's
+/// presence — nothing to recompute, since it is self-contained, unlike the
+/// M4a mechanism it replaced (a hash-keyed lookup under the enumerating
+/// repo's common dir).
 ///
-/// This is a stronger binding than the shared-history check it replaces,
+/// This is a stronger binding than the shared-history check M4a replaced,
 /// for the same reason [`owned_git_dir`]'s containment check is strong for
-/// a linked worktree: the evidence lives in a location the ENUMERATING
-/// party controls (`repo_dir`'s own `.git`), not one the candidate itself
-/// can write to. A `same-uid` attacker able only to plant a sibling
-/// directory cannot forge the LOCK FILE'S CONTENTS — closing auditor B1's
-/// 4-file/1-SHA forgery, which the shared-history check could not (it only
-/// checked that the candidate NAMED a commit `repo_dir` had, never that it
-/// HELD one). And unlike the shared-history check, this has no dependency
-/// on the candidate's current `HEAD` at all — a genuine clone that has
-/// since committed real, local-only work is still recognized, closing
-/// reviewer F13.
+/// a linked worktree: the evidence lives at a path only `provision_isolated_clone_sync`
+/// itself ever writes to (see that artifact's own doc comment for exactly
+/// when). A `same-uid` attacker able only to plant a sibling directory
+/// cannot forge this file's presence any more than the M4a mechanism it
+/// replaced — closing auditor B1's 4-file/1-SHA forgery, which the
+/// shared-history check could not (it only checked that the candidate
+/// NAMED a commit `repo_dir` had, never that it HELD one). And like the
+/// M4a mechanism, this has no dependency on the candidate's current `HEAD`
+/// at all — a genuine clone that has since committed real, local-only work
+/// is still recognized, closing reviewer F13.
 ///
-/// **What this does NOT prove (corrected in this doc-only round — reviewer
-/// P1 / auditor C1 — from an earlier version of this comment that
-/// overclaimed it): that the file exists proves the deck itself wrote
-/// something at this exact path AT SOME POINT — not that the CURRENT
-/// occupant of that path is the clone that earned it.** Two concrete, bounded
-/// ways that gap is real:
-/// - **Reviewer P1 — shared namespace with ordinary linked worktrees.** The
-///   attach-lock namespace here is the SAME one [`create_worktree_sync`]
-///   writes into for an ordinary linked worktree, the common case — it is
-///   not isolated-clone-specific. A deck-created-then-later-removed linked
-///   worktree leaves its lock file behind (never cleaned up on that path
-///   either). An attacker who later plants a `.git` dir plus a forged
-///   ownership marker at that exact now-vacant path inherits the genuine,
-///   already-written lock and reaches the same misattribution outcome the
-///   forgery-closing paragraph above was meant to rule out — without
-///   forging the lock file at all.
-/// - **Auditor C1 — the lock is acquired before `clone_dir.exists()` is
-///   checked.** `provision_isolated_clone_sync` acquires this lock
-///   (writing the artifact unconditionally) BEFORE it checks whether
-///   `clone_dir` already exists. An attacker who pre-plants a directory at
-///   the fully deterministic dispatch path gets the deck itself to write a
-///   genuine artifact vouching for that path. This is bounded — the
-///   dispatch then visibly fails to the operator
-///   (`IsolatedCloneOutcome::AlreadyClaimed`), so nothing actually attaches
-///   into the planted directory — but the directory still reports
-///   `owned: true` with an attacker-chosen `created-by` if inspected before
-///   anyone notices the failed dispatch.
+/// **M4a's two residuals, both closed here:**
+/// - **Reviewer P1 — shared namespace with ordinary linked worktrees.**
+///   M4a's mechanism was the SAME attach-lock file [`create_worktree_sync`]
+///   writes for an ordinary linked worktree, so a deck-created-then-removed
+///   linked worktree's leftover lock file could be inherited by a later
+///   forged occupant of the same path. [`ISOLATED_CLONE_PROVENANCE_FILENAME`]
+///   is a wholly separate namespace — a different filename, living inside
+///   the candidate's own `.git` rather than under the enumerating repo's
+///   common dir — that [`create_worktree_sync`] never writes into under any
+///   circumstance, so there is nothing left for a forged occupant to
+///   inherit (`worktree/reclaim/056`).
+/// - **Auditor C1 — the old lock was acquired before `clone_dir.exists()`
+///   was checked.** `provision_isolated_clone_sync`'s attach lock (still
+///   used, unchanged, for cross-process mutual exclusion — see
+///   `worktree_attach_lock_path`'s own doc comment) is still acquired
+///   before the `clone_dir.exists()` check, and that ordering is
+///   deliberately preserved (moving the check earlier would reopen the
+///   `clone_dir.exists()` -> `git clone` TOCTOU fork#325 auditor A3 closed
+///   — fork #282's TOCTOU family). But [`ISOLATED_CLONE_PROVENANCE_FILENAME`]
+///   is written only afterward, once the clone this call performed has
+///   actually succeeded — a pre-planted directory hits
+///   `IsolatedCloneOutcome::AlreadyClaimed` and returns before that write is
+///   ever reached, so it is never vouched for (`worktree/reclaim/057`).
 ///
-/// Neither residual is fixed in this round; both are deferred to fork#325
-/// M4b, which needs one of: a distinct, clone-specific provenance artifact
-/// (closing the P1 namespace-sharing gap at the source), or unlinking the
-/// lock artifact on the `AlreadyClaimed` early-return path — and only when
-/// THIS call is the one that created it, since an unconditional unlink
-/// would let a losing racer delete the winner's genuine lock. Note that
-/// fix must NOT move the `clone_dir.exists()` check earlier than the lock
-/// acquisition to close C1 directly — that would reopen the exact
-/// `clone_dir.exists()` -> `git clone` TOCTOU fork#325 auditor A3 closed by
-/// moving the lock acquisition first (fork #282's TOCTOU family).
+/// **Bonus, from the same self-contained design (reviewer F2,
+/// `worktree/reclaim/058`):** M4a's mechanism required knowing the
+/// enumerating repo's own common `.git` dir to build the lookup path,
+/// which — when `discover_isolated_clones` runs from inside an isolated
+/// clone itself, exactly what the Nth-concurrent-orchestration gate this
+/// milestone serves does — resolved to the CLONE's own common dir, not the
+/// root checkout's, so a sibling clone's genuine artifact (written under
+/// the ROOT's `.git`) was never found. Checking `candidate`'s own `.git`
+/// needs no such resolution at all: it works identically whether the
+/// caller is the root checkout, a subdirectory of it, or another isolated
+/// clone entirely.
 ///
 /// Other honest limits, stated plainly rather than overclaimed:
 /// - **Same-uid still wins.** An attacker with write access to `repo_dir`'s
 ///   own `.git` defeats this exactly as it defeats `owned_git_dir` — this
 ///   is categorically as strong as the linked-worktree case, not stronger,
-///   and never absolute.
+///   and never absolute. In particular, an attacker with write access to
+///   `candidate`'s own `.git` (e.g. having compromised the agent running
+///   inside that clone) could plant this file directly — no stronger a
+///   claim than `owned_git_dir`'s own containment check makes about a
+///   compromised worktree.
 /// - **Best-effort provenance, not proof of current identity.** A clone
-///   made by a build predating this check, or moved/renamed after creation
-///   (the hash is over the canonical path), has no matching lock file and
-///   correctly reports `owned: false` rather than being hidden — mirroring
-///   how `owned_git_dir` returning `None` yields `owned: false`, never a
-///   dropped row.
-/// - **Stale entries.** The lock file is never removed when a clone is
+///   made by a build predating this check, or one whose write genuinely
+///   failed (best-effort, logged and continued — see
+///   `write_isolated_clone_provenance`'s own doc comment), has no matching
+///   artifact and correctly reports `owned: false` rather than being
+///   hidden — mirroring how `owned_git_dir` returning `None` yields
+///   `owned: false`, never a dropped row.
+/// - **Stale entries.** The artifact is never removed when a clone is
 ///   later deleted, so it would vouch for an unrelated directory recreated
-///   at the same path afterward — weaker than containment in that one
-///   respect. (This is the same underlying mechanism as the P1 residual
-///   above, restated: staleness of the artifact itself, independent of
-///   which namespace it lives in.)
-fn candidate_has_attach_lock(common_dir: &Path, candidate: &Path) -> bool {
-    crate::issue_dispatch_run::worktree_attach_lock_path_from_common_dir(common_dir, candidate)
+///   at the same path afterward if that directory were somehow the SAME
+///   `.git` dir reused — in practice this requires reusing the exact same
+///   `clone_dir` path after a prior clone there was destroyed without its
+///   `.git` being replaced, a narrower window than M4a's shared-namespace
+///   staleness since nothing else in the deck ever writes this filename.
+fn candidate_has_attach_lock(candidate_git_dir: &Path) -> bool {
+    candidate_git_dir
+        .join(ISOLATED_CLONE_PROVENANCE_FILENAME)
         .is_file()
 }
 
@@ -1832,6 +1857,19 @@ fn candidate_has_attach_lock(common_dir: &Path, candidate: &Path) -> bool {
 /// of git's resolved one; the derived `root_checkout` remains the fallback
 /// anchor for the case this function exists to handle (`repo_dir` being a
 /// subdirectory or a linked worktree), so A2's own fix is unaffected.
+///
+/// **M4b (reviewer F2): `repo_dir` being an isolated clone itself.** When
+/// `repo_dir` is an isolated clone, `common_dir`/`root_checkout` above
+/// resolve to the CLONE's own `.git`/directory, not the actual root
+/// checkout's — but that only matters for the anchor/parent computation
+/// above, and the clone's parent directory already IS the root checkout's
+/// parent (M4a provisions every isolated clone as a sibling of its source),
+/// so sibling PATHS are still found correctly by construction. What used to
+/// break was `has_attach_lock`'s check, resolved against the wrong
+/// `common_dir` — fixed by making that check self-contained per candidate
+/// instead (see [`ISOLATED_CLONE_PROVENANCE_FILENAME`]'s and
+/// [`candidate_has_attach_lock`]'s own doc comments), so it needs no
+/// `common_dir` at all any more.
 fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
     let Some(common_dir) = resolve_common_dir(repo_dir) else {
         return Vec::new();
@@ -1876,7 +1914,7 @@ fn discover_isolated_clones(repo_dir: &Path) -> Vec<IsolatedCloneCandidate> {
         // `git` spawn, so resolving it for every marked candidate (rather
         // than gating on it) costs nothing extra — see this function's own
         // doc comment for why it no longer gates inclusion.
-        let has_attach_lock = candidate_has_attach_lock(&common_dir, &path);
+        let has_attach_lock = candidate_has_attach_lock(&git_dir);
         found.push(IsolatedCloneCandidate {
             path,
             git_dir,
