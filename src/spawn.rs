@@ -37,7 +37,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,9 +80,25 @@ const DELIVER_BUFFER_DELAY: std::time::Duration = std::time::Duration::from_mill
 /// spawned agent that happens to share a display name.
 pub const SCHEDULE_PANE_ID_PREFIX: &str = "sched-";
 
-/// Monotonic counter making each spawned pane's `DOT_AGENT_DECK_PANE_ID`
-/// unique within a daemon lifetime (the prompt-delivery write routes by it).
+/// Retained solely so `next_pane_id_does_not_collide_across_a_simulated_daemon_restart`
+/// (issue #430) can reset something mid-test to stand in for a daemon
+/// restart — no longer read by [`next_pane_id`] itself, which is why this is
+/// `#[cfg(test)]`-only. It used to be the pane id's only source of entropy,
+/// which was exactly the bug: a bare counter starting back at 0 on every
+/// real restart, so a task fired once before and once after a restart
+/// minted the identical id. See [`PANE_NONCE`]/[`PANE_SEQ`].
+#[cfg(test)]
 static PANE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Per-process nonce (hashed from the pid + epoch nanos at first use) and
+/// monotonic sequence backing [`next_pane_id`]'s numeric component — the
+/// same restart-resistant recipe [`crate::agent_pty::mint_pane_id`] uses via
+/// the shared [`crate::agent_pty::mint_nonce_seq`] helper (issue #430).
+/// Unlike [`PANE_COUNTER`], `PANE_NONCE` is computed once and cached for the
+/// life of the process, so it differs across a daemon restart even though a
+/// reused pid could otherwise recreate the same counter value.
+static PANE_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PANE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What a fire needs to open a tab. Owned + `Clone` so a scheduler callback can
 /// rebuild it on each fire.
@@ -2177,10 +2195,12 @@ fn surface_spawned_orchestration(
 }
 
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
-/// task name to the allowed charset and appends a monotonic counter (+ role
-/// index for orchestration panes) so concurrent fires never collide.
+/// task name to the allowed charset and appends a restart-resistant
+/// nonce+sequence (+ role index for orchestration panes) so concurrent fires
+/// never collide — and, per issue #430, so two fires of the same task never
+/// collide across a daemon restart either.
 fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
-    let n = PANE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let (nonce, seq) = crate::agent_pty::mint_nonce_seq(&PANE_NONCE, &PANE_SEQ);
     let sanitized: String = task_name
         .chars()
         .map(|c| {
@@ -2192,8 +2212,8 @@ fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
         })
         .collect();
     match role_index {
-        Some(idx) => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{n}-r{idx}"),
-        None => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{n}"),
+        Some(idx) => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{nonce:016x}-{seq}-r{idx}"),
+        None => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{nonce:016x}-{seq}"),
     }
 }
 

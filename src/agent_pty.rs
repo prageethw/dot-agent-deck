@@ -523,6 +523,27 @@ pub fn mint_orchestration_id() -> String {
     format!("orch-{nonce:016x}-{seq}")
 }
 
+/// Shared mint recipe behind [`mint_pane_id`] and `spawn::next_pane_id`
+/// (issue #430): a per-process nonce hashed from `std::process::id()` +
+/// the epoch nanoseconds at first use — computed once and cached in the
+/// caller-supplied `nonce_cell`, so it survives for the life of the process
+/// regardless of any counter a caller resets — combined with a value drawn
+/// from the caller's own monotonic `seq`. Each call site keeps its own
+/// `OnceLock`/`AtomicU64` pair (never shared across callers) so unrelated id
+/// spaces don't perturb each other's sequence.
+pub(crate) fn mint_nonce_seq(nonce_cell: &std::sync::OnceLock<u64>, seq: &AtomicU64) -> (u64, u64) {
+    let nonce = *nonce_cell.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    (nonce, seq.fetch_add(1, Ordering::Relaxed))
+}
+
 /// PRD #365 M2: mint a fresh daemon-authoritative `pane_id` for a
 /// TUI-attached `StartAgent` spawn. Same recipe as [`mint_orchestration_id`]
 /// (a per-process nonce hashed from PID + epoch nanos, combined with a
@@ -538,7 +559,10 @@ pub fn mint_orchestration_id() -> String {
 /// Uses its own `NONCE`/`SEQ` statics rather than sharing
 /// [`mint_orchestration_id`]'s — the two id spaces (`orch-*` orchestration
 /// instance tokens, `pane-*` pane ids) are unrelated and mixing their
-/// sequences would buy nothing.
+/// sequences would buy nothing. `spawn::next_pane_id` shares this function's
+/// [`mint_nonce_seq`] recipe (issue #430 gave it the identical restart
+/// problem this function was written to avoid) but likewise keeps its own
+/// statics for the same reason.
 ///
 /// The `pane-` prefix keeps the value legible in logs, filenames and
 /// `DOT_AGENT_DECK_PANE_ID` (mirroring `spawn.rs`'s existing `sched-`
@@ -548,16 +572,7 @@ pub fn mint_orchestration_id() -> String {
 pub fn mint_pane_id() -> String {
     static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nonce = *NONCE.get_or_init(|| {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::process::id().hash(&mut h);
-        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            dur.as_nanos().hash(&mut h);
-        }
-        h.finish()
-    });
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let (nonce, seq) = mint_nonce_seq(&NONCE, &SEQ);
     format!("pane-{nonce:016x}-{seq}")
 }
 
