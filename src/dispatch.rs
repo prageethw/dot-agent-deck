@@ -2141,7 +2141,20 @@ mod tests {
     /// ordinary shared-checkout worktree before spawn fails. With nothing
     /// rooted in the freshly-cloned directory, the rollback's isolated-clone
     /// branch (`attempt_isolated_clone_cleanup` via `spawn_blocking`) must
-    /// actually remove it, not just report success without cleaning up.
+    /// actually remove it, not just report success without cleaning up. Also
+    /// (auditor F2, PRD fork#325 M3 final round -- "the two things this
+    /// three-round review was actually about") pre-creates a branch of the
+    /// SAME NAME as the dispatch's own `paths.branch` directly in the ROOT
+    /// checkout (`repo`), representing unrelated committed work that
+    /// happened to reuse the name, and asserts it still exists after the
+    /// rollback: the original round-1 BLOCKER (auditor A1) was exactly this
+    /// isolated-clone rollback path running `git -C <root checkout> branch
+    /// -D <branch>` and force-deleting it. Proving the clone itself is
+    /// cleaned up correctly (the assertions below already did) is not the
+    /// same claim as proving the root checkout's branches were never
+    /// touched -- a partial regression that reintroduced the stray `branch
+    /// -D` alongside otherwise-correct clone cleanup would pass every
+    /// assertion this test previously had.
     #[tokio::test]
     async fn spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it() {
         let tmp = crate::test_temp::tempdir().unwrap();
@@ -2166,6 +2179,19 @@ mod tests {
             crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
                 &live_sibling_dir,
             )]),
+        );
+
+        // Auditor F2: unrelated pre-existing committed work in the ROOT
+        // checkout, under the exact branch name this dispatch will pick.
+        let paths = derive_dispatch_paths(&repo, "isolated-notrip-unit");
+        std::process::Command::new("git")
+            .args(["branch", &paths.branch])
+            .current_dir(&repo)
+            .output()
+            .expect("git available");
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "sanity: the unrelated root-checkout branch must actually have been created"
         );
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
@@ -2205,6 +2231,13 @@ mod tests {
                 .contains_key(&result.worktree_dir),
             "the registry entry must still be dropped"
         );
+        assert!(
+            branch_exists(&repo, &paths.branch),
+            "auditor F2 (round-1 BLOCKER A1): the isolated-clone rollback path must NEVER run \
+             `branch -D` against the root checkout -- this branch is unrelated pre-existing \
+             work that merely shares a name with the dispatch, and must survive untouched: {}",
+            result.message
+        );
     }
 
     /// Scenario: issue #490 fix round 2, item 2. Same as
@@ -2222,12 +2255,37 @@ mod tests {
     /// short-circuit the whole scenario before spawn is ever reached. Only
     /// `tab_membership.orchestration_cwd` -- the field `worktree_still_in_use`
     /// actually reads (see `worktree_of_record`) -- needs to name the
-    /// not-yet-created clone target.
+    /// not-yet-created clone target. Also (auditor F1, PRD fork#325 M3 final
+    /// round) gives `repo` an `origin` and installs
+    /// `with_git_remote_set_url_failing`, the same stub
+    /// `dispatch_surfaces_the_origin_warning_in_the_success_message` uses, so
+    /// the `clone_origin_warning` fold into THIS arm's "cleanup skipped"
+    /// message (round 2, reviewer P1-2 / auditor R3) is actually exercised
+    /// end to end rather than merely reachable in principle -- without this,
+    /// a regression dropping that fold again would still pass every
+    /// assertion this test previously had.
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_isolated_clone() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
+        // Gives the source an `origin` so `provision_isolated_clone_sync`
+        // takes the "point at source's own origin" branch rather than the
+        // "no origin" removal branch -- see
+        // `dispatch_surfaces_the_origin_warning_in_the_success_message`.
+        let out = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git remote add failed: {out:?}");
+        let _git_stub = with_git_remote_set_url_failing(tmp.path());
 
         let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
         create_worktree(
@@ -2314,6 +2372,24 @@ mod tests {
             result.message.contains("cleanup skipped"),
             "the skip message must name the cause so an operator doesn't reach for a manual \
              force-removal: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains("could not be pointed at the real remote"),
+            "auditor F1: the clone_origin_warning fold into the skip-cleanup arm (round 2, \
+             reviewer P1-2 / auditor R3) must actually surface here -- live sibling roles \
+             remaining inside the clone are exactly the ones CLAUDE.md rule 1 tells to `git \
+             push origin` from inside it: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains("stub: simulated git remote set-url failure"),
+            "the underlying git error text must flow through on this arm too, not just a \
+             generic notice: {}",
             result.message
         );
 
@@ -2467,7 +2543,15 @@ mod tests {
     /// byte -- proving the `IsolatedCloneOutcome::Failed { error, .. }` arm
     /// actually sanitizes git's own captured stderr before writing it into
     /// the caller's pane, not just the deck-controlled path/name
-    /// interpolations sitting next to it in the same message.
+    /// interpolations sitting next to it in the same message. Also (reviewer
+    /// P3-B, PRD fork#325 M3 final round) proves the negative assertion
+    /// below isn't vacuous by first invoking the stub directly and
+    /// confirming it genuinely emits the raw ESC byte on its own, matching
+    /// `terminal_sanitize.rs`'s own precedent (`escapes_word_joiner_u2060`)
+    /// of confirming the hostile input was actually present before trusting
+    /// its absence downstream -- without this, the stub silently failing to
+    /// emit ESC at all (e.g. a shell quoting change swallowing `\033`) would
+    /// make the "no raw ESC" assertion below pass for the wrong reason.
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_sanitizes_git_stderr_in_the_isolated_clone_failed_message() {
@@ -2493,6 +2577,29 @@ mod tests {
             )]),
         );
         let _git_stub = with_git_clone_failing_with_hostile_stderr(tmp.path());
+
+        // Reviewer P3-B: call the now-stubbed `git clone` directly (a
+        // throwaway probe destination, distinct from the isolated-clone
+        // target `handle_dispatch` will pick below) and confirm ITS raw
+        // stderr genuinely contains the ESC byte, before any sanitizer has
+        // had a chance to touch it.
+        let probe_dest = tmp.path().join("git-stub-probe-dest");
+        let probe = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--",
+                &repo.to_string_lossy(),
+                &probe_dest.to_string_lossy(),
+            ])
+            .output()
+            .expect("stubbed git available on PATH");
+        let probe_stderr = String::from_utf8_lossy(&probe.stderr);
+        assert!(
+            probe_stderr.contains('\u{1b}'),
+            "sanity: the stub itself must genuinely emit a raw ESC byte, or the \"no raw ESC\" \
+             assertion below would be vacuous: {probe_stderr:?}"
+        );
+        let _ = std::fs::remove_dir_all(&probe_dest);
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
