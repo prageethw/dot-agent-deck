@@ -990,7 +990,10 @@ pub struct WorktreeKeptNotice {
 /// Why [`remove_worktree`](crate::issue_dispatch_run::remove_worktree) left a
 /// worktree in place instead of removing it — either
 /// [`RemovalPolicy::KeepIfDirty`](crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty)
-/// chose not to attempt removal, or removal was attempted and failed.
+/// chose not to attempt removal because the tree is dirty (or its dirtiness
+/// could not be checked), removal was attempted and failed, or the entry's
+/// policy is [`RemovalPolicy::IsolatedClone`](crate::issue_dispatch_run::RemovalPolicy::IsolatedClone),
+/// under which removal is never attempted at all, regardless of dirtiness.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KeptReason {

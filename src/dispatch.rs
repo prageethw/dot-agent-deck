@@ -336,7 +336,10 @@ pub async fn handle_dispatch(
             return DispatchResult {
                 worktree_dir: paths.worktree_dir.clone(),
                 success: false,
-                message: format!("dispatch: live-sibling check task panicked: {join_err}"),
+                message: format!(
+                    "dispatch: live-sibling check task panicked: {}",
+                    crate::terminal_sanitize::sanitize_for_terminal_display(&join_err.to_string())
+                ),
             };
         }
     };
@@ -362,6 +365,19 @@ pub async fn handle_dispatch(
         // the provisioning mechanism differs. `provision_isolated_clone_sync`
         // is sync (no async twin exists), so it runs on the blocking pool
         // exactly like the daemon-query gate above.
+        //
+        // Fix round 2 (reviewer P2-7): this arm inherits attach-not-refuse
+        // branch-reuse behaviour from `provision_isolated_clone_sync` (it
+        // `git checkout`s the branch if it already exists, same as Model
+        // A's own isolated arm), while the `else` arm below
+        // (`create_worktree` with `reuse_existing_branch: false`) REFUSES
+        // via `WorktreeCreation::BranchExists` to protect possibly-committed
+        // work. Which of the two runs is decided by `has_live_sibling`, a
+        // runtime/timing-dependent daemon query -- so `dispatch <name>`
+        // against a reused branch name can refuse on one invocation and
+        // silently attach to prior commits on the next, with nothing in the
+        // output distinguishing which semantics just applied. Known,
+        // deliberately deferred -- see the PRD's Out of scope section.
         let source_dir = clone_dir.clone();
         let clone_target = paths.worktree_dir.clone();
         let branch = paths.branch.clone();
@@ -387,8 +403,13 @@ pub async fn handle_dispatch(
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
                     message: format!(
-                        "dispatch: isolated clone already exists at {}. Wait for it to \
-                         finish, or dispatch under a different name.",
+                        "dispatch: an isolated clone from an earlier dispatch of this name is \
+                         still on disk at {} — it may not be running anymore (isolated clones \
+                         are never removed automatically). Run `rm -rf {}` once its work is \
+                         captured, or dispatch under a different name.",
+                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                            &paths.worktree_dir
+                        ),
                         crate::terminal_sanitize::sanitize_path_for_terminal_display(
                             &paths.worktree_dir
                         )
@@ -483,7 +504,10 @@ pub async fn handle_dispatch(
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
                     message: format!(
-                        "dispatch: isolated-clone provisioning task panicked: {join_err}"
+                        "dispatch: isolated-clone provisioning task panicked: {}",
+                        crate::terminal_sanitize::sanitize_for_terminal_display(
+                            &join_err.to_string()
+                        )
                     ),
                 };
             }
@@ -558,7 +582,10 @@ pub async fn handle_dispatch(
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
-                    message: format!("dispatch: failed to create worktree: {e}"),
+                    message: format!(
+                        "dispatch: failed to create worktree: {}",
+                        crate::terminal_sanitize::sanitize_for_terminal_display(&e)
+                    ),
                 };
             }
         }
@@ -629,12 +656,19 @@ pub async fn handle_dispatch(
             // the dispatching agent repeats it to the user verbatim.
             let mut message = match &handle.kind {
                 SpawnKind::Orchestration { name: orch } => format!(
-                    "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
-                    paths.worktree_dir.display()
+                    "dispatch: spawned isolated orchestration '{}' for '{}' in {}",
+                    crate::terminal_sanitize::sanitize_for_terminal_display(orch),
+                    crate::terminal_sanitize::sanitize_for_terminal_display(name),
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
                 ),
                 SpawnKind::SingleAgent => format!(
-                    "dispatch: spawned isolated agent for '{name}' in {}",
-                    paths.worktree_dir.display()
+                    "dispatch: spawned isolated agent for '{}' in {}",
+                    crate::terminal_sanitize::sanitize_for_terminal_display(name),
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
                 ),
             };
             // PRD fork#325 fix round (reviewer B3 / auditor B1): surface the
@@ -680,16 +714,30 @@ pub async fn handle_dispatch(
                     "spawn rollback: a live sibling role is still rooted in this worktree; \
                      skipping cleanup"
                 );
+                let mut message = format!(
+                    "dispatch: spawn failed: {e} (cleanup skipped: {} is still rooted by a \
+                     live sibling role — worktree, branch, and registry entry left in place)",
+                    crate::terminal_sanitize::sanitize_path_for_terminal_display(
+                        &paths.worktree_dir
+                    )
+                );
+                // Fork#325 fix round 2 (reviewer P1-2 / auditor R3): this is
+                // exactly the path where live roles remain inside the clone
+                // -- the agents CLAUDE.md rule 1 tells to `git push origin`
+                // -- so the origin warning matters here at least as much as
+                // on the success path below, and must not be dropped.
+                if let Some(error) = &clone_origin_warning {
+                    message.push_str(&format!(
+                        " (warning: this clone's `origin` could not be pointed at the real \
+                         remote ({}) — manually run `git remote set-url origin <url>` (or `git \
+                         remote remove origin` if none exists) before pushing from inside it)",
+                        crate::terminal_sanitize::sanitize_for_terminal_display(error)
+                    ));
+                }
                 return DispatchResult {
                     worktree_dir: paths.worktree_dir.clone(),
                     success: false,
-                    message: format!(
-                        "dispatch: spawn failed: {e} (cleanup skipped: {} is still rooted by a \
-                         live sibling role — worktree, branch, and registry entry left in place)",
-                        crate::terminal_sanitize::sanitize_path_for_terminal_display(
-                            &paths.worktree_dir
-                        )
-                    ),
+                    message,
                 };
             }
 
@@ -714,7 +762,27 @@ pub async fn handle_dispatch(
                 // `remove_worktree` (a shared-checkout-shaped operation) and
                 // never a `branch -D` against `clone_dir` (the branch lives
                 // in the clone, not there).
-                let cleaned_up_by = attempt_isolated_clone_cleanup(&paths.worktree_dir, &creator);
+                //
+                // This unconditional `remove_dir_all` looks like it
+                // contradicts `RemovalPolicy::IsolatedClone`'s deliberately
+                // conservative "always Kept, regardless of dirtiness" tab-
+                // close policy a few dozen lines away in
+                // `issue_dispatch_run.rs` -- it does not. That policy exists
+                // because a clean working tree does not prove committed work
+                // is safe to discard; this path runs only when `spawn()`
+                // itself just failed and (per `worktree_still_in_use` above)
+                // no live sibling role is rooted here, so for THIS clone no
+                // agent was ever handed it and there is no work of any kind
+                // to protect -- the same reasoning the `else` arm's `Force`
+                // policy already applies to the shared-checkout case.
+
+                let wt = paths.worktree_dir.clone();
+                let cr = creator.clone();
+                let cleaned_up_by =
+                    tokio::task::spawn_blocking(move || attempt_isolated_clone_cleanup(&wt, &cr))
+                        .await
+                        .ok()
+                        .flatten();
                 cleaned_up_by.is_none()
             } else {
                 let _ = remove_worktree(
