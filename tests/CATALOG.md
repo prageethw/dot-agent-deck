@@ -1298,6 +1298,48 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any deeper nesting than one subdirectory level, or the linked-worktree enumeration's own behavior from a subdirectory (unaffected by this milestone).
 - **Platform coverage:** mac+linux+windows.
 
+##### worktree/reclaim/056 — M4b (RED), reviewer P1. The attach-lock namespace `candidate_has_attach_lock` checks is the SAME one `create_worktree_sync` writes into for an ordinary linked worktree, not isolated-clone-specific: a linked worktree is created through the real production path, removed normally via `git worktree remove`, and a same-uid attacker then plants a forged `.git` directory plus a forged ownership marker at the exact now-vacant path — inheriting the genuine, never-cleaned-up lock without forging it. Asserts the forged occupant must never report `owned: true` (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — real `create_worktree_sync` + real `git worktree remove`, then a hand-planted 2-file forgery at the vacated path.
+- **Agent:** none.
+- **Asserts:** the forged directory is discovered but `owned` is `false`, and `is_mine` returns `false` for the identity its own forged marker claims.
+- **Does not assert:** which of the two fix mechanisms the PRD names (a clone-specific provenance artifact vs. unlinking the lock on `AlreadyClaimed`) coder picks — only the observable contract.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/057 — M4b (RED), auditor C1. `provision_isolated_clone_sync` acquires the attach lock (writing the artifact unconditionally) BEFORE checking whether `clone_dir` already exists. A same-uid attacker pre-plants a forged `.git` dir plus a forged ownership marker at the fully deterministic dispatch path; the real provisioner then writes a genuine attach-lock artifact vouching for it even though the dispatch itself visibly fails as `AlreadyClaimed` and never attaches into the planted directory. Asserts the pre-planted directory must never report `owned: true` (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — calls the real `issue_dispatch_run::provision_isolated_clone_sync` against a pre-existing forged directory.
+- **Agent:** none.
+- **Asserts:** the provisioner reports `AlreadyClaimed` without deleting or modifying the pre-existing directory; `examine_worktrees` reports it discovered but `owned: false`, and `is_mine` returns `false` for the forged identity.
+- **Does not assert:** which fix mechanism coder picks — only the observable contract, and never moving the `clone_dir.exists()` check earlier than lock acquisition (that would reopen the TOCTOU fork#325 auditor A3 closed).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/058 — M4b (RED), reviewer F2. `discover_isolated_clones` anchors its scan on the INVOKING repo's own common `.git` dir, so calling `examine_worktrees` with `repo_dir` set to an isolated clone's OWN directory resolves `common_dir` to the clone's own `.git`, not the root checkout's — where every attach-lock artifact this milestone relies on actually lives. The Nth-concurrent-orchestration gate this milestone exists to serve runs, by definition, from inside an isolated clone, so a sibling clone the SAME identity owns currently fails `--mine` from there (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — two real isolated clones provisioned via `provision_isolated_clone_sync`, `examine_worktrees` invoked with `repo_dir` set to one of them.
+- **Agent:** none.
+- **Asserts:** the sibling clone is discovered and satisfies `is_mine` for the shared owning identity when `examine_worktrees` runs from inside the other clone, not just from the root checkout.
+- **Does not assert:** the root checkout's own attribution from inside a clone (out of scope — the 1st orchestration is unaffected either way), or any change to `discover_isolated_clones`'s self-exclusion behavior.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/059 — M4b, auditor B4 (automating auditor A1 item 2's manual finding). `discover_isolated_clones` checks `entry.file_type().is_symlink()` (which does not traverse the symlink) before treating a sibling as a candidate, so a symlinked sibling pointing at a genuine, owned isolated clone is skipped rather than followed and reported under the symlink's own path. No automated test existed for this before — only manual re-verification (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (symlink creation).
+- **Agent:** none.
+- **Asserts:** the real clone is discovered directly and exactly once; the symlinked alias sibling is never reported under its own path.
+- **Does not assert:** Windows symlink behavior (untested — `#[cfg(unix)]`), or any change to the underlying skip logic.
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/060 — M4b, auditor B4 (automating auditor A3's manual PoC). `git_in_untrusted_dir` passes `-c core.fsmonitor=` on every git invocation against a discovery candidate, closing the code-execution vector auditor's lab demonstrated by setting `core.fsmonitor` to an arbitrary program and observing it run during `worktree list`. This plants the same payload against a real clone sibling and proves the payload's sentinel file is never created when `examine_worktrees` runs (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (executable shell payload). Mirrors auditor A3's own reproduction: `git -C <candidate> config core.fsmonitor <payload>`.
+- **Agent:** none.
+- **Asserts:** the hostile clone is still discovered and processed (`check_cleanliness` runs against it); the payload's sentinel file is never created.
+- **Does not assert:** the residual `filter.<driver>.clean`/`.gitattributes` vector auditor's final round separately identified (accepted, same-uid, non-blocker; out of scope here) or Windows behavior (`#[cfg(unix)]`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/061 — M4b (RED), reviewer R1 / auditor D1 (blocker, PR #515). `candidate_has_attach_lock` checks only `.is_file()` on the isolated-clone provenance artifact inside the candidate's OWN `.git` — a location fully attacker-controlled. A bare 3-file forgery (sibling `.git` dir, hand-planted owner marker, self-planted empty provenance file), with no `git clone` and no call into `provision_isolated_clone_sync` anywhere in the chain, currently reports `owned: true` and satisfies `--mine` for the forged identity. Asserts the forged occupant must never report `owned: true` (fork issue #325 M4b).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`.
+- **Agent:** none.
+- **Asserts:** the forged directory is still discovered (discovery stays purely structural); `owned` is `false`; `owner` is `None`; `is_mine` is `false` for the forged identity and for any other identity.
+- **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/056`), or the pre-planted-dispatch-path case (`worktree/reclaim/057`) — this is the bare self-planted-artifact forgery those three do not cover.
+- **Platform coverage:** mac+linux+windows.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
