@@ -33579,10 +33579,18 @@ mod tests {
         );
         let area = buf.area();
         let submit_dimmed = (0..area.height).any(|y| {
-            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
-            row.find("[Submit]").is_some_and(|start| {
-                (start..start + "[Submit]".len())
-                    .all(|x| buf[(x as u16, y)].modifier.contains(Modifier::DIM))
+            // Column-indexed, not byte-indexed: the row's border cells
+            // (`│`) are multi-byte UTF-8, so `String::find` on a
+            // `.collect()`-ed row returns a BYTE offset that drifts from
+            // the cell/column index it's used as below once any
+            // multi-byte glyph precedes the match — silently checking the
+            // DIM modifier on the wrong cells instead of "[Submit]"'s own.
+            let cols: Vec<&str> = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            const LABEL: &str = "[Submit]";
+            (0..cols.len().saturating_sub(LABEL.len())).any(|start| {
+                cols[start..start + LABEL.len()].concat() == LABEL
+                    && (start..start + LABEL.len())
+                        .all(|x| buf[(x as u16, y)].modifier.contains(Modifier::DIM))
             })
         });
         assert!(

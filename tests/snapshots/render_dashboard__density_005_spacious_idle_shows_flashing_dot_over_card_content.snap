@@ -2,7 +2,7 @@
 source: tests/render_dashboard.rs
 expression: flash_on
 ---
-┌ 1 ClaudeCode · example-coder ──────────────────────────────────────── ● Idle ┐
+┌ 1 example-coder ───────────────────────────────────────────────────── ● Idle ┐
 │Dir:  example-project                                                         │
 │Prmt: first prompt                                                            │
 │      second prompt                                                           │

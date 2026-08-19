@@ -1826,6 +1826,7 @@ async fn confirm_prompt_delivery(
                 can_report_prompts,
                 agent_start,
             } => {
+                let armed_before_this_claim = armed;
                 armed |= can_report_prompts && accepts_late_producer;
                 // Issue #666: the watch window saw a genuine, identity-matching,
                 // post-write `SessionStart`. That is facts G ∧ I ∧ W; the rearm
@@ -1834,6 +1835,23 @@ async fn confirm_prompt_delivery(
                 // refuses unless all six hold.
                 if let Some((observed_at, declared)) = agent_start {
                     rearm.observe_agent_start(observed_at, &declared);
+                }
+                // Issue #570: a delivery that starts UNARMED writes nothing at
+                // all on every prior iteration (`if !armed { continue; }`
+                // below skips straight past the write), so the moment a late
+                // producer's standing newly arms it, this is the delivery's
+                // FIRST write, not its Nth retry — unlike an ordinary
+                // already-armed delivery, where fork #194's
+                // `MAX_PAYLOAD_SUBMISSIONS == 1` correctly makes every write
+                // past the caller's own attempt 1 a submit-only probe.
+                // Without this, `attempt` had already run past 1 by the time
+                // an unarmed delivery's first eligible write is reached, so
+                // `attempt_writes_payload` always saw >= 2 and the loop typed
+                // nothing but a bare CR into a pane holding no prompt for it
+                // to submit — the write-and-never-submit failure #570 itself
+                // reports, reintroduced one layer down.
+                if armed && !armed_before_this_claim {
+                    attempt = 0;
                 }
                 if can_report_prompts && !armed && !refused_claim_logged {
                     refused_claim_logged = true;
