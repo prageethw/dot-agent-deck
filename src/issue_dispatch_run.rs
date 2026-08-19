@@ -110,6 +110,13 @@ pub type WorktreeRegistry = Arc<Mutex<HashMap<PathBuf, WorktreeEntry>>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeEntry {
     /// The clone that owns the worktree. Preserved by removal.
+    ///
+    /// Under [`RemovalPolicy::IsolatedClone`] the entry's own directory is
+    /// NOT a linked worktree of this path at all — it is an independent
+    /// clone `git clone`d FROM it — so "owns" and "preserved by removal"
+    /// don't apply the same way; this field is then informational only
+    /// (which source repo the clone came from), unused by
+    /// [`remove_worktree`], which never touches it under that policy.
     pub clone_dir: PathBuf,
     /// Removal policy — see [`RemovalPolicy`].
     pub policy: RemovalPolicy,
@@ -146,6 +153,24 @@ pub enum RemovalPolicy {
     /// Refuse to remove a worktree with uncommitted changes; leave it in place
     /// and log so the user can recover the work.
     KeepIfDirty,
+    /// PRD fork#325 M3 (issue #490 fix round, reviewer B2 / auditor A3): the
+    /// entry is an isolated `git clone` (`provision_isolated_clone_sync`),
+    /// not a linked worktree of `clone_dir` — `git worktree remove` does not
+    /// apply to it at all (it targets a directory that is not a working
+    /// tree of any repo and fails with exit 128). Unlike a linked worktree,
+    /// removing it also destroys its OWN `.git`, so a clean working tree is
+    /// not proof the branch is safe to discard: any commits made only on
+    /// this clone's local branch have no copy anywhere else, whereas a
+    /// removed linked worktree's branch survives in the shared object
+    /// store it came from. `remove_worktree` therefore never attempts
+    /// removal under this policy at all — it always reports
+    /// [`RemoveOutcome::Kept`] with
+    /// [`crate::event::KeptReason::IsolatedClone`], regardless of
+    /// dirtiness, deferring an actually-safe automatic removal to PRD
+    /// fork#325 M4 (future, not this milestone — the same deferral
+    /// `provision_isolated_clone_sync`'s own doc comment already accepts
+    /// for `crate::worktree_reclaim`).
+    IsolatedClone,
 }
 
 /// Construct an empty [`WorktreeRegistry`].
@@ -282,17 +307,21 @@ fn remove_worktree_argv(clone_dir: &str, worktree_dir: &str, force: bool) -> Vec
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
-/// <worktree>`), PRESERVING the clone. Never fatal to the caller — a non-zero
-/// exit (already removed, locked) or a spawn error is logged AND reported back
-/// as [`RemoveOutcome::RemoveFailed`], so the tab-close path never panics or
+/// <worktree>`), PRESERVING the clone — except under
+/// [`RemovalPolicy::IsolatedClone`], whose entry is not a linked worktree at
+/// all and for which this function never runs `git worktree remove` (see
+/// below). Never fatal to the caller — a non-zero exit (already removed,
+/// locked) or a spawn error is logged AND reported back as
+/// [`RemoveOutcome::RemoveFailed`], so the tab-close path never panics or
 /// blocks on it, but the caller can no longer mistake the failure for success.
 ///
-/// `policy` decides what happens when the worktree still holds uncommitted work
-/// — see [`RemovalPolicy`] for why the two producers used to need opposite
-/// answers. Under [`RemovalPolicy::KeepIfDirty`] a dirty tree (or a status
-/// probe that fails, so dirtiness is unknown) is left in place, logged, and
-/// reported back as [`RemoveOutcome::Kept`]; under [`RemovalPolicy::Force`] the
-/// tree is removed regardless.
+/// `policy` decides what happens: under [`RemovalPolicy::IsolatedClone`] the
+/// entry is kept unconditionally, with no probe at all — see that variant's
+/// own doc comment for why dirtiness is irrelevant to it. Under
+/// [`RemovalPolicy::KeepIfDirty`] a dirty tree (or a status probe that fails,
+/// so dirtiness is unknown) is left in place, logged, and reported back as
+/// [`RemoveOutcome::Kept`]; under [`RemovalPolicy::Force`] the tree is removed
+/// regardless.
 ///
 /// `remover` (issue #469) names the caller responsible for this removal —
 /// forwarded verbatim into [`RemoveOutcome::Removed`] and the success log,
@@ -306,28 +335,49 @@ pub async fn remove_worktree(
     remover: &str,
 ) -> RemoveOutcome {
     let worktree = worktree_dir.to_string_lossy();
-    if policy == RemovalPolicy::KeepIfDirty {
-        let status = probe_worktree_dirty(&worktree).await;
-        match status {
-            Ok(output) if !output.trim().is_empty() => {
-                tracing::warn!(
-                    worktree = %worktree_dir.display(),
-                    remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                    "dispatch: worktree has uncommitted changes; leaving in place"
-                );
-                return RemoveOutcome::Kept(crate::event::KeptReason::Dirty);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    worktree = %worktree_dir.display(),
-                    remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
-                    error = %e,
-                    "dispatch: could not check worktree status; leaving in place"
-                );
-                return RemoveOutcome::Kept(crate::event::KeptReason::ProbeError);
+    // An exhaustive match, not `if policy == …` chains (fix round 2, P3-10):
+    // a future fourth `RemovalPolicy` variant now fails to compile here
+    // instead of silently falling through to the destructive tail below.
+    match policy {
+        RemovalPolicy::IsolatedClone => {
+            // See [`RemovalPolicy::IsolatedClone`]'s doc comment: `clone_dir`
+            // is not a linked worktree of anything (`git worktree remove`
+            // would fail with exit 128), and a clean working tree does not
+            // prove it is safe to `remove_dir_all` — this clone's `.git` may
+            // hold the only copy of commits made on its local branch. Kept
+            // unconditionally; not even a dirty-status probe is run, since the
+            // outcome is the same either way.
+            tracing::info!(
+                worktree = %worktree_dir.display(),
+                remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                "dispatch: isolated clone kept in place (not a linked worktree; see RemovalPolicy::IsolatedClone)"
+            );
+            return RemoveOutcome::Kept(crate::event::KeptReason::IsolatedClone);
+        }
+        RemovalPolicy::KeepIfDirty => {
+            let status = probe_worktree_dirty(&worktree).await;
+            match status {
+                Ok(output) if !output.trim().is_empty() => {
+                    tracing::warn!(
+                        worktree = %worktree_dir.display(),
+                        remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                        "dispatch: worktree has uncommitted changes; leaving in place"
+                    );
+                    return RemoveOutcome::Kept(crate::event::KeptReason::Dirty);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        worktree = %worktree_dir.display(),
+                        remover = %crate::terminal_sanitize::sanitize_for_terminal_display(remover),
+                        error = %e,
+                        "dispatch: could not check worktree status; leaving in place"
+                    );
+                    return RemoveOutcome::Kept(crate::event::KeptReason::ProbeError);
+                }
             }
         }
+        RemovalPolicy::Force => {}
     }
 
     let args = remove_worktree_argv(
@@ -1805,15 +1855,21 @@ fn remove_isolated_clone_origin_default(clone_dir: &Path) -> Option<String> {
 /// spawning a thread to race — not worth the complexity for a best-effort
 /// cleanup whose failure already degrades gracefully to a named manual
 /// command.
-fn attempt_isolated_clone_cleanup(clone_dir: &Path, remover: &str) -> Option<String> {
-    // Issue #325 reviewer P3-E: a one-line guard that makes this
-    // destructive, unconditional `remove_dir_all` self-evidently safe to a
-    // future reader — this function is only ever called on a path we just
-    // created via `git clone`, under this function's own attach lock, so
-    // `.git` is always present in practice; the check costs nothing and
-    // means a future caller mistake (a wrong path passed in) removes
-    // nothing instead of silently deleting an unrelated directory.
-    if !clone_dir.join(".git").exists() {
+pub(crate) fn attempt_isolated_clone_cleanup(clone_dir: &Path, remover: &str) -> Option<String> {
+    // Issue #325 reviewer P3-E (widened by fix round 2, auditor R5): a
+    // one-line guard that makes this destructive, unconditional
+    // `remove_dir_all` self-evidently safe to a future reader — this
+    // function is only ever called on a path we just created via `git
+    // clone`, under this function's own attach lock, so `.git` is always
+    // present as a DIRECTORY in practice; the check costs nothing and means
+    // a future caller mistake (a wrong path passed in) removes nothing
+    // instead of silently deleting an unrelated directory. Deliberately
+    // `is_dir()`, not `exists()`: a linked worktree's `.git` is a FILE (it
+    // points back at the main repo's `.git/worktrees/<name>`), so a bare
+    // existence check would wave one through — `is_dir()` is strictly
+    // stronger and correct for every path this function's two callers can
+    // produce (plain `git clone`, never `--separate-git-dir`).
+    if !clone_dir.join(".git").is_dir() {
         return None;
     }
     let removed = std::fs::remove_dir_all(clone_dir).is_ok();
