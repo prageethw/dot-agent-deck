@@ -1391,12 +1391,14 @@ fn issue_claim_013_refuse_no_identity_is_escapable_with_takeover_confirm_stopped
 
 /// Scenario: The same worktree claims issue 14, then claims it AGAIN with a
 /// DIFFERENT `DOT_AGENT_DECK_PANE_ID` — simulating a daemon restart that
-/// recycled the pane-id counter (CLAUDE.md rule 23, verified 2026-08-10:
-/// `DOT_AGENT_DECK_PANE_ID` values are "small daemon-scoped integers … and
-/// they recycle across a daemon restart"; confirmed in code —
-/// `next_pane_id`/`src/spawn.rs`'s `PANE_COUNTER` is a process-global atomic
-/// that resets with the daemon). Assert the SECOND claim is recognized as the
-/// SAME identity and succeeds as an idempotent refresh, never a refusal. This
+/// recycled the pane-id counter (CLAUDE.md rule 23, verified 2026-08-10 —
+/// note issue #430 has since replaced `next_pane_id`/`src/spawn.rs`'s old
+/// process-global `PANE_COUNTER` with a restart-resistant nonce+seq, so this
+/// scenario is no longer reproducible from production `next_pane_id` output;
+/// the test still pins the right property, since identity here must not be
+/// pane-id-keyed regardless of how pane ids are minted). Assert the SECOND
+/// claim is recognized as the SAME identity and succeeds as an idempotent
+/// refresh, never a refusal. This
 /// is round 2's own regression, guarded directly: a pane-id-keyed identity
 /// would make a restarted daemon's recycled id compare EQUAL to a totally
 /// different, unrelated prior holder and wave it through (the fork
