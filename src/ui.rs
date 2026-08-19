@@ -20205,7 +20205,9 @@ fn render_session_card(
     // PRD fork#446 M2: hoisted above the tier branches below — the role name
     // is one of the two survivors (with status) at every height tier, not
     // only the `>= 3` full-card body.
-    let role_name_text = display_name.map(|name| name.as_str()).unwrap_or(&id_display);
+    let role_name_text = display_name
+        .map(|name| name.as_str())
+        .unwrap_or(&id_display);
 
     let num_prefix = match card_number {
         Some(n) => format!("{n} "),
