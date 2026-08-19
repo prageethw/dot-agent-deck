@@ -8045,48 +8045,155 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: issue #492 M3. `set_pending_seed` and
-    /// `take_pending_seed_fallback` both resolve their target purely by
-    /// matching `pane_id_env`, with no `!exited` filter — unlike
-    /// `spawn_agent`'s duplicate-pane-id check and `has_live_pane` in this
-    /// same file, which both skip exited entries. Mirrors
-    /// `registry_allows_pane_id_reuse_when_prior_agent_has_exited`'s
-    /// fixture: spawn `/usr/bin/true` (exits almost immediately) bound to a
-    /// `pane_id_env`, wait for the reader thread to observe EOF and flip
-    /// `exited` while the entry stays retained in the registry (`len() ==
-    /// 1`, `live_count() == 0` — the "stale record not yet reaped" shape
-    /// issue #492 describes), then set a seed against that same
-    /// still-registered but exited `pane_id_env` and read it back through
-    /// the fallback taker. There is no live agent to target at all — only
-    /// the stale exited record — so a seed that round-trips proves both
-    /// functions will silently bind to a dead record instead of refusing
-    /// when no live occupant exists to deliver it to. (A fixture with a
-    /// SECOND, live agent ALSO sharing `pane_id_env` — the literal
-    /// "stranger" shape from issue #492 — was deliberately not built here:
-    /// which of the two records `HashMap` iteration resolves first is
-    /// unspecified and not reproducible deterministically, so such a test
-    /// would pass or fail depending on hash-seed luck rather than on the
-    /// code. This construction isolates the missing filter itself, which is
-    /// deterministic regardless of iteration order because only one
-    /// candidate ever exists.)
+    /// Scenario: PR #507 fix-round rework (reviewer B1, auditor BLOCKER B1).
+    /// The original construction tested `set_pending_seed`/
+    /// `take_pending_seed_fallback`'s `!exited` filter, which is correct and
+    /// unrelated to the actual bug this PR introduced: `arm_seed_fallback`'s
+    /// NEW gate (`is_respawn_successor`) is the wrong invariant. It is the
+    /// ONLY caller-site guard with no test at all — nothing exercises it
+    /// firing after a real respawn. Positive control: run the real
+    /// production sequence — spawn, respawn onto the same `pane_id_env`
+    /// (`respawn_agent_for_pane`, `handle_delegate`'s only path to this
+    /// function), stash a seed for the respawn successor, arm the fallback
+    /// with a short grace — with NOTHING else happening before grace
+    /// elapses. The seed was stashed for exactly this occupant, so delivery
+    /// must succeed; today's code refuses unconditionally here (B1), since
+    /// `is_respawn_successor` is true for every respawn successor with no
+    /// way to tell "the intended recipient, unchanged" apart from "a
+    /// stranger". Race: after the seed is stashed and the fallback armed,
+    /// the respawn successor's PTY closes (`AgentPtyRegistry::close_agent`)
+    /// and a completely FRESH `spawn_agent` call — never another respawn —
+    /// binds an unrelated agent onto the SAME `pane_id_env` before grace
+    /// elapses (the actual threat `write_notice_guarded`'s doc names, and
+    /// auditor S3's exact bypass: a fresh spawn never marks
+    /// `respawn_successor_agents`). Assert the seed does NOT reach that
+    /// stranger.
     #[tokio::test]
-    async fn seed_fallback_set_and_take_resolve_an_exited_record_with_no_live_filter() {
-        const PANE_ID_ENV: &str = "issue-492-seed-fallback-pane";
-        const SEED: &str =
-            "issue-492 sentinel seed - must never round-trip through an exited record";
+    async fn arm_seed_fallback_gate_ignores_who_the_seed_was_stashed_for() {
+        const CONTROL_PANE: &str = "issue-492-seed-control-pane";
+        const RACE_PANE: &str = "issue-492-seed-race-pane";
+        const CONTROL_SEED: &str = "issue-492 sentinel seed - ordinary delivery, unchanged pane";
+        const RACE_SEED: &str = "issue-492 sentinel seed - must never round-trip to a stranger";
+        const GRACE: Duration = Duration::from_millis(500);
+
+        #[cfg(unix)]
+        let byte_command = "/bin/cat";
+        #[cfg(windows)]
+        let byte_command = "more.com";
+
+        // --- Positive control: nothing happens after the seed is armed ---
+        let control_registry = Arc::new(AgentPtyRegistry::new());
+        let _control_original_id = control_registry
+            .spawn_agent(SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), CONTROL_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the control pane's original occupant");
+        let control_new_agent_id = control_registry
+            .respawn_agent_for_pane(CONTROL_PANE, byte_command)
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        control_registry.set_pending_seed(CONTROL_PANE, CONTROL_SEED);
+        arm_seed_fallback(control_registry.clone(), CONTROL_PANE.to_string(), GRACE);
+        tokio::time::sleep(GRACE + Duration::from_millis(300)).await;
+        let control_output = control_registry
+            .snapshot(&control_new_agent_id)
+            .expect("snapshot the respawn successor's PTY");
+        assert!(
+            String::from_utf8_lossy(&control_output).contains(CONTROL_SEED),
+            "positive control: arm_seed_fallback must still deliver a seed to the SAME respawn \
+             successor it was stashed for when nothing else has happened — today's gate \
+             refuses unconditionally because it can't distinguish that from a stranger (B1)"
+        );
+        control_registry.shutdown_all();
+
+        // --- Race: the respawn successor closes before grace elapses, and
+        // a fresh, unrelated spawn takes over the same pane_id_env ---
+        let race_registry = Arc::new(AgentPtyRegistry::new());
+        let _race_original_id = race_registry
+            .spawn_agent(SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), RACE_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the race pane's original occupant");
+        let respawned_agent_id = race_registry
+            .respawn_agent_for_pane(RACE_PANE, byte_command)
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        race_registry.set_pending_seed(RACE_PANE, RACE_SEED);
+        arm_seed_fallback(race_registry.clone(), RACE_PANE.to_string(), GRACE);
+
+        race_registry
+            .close_agent(&respawned_agent_id)
+            .expect("close the respawn successor before the fallback fires");
+        let stranger_agent_id = race_registry
+            .spawn_agent(SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), RACE_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("fresh spawn onto the freed pane_id_env");
+        assert_ne!(
+            respawned_agent_id, stranger_agent_id,
+            "sanity: the fresh spawn onto the freed pane_id_env must produce a NEW agent id"
+        );
+
+        tokio::time::sleep(GRACE + Duration::from_millis(300)).await;
+        let race_output = race_registry
+            .snapshot(&stranger_agent_id)
+            .expect("snapshot the stranger's PTY");
+        let race_output_str = String::from_utf8_lossy(&race_output);
+        assert!(
+            !race_output_str.contains(RACE_SEED),
+            "arm_seed_fallback injected a seed stashed for a respawn successor into a \
+             completely UNRELATED stranger ({stranger_agent_id}) that took over the same \
+             pane_id_env via a fresh spawn_agent call after the successor closed: \
+             `is_respawn_successor` cannot see this handover at all, since a fresh spawn never \
+             marks it. output={race_output_str:?}"
+        );
+
+        race_registry.shutdown_all();
+    }
+
+    /// Scenario: issue #492 M1 (PR #507 fix round, reviewer finding). This
+    /// round added a `!exited` filter to `set_pending_seed`/
+    /// `take_pending_seed_fallback` but NOT to their native-pull siblings,
+    /// `take_pending_seed_native` and `seed_delivered_native` — both still
+    /// resolve the first `pane_id_env` match regardless of liveness. Spawn
+    /// an agent bound to `pane_id_env` that stays alive briefly, stash a
+    /// seed for it while it is still live (the only way `set_pending_seed`
+    /// actually stores one — mirroring the real production sequence: a seed
+    /// is stashed for a live pane, then that pane exits, or crashes, before
+    /// anything pulls it), then wait for it to exit — leaving a stale,
+    /// exited-but-not-yet-reaped record that still carries the unconsumed
+    /// seed. The desired behavior is to refuse: no live occupant remains to
+    /// have pulled it natively. Today's unfiltered functions serve it
+    /// anyway.
+    #[tokio::test]
+    async fn take_pending_seed_native_and_seed_delivered_native_resolve_an_exited_record_with_no_live_filter()
+     {
+        const PANE_ID_ENV: &str = "issue-492-m1-native-seed-pane";
+        const SEED: &str = "issue-492 m1 sentinel seed - must never resolve from an exited record";
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        let _stale_id = registry
+        let _agent_id = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/usr/bin/true"),
+                command: Some("sleep 0.3"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID_ENV.to_string())],
                 ..SpawnOptions::default()
             })
-            .expect("spawn /usr/bin/true");
+            .expect("spawn a briefly-alive agent");
+
+        // Stash a seed while the agent is still live — `set_pending_seed`
+        // filters `!exited`, so this is the only way it actually stores one.
+        registry.set_pending_seed(PANE_ID_ENV, SEED);
 
         // Wait for the reader thread to observe EOF and flip `exited` — the
         // entry stays retained (not reaped) until something explicitly
-        // closes it.
+        // closes it, exactly like `registry_allows_pane_id_reuse_when_prior_agent_has_exited`'s
+        // fixture.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline {
             if registry.live_count() == 0 {
@@ -8097,22 +8204,25 @@ mod spawn_tests {
         assert_eq!(
             registry.live_count(),
             0,
-            "test prerequisite: /usr/bin/true must have exited"
+            "test prerequisite: the briefly-alive agent must have exited"
         );
         assert_eq!(registry.len(), 1, "exited entry must still be in registry");
 
-        // No live agent occupies this pane_id_env at all — only the stale
-        // exited record. The correct/desired behavior is to refuse (no live
-        // target to deliver a seed to); today's code has no such filter.
-        registry.set_pending_seed(PANE_ID_ENV, SEED);
-        let taken = registry.take_pending_seed_fallback(PANE_ID_ENV);
+        let native_taken = registry.take_pending_seed_native(PANE_ID_ENV);
         assert_eq!(
-            taken, None,
-            "set_pending_seed/take_pending_seed_fallback resolved {PANE_ID_ENV}'s stale, \
-             exited-but-not-yet-reaped registry entry with no live occupant — neither function \
-             filters on `!exited` the way `spawn_agent`'s duplicate check and `has_live_pane` \
-             do, so a seed can be silently bound to (and delivered from) a dead record instead \
-             of being refused; got {taken:?}"
+            native_taken, None,
+            "take_pending_seed_native resolved {PANE_ID_ENV}'s stale, exited-but-not-yet-reaped \
+             registry entry and returned its lingering seed instead of refusing: unlike \
+             set_pending_seed/take_pending_seed_fallback, it has no `!exited` filter, so a seed \
+             stashed for a pane that has since exited is served as if still valid; got \
+             {native_taken:?}"
+        );
+        assert!(
+            !registry.seed_delivered_native(PANE_ID_ENV),
+            "seed_delivered_native reported a native delivery for {PANE_ID_ENV} even though no \
+             live occupant remains — the take above should have refused (and left the flag \
+             untouched) rather than resolving the same unfiltered, exited record and marking \
+             it delivered"
         );
 
         registry.shutdown_all();
