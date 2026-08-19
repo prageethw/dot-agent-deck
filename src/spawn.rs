@@ -2865,11 +2865,28 @@ pub async fn spawn_or_reuse(
 
 /// Deliver `prompt` into `pane_id`, waiting out the deliver-on-idle debounce:
 /// if the user keeps typing the window keeps resetting; once the pane is idle
-/// (no keystroke within `debounce`) the prompt is written via the ungated
+/// (no keystroke within `debounce`) the prompt is written via
 /// `write_to_pane_and_submit`. Skip-if-prior-run-still-active (Phase 1) gives
 /// this single-slot semantics per task — a newer fire while one is queued is
 /// skipped, and since a static schedule's prompt is identical each fire the
 /// delivered prompt is the same regardless.
+///
+/// Issue #492: `spawn_or_reuse`'s `ReuseDecision::Reuse { pane_id }` names
+/// only the pane, not the agent it was decided for, at the call site this
+/// function receives it — though the identity isn't literally unavailable:
+/// `ReuseEntry.agent_ids`, recorded under the reuse lock, does carry it. The
+/// registry is used instead of threading that through because it also
+/// survives a respawn without teaching this caller about respawns — see
+/// [`AgentPtyRegistry::authorized_occupant`], which a legitimate respawn
+/// keeps up to date (so a respawned pane keeps delivering) while a fresh,
+/// unrelated `spawn_agent` reusing the same `pane_id_env` after a close does
+/// not (so a stranger is refused). The debounce wait (up to
+/// `REUSE_DELIVERY_HARD_TIMEOUT` of drift) leaves a window where the pane
+/// changes hands before this delivers; binding to the registry's
+/// currently-authorized occupant closes it. Unlike the other three guarded
+/// sites, a respawn landing during this wait is unreachable in production —
+/// `ReuseEntry.delivery_pane_id` is never a delegate target — so the "changed
+/// hands since" wording below is conservative rather than exact here.
 async fn deliver_on_idle(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -2897,8 +2914,77 @@ async fn deliver_on_idle(
             }
         }
     }
-    if let Err(e) = registry.write_to_pane_and_submit(pane_id, prompt).await {
-        tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
+    let expected_agent_id = registry.authorized_occupant(pane_id);
+    // Issue #492 A1: an absent `expected_agent_id` means no occupant has
+    // ever been recorded for this pane — refuse explicitly rather than
+    // letting `write_and_submit_guarded`'s internal `Option` short-circuit
+    // silently write ungated.
+    let Some(expected_agent_id) = expected_agent_id else {
+        tracing::warn!(
+            pane_id,
+            "deliver_on_idle: refusing — no authorized occupant recorded for this pane"
+        );
+        return;
+    };
+    // Issue #424 S3: a recurring scheduled task delivers the SAME fixed
+    // prompt text on every fire, by design — including the very first,
+    // spawn-time delivery, which may still be an unsettled record here (its
+    // own caller settles it on confirm/abandon/stop, a lifecycle this
+    // reuse fire has no part in and may never observe, e.g. when the target
+    // command emits no confirming hook at all). Left in place, that stale
+    // record would make `write_and_submit_guarded`'s repeat-guard read THIS
+    // independent, debounce-decided re-delivery as a retry clobbering a
+    // user's draft — the exact false positive the debounce wait above
+    // already resolved by waiting for the user to go idle. Release it
+    // proactively so an earlier delivery's bookkeeping can never refuse
+    // this one.
+    //
+    // Issue #343: this release opts this site out of #424's repeat-guard
+    // for the ordinary case, harmlessly today only because
+    // `MAX_PAYLOAD_SUBMISSIONS == 1` makes a second, concurrent write
+    // unreachable. If #343 raises that limit, this before-release can
+    // disarm a still-in-flight concurrent delivery's own record (see
+    // `AgentPtyRegistry::note_payload_settled`'s doc) — revisit this
+    // pattern before that lands.
+    registry.note_payload_settled(pane_id, prompt);
+    let outcome = registry
+        .write_and_submit_guarded(
+            pane_id,
+            prompt,
+            Some(expected_agent_id.as_str()),
+            || async { true },
+        )
+        .await;
+    // Same reasoning in the other direction: release the record THIS write
+    // just left, so a later fire of the same recurring prompt isn't refused
+    // by it either. Only when something actually landed — a refusal left no
+    // record to release.
+    if matches!(
+        outcome,
+        Ok(GuardedSend::Applied) | Ok(GuardedSend::Ambiguous)
+    ) {
+        registry.note_payload_settled(pane_id, prompt);
+    }
+    match outcome {
+        Ok(GuardedSend::Applied) => {}
+        Ok(GuardedSend::Ambiguous) => {
+            tracing::warn!(
+                pane_id,
+                "deliver_on_idle: partial write — some bytes landed in the PTY but the \
+                 write+submit sequence did not complete"
+            );
+        }
+        Ok(outcome) => {
+            tracing::warn!(
+                pane_id,
+                outcome = ?outcome,
+                "deliver_on_idle: refusing — no live occupant, or the pane changed hands \
+                 since first spawn or last respawn"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(pane_id, error = %e, "scheduled reuse prompt delivery failed");
+        }
     }
 }
 
@@ -5752,6 +5838,98 @@ mod tests {
             decide_delivery_capped(Some(last), now, started_recent, debounce, hard_cap),
             DeliveryDecision::Queue { .. }
         ));
+    }
+
+    // --- Issue #492: `deliver_on_idle`'s ungated pane-keyed write ---
+
+    /// Scenario: PR #507 fix-round rework (reviewer M2/M3, auditor S3). The
+    /// original respawn-based construction pinned the WRONG invariant — its
+    /// guard asked "did the occupant ever arrive via a respawn?" rather than
+    /// "is the occupant still who the reuse decision named?", and `clear`
+    /// defaults to `true` so a respawn successor is the *normal* state, not
+    /// a rare one. `deliver_on_idle`'s guard now checks
+    /// `authorized_pane_occupant` against the pane's currently-authorized
+    /// occupant instead.
+    /// Positive control: spawn a byte-observation agent bound to a pane and
+    /// call `deliver_on_idle` with nobody in between — the prompt must still
+    /// land, proving the assertion below isn't satisfied by an
+    /// unconditionally-refusing implementation. Race: spawn a
+    /// byte-observation agent, close it (`AgentPtyRegistry::close_agent`,
+    /// standing in for the occupant exiting or being closed), then bind a
+    /// completely unrelated agent onto the SAME `pane_id_env` via a plain
+    /// `spawn_agent` call — never `respawn_agent_for_pane` — which is the
+    /// actual threat `write_notice_guarded`'s own doc names ("a previous
+    /// occupant's `pane_id_env` frees up for the next spawn"). Assert the
+    /// scheduled prompt does NOT land in that new, unrelated occupant's PTY.
+    #[tokio::test]
+    async fn deliver_on_idle_refuses_a_pane_reused_since_the_reuse_decision() {
+        const CONTROL_PANE: &str = "issue-492-deliver-on-idle-control-pane";
+        const RACE_PANE: &str = "issue-492-deliver-on-idle-race-pane";
+        const CONTROL_SENTINEL: &str = "issue-492 sentinel scheduled-task prompt, ordinary case";
+        const RACE_SENTINEL: &str =
+            "issue-492 sentinel scheduled-task prompt, must not reach a stranger";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        // Positive control: nobody took the pane over between the reuse
+        // decision and delivery — the ordinary, common case.
+        let control_agent_id = spawn_byte_target(&registry, CONTROL_PANE);
+        deliver_on_idle(
+            &registry,
+            CONTROL_PANE,
+            CONTROL_SENTINEL,
+            Duration::from_millis(0),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let control_output = registry
+            .snapshot(&control_agent_id)
+            .expect("snapshot the unchanged occupant's PTY");
+        assert!(
+            String::from_utf8_lossy(&control_output).contains(CONTROL_SENTINEL),
+            "positive control: deliver_on_idle must still deliver into a pane whose occupant \
+             has not changed since the reuse decision — otherwise the race assertion below \
+             would pass for the wrong reason (an implementation that unconditionally refuses)"
+        );
+
+        // Race: the occupant `ReuseDecision::Reuse { pane_id }` was decided
+        // against closes, and a completely FRESH `spawn_agent` call — not a
+        // respawn — binds an unrelated agent onto the SAME pane_id_env
+        // before delivery fires.
+        let original_agent_id = spawn_byte_target(&registry, RACE_PANE);
+        registry
+            .close_agent(&original_agent_id)
+            .expect("close the reuse decision's original occupant");
+        let reused_agent_id = spawn_byte_target(&registry, RACE_PANE);
+        assert_ne!(
+            original_agent_id, reused_agent_id,
+            "sanity: the fresh spawn onto the freed pane_id_env must produce a NEW agent id"
+        );
+
+        deliver_on_idle(
+            &registry,
+            RACE_PANE,
+            RACE_SENTINEL,
+            Duration::from_millis(0),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let race_output = registry
+            .snapshot(&reused_agent_id)
+            .expect("snapshot the reused occupant's PTY");
+        let race_output_str = String::from_utf8_lossy(&race_output);
+        assert!(
+            !race_output_str.contains(RACE_SENTINEL),
+            "deliver_on_idle wrote a scheduled-task prompt into a pane whose ORIGINAL occupant \
+             had closed and been replaced by a completely unrelated fresh `spawn_agent` call \
+             (never a respawn) instead of refusing: a fresh spawn never claims \
+             `authorized_pane_occupant` (insert-if-absent), so this handover should have left \
+             the stale value in place and mismatched the stranger — the actual threat \
+             `write_notice_guarded`'s doc names. output={race_output_str:?}"
+        );
+
+        registry.shutdown_all();
     }
 
     // C2 — a single-word command is not shell-wrapped and gets NO SHELL

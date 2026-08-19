@@ -2129,6 +2129,24 @@ async fn run_hook_loop(
                                         state: Some(state.clone()),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
+                                    // Issue #492 (fix round 4, F1): capture the caller
+                                    // pane's authorized occupant BEFORE
+                                    // `handle_dispatch`'s worktree/spawn I/O below, not
+                                    // after. `signal.pane_id` names only the pane that
+                                    // issued the dispatch, not the agent — and that I/O
+                                    // is slow enough for the pane to change hands before
+                                    // this result comes back. Reading late meant a
+                                    // respawn landing DURING the I/O became the new
+                                    // authorized occupant, so the reply to the
+                                    // PREVIOUS agent's request would be delivered — and
+                                    // submitted as a prompt — into a fresh agent that
+                                    // never asked for it. Reading here instead means a
+                                    // respawn during the I/O is refused just like a
+                                    // respawn any time before it, matching
+                                    // `AgentPtyRegistry::authorized_occupant`'s contract
+                                    // at the other three guarded-write sites.
+                                    let expected_agent_id =
+                                        pty_registry.authorized_occupant(&signal.pane_id);
                                     let result = dispatch::handle_dispatch(
                                         &ctx,
                                         &signal.name,
@@ -2139,15 +2157,100 @@ async fn run_hook_loop(
 
                                     // Deliver result to the caller pane (doesn't need
                                     // any AppState lock — uses the PTY registry).
-                                    if let Err(e) = pty_registry
-                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
-                                        .await
-                                    {
+                                    // Issue #492 A1: an absent `expected_agent_id` means
+                                    // no occupant has ever been recorded for this pane —
+                                    // refuse explicitly rather than letting
+                                    // `write_and_submit_guarded`'s internal `Option`
+                                    // short-circuit silently write ungated.
+                                    let Some(expected_agent_id) = expected_agent_id else {
                                         warn!(
                                             pane_id = %signal.pane_id,
-                                            error = %e,
-                                            "dispatch: failed to write result into caller pane"
+                                            "dispatch: refusing to write result — no \
+                                             authorized occupant recorded for this pane"
                                         );
+                                        continue;
+                                    };
+                                    // Issue #424 S3: this dispatch result is a
+                                    // NEW, independent delivery, not a retry —
+                                    // but a stale, unsettled record from an
+                                    // earlier delivery of byte-identical
+                                    // result text (e.g. the same failure
+                                    // message) into this same caller pane
+                                    // would make the repeat-guard read this
+                                    // one as a retry clobbering a user's
+                                    // draft. Release it proactively so it can
+                                    // never refuse this delivery.
+                                    //
+                                    // Issue #343: this release opts this site
+                                    // out of #424's repeat-guard for the
+                                    // ordinary case, harmlessly today only
+                                    // because `MAX_PAYLOAD_SUBMISSIONS == 1`
+                                    // makes a second, concurrent write
+                                    // unreachable. If #343 raises that limit,
+                                    // this before-release can disarm a
+                                    // still-in-flight concurrent delivery's
+                                    // own record (see
+                                    // `AgentPtyRegistry::note_payload_settled`'s
+                                    // doc) — revisit this pattern before that
+                                    // lands.
+                                    pty_registry
+                                        .note_payload_settled(&signal.pane_id, &result.message);
+                                    let outcome = pty_registry
+                                        .write_and_submit_guarded(
+                                            &signal.pane_id,
+                                            &result.message,
+                                            Some(expected_agent_id.as_str()),
+                                            || async { true },
+                                        )
+                                        .await;
+                                    // Issue #424 S3: this delivery is
+                                    // ONE-SHOT — nothing above retries a
+                                    // dispatch result, so the record this
+                                    // write leaves behind guards no retry and
+                                    // can only refuse a LATER delivery of the
+                                    // same result text. Release it here
+                                    // rather than leaving it to the TTL,
+                                    // mirroring every other one-shot
+                                    // guarded-write caller (e.g.
+                                    // `handle_delegate`). Only when something
+                                    // actually landed — a refusal left no
+                                    // record to release.
+                                    if matches!(
+                                        outcome,
+                                        Ok(crate::agent_pty::GuardedSend::Applied)
+                                            | Ok(crate::agent_pty::GuardedSend::Ambiguous)
+                                    ) {
+                                        pty_registry.note_payload_settled(
+                                            &signal.pane_id,
+                                            &result.message,
+                                        );
+                                    }
+                                    match outcome {
+                                        Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                                        Ok(crate::agent_pty::GuardedSend::Ambiguous) => {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                "dispatch: partial write — some bytes landed \
+                                                 in the caller pane but the write+submit \
+                                                 sequence did not complete"
+                                            );
+                                        }
+                                        Ok(outcome) => {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                outcome = ?outcome,
+                                                "dispatch: refusing to write result — no live \
+                                                 occupant, or the caller pane changed hands \
+                                                 since first spawn or last respawn"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                pane_id = %signal.pane_id,
+                                                error = %e,
+                                                "dispatch: failed to write result into caller pane"
+                                            );
+                                        }
                                     }
                                 }
                                 DaemonMessage::WorkDone(signal) => {
@@ -2740,6 +2843,173 @@ mod hook_ingestion_tests {
         // Await the aborted task so it drops its `registry` Arc clone before
         // we tear the registry down — strictly sequences cleanup instead of
         // racing `shutdown_all` against the still-live loop task.
+        let _ = handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PR #507 fix-round rework (reviewer M2/S1). The original
+    /// respawn-based construction pinned the WRONG invariant. Run ONE real
+    /// `run_hook_loop` (mirroring `run_hook_loop_persists_agent_type_into_registry`'s
+    /// fixture) and send it two independent `DaemonMessage::Dispatch`
+    /// signals, each naming an orchestration target that cannot resolve (no
+    /// `.dot-agent-deck.toml` in the working dir) so `handle_dispatch` fails
+    /// fast with a distinctive message, without needing a real git
+    /// repository. Positive control (CONTROL_PANE): the caller pane's
+    /// occupant never changes — the failure message must still land, proving
+    /// the race assertion below isn't satisfied by an unconditionally-
+    /// refusing implementation; this leg polls for that positive signal so
+    /// it returns as soon as delivery happens rather than waiting out a
+    /// fixed deadline. Race (RACE_PANE): close the caller pane's original
+    /// occupant (`AgentPtyRegistry::close_agent`) and bind a completely
+    /// unrelated agent onto the SAME `pane_id_env` via a plain `spawn_agent`
+    /// call — never `respawn_agent_for_pane` — before the result comes back;
+    /// `handle_dispatch` fails before any git I/O here, so 3s is ample
+    /// margin without burning a flat 10s deadline on every GREEN run
+    /// (reviewer S1). Assert the message does NOT land in the reused,
+    /// unrelated occupant's PTY output.
+    #[tokio::test]
+    async fn dispatch_result_refuses_a_pane_reused_since_the_request() {
+        const CONTROL_PANE: &str = "issue-492-l1b-control-pane";
+        const RACE_PANE: &str = "issue-492-l1b-race-pane";
+        const CONTROL_TARGET_NAME: &str = "issue-492-l1b-control-sentinel-target";
+        const RACE_TARGET_NAME: &str = "issue-492-l1b-race-sentinel-target";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let control_cwd = tempfile::tempdir().expect("tempdir");
+        let race_cwd = tempfile::tempdir().expect("tempdir");
+
+        let control_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd: control_cwd.path().to_str(),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), CONTROL_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the control caller pane's occupant");
+
+        let original_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd: race_cwd.path().to_str(),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), RACE_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the race caller pane's original occupant");
+
+        // Simulate the race caller pane being closed and reused by a
+        // completely unrelated agent before the dispatch result comes back —
+        // via a fresh `spawn_agent` call, never `respawn_agent_for_pane`.
+        registry
+            .close_agent(&original_agent_id)
+            .expect("close the original caller occupant");
+        let reused_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd: race_cwd.path().to_str(),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), RACE_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("fresh spawn onto the freed caller pane_id_env");
+        assert_ne!(
+            original_agent_id, reused_agent_id,
+            "sanity: the fresh spawn onto the freed pane_id_env must produce a NEW agent id"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // See the comment in `run_hook_loop_persists_agent_type_into_registry`
+        // above for why this binds without `bind_socket`.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let shutdown = Arc::new(Notify::new());
+
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+        });
+
+        async fn send_dispatch(sock: &std::path::Path, pane_id: &str, target_name: &str) {
+            // No `.dot-agent-deck.toml` in the caller's cwd, so this fails
+            // fast inside `decide_target_with_override`'s
+            // `Orchestration(Some(_))` branch — before any git worktree I/O —
+            // with a message naming `target_name`.
+            let signal = crate::event::DispatchSignal {
+                pane_id: pane_id.to_string(),
+                name: target_name.to_string(),
+                task: None,
+                shape: Some(crate::event::DispatchShape::Orchestration {
+                    name: Some(target_name.to_string()),
+                }),
+                timestamp: chrono::Utc::now(),
+            };
+            let line = serde_json::to_string(&DaemonMessage::Dispatch(signal))
+                .expect("serialize dispatch signal");
+            let mut stream = UnixStream::connect(sock)
+                .await
+                .expect("connect hook socket");
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write dispatch line");
+            stream.flush().await.unwrap();
+        }
+
+        // Positive control: ordinary delivery into an unchanged pane must
+        // still land. Poll for the POSITIVE signal so this leg returns as
+        // soon as delivery happens instead of waiting out a fixed deadline.
+        send_dispatch(&sock, CONTROL_PANE, CONTROL_TARGET_NAME).await;
+        let mut control_output_str = String::new();
+        let control_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < control_deadline {
+            let output = registry
+                .snapshot(&control_agent_id)
+                .expect("snapshot the control occupant's PTY");
+            control_output_str = String::from_utf8_lossy(&output).into_owned();
+            if control_output_str.contains(CONTROL_TARGET_NAME) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            control_output_str.contains(CONTROL_TARGET_NAME),
+            "positive control: the dispatch result must still land in a caller pane whose \
+             occupant has not changed since the request — otherwise the race assertion below \
+             would pass for the wrong reason. output={control_output_str:?}"
+        );
+
+        // Race: `handle_dispatch` fails fast here too (no git I/O), so a
+        // short deadline is ample — never the full 10s window reviewer S1
+        // flagged as burned on every GREEN run.
+        send_dispatch(&sock, RACE_PANE, RACE_TARGET_NAME).await;
+        let mut race_output_str = String::new();
+        let race_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < race_deadline {
+            let output = registry
+                .snapshot(&reused_agent_id)
+                .expect("snapshot the reused occupant's PTY");
+            race_output_str = String::from_utf8_lossy(&output).into_owned();
+            if race_output_str.contains(RACE_TARGET_NAME) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !race_output_str.contains(RACE_TARGET_NAME),
+            "the dispatch result (naming target '{RACE_TARGET_NAME}') was written into the \
+             caller pane's NEW, UNRELATED occupant ({reused_agent_id}) instead of being \
+             refused: the original occupant closed and a fresh spawn_agent call (never a \
+             respawn) took over the same pane_id_env, which should have left \
+             `authorized_pane_occupant` naming the stale, original occupant and mismatched \
+             this stranger. output={race_output_str:?}"
+        );
+
+        handle.abort();
         let _ = handle.await;
         registry.shutdown_all();
     }
