@@ -62,37 +62,26 @@ use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_
 /// `git worktree add` between two `worktree list` calls already changes row
 /// count with no version bump), only field shapes/meanings are.
 ///
-/// `verdict` gaining a fourth value, `"isolated_clone"` (fork#325 M4a,
-/// reviewer F2), was weighed against a bump and deliberately left without
-/// one — this is a judgement call, recorded rather than left silent. The
-/// released `CHANGELOG.md` documents `verdict` as exactly
-/// `remove`/`ask`/`keep`, so on the surface this looks like the same shape
-/// as the `owner` bump above: a consumer parsing against that three-value
-/// domain now sees a value it didn't expect. What actually distinguishes
-/// the two cases: the `owner` bump was forced because an EXISTING row's
-/// `owner` could newly read `Some` where a consumer's prior reasoning
-/// assumed `None` — a pre-existing row's meaning changed under code the
-/// consumer never touched. No pre-existing (linked-worktree) row's
-/// `verdict` can ever become `"isolated_clone"` — `isolated_clone_report`
-/// never runs for a `git worktree list` row, and every linked row still
-/// routes through `decide()`, whose `Verdict::label()` can only ever
-/// produce `remove`/`ask`/`keep` (`run_reclaim`'s exhaustive match trace
-/// confirms this: `"remove"`, `"ask" if yes`, `"ask"`, `_ => kept`, and the
-/// isolated-clone literal only ever reaches the fallthrough arm). So no
-/// consumer's existing assumption about an existing row is ever
-/// contradicted; only a wholly NEW row kind — one no consumer parsing
-/// before this milestone could have been relying on at all — carries the
-/// new value, the same "new rows aren't a meaning change" reasoning `kind`
-/// itself already rests on above, just applied to a field that happens to
-/// be pre-existing rather than new. The honest residual risk, not glossed
-/// over: a consumer with an EXHAUSTIVE match/switch over `verdict` (rather
-/// than a `select`/filter) that treats an unrecognized value as an error
-/// would still break on an isolated-clone row it previously never saw at
-/// all. A consumer that wants pre-M4a semantics unconditionally can filter
-/// on `kind == "linked"` first. If a future change makes `verdict`'s domain
-/// matter more (e.g. M4b making isolated clones sometimes reclaimable),
-/// revisit this decision rather than assuming it still holds.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Bumped to 3 by fork#325 M4a (reviewer F2): `verdict` gains a fourth
+/// value, `"isolated_clone"`. The released `CHANGELOG.md` documents
+/// `verdict` as exactly `remove`/`ask`/`keep` — the same kind of documented
+/// consumer contract the v2 bump above exists to protect — so a consumer
+/// filtering or matching against that three-value domain now sees a value
+/// it didn't previously account for. An earlier round of this milestone
+/// weighed a no-bump reading instead, on the argument that no pre-existing
+/// (linked-worktree) row's `verdict` can ever become `"isolated_clone"` —
+/// only a wholly new row kind carries the new value, so no consumer's
+/// assumption about an EXISTING row is ever contradicted, unlike the
+/// `owner` case above. That distinction doesn't survive contact with what
+/// the v2 precedent actually bumped on: a documented value set gaining a
+/// member a consumer's filter didn't previously expect, full stop — v2 did
+/// not require the changed field to belong to a pre-existing row either,
+/// only that a consumer relying on the documented domain could now be
+/// surprised by it. `verdict` is exactly that: a real, documented API
+/// contract, not an implementation detail whose row-provenance nuance a
+/// consumer could reasonably be expected to track. Bump on the value-set
+/// change itself.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
 /// in the worktree's OWN git metadata dir (`<repo>/.git/worktrees/<name>/`,
