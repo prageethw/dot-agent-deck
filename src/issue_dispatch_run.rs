@@ -2575,7 +2575,18 @@ fn worktree_attach_lock_path(clone_dir: &Path, worktree_dir: &Path) -> Result<Pa
 /// the bounded [`git_common_dir_async`] instead of going through the
 /// unbounded sync [`git_common_dir`]. Pure and infallible: everything that
 /// can fail already happened in resolving `common_dir`.
-fn worktree_attach_lock_path_from_common_dir(common_dir: &Path, worktree_dir: &Path) -> PathBuf {
+///
+/// `pub(crate)`, not private, since fork#325 M4a's final round (reviewer
+/// F13 / auditor A1/B1): [`crate::worktree_reclaim::candidate_has_attach_lock`]
+/// recomputes this exact path for a discovered isolated-clone candidate,
+/// reusing this hash rather than reimplementing it, so that discovery's
+/// ownership check and this function's own lock-acquisition path can never
+/// silently drift apart on what the lock's filename is for the same
+/// `(common_dir, worktree_dir)` pair.
+pub(crate) fn worktree_attach_lock_path_from_common_dir(
+    common_dir: &Path,
+    worktree_dir: &Path,
+) -> PathBuf {
     let canonical_worktree_dir = canonicalize_best_effort(worktree_dir);
 
     let hash = crate::platform::lock::fnv1a64(canonical_worktree_dir.to_string_lossy().as_bytes());
