@@ -1627,7 +1627,25 @@ async fn confirm_prompt_delivery(
             // Refusals are logged once, so a delivery that then holds to its
             // deadline is diagnosable rather than mysterious.
             PromptWatch::Elapsed { can_report_prompts } => {
+                let armed_before_this_claim = armed;
                 armed |= can_report_prompts && accepts_late_producer;
+                // Issue #570: a delivery that starts UNARMED writes nothing at
+                // all on every prior iteration (`if !armed { continue; }`
+                // below skips straight past the write), so the moment a late
+                // producer's standing newly arms it, this is the delivery's
+                // FIRST write, not its Nth retry — unlike an ordinary
+                // already-armed delivery, where fork #194's
+                // `MAX_PAYLOAD_SUBMISSIONS == 1` correctly makes every write
+                // past the caller's own attempt 1 a submit-only probe.
+                // Without this, `attempt` had already run past 1 by the time
+                // an unarmed delivery's first eligible write is reached, so
+                // `attempt_writes_payload` always saw >= 2 and the loop typed
+                // nothing but a bare CR into a pane holding no prompt for it
+                // to submit — the write-and-never-submit failure #570 itself
+                // reports, reintroduced one layer down.
+                if armed && !armed_before_this_claim {
+                    attempt = 0;
+                }
                 if can_report_prompts && !armed && !refused_claim_logged {
                     refused_claim_logged = true;
                     log_prompt_unconfirmable(

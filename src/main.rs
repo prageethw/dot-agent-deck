@@ -749,8 +749,24 @@ struct DelegateVerdict {
     /// "nothing landed", which is what makes a retry safe.
     failed: bool,
     /// Printed to stderr verbatim when set. `None` only for a delegate that
-    /// reached every role it named.
+    /// reached every role it named without anything worth flagging (see
+    /// [`Self::info`] for the one exception).
     message: Option<String>,
+    /// Printed to STDOUT verbatim when set — deliberately a different stream
+    /// than [`Self::message`], because this is a confirmation of what
+    /// happened, not a warning or an error.
+    ///
+    /// fork #92 P2: `--to coder --to coder` de-duplicates to one target
+    /// before dispatch (`AppState::delegate_targets`), so exactly one worker
+    /// pane is armed for two requested copies of the role. An ordinary full
+    /// delivery stays silent (see `delegate_verdict_reports_a_full_delivery_
+    /// silently`), but silence here would be indistinguishable from a SECOND
+    /// worker actually having been armed — the caller has no way to tell "one
+    /// pane, dedup collapsed the rest" from "two panes, both armed". Set only
+    /// for a role requested more than once whose delegate still fully
+    /// resolved; ordinary full deliveries (no repeated role) get `None` here
+    /// too, same as `message`.
+    info: Option<String>,
 }
 
 /// Parse one line of daemon reply into a [`DelegateResponse`], or `None` when
@@ -791,8 +807,14 @@ fn parse_delegate_reply(line: &str) -> Option<dot_agent_deck::event::DelegateRes
 ///   contract "non-zero ⇒ it did not land" would retry and dispatch those panes
 ///   a second time, arming two records for one pane. The message names both
 ///   sides so a retry can be aimed at just the roles that missed.
+///
+/// `requested_roles` is the caller's raw `--to` list, BEFORE
+/// `AppState::delegate_targets` de-duplicates it — needed only for
+/// [`DelegateVerdict::info`]'s fork #92 P2 case below; every other branch
+/// ignores it.
 fn delegate_verdict(
     pane_id: &str,
+    requested_roles: &[String],
     resp: &dot_agent_deck::event::DelegateResponse,
 ) -> DelegateVerdict {
     if let Some(error) = resp.error.as_deref() {
@@ -801,12 +823,40 @@ fn delegate_verdict(
             message: Some(format!(
                 "Error: delegate from pane {pane_id} failed: {error}"
             )),
+            info: None,
         };
     }
     if resp.unresolved_roles.is_empty() {
+        // fork #92 P2: a role named more than once in `requested_roles` but
+        // present in `delivered` (necessarily once — `delivered` is already
+        // de-duplicated) collapsed via `delegate_targets`'s dedup. Naming it
+        // here is the ONE exception to an ordinary full delivery's silence —
+        // without it the caller cannot tell "one pane, dedup collapsed the
+        // rest" from "two panes, both armed".
+        let mut requested_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for role in requested_roles {
+            *requested_counts.entry(role.as_str()).or_insert(0) += 1;
+        }
+        let collapsed: Vec<&str> = resp
+            .delivered
+            .iter()
+            .filter(|role| requested_counts.get(role.as_str()).is_some_and(|&n| n > 1))
+            .map(|role| role.as_str())
+            .collect();
         return DelegateVerdict {
             failed: false,
             message: None,
+            info: if collapsed.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "Delegated to: {}. (Requested more than once in this delegate; \
+                     exactly one worker pane exists for the role, so it was armed \
+                     once, not once per request.)",
+                    collapsed.join(", ")
+                ))
+            },
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
@@ -823,6 +873,7 @@ fn delegate_verdict(
                 "Error: delegate from pane {pane_id} reached no worker for role(s): \
                  {unresolved}. No role in this orchestration received it. {causes}"
             )),
+            info: None,
         };
     }
     DelegateVerdict {
@@ -834,6 +885,7 @@ fn delegate_verdict(
              roles a second time. {causes}",
             resp.delivered.join(", ")
         )),
+        info: None,
     }
 }
 
@@ -1151,7 +1203,10 @@ fn main() -> ExitCode {
                 // we do not understand, not a proven failure.
                 return ExitCode::SUCCESS;
             };
-            let verdict = delegate_verdict(&pane_id_for_report, &resp);
+            let verdict = delegate_verdict(&pane_id_for_report, &signal_roles, &resp);
+            if let Some(info) = verdict.info {
+                println!("{info}");
+            }
             if let Some(message) = verdict.message {
                 eprintln!("{message}");
             }
@@ -3104,16 +3159,34 @@ mod tests {
         }
     }
 
+    /// `&[&str]` to the `Vec<String>` `delegate_verdict`'s `requested_roles`
+    /// takes — the caller's raw, pre-dedup `--to` list.
+    fn requested(roles: &[&str]) -> Vec<String> {
+        roles.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn delegate_verdict_reports_a_full_delivery_silently() {
-        let v = delegate_verdict("pane-1", &reply(&["coder", "tester"], &[], None));
+        let v = delegate_verdict(
+            "pane-1",
+            &requested(&["coder", "tester"]),
+            &reply(&["coder", "tester"], &[], None),
+        );
         assert!(!v.failed, "every named role resolved — this is a success");
         assert_eq!(v.message, None, "a clean delegate prints nothing");
+        assert_eq!(
+            v.info, None,
+            "no role was requested more than once, so there is nothing to flag"
+        );
     }
 
     #[test]
     fn delegate_verdict_fails_a_routing_error() {
-        let v = delegate_verdict("xcaller", &reply(&[], &[], Some("no orchestration role")));
+        let v = delegate_verdict(
+            "xcaller",
+            &requested(&[]),
+            &reply(&[], &[], Some("no orchestration role")),
+        );
         assert!(v.failed, "a routing error means nothing was dispatched");
         let msg = v.message.expect("a routing error must be reported");
         assert!(
@@ -3124,7 +3197,11 @@ mod tests {
 
     #[test]
     fn delegate_verdict_fails_when_nothing_landed() {
-        let v = delegate_verdict("pane-1", &reply(&[], &["ghost"], None));
+        let v = delegate_verdict(
+            "pane-1",
+            &requested(&["ghost"]),
+            &reply(&[], &["ghost"], None),
+        );
         assert!(v.failed, "no role received the task — non-zero is correct");
         let msg = v.message.expect("an unreached delegate must be reported");
         assert!(
@@ -3151,7 +3228,11 @@ mod tests {
     // one pane.
     #[test]
     fn delegate_verdict_does_not_fail_a_partial_delivery() {
-        let v = delegate_verdict("pane-1", &reply(&["coder"], &["tester"], None));
+        let v = delegate_verdict(
+            "pane-1",
+            &requested(&["coder", "tester"]),
+            &reply(&["coder"], &["tester"], None),
+        );
         assert!(
             !v.failed,
             "a delegate that half landed must NOT exit non-zero: a retry would \
