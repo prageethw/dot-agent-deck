@@ -1246,6 +1246,17 @@ mod tests {
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "guard-trip-unit");
 
+        // issue #490's clone gate now runs unconditionally near the top of
+        // `handle_dispatch`, before any worktree provisioning -- without a
+        // reachable daemon it fails closed and returns before the #469
+        // rollback logic this test pins is ever reached. Stub a daemon
+        // reporting no live sibling so the gate takes its `Ok(false)` branch
+        // and falls through to the original `create_worktree`/`spawn()` path.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
+
         // The worktree doesn't exist yet -- `handle_dispatch` creates it --
         // but a real PTY-backed sibling needs a real cwd to spawn into, so
         // create the plain (non-worktree) directory ahead of it. `git
@@ -1337,6 +1348,17 @@ mod tests {
         let repo = tmp.path().join("repo");
         init_repo(&repo);
         let paths = derive_dispatch_paths(&repo, "guard-notrip-unit");
+
+        // See the sibling `..._skips_cleanup...` test above: without a
+        // reachable daemon, issue #490's gate fails closed before the #469
+        // force-removal arm this test pins is ever reached, and the
+        // assertions below would pass vacuously (nothing was ever created)
+        // rather than because removal actually ran. Stub a daemon reporting
+        // no live sibling so the gate falls through to the original path.
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![]),
+        );
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
