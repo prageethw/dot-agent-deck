@@ -8659,6 +8659,16 @@ clear = false
         };
 
         let registry = Arc::new(AgentPtyRegistry::new());
+        // Issue #448: `handle_work_done` only delivers when the completion is
+        // SOLICITED — a `WorkDoneProvenance::Unsolicited` is inlined into the
+        // orchestrator feedback instead of written to disk (see the comment
+        // above `let channel = match provenance` in `handle_work_done`). This
+        // test predates that gating and must arm a commission for "P" itself
+        // or it now proves nothing about the reserve→confirm→signal chain.
+        assert!(
+            registry.arm_delegation_commission("P", "orchestrator-pane"),
+            "pane P is not mid-close, arming must succeed"
+        );
         state.handle_work_done(signal, &registry).await;
 
         let file_name = work_done_file_name("coder", "P");
