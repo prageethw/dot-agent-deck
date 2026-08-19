@@ -48,6 +48,23 @@
 //! trips [`WorkTypeError::NoSupplier`] and the post-merge signal this repo
 //! depends on to catch a broken `main` (`ci.yml`'s own twelve-line
 //! rationale, naming the 2026-07-29 incident) trains everyone to ignore it.
+//!
+//! # `fork-only` is exempt, but by exact name, not a prefix
+//!
+//! Unlike `main`, `fork-only` gets no B1 skip: [`resolve_base`] diffs
+//! against `origin/main`, which does not yet equal `fork-only`'s tip until
+//! the sync workflow's later stage resets `main` to it — a step gated on
+//! this very CI run going green. So this gate would otherwise see the
+//! *entire* rebased stack's diff against a still-unsynced `origin/main`,
+//! naturally spanning every changelog work type accumulated across the
+//! whole fork-only history, and correctly reject it as not single-topic.
+//! `fork-only` is conceptually the same kind of branch as `sync/*` /
+//! `upstream/*` — a whole-stack sync branch, not a focused change — so it
+//! is exempt for the same reason. It is matched by exact name
+//! ([`EXEMPT_BRANCH_EXACT`]), not added to [`EXEMPT_BRANCH_PREFIXES`]: there
+//! is exactly one such branch, not a namespace of them, and prefix-matching
+//! it would also exempt any hypothetical `fork-only-*` branch that is a
+//! human's ordinary PR branch.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -70,6 +87,13 @@ use crate::list_tests::TestEntry;
 /// local-invocation property `CONTRIBUTING.md:55` protects. A PR still
 /// needs an approving human review to merge either way.
 const EXEMPT_BRANCH_PREFIXES: [&str; 3] = ["renovate/", "sync/", "upstream/"];
+
+/// The one branch name — not a namespace prefix — exempt from the gate
+/// outright: the fork's own whole-stack rebase branch. See the module doc's
+/// "`fork-only` is exempt, but by exact name, not a prefix" section for why
+/// it needs the exemption and why it is matched exactly rather than folded
+/// into [`EXEMPT_BRANCH_PREFIXES`].
+const EXEMPT_BRANCH_EXACT: &str = "fork-only";
 
 /// The single source for the "N rules" count in [`describe_success`]'s
 /// success line and [`self_test`]'s case array length (N1) — one literal
@@ -521,11 +545,12 @@ fn print_usage() {
 }
 
 /// Whether `branch` is exempt from the gate outright — see
-/// [`EXEMPT_BRANCH_PREFIXES`].
+/// [`EXEMPT_BRANCH_PREFIXES`] and [`EXEMPT_BRANCH_EXACT`].
 fn is_exempt_branch(branch: &str) -> bool {
-    EXEMPT_BRANCH_PREFIXES
-        .iter()
-        .any(|prefix| branch.starts_with(prefix))
+    branch == EXEMPT_BRANCH_EXACT
+        || EXEMPT_BRANCH_PREFIXES
+            .iter()
+            .any(|prefix| branch.starts_with(prefix))
 }
 
 /// The branch under test. GitHub Actions checks out `pull_request` events at
@@ -1941,6 +1966,28 @@ mod tests {
             "a merged base (base == HEAD) must be treated as nothing-to-classify \
              and skipped, not run through derivation (B1) — every merge to main \
              would otherwise turn `push: [main]` red"
+        );
+    }
+
+    // -- fork-only exemption -------------------------------------------------
+
+    #[test]
+    fn fork_only_branch_is_exempt() {
+        assert!(
+            is_exempt_branch("fork-only"),
+            "the fork's whole-stack sync branch must be exempt from the gate \
+             (see the module doc's \"`fork-only` is exempt, but by exact \
+             name, not a prefix\" section)"
+        );
+    }
+
+    #[test]
+    fn fork_only_lookalike_branch_is_not_exempt_by_prefix() {
+        assert!(
+            !is_exempt_branch("fork-only-foo"),
+            "the exemption is an exact match, not a prefix — a human's \
+             ordinary PR branch that merely starts with 'fork-only' must \
+             still be gated"
         );
     }
 
