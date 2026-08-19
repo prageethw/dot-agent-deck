@@ -4303,6 +4303,25 @@ mod tests {
         assert!(r.ends_with("-r2"));
     }
 
+    /// Scenario: mints a pane id, then resets `PANE_COUNTER` back to zero
+    /// (standing in for a daemon restart, which a unit test can't otherwise
+    /// trigger) and mints a second pane id for the same task name and role
+    /// index. The two ids must still differ — issue #430 is that they don't,
+    /// because `next_pane_id`'s only entropy is the bare restart-vulnerable
+    /// `PANE_COUNTER`, so two fires of the same scheduled task separated by
+    /// a real daemon restart mint the identical id and collide on
+    /// `pane_digest_hex` / the work-done report path.
+    #[test]
+    fn next_pane_id_does_not_collide_across_a_simulated_daemon_restart() {
+        let before_restart = next_pane_id("digest", None);
+        PANE_COUNTER.store(0, Ordering::SeqCst);
+        let after_restart = next_pane_id("digest", None);
+        assert_ne!(
+            before_restart, after_restart,
+            "next_pane_id must not mint the same id across a daemon restart"
+        );
+    }
+
     #[test]
     fn load_config_for_dir_none_when_absent() {
         let dir = tempfile::tempdir().unwrap();
