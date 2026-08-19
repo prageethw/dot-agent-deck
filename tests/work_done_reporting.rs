@@ -162,6 +162,13 @@ impl WorkDoneHarness {
             (WORKER_PANE, WORKER_ROLE, false),
         ] {
             state.register_pane(pane_id.to_string());
+            // Fork #358 M1/M4: `handle_work_done` refuses a signal whose
+            // (generation, daemon_boot_id) doesn't match the pane's current
+            // registration, so this harness's own hand-rolled registration
+            // (rather than `register_orchestration_role`) has to reserve one
+            // too, or every signal it produces is refused as stale by
+            // construction.
+            state.reserve_registration_generation(pane_id);
             state
                 .pane_role_map
                 .insert(pane_id.to_string(), role.to_string());
@@ -218,6 +225,11 @@ impl WorkDoneHarness {
     /// The real work-done path: the signal `dot-agent-deck work-done --task-file`
     /// puts on the hook socket, from the WORKER's pane.
     async fn work_done(&self, summary: &str) {
+        let generation = *self
+            .state
+            .pane_registration_generation
+            .get(WORKER_PANE)
+            .expect("the worker pane must have reserved a registration generation");
         self.state
             .handle_work_done(
                 WorkDoneSignal {
@@ -225,6 +237,8 @@ impl WorkDoneHarness {
                     task: summary.to_string(),
                     done: false,
                     timestamp: chrono::Utc::now(),
+                    generation,
+                    daemon_boot_id: self.state.daemon_boot_id().to_string(),
                 },
                 &self.registry,
             )
