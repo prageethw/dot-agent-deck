@@ -2598,9 +2598,15 @@ pub(crate) fn worktree_attach_lock_path_from_common_dir(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("worktree");
-    common_dir
+    let result = common_dir
         .join("dot-agent-deck-worktree-locks")
-        .join(format!("{basename}-{hash:016x}.lock"))
+        .join(format!("{basename}-{hash:016x}.lock"));
+    eprintln!(
+        "DEBUG-325M4 worktree_attach_lock_path_from_common_dir: common_dir={common_dir:?} \
+         worktree_dir(raw)={worktree_dir:?} canonical_worktree_dir={canonical_worktree_dir:?} \
+         hash={hash:016x} result={result:?}"
+    );
+    result
 }
 
 /// Fork #331 audit B2: resolves the repository's shared common `.git` dir the
@@ -2651,6 +2657,9 @@ pub(crate) fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
                 "git rev-parse --git-common-dir in {clone_dir:?} printed no output"
             ));
         }
+        eprintln!(
+            "DEBUG-325M4 git_common_dir(write-site,primary): input_dir={clone_dir:?} output={dir:?}"
+        );
         return Ok(PathBuf::from(dir));
     }
 
@@ -2683,7 +2692,11 @@ pub(crate) fn git_common_dir(clone_dir: &Path) -> Result<PathBuf, String> {
             "git rev-parse --git-common-dir in {clone_dir:?} printed no output"
         ));
     }
-    Ok(clone_dir.join(dir))
+    let joined = clone_dir.join(dir);
+    eprintln!(
+        "DEBUG-325M4 git_common_dir(write-site,fallback): input_dir={clone_dir:?} output={joined:?}"
+    );
+    Ok(joined)
 }
 
 /// Async counterpart to [`git_common_dir`] for [`create_worktree`]'s

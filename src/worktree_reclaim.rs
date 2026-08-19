@@ -965,6 +965,7 @@ fn resolve_common_dir(repo_dir: &Path) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;
     }
+    eprintln!("DEBUG-325M4 resolve_common_dir(check-site): input_dir={repo_dir:?} output={raw:?}");
     Some(PathBuf::from(raw))
 }
 
