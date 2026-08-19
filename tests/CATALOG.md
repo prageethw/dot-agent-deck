@@ -1161,6 +1161,35 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** a worktree created through the production `create_worktree_sync` path and reclaimed by a bare `run_reclaim(repo, yes=false, remover)` reports exactly one `removed` entry, and that entry's `removed_by` equals the exact `remover` string the caller passed in.
 - **Does not assert:** that the identity is ever surfaced anywhere outside the in-memory `WorktreeReport` — that is pinned separately by `format_reclaim_human_escapes_hostile_content_in_removed_by` and the module's other `format_reclaim_human` tests; the `pending`/`kept` paths, where `removed_by` stays `None` (covered by the pre-existing `008`/`011` fixtures, unchanged by this test).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other creator-identity tests).
+
+##### worktree/reclaim/049 — M4a (RED, no discovery mechanism exists yet). A deck-owned isolated clone (a genuine `git clone` sibling of the repo, its own `.git` DIRECTORY, marked owned the same way `provision_isolated_clone_sync` marks a real one) is reported by `examine_worktrees` — today it is structurally invisible, since `list_linked_worktrees` (`git worktree list`) never sees a directory that isn't a linked worktree of the enumerating repo at all (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — a real `git clone` fixture, mirroring `worktree/reclaim/017`'s real-`git worktree add` fixture for the linked-worktree case.
+- **Agent:** none.
+- **Asserts:** `examine_worktrees(repo)` includes an entry whose `real_path` equals the isolated clone's directory.
+- **Does not assert:** anything about how the entry is distinguished from an ordinary linked worktree's report (`worktree/reclaim/051`), or about its verdict (`worktree/reclaim/052`).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/050 — M4a (RED). Discovery excludes every sibling directory that is NOT a deck-owned isolated clone: a plain directory with no `.git` at all, an unrelated independent repo (its own `.git` directory, no marker), and a genuine clone of the repo carrying no ownership marker — while the one genuine deck-owned isolated clone in the same fixture still appears (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, same real-`git clone` fixture technique as `worktree/reclaim/049`.
+- **Agent:** none.
+- **Asserts:** `examine_worktrees(repo)` never reports the plain directory, the unrelated repo, or the unmarked clone, and still reports the owned clone, all in one fixture.
+- **Does not assert:** the ordinary-linked-worktree exclusion case (a `.git` FILE redirect) — already covered by the pre-existing `list_linked_worktrees` enumeration this milestone does not touch.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/051 — M4a (RED). An isolated clone's report is distinguishable from an ordinary linked worktree's report — a new `kind` field, `"isolated_clone"` vs. `"linked"`, checked through the `--json` document rather than a `WorktreeReport` struct field so the RED signature is an assertion failure, not a build break (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — reads the `examine_worktrees` → `WorktreeListDocument` → `serde_json::Value` path, mirroring `worktree/reclaim/037`'s own precedent for pinning a not-yet-existing field without a compile break.
+- **Agent:** none.
+- **Asserts:** in one fixture examining a linked worktree and an isolated clone together, their `kind` values differ, and the isolated clone's `kind` reads exactly `"isolated_clone"`.
+- **Does not assert:** the linked worktree's own `kind` value — only that it differs from the isolated clone's; the exact string coder assigns ordinary worktrees is that function's design decision, not pinned here.
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/052 — M4a (RED). A discovered isolated clone that is clean and whose branch has a MERGED PR — the exact combination that makes an ordinary linked worktree `Verdict::Remove` — never gets an automatic-removal verdict, and is never actually removed by `worktree reclaim`, with or without `--yes`: this milestone slice is discovery-only, and automatic isolated-clone reclaim is deliberately deferred to a documented follow-up (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — same stub-`gh`-MERGED fixture shape as `worktree/reclaim/008`, applied to a real isolated clone instead of a linked worktree.
+- **Agent:** none.
+- **Asserts:** the isolated clone's report `verdict` is never `"remove"`; a bare `run_reclaim` and a `run_reclaim` with `yes=true` both leave the clone directory on disk and absent from `ReclaimOutcome::removed`.
+- **Does not assert:** what verdict label (`"ask"`, `"keep"`, or a new label) the isolated clone actually gets, or whether it ever becomes reclaimable under `--yes` in a future milestone — only that this slice never removes one automatically.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other `gh`-stub fixtures).
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.

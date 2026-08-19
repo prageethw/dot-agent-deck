@@ -3784,4 +3784,320 @@ mod tests {
              got {out:?}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Fork #325 M4a: isolated-clone discovery (RED — no production code
+    // exists yet). An isolated clone (`provision_isolated_clone_sync`) is a
+    // fully independent `git clone` sibling of the repo, not a linked
+    // worktree -- `list_linked_worktrees`/`examine_worktrees` structurally
+    // cannot see it today, since it never appears in `git worktree list`'s
+    // output run from `repo_dir`. These tests pin the discovery surface
+    // this milestone slice adds: `examine_worktrees` must also enumerate
+    // deck-owned isolated clones sitting as siblings of `repo_dir`,
+    // distinguish them from an ordinary linked worktree in the report, and
+    // never assign one an automatic-removal verdict.
+    // -------------------------------------------------------------------
+
+    /// A genuine, independent `git clone` of `repo` at `clone_dir` -- the
+    /// same on-disk shape `provision_isolated_clone_sync` produces
+    /// (fork#325 M3): a real `.git` DIRECTORY, never a linked worktree's
+    /// `.git` FILE redirect. `origin` is repointed at the same GitHub URL
+    /// `init_repo_with_origin` gives `repo`, mirroring
+    /// `point_isolated_clone_origin`'s real behavior when the source has an
+    /// origin (fork#325 M3) -- a plain `git clone`'s default `origin`
+    /// (repo's own local filesystem path) would make `derive_repo_slug`
+    /// fail to parse a GitHub owner/repo, and every PR-state-dependent
+    /// assertion below would then be vacuous (`Unresolvable` already never
+    /// removes, so it would prove nothing about the isolated-clone-specific
+    /// gate under test).
+    fn clone_repo_with_github_origin(repo: &Path, clone_dir: &Path) {
+        let out = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--",
+                &repo.display().to_string(),
+                &clone_dir.display().to_string(),
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git clone failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = std::process::Command::new("git")
+            .current_dir(clone_dir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/test-org/test-repo.git",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("git remote set-url failed to spawn: {e}"));
+        assert!(
+            out.status.success(),
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A `gh` stub answering `gh pr list --head <branch> ...` with a single
+    /// canned MERGED reply for `branch`, matching `worktree_reclaim_008`'s
+    /// own script shape.
+    fn write_merged_gh_stub(bindir: &Path, branch: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
+        );
+        std::fs::create_dir_all(bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Scenario: A real, deck-owned isolated clone (a genuine `git clone`
+    /// sibling of the repo, its own `.git` DIRECTORY, marked owned via the
+    /// same `mark_worktree_owned` call `provision_isolated_clone_sync` uses)
+    /// sits next to `repo`. `examine_worktrees(repo)` must report it --
+    /// today it is silently absent, since `list_linked_worktrees` (`git
+    /// worktree list`) structurally cannot see a directory that is not a
+    /// linked worktree of `repo` at all.
+    #[spec("worktree/reclaim/049")]
+    #[test]
+    fn worktree_reclaim_049_isolated_clone_is_discovered() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-issue-999");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-999#999")
+            .expect("mark_worktree_owned must succeed against a real independent clone");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        assert!(
+            reports.iter().any(|r| r.real_path == clone_dir),
+            "a deck-owned isolated clone sitting as a sibling of the repo must be discoverable \
+             by examine_worktrees, got reports for paths: {:?}",
+            reports.iter().map(|r| &r.real_path).collect::<Vec<_>>()
+        );
+    }
+
+    /// Scenario: three sibling directories that must each NEVER be reported
+    /// as a discovered isolated clone: a plain directory with no `.git` at
+    /// all; an unrelated, independently-`git init`ed repo (its own `.git`
+    /// DIRECTORY, structurally identical to a real isolated clone) with no
+    /// marker; and a genuine `git clone` OF `repo` that carries no
+    /// ownership marker at all (a clone the deck did not make, or whose
+    /// marker write failed) -- alongside one genuine deck-owned isolated
+    /// clone that MUST appear. Discovery must never mistake "has a `.git`
+    /// directory" for "is a deck-owned isolated clone".
+    #[spec("worktree/reclaim/050")]
+    #[test]
+    fn worktree_reclaim_050_only_owned_isolated_clones_are_discovered() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        // (a) plain directory, no `.git` at all.
+        let plain_dir = scratch.path().join("repo-plain-sibling");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+
+        // (b) an unrelated, independent repo -- its own `.git` DIRECTORY,
+        // structurally identical to a real isolated clone, but not derived
+        // from `repo` and carrying no marker.
+        let unrelated_repo = scratch.path().join("repo-unrelated-sibling");
+        init_repo_with_origin(&unrelated_repo);
+
+        // (c) a genuine clone OF `repo`, but never marked owned -- the
+        // shape a clone the deck didn't create (or whose marker write
+        // failed) would have.
+        let unmarked_clone = scratch.path().join("repo-isolated-unmarked");
+        clone_repo_with_github_origin(&repo, &unmarked_clone);
+
+        // The one genuine positive: a deck-owned isolated clone.
+        let owned_clone = scratch.path().join("repo-isolated-owned");
+        clone_repo_with_github_origin(&repo, &owned_clone);
+        mark_worktree_owned(&owned_clone, "issue-dispatch:isolated-owned#1000")
+            .expect("mark_worktree_owned must succeed");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let all_paths = || reports.iter().map(|r| &r.real_path).collect::<Vec<_>>();
+
+        assert!(
+            !reports.iter().any(|r| r.real_path == plain_dir),
+            "a plain sibling directory with no .git at all must never be reported, got \
+             paths: {:?}",
+            all_paths()
+        );
+        assert!(
+            !reports.iter().any(|r| r.real_path == unrelated_repo),
+            "an unrelated independent repo (its own .git directory, no marker) must never be \
+             reported, got paths: {:?}",
+            all_paths()
+        );
+        assert!(
+            !reports.iter().any(|r| r.real_path == unmarked_clone),
+            "a genuine clone of the repo carrying NO ownership marker must never be reported, \
+             got paths: {:?}",
+            all_paths()
+        );
+        assert!(
+            reports.iter().any(|r| r.real_path == owned_clone),
+            "the one genuine deck-owned isolated clone must still be reported alongside the \
+             exclusions above, got paths: {:?}",
+            all_paths()
+        );
+    }
+
+    /// Scenario: one ordinary linked worktree and one deck-owned isolated
+    /// clone are examined together. A consumer of the report (a human
+    /// table, or the `--json` document) must be able to tell them apart --
+    /// this is the whole reason M4a exists as discovery, not just presence:
+    /// treating an isolated clone as an ordinary worktree in the report
+    /// would make `worktree reclaim` reason about it exactly like a linked
+    /// worktree, which is the safety property M4a exists to prevent.
+    /// Checked through the `--json` document as `serde_json::Value`
+    /// (mirroring `worktree_reclaim_037`'s own precedent for a
+    /// not-yet-existing field) rather than a `WorktreeReport` struct field,
+    /// so this test's own RED signature is an assertion failure, not a
+    /// build break: today both rows are missing whatever field
+    /// distinguishes them, since neither the isolated clone (see
+    /// `worktree_reclaim_049`) nor a `kind` discriminator exists yet.
+    ///
+    /// Design decision (flagged for coder, see the work-done report): the
+    /// discriminator is a new `kind` field on `WorktreeReport`/the `--json`
+    /// document, `"linked"` for an ordinary worktree and `"isolated_clone"`
+    /// for a discovered isolated clone.
+    #[spec("worktree/reclaim/051")]
+    #[test]
+    fn worktree_reclaim_051_isolated_clone_report_is_distinguishable_from_linked_worktree() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let linked_wt = scratch.path().join("repo-linked");
+        add_worktree(&repo, &linked_wt, "feat/linked");
+        mark_worktree_owned(&linked_wt, "orch-linked").expect("mark_worktree_owned must succeed");
+
+        let clone_dir = scratch.path().join("repo-isolated-distinguish");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-distinguish#1001")
+            .expect("mark_worktree_owned must succeed");
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let worktrees = parsed["worktrees"]
+            .as_array()
+            .expect("worktrees must be a JSON array");
+
+        let find_kind = |path: &Path| -> Option<String> {
+            let path_str = path.to_string_lossy().into_owned();
+            worktrees
+                .iter()
+                .find(|w| w["path"].as_str() == Some(path_str.as_str()))
+                .map(|w| w["kind"].to_string())
+        };
+
+        let linked_kind = find_kind(&linked_wt);
+        let clone_kind = find_kind(&clone_dir);
+
+        assert_ne!(
+            linked_kind, clone_kind,
+            "an isolated clone's report must carry a `kind` distinguishable from an ordinary \
+             linked worktree's report -- got linked={linked_kind:?} isolated_clone={clone_kind:?}"
+        );
+        // The RED assertion: today no discriminator field exists at all, and
+        // the isolated clone isn't even reported (see worktree_reclaim_049),
+        // so `clone_kind` is `None` -- this fails until both land.
+        assert_eq!(
+            clone_kind.as_deref(),
+            Some("\"isolated_clone\""),
+            "the isolated clone's `kind` field must read exactly \"isolated_clone\" in the \
+             --json document, got {clone_kind:?}"
+        );
+    }
+
+    /// Scenario: a deck-owned isolated clone that is CLEAN and whose branch
+    /// has a MERGED PR -- the exact combination that makes an ordinary
+    /// linked worktree `Verdict::Remove` -- must never be automatically
+    /// removed by `worktree reclaim`, with or without `--yes`. This is
+    /// M4a's deliberate, conservative stopping point: whether an isolated
+    /// clone ever becomes safely auto-reclaimable (and under what stricter
+    /// condition) is left to a documented follow-up, not implemented here.
+    #[spec("worktree/reclaim/052")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_052_isolated_clone_never_gets_an_automatic_removal_verdict() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-never-removed");
+        clone_repo_with_github_origin(&repo, &clone_dir);
+        mark_worktree_owned(&clone_dir, "issue-dispatch:isolated-never-removed#1002")
+            .expect("mark_worktree_owned must succeed");
+
+        // `git clone` checks out the source's HEAD branch ("main") with no
+        // local changes -- clean by construction. The gh stub answers
+        // MERGED for that exact branch, so every gate an ordinary linked
+        // worktree would need to reach `Verdict::Remove` is satisfied here.
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub(&bindir, "main");
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports.iter().find(|r| r.real_path == clone_dir).expect(
+            "the isolated clone must be present in the report at all -- see \
+             worktree_reclaim_049",
+        );
+        assert_ne!(
+            clone_report.verdict.as_str(),
+            "remove",
+            "a clean, PR-merged isolated clone must never get an automatic-removal verdict, \
+             got {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Neither a bare reclaim nor `--yes` may actually delete it.
+        let bare = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !bare.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` must never remove an isolated clone, got removed: {:?}",
+            bare.removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the isolated clone directory must still exist on disk after a bare reclaim"
+        );
+
+        let confirmed = run_reclaim(&repo, true, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+        assert!(
+            !confirmed.removed.iter().any(|r| r.real_path == clone_dir),
+            "`worktree reclaim --yes` must never remove an isolated clone either -- M4a defers \
+             automatic isolated-clone reclaim to a documented follow-up, got removed: {:?}",
+            confirmed
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the isolated clone directory must still exist on disk after `reclaim --yes`"
+        );
+    }
 }
