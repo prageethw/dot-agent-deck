@@ -1763,6 +1763,122 @@ mod tests {
         }
     }
 
+    /// Locate the real `git` binary via `command -v`, so a `PATH`-shimmed
+    /// fake `git` (below) can still delegate every call it doesn't care
+    /// about to the genuine implementation, regardless of where CI's `git`
+    /// actually lives.
+    #[cfg(unix)]
+    fn real_git_path() -> String {
+        let out = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate the real git binary via `command -v`");
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(!path.is_empty(), "no real git binary found on PATH");
+        path
+    }
+
+    /// RAII guard restoring `PATH` to its prior value on drop. Shared by
+    /// both `PATH`-shimmed-`git` helpers below.
+    struct FakeGitOnPathGuard {
+        prev_path: String,
+    }
+
+    impl Drop for FakeGitOnPathGuard {
+        fn drop(&mut self) {
+            // SAFETY: `PATH` is process-global, but per CLAUDE.md rule 5's
+            // fork addendum every test run happens in CI via `cargo
+            // nextest`, which runs each test in its OWN process (the same
+            // justification `git_common_dir_async_is_bounded_by_an_external_timeout`
+            // already relies on for its own `PATH` mutation) -- so no
+            // sibling test observes this. Restored unconditionally here.
+            unsafe {
+                std::env::set_var("PATH", &self.prev_path);
+            }
+        }
+    }
+
+    /// Prepend a fake `git` to `PATH` that fails ONLY `git remote set-url`
+    /// invocations -- `point_isolated_clone_origin`'s exact command -- and
+    /// passes every other invocation straight through to the real `git`.
+    /// Lets a test force `IsolatedCloneOutcome::Created { origin_warning:
+    /// Some(_), .. }` deterministically: `point_isolated_clone_origin`'s
+    /// failure branch otherwise requires a filesystem-permission race
+    /// against `provision_isolated_clone_sync`'s own single synchronous
+    /// call, which this sidesteps entirely.
+    #[cfg(unix)]
+    fn with_git_remote_set_url_failing(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-remote-set-url-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = remote ] && [ \"$2\" = set-url ]; then\n\
+                 \x20\x20echo 'stub: simulated git remote set-url failure' >&2\n\
+                 \x20\x20exit 1\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
+    /// Prepend a fake `git` to `PATH` that fails ONLY `git clone`
+    /// invocations, writing stderr containing a raw terminal-hostile control
+    /// byte (`ESC`, as part of an ANSI color escape) before exiting
+    /// non-zero -- simulating a hostile or corrupted repository/remote
+    /// emitting escape sequences into git's own captured error output --
+    /// and passes every other invocation through to the real `git`. Creates
+    /// the destination directory (with a `.git` marker) before failing so
+    /// `handle_isolated_clone_add_error` takes its ordinary
+    /// leaves-a-half-created-directory `Failed` path rather than the
+    /// `!clone_dir.exists()` early `Err` branch.
+    #[cfg(unix)]
+    fn with_git_clone_failing_with_hostile_stderr(scratch: &Path) -> FakeGitOnPathGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_git = real_git_path();
+        let bindir = scratch.join("git-clone-fail-stub-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("git");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = clone ]; then\n\
+                 \x20\x20dest=\"\"\n\
+                 \x20\x20for a in \"$@\"; do dest=\"$a\"; done\n\
+                 \x20\x20mkdir -p \"$dest/.git\"\n\
+                 \x20\x20printf 'fatal: simulated clone failure \\033[31mhostile\\033[0m\\n' >&2\n\
+                 \x20\x20exit 128\n\
+                 fi\n\
+                 exec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: see `FakeGitOnPathGuard::drop`.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{prev_path}", bindir.display()));
+        }
+        FakeGitOnPathGuard { prev_path }
+    }
+
     /// Scenario: issue #490, case 1 -- regression guard. No live orchestration
     /// shares the target root checkout (the stub daemon answers `ListAgents`
     /// with an empty `agent_records`), so `handle_dispatch` must provision the
@@ -1893,6 +2009,24 @@ mod tests {
             repo.display(),
             result.message
         );
+
+        // Fix round 2 (reviewer/auditor, tester round): `record_worktree`'s
+        // call site branches the registered policy on `has_live_sibling` --
+        // this must land as `RemovalPolicy::IsolatedClone`, never the
+        // shared-checkout arm's `KeepIfDirty`, or tab close would run `git
+        // worktree remove` against a directory that isn't a linked worktree
+        // of anything.
+        let registered_policy = ctx
+            .worktrees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&result.worktree_dir)
+            .map(|entry| entry.policy);
+        assert_eq!(
+            registered_policy,
+            Some(RemovalPolicy::IsolatedClone),
+            "an isolated-clone dispatch must be registered under RemovalPolicy::IsolatedClone"
+        );
     }
 
     /// Scenario: issue #490, case 3a -- fail closed on a well-formed daemon
@@ -1994,6 +2128,407 @@ mod tests {
         assert!(
             !branch_exists(&repo, &paths.branch),
             "a fail-closed refusal must not leave a branch behind either: {}",
+            result.message
+        );
+    }
+
+    // --- issue #490 fix round 2 (tester round): coverage for the isolated-
+    // clone rollback/cleanup logic reviewer+auditor found undertested across
+    // two rounds of fixes (P1-4: the changelog's `No-Test:` claim was false
+    // for all of it). Each test below is the isolated-clone-arm twin of an
+    // already-pinned shared-checkout-arm test, forcing the isolated branch
+    // via the same `with_crafted_attach_daemon` live-sibling gate the
+    // `dispatch_isolates_into_a_fresh_clone_when_a_live_sibling_shares_the_checkout`
+    // test above already uses.
+
+    /// Scenario: issue #490 fix round 2, item 1. Same forced-spawn-failure
+    /// setup as `spawn_rollback_force_removes_when_nothing_else_roots_the_worktree`
+    /// (#469), but with the live-sibling GATE also tripped, so
+    /// `handle_dispatch` provisions an ISOLATED CLONE rather than an
+    /// ordinary shared-checkout worktree before spawn fails. With nothing
+    /// rooted in the freshly-cloned directory, the rollback's isolated-clone
+    /// branch (`attempt_isolated_clone_cleanup` via `spawn_blocking`) must
+    /// actually remove it, not just report success without cleaning up.
+    #[tokio::test]
+    async fn spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        // Trips the has_live_sibling GATE: an already-live orchestration
+        // sharing `repo`'s git-common-dir via its own sibling worktree.
+        let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
+        create_worktree(
+            &repo,
+            &live_sibling_dir,
+            "agent/existing-live-orchestration",
+            false,
+            "test:existing-live-orchestration",
+        )
+        .await
+        .expect("provision the pre-existing live sibling worktree");
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
+                &live_sibling_dir,
+            )]),
+        );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-490".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "isolated-notrip-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("spawn failed"),
+            "the rollback arm must actually have been reached: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("cleanup skipped"),
+            "nothing is rooted in the fresh clone, so cleanup must not be skipped: {}",
+            result.message
+        );
+        assert!(
+            !result.worktree_dir.exists(),
+            "with nothing else rooted there, the isolated clone must actually be removed \
+             via attempt_isolated_clone_cleanup, exactly as force-removal already works for \
+             the shared-checkout arm: {}",
+            result.message
+        );
+        assert!(
+            !ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&result.worktree_dir),
+            "the registry entry must still be dropped"
+        );
+    }
+
+    /// Scenario: issue #490 fix round 2, item 2. Same as
+    /// `spawn_rollback_force_removes_the_isolated_clone_when_nothing_else_roots_it`,
+    /// but with a live sibling role ALSO registered as rooted INSIDE the
+    /// about-to-be-cleaned-up clone -- the #469 multi-role liveness guard
+    /// (`worktree_still_in_use`) -- which must protect the isolated clone
+    /// exactly as it already protects an ordinary shared-checkout worktree.
+    /// The sibling's real PTY is spawned into `tmp.path()` (which already
+    /// exists) rather than the clone target itself: unlike the
+    /// shared-checkout arm's `git worktree add` (which tolerates a
+    /// pre-existing EMPTY directory), `provision_isolated_clone_sync` reports
+    /// `AlreadyClaimed` for ANY pre-existing path, so pre-creating the clone
+    /// target the way the #469 test pre-creates its worktree dir would
+    /// short-circuit the whole scenario before spawn is ever reached. Only
+    /// `tab_membership.orchestration_cwd` -- the field `worktree_still_in_use`
+    /// actually reads (see `worktree_of_record`) -- needs to name the
+    /// not-yet-created clone target.
+    #[tokio::test]
+    async fn spawn_rollback_skips_cleanup_when_a_live_sibling_still_roots_the_isolated_clone() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
+        create_worktree(
+            &repo,
+            &live_sibling_dir,
+            "agent/existing-live-orchestration",
+            false,
+            "test:existing-live-orchestration",
+        )
+        .await
+        .expect("provision the pre-existing live sibling worktree");
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
+                &live_sibling_dir,
+            )]),
+        );
+
+        let paths = derive_dispatch_paths(&repo, "isolated-trip-unit");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let sibling_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                cwd: Some(&tmp.path().to_string_lossy()),
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "isolated-trip-unit".to_string(),
+                    role_index: 0,
+                    role_name: "coder".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(paths.worktree_dir.to_string_lossy().into_owned()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect(
+                "spawn a live sibling agent claiming to be rooted in the about-to-be-created \
+                 isolated clone",
+            );
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("/definitely-not-a-real-binary-xyz-490".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "isolated-trip-unit", "task", None).await;
+
+        // Close the sibling shell before any assertion can panic (mirroring
+        // the #469 test's own F5a precaution).
+        let _ = registry.close_agent(&sibling_id);
+
+        assert!(
+            !result.success,
+            "the spawn itself must still report failure"
+        );
+        assert_eq!(
+            result.worktree_dir, paths.worktree_dir,
+            "sanity: the dispatch must have picked the same path this test pre-derived"
+        );
+        assert!(
+            paths.worktree_dir.exists(),
+            "a live sibling still rooted in the isolated clone must keep it from being \
+             force-removed (issue #469, isolated-clone arm): {}",
+            result.message
+        );
+        assert!(
+            branch_exists(&repo, &paths.branch)
+                || crate::issue_dispatch_run::git_common_dir(&paths.worktree_dir).is_ok(),
+            "the clone itself (which carries its own local branch) must survive too"
+        );
+        assert!(
+            ctx.worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&paths.worktree_dir),
+            "the registry entry must survive so a later close can still find and clean it up"
+        );
+        assert!(
+            result.message.contains("cleanup skipped"),
+            "the skip message must name the cause so an operator doesn't reach for a manual \
+             force-removal: {}",
+            result.message
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.worktree_dir);
+    }
+
+    /// Scenario: issue #490 fix round 2, item 3. The isolated clone's
+    /// registered `RemovalPolicy::IsolatedClone` must ALWAYS report `Kept`
+    /// on tab close -- even when the clone's working tree is perfectly
+    /// clean -- unlike `RemovalPolicy::KeepIfDirty`
+    /// (`keep_if_dirty_preserves_a_worktree_with_uncommitted_work` above),
+    /// which only protects a DIRTY tree. Deleting an isolated clone destroys
+    /// its own `.git`, so a clean working tree does not prove it is safe to
+    /// discard the way it does for a linked worktree sharing the root's
+    /// object store.
+    #[tokio::test]
+    async fn isolated_clone_is_always_kept_on_tab_close_even_when_clean() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let clone_dir = tmp.path().join("isolated-clone");
+
+        // A real, genuinely-clean `git clone` -- not provisioned via
+        // `provision_isolated_clone_sync`, since `remove_worktree`'s policy
+        // branch doesn't care how the clone came to exist, only what policy
+        // it's called with.
+        let out = std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                "--",
+                &repo.to_string_lossy(),
+                &clone_dir.to_string_lossy(),
+            ])
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git clone failed: {out:?}");
+
+        let outcome = remove_worktree(
+            &clone_dir,
+            &repo,
+            RemovalPolicy::IsolatedClone,
+            "dispatch:test",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            crate::issue_dispatch_run::RemoveOutcome::Kept(crate::event::KeptReason::IsolatedClone),
+            "an isolated clone must always be reported Kept, regardless of dirtiness"
+        );
+        assert!(
+            clone_dir.exists(),
+            "an isolated clone must never be auto-removed on tab close, even when its \
+             working tree is clean -- removing it would destroy its own .git"
+        );
+    }
+
+    /// Scenario: issue #490 fix round 2, item 4 (reviewer B3 / auditor B1).
+    /// Forces `provision_isolated_clone_sync` to actually return
+    /// `Created { origin_warning: Some(_), .. }` by making `git remote
+    /// set-url` fail underneath it (a `PATH`-shimmed `git`, so nothing here
+    /// depends on filesystem-permission timing), then asserts
+    /// `handle_dispatch`'s SUCCESS message actually surfaces that warning
+    /// text -- the field CLAUDE.md rule 1 tells the dispatched agent to `git
+    /// push origin` from inside, so silently dropping this warning would let
+    /// a push land back in the user's own root checkout instead of the real
+    /// remote.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_surfaces_the_origin_warning_in_the_success_message() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        // The origin fixup takes the "point at the source's own origin"
+        // branch -- whose `origin_warning` is never overwritten again below
+        // it in `provision_isolated_clone_sync` -- only when the SOURCE
+        // itself has an origin configured. The "no origin" branch's later
+        // `remove_isolated_clone_origin_default` call (unaffected by this
+        // test's stub, which only fails `remote set-url`) would otherwise
+        // silently overwrite the warning this test injects.
+        let out = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git remote add failed: {out:?}");
+
+        let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
+        create_worktree(
+            &repo,
+            &live_sibling_dir,
+            "agent/existing-live-orchestration",
+            false,
+            "test:existing-live-orchestration",
+        )
+        .await
+        .expect("provision the pre-existing live sibling worktree");
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
+                &live_sibling_dir,
+            )]),
+        );
+        let _git_stub = with_git_remote_set_url_failing(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "origin-warn-unit", "task", None).await;
+
+        assert!(
+            result.success,
+            "the origin fixup failing must not fail the whole dispatch: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains("could not be pointed at the real remote"),
+            "the success message must surface the origin_warning, not silently drop it: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains("stub: simulated git remote set-url failure"),
+            "the underlying git error text must actually flow through, not just a generic \
+             notice: {}",
+            result.message
+        );
+    }
+
+    /// Scenario: issue #490 fix round 2, item 5 (R4/P2-8). Forces the
+    /// isolated arm's `git clone` step itself to fail with stderr containing
+    /// a raw terminal-hostile control byte (`ESC`), then asserts
+    /// `handle_dispatch`'s resulting failure message never contains that raw
+    /// byte -- proving the `IsolatedCloneOutcome::Failed { error, .. }` arm
+    /// actually sanitizes git's own captured stderr before writing it into
+    /// the caller's pane, not just the deck-controlled path/name
+    /// interpolations sitting next to it in the same message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_sanitizes_git_stderr_in_the_isolated_clone_failed_message() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+
+        let live_sibling_dir = tmp.path().join("repo-existing-live-orchestration");
+        create_worktree(
+            &repo,
+            &live_sibling_dir,
+            "agent/existing-live-orchestration",
+            false,
+            "test:existing-live-orchestration",
+        )
+        .await
+        .expect("provision the pre-existing live sibling worktree");
+
+        let _daemon = with_crafted_attach_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![live_orchestration_record(
+                &live_sibling_dir,
+            )]),
+        );
+        let _git_stub = with_git_clone_failing_with_hostile_stderr(tmp.path());
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("cat".to_string()),
+            state: None,
+        };
+
+        let result = handle_dispatch(&ctx, "hostile-clone-fail-unit", "task", None).await;
+
+        assert!(!result.success);
+        assert!(
+            result.message.contains("isolated clone failed"),
+            "sanity: the isolated clone's own git-clone-failure arm must have been reached: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains('\u{1b}'),
+            "a raw ESC byte from git's own stderr must never reach the caller's pane \
+             unsanitized: {:?}",
+            result.message
+        );
+        assert!(
+            result.message.contains("simulated clone failure"),
+            "the underlying git error text must still be readable, just escaped, not \
+             discarded entirely: {}",
             result.message
         );
     }
