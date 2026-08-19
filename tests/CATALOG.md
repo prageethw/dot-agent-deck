@@ -1190,6 +1190,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** what verdict label (`"ask"`, `"keep"`, or a new label) the isolated clone actually gets, or whether it ever becomes reclaimable under `--yes` in a future milestone — only that this slice never removes one automatically.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching this suite's other `gh`-stub fixtures).
 
+##### worktree/reclaim/053 — M4 final round (reviewer F13 / auditor A1/B1). A genuine isolated clone built through the real production provisioner (`issue_dispatch_run::provision_isolated_clone_sync`), carrying the real attach-lock artifact the provisioner writes, is reported by `examine_worktrees` with `owned: true` and the correct `owner`/`owner_kind` — closing the gap coder flagged that none of `worktree/reclaim/049`-`052` build their fixture this way, so the new `owned: true` path (the actual security fix replacing `candidate_shares_history_with` with `candidate_has_attach_lock`) had zero coverage (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — calls `issue_dispatch_run::provision_isolated_clone_sync` directly (real production provisioning) rather than hand-assembling a marker, so the attach-lock artifact examined is the genuine one the deck's own code writes.
+- **Agent:** none.
+- **Asserts:** the provisioner succeeds with no marker warning and leaves a real attach-lock artifact on disk; `examine_worktrees(repo)`'s report for the resulting clone has `owned: true`, `owner` equal to the exact creator string passed to the provisioner, `owner_kind: "agent"`, `kind: "isolated_clone"`, and no `owner_reason`.
+- **Does not assert:** the forgery-rejection case (`worktree/reclaim/054`) or the subdirectory-anchor case (`worktree/reclaim/055`).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/054 — M4 final round, auditor A1/B1's exact forgery. A sibling directory whose `.git` is a plain directory with no real git objects/refs/config, a `HEAD` file containing a real but unrelated-to-this-candidate commit SHA as plain text, and a hand-planted `dot-agent-deck-owner` marker claiming an arbitrary identity — but no attach-lock artifact — is still discovered (discovery stays purely structural) but reports `owned: false`, `owner_kind: "unknown"`, and never satisfies `is_mine` for any identity, including the one the forged marker claims (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — a hand-built 2-file forgery (no `git` invocation needed to construct it), mirroring auditor B1's own reproduction.
+- **Agent:** none.
+- **Asserts:** `examine_worktrees(repo)` still reports the forged directory's `real_path`; its `owned` is `false`, `owner` is `None` (the forged marker's content is never read absent a matching attach lock), `owner_kind` is `"unknown"`, `owner_reason` equals `ISOLATED_CLONE_NO_ATTACH_LOCK_REASON`; and `is_mine` returns `false` for both the forged identity itself and an unrelated identity.
+- **Does not assert:** the genuine-attach-lock case (`worktree/reclaim/053`) or anything about `worktree reclaim`'s removal behavior for this row (already covered generally by `worktree/reclaim/052`'s never-removed assertions).
+- **Platform coverage:** mac+linux+windows.
+
+##### worktree/reclaim/055 — Auditor B4. `examine_worktrees` invoked from a SUBDIRECTORY of the root checkout (not the checkout root itself) still discovers a sibling isolated clone identically to invoking it from the root — pinning the fix `discover_isolated_clones`'s auditor A2 round made (deriving the scan anchor via `resolve_common_dir` rather than assuming `repo_dir` already is the root checkout), which reviewer/auditor had only re-verified manually (fork issue #325 M4).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — reuses `worktree/reclaim/049`'s exact fixture shape, calling `examine_worktrees` once against the repo root and once against a real subdirectory of it.
+- **Agent:** none.
+- **Asserts:** the isolated clone's `kind`, `owned`, `owner`, and `owner_kind` are identical whether `examine_worktrees` is called against the root checkout or a subdirectory of it.
+- **Does not assert:** any deeper nesting than one subdirectory level, or the linked-worktree enumeration's own behavior from a subdirectory (unaffected by this milestone).
+- **Platform coverage:** mac+linux+windows.
+
 #### worktree/guard
 
 ##### worktree/guard/001 — `dot-agent-deck worktree list` (fork issue #325 M2, dedicated detector does not exist yet) names a shallow enumerating repository as such, and stays silent for a normal, full-history one.
