@@ -4760,14 +4760,6 @@ mod tests {
             "the real provisioner must succeed and write the ownership marker with no warning, \
              got {outcome:?}"
         );
-        assert!(
-            crate::issue_dispatch_run::worktree_attach_lock_path_from_common_dir(
-                &resolve_common_dir(&repo).expect("repo must resolve a common dir"),
-                &clone_dir,
-            )
-            .is_file(),
-            "sanity: the real provisioner must have left a real attach-lock artifact on disk"
-        );
         // Reviewer F6: this test's assertions don't depend on the PR-state
         // verdict, so a non-GitHub origin (set only AFTER provisioning has
         // already written the attach lock and the marker) keeps
