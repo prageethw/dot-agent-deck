@@ -4421,6 +4421,64 @@ mod tests {
         ));
     }
 
+    // --- Issue #492: `deliver_on_idle`'s ungated pane-keyed write ---
+
+    /// Scenario: spawn a byte-observation agent bound to `pane_id`, standing
+    /// in for the occupant that was live when `spawn_or_reuse` snapshotted
+    /// `ReuseDecision::Reuse { pane_id }`. Then, standing in for the pane
+    /// being handed to a different agent during `deliver_on_idle`'s debounce
+    /// wait (up to `REUSE_DELIVERY_HARD_TIMEOUT` of drift), respawn a fresh
+    /// agent onto the SAME `pane_id_env` via `respawn_agent_for_pane` — the
+    /// real primitive a delegate `clear = true` or a natural respawn uses to
+    /// replace a pane's live occupant. Call `deliver_on_idle` with a zero
+    /// debounce so it delivers immediately, and assert the scheduled prompt
+    /// does NOT land in the new occupant's PTY: it was queued for whoever
+    /// occupied the pane at decision time, not for a stranger that has since
+    /// taken it over.
+    #[tokio::test]
+    async fn deliver_on_idle_refuses_a_pane_reused_since_the_reuse_decision() {
+        const PANE_ID: &str = "issue-492-deliver-on-idle-pane";
+        const SENTINEL: &str =
+            "issue-492 sentinel scheduled-task prompt, must not reach a stranger";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original_agent_id = spawn_byte_target(&registry, PANE_ID);
+
+        // Simulate the pane being reused by a different agent between the
+        // `ReuseDecision::Reuse { pane_id }` snapshot and this delivery — the
+        // real primitive production respawn/delegate uses.
+        #[cfg(unix)]
+        let respawn_command = "/bin/cat";
+        #[cfg(windows)]
+        let respawn_command = "more.com";
+        let reused_agent_id = registry
+            .respawn_agent_for_pane(PANE_ID, respawn_command)
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        assert_ne!(
+            original_agent_id, reused_agent_id,
+            "sanity: respawn must produce a NEW agent id occupying the same pane"
+        );
+
+        deliver_on_idle(&registry, PANE_ID, SENTINEL, Duration::from_millis(0)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let output = registry
+            .snapshot(&reused_agent_id)
+            .expect("snapshot the reused occupant's PTY");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            !output_str.contains(SENTINEL),
+            "deliver_on_idle wrote a scheduled-task prompt queued for the PREVIOUS occupant \
+             of pane {PANE_ID} into the pane's NEW occupant ({reused_agent_id}) instead of \
+             refusing: today's ungated `write_to_pane_and_submit` call resolves purely by \
+             pane_id_env, with no check that the occupant is still who the reuse decision was \
+             made for. output={output_str:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
     // C2 — a single-word command is not shell-wrapped and gets NO SHELL
     // override; a multi-word command is wrapped and carries the override.
     #[test]

@@ -2709,6 +2709,124 @@ mod hook_ingestion_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: issue #492 L1b. The `Dispatch` arm's result delivery
+    /// (`pty_registry.write_to_pane_and_submit(&signal.pane_id,
+    /// &result.message)`) resolves `signal.pane_id` purely by `pane_id_env`,
+    /// with no check that its live occupant is still the caller that issued
+    /// the dispatch — the same ungated shape as `handle_work_done`'s
+    /// feedback write. Run the real `run_hook_loop` (mirroring
+    /// `run_hook_loop_persists_agent_type_into_registry`'s fixture) against
+    /// a spawned byte-observation agent bound to a `pane_id_env`, then
+    /// simulate that pane being reused by a different agent — via
+    /// `respawn_agent_for_pane`, the real primitive a `clear = true`
+    /// delegate or a natural respawn uses — BEFORE the dispatch result comes
+    /// back, standing in for the real race: `handle_dispatch`'s
+    /// worktree/spawn I/O is slow enough for the caller's pane to have
+    /// changed hands by the time it returns. Send a `DaemonMessage::Dispatch`
+    /// over the hook socket naming an orchestration target that cannot
+    /// resolve (no `.dot-agent-deck.toml` in the working dir) — chosen so
+    /// `handle_dispatch` fails fast with a distinctive message, without
+    /// needing a real git repository — and assert that message does NOT
+    /// land in the reused occupant's PTY output: it was owed to the pane's
+    /// ORIGINAL caller, not to a stranger that has since taken over the
+    /// pane.
+    #[tokio::test]
+    async fn dispatch_result_writes_into_a_pane_reused_since_the_request() {
+        const CALLER_PANE: &str = "issue-492-l1b-caller-pane";
+        const TARGET_NAME: &str = "issue-492-l1b-sentinel-target";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let original_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                cwd: cwd.path().to_str(),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), CALLER_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the caller pane's original occupant");
+
+        // Simulate the caller pane being reused by a different agent before
+        // the dispatch result comes back.
+        let reused_agent_id = registry
+            .respawn_agent_for_pane(CALLER_PANE, "/bin/cat")
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        assert_ne!(
+            original_agent_id, reused_agent_id,
+            "sanity: respawn must produce a NEW agent id occupying the caller pane"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        // See the comment in `run_hook_loop_persists_agent_type_into_registry`
+        // above for why this binds without `bind_socket`.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let shutdown = Arc::new(Notify::new());
+
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+        });
+
+        // No `.dot-agent-deck.toml` in `cwd`, so this fails fast inside
+        // `decide_target_with_override`'s `Orchestration(Some(_))` branch —
+        // before any git worktree I/O — with a message naming TARGET_NAME.
+        let signal = crate::event::DispatchSignal {
+            pane_id: CALLER_PANE.to_string(),
+            name: TARGET_NAME.to_string(),
+            task: None,
+            shape: Some(crate::event::DispatchShape::Orchestration {
+                name: Some(TARGET_NAME.to_string()),
+            }),
+            timestamp: chrono::Utc::now(),
+        };
+        let line = serde_json::to_string(&DaemonMessage::Dispatch(signal))
+            .expect("serialize dispatch signal");
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect hook socket");
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write dispatch line");
+        stream.flush().await.unwrap();
+
+        // Delivery is asynchronous — poll for the result to land somewhere.
+        let mut output_str = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let output = registry
+                .snapshot(&reused_agent_id)
+                .expect("snapshot the reused occupant's PTY");
+            output_str = String::from_utf8_lossy(&output).into_owned();
+            if output_str.contains(TARGET_NAME) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            !output_str.contains(TARGET_NAME),
+            "the dispatch result (naming target '{TARGET_NAME}') was written into the caller \
+             pane's NEW occupant ({reused_agent_id}) instead of being refused: today's ungated \
+             write_to_pane_and_submit call in the `Dispatch` arm of `run_hook_loop` resolves \
+             signal.pane_id purely by pane_id_env, with no check that the occupant is still the \
+             caller that issued the dispatch. output={output_str:?}"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        registry.shutdown_all();
+    }
+
     /// Scenario: PRD #370's whole point, end to end, **restimulated for PRD
     /// #386 M3**. Spawn a real `/bin/sh` pane, seed it a known session the way
     /// a real hook `SessionStart` would (so `AppState::pane_hook_session_id`

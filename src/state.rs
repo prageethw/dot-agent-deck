@@ -8506,6 +8506,113 @@ clear = false
         );
     }
 
+    /// Scenario: issue #492 L1a. The feedback write at the very end of
+    /// `handle_work_done` (`registry.write_to_pane_and_submit(&orch_pane_id,
+    /// &feedback)`) resolves `orch_pane_id` purely by `pane_id_env`, with no
+    /// check that its live occupant is still the orchestrator the worker was
+    /// delegated under — unlike `AgentPtyRegistry::deliver_worker_exited_notice`,
+    /// which binds to an `expected_agent_id` and revalidates before writing.
+    /// Register an orchestrator pane and a worker pane under the same
+    /// orchestration via the real reserve→confirm chain (so the signal's
+    /// generation/boot-id gate passes, as in
+    /// `handle_work_done_delivers_when_signal_carries_the_reserved_generation`),
+    /// spawn a real byte-observation agent bound to the orchestrator's
+    /// `pane_id_env`, then simulate that pane being reused by a DIFFERENT
+    /// agent between the delegation and this work-done report — via
+    /// `respawn_agent_for_pane`, the real primitive a `clear = true`
+    /// delegate or a natural respawn uses. Arm a delegation commission so
+    /// the completion is SOLICITED (`handle_work_done`'s normal path), then
+    /// delivers a work-done signal for the worker pane and assert the
+    /// composed feedback text does NOT appear in the reused occupant's PTY
+    /// output: it was owed to the orchestrator that commissioned the work,
+    /// not to a stranger that has since taken over its pane.
+    #[tokio::test]
+    async fn handle_work_done_writes_feedback_into_a_pane_reused_since_the_delegation() {
+        const ORCH_PANE: &str = "issue-492-l1a-orch-pane";
+        const WORKER_PANE: &str = "issue-492-l1a-worker-pane";
+        const SENTINEL: &str = "issue-492-l1a-sentinel-task";
+
+        let identity = instance("orch-issue-492-l1a");
+        let mut state = AppState::default();
+
+        let orch_generation = state.reserve_registration_generation(ORCH_PANE);
+        state.confirm_orchestration_role(
+            ORCH_PANE,
+            "orchestrator",
+            true,
+            identity.clone(),
+            None,
+            orch_generation,
+        );
+        let worker_generation = state.reserve_registration_generation(WORKER_PANE);
+        state.confirm_orchestration_role(
+            WORKER_PANE,
+            "coder",
+            false,
+            identity,
+            None,
+            worker_generation,
+        );
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        #[cfg(unix)]
+        let byte_command = "/bin/cat";
+        #[cfg(windows)]
+        let byte_command = "more.com";
+        let original_orch_agent_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    ORCH_PANE.to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the orchestrator pane's original occupant");
+
+        // Simulate the orchestrator pane being reused by a different agent
+        // between the delegation and this work-done report.
+        let reused_agent_id = registry
+            .respawn_agent_for_pane(ORCH_PANE, byte_command)
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        assert_ne!(
+            original_orch_agent_id, reused_agent_id,
+            "sanity: respawn must produce a NEW agent id occupying the orchestrator pane"
+        );
+
+        assert!(
+            registry.arm_delegation_commission(WORKER_PANE, ORCH_PANE),
+            "neither pane is mid-close, arming must succeed"
+        );
+
+        let signal = WorkDoneSignal {
+            pane_id: WORKER_PANE.to_string(),
+            task: SENTINEL.to_string(),
+            done: false,
+            timestamp: Utc::now(),
+            generation: worker_generation,
+            daemon_boot_id: state.daemon_boot_id().to_string(),
+        };
+        state.handle_work_done(signal, &registry).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let output = registry
+            .snapshot(&reused_agent_id)
+            .expect("snapshot the reused occupant's PTY");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            !output_str.contains(SENTINEL),
+            "handle_work_done wrote the worker's feedback into the orchestrator pane's NEW \
+             occupant ({reused_agent_id}) instead of refusing: today's ungated \
+             write_to_pane_and_submit call at the end of handle_work_done resolves purely by \
+             pane_id, with no check that the occupant is still the orchestrator the worker was \
+             delegated under. output={output_str:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
     /// Scenario: model a daemon restart as two SEPARATE `AppState` instances
     /// (a restart is a fresh process with fresh in-memory state, not one
     /// state reused twice). Register pane "P" for orchestration A in

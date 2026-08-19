@@ -7990,6 +7990,79 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: issue #492 M3. `set_pending_seed` and
+    /// `take_pending_seed_fallback` both resolve their target purely by
+    /// matching `pane_id_env`, with no `!exited` filter — unlike
+    /// `spawn_agent`'s duplicate-pane-id check and `has_live_pane` in this
+    /// same file, which both skip exited entries. Mirrors
+    /// `registry_allows_pane_id_reuse_when_prior_agent_has_exited`'s
+    /// fixture: spawn `/usr/bin/true` (exits almost immediately) bound to a
+    /// `pane_id_env`, wait for the reader thread to observe EOF and flip
+    /// `exited` while the entry stays retained in the registry (`len() ==
+    /// 1`, `live_count() == 0` — the "stale record not yet reaped" shape
+    /// issue #492 describes), then set a seed against that same
+    /// still-registered but exited `pane_id_env` and read it back through
+    /// the fallback taker. There is no live agent to target at all — only
+    /// the stale exited record — so a seed that round-trips proves both
+    /// functions will silently bind to a dead record instead of refusing
+    /// when no live occupant exists to deliver it to. (A fixture with a
+    /// SECOND, live agent ALSO sharing `pane_id_env` — the literal
+    /// "stranger" shape from issue #492 — was deliberately not built here:
+    /// which of the two records `HashMap` iteration resolves first is
+    /// unspecified and not reproducible deterministically, so such a test
+    /// would pass or fail depending on hash-seed luck rather than on the
+    /// code. This construction isolates the missing filter itself, which is
+    /// deterministic regardless of iteration order because only one
+    /// candidate ever exists.)
+    #[tokio::test]
+    async fn seed_fallback_set_and_take_resolve_an_exited_record_with_no_live_filter() {
+        const PANE_ID_ENV: &str = "issue-492-seed-fallback-pane";
+        const SEED: &str =
+            "issue-492 sentinel seed - must never round-trip through an exited record";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _stale_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID_ENV.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        // Wait for the reader thread to observe EOF and flip `exited` — the
+        // entry stays retained (not reaped) until something explicitly
+        // closes it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: /usr/bin/true must have exited"
+        );
+        assert_eq!(registry.len(), 1, "exited entry must still be in registry");
+
+        // No live agent occupies this pane_id_env at all — only the stale
+        // exited record. The correct/desired behavior is to refuse (no live
+        // target to deliver a seed to); today's code has no such filter.
+        registry.set_pending_seed(PANE_ID_ENV, SEED);
+        let taken = registry.take_pending_seed_fallback(PANE_ID_ENV);
+        assert_eq!(
+            taken, None,
+            "set_pending_seed/take_pending_seed_fallback resolved {PANE_ID_ENV}'s stale, \
+             exited-but-not-yet-reaped registry entry with no live occupant — neither function \
+             filters on `!exited` the way `spawn_agent`'s duplicate check and `has_live_pane` \
+             do, so a seed can be silently bound to (and delivered from) a dead record instead \
+             of being refused; got {taken:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
     #[tokio::test]
     async fn registry_allows_pane_id_reuse_when_prior_agent_has_exited() {
         // Round-10 auditor #3: the duplicate-pane-id check must mirror
