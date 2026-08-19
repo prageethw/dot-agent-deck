@@ -1102,13 +1102,24 @@ async fn compute_write_and_submit_outcome(
                     })
                     .await
             } else {
+                // Issue #494: a paned target has no upstream gate equivalent to the
+                // paneless branch's `None => Writable::None` above — `Writable::Live`
+                // here is reached by `pane_writable` alone, keyed by `pane_id`, with
+                // no requirement that the caller named an agent at all. Mirroring PR
+                // #477's fix for issue #465's identical bug class (`state.rs`'s
+                // `dispatch_one_owned`): treat an unresolved/absent identity as no
+                // verified target rather than falling through to an unguarded write
+                // keyed by pane_id alone.
+                let Some(expected_agent_id) = extras.expected_agent_id.as_deref() else {
+                    return Ok(SendResult::NoLiveTarget);
+                };
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
                 registry
                     .write_and_submit_guarded(
                         pane_id,
                         text,
-                        extras.expected_agent_id.as_deref(),
+                        Some(expected_agent_id),
                         move || async move {
                             // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
                             // stale-pre-lock-snapshot CLASS close: this closure is
@@ -1148,13 +1159,25 @@ async fn compute_write_and_submit_outcome(
                             // (always). A `None` current-session (the session ended,
                             // or none was recorded) is refused too on an attached,
                             // live-interactive pane — never a silent accept.
-                            if let Some(expected) = expected_session.as_deref() {
-                                match guard.pane_hook_session_id(&pane_for_check) {
+                            //
+                            // Issue #494: that same "refused too" rule must also fire
+                            // when the CALLER'S `expected_session` is `None` — a
+                            // caller that named no session generation at all supplies
+                            // strictly less confidence than one whose named session
+                            // simply isn't recorded, so it cannot be treated more
+                            // permissively. Matching on `expected_session` (rather
+                            // than `if let Some`) makes that `None`-caller case an
+                            // explicit arm instead of a silently skipped one.
+                            match expected_session.as_deref() {
+                                Some(expected) => match guard.pane_hook_session_id(&pane_for_check)
+                                {
                                     Some(current) if current != expected => return false,
                                     Some(_) => {}
                                     None if has_live_attach => return false,
                                     None => {}
-                                }
+                                },
+                                None if has_live_attach => return false,
+                                None => {}
                             }
                             true
                         },
