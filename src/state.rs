@@ -10979,15 +10979,16 @@ clear = false
             daemon_boot_id: state.daemon_boot_id().to_string(),
         };
 
-        let registry = AgentPtyRegistry::new();
-        // Issue #448: an UNSOLICITED completion is never written to disk —
-        // only a report crediting an outstanding commission is. This test is
-        // about the generation/boot-id gate, not the commission ledger, so
-        // arm one here to isolate the two: without it, the signal would be
-        // refused as unsolicited regardless of whether the gate passed.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // Issue #448: `handle_work_done` only delivers when the completion is
+        // SOLICITED — a `WorkDoneProvenance::Unsolicited` is inlined into the
+        // orchestrator feedback instead of written to disk (see the comment
+        // above `let channel = match provenance` in `handle_work_done`). This
+        // test predates that gating and must arm a commission for "P" itself
+        // or it now proves nothing about the reserve→confirm→signal chain.
         assert!(
-            registry.arm_delegation_commission("P", "orch-chain-pane"),
-            "precondition: arming the commission must succeed against a fresh registry"
+            registry.arm_delegation_commission("P", "orchestrator-pane"),
+            "pane P is not mid-close, arming must succeed"
         );
         state.handle_work_done(signal, &registry).await;
 
