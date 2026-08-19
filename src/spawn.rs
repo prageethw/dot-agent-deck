@@ -7335,6 +7335,100 @@ mod tests {
         ));
     }
 
+    // --- Issue #492: `deliver_on_idle`'s ungated pane-keyed write ---
+
+    /// Scenario: PR #507 fix-round rework (reviewer M2/M3, auditor S3). The
+    /// original respawn-based construction pinned the WRONG invariant — its
+    /// guard asked "did the occupant ever arrive via a respawn?" rather than
+    /// "is the occupant still who the reuse decision named?", and `clear`
+    /// defaults to `true` so a respawn successor is the *normal* state, not
+    /// a rare one. `deliver_on_idle`'s guard now checks
+    /// `authorized_pane_occupant` against the pane's currently-authorized
+    /// occupant instead.
+    /// Positive control: spawn a byte-observation agent bound to a pane and
+    /// call `deliver_on_idle` with nobody in between — the prompt must still
+    /// land, proving the assertion below isn't satisfied by an
+    /// unconditionally-refusing implementation. Race: spawn a
+    /// byte-observation agent, close it (`AgentPtyRegistry::close_agent`,
+    /// standing in for the occupant exiting or being closed), then bind a
+    /// completely unrelated agent onto the SAME `pane_id_env` via a plain
+    /// `spawn_agent` call — never `respawn_agent_for_pane` — which is the
+    /// actual threat `write_notice_guarded`'s own doc names ("a previous
+    /// occupant's `pane_id_env` frees up for the next spawn"). Assert the
+    /// scheduled prompt does NOT land in that new, unrelated occupant's PTY.
+    #[tokio::test]
+    async fn deliver_on_idle_refuses_a_pane_reused_since_the_reuse_decision() {
+        const CONTROL_PANE: &str = "issue-492-deliver-on-idle-control-pane";
+        const RACE_PANE: &str = "issue-492-deliver-on-idle-race-pane";
+        const CONTROL_SENTINEL: &str = "issue-492 sentinel scheduled-task prompt, ordinary case";
+        const RACE_SENTINEL: &str =
+            "issue-492 sentinel scheduled-task prompt, must not reach a stranger";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        // Positive control: nobody took the pane over between the reuse
+        // decision and delivery — the ordinary, common case.
+        let control_agent_id = spawn_byte_target(&registry, CONTROL_PANE);
+        deliver_on_idle(
+            &registry,
+            CONTROL_PANE,
+            &control_agent_id,
+            CONTROL_SENTINEL,
+            Duration::from_millis(0),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let control_output = registry
+            .snapshot(&control_agent_id)
+            .expect("snapshot the unchanged occupant's PTY");
+        assert!(
+            String::from_utf8_lossy(&control_output).contains(CONTROL_SENTINEL),
+            "positive control: deliver_on_idle must still deliver into a pane whose occupant \
+             has not changed since the reuse decision — otherwise the race assertion below \
+             would pass for the wrong reason (an implementation that unconditionally refuses)"
+        );
+
+        // Race: the occupant `ReuseDecision::Reuse { pane_id }` was decided
+        // against closes, and a completely FRESH `spawn_agent` call — not a
+        // respawn — binds an unrelated agent onto the SAME pane_id_env
+        // before delivery fires.
+        let original_agent_id = spawn_byte_target(&registry, RACE_PANE);
+        registry
+            .close_agent(&original_agent_id)
+            .expect("close the reuse decision's original occupant");
+        let reused_agent_id = spawn_byte_target(&registry, RACE_PANE);
+        assert_ne!(
+            original_agent_id, reused_agent_id,
+            "sanity: the fresh spawn onto the freed pane_id_env must produce a NEW agent id"
+        );
+
+        deliver_on_idle(
+            &registry,
+            RACE_PANE,
+            &original_agent_id,
+            RACE_SENTINEL,
+            Duration::from_millis(0),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let race_output = registry
+            .snapshot(&reused_agent_id)
+            .expect("snapshot the reused occupant's PTY");
+        let race_output_str = String::from_utf8_lossy(&race_output);
+        assert!(
+            !race_output_str.contains(RACE_SENTINEL),
+            "deliver_on_idle wrote a scheduled-task prompt into a pane whose ORIGINAL occupant \
+             had closed and been replaced by a completely unrelated fresh `spawn_agent` call \
+             (never a respawn) instead of refusing: a fresh spawn never claims \
+             `authorized_pane_occupant` (insert-if-absent), so this handover should have left \
+             the stale value in place and mismatched the stranger — the actual threat \
+             `write_notice_guarded`'s doc names. output={race_output_str:?}"
+        );
+
+        registry.shutdown_all();
+    }
+
     // C2 — a single-word command is not shell-wrapped and gets NO SHELL
     // override; a multi-word command is wrapped and carries the override.
     #[test]

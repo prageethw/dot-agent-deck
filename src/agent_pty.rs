@@ -3303,6 +3303,47 @@ pub struct AgentPtyRegistry {
     /// delivery. Grows by agents spawned in one daemon's lifetime, like
     /// [`Self::user_input_at`] (negligible: one short string each).
     launcher_handoff_agents: Mutex<HashMap<String, AgentType>>,
+    /// Issue #492 (fix round 2): the agent id each `pane_id_env` is currently
+    /// AUTHORIZED to receive an automated write for — a scheduled task's
+    /// `deliver_on_idle`, `handle_work_done`'s orchestrator feedback, the
+    /// daemon's `Dispatch` result arm, and the seed-injection fallback all
+    /// resolve their target purely by `pane_id_env`, with no caller-supplied
+    /// identity of their own to verify against, so this is the identity they
+    /// bind [`Self::write_and_submit_guarded`]'s `expected_agent_id` to.
+    ///
+    /// This replaces round 1's `respawn_successor_agents`: marking "this id
+    /// was EVER produced by a respawn" refused a write forever after the
+    /// FIRST respawn, on every pane a `clear = true` delegate ever touched —
+    /// and `clear` defaults to `true` (`project_config::default_clear`), so
+    /// that was most delegated workers, permanently (reviewer/auditor
+    /// blockers B1/B2). It also never caught the actual threat: a fresh
+    /// `spawn_agent` reusing a `pane_id_env` after the prior occupant closed
+    /// never goes through a respawn, so it was never marked and always let
+    /// the write through (B3(a)/S3) — the exact case
+    /// [`Self::write_notice_guarded`]'s doc names.
+    ///
+    /// The correct invariant is per-PANE, not per-agent, and self-clears on
+    /// every LEGITIMATE handover instead of latching forever:
+    /// - [`Self::spawn_agent`] records the entry the FIRST time a
+    ///   `pane_id_env` is ever seen (insert-if-absent) — the pane's original
+    ///   occupant becomes the baseline.
+    /// - [`Self::respawn_agent_for_pane`] OVERWRITES it unconditionally on
+    ///   every respawn: a respawn is a controlled, intentional handover
+    ///   (`handle_delegate`'s `clear = true` path), so the new successor
+    ///   becomes the new authorized occupant — a pane respawned any number
+    ///   of times over its life keeps passing.
+    /// - A bare `spawn_agent` that reuses a `pane_id_env` already present
+    ///   here (the previous occupant closed or crashed, and something else
+    ///   bound a fresh, unrelated agent onto the freed id) does NOT update
+    ///   the entry, so the stale value mismatches the new live occupant at
+    ///   write time and the guarded write refuses the stranger.
+    ///
+    /// Keyed by `pane_id_env` (a `String`, unlike [`Self::launcher_handoff_agents`]'s
+    /// agent-id key) and never REMOVED — matching that field's never-cleared
+    /// pattern — but values ARE overwritten on respawn, so growth is bounded
+    /// by the number of DISTINCT `pane_id_env` strings ever used in one
+    /// daemon's lifetime, not by respawn or spawn count.
+    authorized_pane_occupant: Mutex<HashMap<String, String>>,
     /// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger
     /// for guarded write-and-submit. Keyed by the caller's stable `delivery_id`;
     /// each record binds the id to a fingerprint of the target agent identity,
@@ -4076,6 +4117,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             launcher_handoff_agents: Mutex::new(HashMap::new()),
+            authorized_pane_occupant: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
             delivery_notice_sink: Mutex::new(None),
@@ -5552,6 +5594,46 @@ impl AgentPtyRegistry {
             })
     }
 
+    /// Issue #492 (fix round 2): record `agent_id` as `pane_id_env`'s
+    /// authorized occupant the FIRST time this `pane_id_env` is ever seen —
+    /// a no-op if an entry already exists, so reusing a `pane_id_env` after
+    /// its prior occupant closed does NOT grant the new, unrelated agent
+    /// standing. Called from [`Self::spawn_agent`]. See
+    /// [`Self::authorized_pane_occupant`].
+    fn record_authorized_occupant_if_new(&self, pane_id_env: &str, agent_id: &str) {
+        self.authorized_pane_occupant
+            .lock()
+            .unwrap()
+            .entry(pane_id_env.to_string())
+            .or_insert_with(|| agent_id.to_string());
+    }
+
+    /// Issue #492 (fix round 2): unconditionally overwrite `pane_id_env`'s
+    /// authorized occupant — called only from [`Self::respawn_agent_for_pane`],
+    /// a controlled, intentional handover, so the respawn successor becomes
+    /// the new authorized occupant rather than being refused. See
+    /// [`Self::authorized_pane_occupant`].
+    fn set_authorized_occupant(&self, pane_id_env: &str, agent_id: &str) {
+        self.authorized_pane_occupant
+            .lock()
+            .unwrap()
+            .insert(pane_id_env.to_string(), agent_id.to_string());
+    }
+
+    /// Issue #492 (fix round 2): the agent id `pane_id_env` is currently
+    /// authorized to receive an automated write for, if any — see
+    /// [`Self::authorized_pane_occupant`]. The four automated background
+    /// writers this guards (`deliver_on_idle`, `handle_work_done` feedback,
+    /// the `Dispatch` result arm, the seed-injection fallback) pass this as
+    /// [`Self::write_and_submit_guarded`]'s `expected_agent_id`.
+    pub fn authorized_occupant(&self, pane_id_env: &str) -> Option<String> {
+        self.authorized_pane_occupant
+            .lock()
+            .unwrap()
+            .get(pane_id_env)
+            .cloned()
+    }
+
     /// Issue #570: whether THIS DAEMON spawned `agent_id` as an agent type it
     /// selected itself, and that type reports submitted prompts.
     ///
@@ -6038,6 +6120,10 @@ impl AgentPtyRegistry {
         let registry_for_thread = Arc::downgrade(self);
         let agent_id_for_thread = preallocated_id.clone();
         let pane_id_env_for_thread = pane_id_env.clone();
+        // Issue #492 (fix round 2): clone before `pane_id_env_for_thread`
+        // moves into the reader thread's closure below, so it survives to
+        // the authorized-occupant record after the `inner` lock is dropped.
+        let pane_id_env_for_occupant_record = pane_id_env_for_thread.clone();
         // Captured HERE, at spawn time, rather than inside
         // `pump_reader` itself — `Handle::try_current()` must run on a
         // thread that is currently inside a tokio runtime, and `spawn_agent`
@@ -6121,6 +6207,15 @@ impl AgentPtyRegistry {
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
+        drop(inner);
+        // Issue #492 (fix round 2): record this as the pane's authorized
+        // occupant the first time this `pane_id_env` is ever seen — a no-op
+        // if a respawn or an earlier spawn already claimed it. Dropped
+        // `inner` above first so this (a separate lock) is never nested
+        // with it. See [`Self::authorized_pane_occupant`].
+        if let Some(ref claimed) = pane_id_env_for_occupant_record {
+            self.record_authorized_occupant_if_new(claimed, &id);
+        }
         Ok(id)
     }
 
@@ -7185,6 +7280,13 @@ impl AgentPtyRegistry {
             agent_type: respawn_agent_type,
         };
         let new_agent_id = self.spawn_agent(opts)?;
+        // Issue #492 (fix round 2): a respawn is a controlled, intentional
+        // handover, so the successor becomes the pane's new authorized
+        // occupant — overwriting whatever `spawn_agent`'s insert-if-new call
+        // above left in place (a no-op there, since this `pane_id_env`
+        // already had an entry from its original spawn). See
+        // [`Self::authorized_pane_occupant`].
+        self.set_authorized_occupant(pane_id_env, &new_agent_id);
         // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
         // card keeps the agent label the previous child taught us (`list_agents`
         // → `AgentRecord.agent_type`) instead of reverting to "No agent" until
@@ -8727,23 +8829,28 @@ impl AgentPtyRegistry {
     #[cfg(test)]
     pub fn take_pending_seed_fallback(&self, pane_id_env: &str) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
-        let agent = inner
-            .agents
-            .values_mut()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))?;
+        let agent = inner.agents.values_mut().find(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        })?;
         agent.pending_seed.take()
     }
 
     /// PRD #201: whether this pane's seed was delivered via the NATIVE
     /// `get-seed` pull (vs. the PTY-injection fallback, or not yet delivered).
     /// Test observable that distinguishes native delivery from the safety net.
+    ///
+    /// Issue #492 M1: filters `!exited`, matching
+    /// [`Self::take_pending_seed_native`] — see that method's doc for why an
+    /// unfiltered lookup can resolve the wrong record.
     pub fn seed_delivered_native(&self, pane_id_env: &str) -> bool {
         self.inner
             .lock()
             .unwrap()
             .agents
             .values()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+            .find(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })
             .map(|a| a.seed_delivered_native)
             .unwrap_or(false)
     }
@@ -10699,6 +10806,163 @@ mod spawn_tests {
 
         registry.shutdown_all();
     }
+
+    /// Scenario: PR #507 fix-round rework (reviewer B1, auditor BLOCKER B1),
+    /// updated for issue #916/#617's later `arm_seed_fallback`/
+    /// `take_pending_seed_fallback_for` rework: `expected_agent_id` is now a
+    /// PARAMETER the caller supplies at arm time (the id the seed was just
+    /// stashed for), rather than resolved internally via
+    /// `authorized_pane_occupant` — the round-1 invariant
+    /// (`authorized_pane_occupant`, "was this id ever produced by a
+    /// respawn") which could never tell "the intended recipient, unchanged"
+    /// apart from "a stranger". Positive control: run the real production
+    /// sequence — spawn, respawn onto the same `pane_id_env`
+    /// (`respawn_agent_for_pane`, `handle_delegate`'s only path to this
+    /// function), stash a seed for the respawn successor, arm the fallback
+    /// with that successor's id and a short grace — with NOTHING else
+    /// happening before grace elapses. The seed was stashed for exactly
+    /// this occupant, so delivery must succeed. Race: after the seed is
+    /// stashed and the fallback armed, the respawn successor's PTY closes
+    /// (`AgentPtyRegistry::close_agent`, which REMOVES the record) and a
+    /// completely FRESH `spawn_agent` call — never another respawn — binds
+    /// an unrelated agent onto the SAME `pane_id_env` before grace elapses
+    /// (the actual threat `write_notice_guarded`'s doc names):
+    /// `take_pending_seed_fallback_for` looks the armed id up directly, and
+    /// that record is gone, so the fallback refuses rather than falling
+    /// back to whichever record now holds the pane. Assert the seed does
+    /// NOT reach that stranger.
+    /// ("was this id ever produced by a respawn"), which could never tell
+    /// "the intended recipient, unchanged" apart from "a stranger". Positive
+    /// control: run the real production sequence — spawn, respawn onto the
+    /// same `pane_id_env` (`respawn_agent_for_pane`, `handle_delegate`'s only
+    /// path to this function), stash a seed for the respawn successor, arm
+    /// the fallback with a short grace — with NOTHING else happening before
+    /// grace elapses. The seed was stashed for exactly this occupant, and
+    /// `set_authorized_occupant` records the respawn successor as such, so
+    /// delivery must succeed. Race: after the seed is stashed and the
+    /// fallback armed, the respawn successor's PTY closes
+    /// (`AgentPtyRegistry::close_agent`) and a completely FRESH
+    /// `spawn_agent` call — never another respawn — binds an unrelated
+    /// agent onto the SAME `pane_id_env` before grace elapses (the actual
+    /// threat `write_notice_guarded`'s doc names): the fresh spawn never
+    /// claims `authorized_pane_occupant`
+    /// (`record_authorized_occupant_if_new` is insert-if-absent), so the
+    /// stale, pre-respawn value stays in place and mismatches the stranger.
+    /// Assert the seed does NOT reach that stranger.
+    #[tokio::test]
+    async fn arm_seed_fallback_refuses_a_pane_reused_since_the_seed_was_stashed() {
+        const CONTROL_PANE: &str = "issue-492-seed-control-pane";
+        const RACE_PANE: &str = "issue-492-seed-race-pane";
+        const CONTROL_SEED: &str = "issue-492 sentinel seed - ordinary delivery, unchanged pane";
+        const RACE_SEED: &str = "issue-492 sentinel seed - must never round-trip to a stranger";
+        const GRACE: Duration = Duration::from_millis(500);
+
+        #[cfg(unix)]
+        let byte_command = "/bin/cat";
+        #[cfg(windows)]
+        let byte_command = "more.com";
+
+        // --- Positive control: nothing happens after the seed is armed ---
+        let control_registry = Arc::new(AgentPtyRegistry::new());
+        let _control_original_id = control_registry
+            .spawn_agent(SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), CONTROL_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the control pane's original occupant");
+        let control_new_agent_id = control_registry
+            .respawn_agent_for_pane(CONTROL_PANE, byte_command)
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        control_registry.set_pending_seed(CONTROL_PANE, CONTROL_SEED);
+        arm_seed_fallback(
+            control_registry.clone(),
+            CONTROL_PANE.to_string(),
+            control_new_agent_id.clone(),
+            GRACE,
+        );
+        tokio::time::sleep(GRACE + Duration::from_millis(300)).await;
+        let control_output = control_registry
+            .snapshot(&control_new_agent_id)
+            .expect("snapshot the respawn successor's PTY");
+        assert!(
+            String::from_utf8_lossy(&control_output).contains(CONTROL_SEED),
+            "positive control: arm_seed_fallback must still deliver a seed to the SAME respawn \
+             successor it was stashed for when nothing else has happened — otherwise the race \
+             assertion below would pass for the wrong reason (an implementation that \
+             unconditionally refuses)"
+        );
+        control_registry.shutdown_all();
+
+        // --- Race: the respawn successor closes before grace elapses, and
+        // a fresh, unrelated spawn takes over the same pane_id_env ---
+        let race_registry = Arc::new(AgentPtyRegistry::new());
+        let _race_original_id = race_registry
+            .spawn_agent(SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), RACE_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the race pane's original occupant");
+        let respawned_agent_id = race_registry
+            .respawn_agent_for_pane(RACE_PANE, byte_command)
+            .await
+            .expect("respawn onto the same pane_id_env must succeed");
+        race_registry.set_pending_seed(RACE_PANE, RACE_SEED);
+        arm_seed_fallback(
+            race_registry.clone(),
+            RACE_PANE.to_string(),
+            respawned_agent_id.clone(),
+            GRACE,
+        );
+
+        race_registry
+            .close_agent(&respawned_agent_id)
+            .expect("close the respawn successor before the fallback fires");
+        let stranger_agent_id = race_registry
+            .spawn_agent(SpawnOptions {
+                command: Some(byte_command),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), RACE_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("fresh spawn onto the freed pane_id_env");
+        assert_ne!(
+            respawned_agent_id, stranger_agent_id,
+            "sanity: the fresh spawn onto the freed pane_id_env must produce a NEW agent id"
+        );
+
+        tokio::time::sleep(GRACE + Duration::from_millis(300)).await;
+        let race_output = race_registry
+            .snapshot(&stranger_agent_id)
+            .expect("snapshot the stranger's PTY");
+        let race_output_str = String::from_utf8_lossy(&race_output);
+        assert!(
+            !race_output_str.contains(RACE_SEED),
+            "arm_seed_fallback injected a seed stashed for a respawn successor into a \
+             completely UNRELATED stranger ({stranger_agent_id}) that took over the same \
+             pane_id_env via a fresh spawn_agent call after the successor closed: a fresh spawn \
+             never claims `authorized_pane_occupant` (insert-if-absent), so this handover \
+             should have left the stale value in place and mismatched the stranger. \
+             output={race_output_str:?}"
+        );
+
+        race_registry.shutdown_all();
+    }
+
+    // `take_pending_seed_native_and_seed_delivered_native_refuse_an_exited_record`
+    // (issue #492 M1, PR #507 fix round) was retired here on issue #916/#617.
+    // It asserted `take_pending_seed_native` refuses a stale, exited-but-
+    // not-yet-reaped record — but #916 made that refusal live on a NEW,
+    // identity-scoped sibling, `take_pending_seed_native_for`, deliberately
+    // keeping the bare `take_pending_seed_native` UNFILTERED as a
+    // `#[cfg(test)]`-only raw probe (see its own doc comment above) so a
+    // test can observe a pane's slot the way an extension would, regardless
+    // of liveness. This test's premise — that the bare function refuses —
+    // is therefore now false by design, and the property it existed to pin
+    // (an exited record must not answer a native pull) is what
+    // `native_seed_pull_skips_an_exited_record_and_a_stranger` above already
+    // proves against the current, identity-scoped function.
 
     #[tokio::test]
     async fn registry_allows_pane_id_reuse_when_prior_agent_has_exited() {
