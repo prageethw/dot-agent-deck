@@ -3725,6 +3725,13 @@ without depending on the config struct API.
 - **Does not assert:** a production fix — diagnosis only, per the delegating task. Whether *this specific way* of reaching a non-live focused pane (a self-declaring script) matches how the reporter's own session actually went non-live (their agent CLI is still unconfirmed) — only that the swallow gate, once reached, behaves exactly as `newpane/001`-`003`'s shared `open_orchestration` setup would need it to for issue #521 to be explained this way.
 - **Platform coverage:** linux (Unix-only: the self-declaring script is a `/bin/sh` + `python3` fixture, mirroring `pane_input_007`'s own `#[cfg(unix)]` gate).
 
+##### orchestration/newpane/005 — `Ctrl+n` after a SECOND concurrent orchestration is opened, on both the second tab's own pane and (after switching back) the first tab's pane (issue #521 second-orchestration hypothesis).
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** a FIRST orchestration is opened with a blank Worktree slug in the fixture's directory; back on the Dashboard, a SECOND orchestration is opened against the SAME directory with a typed Worktree slug, which `root_checkout_has_live_sibling`'s `AnySharedCommonDir` scope resolves to `774526ed`/`cb1df96d`'s isolated-clone provisioning (`provision_isolated_clone_sync`) since the first orchestration is still live in that directory — the one Nth-concurrent-orchestration code path `001`-`004` never exercise. With the SECOND orchestration's own orchestrator pane focused, `Ctrl+n` is asserted to open the ` Select Directory ` popup. The test then switches back (`Ctrl+PageUp`) to the FIRST orchestration's tab and asserts `Ctrl+n` opens the popup there too, checking whether any state the second open leaves behind is scoped to the second tab or is deck-global (`UiState`, `src/ui.rs`, is one struct shared by every tab).
+- **Does not assert:** a production fix — diagnosis only, per the delegating task. Whether this particular route to a second concurrent orchestration (typed-slug, same directory) matches the reporter's own setup exactly — only that it is the one Nth-orchestration code path (isolated-clone provisioning) flagged as untested by every prior hypothesis in this file.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.

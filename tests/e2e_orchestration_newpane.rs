@@ -32,13 +32,23 @@
 //! state or focus history — which is exactly why `001`-`003` could not have
 //! exercised this path no matter which angle they varied.
 //!
+//! `005` isolates a FOURTH angle: the reporter later narrowed the repro to
+//! "this happens from second orchestras tab" — i.e. specifically once a
+//! SECOND concurrent orchestration is open, not tied to encoding, focus-reach
+//! path, or session liveness (all ruled out above). `001`-`004` all open
+//! exactly one orchestration tab, so none of them exercise
+//! `774526ed`/`cb1df96d` (PRD fork#325 M3, both already ancestors of this
+//! branch's HEAD) — the isolated-clone provisioning that fires specifically
+//! for the Nth concurrent orchestration against a root checkout a live
+//! sibling already shares.
+//!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
 mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, commit_fixture, open_orchestration_with_slug};
 use dot_agent_deck::event::Writable;
 use spec::spec;
 
@@ -289,5 +299,91 @@ exec cat
          non_live_input_feedback status message never appeared either — \
          Ctrl+n was swallowed by something other than the expected gate.\n\
          Grid:\n{grid}"
+    );
+}
+
+/// Scenario: issue #521, second-concurrent-orchestration hypothesis. Open a
+/// FIRST orchestration with a blank Worktree slug in the `orch-deck` fixture,
+/// return to the Dashboard, then open a SECOND orchestration against the SAME
+/// directory with a TYPED Worktree slug — routing the spawn through
+/// `root_checkout_has_live_sibling`'s `AnySharedCommonDir` scope, which
+/// `774526ed`/`cb1df96d` (PRD fork#325 M3, both already ancestors of this
+/// branch's HEAD) resolve to the isolated-clone provisioning arm
+/// (`provision_isolated_clone_sync`) because the FIRST orchestration is
+/// already live in `req.dir`. This is the one Nth-concurrent-orchestration
+/// code path none of `001`-`004` exercised — they all open exactly one
+/// orchestration tab. With the SECOND orchestration's own orchestrator pane
+/// focused, press `Ctrl+n` and confirm the directory picker opens. Then
+/// switch back to the FIRST orchestration's tab and press `Ctrl+n` there too
+/// — `UiState` (`src/ui.rs`) is a single struct shared by every tab, so if
+/// whatever the second open leaves behind is deck-global rather than scoped
+/// to the second tab, the first tab would be silently blocked as well.
+#[spec("orchestration/newpane/005")]
+#[test]
+fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-deck");
+    let work = deck.workdir().to_path_buf();
+    // Issue #489: the second `open_orchestration_with_slug` call below needs
+    // a ref to branch from — `git worktree add`/the isolated-clone arm it
+    // goes through both fail against an unborn HEAD (the harness's own bare
+    // `git init`). Same reason `identity_009` commits the fixture first.
+    commit_fixture(&work);
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
+
+    // Back to the Dashboard to open a second orchestration in the same dir.
+    deck.send_bytes(b"\x04"); // Ctrl+D -> Normal mode (still on the orchestration tab)
+    deck.send_bytes(b"\x1b[D"); // Left -> previous tab -> Dashboard
+    deck.wait_for_string("session(s)");
+
+    // Second orchestration, same directory, typed slug — goes through the
+    // Nth-concurrent-orchestration isolated-clone arm since the first
+    // orchestration is still live in `work`.
+    open_orchestration_with_slug(&deck, "newpane521");
+    deck.wait_for_absence("New Agent"); // form closed -> second tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
+
+    // Ctrl+n with the SECOND orchestration's own pane focused.
+    deck.send_bytes(b"\x0e");
+    let second_tab_picker_opened =
+        deck.wait_for_grid_string_within("Select Directory", Duration::from_secs(3));
+    assert!(
+        second_tab_picker_opened,
+        "Ctrl+n with the SECOND concurrently-open orchestration's own pane \
+         focused did not open the directory picker (issue #521, \
+         second-orchestration hypothesis) — the isolated-clone provisioning \
+         774526ed/cb1df96d added for the Nth concurrent orchestration may \
+         leave state that silently blocks a later Ctrl+n on the tab it just \
+         opened.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Whatever that press did, get back to a clean state and switch to the
+    // FIRST orchestration's tab to check whether it is independently still
+    // able to open the picker (per-tab) or also silently blocked
+    // (deck-global) now that a second orchestration exists.
+    deck.send_bytes(b"\x1b"); // Esc -> cancel/close whatever Ctrl+n opened, if anything
+    deck.wait_until_quiescent();
+    deck.send_bytes(TAB_PREV); // Ctrl+PageUp -> previous tab -> first orchestration
+    deck.wait_until_quiescent();
+
+    deck.send_bytes(b"\x0e");
+    let first_tab_picker_opened =
+        deck.wait_for_grid_string_within("Select Directory", Duration::from_secs(3));
+    assert!(
+        first_tab_picker_opened,
+        "Ctrl+n on the FIRST orchestration's own pane, pressed AFTER a \
+         second concurrent orchestration was opened, did not open the \
+         directory picker — the state left behind by opening the second \
+         orchestration appears to be deck-global (UiState is one struct \
+         shared by every tab), not scoped to the second tab alone.\n\
+         Grid:\n{}",
+        deck.snapshot_grid()
     );
 }
