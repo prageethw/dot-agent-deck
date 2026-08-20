@@ -30,7 +30,12 @@
 //! `orch-deck` fixture's `cat` stub roles never declare a `live_target` at
 //! all, so `pane_writable` defaults to `Live` for them regardless of tab
 //! state or focus history — which is exactly why `001`-`003` could not have
-//! exercised this path no matter which angle they varied.
+//! exercised this path no matter which angle they varied. **REFUTED**: CI
+//! showed the picker opens anyway (3/3 tries), and an auditor noticed the
+//! swallow message ALSO appears alongside it — a real but separate, minor UI
+//! inconsistency, now tracked as issue #524 rather than as part of #521.
+//! `004` is `#[ignore]`d rather than deleted, since it is #524's ready-made
+//! repro; see its own doc comment for detail.
 //!
 //! `005` isolates a FOURTH angle: the reporter later narrowed the repro to
 //! "this happens from second orchestras tab" — i.e. specifically once a
@@ -204,13 +209,13 @@ fn newpane_003_ctrl_n_after_tab_switch_away_and_back_to_orchestrator_pane() {
     );
 }
 
-/// Scenario: issue #521, non-live-focused-pane hypothesis. Open an
-/// Orchestration tab (`newpane-nonlive` fixture) whose orchestrator role, on
-/// startup, declares its OWN session `HistoryOnly` via a synthetic
-/// `session_start` hook event carrying `live_target: {kind: process,
-/// writable: history-only}` — the same technique
-/// `e2e_pane_send_result.rs`'s `pane_input_007` already uses to put an
-/// orchestrator role pane in that state, and the same declaration
+/// Scenario: issue #521, non-live-focused-pane hypothesis — REFUTED, and now
+/// tracked separately as issue #524. Open an Orchestration tab
+/// (`newpane-nonlive` fixture) whose orchestrator role, on startup, declares
+/// its OWN session `HistoryOnly` via a synthetic `session_start` hook event
+/// carrying `live_target: {kind: process, writable: history-only}` — the
+/// same technique `e2e_pane_send_result.rs`'s `pane_input_007` already uses
+/// to put an orchestrator role pane in that state, and the same declaration
 /// `AppState::pane_writable`'s doc comment names as the concrete real-world
 /// example (a wrapped Codex pane). The role then `exec`s `cat` so its PTY
 /// stays open and interactive, exactly like `orch-deck`'s stub roles. Press
@@ -219,9 +224,27 @@ fn newpane_003_ctrl_n_after_tab_switch_away_and_back_to_orchestrator_pane() {
 /// or the `non_live_input_feedback` swallow gate (`src/ui.rs`, the `run_tui`
 /// event-read loop) fires first — no picker, and the "History-only session
 /// cannot accept live input" status message appears instead.
-#[spec("orchestration/newpane/004")]
+///
+/// CI settled this deterministically (3/3 tries,
+/// <https://github.com/prageethw/dot-agent-deck/actions/runs/32392160186>):
+/// the picker opens anyway, refuting the hypothesis for #521's purposes —
+/// but an auditor reviewing that failure noticed the status message ALSO
+/// appears, i.e. both fire together, which is a real (if minor) UI
+/// inconsistency unrelated to #521's actual, now-fixed root cause (a blank
+/// Worktree slug refusing instead of auto-isolating a 2nd+ concurrent
+/// orchestration). Tracked as issue #524 rather than fixed here. Ignored
+/// rather than deleted: this is the only e2e coverage of a *global chord*
+/// (as opposed to forwarded pane text/paste, which `pane_input_007` and
+/// `orchestration/remit/003` already cover) landing on a `HistoryOnly`
+/// focused pane, so it doubles as issue #524's ready-made repro. Whoever
+/// picks up #524 should un-ignore this and rewrite the assertions to match
+/// whichever single behavior the fix settles on. No `#[spec(...)]`
+/// annotation here: Decision 26 forbids pairing `#[ignore]` with
+/// `#[spec(...)]`, so `orchestration/newpane/004` moved to
+/// `xtask/linkage-check/m2.allowlist` instead while this stays ignored.
 #[test]
 #[cfg(unix)]
+#[ignore = "issue #524: hypothesis refuted (picker opens anyway); kept as a repro for the separate contradictory-dual-fire bug it uncovered"]
 fn newpane_004_ctrl_n_swallowed_when_focused_pane_reports_history_only() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
