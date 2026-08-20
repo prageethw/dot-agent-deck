@@ -3695,6 +3695,15 @@ without depending on the config struct API.
 - **Does not assert:** any width other than 80; a fix's exact shape (shortened message vs. clipped `Paragraph`) — either satisfies this assertion.
 - **Platform coverage:** mac+linux.
 
+#### orchestration/newpane
+
+##### orchestration/newpane/001 — `Ctrl+n` opens the directory picker on a real Orchestration tab with the orchestrator's own pane focused (issue #521).
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** with a real Orchestration tab open and the orchestrator's own pane focused (the default focus right after the tab opens — no jump away and back), pressing `Ctrl+n` makes the ` Select Directory ` popup (`Action::NewPane`'s `UiMode::DirPicker`) appear on the rendered grid, the same result the identical chord already produces from the Dashboard (used to open the tab in the first place, via this file's own `open_orchestration` helper). Reported: on an Orchestration tab with the orchestrator pane focused it does nothing at all — no picker, no status message, no forwarded keystroke.
+- **Does not assert:** whether `Ctrl+n` works with a worker/role pane focused instead, or on a Dashboard/Mode tab while a pane is already open elsewhere — the reporter had not yet confirmed either, so this test isolates the orchestrator-pane-focused case specifically; the root cause (what upstream of `handle_key_event` swallows the chord in this one state) — that is the coder's job next.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.
