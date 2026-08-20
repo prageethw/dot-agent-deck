@@ -3718,6 +3718,13 @@ without depending on the config struct API.
 - **Does not assert:** which `UiMode` the deck is in while the Dashboard is up mid-switch (the Dashboard leg of `capture_focus_on_switch_out`/`restore_focus_on_switch_in` is a no-op, so this is deliberately left unobserved — settled on quiescence, not a mode-specific string) — `/002` already covers mode-independence of `Ctrl+n`'s resolution; this test isolates the tab-switch-back angle alone.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/newpane/004 — `Ctrl+n` is swallowed with no picker when the focused pane's own session has declared itself `HistoryOnly` (issue #521 non-live-pane hypothesis).
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/newpane-nonlive`: a single orchestrator role running a script, written into the deck's workdir by the test itself, that self-declares `HistoryOnly` via a synthetic `session_start` hook event — same `write_hook_line` technique as `e2e_pane_send_result.rs`'s `pane_input_007` — then `exec`s `cat`; no LLM tokens spent).
+- **Asserts:** with the orchestrator's own pane focused on a real Orchestration tab, once its session has durably declared `live_target: {kind: process, writable: history-only}` (confirmed applied via `deck.subscribe_events()` before the keypress, to avoid racing the injected event), pressing `Ctrl+n` does NOT open the ` Select Directory ` popup, and instead the `non_live_input_feedback` swallow gate's status message ("History-only session cannot accept live input") appears — the gate is `src/ui.rs`'s `run_tui` event-read loop, guarded on `ui.mode == UiMode::PaneInput && pane_writable(focused_id) != Live`. Whether this genuinely reproduces issue #521 (rather than merely failing to open the picker for some other reason) is decided by CI, not by this description — see the delegating task's `work-done` report for the confirmed result.
+- **Does not assert:** a production fix — diagnosis only, per the delegating task. Whether *this specific way* of reaching a non-live focused pane (a self-declaring script) matches how the reporter's own session actually went non-live (their agent CLI is still unconfirmed) — only that the swallow gate, once reached, behaves exactly as `newpane/001`-`003`'s shared `open_orchestration` setup would need it to for issue #521 to be explained this way.
+- **Platform coverage:** linux (Unix-only: the self-declaring script is a `/bin/sh` + `python3` fixture, mirroring `pane_input_007`'s own `#[cfg(unix)]` gate).
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.

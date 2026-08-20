@@ -21,6 +21,17 @@
 //! byte), and reaching the orchestrator's pane via a tab switch rather than a
 //! fresh tab open.
 //!
+//! `004` isolates a THIRD angle found while none of `001`-`003` reproduced:
+//! the `run_tui` event-read loop's `non_live_input_feedback` swallow gate
+//! (`src/ui.rs`), which intercepts every key/paste in `PaneInput` mode
+//! *before* `global_action_for_mode` ever sees it whenever the focused pane's
+//! session has declared a non-`Live` `Writable` (the concrete example named
+//! in `AppState::pane_writable`'s doc comment is a wrapped Codex pane). The
+//! `orch-deck` fixture's `cat` stub roles never declare a `live_target` at
+//! all, so `pane_writable` defaults to `Live` for them regardless of tab
+//! state or focus history — which is exactly why `001`-`003` could not have
+//! exercised this path no matter which angle they varied.
+//!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
 mod common;
@@ -28,7 +39,17 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::event::Writable;
 use spec::spec;
+
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, contents).expect("write history-only self-declaring script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod history-only self-declaring script");
+}
 
 /// Drive the new-pane dialog to open the (single) orchestration in the
 /// `orch-deck` fixture. Duplicated per-file by this suite's own convention
@@ -173,5 +194,100 @@ fn newpane_003_ctrl_n_after_tab_switch_away_and_back_to_orchestrator_pane() {
          open, did not open the directory picker (issue #521 tab-switch-back \
          hypothesis).\nGrid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// Scenario: issue #521, non-live-focused-pane hypothesis. Open an
+/// Orchestration tab (`newpane-nonlive` fixture) whose orchestrator role, on
+/// startup, declares its OWN session `HistoryOnly` via a synthetic
+/// `session_start` hook event carrying `live_target: {kind: process,
+/// writable: history-only}` — the same technique
+/// `e2e_pane_send_result.rs`'s `pane_input_007` already uses to put an
+/// orchestrator role pane in that state, and the same declaration
+/// `AppState::pane_writable`'s doc comment names as the concrete real-world
+/// example (a wrapped Codex pane). The role then `exec`s `cat` so its PTY
+/// stays open and interactive, exactly like `orch-deck`'s stub roles. Press
+/// `Ctrl+n` with that pane focused and confirm which of two outcomes
+/// happens: the picker opens (this hypothesis does NOT explain issue #521),
+/// or the `non_live_input_feedback` swallow gate (`src/ui.rs`, the `run_tui`
+/// event-read loop) fires first — no picker, and the "History-only session
+/// cannot accept live input" status message appears instead.
+#[spec("orchestration/newpane/004")]
+#[test]
+#[cfg(unix)]
+fn newpane_004_ctrl_n_swallowed_when_focused_pane_reports_history_only() {
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_pty_size(120, 40)
+        .launch_with_fixture("newpane-nonlive");
+    deck.wait_for_string("No active sessions");
+
+    let script = deck.workdir().join("newpane-nonlive.sh");
+    write_executable(
+        &script,
+        r#"#!/bin/sh
+python3 - <<'PY'
+import datetime
+import json
+import os
+import socket
+
+payload = {
+    "session_id": "newpane-nonlive-session",
+    "agent_type": "codex",
+    "event_type": "session_start",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "pane_id": os.environ["DOT_AGENT_DECK_PANE_ID"],
+    "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    "live_target": {"kind": "process", "writable": "history-only"},
+}
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["DOT_AGENT_DECK_SOCKET"])
+s.sendall((json.dumps(payload) + "\n").encode())
+s.close()
+PY
+exec cat
+"#,
+    );
+
+    let events = deck.subscribe_events();
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
+
+    // Wait for the daemon to have actually APPLIED the synthetic
+    // history-only declaration before pressing Ctrl+n — otherwise the test
+    // races the event against the keypress instead of deterministically
+    // exercising the swallow gate.
+    events.wait_for(
+        |event| event.live_target.map(|lt| lt.writable) == Some(Writable::HistoryOnly),
+        Duration::from_secs(5),
+    );
+
+    // Ctrl+n with the orchestrator's own (now HistoryOnly) pane focused.
+    deck.send_bytes(b"\x0e");
+
+    let picker_opened =
+        deck.wait_for_grid_string_within("Select Directory", Duration::from_secs(3));
+    let feedback_shown = deck.wait_for_grid_string_within(
+        "History-only session cannot accept live input",
+        Duration::from_secs(2),
+    );
+    let grid = deck.snapshot_grid();
+
+    assert!(
+        !picker_opened,
+        "expected the non_live_input_feedback swallow gate to intercept \
+         Ctrl+n before global_action_for_mode ever saw it (issue #521 \
+         non-live-pane hypothesis), but the directory picker opened anyway \
+         — this hypothesis does NOT explain issue #521.\nGrid:\n{grid}"
+    );
+    assert!(
+        feedback_shown,
+        "the directory picker did not open, but the \
+         non_live_input_feedback status message never appeared either — \
+         Ctrl+n was swallowed by something other than the expected gate.\n\
+         Grid:\n{grid}"
     );
 }
