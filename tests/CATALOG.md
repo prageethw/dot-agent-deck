@@ -3701,7 +3701,21 @@ without depending on the config struct API.
 - **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
 - **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
 - **Asserts:** with a real Orchestration tab open and the orchestrator's own pane focused (the default focus right after the tab opens — no jump away and back), pressing `Ctrl+n` makes the ` Select Directory ` popup (`Action::NewPane`'s `UiMode::DirPicker`) appear on the rendered grid, the same result the identical chord already produces from the Dashboard (used to open the tab in the first place, via this file's own `open_orchestration` helper). Reported: on an Orchestration tab with the orchestrator pane focused it does nothing at all — no picker, no status message, no forwarded keystroke.
-- **Does not assert:** whether `Ctrl+n` works with a worker/role pane focused instead, or on a Dashboard/Mode tab while a pane is already open elsewhere — the reporter had not yet confirmed either, so this test isolates the orchestrator-pane-focused case specifically; the root cause (what upstream of `handle_key_event` swallows the chord in this one state) — that is the coder's job next.
+- **Does not assert:** whether `Ctrl+n` works with a worker/role pane focused instead, or on a Dashboard/Mode tab while a pane is already open elsewhere — the reporter had not yet confirmed either, so this test isolates the orchestrator-pane-focused case specifically; the root cause (what upstream of `handle_key_event` swallows the chord in this one state) — that is the coder's job next. **This test PASSES against unfixed `main`** — the freshly-opened-tab shape of the repro does not by itself reproduce the bug; `orchestration/newpane/002` and `/003` isolate the two repro angles still open.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/newpane/002 — `Ctrl+n` sent as the CSI-u kitty encoding (`ESC[110;5u`) with the orchestrator's own pane focused (issue #521 CSI-u hypothesis).
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** identical setup to `orchestration/newpane/001`, except the injected bytes are `ESC[110;5u` — the kitty-protocol CSI-u encoding of Ctrl+n a real kitty-capable terminal sends once the deck's own startup push of the enhanced keyboard protocol (`DISAMBIGUATE_ESCAPE_CODES`) is in effect — rather than the legacy single control byte `\x0e`. Confirms or refutes the theory that the wire encoding, not the resolution logic, is where issue #521 lives; the ` Select Directory ` popup is expected to appear exactly as in `/001`.
+- **Does not assert:** the resolution-path reasoning itself — `keyevent_ctrl_c0_matches_crossterm_decoder` (`src/ui.rs`) and `matches_binding` (`src/keybindings.rs`) already establish that both wire forms decode to the identical `(KeyCode, KeyModifiers)` pair, so on paper this should pass identically to `/001`; this test exists to check that on its merits against the real binary rather than assume it.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/newpane/003 — `Ctrl+n` opens the directory picker after leaving the Orchestration tab and switching back to it (issue #521 tab-switch-back hypothesis).
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** identical setup to `orchestration/newpane/001`, except the orchestrator's own pane is reached by switching away to the Dashboard (`Ctrl+PageUp`) and back (`Ctrl+PageDown`) — `switch_tab_with_focus`'s restore path — rather than by the tab having just been created. One of the two repro angles issue #521 explicitly flagged as not yet confirmed. `Ctrl+n` is expected to open the ` Select Directory ` popup exactly as in `/001`.
+- **Does not assert:** which `UiMode` the deck is in while the Dashboard is up mid-switch (the Dashboard leg of `capture_focus_on_switch_out`/`restore_focus_on_switch_in` is a no-op, so this is deliberately left unobserved — settled on quiescence, not a mode-specific string) — `/002` already covers mode-independence of `Ctrl+n`'s resolution; this test isolates the tab-switch-back angle alone.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/focus
