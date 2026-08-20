@@ -42,6 +42,17 @@
 //! for the Nth concurrent orchestration against a root checkout a live
 //! sibling already shares.
 //!
+//! `006` isolates a FIFTH angle, found from a live daemon log rather than a
+//! static read: the REAL `ps`/`getsid`-based shell-activity poller
+//! (`run_shell_activity_monitor` in `src/daemon.rs`, `pane_unconfirmed_streaks`,
+//! fork issue #216) landing the orchestrator's own pane in its `unconfirmed`
+//! bucket — a candidate the poller has no opinion about — rather than
+//! `004`'s synthetic `HistoryOnly` hook declaration. A static read of
+//! `global_action_for_mode` (`src/ui.rs`) shows no status gating there, so if
+//! this mechanism explains the bug it is reached downstream, the same way
+//! `004`'s hypothesis was (the `non_live_input_feedback` swallow gate) or
+//! somewhere else in the `SpawnPane` dispatch path.
+//!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
 mod common;
@@ -384,6 +395,69 @@ fn newpane_005_ctrl_n_after_second_concurrent_orchestration_opened() {
          orchestration appears to be deck-global (UiState is one struct \
          shared by every tab), not scoped to the second tab alone.\n\
          Grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: issue #521, shell-activity-unconfirmed hypothesis. Open an
+/// Orchestration tab (`newpane-unconfirmed` fixture) whose orchestrator role
+/// forks a tight loop of very short-lived children — no `setsid`, so they
+/// stay in the pane's own POSIX session — and `exec`s `cat` to remain
+/// interactive, exactly like `orch-deck`'s stub roles. The loop is
+/// engineered so that within any one of the daemon's real `ps`-based
+/// shell-activity poll ticks, a descendant present for the poller's FIRST
+/// `ps` capture has, with very high probability, already exited by its
+/// SECOND, identity-confirming capture (fork issue #30's
+/// `invalidate_unconfirmed_session_ids`) — which resets that row's session
+/// id to unreadable and, via `descendant_shell_activity`
+/// (`src/platform/proc/scan.rs`), lands this pane's own classification in
+/// the REAL poller's `unconfirmed` bucket
+/// (`src/daemon.rs`'s `pane_unconfirmed_streaks`), reached through the
+/// genuine `ps`/`getsid` path rather than `newpane_004`'s synthetic hook
+/// declaration. After giving the poller several ticks' worth of margin to
+/// observe the fork storm, press `Ctrl+n` with that pane focused and confirm
+/// the directory picker still opens.
+#[spec("orchestration/newpane/006")]
+#[test]
+#[cfg(unix)]
+fn newpane_006_ctrl_n_when_orchestrator_pane_genuinely_unconfirmed() {
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_pty_size(120, 40)
+        .launch_with_fixture("newpane-unconfirmed");
+    deck.wait_for_string("No active sessions");
+
+    let script = deck.workdir().join("newpane-unconfirmed.sh");
+    write_executable(
+        &script,
+        r#"#!/bin/sh
+( while :; do /usr/bin/true; done ) &
+exec cat
+"#,
+    );
+
+    open_orchestration(&deck);
+    deck.wait_for_absence("New Agent"); // form closed -> tab up, orchestrator focused
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // live PTY, PaneInput mode, orchestrator focused
+
+    // Margin for the real poller to run several 500ms ticks against the fork
+    // storm before the keypress — this harness has no direct signal for
+    // "classified unconfirmed now", so this is a bounded wait rather than a
+    // synchronized one (Decision 21: bounded polling only, never a raw
+    // sleep, inside an e2e test body).
+    common::wait_until(Duration::from_secs(3), || false);
+
+    // Ctrl+n with the orchestrator's own pane focused, genuinely (not
+    // synthetically) unconfirmed by the real shell-activity poller.
+    deck.send_bytes(b"\x0e");
+
+    assert!(
+        deck.wait_for_grid_string_within("Select Directory", Duration::from_secs(3)),
+        "Ctrl+n with the orchestrator's own pane focused on an Orchestration \
+         tab, after several ticks of the REAL ps/getsid shell-activity \
+         poller sampling a fork storm engineered to land this pane in its \
+         `unconfirmed` bucket (issue #521 shell-activity-unconfirmed \
+         hypothesis), did not open the directory picker.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
