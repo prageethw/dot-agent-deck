@@ -34023,6 +34023,173 @@ mod tests {
         );
     }
 
+    /// Scenario: Issue #521 — the fix direction agreed for issue #489's
+    /// blank-slug refusal (`worktree_017`, immediately above): once fixed, a
+    /// blank-slug `Action::SpawnPane` against a root checkout with a live
+    /// sibling orchestration must auto-generate a slug and provision an
+    /// isolated clone — mirroring the typed-slug arm's existing auto-isolate
+    /// behavior (`orchestration/worktree/014`) — instead of refusing and
+    /// asking the user to type one. Dispatches a blank-slug
+    /// `Action::SpawnPane` against a real git repo (with one commit, so
+    /// `provision_isolated_clone_sync`'s checkout step has a ref to attach
+    /// to) while a stubbed daemon reports a live sibling orchestration whose
+    /// `orchestration_cwd` is that same repo, and asserts an orchestration
+    /// tab opens with its role panes rooted in a freshly created, distinct
+    /// clone directory — the opposite of the refusal `worktree_017` pins
+    /// today. Currently RED: today's code takes the `None` arm's `Ok(true)`
+    /// refusal branch, so no tab opens and no clone is created.
+    #[spec("orchestration/worktree/018")]
+    #[test]
+    fn worktree_018_blank_slug_auto_isolates_when_root_checkout_has_live_sibling() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_git_repo(&repo);
+        // A commit is required — `provision_isolated_clone_sync`'s checkout
+        // step (`git checkout -b <branch>` when the branch is `Absent`)
+        // needs a ref to branch from, matching `worktree_004`'s precedent.
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed in {repo:?}");
+        };
+        std::fs::write(repo.join("README.md"), "worktree_018 fixture\n").expect("write README");
+        run_git(&["add", "-A"]);
+        run_git(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let sibling_record = crate::agent_pty::AgentRecord {
+            id: "sibling-agent".to_string(),
+            pane_id_env: None,
+            display_name: None,
+            cwd: None,
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "other-orchestration".to_string(),
+                role_index: 0,
+                role_name: "orchestrator".to_string(),
+                is_start_role: true,
+                orchestration_cwd: Some(repo.display().to_string()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+        };
+        let _daemon = with_crafted_response_daemon(
+            tmp.path(),
+            crate::daemon_protocol::AttachResponse::agent_records(vec![sibling_record]),
+        );
+
+        let config = make_orchestration("review");
+        let req = NewPaneRequest {
+            dir: repo.clone(),
+            name: String::new(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        // The refusal `worktree_017` pins must NOT happen here: an
+        // orchestration tab must open instead of leaving the Dashboard
+        // active.
+        assert!(
+            !matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "a blank-slug spawn against a root checkout with a live sibling orchestration must \
+             auto-isolate (fix direction agreed for issue #521), not refuse and leave the \
+             Dashboard tab active the way it does today"
+        );
+        // ...with its role panes actually spawned...
+        let names = pc.recorded_orchestration_names();
+        assert_eq!(
+            names.len(),
+            config.roles.len(),
+            "every role pane must be spawned once auto-isolation succeeds, not refused before \
+             any pane is created"
+        );
+
+        // ...rooted in a FRESH, DISTINCT clone directory — not `repo`
+        // itself, the collision this whole gate exists to prevent.
+        let cwds = pc.recorded_cwds();
+        assert_eq!(cwds.len(), config.roles.len());
+        let repo_str = repo.display().to_string();
+        for cwd in &cwds {
+            let cwd = cwd.as_deref().expect("every role pane must carry a cwd");
+            assert_ne!(
+                cwd, repo_str,
+                "an auto-isolated clone must root role panes in its OWN directory, not the \
+                 shared root checkout — spawning into `repo` here would be exactly the \
+                 collision this gate exists to prevent"
+            );
+            let clone_dir = std::path::PathBuf::from(cwd);
+            assert!(
+                clone_dir.is_dir(),
+                "the auto-isolated clone directory must actually exist on disk at {cwd}"
+            );
+            // A genuine isolated CLONE has its own real `.git` directory
+            // (from `git clone`) — unlike a linked `git worktree add`
+            // sibling, whose `.git` is a one-line file pointing back at the
+            // shared checkout's object store. This is what distinguishes
+            // "auto-isolated clone" (what `014`'s typed-slug arm already
+            // does, and what this fix must match) from merely resolving a
+            // sibling path without isolating it.
+            assert!(
+                clone_dir.join(".git").is_dir(),
+                "the auto-isolated directory at {cwd} must be a real, independent git clone \
+                 (a directory `.git`), not a linked worktree sharing the root checkout's \
+                 object store"
+            );
+        }
+
+        // ...and the manual-slug refusal wording `worktree_017` pins must
+        // not appear in the status message.
+        let message = ui
+            .status_message
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !message.contains("type a Worktree slug to isolate this one"),
+            "auto-isolation succeeding (silently, or with a warning of its own) must not \
+             surface the manual-slug refusal wording; got {message:?}"
+        );
+    }
+
     /// Scenario: Submit a new-pane orchestration request whose `dir` is
     /// ALREADY the resolved worktree path (simulating that a worktree was
     /// created and its path threaded into the request), and dispatch the
