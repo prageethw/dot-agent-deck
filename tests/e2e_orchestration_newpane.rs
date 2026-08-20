@@ -59,32 +59,18 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TuiDeck, commit_fixture, open_orchestration_with_slug};
+use common::{
+    TuiDeck, commit_fixture, open_orchestration, open_orchestration_with_slug, write_executable,
+};
 use dot_agent_deck::event::Writable;
 use spec::spec;
 
-#[cfg(unix)]
-fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write history-only self-declaring script");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod history-only self-declaring script");
-}
-
-/// Drive the new-pane dialog to open the (single) orchestration in the
-/// `orch-deck` fixture. Duplicated per-file by this suite's own convention
-/// (see `e2e_orchestration_lock.rs`, `e2e_orchestration_focus.rs`, etc. — each
-/// carries its own copy rather than sharing one across `tests/*.rs` binaries).
-/// Lands with the orchestrator (start) role focused in `PaneInput` mode.
-fn open_orchestration(deck: &TuiDeck) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: …]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-}
+// `write_executable` and `open_orchestration` are shared with
+// `tests/e2e_orchestration_remit.rs` via `tests/common/mod.rs` — the two
+// files' private copies were flagged by SonarCloud's new-code duplication
+// gate (issue #521 fix round). See `common::open_orchestration`'s doc
+// comment for why this pair, specifically, is shared rather than following
+// this suite's usual per-file convention.
 
 /// Scenario: issue #521. Open a real Orchestration tab (`orch-deck` fixture,
 /// two `cat` stub roles) and leave the orchestrator's own pane focused — the
