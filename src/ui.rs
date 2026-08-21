@@ -25852,6 +25852,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dashboard_placeholder_pending_agent_shows_starting_not_no_agent() {
+        // Third case, distinct from both siblings above: a placeholder with
+        // NO agent_type (still `AgentType::None`) but a real `agent_id` —
+        // the shape a freshly-spawned Orchestration-tab role pane has before
+        // it has reported in. This must render as "Starting…", not as the
+        // genuinely-empty "No agent" / "Launch an agent to get started"
+        // copy those siblings pin.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("Starting…"),
+            "pending placeholder (agent_type=None, agent_id=Some) must show \
+             the 'Starting…' status; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("No agent"),
+            "pending placeholder (agent_type=None, agent_id=Some) must not \
+             show the genuinely-empty 'No agent' status; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Launch an agent to get started"),
+            "pending placeholder (agent_type=None, agent_id=Some) must not \
+             show the genuinely-empty 'Launch an agent to get started' \
+             body line; got:\n{rendered}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Navigation tests
     // ---------------------------------------------------------------------------
