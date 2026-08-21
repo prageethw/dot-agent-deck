@@ -50,6 +50,7 @@ use tokio::task::JoinHandle;
 use dot_agent_deck::agent_pty::AgentPtyRegistry;
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use dot_agent_deck::pane::{AgentSpawnOptions, PaneController};
 use dot_agent_deck::state::{AppState, SharedState};
 use dot_agent_deck::ui::{SPAWN_TIME_READINESS_BUFFER, should_inject_spawn_time_prompt};
@@ -62,12 +63,22 @@ mod common;
 /// comment for the rationale.
 const STUB_NOT_READY_MS: u64 = 300;
 
+/// Issue #494: the session generation a real `SessionStart` hook would
+/// report for this pane — see the "Simulated SessionStart" comment at the
+/// synthetic-event call site for why this test now has to stamp one.
+const TEST_SESSION_ID: &str = "spawn-time-test-session";
+
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
 struct DaemonHandle {
     _dir: TempDir,
     attach_path: PathBuf,
     pty_registry: Arc<AgentPtyRegistry>,
+    // Issue #494: needed so the test can apply a synthetic `SessionStart`
+    // AgentEvent the same way a real hook does (see the write-site comment
+    // below) — the daemon's own copy, not a fresh `AppState`, since the
+    // paned write-and-submit gate reads THIS state.
+    state: SharedState,
     handle: JoinHandle<()>,
 }
 
@@ -93,6 +104,7 @@ async fn spawn_daemon() -> DaemonHandle {
         .with_idle_shutdown(None)
         .with_lock_dir_override(common::lock_dir_path());
     let pty_registry = daemon.pty_registry.clone();
+    let state_handle = daemon.state.clone();
 
     let hook_for_daemon = hook_path.clone();
     let handle = tokio::spawn(async move {
@@ -117,6 +129,7 @@ async fn spawn_daemon() -> DaemonHandle {
         _dir: dir,
         attach_path,
         pty_registry,
+        state: state_handle,
         handle,
     }
 }
@@ -304,6 +317,59 @@ async fn spawn_time_role_prompt_submits_after_input_readiness_buffer() {
     // setup — that's the moment its discard window begins, mirroring
     // production where the input-ready gap is measured from
     // SessionStart.
+    //
+    // Issue #494: a real agent's SessionStart hook does two things at once
+    // via `AppState::apply_event` — it flips `agent_ready` (ui.rs's real
+    // gate, which this harness bypasses in favor of driving
+    // `should_inject_spawn_time_prompt` directly) AND it populates
+    // `pane_hook_session`, which is what a real spawn-time delivery's
+    // `expected_session_id` is captured from
+    // (`snapshot.pane_hook_session_id(&sp.pane_id)` in ui.rs). Both land
+    // from the SAME event, so for an agent type that DOES emit
+    // SessionStart — Claude Code, this test's target — `expected_session_id`
+    // is already `Some(...)`, matching the pane's current `pane_hook_session`,
+    // by the time the buffer elapses and the write fires. This stub is a
+    // bare `/bin/sh` + Python script with no hook integration, so nothing
+    // ever told the daemon a session exists — apply one here, at the exact
+    // moment this test already calls "simulated SessionStart", so the write
+    // below carries what a real Claude-Code-shaped delivery would actually
+    // carry.
+    //
+    // This is deliberately NOT the only shape a real delivery takes: issue
+    // #494's own text records that the deck's spawn-time seed path "builds a
+    // delivery with both axes unresolved" for agent types that never emit
+    // SessionStart at all — the deck's 10s no-SessionStart fallback (the
+    // caller of `should_inject_spawn_time_prompt` in `ui.rs`) deliberately
+    // writes with `expected_session_id: None`. That `None`-caller case is
+    // real, reaches this same write-and-submit gate, and is pinned
+    // separately in `src/daemon_protocol.rs`'s paned-write session-gate
+    // tests (`paned_write_refuses_missing_expected_session_on_attached_pane`
+    // for a pane with recorded hook history, and its case-(a) sibling for a
+    // pane with none at all, which the gate must let through). Without the
+    // simulated SessionStart here, THIS stub's pane would instead have
+    // `pane_hook_session_id() == None` at write time while the caller's
+    // `expected_session_id` stays `Some(TEST_SESSION_ID)` — a mismatch that
+    // the `Some(expected)` arm's `None if has_live_attach` case refuses as
+    // `Stale` regardless of the poll margin: this was never a race against
+    // the readiness buffer, the daemon was refusing to write because the
+    // stub's pane never reported a session at all.
+    daemon.state.write().await.apply_event(AgentEvent {
+        session_id: TEST_SESSION_ID.to_string(),
+        agent_type: AgentType::ClaudeCode,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.clone()),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        model: None,
+    });
     let ready_since = Instant::now();
 
     // Drive the same gate the TUI loop drives. Without the fix, this
@@ -328,10 +394,17 @@ async fn spawn_time_role_prompt_submits_after_input_readiness_buffer() {
     let controller_for_write = controller.clone();
     let pane_for_write = pane_id.clone();
     let prompt_for_write = role_prompt.to_string();
+    let agent_id_for_write = agent_id.clone();
     tokio::task::spawn_blocking(move || {
         controller_for_write
-            .write_and_submit_to_pane(&pane_for_write, &prompt_for_write)
-            .expect("write_and_submit_to_pane")
+            .write_and_submit_to_pane_with_identity(
+                &pane_for_write,
+                &prompt_for_write,
+                Some(agent_id_for_write.as_str()),
+                Some(TEST_SESSION_ID),
+                None,
+            )
+            .expect("write_and_submit_to_pane_with_identity")
     })
     .await
     .expect("join write task");

@@ -2061,6 +2061,19 @@ async fn compute_write_and_submit_outcome(
                     })
                     .await
             } else {
+                // Issue #494: a paned target has no upstream gate equivalent to the
+                // paneless branch's `None => Writable::None` above — `Writable::Live`
+                // here is reached by `pane_writable` alone, keyed by `pane_id`, with
+                // no requirement that the caller named an agent at all. Mirroring PR
+                // #477's fix for issue #465's identical bug class (`state.rs`'s
+                // `dispatch_one_owned`): treat an unresolved/absent identity as no
+                // verified target rather than falling through to an unguarded write
+                // keyed by pane_id alone. This used to be a second, paned-only
+                // `let Some(..) else` re-check of `extras.expected_agent_id`; issue
+                // #608/#617 moved that refusal to the shared resolution block above
+                // (`agent_id`'s own binding a few lines up), which now covers both
+                // arms structurally, so restating it here would only re-derive the
+                // same already-`Some` value.
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
                 // Issue #915 (finding 4): the ended-generation witness is keyed by
@@ -5325,6 +5338,87 @@ mod tests {
 
         reg.shutdown_all();
     }
+
+    /// Issue #494: `compute_write_and_submit_outcome`'s **paned** branch forwards
+    /// `extras.expected_agent_id.as_deref()` straight into
+    /// `write_and_submit_guarded` with no gate of its own — when it is `None`,
+    /// `write_and_submit_guarded`'s pre-lock identity check
+    /// (`if let Some(expected) = expected_agent_id && expected != target.agent_id`)
+    /// is skipped entirely, and the paned re-resolution afterwards only compares
+    /// the pane's CURRENT agent against ITSELF (there is no separate "did the
+    /// caller name an agent at all" gate), so the write proceeds keyed by
+    /// `pane_id` alone. Contrast the **paneless** branch a few lines earlier in
+    /// the same function: `Writable::Live` there is reachable ONLY when
+    /// `extras.expected_agent_id` is `Some` (`None => Writable::None` at the
+    /// `pane_writable`/`agent_writable` match), so an absent agent id fails
+    /// closed before the guarded send is ever reached. The paned branch has no
+    /// equivalent upstream gate. This pins the gap: a live pane with a
+    /// registered agent, written to with `expected_agent_id: None`, must be
+    /// REFUSED (never `SendResult::Applied`) — mirroring the `let Some(...) else
+    /// { return ... }` shape PR #477 established for issue #465's identical bug
+    /// class at a different call site.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paned_write_refuses_missing_expected_agent_id() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-494-no-expected-agent-id";
+        let _id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // No `expected_session_id` either, so the (separately buggy, separately
+        // pinned below) session gate can never be the reason this is refused —
+        // isolates the agent-id axis.
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: None,
+            expected_session_id: None,
+            ..Default::default()
+        };
+        let result = compute_write_and_submit_outcome(
+            &reg,
+            &state,
+            pane_id,
+            "printf 'SHOULD-NOT-BE-DELIVERED\\n'",
+            &extras,
+        )
+        .await;
+
+        // R5: tightened from `assert_ne!(.., Ok(Applied))`, which passes on any
+        // `Err` too. The paned branch's `let Some(expected_agent_id) = ... else`
+        // arm (daemon_protocol.rs) returns `NoLiveTarget` directly for a `None`
+        // agent id, before `write_and_submit_guarded` is ever reached — assert
+        // that exact variant.
+        assert_eq!(
+            result,
+            Ok(crate::event::SendResult::NoLiveTarget),
+            "a paned write-and-submit with NO expected_agent_id must fail closed with \
+             NoLiveTarget, not deliver (got {result:?}) — the caller named no target identity \
+             at all, so the write must not proceed keyed by pane_id alone"
+        );
+
+        reg.shutdown_all();
+    }
+
+    // `paned_write_refuses_missing_expected_session_on_attached_pane` and
+    // `paned_write_allows_missing_expected_session_with_no_hook_history`
+    // (issue #494 / auditor finding A2) were retired here on issue #915.
+    // Both pinned the `None if has_live_attach => return false` arm's
+    // ATTACHMENT-conditional refusal, which #915 (finding 5) removed
+    // entirely — attachment is no longer an input to this closure at all,
+    // so a `None`-session write is refused unconditionally on a pane that
+    // already has hook history, regardless of whether a client is
+    // attached. That property is what
+    // `guarded_send_refuses_named_generation_on_unattached_pane` above (and
+    // `unnamed_send_is_refused_only_for_an_agent_whose_generation_ended`
+    // below) now pin against the current, attachment-free closure.
 
     /// Issue #915 (finding 4) — a caller that names NO generation is accepted
     /// against an agent that never had one and refused against an agent whose
