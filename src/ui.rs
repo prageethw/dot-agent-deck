@@ -34531,6 +34531,15 @@ mod tests {
         let worktree = tmp.path().join("dot-agent-deck-my-feature");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
         let worktree_str = worktree.display().to_string();
+        // Issue #201 fix-round regression fix: `Action::SpawnPane`'s handler
+        // now claims the orchestration name over the attach socket
+        // (`ClaimOrchestrationName`) right after the role panes are created,
+        // unconditionally of the worktree-creation branch this test is
+        // actually about — so it needs a stub daemon too, the same seam
+        // `worktree_004` already uses for the pre-existing
+        // `root_checkout_has_live_sibling` gate. A fresh, empty registry
+        // claims any name, so this yields `AttachResponse::ok()`.
+        let _daemon = with_empty_agents_daemon(tmp.path());
 
         let config = make_orchestration("review");
         let req = NewPaneRequest {
@@ -35540,6 +35549,11 @@ mod tests {
     #[test]
     fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
         let tmp = tempdir().expect("tempdir");
+        // Issue #201 fix-round regression fix: see `worktree_003`'s matching
+        // comment — `Action::SpawnPane` now claims the orchestration name
+        // over the attach socket after spawning the role panes, so this
+        // dispatch needs the same stub daemon `worktree_004` already uses.
+        let _daemon = with_empty_agents_daemon(tmp.path());
         let config = OrchestrationConfig {
             name: "capture-at-creation".to_string(),
             roles: vec![OrchestrationRoleConfig {
