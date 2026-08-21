@@ -35,7 +35,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, open_orchestration, write_executable};
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use spec::spec;
 
@@ -150,30 +150,16 @@ while IFS= read -r line; do
 done
 "#;
 
-#[cfg(unix)]
-fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write orchestrator-remit.sh");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod orchestrator-remit.sh");
-}
-
-/// Drive the new-pane dialog to open the (single) orchestration in the
-/// `remit-reassert-orchestration` fixture. Mirrors
-/// `tests/e2e_orchestration_lock.rs::open_orchestration` — with no
-/// `[[modes]]` defined the Mode chip row is `[No mode] [Orch:
-/// remit-reassert] [schedule]`, so ONE Right selects the orchestration;
-/// selecting an orchestration hides the Command field, so a second Enter
-/// submits the form.
-fn open_orchestration(deck: &TuiDeck) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: remit-reassert]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-}
+// `write_executable` and `open_orchestration` (the latter behaves
+// identically here — with no `[[modes]]` defined the Mode chip row is
+// `[No mode] [Orch: remit-reassert] [schedule]`, so ONE Right selects the
+// orchestration, and selecting it hides the Command field so a second Enter
+// submits the form) are shared with `tests/e2e_orchestration_newpane.rs` via
+// `tests/common/mod.rs` — the two files' private copies were flagged by
+// SonarCloud's new-code duplication gate (issue #521 fix round). See
+// `common::open_orchestration`'s doc comment for why this pair,
+// specifically, is shared rather than following this suite's usual per-file
+// convention.
 
 /// The fixture's full daemon registry record for `role`. Mirrors
 /// `tests/e2e_orchestration_focus.rs::role_agent_record`.

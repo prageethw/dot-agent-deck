@@ -73,6 +73,14 @@ orchestration/delegate/001
 orchestration/delegate/002
 orchestration/delegate/003
 orchestration/delegate/004
+# orchestration/newpane/004 — REFUTED for issue #521 (the picker opens
+# anyway); `#[ignore]`d in tests/e2e_orchestration_newpane.rs rather than
+# deleted, since it doubles as the repro for the separate contradictory
+# dual-fire bug it uncovered (tracked as issue #524). Decision 26 forbids
+# pairing #[ignore] with #[spec(...)], so the annotation was dropped from
+# the test and this entry added instead. Remove this line and restore the
+# annotation once #524 is fixed and the test is un-ignored.
+orchestration/newpane/004
 prompt/dir-picker/001
 prompt/dir-picker/002
 prompt/dir-picker/003

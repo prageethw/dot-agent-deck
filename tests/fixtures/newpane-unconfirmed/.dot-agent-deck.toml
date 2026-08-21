@@ -1,0 +1,15 @@
+# Fixture for issue #521's shell-activity-unconfirmed hypothesis
+# (orchestration/newpane/006). A single orchestration whose start role runs a
+# script (written into the deck's workdir by the test itself) that keeps
+# forking very short-lived children with no `setsid`, so the REAL `ps`-based
+# shell-activity poller's two-sample identity check (fork issue #30) lands
+# this pane's own classification in the `unconfirmed` bucket on essentially
+# every poll tick, then `exec`s `cat` so the pane stays open and interactive
+# for the rest of the test.
+[[orchestrations]]
+name = "unconfirmed-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "./newpane-unconfirmed.sh"
+start = true
