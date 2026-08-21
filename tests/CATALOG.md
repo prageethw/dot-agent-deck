@@ -1253,18 +1253,53 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the no-provenance-file case (`worktree/reclaim/054`), the vacated-linked-worktree-lock case (`worktree/reclaim/056`), or the pre-planted-dispatch-path case (`worktree/reclaim/057`) — this is the bare self-planted-artifact forgery those three do not cover.
 - **Platform coverage:** mac+linux+windows.
 
-##### worktree/reclaim/062 — M4c (RED), maintainer-decided rule (not yet implemented). An isolated clone whose branch has a MERGED PR and whose CURRENT HEAD SHA equals that PR's merge-commit SHA exactly must report as auto-reclaim-eligible — distinct from the permanently-conservative `"isolated_clone"` verdict `worktree/reclaim/052` pins. `isolated_clone_report` never resolves the clone's own HEAD SHA or the PR's merge-commit SHA today, and unconditionally hard-codes the `"isolated_clone"` verdict regardless of PR/merge state (fork issue #325 M4c).
-- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script).
+##### worktree/reclaim/062 — M4c TIGHTENED rule (RED), auditor A1/A2/A3/A8 on PR #526 (maintainer approved tightening rather than shipping or reverting). An isolated clone that is owned (a real attach-lock artifact via `provision_isolated_clone_sync`), clean, has exactly one local branch matching its resolved branch with an empty `git stash list`, and whose HEAD TREE equals a merged PR's merge-commit TREE (content equality, not commit-SHA equality — a squash-merge repo's genuine clone essentially never matches on commit SHA) must report as auto-reclaim-eligible. `isolated_clone_report` consults none of `has_attach_lock`, `cleanliness`, or extraneous local refs today, and there is no tree-SHA machinery of any kind yet — only the bare HEAD-commit-SHA comparison the pre-tightening rule used (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script answering both `pr list` and `api graphql`) — built through the real production provisioner (`issue_dispatch_run::provision_isolated_clone_sync`), not a hand-assembled marker, so the genuine attach-lock artifact is what's examined.
 - **Agent:** none.
-- **Asserts:** a deck-owned isolated clone, PR-merged with a `mergeCommit.oid` equal to the clone's own current HEAD SHA, reports `verdict == "isolated_clone_reclaimable"`.
-- **Does not assert:** the diverged/negative case (`worktree/reclaim/063`), or that `run_reclaim` actually removes the clone — the new verdict's removal wiring is the coder's follow-up, not this milestone slice.
+- **Asserts:** a deck-owned, clean, single-local-branch, no-stash isolated clone whose HEAD tree SHA equals a merged PR's `mergeCommit.tree.oid` reports `verdict == "isolated_clone_reclaimable"`.
+- **Does not assert:** any of the six negative gates each pinned individually (`worktree/reclaim/063`-`067`), or that `run_reclaim` actually removes the clone.
 - **Platform coverage:** mac+linux.
 
-##### worktree/reclaim/063 — M4c sibling negative case. An isolated clone whose branch has a MERGED PR but whose CURRENT HEAD has diverged from that PR's merge-commit SHA (an extra local commit made after the merge) must stay exactly as conservative as `worktree/reclaim/052` — never an automatic-removal verdict, and never the new M4c reclaim-eligible verdict either. Exercises `052`'s already-shipped behavior against a new fixture; expected already GREEN, proving M4c's new rule doesn't loosen the existing conservative default for a clone that has drifted past its merge point (fork issue #325 M4c).
+##### worktree/reclaim/063 — M4c tightening, auditor A3 (content-equality negative, the sibling `062` proves positively). An isolated clone that is owned, clean, and carries no extraneous local refs — otherwise a full match against the tightened rule — but whose CURRENT HEAD TREE has diverged from the merged PR's merge-commit TREE (an extra local commit made after the point the PR merged) must stay exactly as conservative as `worktree/reclaim/052` — never an automatic-removal verdict, and never the tightened M4c reclaim-eligible verdict either. Built through the real provisioner so this isolates the content-equality gate from the ownership/cleanliness/extraneous-refs gates `063`-`067` cover individually (fork issue #325 M4c).
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script).
 - **Agent:** none.
-- **Asserts:** the diverged clone's `verdict` remains exactly `"isolated_clone"`; neither a bare `worktree reclaim` nor `--yes` removes it.
-- **Does not assert:** the exact-match positive case (`worktree/reclaim/062`).
+- **Asserts:** the tree-diverged clone's `verdict` remains exactly `"isolated_clone"`; neither a bare `worktree reclaim` nor `--yes` removes it.
+- **Does not assert:** the exact-match positive case (`worktree/reclaim/062`), or the other four negative gates (`064`-`067`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/064 — M4c tightening, auditor A1. An isolated clone that is owned, has a single local branch matching its resolved branch, no stash entries, and a HEAD tree equal to the merged PR's merge-commit tree — otherwise a full match against the tightened rule — but carries an UNCOMMITTED change must stay exactly as conservative as `"isolated_clone"`. `remove_dir_all` has no equivalent of `git worktree remove`'s own refusal against a dirty tree, so eligibility itself must consult cleanliness rather than leaving it a display-only field, as it was before this tightening (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, then a single uncommitted file written after the SHA/tree the stub claims to match are captured.
+- **Agent:** none.
+- **Asserts:** the fixture's `clean` field is genuinely `false` (sanity); the dirty clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the ownership/extraneous-refs gates (`065`-`067`) or the content-equality gate (`062`/`063`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/065 — M4c tightening, auditor A2 (the security-relevant case). An isolated clone that LOOKS otherwise fully eligible — a genuine `git clone`, a single local branch matching its resolved branch, clean, no stash, and a HEAD tree equal to the merged PR's merge-commit tree — but carries NO deck attach-lock provenance artifact (the exact M4b forgery shape `worktree/reclaim/054` already pins for the display `owned` field, now asserted against the deletion decision instead) must stay exactly as conservative as `"isolated_clone"`. The fixture is built the same way as a genuine deck-owned clone in every other respect, proving eligibility cannot rest entirely on evidence the candidate directory itself controls (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — a real `git clone` plus a hand-planted ownership marker (the pre-tightening `062`/`063` fixture shape), deliberately never calling `provision_isolated_clone_sync`.
+- **Agent:** none.
+- **Asserts:** the fixture's `owned` field is genuinely `false` (sanity); the unowned clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the genuine-attach-lock positive case (`062`) or the other three negative gates (`063`/`064`/`066`/`067`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/066 — M4c tightening, auditor A3. An isolated clone that is owned, clean, content-matching, and carries no stash, but has a SECOND local branch beyond the one it resolved/checked out, must stay exactly as conservative as `"isolated_clone"`. HEAD/its tree proves ONE ref is safe to discard; `remove_dir_all` destroys the WHOLE clone, including every other local branch, which may hold commits with no copy anywhere else (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, then a second local branch created (never checked out).
+- **Agent:** none.
+- **Asserts:** the extra-branch clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the stash-entry variant of the same gate (`067`), or the other three negative gates (`063`-`065`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/067 — M4c tightening, auditor A3's other half. An isolated clone that is owned, clean (a stash push leaves the working tree exactly as committed), content-matching, and has exactly one local branch, but carries a NON-EMPTY `git stash list`, must stay exactly as conservative as `"isolated_clone"`. A stash entry is local-only content `remove_dir_all` would destroy with no copy anywhere else — the same hazard as an extra branch (`066`), through git's other local-only ref namespace (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, then a tracked-file edit stashed away.
+- **Agent:** none.
+- **Asserts:** the fixture's `clean` field is genuinely `true` after the stash push (sanity — a stash leaves the tree as committed); the clone's `verdict` remains exactly `"isolated_clone"`.
+- **Does not assert:** the extra-local-branch variant of the same gate (`066`), or the other three negative gates (`063`-`065`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/068 — M4c tightening, auditor A8 — the case that PROVES the fix rather than merely adding a gate. On a squash-merge repo, a genuine isolated clone's own commit SHA essentially never equals the PR's `mergeCommit.oid` (GitHub's squash merge creates a brand-new commit object, not a fast-forward), so the pre-tightening, commit-SHA-only rule was inert for exactly the real clones this milestone exists to reclaim, while a planted candidate could satisfy it trivially with one `git checkout`. An owned, clean, single-branch, no-stash clone whose commit SHA does NOT equal the (simulated) squash-merge commit's SHA, but whose TREE SHA DOES equal that merge commit's tree SHA, must report the tightened reclaim-eligible verdict (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner; the stub's claimed `mergeCommit.oid` is the clone's own real HEAD SHA reversed (asserted different, still 40 hex characters), while its `mergeCommit.tree.oid` is the clone's own real tree SHA.
+- **Agent:** none.
+- **Asserts:** the sanity assertion that the simulated squash-merge commit SHA genuinely differs from the clone's own HEAD SHA; the clone's `verdict` equals exactly `"isolated_clone_reclaimable"` despite the commit-SHA mismatch.
+- **Does not assert:** the ordinary matching-commit-SHA positive case (`062`), which this test deliberately diverges from on that one axis.
 - **Platform coverage:** mac+linux.
 
 #### worktree/guard
