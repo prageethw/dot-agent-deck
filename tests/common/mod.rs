@@ -122,6 +122,7 @@ pub struct TuiDeckBuilder {
     claude_trust_paths: Vec<String>,
     claude_trust_workdir: bool,
     suppress_success_recording: bool,
+    launch_subdir: Option<PathBuf>,
 }
 
 impl TuiDeckBuilder {
@@ -130,6 +131,20 @@ impl TuiDeckBuilder {
     /// value than Decision 20's pinned default (e.g. `NO_COLOR=1`).
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Launch the deck from `subdir` *inside* the fixture instead of at the
+    /// fixture root, creating it if absent. The fixture still lands at the
+    /// tempdir root, so the project's `.dot-agent-deck.toml` sits one or more
+    /// levels ABOVE the deck's working directory — which is the shape issue
+    /// #577 is about: a deck started somewhere below its project root.
+    ///
+    /// Everything else is unchanged; in particular `HOME`, both sockets and
+    /// the state dir still point at the per-test tempdir, so a test using this
+    /// is no less isolated than one launching at the root.
+    pub fn with_launch_subdir(mut self, subdir: impl Into<PathBuf>) -> Self {
+        self.launch_subdir = Some(subdir.into());
         self
     }
 
@@ -409,6 +424,7 @@ impl TuiDeck {
             claude_trust_paths: Vec::new(),
             claude_trust_workdir: false,
             suppress_success_recording: false,
+            launch_subdir: None,
         }
     }
 
@@ -581,7 +597,17 @@ impl TuiDeck {
         // (debug vs. release matches the test's profile).
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
-        cmd.cwd(&work);
+        // Default: launch at the fixture root. `with_launch_subdir` moves the
+        // deck's cwd below it without moving the fixture (issue #577).
+        let launch_dir = match &builder.launch_subdir {
+            Some(sub) => {
+                let dir = work.join(sub);
+                std::fs::create_dir_all(&dir).expect("create launch subdir");
+                dir
+            }
+            None => work.clone(),
+        };
+        cmd.cwd(&launch_dir);
         // PRD #89: the `--continue` flag was removed — auto-restore is now the
         // default. A staged saved session (pointed at by `DOT_AGENT_DECK_SESSION`
         // below) is restored unconditionally on launch when the daemon is empty,
@@ -5907,6 +5933,54 @@ impl EventSub {
         }
     }
 
+    /// Wait for the latest still-live genuine `SessionStart` that names one
+    /// daemon-managed pane and agent, then return its conversation generation.
+    /// Matching `SessionEnd`s clear a generation; launcher/wrapper-fork starts
+    /// are boot evidence rather than a conversation and therefore cannot
+    /// authorize a guarded prompt delivery.
+    pub fn wait_for_session_start_on_pane(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        timeout: Duration,
+    ) -> String {
+        use dot_agent_deck::event::EventType;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let events = self.events.lock().unwrap();
+            let mut current_session_id: Option<String> = None;
+            for event in events.iter().filter(|event| {
+                event.pane_id.as_deref() == Some(pane_id)
+                    && event.agent_id.as_deref() == Some(agent_id)
+            }) {
+                match event.event_type {
+                    EventType::SessionStart if !event.is_wrapper_fork_session_start() => {
+                        current_session_id = Some(event.session_id.clone());
+                    }
+                    EventType::SessionEnd
+                        if current_session_id.as_deref() == Some(event.session_id.as_str()) =>
+                    {
+                        current_session_id = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(session_id) = current_session_id {
+                return session_id;
+            }
+            if Instant::now() >= deadline {
+                let seen = events.clone();
+                panic!(
+                    "no still-live genuine SessionStart for pane {pane_id:?} and agent \
+                     {agent_id:?} appeared within {timeout:?}; observed events: {seen:#?}"
+                );
+            }
+            drop(events);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Like [`Self::wait_for`], but returns `None` instead of panicking when
     /// `timeout` elapses with no match. For a caller that must distinguish
     /// "the precondition this run needed was never met" (inconclusive) from
@@ -6033,6 +6107,42 @@ pub fn attach_request_on(
     socket: &Path,
     req: &dot_agent_deck::daemon_protocol::AttachRequest,
 ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    let payload = serde_json::to_value(req).expect("serialize AttachRequest");
+    attach_json_request_on(socket, &payload)
+}
+
+/// Send a guarded `WriteAndSubmit` request over a daemon attach socket.
+///
+/// The identity fields are additive JSON keys rather than fields on
+/// `AttachRequest`, so E2E clients use this helper when they need to model the
+/// production seed/orchestrator prompt-delivery RPC.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_and_submit_with_identity_on(
+    socket: &Path,
+    pane_id: &str,
+    text: &str,
+    expected_agent_id: &str,
+    expected_session_id: Option<&str>,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    let mut request = serde_json::json!({
+        "op": "write-and-submit",
+        "pane_id": pane_id,
+        "text": text,
+        "expected_agent_id": expected_agent_id,
+    });
+    if let Some(session_id) = expected_session_id {
+        request["expected_session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+    attach_json_request_on(socket, &request)
+}
+
+/// Send one JSON request over a daemon attach socket and read its response.
+#[cfg(unix)]
+fn attach_json_request_on(
+    socket: &Path,
+    req: &serde_json::Value,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
     use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
     use std::io::{Read, Write};
 
@@ -6040,7 +6150,7 @@ pub fn attach_request_on(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
-    let payload = serde_json::to_vec(req).expect("serialize AttachRequest");
+    let payload = serde_json::to_vec(req).expect("serialize attach request JSON");
     let mut header = [0u8; 5];
     header[0] = KIND_REQ;
     header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());

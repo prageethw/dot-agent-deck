@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 //! Issue #582 — regression tests for `scripts/assemble-changelog.sh`, the
 //! release-time fragment assembler.
 //!
@@ -19,22 +19,21 @@
 //! tests only). They run in the fast tier: each one is a single `bash`
 //! invocation against a scratch directory, no network, no sleeps.
 //!
-//! `#![cfg(target_os = "linux")]` because that is where the subject actually
-//! runs: `release.yml` invokes this script on `ubuntu-latest`, and nothing else
-//! invokes it at all. The gate is deliberately narrower than `unix`, and it is
-//! not caution — an earlier `#![cfg(unix)]` turned `build-macos` red, with
-//! every case failing identically at `assemble-changelog.sh: line 12: added:
-//! unbound variable`. Line 12 is the `declare -A TYPE_HEADERS=(` block, which
-//! predates this file: macOS ships bash 3.2, which has no associative arrays,
-//! so `[added]="Added"` is parsed as an *arithmetic* subscript and `added` is
-//! an unset variable under the script's `set -u`. (Reproduced on bash 5 by
-//! dropping the `declare -A`: same message, same variable.) So the script has
-//! always required bash 4+, and these tests were simply the first thing ever to
-//! execute it on a macOS runner. Making it bash-3.2-clean is a real
-//! improvement, but it is a change to the highest-blast-radius script in the
-//! repo and belongs to its own issue rather than to the #582 fix — tracked in
-//! #593. Until then a test that runs where the script does not is a test whose
-//! red says nothing about the script's correctness.
+//! `#![cfg(unix)]`, which is where the subject can run. It was briefly
+//! `#![cfg(target_os = "linux")]`: gated `unix` it turned `build-macos` red,
+//! with every case failing identically at `assemble-changelog.sh: line 12:
+//! added: unbound variable`. Line 12 was a `declare -A TYPE_HEADERS=(` block
+//! that predated this file — macOS ships bash 3.2.57, which has no associative
+//! arrays, so `[added]="Added"` was parsed as an *arithmetic* subscript and
+//! `added` read as an unset variable under the script's `set -u`. The script
+//! had therefore always required bash 4+, and these tests were simply the first
+//! thing ever to execute it on a macOS runner. Narrowing to `linux` was the
+//! right call for the #582 bugfix — a test that runs where the script does not
+//! is a test whose red says nothing about the script's correctness — but it
+//! parked the portability defect rather than fixing it. Issue #593 replaced the
+//! associative array with a `case` function, so the script is now bash-3.2
+//! clean and the gate is back to `unix`, which is what makes `build-macos`
+//! prove that rather than leaving it resting on review.
 
 // Issue #322 / linkage-check check 8: `tests/` may not call a bare `tempfile`
 // constructor. This crate does not link the PTY harness, so it uses the
@@ -231,4 +230,186 @@ fn nested_fragment_with_a_recognized_suffix_is_rendered_then_deleted() {
          being consumed silently.\nstdout:\n{stdout}",
     );
     assert!(!exists(root, "nested/701.bugfix.md"));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #593 — the type/heading mapping.
+//
+// The mapping used to be a `declare -A TYPE_HEADERS`, which is bash 4 and so
+// died on macOS's bash 3.2.57 before the script did anything. It is now a
+// `type_header()` `case`. That rewrite touched all nine arms while the tests
+// above exercise only `feature` and `bugfix`, so the rest had no coverage.
+//
+// The mapping is declared in two places that must agree: the `TYPES` array
+// (scan order) and `type_header()`'s arms (heading per type). Both lists are
+// therefore READ OUT OF THE SCRIPT rather than mirrored here. A mirrored copy
+// would have made these tests describe a lockstep they did not enforce — add a
+// tenth type to the script and a hardcoded list simply never feeds it, so it
+// goes untested while the test still claims to have checked it.
+
+/// The script's `TYPES=(…)` array — the authoritative list, in scan order.
+fn declared_types(script: &str) -> Vec<String> {
+    let line = script
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("TYPES=("))
+        .expect("the script declares a single-line TYPES=(…) array");
+    line.trim_start_matches("TYPES=(")
+        .split(')')
+        .next()
+        .expect("TYPES=(…) closes on its own line")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `type_header()`'s `case` arms as `(aliases, heading)`, in source order. The
+/// `*)` catch-all is the mismatch guard rather than a mapping, so it is left
+/// out.
+fn mapped_headings(script: &str) -> Vec<(Vec<String>, String)> {
+    let body = script
+        .split_once("type_header() {")
+        .expect("the script defines type_header()")
+        .1;
+    let body = body
+        .split_once("\n}")
+        .expect("type_header() has a closing brace")
+        .0;
+
+    body.lines()
+        .filter_map(|line| {
+            let (labels, rest) = line.trim().split_once(')')?;
+            // Arm labels are lowercase names joined by `|`. Anything else on a
+            // line that happens to contain `)` — the `*)` catch-all, or the
+            // error text mentioning `type_header()` — is not a mapping.
+            if labels.is_empty() || !labels.chars().all(|c| c.is_ascii_lowercase() || c == '|') {
+                return None;
+            }
+            let heading = rest
+                .split('"')
+                .nth(1)
+                .expect("a mapping arm echoes a quoted heading");
+            Some((
+                labels.split('|').map(str::to_owned).collect(),
+                heading.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn heading_for(map: &[(Vec<String>, String)], ty: &str) -> Option<String> {
+    map.iter()
+        .find(|(aliases, _)| aliases.iter().any(|a| a == ty))
+        .map(|(_, heading)| heading.clone())
+}
+
+/// The lockstep itself, checked statically against the script text: every type
+/// the script scans for has an arm that maps it to a heading, and no arm maps a
+/// type the script never scans for.
+///
+/// A type in `TYPES` with no arm falls through to `*)` and aborts the release
+/// — the failure this catches is a release going out short a section, and it
+/// catches it without spawning a shell.
+#[test]
+fn every_declared_type_has_a_heading_arm_and_vice_versa() {
+    let script = fs::read_to_string(script_path()).expect("the assembler script is readable");
+    let declared = declared_types(&script);
+    let map = mapped_headings(&script);
+
+    assert!(
+        !declared.is_empty() && !map.is_empty(),
+        "the parsers found nothing — the script's shape changed and these \
+         tests are no longer reading it.\nTYPES: {declared:?}\narms: {map:?}",
+    );
+
+    let unmapped: Vec<&String> = declared
+        .iter()
+        .filter(|ty| heading_for(&map, ty).is_none())
+        .collect();
+    assert!(
+        unmapped.is_empty(),
+        "these types are in TYPES but have no type_header() arm, so the \
+         script aborts the moment a fragment of one shows up: {unmapped:?}",
+    );
+
+    let orphaned: Vec<&String> = map
+        .iter()
+        .flat_map(|(aliases, _)| aliases)
+        .filter(|alias| !declared.contains(alias))
+        .collect();
+    assert!(
+        orphaned.is_empty(),
+        "these types have a type_header() arm but are not in TYPES, so no \
+         fragment of them is ever scanned for: {orphaned:?}",
+    );
+}
+
+/// One fragment of every type the script declares is rendered, under the
+/// heading the script's own arms map it to, with aliases collapsing into a
+/// single section.
+///
+/// Both the input types and the expected headings come from the script, so a
+/// type added later is exercised automatically rather than silently skipped.
+/// What is asserted is that the script's *runtime* behaviour matches its own
+/// *declarations* — every fragment reaches the notes, each heading is opened
+/// exactly once, and the sections come out in `TYPES` order.
+#[test]
+fn every_declared_type_renders_under_its_mapped_heading() {
+    let script = fs::read_to_string(script_path()).expect("the assembler script is readable");
+    let declared = declared_types(&script);
+    let map = mapped_headings(&script);
+
+    let scratch = test_temp::tempdir().expect("scratch dir");
+    let root = scratch.path();
+    write_fragment(root, ".gitkeep", "");
+    for (i, ty) in declared.iter().enumerate() {
+        write_fragment(
+            root,
+            &format!("{}.{ty}.md", 700 + i),
+            &format!("## Entry for {ty}\n\nBody for {ty}.\n"),
+        );
+    }
+
+    let out = run(root, "9.9.9");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "a fragment of every declared type must assemble cleanly.\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    for ty in &declared {
+        assert!(
+            stdout.contains(&format!("**Entry for {ty}**")),
+            "the '{ty}' fragment never reached the release notes.\n\
+             stdout:\n{stdout}",
+        );
+    }
+
+    // First appearance of each mapped heading, walking TYPES in order — this
+    // is what the aliasing is *for*, so `feature` must not open a section of
+    // its own next to `added`.
+    let mut expected: Vec<String> = Vec::new();
+    for ty in &declared {
+        let heading = format!(
+            "### {}",
+            heading_for(&map, ty).expect("checked by the lockstep test above"),
+        );
+        if !expected.contains(&heading) {
+            expected.push(heading);
+        }
+    }
+
+    let actual: Vec<&str> = stdout
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| l.starts_with("### "))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "the rendered sections must match what the script's own TYPES order \
+         and type_header() arms imply — a repeat means the alias dedup broke, \
+         a missing one means an arm stopped matching at runtime.\n\
+         stdout:\n{stdout}",
+    );
 }

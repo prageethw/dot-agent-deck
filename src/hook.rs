@@ -505,8 +505,8 @@ pub const DELEGATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// connect/write/read. An earlier draft of this function was exactly that, and
 /// it carried no deadline; sharing the one implementation gives `delegate` the
 /// total-operation bound, the half-close, the read-exactly-one-line behaviour
-/// PRD #163 M4 needed for Windows, and any future fix to the connect phase
-/// (issue #435) for free.
+/// PRD #163 M4 needed for Windows, and — since issue #435 — a connect step that
+/// is inside the deadline rather than beside it, for free.
 pub fn send_and_await_reply(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(DELEGATE_REPLY_TIMEOUT))
 }
@@ -567,7 +567,10 @@ const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// `Some(String::new())`.
 ///
 /// [`GET_SEED_REQUEST_TIMEOUT`] bounds the **whole exchange**, not just a
-/// single idle read: [`request_from_socket_inner`]'s read loop measures
+/// single idle read — and since issue #435 that is literally rather than
+/// approximately true, because the connect step goes through
+/// [`crate::platform::ipc::IpcClient::connect_timeout`] instead of a blocking
+/// `connect(2)` that no deadline reached. The read loop measures
 /// elapsed wall-clock time against it and shrinks each individual blocking
 /// read's own timeout to whatever is left, so a peer that keeps dribbling a
 /// byte at a time without ever completing the reply line can no longer keep
@@ -635,6 +638,23 @@ fn request_from_socket_at(
     json: &str,
     timeout: Option<std::time::Duration>,
 ) -> SocketReply {
+    request_from_socket_at_detailed(path, json, timeout).0
+}
+
+/// [`request_from_socket_at`], plus the [`ReplyReadError`] behind a
+/// [`SocketReply::NoReply`] when there is one.
+///
+/// The extra half is diagnostic only — `request_from_socket_at` above is
+/// literally this function's first return value and nothing else, so
+/// production behavior is unchanged. Issue #564: the socket tests assert on the reason as well
+/// as the outcome, so a future failure prints *which* branch ended the
+/// exchange rather than a bare `None` that four different causes could
+/// produce.
+fn request_from_socket_at_detailed(
+    path: &std::path::Path,
+    json: &str,
+    timeout: Option<std::time::Duration>,
+) -> (SocketReply, Option<ReplyReadError>) {
     // The total-operation deadline starts here, before connect, rather than
     // being re-armed with a fresh full budget once the connection is
     // established and the request written below. Connect and the write are
@@ -644,9 +664,21 @@ fn request_from_socket_at(
     // `request_from_socket`'s docs describe. The timeout value itself is
     // unchanged — only when the clock starts.
     let deadline = timeout.map(|budget| std::time::Instant::now() + budget);
-    let mut stream = match crate::platform::ipc::IpcClient::connect(path) {
+    // Issue #435: connect through the deadline-aware entry point, not the bare
+    // one. `IpcClient::connect` blocks uninterruptibly on Unix when the
+    // daemon's accept queue is full, so starting the clock above bounded the
+    // *rest* of the exchange while connect itself could still run past the
+    // budget indefinitely — the whole-exchange bound this function's docs
+    // promise was approximate rather than literal. A connect that blows the
+    // budget lands in `Unreachable`, which is the honest classification: the
+    // request was never sent.
+    let connected = match timeout {
+        Some(budget) => crate::platform::ipc::IpcClient::connect_timeout(path, budget),
+        None => crate::platform::ipc::IpcClient::connect(path),
+    };
+    let mut stream = match connected {
         Ok(stream) => stream,
-        Err(_) => return SocketReply::Unreachable,
+        Err(_) => return (SocketReply::Unreachable, None),
     };
     if let Some(deadline) = deadline {
         // Zero/negative remaining budget: do not hand the socket a zero
@@ -656,15 +688,15 @@ fn request_from_socket_at(
         // during connect folds into `NoReply`, matching how the read loop
         // treats a deadline that expires mid-operation.
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return SocketReply::NoReply;
+            return (SocketReply::NoReply, Some(ReplyReadError::DeadlineExpired));
         };
         if stream.set_timeouts(remaining).is_err() {
-            return SocketReply::Unreachable;
+            return (SocketReply::Unreachable, None);
         }
     }
     let msg = format!("{json}\n");
     if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
-        return SocketReply::Unreachable;
+        return (SocketReply::Unreachable, None);
     }
     // Half-close our write side so the daemon's line reader sees EOF after our
     // single request and doesn't block waiting for more (it reads in a loop).
@@ -684,8 +716,52 @@ fn request_from_socket_at(
     // fold into `SocketReply::NoReply` here / the caller's documented "no
     // seed" → PTY-injection fallback for `get-seed`.
     match read_reply_line(&mut stream, deadline) {
-        Some(line) => SocketReply::Line(line),
-        None => SocketReply::NoReply,
+        Ok(line) => (SocketReply::Line(line), None),
+        Err(err) => {
+            // Every reason still folds into the one `NoReply` the callers
+            // already handle — the wire contract is unchanged. It is only
+            // recorded on the way past, because issue #564's two occurrences
+            // both had to be diagnosed from a nextest *duration* (0.4s of a 5s
+            // budget) after the fact: the reply path had no way to say which of
+            // its four terminal branches fired.
+            tracing::debug!(reason = %err, "hook socket request read no reply line");
+            (SocketReply::NoReply, Some(err))
+        }
+    }
+}
+
+/// Why [`read_reply_line`] returned no reply line.
+///
+/// Every variant folds into [`SocketReply::NoReply`] at the boundary, so this
+/// changes no caller's behavior; it exists so a failure names itself instead
+/// of collapsing four distinct causes into one `None`. Issue #564: a
+/// `get-seed` that silently degrades to PTY injection looks identical to one
+/// that never had a daemon to talk to, which is exactly the ambiguity that
+/// made a macOS-only flake take two occurrences and a log excavation to place.
+#[derive(Debug)]
+enum ReplyReadError {
+    /// The total-operation budget was gone before a reply line completed —
+    /// a genuinely wedged or unreachably slow daemon.
+    DeadlineExpired,
+    /// The peer closed without writing a single byte: an older daemon that
+    /// does not know this verb. See [`SocketReply::NoReply`].
+    ClosedWithoutReply,
+    /// A read, or the per-read timeout re-arm, failed for a reason that is
+    /// not transient — transient ones are retried, see
+    /// [`is_transient_read_error`].
+    Io(std::io::Error),
+    /// A reply line arrived but was not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for ReplyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadlineExpired => write!(f, "total-operation deadline expired"),
+            Self::ClosedWithoutReply => write!(f, "peer closed without writing any bytes"),
+            Self::Io(err) => write!(f, "read failed: {err} (kind {:?})", err.kind()),
+            Self::InvalidUtf8 => write!(f, "reply line was not valid UTF-8"),
+        }
     }
 }
 
@@ -702,13 +778,22 @@ fn request_from_socket_at(
 /// against `deadline` and re-arms the socket's per-read timeout to whatever
 /// is left before each individual read, so the *operation as a whole* —
 /// regardless of how the peer paces its bytes — cannot run past `deadline`.
-/// Once the deadline has passed, any read fails, the peer closes before
-/// sending a single byte, or the line is not valid UTF-8, this returns
-/// `None`; the caller folds that into `SocketReply::NoReply` exactly as it
-/// already did for a timed-out read — see [`request_from_socket`]. A peer
-/// that closes *after* writing part of a line, but before the newline, is a
-/// distinct case: the partial line is still returned as `Some(partial)`, not
-/// folded into `None`.
+/// Once the deadline has passed, a read fails non-transiently, the peer
+/// closes before sending a single byte, or the line is not valid UTF-8, this
+/// returns the matching [`ReplyReadError`]; the caller folds every one of
+/// them into `SocketReply::NoReply` exactly as it already did for a timed-out
+/// read — see [`request_from_socket`]. The typed reason exists only so a
+/// failure can say which of the four it was (issue #564). A peer that closes
+/// *after* writing part of a line, but before the newline, is a distinct
+/// case: the partial line is still returned as `Ok(partial)`, not folded into
+/// an error.
+///
+/// "A read fails" is deliberately narrower than "`read` returned `Err`":
+/// `EINTR`, and a per-read timeout that fires while the operation's own
+/// budget still has time on it, are retried rather than treated as the end of
+/// the exchange — see [`is_transient_read_error`]. Reading `Err` as final
+/// regardless is what let a daemon replying 300ms into a 5s budget be
+/// reported as an absent one on macOS CI.
 ///
 /// `deadline` is computed once by the caller — [`request_from_socket_at`] —
 /// from a point **before** it connects, not re-derived here from a fresh
@@ -717,20 +802,65 @@ fn request_from_socket_at(
 /// actually be bounded and the exchange as a whole could run past what the
 /// caller's `timeout` advertises.
 ///
-/// `None` falls back to unbounded blocking reads with no re-arming, for
-/// callers that pass no deadline at all.
+/// A `deadline` of `None` falls back to unbounded blocking reads with no
+/// re-arming, for callers that pass no deadline at all.
 fn read_reply_line(
     stream: &mut crate::platform::ipc::IpcClient,
     deadline: Option<std::time::Instant>,
-) -> Option<String> {
+) -> Result<String, ReplyReadError> {
     let mut buf = [0u8; 512];
     let mut line = Vec::new();
     loop {
         if let Some(deadline) = deadline {
-            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
-            stream.set_timeouts(remaining).ok()?;
+            // `checked_duration_since` yields `Some(ZERO)` at the exact instant
+            // the deadline lands, and `set_read_timeout(ZERO)` is an
+            // `InvalidInput` error rather than a timeout — so an exhausted
+            // budget is reported as what it is instead of as an I/O failure.
+            let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => return Err(ReplyReadError::DeadlineExpired),
+            };
+            stream.set_timeouts(remaining).map_err(ReplyReadError::Io)?;
         }
-        let n = stream.read(&mut buf).ok()?;
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            // Issue #564: a read error is NOT on its own evidence that the
+            // exchange is over. Two classes have to be reconciled with the
+            // deadline before they can end it, and folding them straight into
+            // "no reply" is what let a daemon replying 300ms into a 5s budget
+            // be reported as an absent one.
+            //
+            // `Interrupted` (EINTR) is transient by definition — a signal
+            // landed on this thread while it sat in `read(2)`. It says nothing
+            // about the peer and nothing about the clock, and `std` does not
+            // retry it for us here the way `Write::write_all` does on the send
+            // side. Retrying is always correct: the loop re-arms from
+            // `deadline` on the next pass, so the operation stays bounded.
+            //
+            // `WouldBlock`/`TimedOut` (EAGAIN/EWOULDBLOCK/ETIMEDOUT) are the
+            // socket's OWN per-read `SO_RCVTIMEO` firing, which is a different
+            // clock from the total-operation deadline this function
+            // advertises. Normally the two coincide, because the re-arm above
+            // sets the per-read timeout to exactly the remaining budget — but
+            // treating the per-read result as final regardless meant the
+            // operation ended on the socket's word rather than on the
+            // deadline's, so any early or spurious fire cut an exchange short
+            // that still had seconds left. Consult the deadline instead: while
+            // budget remains, go back and read again; once it is gone, the
+            // loop head above returns `DeadlineExpired`.
+            //
+            // This cannot spin. A `WouldBlock` from a `SO_RCVTIMEO` armed at
+            // `remaining` has by definition just consumed `remaining`, so the
+            // loop head finds no budget and ends the operation on the very
+            // next pass — the ordinary case costs exactly one extra trip round
+            // the loop. The retry earns its keep only when a fire is EARLY,
+            // which is the case that has no other defence, and even a fire
+            // that were somehow instant is bounded by the same deadline rather
+            // than by a retry count. `socket_003`/`socket_005` pin that end of
+            // it: both still return at ~5.01s, unchanged by this.
+            Err(err) if is_transient_read_error(&err, deadline) => continue,
+            Err(err) => return Err(ReplyReadError::Io(err)),
+        };
         if n == 0 {
             // EOF with nothing received at all: the daemon closed without
             // answering — exactly the "old daemon that doesn't know this
@@ -743,7 +873,7 @@ fn read_reply_line(
             // `Line(partial)` unchanged: that is a distinct scenario this fix
             // does not touch.
             if line.is_empty() {
-                return None;
+                return Err(ReplyReadError::ClosedWithoutReply);
             }
             break;
         }
@@ -753,9 +883,25 @@ fn read_reply_line(
         }
         line.extend_from_slice(&buf[..n]);
     }
-    String::from_utf8(line)
-        .ok()
-        .map(|s| s.trim_end_matches('\r').to_string())
+    match String::from_utf8(line) {
+        Ok(line) => Ok(line.trim_end_matches('\r').to_string()),
+        Err(_) => Err(ReplyReadError::InvalidUtf8),
+    }
+}
+
+/// Should this `read(2)` failure send [`read_reply_line`] back for another
+/// pass rather than ending the exchange? See the call site for why each class
+/// is here; `deadline` is what decides the timeout-class ones, so a caller
+/// that passed no deadline at all (unbounded blocking reads) keeps treating
+/// them as final rather than spinning on them forever.
+fn is_transient_read_error(err: &std::io::Error, deadline: Option<std::time::Instant>) -> bool {
+    match err.kind() {
+        std::io::ErrorKind::Interrupted => true,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            deadline.is_some_and(|deadline| deadline > std::time::Instant::now())
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1060,41 +1206,69 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn socket_004_slow_but_replying_daemon_still_returns_the_reply() {
+        const REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
         let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
         let socket_path = _tmp.path().join("s.sock");
         let listener =
             std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
 
         // Stub daemon: read the request line, wait a short delay comfortably
-        // inside the 5s bound the fix will add, then reply with one line.
-        let daemon_thread = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+        // inside the 5s bound, then reply with one line. It reports what it
+        // actually managed to do rather than swallowing every error into `_`,
+        // so a failure can separate "the client dropped a reply that WAS
+        // written" from "the daemon never wrote one" — a distinction issue
+        // #564 had no way to make from either of its CI occurrences.
+        let daemon_thread = std::thread::spawn(move || match listener.accept() {
+            Err(err) => format!("accept failed: {err}"),
+            Ok((mut stream, _)) => {
                 let mut reader = std::io::BufReader::new(&stream);
                 let mut line = String::new();
-                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                let _ = std::io::Write::write_all(&mut stream, br#"{"seed":"abc123"}"#);
-                let _ = std::io::Write::write_all(&mut stream, b"\n");
-                let _ = std::io::Write::flush(&mut stream);
+                if let Err(err) = std::io::BufRead::read_line(&mut reader, &mut line) {
+                    return format!("reading the request line failed: {err}");
+                }
+                std::thread::sleep(REPLY_DELAY);
+                // Two writes, not one: this also keeps the client's read loop
+                // going round a second time for the newline, which is the
+                // path that has to survive a transient read error.
+                let written = std::io::Write::write_all(&mut stream, br#"{"seed":"abc123"}"#)
+                    .and_then(|()| std::io::Write::write_all(&mut stream, b"\n"))
+                    .and_then(|()| std::io::Write::flush(&mut stream));
+                match written {
+                    Ok(()) => "wrote and flushed the reply line".to_string(),
+                    Err(err) => format!("writing the reply failed: {err}"),
+                }
             }
         });
 
-        let result = match request_from_socket_at(
+        let started = std::time::Instant::now();
+        let (reply, read_error) = request_from_socket_at_detailed(
             &socket_path,
             r#"{"type":"get-seed"}"#,
             Some(GET_SEED_REQUEST_TIMEOUT),
-        ) {
-            SocketReply::Line(line) => Some(line),
-            SocketReply::NoReply | SocketReply::Unreachable => None,
-        };
+        );
+        let elapsed = started.elapsed();
+        let daemon_report = daemon_thread
+            .join()
+            .unwrap_or_else(|_| "the stub daemon thread panicked".to_string());
 
-        let _ = daemon_thread.join();
-
-        assert_eq!(
-            result,
-            Some(r#"{"seed":"abc123"}"#.to_string()),
+        // Deliberately NOT collapsed into `Option<String>` before asserting.
+        // The old assertion printed a bare `left: None` — a value `NoReply`
+        // and `Unreachable` produce alike, naming neither the cause nor how
+        // much of the budget had been spent. Both of issue #564's macOS
+        // occurrences had to be placed by reading the *duration* out of a
+        // nextest line after the fact (0.435s and 0.401s of a 5s budget,
+        // against a 0.307s honest cost), which is what showed the deadline
+        // was never in play and the exchange had been ended by a read error
+        // instead. That should come out of the assertion itself next time.
+        assert!(
+            matches!(&reply, SocketReply::Line(line) if line == r#"{"seed":"abc123"}"#),
             "a daemon that replies well inside the timeout bound must not be mistaken for \
-             an absent one"
+             an absent one — got {reply:?} (read error: {read_error:?}) after {elapsed:?} of \
+             a {GET_SEED_REQUEST_TIMEOUT:?} budget, having slept {REPLY_DELAY:?} before \
+             replying; the stub daemon reports: {daemon_report}. An elapsed time well short \
+             of the budget means something other than the deadline ended the exchange — see \
+             `is_transient_read_error`."
         );
     }
 
@@ -1233,6 +1407,143 @@ mod tests {
              SocketReply::NoReply, matching its own doc comment's \"daemon closed without \
              answering\" case, not SocketReply::Line(\"\") — got {result:?}"
         );
+    }
+
+    /// Scenario: A stub daemon accepts the connection, reads the request line,
+    /// waits 300ms and then replies — while the test hammers the *client*
+    /// thread with `SIGUSR1`, whose handler is installed deliberately without
+    /// `SA_RESTART` so that every signal landing while the client sits in
+    /// `read(2)` surfaces as `EINTR`. The reply must still come back intact:
+    /// a signal on the reading thread says nothing about the peer and nothing
+    /// about the clock, so it must not be mistaken for an absent daemon.
+    #[spec("error/socket/007")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_007_signal_interrupted_read_still_returns_the_reply() {
+        /// Long enough that the client is parked in `read(2)` for the whole
+        /// signalling window below, and still ~16x inside the 5s budget.
+        const REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+        /// Let connect + write + `shutdown_write` finish before the first
+        /// signal. Those are sub-millisecond on an already-bound local socket,
+        /// so this is a ~50x margin; it matters because `UnixStream::connect`
+        /// does not retry `EINTR` and a signal landing there would fail the
+        /// test as `Unreachable` for an unrelated reason (called out in the
+        /// assertion message so that case is not mysterious).
+        const SIGNAL_LEAD_IN: std::time::Duration = std::time::Duration::from_millis(50);
+        const SIGNAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const SIGNAL_ROUNDS: usize = 25;
+        /// Generous: the operation itself is bounded at 5s, so this only has
+        /// to fail before nextest's own kill window rather than pin any
+        /// timing.
+        const ASSERT_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
+
+        extern "C" fn noop_signal_handler(_signum: libc::c_int) {}
+
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Install the handler WITHOUT `SA_RESTART`. With it (or with the
+        // default disposition) the kernel would restart the interrupted
+        // `read(2)` itself and there would be no `EINTR` for the code under
+        // test to mishandle — clearing it is the whole point. Scoped: the
+        // previous disposition is restored at the end, and `SIGUSR1` is used
+        // nowhere else in the crate.
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop_signal_handler as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, &mut previous),
+                0,
+                "installing the SIGUSR1 handler must succeed"
+            );
+        }
+
+        let daemon_thread = std::thread::spawn(move || match listener.accept() {
+            Err(err) => format!("accept failed: {err}"),
+            Ok((mut stream, _)) => {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                if let Err(err) = std::io::BufRead::read_line(&mut reader, &mut line) {
+                    return format!("reading the request line failed: {err}");
+                }
+                std::thread::sleep(REPLY_DELAY);
+                let written = std::io::Write::write_all(&mut stream, br#"{"seed":"abc123"}"#)
+                    .and_then(|()| std::io::Write::write_all(&mut stream, b"\n"))
+                    .and_then(|()| std::io::Write::flush(&mut stream));
+                match written {
+                    Ok(()) => "wrote and flushed the reply line".to_string(),
+                    Err(err) => format!("writing the reply failed: {err}"),
+                }
+            }
+        });
+
+        let (thread_tx, thread_rx) = std::sync::mpsc::channel::<usize>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let client_socket_path = socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            // `pthread_t` is an integer on Linux and an opaque pointer on
+            // macOS; `usize` is the one shape that carries both across the
+            // channel without a `cfg`.
+            let _ = thread_tx.send(unsafe { libc::pthread_self() } as usize);
+            let _ = result_tx.send(request_from_socket_at_detailed(
+                &client_socket_path,
+                r#"{"type":"get-seed"}"#,
+                Some(GET_SEED_REQUEST_TIMEOUT),
+            ));
+            // Outlive the signalling loop, not merely the read: `pthread_kill`
+            // against a thread that has already exited is undefined behaviour,
+            // so this thread may not return until the last signal has been
+            // sent.
+            let _ = release_rx.recv();
+        });
+
+        let client_thread_id = thread_rx
+            .recv_timeout(ASSERT_CEILING)
+            .expect("the client thread must report its thread id");
+
+        std::thread::sleep(SIGNAL_LEAD_IN);
+        for _ in 0..SIGNAL_ROUNDS {
+            unsafe { libc::pthread_kill(client_thread_id as libc::pthread_t, libc::SIGUSR1) };
+            std::thread::sleep(SIGNAL_INTERVAL);
+        }
+
+        let outcome = result_rx.recv_timeout(ASSERT_CEILING);
+        // Safe to release now: the signalling loop above has finished, so no
+        // further `pthread_kill` can race the thread's exit.
+        let _ = release_tx.send(());
+        let daemon_report = daemon_thread
+            .join()
+            .unwrap_or_else(|_| "the stub daemon thread panicked".to_string());
+        unsafe {
+            libc::sigaction(libc::SIGUSR1, &previous, std::ptr::null_mut());
+        }
+
+        let (reply, read_error) = outcome.expect(
+            "the client thread must return within the ceiling — the operation is bounded at \
+             GET_SEED_REQUEST_TIMEOUT, so a timeout here means an EINTR retry loop that does \
+             not consult the deadline",
+        );
+        assert!(
+            matches!(&reply, SocketReply::Line(line) if line == r#"{"seed":"abc123"}"#),
+            "a read interrupted by a signal must be retried, not mistaken for an absent \
+             daemon — got {reply:?} (read error: {read_error:?}); the stub daemon reports: \
+             {daemon_report}. `SocketReply::Unreachable` here would mean a signal landed \
+             during connect/write instead of during the read, which the {SIGNAL_LEAD_IN:?} \
+             lead-in is sized to prevent."
+        );
+
+        // Joined last, deliberately. If the client thread ever failed to
+        // return within the ceiling the assertions above are the only thing
+        // that can say so, and joining a wedged thread first would hang the
+        // test until nextest killed it — losing exactly the diagnostic the
+        // failure exists to produce.
+        let _ = client_thread.join();
     }
 
     #[test]

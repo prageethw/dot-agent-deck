@@ -19,6 +19,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot};
 
 use crate::event::{AgentType, OrchestrationSurface};
 use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
+use crate::state::Ownership;
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -1793,6 +1794,34 @@ pub struct RunningAgent {
     /// `shutdown_all` still find the entry; only the idle gate filters it
     /// out. `Arc` because the reader thread holds an independent clone.
     pub exited: Arc<AtomicBool>,
+    /// Issue #454 round-3 audit (finding 4): set once, and never cleared, when a
+    /// LATER generation is published onto this record's `pane_id_env`.
+    ///
+    /// This is what makes disownership MONOTONE. The retirement rule in
+    /// [`AgentPtyRegistry::generation_ownership`] lets an exited generation keep
+    /// answering for its own pane until another generation claims it, and the
+    /// first implementation of "another generation claims it" was a *live*
+    /// lookup — so ownership came BACK when the successor exited in turn:
+    /// `A` exits on `P`, `B` takes `P`, `B` exits, and `A` was suddenly the
+    /// pane's owner again with neither record reaped. A retired generation
+    /// regaining its pane is exactly the resurrection the round-2 fix set out to
+    /// forbid, and it re-opened the stale-report chain behind it.
+    ///
+    /// Registry ids only ever increment and are never reused, so "a later
+    /// generation has claimed this pane" is a monotone predicate: once true it
+    /// can never become false again. Recording it on the record it disowns makes
+    /// it exactly that, needs no clock, no reaper and no second map, and is
+    /// bounded by the records themselves — a reaped record takes its flag with
+    /// it.
+    ///
+    /// Set at PUBLISH, not at reservation. A reservation that never becomes an
+    /// agent did not change the pane's hands, and ending the predecessor's grace
+    /// period on a spawn that failed would drop the final `SessionEnd` this
+    /// grace exists to catch. The pending reservation still disowns the
+    /// predecessor for as long as it is outstanding — see
+    /// [`AgentPtyRegistry::pane_claimed_by_other`] — so the window is covered at
+    /// both ends without making a failed spawn permanent.
+    pub pane_handed_over: bool,
     /// PRD #201 native prompt delivery: a seed/prompt the daemon prepared for
     /// this pane, awaiting a NATIVE pull by the agent's extension via
     /// `dot-agent-deck get-seed` (which then calls `pi.sendUserMessage`).
@@ -2885,6 +2914,124 @@ pub enum SilenceWatchRetirement {
 struct RegistryInner {
     next_id: u64,
     agents: HashMap<String, RunningAgent>,
+    /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
+    /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
+    /// spawn's validated `pane_id_env` (`None` for a paneless agent).
+    ///
+    /// [`AgentPtyRegistry::spawn_agent`] launches the child BEFORE it can take
+    /// this lock to publish the agent, so between those two points the daemon
+    /// owns a running child it cannot yet recognise. That gap is not
+    /// theoretical: the child's very first action can be
+    /// `dot-agent-deck agent-event --type running`, and the daemon's admission
+    /// check ([`crate::state::AppState::apply_event`]) would drop the report as
+    /// coming from a pane nobody owns — leaving `daemon status` and reconnect at
+    /// `live = None` with no later event to repair it, which is issue #454 all
+    /// over again for a wrapper that never emits `SessionStart`.
+    ///
+    /// The reservation is taken BEFORE the child exists and released under the
+    /// SAME lock acquisition that inserts into `agents`, so ownership is
+    /// continuously observable: every path that answers "do we own this?" sees
+    /// either the reservation or the agent, never neither. It is released on
+    /// every failure path too (see [`SpawnReservation`]), including a panic
+    /// inside the spawn itself.
+    ///
+    /// Round-2 audit: a reservation is also EXCLUSIVE on its pane id. Taking one
+    /// for a pane another reservation or another live agent already claims fails
+    /// the spawn outright, under this same lock — so "at most one generation
+    /// claims a pane" holds at every instant, which is the invariant
+    /// [`AgentPtyRegistry::owns_generation`]'s retirement rule rests on.
+    pending_spawns: HashMap<String, Option<String>>,
+    /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
+    /// currently in progress, keyed by pane id.
+    ///
+    /// `StopAgent` authorises a pane-scoped teardown — dropping the pane's
+    /// delegations, cancelling its provisional prompt, and taking its role, cwd,
+    /// orchestrator marker and routing identity back out of `AppState` — on the
+    /// strength of "nobody else holds this pane". That authorisation was
+    /// check-then-act: it was decided before `close_agent`, which can spend the
+    /// whole three-second termination grace, and acted on afterwards, so a spawn
+    /// reserving the pane anywhere in between had its freshly registered state
+    /// deleted by its predecessor's close.
+    ///
+    /// Rather than revalidate at each of the four steps — which only shrinks the
+    /// window, and cannot close the last one because the registry lock and the
+    /// `AppState` write lock are different locks — the authorisation is made
+    /// DURABLE: taking it also blocks any new generation from claiming the pane
+    /// until the cleanup finishes. See [`AgentPtyRegistry::hold_pane_for_cleanup`].
+    ///
+    /// This costs almost nothing in practice, because the pane is already
+    /// unavailable for most of the same window: a LIVE agent on it fails the
+    /// reservation's exclusivity test anyway, and the only genuinely new
+    /// exclusion is the short tail between a dead child and its record being
+    /// dropped by `close_agent`.
+    cleanup_holds: HashSet<String>,
+}
+
+/// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
+///
+/// `Drop` releases it by taking the registry lock, which is correct for every
+/// path that is NOT already holding it. The success path *is* — `spawn_agent`
+/// holds `inner` from the post-spawn acquisition through `agents.insert` — so it
+/// calls [`Self::release_locked`] instead, which consumes the guard and disarms
+/// `Drop` (a second lock acquisition on a `std::sync::Mutex` would deadlock).
+struct SpawnReservation<'a> {
+    registry: &'a AgentPtyRegistry,
+    id: Option<String>,
+}
+
+impl<'a> SpawnReservation<'a> {
+    /// Release the reservation while the caller already holds the registry lock.
+    fn release_locked(mut self, inner: &mut RegistryInner) {
+        if let Some(id) = self.id.take() {
+            inner.pending_spawns.remove(&id);
+        }
+    }
+}
+
+impl Drop for SpawnReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // A poisoned lock means some other thread panicked mid-mutation;
+            // there is nothing useful to do here and panicking in `Drop` would
+            // abort. The stale entry is bounded by one per panicking spawn.
+            if let Ok(mut inner) = self.registry.inner.lock() {
+                inner.pending_spawns.remove(&id);
+            }
+        }
+    }
+}
+
+/// Issue #454 round-3 review (blocker 1): RAII holder for a
+/// [`RegistryInner::cleanup_holds`] entry — the durable form of "this pane is
+/// still the stopping agent's to give up".
+///
+/// Held for the WHOLE of `StopAgent`'s pane-scoped cleanup and released on every
+/// exit from it, including the early `?` returns and a panic. While it is held,
+/// no new generation can reserve the pane, so the authorisation that granted it
+/// cannot go stale under the cleanup that acts on it. Owns an `Arc` rather than
+/// borrowing the registry because it lives across `.await` points.
+pub struct PaneCleanupHold {
+    registry: Arc<AgentPtyRegistry>,
+    pane_id: String,
+}
+
+impl PaneCleanupHold {
+    /// The pane this hold authorises cleanup of.
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+}
+
+impl Drop for PaneCleanupHold {
+    fn drop(&mut self) {
+        // Same reasoning as `SpawnReservation::drop`: a poisoned lock means
+        // another thread panicked mid-mutation, and panicking in `Drop` would
+        // abort. A leaked hold blocks reuse of ONE pane id on a registry that is
+        // already unable to answer any ownership question at all.
+        if let Ok(mut inner) = self.registry.inner.lock() {
+            inner.cleanup_holds.remove(&self.pane_id);
+        }
+    }
 }
 
 /// Issue #424 (reviewer blocker 3 / auditor MEDIUM): one daemon-authored report
@@ -2959,12 +3106,28 @@ impl Default for AgentPtyRegistry {
     }
 }
 
+/// Issue #454: the registry IS the daemon's ownership authority — see
+/// [`crate::state::AgentOwnership`] for why the daemon cannot keep an accurate
+/// copy of this by hand, and [`AgentPtyRegistry::generation_ownership`] for the
+/// properties that make asking here correct.
+impl crate::state::AgentOwnership for AgentPtyRegistry {
+    fn generation_ownership(
+        &self,
+        pane_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> crate::state::Ownership {
+        AgentPtyRegistry::generation_ownership(self, pane_id, agent_id)
+    }
+}
+
 impl AgentPtyRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(RegistryInner {
                 next_id: 1,
                 agents: HashMap::new(),
+                pending_spawns: HashMap::new(),
+                cleanup_holds: HashSet::new(),
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             detach_count: AtomicU64::new(0),
@@ -4387,11 +4550,60 @@ impl AgentPtyRegistry {
         // the OLD agent's `spawn_env` (which carries its id), and an
         // untrimmed replay would tag the NEW agent's hooks with the
         // OLD id — defeating the whole point of the filter.
+        //
+        // Issue #454: the same acquisition RESERVES the spawn. The child is
+        // launched below, before we can take this lock again to publish the
+        // agent, so without the reservation there is a window in which the
+        // daemon owns a running child that nothing can recognise — and a
+        // wrapper whose first act is `dot-agent-deck agent-event --type running`
+        // lands squarely in it. See [`RegistryInner::pending_spawns`].
+        //
+        // Issue #454 round-2 audit (blocker D): the reservation is EXCLUSIVE on
+        // the pane id, and that is the half the first version was missing.
+        // Ownership was conferred by a reservation but uniqueness was enforced
+        // only by the post-fork duplicate check further down, so two concurrent
+        // `StartAgent` calls for one pane both reserved it, both forked a child,
+        // and BOTH were owners until the loser was rejected as
+        // `DuplicatePaneId`. A loser that emitted before it was killed had its
+        // event admitted against a pane whose real occupant is the winner —
+        // and, once the winner is published, admitted again if it was processed
+        // late. Refusing the second reservation under the same lock that grants
+        // the first makes "at most one generation claims a pane" true at every
+        // instant, which is what the retirement rule in
+        // [`Self::owns_generation`] rests on.
+        //
+        // It also stops forking a child only to kill it: the rejection now
+        // happens before `spawn`, not after. The post-fork check below stays —
+        // it is the one that is atomic with the `agents.insert`, and this one is
+        // not a substitute for it.
         let preallocated_id = {
             let mut inner = self.inner.lock().unwrap();
+            if let Some(ref candidate) = pane_id_env
+                && (inner.cleanup_holds.contains(candidate.as_str())
+                    || inner
+                        .pending_spawns
+                        .values()
+                        .any(|reserved| reserved.as_deref() == Some(candidate.as_str()))
+                    || inner.agents.values().any(|a| {
+                        a.pane_id_env.as_deref() == Some(candidate.as_str())
+                            && !a.exited.load(Ordering::SeqCst)
+                    }))
+            {
+                // Issue #454 round 3: `cleanup_holds` is the third exclusion and
+                // the one that is not about a live occupant — a `StopAgent` is
+                // mid-way through taking this pane's state apart, and a
+                // generation that claimed it now would have that state deleted
+                // out from under it. See [`Self::hold_pane_for_cleanup`].
+                return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
+            }
             let id = inner.next_id.to_string();
             inner.next_id += 1;
+            inner.pending_spawns.insert(id.clone(), pane_id_env.clone());
             id
+        };
+        let reservation = SpawnReservation {
+            registry: self,
+            id: Some(preallocated_id.clone()),
         };
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
@@ -4443,6 +4655,12 @@ impl AgentPtyRegistry {
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
+        // Issue #454: hand ownership over from the reservation to `agents`
+        // WITHOUT releasing the lock in between — every early return below has
+        // already given up on this spawn, and the success path inserts under
+        // this very acquisition. Released here rather than via `Drop` because
+        // `Drop` would try to take a lock this scope already holds.
+        reservation.release_locked(&mut inner);
 
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard B — re-check the
         // shutdown latch *inside* the inner lock, so the check + insert
@@ -4481,6 +4699,14 @@ impl AgentPtyRegistry {
         // so the live/dead boundary stays consistent
         // (round-11 reviewer #A). Cleanup paths (`close_agent`,
         // `shutdown_all`) deliberately still touch exited entries.
+        //
+        // Issue #454 round 2: the pre-fork reservation now applies this same
+        // test, so in practice a duplicate is rejected before the child is
+        // forked and this branch is unreachable for a concurrent spawn. It is
+        // kept because it is the check that is ATOMIC with the insert below,
+        // and because `spawn` above releases the lock in between — nothing else
+        // publishes a live agent today, but this is the guarantee, not an
+        // assumption about callers.
         if let Some(ref candidate) = pane_id_env
             && inner.agents.values().any(|a| {
                 a.pane_id_env.as_deref() == Some(candidate.as_str())
@@ -4497,6 +4723,18 @@ impl AgentPtyRegistry {
         // check, so the record cannot outlive the handover.
         if let Some(ref claimed) = pane_id_env {
             self.forget_pane_input(claimed);
+            // Issue #454 round-3 audit (finding 4): the pane changes hands HERE,
+            // under the same lock as the duplicate check and the insert below.
+            // Every record still sitting on this pane is a retired generation
+            // (a live one would have been refused by the check just above), and
+            // each of them is disowned from this instant on — permanently, so
+            // the successor exiting can never hand the pane back. See
+            // [`RunningAgent::pane_handed_over`].
+            for agent in inner.agents.values_mut() {
+                if agent.pane_id_env.as_deref() == Some(claimed.as_str()) {
+                    agent.pane_handed_over = true;
+                }
+            }
         }
 
         let pty = guard.take();
@@ -4576,6 +4814,9 @@ impl AgentPtyRegistry {
             pty_rows: captured_rows,
             pty_cols: captured_cols,
             exited,
+            // Issue #454: a fresh generation has not been handed over yet. It
+            // is the one doing the taking-over, a few lines above.
+            pane_handed_over: false,
             // PRD #201: a fresh agent starts with no pending seed; the seed
             // path (StartAgent `seed` at spawn / a delegate respawn) sets it
             // right after this spawn returns, before the agent's extension
@@ -5420,6 +5661,10 @@ impl AgentPtyRegistry {
             pty_rows,
             pty_cols,
             exited: _,
+            // Issue #454: the OLD record is being removed outright, so its
+            // handover flag has nothing left to disown. The fresh generation
+            // starts `false` and takes the pane over in `spawn_agent`.
+            pane_handed_over: _,
             // PRD #201: a respawn (`clear = true` delegate) drops any seed the
             // old child left unconsumed; the caller re-arms the fresh child's
             // seed via `set_pending_seed` right after this returns.
@@ -5705,6 +5950,288 @@ impl AgentPtyRegistry {
         self.agent_records().into_iter().map(|r| r.id).collect()
     }
 
+    /// Issue #454: the agent recorded under `id`, INCLUDING one whose child has
+    /// already exited.
+    ///
+    /// [`Self::agent_records`] filters exited entries because it is the
+    /// hydration source and a dead entry there materialises a ghost pane. The
+    /// CLEANUP paths need the opposite: `StopAgent` reads the stopping agent's
+    /// `pane_id_env` so it can take the pane's role-map entries and daemon-state
+    /// registration back, and reading that through the filtered list meant a
+    /// naturally-exited child produced `pane_id_env == None` and every cleanup
+    /// step was skipped — permanently, since the registry entry is removed by
+    /// the same handler. Cleanup is exactly the case where a dead entry is the
+    /// thing you are looking for.
+    pub fn agent_record_any(&self, id: &str) -> Option<AgentRecord> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(id).map(|agent| AgentRecord {
+            id: id.to_string(),
+            pane_id_env: agent.pane_id_env.clone(),
+            display_name: agent.display_name.clone(),
+            cwd: agent.cwd.clone(),
+            tab_membership: agent.tab_membership.clone(),
+            agent_type: agent.agent_type.clone(),
+            rows: agent.pty_rows,
+            cols: agent.pty_cols,
+            live: None,
+        })
+    }
+
+    /// Issue #454: does this registry own the GENERATION an event naming
+    /// `(pane_id, agent_id)` comes from?
+    ///
+    /// This is the daemon's answer to "may this event drive my session state?"
+    /// — [`crate::state::AgentOwnership`] states the rule in full and this is
+    /// the only implementation of it. Four properties make the registry the
+    /// right authority, and each is one the set-of-registered-ids it replaced
+    /// could not hold:
+    ///
+    /// * it is true from BEFORE the child exists (the spawn reservation), so a
+    ///   child that reports faster than its spawner returns is still owned;
+    /// * it is keyed by GENERATION, so an event can be bound to the spawn it
+    ///   actually came from — a set of pane ids has no way to express that, and
+    ///   a pane id is explicitly reusable;
+    /// * a retired generation keeps its pane until another generation claims it,
+    ///   which is what lets a final `Idle`/`SessionEnd` written just before exit
+    ///   still land after the PTY EOF was observed — and once a claim HAS
+    ///   happened the disownership is permanent, so the successor exiting in
+    ///   turn cannot hand the pane back (round-3 audit finding 4);
+    /// * it cannot be grown by anything but a spawn, so repeated short-lived
+    ///   panes leave nothing behind.
+    ///
+    /// Does not panic on a poisoned lock (auditor round-2 finding E). This sits
+    /// on EVERY admission path now, and `ingest_event` has already broadcast to
+    /// attached clients by the time `apply_event` runs — so a panic here would
+    /// kill the per-connection task with the daemon's own state unchanged and
+    /// the TUIs' updated, which is both a divergence and a repeatable local DoS.
+    ///
+    /// Round 3 (reviewer blocker 2): a poisoned registry answers
+    /// [`Ownership::Unknown`], NOT "unclaimed". The distinction is the whole
+    /// reason this returns three states — see [`crate::state::AgentOwnership`].
+    /// Every caller that reads the answer as a grant treats `Unknown` exactly as
+    /// it treats `Unclaimed` and denies; the one caller that reads the ABSENCE
+    /// of a claim as a grant of its own must not, and could not tell the two
+    /// apart while this returned a `bool`.
+    pub fn generation_ownership(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> Ownership {
+        let Ok(inner) = self.inner.lock() else {
+            tracing::error!("generation_ownership: registry lock is poisoned; cannot answer");
+            return Ownership::Unknown;
+        };
+        match (pane_id, agent_id) {
+            // The daemon's own shape: every agent it spawns is handed
+            // `DOT_AGENT_DECK_AGENT_ID`, so its reports name both keys.
+            (Some(pane), Some(agent)) => {
+                // In flight: reserved for this pane, child not yet published.
+                if inner
+                    .pending_spawns
+                    .get(agent)
+                    .is_some_and(|reserved| reserved.as_deref() == Some(pane))
+                {
+                    return Ownership::Owned;
+                }
+                match inner.agents.get(agent) {
+                    // Published, and this really is its pane.
+                    Some(a) if a.pane_id_env.as_deref() == Some(pane) => {
+                        // Round 3 (auditor finding 4): `pane_handed_over` is the
+                        // MONOTONE half of the retirement rule and has to be
+                        // read first. `pane_claimed_by_other` looks at who holds
+                        // the pane NOW, which un-answers itself the moment the
+                        // successor exits too — so a retired generation got its
+                        // pane back once both records were dead. The flag is set
+                        // as the pane changes hands and is never cleared, so the
+                        // handover is permanent no matter what becomes of the
+                        // successor. See [`RunningAgent::pane_handed_over`].
+                        let disowned =
+                            a.pane_handed_over || Self::pane_claimed_by_other(&inner, pane, agent);
+                        if !a.exited.load(Ordering::SeqCst) || !disowned {
+                            Ownership::Owned
+                        } else {
+                            Ownership::Unclaimed
+                        }
+                    }
+                    // Either unknown, or a generation whose pane is a different
+                    // one — an event that names a pane its own agent never had
+                    // is not that agent's to write.
+                    _ => Ownership::Unclaimed,
+                }
+            }
+            // A producer that named no generation: a pre-F9 hook script, or any
+            // wrapper that lost `DOT_AGENT_DECK_AGENT_ID` on the way (PRD #110 /
+            // issue #398 keep this shape working deliberately). There is nothing
+            // to bind to, so the pane is the whole answer — any generation
+            // claiming it, live or retired, admits. Unchanged from round 1.
+            (Some(pane), None) => {
+                let claimed = inner
+                    .pending_spawns
+                    .values()
+                    .any(|reserved| reserved.as_deref() == Some(pane))
+                    || inner
+                        .agents
+                        .values()
+                        .any(|a| a.pane_id_env.as_deref() == Some(pane));
+                if claimed {
+                    Ownership::Owned
+                } else {
+                    Ownership::Unclaimed
+                }
+            }
+            // A daemon-side agent spawned without `DOT_AGENT_DECK_PANE_ID` is a
+            // supported shape — its writability is resolved by agent identity
+            // throughout the guarded-send and attach-input paths
+            // (`AppState::agent_writable`), which only works if the session it
+            // declares is admitted in the first place. Its events carry
+            // `pane_id: None`, so pane-keyed ownership can never speak for them
+            // and this is the arm that does.
+            //
+            // Deliberately restricted to agents that are genuinely paneless: an
+            // event that dropped its `DOT_AGENT_DECK_PANE_ID` but kept its agent
+            // id belongs to a pane-carrying agent, and admitting it would mint a
+            // second, pane-less session card beside the pane's own.
+            //
+            // No liveness condition, unlike the paned arm: a registry id is
+            // never reused (`next_id` only ever increments), so a retired
+            // paneless generation has no successor that its late report could be
+            // written against. The report can only reach its own session.
+            (None, Some(agent)) => {
+                let owned = inner
+                    .pending_spawns
+                    .get(agent)
+                    .is_some_and(|reserved| reserved.is_none())
+                    || inner
+                        .agents
+                        .get(agent)
+                        .is_some_and(|a| a.pane_id_env.is_none());
+                if owned {
+                    Ownership::Owned
+                } else {
+                    Ownership::Unclaimed
+                }
+            }
+            // Names neither key, so it names nothing this registry can own.
+            // `AppState` falls back to its historical "this process manages no
+            // panes at all, so it is watching EXTERNAL agents" rule.
+            (None, None) => Ownership::Unclaimed,
+        }
+    }
+
+    /// Issue #454 round-3 review (blocker 1): take the durable authorisation for
+    /// `StopAgent`'s PANE-SCOPED cleanup of `pane_id` on behalf of `stopping_id`.
+    ///
+    /// Returns `None` — cleanup REFUSED — when any other generation claims the
+    /// pane, or when the registry cannot be asked. Returns a
+    /// [`PaneCleanupHold`] otherwise, and no new generation can reserve the pane
+    /// until that hold is dropped.
+    ///
+    /// # Why the answer has to be durable rather than merely correct
+    ///
+    /// Everything `StopAgent` does with a pane id — `begin_pane_close`,
+    /// `cancel_prompt_confirmation`, `unregister_pane`, `finish_pane_close` — is
+    /// scoped to the PANE while the agent being stopped is not, so all of it
+    /// belongs to whoever holds the pane at the moment it runs. The previous
+    /// authorisation was a `pane_current_agent_id(P) == A || None` test taken
+    /// once, before `close_agent`, which:
+    ///
+    /// * could not see a spawn that had RESERVED the pane but not published yet,
+    ///   and so read "B is starting on P" as "nobody holds P" — the exact gap
+    ///   `pending_spawns` exists to fill, consulted everywhere except here;
+    /// * was taken before a `close_agent` that can spend the whole
+    ///   `AGENT_TERMINATE_GRACE` window, and acted on afterwards — so B could
+    ///   reserve, spawn, publish AND have `StartAgent` register its role, cwd,
+    ///   orchestrator marker and routing identity inside the gap, all of which
+    ///   the predecessor's `unregister_pane` then deleted.
+    ///
+    /// Revalidating at each step shrinks that window without closing it, and
+    /// cannot close the last one at all: the claim is taken under the registry
+    /// lock and `unregister_pane` runs under the `AppState` write lock. Holding
+    /// the pane instead makes one check enough — the fact the check established
+    /// is still true when the cleanup acts on it, because nothing may change it.
+    ///
+    /// # What it costs
+    ///
+    /// Almost nothing, because the pane is already unavailable for most of the
+    /// same window. While the stopping agent's child is LIVE its record fails
+    /// the reservation's exclusivity test on its own, and that covers the whole
+    /// termination grace — the one interval this genuinely adds is the short tail
+    /// between the child being dead and `close_agent` dropping its record. A
+    /// spawn that lands in that tail is refused with `DuplicatePaneId`, the same
+    /// error it would get one instant earlier.
+    pub fn hold_pane_for_cleanup(
+        self: &Arc<Self>,
+        pane_id: &str,
+        stopping_id: &str,
+    ) -> Option<PaneCleanupHold> {
+        let Ok(mut inner) = self.inner.lock() else {
+            tracing::error!(
+                pane_id = %pane_id,
+                stopping = %stopping_id,
+                "hold_pane_for_cleanup: registry lock is poisoned; refusing pane-scoped cleanup"
+            );
+            return None;
+        };
+        if Self::pane_claimed_by_other(&inner, pane_id, stopping_id) {
+            tracing::debug!(
+                pane_id = %pane_id,
+                stopping = %stopping_id,
+                "StopAgent: skipping pane-scoped cleanup; another generation already \
+                 claims the pane"
+            );
+            return None;
+        }
+        // A second hold on one pane cannot happen for one agent and would be a
+        // second `StopAgent` racing this one for another; refuse it the same way.
+        if !inner.cleanup_holds.insert(pane_id.to_string()) {
+            tracing::debug!(
+                pane_id = %pane_id,
+                stopping = %stopping_id,
+                "StopAgent: skipping pane-scoped cleanup; another close already holds the pane"
+            );
+            return None;
+        }
+        Some(PaneCleanupHold {
+            registry: Arc::clone(self),
+            pane_id: pane_id.to_string(),
+        })
+    }
+
+    /// Test-only: put the registry into the state a spawn is in between
+    /// RESERVING `pane_id` and publishing its record.
+    ///
+    /// That window is what round-3 blocker 1 is about — it is invisible to
+    /// `pane_current_agent_id`, so the old `StopAgent` gate read it as "nobody
+    /// holds this pane" — and it is not reachable from outside this module,
+    /// because `RegistryInner` is private and a real spawn passes through it too
+    /// fast to schedule against. Tests in `crate::daemon_protocol` need it to
+    /// drive the handler end to end; the registry's own tests reach
+    /// `pending_spawns` directly.
+    #[cfg(test)]
+    pub(crate) fn reserve_pane_for_test(&self, agent_id: &str, pane_id: &str) {
+        self.inner
+            .lock()
+            .expect("registry lock poisoned in a test seam")
+            .pending_spawns
+            .insert(agent_id.to_string(), Some(pane_id.to_string()));
+    }
+
+    /// Issue #454 (round-2 audit): does any generation OTHER than `excluded`
+    /// currently claim `pane_id`?
+    ///
+    /// This is the boundary on a retired generation's grace period. "Claim"
+    /// means a live published agent or an in-flight spawn reservation — the same
+    /// two things [`Self::owns_generation`] treats as ownership — because both
+    /// are generations that will write to that pane. Another RETIRED generation
+    /// does not count: two corpses on one pane is a reaping question, and
+    /// neither of them can be written over.
+    fn pane_claimed_by_other(inner: &RegistryInner, pane_id: &str, excluded: &str) -> bool {
+        inner.agents.iter().any(|(id, a)| {
+            id != excluded
+                && a.pane_id_env.as_deref() == Some(pane_id)
+                && !a.exited.load(Ordering::SeqCst)
+        }) || inner
+            .pending_spawns
+            .iter()
+            .any(|(id, reserved)| id != excluded && reserved.as_deref() == Some(pane_id))
+    }
+
     /// All currently-owned *live* agents as `(id, pane_id_env)`
     /// records, sorted ascending by id. M2.x rehydration relies on the
     /// captured `pane_id_env` to rebind the TUI's local pane id to
@@ -5888,6 +6415,74 @@ impl AgentPtyRegistry {
             .agents
             .get(id)
             .map(|a| a.writer.clone())
+    }
+
+    /// Issue #581 test-only seam: register a synthetic agent that owns `child`,
+    /// so the shutdown phases can be driven against a child whose *reap*
+    /// deliberately wedges — the stuck-NFS shape, which no real process can be
+    /// coaxed into reproducing (a real child always returns from `wait` once
+    /// SIGKILL lands).
+    ///
+    /// Everything other than `child` is inert filler: a freshly-opened PTY
+    /// nobody reads from and an empty bus, because the teardown paths touch
+    /// only `child` and `process_group`. `#[cfg(test)]` keeps it out of the
+    /// production API surface, like [`Self::agent_writer`] above.
+    #[cfg(test)]
+    pub(crate) fn insert_test_agent(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    ) -> String {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty for a synthetic test agent");
+        let writer = pair
+            .master
+            .take_writer()
+            .expect("take_writer for a synthetic test agent");
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_id += 1;
+        let id = format!("test-agent-{}", inner.next_id);
+        inner.agents.insert(
+            id.clone(),
+            RunningAgent {
+                child,
+                // `adopt(None)` is the portable "there is no group to hold"
+                // constructor: a no-op ZST on Unix, and an unassigned (jobless)
+                // handle on Windows, which is what makes both backends take
+                // their documented `Child::kill` fallback here.
+                process_group: crate::platform::proc::AgentProcessGroup::adopt(None),
+                master: pair.master,
+                writer: Arc::new(AsyncMutex::new(PaneWriter::new(
+                    writer,
+                    None,
+                    self.pane_input.clone(),
+                ))),
+                bus: Arc::new(AgentBus::new()),
+                pane_id_env: None,
+                display_name: None,
+                cwd: None,
+                tab_membership: None,
+                agent_type: None,
+                spawn_agent_type: None,
+                spawn_env: Vec::new(),
+                pty_rows: 24,
+                pty_cols: 80,
+                exited: Arc::new(AtomicBool::new(false)),
+                // Issue #454: `false` is the birth value — the flag latches to
+                // `true` only when a *successor* takes this record's pane, and
+                // this synthetic agent holds no pane at all (`pane_id_env:
+                // None`), so nothing can ever hand one over.
+                pane_handed_over: false,
+                pending_seed: None,
+                seed_delivered_native: false,
+            },
+        );
+        id
     }
 
     /// Update the per-agent display name and cwd captured in the registry
@@ -6097,18 +6692,67 @@ impl AgentPtyRegistry {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
+    /// SIGKILL every agent in `agents` — the whole descendant tree of each —
+    /// and reap them all. Shared by [`Self::shutdown_all`] and phase 3 of
+    /// [`Self::shutdown_all_graceful`].
+    ///
+    /// **The kill pass and the reap pass are separate, and that is the whole
+    /// point** (issue #581). Both callers used to signal-then-wait inside one
+    /// loop iteration, which makes *signal delivery* hostage to *reap latency*:
+    /// a child wedged in uninterruptible kernel I/O does not die on SIGKILL
+    /// until that I/O completes (the stuck-NFS case), so the loop parks in that
+    /// agent's unbounded `wait()` and **every agent behind it in the vector is
+    /// never signalled at all**. It failed silently — the starved agents log
+    /// nothing, and every caller of these two methods is terminal, so nothing
+    /// ran later to notice the still-running agent processes left behind by a
+    /// shutdown that looked clean.
+    ///
+    /// So pass 1 signals everybody first, and only then does pass 2 reap. The
+    /// reap is a shared non-blocking poll rather than a per-agent blocking
+    /// `wait()`, so one wedged agent cannot hold its siblings' *reaps* hostage
+    /// either — the same shape as `shutdown_all_graceful`'s own grace poll and
+    /// as the wrapper's reap loop (see the "finding #12" comment in
+    /// [`crate::wrap`]). The 50 ms cadence matches both, and costs at most one
+    /// tick: a shutdown whose agents already exited during the grace window
+    /// clears the whole vector on the first `try_wait` pass and never sleeps.
+    ///
+    /// **The reap is never dropped.** An agent leaves the vector only once its
+    /// `try_wait` reported an exit status, or reported an error (meaning there
+    /// is no status left to collect) — so this cannot trade the leaked-process
+    /// bug for a leaked-zombie one. A genuinely wedged child therefore still
+    /// holds this function until the kernel lets its `wait` complete, exactly as
+    /// before; what changed is that it no longer takes its siblings with it.
+    fn force_kill_and_reap_all(mut agents: Vec<RunningAgent>) {
+        // Pass 1: signal only.
+        for agent in &mut agents {
+            crate::platform::proc::force_kill_child_group(&mut agent.child, &agent.process_group);
+        }
+
+        // Pass 2: reap, dropping each agent as its status is collected.
+        //
+        // Termination depends on `try_wait` staying `Some` once it has reported
+        // an exit: phase 2 above may already have collected a child's status, and
+        // this loop asks again. Both backends hold that — Unix `Child` is
+        // `std::process::Child`, which caches the status and short-circuits, and
+        // `WinChild::try_wait` re-reads `GetExitCodeProcess` on a handle it still
+        // owns. A `Child` impl that answered `None` after reporting an exit would
+        // pin its agent here forever.
+        while !agents.is_empty() {
+            agents.retain_mut(|agent| matches!(agent.child.try_wait(), Ok(None)));
+            if agents.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock().unwrap();
             inner.agents.drain().map(|(_, a)| a).collect()
         };
-        for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(
-                &mut agent.child,
-                &agent.process_group,
-            );
-        }
+        Self::force_kill_and_reap_all(agents);
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
         // live_count == 0.
@@ -6176,18 +6820,15 @@ impl AgentPtyRegistry {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
-        // is no-op-safe on an already-exited child (ESRCH is logged-but-
-        // ignored and `wait` returns the cached status), so this loop is
-        // safe to run unconditionally. On Windows this is where the
-        // `TerminateJobObject` backstop for each agent's descendant tree runs
-        // (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort only.
-        for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(
-                &mut agent.child,
-                &agent.process_group,
-            );
-        }
+        // Phase 3: SIGKILL any survivor and reap. The kill is no-op-safe on an
+        // already-exited child (ESRCH is logged-but-ignored), so it runs
+        // unconditionally. On Windows this is where the `TerminateJobObject`
+        // backstop for each agent's descendant tree runs (PRD #163 M3) —
+        // phase 1's `CTRL_BREAK_EVENT` is best-effort only.
+        //
+        // Issue #581: the kill pass and the reap pass are SEPARATE, and
+        // [`Self::force_kill_and_reap_all`] documents why.
+        Self::force_kill_and_reap_all(agents);
 
         self.change_notify.notify_one();
     }
@@ -7397,6 +8038,573 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    // ---- Issue #454: the registry as the daemon's OWNERSHIP AUTHORITY. ----
+    //
+    // `AppState::apply_event` admits an event only for a GENERATION this process
+    // owns, and on the daemon that question is answered here. These tests pin
+    // the four properties that made asking here the fix rather than maintaining
+    // a second copy of the answer: ownership starts BEFORE the child exists, it
+    // is keyed by generation and not by the reusable pane slot, a retired
+    // generation keeps its pane exactly until another one claims it, and the
+    // reservation that provides the first of those is exclusive and released on
+    // every path.
+
+    /// Reads the tri-state answer as the one thing most of these tests care
+    /// about: "is this generation OWNED?". The `Unclaimed` / `Unknown` split is
+    /// asserted on its own where it matters —
+    /// `a_poisoned_registry_answers_unknown_rather_than_unclaimed` here, and the
+    /// admission tests in `crate::state`.
+    fn owns(registry: &AgentPtyRegistry, pane_id: Option<&str>, agent_id: Option<&str>) -> bool {
+        registry.generation_ownership(pane_id, agent_id) == Ownership::Owned
+    }
+
+    /// The startup-race half. A spawn is owned from the moment it is RESERVED —
+    /// before `spawn()` forks the child — so a wrapper whose very first act is
+    /// `dot-agent-deck agent-event --type running` is already recognised when
+    /// its report lands. Registering ownership after `spawn_agent` returned left
+    /// that report to be dropped with nothing later to repair it, which is issue
+    /// #454's symptom for any producer that never emits `SessionStart`.
+    ///
+    /// Asserted against the reservation directly because the window it covers is
+    /// microseconds of lock-held work inside `spawn_agent` and cannot be paused
+    /// from outside.
+    #[test]
+    fn a_reserved_spawn_is_owned_before_its_agent_is_published() {
+        let registry = AgentPtyRegistry::new();
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner
+                .pending_spawns
+                .insert("77".to_string(), Some("in-flight-pane-454".to_string()));
+            inner.pending_spawns.insert("78".to_string(), None);
+        }
+        assert!(
+            owns(&registry, Some("in-flight-pane-454"), Some("77")),
+            "a pane whose spawn is in flight must already be owned by the \
+             generation that reserved it"
+        );
+        assert!(
+            owns(&registry, Some("in-flight-pane-454"), None),
+            "and by an untagged producer naming that pane — a hook that lost \
+             DOT_AGENT_DECK_AGENT_ID has only the pane to go on"
+        );
+        assert!(
+            owns(&registry, None, Some("78")),
+            "a paneless agent whose spawn is in flight must already be owned"
+        );
+        assert!(
+            !owns(&registry, Some("never-spawned-454"), None),
+            "a pane nobody spawned is owned by nobody"
+        );
+        assert!(
+            !owns(&registry, None, Some("77")),
+            "an agent that carries a pane must not answer the PANELESS query — \
+             admitting it would mint a second, pane-less card beside its own"
+        );
+        assert!(
+            !owns(&registry, Some("in-flight-pane-454"), Some("78")),
+            "and generation 78 does not own 77's pane just because 77's spawn is \
+             in flight — the pair has to match"
+        );
+        assert!(
+            !owns(&registry, None, None),
+            "an event naming neither key names nothing this registry can own"
+        );
+    }
+
+    /// A successful spawn hands ownership from the reservation to the published
+    /// agent under one lock acquisition, leaving no reservation behind. If it
+    /// leaked, the id would keep admitting events forever — the failure mode the
+    /// hand-maintained set had, reproduced inside the fix.
+    #[tokio::test]
+    async fn a_successful_spawn_releases_its_reservation() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "reserved-ok-454".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /bin/sh");
+        assert!(
+            registry.inner.lock().unwrap().pending_spawns.is_empty(),
+            "a published agent must not also hold a reservation"
+        );
+        assert!(owns(&registry, Some("reserved-ok-454"), Some(&id)));
+        assert!(
+            !owns(&registry, None, Some(&id)),
+            "an agent with a pane id is not a paneless agent"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Round-2 audit, blocker D — the reservation is EXCLUSIVE on its pane, and
+    /// the rejection now happens BEFORE the loser forks a child.
+    ///
+    /// Round 1 conferred ownership with the reservation but enforced uniqueness
+    /// only in the post-fork duplicate check, so two `StartAgent` calls for one
+    /// pane both reserved it and both forked. The loser was an OWNER of that
+    /// pane for the length of its own spawn, which is long enough for a fast
+    /// child to emit — and its event was then admitted against a pane whose real
+    /// occupant is the winner.
+    ///
+    /// `pending_spawns` holding the winner's reservation is the state that
+    /// window consists of, so the test stands one there by hand and shows the
+    /// second spawn cannot join it. Doing it that way is not a shortcut around a
+    /// race: the reservation is taken and released under one lock hold inside
+    /// `spawn_agent` and cannot be observed from outside mid-spawn.
+    #[tokio::test]
+    async fn a_second_reservation_for_one_pane_is_refused_before_it_forks() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.next_id = 900;
+            inner
+                .pending_spawns
+                .insert("899".to_string(), Some("contested-454".to_string()));
+        }
+
+        let loser = registry.spawn_agent(SpawnOptions {
+            command: Some("/bin/sh"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "contested-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        });
+        assert!(
+            matches!(loser, Err(AgentPtyError::DuplicatePaneId(_))),
+            "a pane already claimed by an in-flight spawn must refuse a second \
+             one; got {loser:?}"
+        );
+
+        let inner = registry.inner.lock().unwrap();
+        assert_eq!(
+            inner.pending_spawns.len(),
+            1,
+            "only the first spawn may hold a reservation on the pane; \
+             pending={:?}",
+            inner.pending_spawns
+        );
+        assert!(
+            inner.agents.is_empty(),
+            "the refused spawn must not have forked a child at all"
+        );
+        drop(inner);
+        assert!(
+            !owns(&registry, Some("contested-454"), Some("900")),
+            "the losing generation must never own the contested pane — its \
+             report would otherwise be written against the winner's card"
+        );
+
+        registry.inner.lock().unwrap().pending_spawns.clear();
+        registry.shutdown_all();
+    }
+
+    /// And a spawn that FAILS after taking its reservation releases it through
+    /// `Drop`, which is the path no early `return` covers. A command that cannot
+    /// be executed fails inside `spawn()` — after the reservation exists and
+    /// before the lock that would release it explicitly is ever taken.
+    #[tokio::test]
+    async fn a_failed_spawn_releases_its_reservation_through_drop() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let failed = registry.spawn_agent(SpawnOptions {
+            command: Some("/nonexistent/dot-agent-deck-454-no-such-binary"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "reserved-failed-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        });
+        assert!(
+            failed.is_err(),
+            "precondition: spawning a nonexistent command must fail; got {failed:?}"
+        );
+        assert!(
+            registry.inner.lock().unwrap().pending_spawns.is_empty(),
+            "a failed spawn must not leave a reservation admitting events for a \
+             child that never started — and, now that the reservation is \
+             exclusive, must not lock the pane out of ever being spawned again"
+        );
+        let retry = registry.spawn_agent(SpawnOptions {
+            command: Some("/bin/sh"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "reserved-failed-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        });
+        assert!(
+            retry.is_ok(),
+            "the pane must be spawnable after the failed attempt released it; \
+             got {retry:?}"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Round-2 reviewer, blocker B — the half round 1 got backwards.
+    ///
+    /// The hook transport is fire-and-forget: the producer writes its final
+    /// `Idle`/`SessionEnd`, flushes, and exits. `pump_reader` can observe the
+    /// PTY EOF and set `exited` while those bytes are still queued on the
+    /// socket. Round 1 read `exited` as instantaneous loss of ownership, so that
+    /// report was dropped — and for an ORDINARY daemon pane there was no
+    /// `managed_pane_ids` fallback left to catch it, because being owned is
+    /// exactly what makes `apply_event` skip its `SessionStart` auto-register
+    /// branch. A lost `SessionEnd` never removes its `SessionState`, so
+    /// repeated short-lived agents accumulate it.
+    ///
+    /// So a retired generation keeps its own pane. What ENDS that is another
+    /// generation claiming the pane, not the clock — pinned in the test below.
+    #[tokio::test]
+    async fn a_retired_generation_still_owns_its_own_pane() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "dead-pane-454".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            owns(&registry, Some("dead-pane-454"), Some(&id)),
+            "a generation that has exited still owns its OWN pane — its final \
+             report can still be in flight, and dropping a SessionEnd leaks the \
+             pane's session state forever"
+        );
+        assert!(
+            !owns(&registry, Some("dead-pane-454"), Some("some-other-id")),
+            "but only that generation: a different id naming the dead pane owns \
+             nothing"
+        );
+        assert!(
+            !owns(&registry, Some("some-other-pane-454"), Some(&id)),
+            "and only that pane: the pair has to match in both directions"
+        );
+        assert_eq!(
+            registry
+                .agent_record_any(&id)
+                .and_then(|r| r.pane_id_env)
+                .as_deref(),
+            Some("dead-pane-454"),
+            "cleanup still has to be able to read a dead agent's pane id — \
+             `agent_records` filters it out and `StopAgent` then skipped every \
+             cleanup step, permanently"
+        );
+
+        // And reaping the record ends it. Nothing is in flight for a generation
+        // whose entry is gone, and the daemon has explicitly finished with it.
+        registry.close_agent(&id).expect("close the exited agent");
+        assert!(
+            !owns(&registry, Some("dead-pane-454"), Some(&id)),
+            "a reaped generation owns nothing — otherwise a dead id keeps \
+             admitting forged reports for a pane with no process behind it"
+        );
+        registry.shutdown_all();
+    }
+
+    /// The boundary on that grace, and the audit's blocker-D half: a retired
+    /// generation owns its pane only until another generation CLAIMS it. The
+    /// registry deliberately lets a live agent reuse a dead one's pane id, so
+    /// without this an old generation's delayed event would be written against
+    /// its successor's card.
+    ///
+    /// Pinning the SEQUENCE is the whole point: A exits (retired, still owner),
+    /// then B spawns onto the same pane, and only then is A's ownership gone.
+    #[tokio::test]
+    async fn a_retired_generation_is_disowned_the_moment_its_pane_is_reused() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let opts = |command| SpawnOptions {
+            command: Some(command),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "reused-pane-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            owns(&registry, Some("reused-pane-454"), Some(&old)),
+            "precondition: while nothing else claims the pane, the retired \
+             generation still owns it"
+        );
+
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once its child is gone");
+
+        assert!(
+            !owns(&registry, Some("reused-pane-454"), Some(&old)),
+            "once a live generation holds the pane, the retired one owns \
+             nothing there — its delayed report would land on the new agent's \
+             card, or mint a rival session on a pane that already has one"
+        );
+        assert!(
+            owns(&registry, Some("reused-pane-454"), Some(&new)),
+            "and the live generation does own it"
+        );
+        assert!(
+            owns(&registry, Some("reused-pane-454"), None),
+            "an untagged producer still resolves by pane alone — it names no \
+             generation, so there is nothing to bind and this is the PRD #110 / \
+             issue #398 compatibility shape"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Round-3 audit, finding 4: that boundary has to be MONOTONE. A retired
+    /// generation must not get its pane BACK.
+    ///
+    /// The first implementation of "until another generation claims it" asked
+    /// who holds the pane *now* — and that question un-answers itself. `A` exits
+    /// on `P`, `B` claims `P`, `B` exits in turn, and with neither record reaped
+    /// there is suddenly no live claimant, so `A` owned `P` again. That is the
+    /// resurrection the generation-keyed rule exists to forbid, and everything
+    /// downstream of admission trusts it: a re-admitted `A` report with a
+    /// producer-supplied far-future timestamp becomes the pane's high-water
+    /// session, which `pane_writable` then selects over a live successor.
+    ///
+    /// The SEQUENCE is the finding, and it is exactly the one clause the
+    /// sibling test above omits — the successor has to EXIT before the
+    /// assertion. Neither record is reaped, so nothing but the monotone flag can
+    /// answer this.
+    #[tokio::test]
+    async fn a_retired_generation_stays_disowned_once_its_successor_also_exits() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let opts = || SpawnOptions {
+            command: Some("/usr/bin/true"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "handback-pane-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        };
+        let wait_for_exit = |registry: Arc<AgentPtyRegistry>, which: &'static str| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while registry.live_count() != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the {which} child never exited"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let old = registry
+            .spawn_agent(opts())
+            .expect("spawn the first generation");
+        wait_for_exit(Arc::clone(&registry), "first").await;
+
+        let new = registry
+            .spawn_agent(opts())
+            .expect("the pane must be reusable once the first child is gone");
+        assert!(
+            !owns(&registry, Some("handback-pane-454"), Some(&old)),
+            "precondition: the handover disowns the predecessor while the \
+             successor is live"
+        );
+        wait_for_exit(Arc::clone(&registry), "second").await;
+
+        // Neither record has been reaped — `close_agent` was never called for
+        // either — so "who holds the pane now?" answers NOBODY, and that is
+        // precisely the reading that handed the pane back.
+        for (which, id) in [("predecessor", &old), ("successor", &new)] {
+            assert_eq!(
+                registry
+                    .agent_record_any(id)
+                    .and_then(|r| r.pane_id_env)
+                    .as_deref(),
+                Some("handback-pane-454"),
+                "precondition: the {which}'s record must still be in the \
+                 registry, or this test proves nothing about the retirement rule"
+            );
+        }
+        assert!(
+            !owns(&registry, Some("handback-pane-454"), Some(&old)),
+            "a generation that has been handed over must stay disowned FOREVER \
+             — its successor exiting is not a reason to give the pane back"
+        );
+        assert!(
+            owns(&registry, Some("handback-pane-454"), Some(&new)),
+            "the newest retired generation keeps its own grace period, exactly \
+             as the sibling test above pins for a lone retiree — nothing has \
+             claimed the pane after it"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Round-3 review, blocker 1 (the ADMISSION half). `StopAgent` authorises
+    /// its pane-scoped cleanup on "nobody else holds this pane", and the
+    /// question it used to ask — `pane_current_agent_id` — cannot see a
+    /// successor that has RESERVED the pane and not published yet. `None` came
+    /// back and was read as "nobody holds it".
+    ///
+    /// The precondition assert is the finding stated as evidence: the old gate's
+    /// own question answers `None` in exactly the state where the hold refuses.
+    #[test]
+    fn a_pane_a_successor_has_only_reserved_refuses_the_predecessors_cleanup_hold() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.pending_spawns.insert(
+                "successor-454".to_string(),
+                Some("stop-race-pane-454".to_string()),
+            );
+        }
+
+        assert!(
+            registry
+                .pane_current_agent_id("stop-race-pane-454")
+                .is_none(),
+            "precondition: a reservation is INVISIBLE to the published-and-live \
+             lookup the old gate asked, which is why it authorised"
+        );
+        assert!(
+            registry
+                .hold_pane_for_cleanup("stop-race-pane-454", "predecessor-454")
+                .is_none(),
+            "a pane a successor is mid-spawn onto is not the predecessor's to \
+             give up — authorising here deletes the successor's role, cwd and \
+             routing identity the moment it registers them"
+        );
+        assert!(
+            registry
+                .hold_pane_for_cleanup("some-other-pane-454", "predecessor-454")
+                .is_some(),
+            "…and an unclaimed pane still is: the refusal must be about THIS \
+             pane, not about holds in general"
+        );
+    }
+
+    /// Round-3 review, blocker 1 (the DURABILITY half). The authorisation was
+    /// check-then-act — taken before a `close_agent` that can spend the whole
+    /// three-second termination grace, and acted on afterwards in
+    /// `unregister_pane` — so a successor could reserve, spawn, publish and
+    /// register its whole identity inside the gap, only for the predecessor's
+    /// cleanup to delete it.
+    ///
+    /// Revalidating at each step shrinks that window without closing it (the
+    /// claim is taken under the registry lock and `unregister_pane` runs under
+    /// the `AppState` write lock). So the fact the check established is made to
+    /// STAY true instead: while the hold lives, nothing may claim the pane. The
+    /// second half — that dropping it releases the pane — is what keeps this a
+    /// bounded exclusion rather than a leak.
+    #[tokio::test]
+    async fn a_cleanup_hold_keeps_the_pane_out_of_a_successors_hands_until_it_is_dropped() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let opts = || SpawnOptions {
+            command: Some("/bin/sh"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "held-pane-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        };
+
+        let hold = registry
+            .hold_pane_for_cleanup("held-pane-454", "stopping-454")
+            .expect("an unclaimed pane is the stopping agent's to give up");
+        match registry.spawn_agent(opts()) {
+            Err(AgentPtyError::DuplicatePaneId(pane)) => {
+                assert_eq!(pane, "held-pane-454", "the refusal must name the held pane")
+            }
+            other => panic!(
+                "a successor must not be able to claim a pane whose cleanup is \
+                 still in flight; got {:?}",
+                other.map(|id| format!("spawned as {id}"))
+            ),
+        }
+
+        drop(hold);
+        let id = registry.spawn_agent(opts()).expect(
+            "dropping the hold must hand the pane back — the exclusion \
+                     lasts for the cleanup, not for the daemon's life",
+        );
+        assert!(
+            owns(&registry, Some("held-pane-454"), Some(&id)),
+            "and the successor genuinely owns it afterwards"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Round-2 audit, finding E: the ownership query is on EVERY admission path
+    /// now, so a poisoned registry lock must DENY rather than panic.
+    ///
+    /// `ingest_event` has already broadcast to attached clients by the time
+    /// `apply_event` runs, so a panic here kills the per-connection task with
+    /// the TUIs updated and the daemon's own state not — the exact
+    /// daemon/TUI divergence this issue exists to remove, plus a repeatable
+    /// local DoS on every subsequent paned event.
+    ///
+    /// The registry is deliberately never dropped: `Drop` runs `shutdown_all`,
+    /// which unwraps the same poisoned lock, and a panic inside a destructor
+    /// aborts the process rather than failing the assertion. `ManuallyDrop`
+    /// keeps that out of the way — including on the unwinding path a regression
+    /// would take — and the registry holds no agents, so there is nothing to
+    /// reap.
+    #[test]
+    fn a_poisoned_registry_answers_unknown_rather_than_unclaimed() {
+        let registry = std::mem::ManuallyDrop::new(AgentPtyRegistry::new());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = registry.inner.lock().unwrap();
+            panic!("poison the registry lock");
+        }));
+        assert!(
+            poisoned.is_err(),
+            "precondition: the closure must have panicked"
+        );
+        assert!(
+            registry.inner.lock().is_err(),
+            "precondition: the lock must now be poisoned"
+        );
+
+        // Round 3 (reviewer blocker 2): the answer is `Unknown`, NOT
+        // `Unclaimed`. Both deny, so this used to be indistinguishable from a
+        // registry that had looked and found nothing — and `apply_event` read
+        // that second answer as a licence to auto-register the pane. Asserting
+        // the exact variant is the point of this test now; the sibling in
+        // `state.rs` pins what the caller does with it.
+        for (pane, agent) in [
+            (Some("any-pane-454"), Some("1")),
+            (Some("any-pane-454"), None),
+            (None, Some("1")),
+            (None, None),
+        ] {
+            assert_eq!(
+                registry.generation_ownership(pane, agent),
+                Ownership::Unknown,
+                "a registry that cannot answer must say so, not panic and not \
+                 report the question as unclaimed; asked ({pane:?}, {agent:?})"
+            );
+        }
+    }
     #[tokio::test]
     async fn agent_records_filters_exited_entries() {
         // Round-11 reviewer #A: agent_records is the hydration source.
@@ -9809,5 +11017,388 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("some-other-pane"), None);
         reg.close_agent(&id).expect("close the orchestrator stub");
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #581 — one wedged agent's reap must not starve its siblings of
+    // their phase-3 SIGKILL.
+    // ---------------------------------------------------------------------
+
+    /// A latch the test flips to let a deliberately-wedged reap finally
+    /// complete, so the shutdown thread can always be joined.
+    #[derive(Debug, Default)]
+    struct WedgeGate {
+        released: Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    impl WedgeGate {
+        fn is_released(&self) -> bool {
+            *self.released.lock().unwrap()
+        }
+
+        fn block_until_released(&self) {
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.wake.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// A [`portable_pty::Child`] whose *reap* is under the test's control while
+    /// its *kill* is real.
+    ///
+    /// No real process can be coaxed into the shape issue #581 is about — a
+    /// child wedged in uninterruptible kernel I/O, which SIGKILL cannot
+    /// dislodge until the I/O completes — because a real child always returns
+    /// from `wait` once SIGKILL lands. So the wedge is modelled here and only
+    /// here: everything the teardown path *does* (the signal it sends, the pid
+    /// it sends it to) stays production code running against a real process
+    /// group in the Unix test below.
+    #[derive(Debug)]
+    struct WedgedChild {
+        /// Reported to the teardown path as this child's pid. `Some` makes the
+        /// production `killpg(SIGKILL)` land on a real process group; `None`
+        /// drives the documented pid-unavailable fallback, which is
+        /// `Child::kill` on both backends and therefore observable on Windows
+        /// too.
+        pid: Option<u32>,
+        /// How many times the teardown path issued a kill through that
+        /// fallback. A count, not a flag: phase 1's SIGTERM ask reaches the
+        /// same fallback, so only a kill *beyond* [`PHASE_ONE_FALLBACK_KILLS`]
+        /// is phase 3's. (The first draft asserted a flag and passed on the
+        /// unfixed code — phase 1 had already set it for every agent.)
+        kills: Arc<std::sync::atomic::AtomicUsize>,
+        /// Set when the child was actually reaped (by either `wait` or a
+        /// `try_wait` that reported an exit). The fix must not buy signal
+        /// independence by dropping the reap.
+        reaped: Arc<AtomicBool>,
+        /// Until released, `wait` blocks forever and `try_wait` keeps saying
+        /// "still running".
+        gate: Arc<WedgeGate>,
+        /// When set, the blocking `wait` never returns *at all*, however the
+        /// gate stands — the unbounded-`wait` half of the same wedge, which
+        /// only a `try_wait`-based reap can get past.
+        wait_never_returns: bool,
+    }
+
+    impl WedgedChild {
+        fn new(pid: Option<u32>, gate: Arc<WedgeGate>) -> Self {
+            Self {
+                pid,
+                kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reaped: Arc::new(AtomicBool::new(false)),
+                gate,
+                wait_never_returns: false,
+            }
+        }
+    }
+
+    impl portable_pty::ChildKiller for WedgedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            unreachable!("no teardown path clones a killer")
+        }
+    }
+
+    impl portable_pty::Child for WedgedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            if !self.gate.is_released() {
+                return Ok(None);
+            }
+            self.reaped.store(true, Ordering::SeqCst);
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            if self.wait_never_returns {
+                // `park` may wake spuriously, so loop: this call must never
+                // return, which is the whole point of the flag.
+                loop {
+                    std::thread::park();
+                }
+            }
+            self.gate.block_until_released();
+            self.reaped.store(true, Ordering::SeqCst);
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            self.pid
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    /// Poll `done` until it holds or `budget` elapses. Returns what it last saw.
+    fn holds_within(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// How long a phase-3 kill is given to reach every agent before the test
+    /// calls it starved. Generous — it is only ever paid on failure.
+    const WEDGE_TEST_BUDGET: Duration = Duration::from_secs(10);
+
+    /// Kills that phase 1's SIGTERM *ask* contributes per agent for a pid-less
+    /// child, before phase 3 is reached at all: on Unix `killpg` needs a pid and
+    /// so takes the `Child::kill` fallback, while on Windows
+    /// `GenerateConsoleCtrlEvent` skips a pid-less child outright. Phase 3's
+    /// force-kill is the one *on top of* this baseline, so it is the only thing
+    /// a strictly-greater count can be.
+    const PHASE_ONE_FALLBACK_KILLS: usize = if cfg!(unix) { 1 } else { 0 };
+
+    /// Issue #581 (regression): phase 3 must force-kill *every* surviving
+    /// agent, even when the first one it touches never finishes being reaped.
+    ///
+    /// Both agents are wedged, so the pre-fix serial loop
+    /// (`for mut agent in agents { force_kill_child_and_wait(…) }`) issues
+    /// exactly one kill whichever order `drain()` yields the map in, and then
+    /// blocks forever inside that agent's `wait()`. Requiring *both* kills is
+    /// therefore deterministically red on the old code and green on the new one,
+    /// with no dependence on `HashMap` iteration order. This is the portable
+    /// half — `pid: None` takes the documented pid-unavailable fallback, which
+    /// is `Child::kill` on the Unix *and* the Windows backend.
+    #[test]
+    fn shutdown_all_graceful_force_kills_every_agent_even_when_a_reap_wedges() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gates: Vec<Arc<WedgeGate>> = (0..2).map(|_| Arc::new(WedgeGate::default())).collect();
+        let mut kills = Vec::new();
+        let mut reaped = Vec::new();
+        for gate in &gates {
+            let child = WedgedChild::new(None, gate.clone());
+            kills.push(child.kills.clone());
+            reaped.push(child.reaped.clone());
+            registry.insert_test_agent(Box::new(child));
+        }
+
+        let force_killed = |k: &Arc<std::sync::atomic::AtomicUsize>| {
+            k.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS
+        };
+        let shutting_down = registry.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+        });
+
+        let all_killed = holds_within(WEDGE_TEST_BUDGET, || kills.iter().all(force_killed));
+        // Counted *before* the release below: letting the wedge go lets the old
+        // serial loop finish delivering, so a count taken afterwards reads zero
+        // even when the starvation happened.
+        let starved = kills.iter().filter(|k| !force_killed(k)).count();
+
+        // Release before asserting so the shutdown thread is always joinable,
+        // failure or not.
+        for gate in &gates {
+            gate.release();
+        }
+        shutdown.join().expect("the shutdown thread must not panic");
+
+        assert!(
+            all_killed,
+            "every agent must be force-killed in phase 3; a wedged sibling's reap \
+             starved {} of {} agents of their kill",
+            starved,
+            kills.len()
+        );
+        assert!(
+            reaped.iter().all(|r| r.load(Ordering::SeqCst)),
+            "signal independence must not be bought by dropping the reap — a \
+             child that is signalled and never waited on is a zombie"
+        );
+    }
+
+    /// Control for the wedged tests: with nothing wedged, the very same two
+    /// agents are force-killed *and* reaped, and `shutdown_all_graceful`
+    /// returns on its own.
+    ///
+    /// Without it, "both agents were killed" could not distinguish *the wedge*
+    /// starving a sibling from this whole path being broken — the pre-fix code
+    /// passes this one.
+    #[test]
+    fn shutdown_all_graceful_force_kills_and_reaps_every_agent_when_nothing_wedges() {
+        let registry = AgentPtyRegistry::new();
+        let mut kills = Vec::new();
+        let mut reaped = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::new(WedgeGate::default());
+            gate.release();
+            let child = WedgedChild::new(None, gate);
+            kills.push(child.kills.clone());
+            reaped.push(child.reaped.clone());
+            registry.insert_test_agent(Box::new(child));
+        }
+
+        registry.shutdown_all_graceful(Duration::from_millis(0));
+
+        assert!(
+            kills
+                .iter()
+                .all(|k| k.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS),
+            "with no wedge anywhere, every agent is force-killed"
+        );
+        assert!(
+            reaped.iter().all(|r| r.load(Ordering::SeqCst)),
+            "with no wedge anywhere, every agent is reaped"
+        );
+        assert!(
+            registry.is_empty(),
+            "the registry is drained by the shutdown"
+        );
+    }
+
+    /// A real process in a process group of its own that **ignores SIGTERM**,
+    /// plus a channel that fires when it dies.
+    ///
+    /// `trap ""` sets `SIG_IGN`, which `exec` preserves, so only phase 3's
+    /// `killpg(SIGKILL)` can end this process — the shape phase 3 exists for,
+    /// and the behaviour of any interactive shell. Death is observed through the
+    /// EOF its inherited stdout pipe gets once the last holder of the write end
+    /// is gone; a `kill(pid, 0)` liveness probe could not, because a killed
+    /// child answers it right up until we reap the zombie.
+    #[cfg(unix)]
+    fn spawn_sigterm_proof_stand_in() -> (std::process::Child, std::sync::mpsc::Receiver<()>) {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut proc = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"trap "" TERM; printf r; exec sleep 300"#)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            // Its own process group, so the production `killpg` reaches this
+            // process and nothing else — the test runner included.
+            .process_group(0)
+            .spawn()
+            .expect("spawn the stand-in agent process");
+        let mut stdout = proc.stdout.take().expect("piped stdout");
+        // Block until the shell confirms the trap is installed. Without this
+        // handshake the test races `sh`'s startup against phase 1's SIGTERM and
+        // the stand-in intermittently dies before it is SIGTERM-proof, which
+        // makes the whole assertion pass vacuously (measured: both stand-ins
+        // gone ~1 ms after spawn, no phase 3 involved).
+        let mut ready = [0u8; 1];
+        stdout
+            .read_exact(&mut ready)
+            .expect("stand-in readiness byte");
+        assert_eq!(&ready, b"r", "unexpected readiness byte from the stand-in");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink);
+            let _ = tx.send(());
+        });
+        (proc, rx)
+    }
+
+    /// Issue #581 at the altitude an operator sees it: a real agent process left
+    /// **alive** by a shutdown that looked clean.
+    ///
+    /// Same deterministic setup as the portable test — both agents wedged, so
+    /// exactly one kill escapes the pre-fix loop regardless of drain order — but
+    /// the pid handed to the teardown path is a real one, so the SIGKILL that
+    /// does or does not arrive is the production `killpg` landing on a real
+    /// process group, and the assertion is that no agent process outlived the
+    /// shutdown.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_all_graceful_kills_every_real_agent_process_even_when_a_reap_wedges() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gates: Vec<Arc<WedgeGate>> = (0..2).map(|_| Arc::new(WedgeGate::default())).collect();
+        let mut stand_ins = Vec::new();
+        for gate in &gates {
+            let (proc, died) = spawn_sigterm_proof_stand_in();
+            registry.insert_test_agent(Box::new(WedgedChild::new(Some(proc.id()), gate.clone())));
+            stand_ins.push((proc, died));
+        }
+
+        let shutting_down = registry.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+        });
+
+        let died: Vec<bool> = stand_ins
+            .iter()
+            .map(|(_, died)| died.recv_timeout(WEDGE_TEST_BUDGET).is_ok())
+            .collect();
+
+        // Release before asserting so the shutdown thread is always joinable,
+        // and reap the stand-ins whatever the outcome.
+        for gate in &gates {
+            gate.release();
+        }
+        shutdown.join().expect("the shutdown thread must not panic");
+        for (mut proc, _) in stand_ins {
+            let _ = proc.kill();
+            let _ = proc.wait();
+        }
+
+        assert!(
+            died.iter().all(|d| *d),
+            "every agent process must receive phase 3's SIGKILL regardless of where \
+             a wedged sibling sits in the drain order; per-agent died? = {died:?}"
+        );
+    }
+
+    /// Issue #581, the other half of the same starvation: phase 3's *reap* must
+    /// not sit behind another agent's unbounded `Child::wait` either.
+    ///
+    /// Both children here report their exit through `try_wait` the moment they
+    /// are asked, but their blocking `wait` never returns — the shape the
+    /// issue's "reap through a bounded, guaranteed-reaping helper rather than a
+    /// bare `child.wait()`" recommendation is about. A reap done through a
+    /// shared non-blocking poll collects both statuses and the shutdown
+    /// finishes; a reap done through `wait` parks forever on whichever agent it
+    /// touches first and never reaps the other.
+    #[test]
+    fn shutdown_all_graceful_reaps_without_parking_in_an_unbounded_wait() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut reaped = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::new(WedgeGate::default());
+            gate.release();
+            let mut child = WedgedChild::new(None, gate);
+            child.wait_never_returns = true;
+            reaped.push(child.reaped.clone());
+            registry.insert_test_agent(Box::new(child));
+        }
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let shutting_down = registry.clone();
+        let done = finished.clone();
+        // Deliberately never joined: on a regression this thread is parked in
+        // `Child::wait` forever, which is precisely what is being reported.
+        std::thread::spawn(move || {
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+            done.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            holds_within(WEDGE_TEST_BUDGET, || finished.load(Ordering::SeqCst)),
+            "the shutdown never finished — it is parked in a bare `Child::wait` \
+             that this child never returns from, so no later agent is reaped"
+        );
+        assert!(
+            reaped.iter().all(|r| r.load(Ordering::SeqCst)),
+            "every agent must still be reaped, not merely signalled"
+        );
     }
 }

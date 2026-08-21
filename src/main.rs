@@ -1374,6 +1374,35 @@ fn main() -> ExitCode {
     }
 }
 
+/// The deck's project directory for the process-global config reads that have
+/// no narrower directory to key off — today just the `[features]` table
+/// (issue #577).
+///
+/// Resolved ONCE here, at the entry point, and handed to
+/// `features::init_and_watch` as an explicit directory — the same shape as
+/// `examine_worktrees(&cwd)` and `run_reclaim(&cwd, …)` below, and as
+/// `load_project_config(dir)` everywhere else. `features_config_path` no
+/// longer reaches for the process cwd itself, so nothing downstream of this
+/// call silently depends on where the process happens to be running.
+///
+/// The launch directory is where the search STARTS, not where it ends:
+/// `resolve_project_dir` walks up to the nearest ancestor holding a trusted
+/// `.dot-agent-deck.toml`, so a deck started at `repo/src` finds `repo`'s
+/// flags instead of silently finding none. With no config at or above the
+/// launch directory it returns that directory unchanged, which is the
+/// pre-#577 path exactly.
+fn launch_project_dir() -> std::path::PathBuf {
+    let start = std::env::current_dir().unwrap_or_else(|e| {
+        // Not fatal: `.` preserves the pre-#577 fallback, and a deck that
+        // cannot resolve its own cwd still starts with the flag OFF.
+        tracing::warn!(
+            "failed to resolve the launch directory ({e}); reading [features] relative to \".\""
+        );
+        std::path::PathBuf::from(".")
+    });
+    dot_agent_deck::config::resolve_project_dir(&start)
+}
+
 #[tokio::main]
 async fn run_dashboard() -> ExitCode {
     init_logging_from_env();
@@ -1404,10 +1433,7 @@ fn init_logging_from_env() {
         {
             Ok(log_file) => {
                 tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::from_default_env()
-                            .add_directive("dot_agent_deck=info".parse().unwrap()),
-                    )
+                    .with_env_filter(dot_agent_deck::logging::env_filter_from_env())
                     .with_writer(log_file)
                     .with_ansi(false)
                     .init();
@@ -1435,8 +1461,10 @@ async fn run_tui_session() -> ExitCode {
     // `.dot-agent-deck.toml` `[features]` (env override wins) and start the
     // live re-read watcher. The startup state is recorded via a single
     // `tracing::info!` line, which surfaces only when file logging is enabled
-    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal.
-    dot_agent_deck::features::init_and_watch();
+    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal. The project
+    // directory is resolved HERE, at the entry point, and passed down (issue
+    // #577) — see `launch_project_dir`.
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_path = attach_socket_path();
@@ -1805,8 +1833,13 @@ fn run_daemon_hello_cli() -> ExitCode {
 /// `dot-agent-deck daemon status [--json]`. Read-only CLI
 /// consumer of the existing `AttachRequest::ListAgents`
 /// ([`dot_agent_deck::daemon_client::DaemonClient::list_agents`]) — no new
-/// attach request type, no `PROTOCOL_VERSION` bump (see
-/// `.dot-agent-deck/47-status-query-design.md` in the root checkout). Row
+/// attach request type, and therefore no `PROTOCOL_VERSION` bump: this command
+/// puts nothing new on the wire, so an older daemon answers a newer CLI's
+/// status query exactly as it always did (issue #459 — this rationale used to
+/// cite a design note under the gitignored `.dot-agent-deck/`, which no reader
+/// of the merged source could open). The `--json` document has its own,
+/// separate [`dot_agent_deck::daemon_status::SCHEMA_VERSION`]; that is what
+/// moves when the document shape changes. Row
 /// shaping lives in [`dot_agent_deck::daemon_status`]; this wrapper only
 /// bounds the round trip with [`dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT`]
 /// and translates the outcome into stdout/stderr text and an exit code.
@@ -1949,8 +1982,11 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // `tracing` global-default init would panic).
     // PRD #139 M1.2/M2.1: the daemon reads the experimental flag from the same
     // `.dot-agent-deck.toml` source of truth and watches it independently of
-    // the TUI (the file is the contract; no cross-process sync).
-    dot_agent_deck::features::init_and_watch();
+    // the TUI (the file is the contract; no cross-process sync). The detached
+    // spawn in `platform::detach` sets no `current_dir`, so the daemon
+    // inherits the launching TUI's directory and the two agree on the file by
+    // construction.
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();
