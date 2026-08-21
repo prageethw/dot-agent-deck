@@ -8065,6 +8065,58 @@ mod spawn_tests {
         assert!(registry.is_empty());
     }
 
+    /// Fork issue #201: `name_collision()` (`src/ui.rs`) refuses a New-Pane
+    /// form submit against `live_orchestration_names`, a list captured ONCE
+    /// at form-open via a single `ListAgents` round-trip. Two forms opened
+    /// close together both read the same stale snapshot, so nothing at the
+    /// point identity is actually WRITTEN enforces uniqueness — this pins
+    /// the daemon-side claim (#201 option (b)) that closes that window:
+    /// enforcement at claim time, not at a form's stale read time.
+    ///
+    /// Scenario: two threads race to claim the identical orchestration name
+    /// at the same instant (a `Barrier` forces them to attempt the claim
+    /// together), simulating two New-Pane forms submitting close enough
+    /// together that neither's stale snapshot would have refused the other.
+    /// Exactly one claim succeeds; releasing the winner's claim then lets a
+    /// third, later claimant take the freed name.
+    #[spec("orchestration/identity/012")]
+    #[test]
+    fn identity_012_daemon_side_name_claim_is_exclusive_under_race() {
+        const NAME: &str = "myrepo-orchestrator-1";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let (registry_a, barrier_a) = (registry.clone(), barrier.clone());
+        let claim_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            registry_a.claim_orchestration_name(NAME, "pane-a")
+        });
+        let (registry_b, barrier_b) = (registry.clone(), barrier.clone());
+        let claim_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            registry_b.claim_orchestration_name(NAME, "pane-b")
+        });
+
+        let won_a = claim_a.join().expect("claiming thread a must not panic");
+        let won_b = claim_b.join().expect("claiming thread b must not panic");
+
+        assert_ne!(
+            won_a, won_b,
+            "exactly one of two simultaneous claims for the same name must succeed \
+             (won_a={won_a}, won_b={won_b}) — both succeeding is fork issue #201's race \
+             reopened at the daemon layer; both refusing would wrongly starve every claimant"
+        );
+
+        let winner_pane = if won_a { "pane-a" } else { "pane-b" };
+        registry.release_orchestration_name(winner_pane);
+
+        assert!(
+            registry.claim_orchestration_name(NAME, "pane-c"),
+            "releasing the winner's claim must free the name for a later claimant"
+        );
+    }
+
     #[test]
     fn registry_resize_rejects_zero_dims() {
         let registry = Arc::new(AgentPtyRegistry::new());

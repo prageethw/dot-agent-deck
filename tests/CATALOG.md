@@ -3635,6 +3635,13 @@ without depending on the config struct API.
 - **Does not assert:** anything about the marker file or `owner_of` (covered by `orchestration/identity/010` and the `worktree/reclaim` series); LLM-agent behaviour (no agent is spawned); the interactive form/restore paths that populate `AgentSpawnOptions::owner` in the first place (covered by `orchestration/identity/001`–`008` and the PRD's M2.4 milestone text) — this test starts from an already-populated `AgentSpawnOptions`, proving only that the value, once set, survives to the child's real environment.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/identity/012 — Two near-simultaneous claim attempts for the SAME orchestration name — simulating two New-Pane forms racing, fork issue #201's own scenario — resolve to exactly one winner; the loser is refused rather than both landing. Releasing the winner's claim frees the name for a later claimant (fork issue #201 option (b): a daemon-side claim taken when the claiming pane is spawned, released when that pane closes — closing the window `orchestration/identity/003`'s form-open snapshot cannot see, since two forms opened close together each read a `live_orchestration_names` list captured once, before either submits).
+- **Layer:** fast unit test, in-process (`src/agent_pty.rs`, `#[cfg(test)] mod tests`). Two `std::thread`s synchronized on a `std::sync::Barrier` call `AgentPtyRegistry::claim_orchestration_name` for the identical name at the same instant — no daemon, no PTY, no wire-protocol round-trip.
+- **Agent:** none.
+- **Asserts:** exactly one of the two racing claims succeeds (an XOR, not "at most one" and "at least one" checked independently); calling `AgentPtyRegistry::release_orchestration_name` for the winner's pane id then lets a third, later claim for the same name succeed.
+- **Does not assert:** the wire-protocol surface a `ClaimOrchestrationName`/release `AttachRequest` variant would add, or the TUI-side `Action::SpawnPane` call site that would invoke it over the daemon socket — scoped to the registry method such a handler would call, not the RPC itself; automatic release driven by `StopAgent`'s pane-close handler (left to the coder's implementation, plus a possible follow-up L2/PTY test per CLAUDE.md rule 4); the UI form-level advisory refusal path, which `orchestration/identity/003` already covers and this test does not touch.
+- **Platform coverage:** mac+linux+windows (pure `Mutex`/`HashMap`/thread logic, no PTY).
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
