@@ -6918,4 +6918,98 @@ mod tests {
              `reclaim --yes`"
         );
     }
+
+    /// Scenario: fork issue #325 M4c, PR #526 round 4 (reviewer/auditor N2)
+    /// -- `remove_isolated_clone_dir`'s own TOCTOU re-verification
+    /// (cleanliness, single local branch, empty stash, and HEAD-vs-merged-PR
+    /// headRefOid, each re-derived fresh immediately before deletion) had
+    /// zero test coverage: deleting that whole block would leave every
+    /// existing test in this file green. This test genuinely opens the
+    /// TOCTOU window rather than handing the primitive an already-bad
+    /// fixture: a real isolated clone is provisioned and confirmed via
+    /// `examine_worktrees` to be reclaim-eligible, THEN an untracked file is
+    /// written into it -- simulating work happening in the window between
+    /// examination and deletion -- and only then is
+    /// `remove_isolated_clone_dir` called directly, carrying exactly the
+    /// stale eligibility `run_reclaim` would have handed it. The clone must
+    /// be refused, not deleted.
+    #[spec("worktree/reclaim/073")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_073_toctou_reverification_refuses_a_clone_dirtied_after_examination() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-toctou-dirty");
+        let creator = "issue-dispatch:toctou-dirty#2011";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "toctou-dirty-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "toctou-dirty-branch", &head_ref_oid);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        // Confirm the clone is genuinely eligible at examination time --
+        // proves this is a real TOCTOU window, not a fixture that was
+        // already ineligible when handed to the removal primitive.
+        let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
+        let clone_report = reports
+            .iter()
+            .find(|r| r.real_path == clone_dir)
+            .expect("the isolated clone must be present in the report");
+        assert_eq!(
+            clone_report.verdict.as_str(),
+            VERDICT_ISOLATED_CLONE_RECLAIMABLE,
+            "sanity: the clone must be reclaim-eligible at examination time, before the TOCTOU \
+             mutation below, or this test would not be exercising the re-verification's refusal \
+             path at all -- got {:?} (reason: {:?})",
+            clone_report.verdict,
+            clone_report.reason
+        );
+
+        // Open the TOCTOU window: dirty the clone (an untracked file) after
+        // examination confirmed it clean, before removal actually runs.
+        std::fs::write(clone_dir.join("dirtied-after-examination.txt"), b"oops\n").unwrap();
+
+        // Call the removal primitive directly, carrying the now-stale
+        // eligibility `run_reclaim` would have carried from the report
+        // above -- this is exactly the sequence `run_reclaim` follows
+        // internally, with the mutation inserted in the window between its
+        // two steps.
+        let result = remove_isolated_clone_dir(&clone_dir, "test-remover");
+
+        assert!(
+            result.is_err(),
+            "remove_isolated_clone_dir must refuse when the clone has been dirtied since it was \
+             examined, not trust the stale examination-time verdict, got {result:?}"
+        );
+        assert!(
+            clone_dir.exists(),
+            "the clone directory must be left on disk when the TOCTOU refusal fires"
+        );
+        assert!(
+            clone_dir.join("dirtied-after-examination.txt").exists(),
+            "the refusal must not touch the directory's other contents"
+        );
+    }
 }

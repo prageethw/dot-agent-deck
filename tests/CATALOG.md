@@ -1320,7 +1320,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests` — calls the private `remove_isolated_clone_dir` primitive directly against a hand-built, non-git fixture directory; no real git repo or `gh` stub needed.
 - **Agent:** none.
 - **Asserts:** the call returns `Err(_)`; the directory and its other contents still exist on disk afterward.
-- **Does not assert:** the TOCTOU re-verification `remove_isolated_clone_dir` does NOT yet do (reviewer M1's own recommendation — re-running the full eligibility check, not just the `.git`-shape check, immediately before deleting) — that is a coder follow-up, not this test's scope.
+- **Does not assert:** the TOCTOU re-verification `remove_isolated_clone_dir` also performs beyond the `.git`-shape check this test exercises — it re-derives 4 of its examination-time verdict's 5 AND'd conditions fresh immediately before deleting (cleanliness, single local branch, empty stash, HEAD-vs-merged-PR headRefOid), deliberately excluding `has_attach_lock` (examination-time-only, since it is derived from the deck's own provenance marker rather than anything that can change between examination and removal) — see `073` for that re-verification's own refusal-path coverage.
 - **Platform coverage:** mac+linux+windows.
 
 ##### worktree/reclaim/072 — M4c, PR #526 round 3, reviewer M3. `worktree/reclaim/052` passes for an undocumented reason: its `gh` stub omits `headRefOid` entirely, so it only ever exercises the "head ref unresolvable" (`None`) path, never the case where `headRefOid` is genuinely present in the response but simply does not match the clone's own HEAD. An owned, clean, single-branch, no-stash isolated clone whose merged PR carries a well-formed but MISMATCHED `headRefOid` must stay exactly as conservative as `"isolated_clone"` (fork issue #325 M4c).
@@ -1328,6 +1328,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** the sanity assertion that the mismatched `headRefOid` genuinely differs from the clone's own HEAD SHA; the clone's `verdict` equals exactly `"isolated_clone"`; neither a bare reclaim nor `--yes` removes it, and the directory still exists on disk afterward.
 - **Does not assert:** the omitted-field (`None`) path already covered by `052`, or the exact-match positive case (`062`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/073 — M4c, PR #526 round 4, reviewer/auditor N2. `remove_isolated_clone_dir`'s TOCTOU re-verification (cleanliness, single local branch, empty stash, HEAD-vs-merged-PR headRefOid, each re-derived fresh immediately before deleting) had zero test coverage — deleting that whole block would leave every existing test in the file green. A genuinely eligible isolated clone, confirmed reclaim-eligible via `examine_worktrees` first, is then dirtied (an untracked file written into it) before `remove_isolated_clone_dir` is called directly, carrying the now-stale eligibility `run_reclaim` would have handed it — proving re-verification rather than merely a check against an already-bad fixture (fork issue #325 M4c).
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/worktree_reclaim.rs`'s own `#[cfg(test)] mod tests`, `#[cfg(unix)]` (stub `gh` script) — built through the real provisioner, calling `examine_worktrees` then the private `remove_isolated_clone_dir` primitive directly.
+- **Agent:** none.
+- **Asserts:** the sanity assertion that the clone's `verdict` is exactly `isolated_clone_reclaimable` before the TOCTOU mutation; after dirtying, `remove_isolated_clone_dir` returns `Err(_)`; the clone directory and the dirtying file both still exist on disk afterward.
+- **Does not assert:** the other three re-checked conditions (single local branch, empty stash, HEAD-vs-headRefOid) — one convincing refusal path is covered here, not all four; the `has_attach_lock` condition, which is examination-time-only and not re-derived by this function at all (see `071`).
 - **Platform coverage:** mac+linux.
 
 #### worktree/guard
