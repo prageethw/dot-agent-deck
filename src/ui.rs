@@ -10993,15 +10993,21 @@ fn dispatch_action(
                                 // `SessionStart` hook fires — preserving
                                 // the orchestration readiness gate's
                                 // 10-second fallback (pre-M2.13 contract).
-                                for (id, agent_id) in
-                                    role_pane_ids.iter().zip(role_agent_ids.iter())
+                                for (i, (id, agent_id)) in
+                                    role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate()
                                 {
                                     st.register_pane(id.clone());
-                                    st.insert_placeholder_session(
+                                    let expects_agent_report =
+                                        crate::event::AgentType::from_command(Some(
+                                            &orch_config.roles[i].command,
+                                        ))
+                                        .is_some();
+                                    st.insert_placeholder_session_awaiting_report(
                                         id.clone(),
                                         Some(dir_str.clone()),
                                         None,
                                         agent_id.clone(),
+                                        expects_agent_report,
                                     );
                                 }
                                 // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
@@ -11266,6 +11272,9 @@ fn dispatch_action(
                     };
                     // `spawn_agent_type` and the wrapped `launch_command` (used
                     // for `cmd` above) were both resolved before the dims block.
+                    // Captured before the move into `AgentSpawnOptions` below —
+                    // the placeholder insert after spawn needs it too.
+                    let spawn_expects_agent_report = spawn_agent_type.is_some();
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),
@@ -11294,11 +11303,12 @@ fn dispatch_action(
                             {
                                 let mut st = state.blocking_write();
                                 st.register_pane(new_id.clone());
-                                st.insert_placeholder_session(
+                                st.insert_placeholder_session_awaiting_report(
                                     new_id.clone(),
                                     Some(dir_str.clone()),
                                     None,
                                     new_agent_id,
+                                    spawn_expects_agent_report,
                                 );
                             }
                             ui.pane_display_names
@@ -13284,15 +13294,21 @@ pub fn run_tui(
                                     .collect();
                                 {
                                     let mut st = state.blocking_write();
-                                    for (id, agent_id) in
-                                        role_pane_ids.iter().zip(role_agent_ids.iter())
+                                    for (i, (id, agent_id)) in
+                                        role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate()
                                     {
                                         st.register_pane(id.clone());
-                                        st.insert_placeholder_session(
+                                        let expects_agent_report =
+                                            crate::event::AgentType::from_command(Some(
+                                                &orch_config.roles[i].command,
+                                            ))
+                                            .is_some();
+                                        st.insert_placeholder_session_awaiting_report(
                                             id.clone(),
                                             Some(saved_pane.dir.clone()),
                                             None,
                                             agent_id.clone(),
+                                            expects_agent_report,
                                         );
                                     }
                                     for (i, role) in orch_config.roles.iter().enumerate() {
@@ -20381,9 +20397,9 @@ fn render_session_card(
     show_agent_type_badge: bool,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
-    let is_pending = is_placeholder && session.agent_id.is_some();
+    let is_pending = is_placeholder && session.expects_agent_report;
     let (status_label, status_style) = if is_pending {
-        ("Starting…", text_dim())
+        ("Starting…", text_primary())
     } else if is_placeholder {
         ("No agent", text_primary())
     } else {
@@ -20696,7 +20712,7 @@ fn render_session_card(
     if is_pending {
         lines.push(Line::from(Span::styled(
             "Waiting for agent to report in…",
-            text_dim(),
+            text_primary(),
         )));
     } else if is_placeholder {
         lines.push(Line::from(Span::styled(
@@ -24847,6 +24863,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -27932,6 +27949,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -29891,6 +29909,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         }
     }
 
@@ -30253,6 +30272,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         // Spacious: get all 3
@@ -30290,6 +30310,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -30318,6 +30339,7 @@ mod tests {
             pending_permission_tool: None,
             shell_synthetic_working: false,
             model: None,
+            expects_agent_report: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

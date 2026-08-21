@@ -393,6 +393,15 @@ pub struct SessionState {
     /// carrying `None` must NOT clear a previously-known model, since most
     /// events don't carry one. `None` until the first event that does.
     pub model: Option<String>,
+    /// Pending-status redesign: `true` only when this placeholder was minted
+    /// via [`Self::insert_placeholder_session_awaiting_report`] for a pane
+    /// spawned running a recognized agent CLI that has not yet reported in.
+    /// Replaces the old `agent_id.is_some()` guess in `render_session_card`,
+    /// which also matched bare shells, arbitrary non-agent commands, and
+    /// `SessionEnd`-restored placeholders whose `agent_id` is carried
+    /// forward only for the reuse guard. `false` for every other
+    /// placeholder.
+    pub expects_agent_report: bool,
 }
 
 impl SessionState {
@@ -4283,6 +4292,39 @@ impl AppState {
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
     ) {
+        self.insert_placeholder_session_inner(pane_id, cwd, agent_type, agent_id, false);
+    }
+
+    /// Pending-status redesign: sibling of [`Self::insert_placeholder_session`]
+    /// for the three call sites that spawn a pane running a recognized agent
+    /// CLI and therefore know, at mint time, that the placeholder is awaiting
+    /// that agent's first report. Every other caller keeps using the plain
+    /// constructor above, which seeds `expects_agent_report = false`.
+    pub fn insert_placeholder_session_awaiting_report(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) {
+        self.insert_placeholder_session_inner(
+            pane_id,
+            cwd,
+            agent_type,
+            agent_id,
+            expects_agent_report,
+        );
+    }
+
+    fn insert_placeholder_session_inner(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: Option<AgentType>,
+        agent_id: Option<String>,
+        expects_agent_report: bool,
+    ) {
         let session_id = session_id_for_pane(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
@@ -4306,6 +4348,7 @@ impl AppState {
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
                 model: None,
+                expects_agent_report,
             },
         );
     }
@@ -6048,6 +6091,7 @@ impl AppState {
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
                 model: event.model.clone(),
+                expects_agent_report: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -9724,6 +9768,7 @@ clear = false
                 pending_permission_tool: None,
                 shell_synthetic_working: false,
                 model: None,
+                expects_agent_report: false,
             },
         );
 
