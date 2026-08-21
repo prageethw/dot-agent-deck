@@ -1536,6 +1536,13 @@ pub(crate) fn provision_isolated_clone_sync(
     // comment). The two probes are now kept apart as a `BranchLocation` so
     // `isolated_clone_checkout_argv` can give the remote-only case its own,
     // DWIM-free checkout form.
+    //
+    // Fork#325 M4c fix round: read the clone's pre-checkout default branch
+    // NOW, before either probe or the checkout itself ever moves `HEAD` —
+    // [`remove_stray_default_branch`] below needs this name to clean up the
+    // leftover ref checkout leaves behind in the `Absent`/`RemoteOnly`
+    // cases.
+    let default_branch = resolve_clone_default_branch(clone_dir);
     let branch_location = if run_status_sync(
         "git",
         &crate::issue_dispatch::worktree_branch_probe_argv(clone_dir, branch),
@@ -1569,6 +1576,22 @@ pub(crate) fn provision_isolated_clone_sync(
         // saw `clone_dir.exists()` and reported "clone already exists",
         // naming no recovery command.
         return handle_isolated_clone_add_error(err, clone_dir, creator);
+    }
+
+    // Fork#325 M4c fix round: `Local` means `branch` WAS the clone's
+    // pre-checkout default branch — nothing to clean up, and
+    // `default_branch.as_deref() == Some(branch)` guards the same case a
+    // second time in case `Local` was ever reachable for some other reason
+    // (belt-and-suspenders: `git branch -d` on the currently checked-out
+    // branch fails loudly anyway, but there is no reason to invoke it at
+    // all when there is nothing stray to remove).
+    if !matches!(
+        branch_location,
+        crate::issue_dispatch::BranchLocation::Local
+    ) && let Some(stray) = default_branch.as_deref()
+        && stray != branch
+    {
+        remove_stray_default_branch(clone_dir, stray);
     }
 
     if source_origin.is_none() {
@@ -1839,6 +1862,80 @@ fn remove_isolated_clone_origin_default(clone_dir: &Path) -> Option<String> {
         Err(e) => Some(format!(
             "failed to remove the clone's default local-path origin: {e}"
         )),
+    }
+}
+
+/// The branch a fresh `git clone` checked out by default — the source
+/// repo's own current HEAD branch — via `git symbolic-ref --short -q HEAD`,
+/// read BEFORE the checkout below ever moves `clone_dir`'s `HEAD` off of it.
+/// `None` on any spawn/exit failure or empty output (e.g. a detached-HEAD
+/// source), mirroring [`read_source_origin_url`]'s fail-open-to-`None`
+/// shape: an unresolvable default branch just means
+/// [`remove_stray_default_branch`] below has nothing it can safely name to
+/// clean up, never a hard failure of provisioning itself.
+fn resolve_clone_default_branch(clone_dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Delete `clone_dir`'s leftover default branch once the checkout onto the
+/// dispatched `branch` has moved `HEAD` off of it (fork#325 M4c fix round).
+///
+/// A fresh `git clone` checks out the source's own default branch
+/// (typically `main`) as a genuine local `refs/heads/` ref.
+/// `isolated_clone_checkout_argv`'s `Absent` (`checkout -b <branch>`) and
+/// `RemoteOnly` (`checkout -b <branch> --track origin/<branch>`) forms both
+/// move `HEAD` onto the dispatched work branch WITHOUT touching that
+/// original ref — so it stayed behind as a second, permanent local branch,
+/// which meant `isolated_clone_report`'s tightened `single_local_branch`
+/// gate (exactly one local branch: the resolved current one) could never be
+/// satisfied by ANY real dispatched clone, not merely the deliberately
+/// broken fixtures the tightened rule's own negative tests construct —
+/// `worktree_reclaim_062`/`068` are the only two fixtures that exercise
+/// every gate positively, and both caught this: reclaim eligibility was
+/// unreachable for a genuinely matching clone before this cleanup existed.
+///
+/// Safe to delete with a plain `-d` (never `-D`): at the point this runs,
+/// the leftover branch's tip is exactly the commit the dispatched branch
+/// was just cut from (or fast-forwarded from, in the `RemoteOnly` case) —
+/// no dispatched work has been committed yet — so it is by construction
+/// fully merged into `HEAD` and `-d` cannot refuse it. Best-effort, and
+/// deliberately never propagated as a hard failure of provisioning: a
+/// failure here (a `branch.<name>` config `git branch -d` itself refuses to
+/// touch, a `pre-branch`-style hook, or any other local misconfiguration)
+/// just means this clone keeps an extra branch and stays on the
+/// permanently-conservative `isolated_clone` verdict on the next `reclaim`
+/// sweep — the exact same safe fallback an unresolvable gate anywhere else
+/// in the tightened rule already produces.
+fn remove_stray_default_branch(clone_dir: &Path, original_branch: &str) {
+    let out = std::process::Command::new("git")
+        .current_dir(clone_dir)
+        .args(["branch", "-d", "--", original_branch])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::warn!(
+            clone = %clone_dir.display(),
+            branch = %original_branch,
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "issue-dispatch: could not delete the isolated clone's leftover default branch; \
+             it will keep reporting more than one local branch to `worktree list`/`reclaim`"
+        ),
+        Err(e) => tracing::warn!(
+            clone = %clone_dir.display(),
+            branch = %original_branch,
+            error = %e,
+            "issue-dispatch: could not delete the isolated clone's leftover default branch; \
+             it will keep reporting more than one local branch to `worktree list`/`reclaim`"
+        ),
     }
 }
 
