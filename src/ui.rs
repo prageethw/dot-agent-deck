@@ -25860,30 +25860,33 @@ mod tests {
         );
     }
 
-    /// Scenario: Insert a placeholder session with a real `agent_id` but no
-    /// `agent_type` yet (the shape an Orchestration-tab role pane has while
-    /// its harness is still starting, e.g. sitting at a "trust this folder"
-    /// prompt), render it, and assert the card shows "Starting…" rather than
-    /// "No agent" or "Launch an agent to get started".
+    /// Scenario: Insert a placeholder session explicitly flagged as
+    /// awaiting an agent report (the shape a freshly-spawned Orchestration-
+    /// tab role pane has while its recognized-agent-CLI harness is still
+    /// starting, e.g. sitting at a "trust this folder" prompt), render it,
+    /// and assert the card shows "Starting…" rather than "No agent" or
+    /// "Launch an agent to get started".
     #[spec("dashboard/placeholder/001")]
     #[test]
     fn dashboard_placeholder_001_pending_agent_shows_starting_not_no_agent() {
         // Third case, distinct from both siblings above: a placeholder with
-        // NO agent_type (still `AgentType::None`) but a real `agent_id` —
-        // the shape a freshly-spawned Orchestration-tab role pane has before
-        // it has reported in. This must render as "Starting…", not as the
-        // genuinely-empty "No agent" / "Launch an agent to get started"
-        // copy those siblings pin.
+        // NO agent_type (still `AgentType::None`) but explicitly marked
+        // `expects_agent_report = true` — the shape a freshly-spawned
+        // Orchestration-tab role pane has, spawned running a command
+        // recognized as a real agent CLI, before it has reported in. This
+        // must render as "Starting…", not as the genuinely-empty "No agent"
+        // / "Launch an agent to get started" copy those siblings pin.
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut state = AppState::default();
         state.register_pane("1".to_string());
-        state.insert_placeholder_session(
+        state.insert_placeholder_session_awaiting_report(
             "1".to_string(),
             Some("/tmp".to_string()),
             None,
             Some("d-1".to_string()),
+            true,
         );
 
         let mut ui = default_ui();
@@ -25937,6 +25940,89 @@ mod tests {
             "pending placeholder (agent_type=None, agent_id=Some) must not \
              show the genuinely-empty 'Launch an agent to get started' \
              body line; got:\n{rendered}"
+        );
+    }
+
+    /// Scenario: Insert a placeholder session via the plain
+    /// `insert_placeholder_session` constructor with a real `agent_id` but
+    /// no `agent_type` — the shape a bare shell pane, an unrecognized
+    /// command (`sleep 600`, `cat`), or any other non-agent PTY has — and
+    /// assert the card shows "No agent" / "Launch an agent to get started"
+    /// rather than "Starting…".
+    #[spec("dashboard/placeholder/002")]
+    #[test]
+    fn dashboard_placeholder_002_non_agent_command_keeps_no_agent() {
+        // Negative case proving the discriminator no longer false-positives
+        // on non-agent panes: `agent_id.is_some()` alone used to be read as
+        // "pending", which also matched bare shell panes and arbitrary
+        // non-agent commands. The plain constructor seeds
+        // `expects_agent_report = false`, so this must render the
+        // genuinely-empty copy, never "Starting…".
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut state = AppState::default();
+        state.register_pane("1".to_string());
+        state.insert_placeholder_session(
+            "1".to_string(),
+            Some("/tmp".to_string()),
+            None,
+            Some("d-1".to_string()),
+        );
+
+        let mut ui = default_ui();
+        let filtered = filter_sessions(&state, &ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                };
+                let tab_bar =
+                    TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    PaneLayout::Stacked,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                )
+            })
+            .unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !rendered.contains("Starting…"),
+            "non-agent placeholder (agent_type=None, agent_id=Some, \
+             expects_agent_report=false) must not show 'Starting…'; \
+             got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("No agent"),
+            "non-agent placeholder (agent_type=None, agent_id=Some, \
+             expects_agent_report=false) must show the genuinely-empty \
+             'No agent' status; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Launch an agent to get started"),
+            "non-agent placeholder (agent_type=None, agent_id=Some, \
+             expects_agent_report=false) must show the genuinely-empty \
+             'Launch an agent to get started' body line; got:\n{rendered}"
         );
     }
 

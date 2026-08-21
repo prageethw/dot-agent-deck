@@ -10108,4 +10108,66 @@ clear = false
              stale recorded failure rather than latching it forever"
         );
     }
+
+    /// Scenario: pending-status redesign blocker 2 — a `SessionEnd` for a
+    /// session that carries a real `agent_id` (state.rs's terminal-frame
+    /// restoration branch) rebuilds a placeholder via the plain
+    /// `insert_placeholder_session`, which must seed
+    /// `expects_agent_report = false`. Drive `apply_event` with the
+    /// `SessionEnd` and assert the restored placeholder's field directly,
+    /// so a restored session whose agent already exited can never render
+    /// as "Starting…" merely because its `agent_id` was carried forward
+    /// for the reuse guard.
+    #[test]
+    fn session_end_restored_placeholder_does_not_expect_agent_report() {
+        let mut state = AppState::default();
+        state.register_pane("9".to_string());
+        state.insert_placeholder_session(
+            "9".to_string(),
+            Some("/tmp".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some("agent-99".to_string()),
+        );
+
+        let session_id = "pane-9".to_string();
+        state.apply_event(AgentEvent {
+            session_id: session_id.clone(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("9".to_string()),
+            agent_id: Some("agent-99".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            model: None,
+        });
+
+        let restored = state
+            .sessions
+            .get(&session_id)
+            .expect("SessionEnd must restore a placeholder for a managed pane");
+        assert_eq!(
+            restored.agent_type,
+            AgentType::None,
+            "the restored placeholder's agent_type is unknown post-end"
+        );
+        assert_eq!(
+            restored.agent_id.as_deref(),
+            Some("agent-99"),
+            "the dying agent's agent_id is carried forward for the reuse guard"
+        );
+        assert!(
+            !restored.expects_agent_report,
+            "a SessionEnd restoration must not claim the restored \
+             placeholder is awaiting an agent report -- that would render \
+             'Starting...' permanently for a pane whose agent already \
+             exited"
+        );
+    }
 }

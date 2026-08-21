@@ -247,11 +247,18 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### dashboard/placeholder
 
-##### dashboard/placeholder/001 — A placeholder session with a real `agent_id` but no `agent_type` yet renders "Starting…", not "No agent".
+##### dashboard/placeholder/001 — A placeholder explicitly awaiting an agent report renders "Starting…", not "No agent".
 - **Layer:** L1 (in-process `TestBackend` render).
 - **Agent:** none.
-- **Asserts:** a placeholder session with a real `agent_id` but `agent_type == AgentType::None` (the Orchestration-tab role-pane shape while its harness hasn't reported in yet) renders `"Starting…"` and neither `"No agent"` nor `"Launch an agent to get started"`.
-- **Does not assert:** the genuinely-idle placeholder case (agent_id also `None`), covered by the existing sibling tests `dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent` and `dashboard_placeholder_without_agent_type_shows_launch_an_agent`.
+- **Asserts:** a placeholder session inserted via `insert_placeholder_session_awaiting_report(.., expects_agent_report: true)` — still `agent_type == AgentType::None` (the Orchestration-tab role-pane shape, spawned running a command recognized as a real agent CLI, before its harness has reported in) — renders `"Starting…"` and neither `"No agent"` nor `"Launch an agent to get started"`.
+- **Does not assert:** the genuinely-idle placeholder case (agent_id also `None`), covered by `dashboard_placeholder_without_agent_type_shows_launch_an_agent`; the hydrated-known-`agent_type` case, covered separately by `dashboard_placeholder_with_agent_type_does_not_show_launch_an_agent`; the non-agent-command negative case (real `agent_id`, `expects_agent_report == false`), covered by `dashboard/placeholder/002`; the reconnect-hydration path (`seed_hydrated_session`), which defers `expects_agent_report` to `false` even when the original spawn command was a recognized agent — a known, deliberate scope limitation, not a regression (renders `"No agent"` there instead of `"Starting…"`, same as before this redesign).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/placeholder/002 — A placeholder for a non-agent command (real `agent_id`, unrecognized/bare-shell command) keeps "No agent", never "Starting…".
+- **Layer:** L1 (in-process `TestBackend` render).
+- **Agent:** none.
+- **Asserts:** a placeholder session inserted via the plain `insert_placeholder_session` (real `agent_id`, `agent_type == AgentType::None`) — the shape a bare shell pane, an unrecognized command (`sleep 600`, `cat`), or any other non-agent PTY has — seeds `expects_agent_report == false` and renders `"No agent"` / `"Launch an agent to get started"`, never `"Starting…"`. This is the negative case proving the discriminator no longer false-positives on `agent_id.is_some()` alone.
+- **Does not assert:** the awaiting-report positive case, covered by `dashboard/placeholder/001`.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/selection
