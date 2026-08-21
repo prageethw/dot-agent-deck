@@ -81,7 +81,17 @@ use crate::terminal_sanitize::{sanitize_for_terminal_display, sanitize_path_for_
 /// contract, not an implementation detail whose row-provenance nuance a
 /// consumer could reasonably be expected to track. Bump on the value-set
 /// change itself.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped to 4 by fork#325 M4c (maintainer-decided rule): `verdict` gains a
+/// FIFTH value, `"isolated_clone_reclaimable"` -- the same shape as the v3
+/// bump immediately above, restated rather than re-argued: a documented
+/// value-set gaining a member a consumer's filter didn't previously expect
+/// is what forces a bump here, independent of whether any pre-existing row's
+/// `verdict` could ever transition into the new value (it cannot -- only an
+/// isolated-clone row whose PR is merged at its exact current HEAD SHA ever
+/// carries it, mirroring exactly how only a wholly-new isolated-clone row
+/// ever carried v3's `"isolated_clone"`).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
 /// in the worktree's OWN git metadata dir (`<repo>/.git/worktrees/<name>/`,
@@ -141,12 +151,34 @@ const KIND_LINKED: &str = "linked";
 /// from `remove`/`ask`/`keep`, with no separate lookup needed.
 const KIND_ISOLATED_CLONE: &str = "isolated_clone";
 
+/// `WorktreeReport::verdict` value for an isolated clone whose branch has a
+/// MERGED PR and whose own current HEAD SHA equals that PR's merge-commit
+/// SHA exactly (fork#325 M4c, maintainer-decided rule) — distinct from
+/// [`KIND_ISOLATED_CLONE`], which every other isolated-clone row still
+/// reports as its `verdict` unchanged (unmerged, or merged-but-diverged).
+/// `kind` stays [`KIND_ISOLATED_CLONE`] regardless — this is a `verdict`-only
+/// distinction, the row kind itself doesn't change. See
+/// [`isolated_clone_report`]'s own doc comment for the exact comparison, and
+/// [`SCHEMA_VERSION`]'s own doc comment for why a new documented `verdict`
+/// value bumps that constant.
+const VERDICT_ISOLATED_CLONE_RECLAIMABLE: &str = "isolated_clone_reclaimable";
+
 /// Resolved PR state for a worktree's branch, or why it could not be
 /// resolved. `Unresolvable` and `NoPr` both keep — the distinction is only
 /// for the reported reason.
+///
+/// `Merged` carries the PR's merge-commit SHA (fork#325 M4c) — `gh pr list
+/// --json mergeCommit` returns `{"oid": "<sha>"}` for a merged PR, resolved
+/// by [`resolve_pr_state`]. `None` when `gh`'s response carries no
+/// `mergeCommit.oid` at all (malformed/absent field) — deliberately never
+/// treated as "unresolvable" at the `PrState` level (a merged PR is still a
+/// merged PR for [`decide`]'s purposes), but [`isolated_clone_report`]'s M4c
+/// comparison must treat a `None` SHA as never eligible for the new
+/// reclaimable verdict: an ambiguous signal must never widen eligibility for
+/// a safety-relevant deletion decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrState {
-    Merged,
+    Merged { merge_sha: Option<String> },
     Open,
     ClosedUnmerged,
     NoPr,
@@ -156,7 +188,7 @@ pub enum PrState {
 impl PrState {
     fn label(&self) -> &'static str {
         match self {
-            PrState::Merged => "merged",
+            PrState::Merged { .. } => "merged",
             PrState::Open => "open",
             PrState::ClosedUnmerged => "closed_unmerged",
             PrState::NoPr => "no_pr",
@@ -418,7 +450,7 @@ impl Verdict {
 ///    worktree is clean by definition.
 pub fn decide(pr_state: &PrState, clean: &Cleanliness, ownership: Ownership) -> Verdict {
     match pr_state {
-        PrState::Merged => match clean {
+        PrState::Merged { .. } => match clean {
             Cleanliness::Dirty => Verdict::Keep(
                 "dirty: uncommitted or untracked changes are present that were never part of the merged PR"
                     .to_string(),
@@ -468,11 +500,12 @@ pub struct WorktreeReport {
     pub owned: bool,
     pub pr_state: String,
     /// One of `"remove"` / `"ask"` / `"keep"` (from [`Verdict::label`], via
-    /// [`decide`]) for a `kind == "linked"` row, or the literal
-    /// `"isolated_clone"` (from [`isolated_clone_report`], never through
-    /// [`decide`] at all) for a `kind == "isolated_clone"` row — see
-    /// [`SCHEMA_VERSION`]'s own doc comment (reviewer F2) for why this
-    /// fourth value forced the bump to `SCHEMA_VERSION` 3. Two independent
+    /// [`decide`]) for a `kind == "linked"` row, or one of `"isolated_clone"`
+    /// / `"isolated_clone_reclaimable"` (from [`isolated_clone_report`],
+    /// never through [`decide`] at all) for a `kind == "isolated_clone"`
+    /// row — see [`SCHEMA_VERSION`]'s own doc comment (reviewer F2, then
+    /// fork#325 M4c) for why this fourth and fifth value each forced a
+    /// bump, to `SCHEMA_VERSION` 3 and 4 respectively. Two independent
     /// producers, both of which this doc comment names, is why this field
     /// needs one where every sibling field's own doc comment already has
     /// one.
@@ -1466,7 +1499,7 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             "--repo",
             &repo_slug,
             "--json",
-            "state,headRefName,headRepositoryOwner",
+            "state,headRefName,headRepositoryOwner,mergeCommit",
         ])
         .output();
     let out = match out {
@@ -1506,7 +1539,14 @@ fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
             name_matches.len()
         )),
         ([one], _) => match one.get("state").and_then(|s| s.as_str()) {
-            Some("MERGED") => PrState::Merged,
+            Some("MERGED") => {
+                let merge_sha = one
+                    .get("mergeCommit")
+                    .and_then(|m| m.get("oid"))
+                    .and_then(|o| o.as_str())
+                    .map(|s| s.to_string());
+                PrState::Merged { merge_sha }
+            }
             Some("OPEN") => PrState::Open,
             Some("CLOSED") => PrState::ClosedUnmerged,
             Some(other) => PrState::Unresolvable(format!("unrecognized PR state {other:?}")),
@@ -1990,6 +2030,30 @@ fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(raw).into_owned())
 }
 
+/// Resolve an isolated clone's own current HEAD commit SHA via `git
+/// rev-parse HEAD`, run inside the clone itself (fork#325 M4c) — `None` on
+/// any spawn/exit/parse failure. Mirrors [`resolve_isolated_clone_branch`]'s
+/// shape exactly, including running via [`git_in_untrusted_dir`] for the
+/// same reason: this is a `git` invocation with `current_dir` set inside an
+/// untrusted candidate. Used by [`isolated_clone_report`] to compare against
+/// a merged PR's merge-commit SHA — an exact match is the only signal that
+/// widens a row's verdict past the permanently-conservative
+/// `"isolated_clone"` default.
+fn resolve_isolated_clone_head_sha(clone_dir: &Path) -> Option<String> {
+    let out = git_in_untrusted_dir(clone_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = trim_trailing_newline(&out.stdout);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(raw).into_owned())
+}
+
 /// Build the report row for one discovered isolated clone (fork#325 M4a).
 /// Cleanliness and PR state ARE probed — real signals, useful to a human
 /// scanning `worktree list`'s CLEAN/PR columns — but neither one, nor any
@@ -2009,6 +2073,16 @@ fn resolve_isolated_clone_branch(clone_dir: &Path) -> Option<String> {
 /// a value distinct from `"remove"`/`"ask"` — so [`run_reclaim`]'s string
 /// match falls through to its `_ => kept.push(r)` arm unconditionally,
 /// with no new match arm needed there at all.
+///
+/// **Fork#325 M4c exception (maintainer-decided rule):** the one condition
+/// under which `verdict` is NOT hard-coded to [`KIND_ISOLATED_CLONE`] is a
+/// MERGED PR whose merge-commit SHA equals this clone's own current HEAD SHA
+/// exactly ([`VERDICT_ISOLATED_CLONE_RECLAIMABLE`]) — [`run_reclaim`] gets a
+/// dedicated match arm for that value, using a removal primitive other than
+/// `remove_worktree_dir`'s `git worktree remove` (which fails loudly against
+/// a plain clone, not a linked worktree). Every other case — unmerged, or
+/// merged-but-diverged — is unaffected and still hard-codes
+/// [`KIND_ISOLATED_CLONE`] exactly as before this milestone.
 ///
 /// Final round (reviewer F13 / auditor A1/B1): `owned` and `owner`/
 /// `owner_kind` below are now backed by `candidate.has_attach_lock` —
@@ -2061,6 +2135,39 @@ fn isolated_clone_report(
         ),
         None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
     };
+    // Fork#325 M4c (maintainer-decided rule): the only condition that ever
+    // widens this row's verdict past the permanently-conservative
+    // `KIND_ISOLATED_CLONE` default -- a MERGED PR whose merge-commit SHA
+    // was itself resolvable (`merge_sha: Some(..)`) AND equals this clone's
+    // OWN current HEAD SHA exactly. A merged-but-SHA-unresolvable PR
+    // (`merge_sha: None`) never qualifies -- the match below falls through
+    // to `false` for that case -- an ambiguous signal must never widen
+    // eligibility for a safety-relevant deletion decision.
+    let head_sha = resolve_isolated_clone_head_sha(&path);
+    let is_reclaim_eligible = match &pr_state {
+        PrState::Merged {
+            merge_sha: Some(merge_sha),
+        } => head_sha.as_deref() == Some(merge_sha.as_str()),
+        _ => false,
+    };
+    let (verdict, reason) = if is_reclaim_eligible {
+        (
+            VERDICT_ISOLATED_CLONE_RECLAIMABLE.to_string(),
+            "isolated clone: branch's pull request is merged and this clone's HEAD SHA equals \
+             the PR's merge-commit SHA exactly -- eligible for automatic reclaim (fork#325 M4c, \
+             maintainer-decided rule)"
+                .to_string(),
+        )
+    } else {
+        (
+            KIND_ISOLATED_CLONE.to_string(),
+            "isolated clone: automatic reclaim is deferred to a documented follow-up \
+             milestone -- never auto-removed by `worktree reclaim`, with or without --yes, \
+             regardless of PR state or cleanliness (mirrors RemovalPolicy::IsolatedClone's \
+             daemon-side precedent; fork#325 M4a)"
+                .to_string(),
+        )
+    };
     // Discovery already required this marker to be `is_file()`, but its
     // content is only trusted once `has_attach_lock` has confirmed the
     // deck's own attach-lock artifact for this candidate (final round —
@@ -2095,14 +2202,8 @@ fn isolated_clone_report(
         clean,
         owned: has_attach_lock,
         pr_state: pr_state.label().to_string(),
-        verdict: KIND_ISOLATED_CLONE.to_string(),
-        reason: Some(
-            "isolated clone: automatic reclaim is deferred to a documented follow-up \
-             milestone -- never auto-removed by `worktree reclaim`, with or without --yes, \
-             regardless of PR state or cleanliness (mirrors RemovalPolicy::IsolatedClone's \
-             daemon-side precedent; fork#325 M4a)"
-                .to_string(),
-        ),
+        verdict,
+        reason: Some(reason),
         owner,
         owner_kind,
         owner_reason,
@@ -2176,11 +2277,14 @@ pub fn format_list_error_for_cli(e: &str) -> String {
 /// 4) is not reachable today — not every [`WorktreeReport::real_path`] comes
 /// from `git worktree list` any more (fork#325 M4a's isolated-clone rows
 /// come from `read_dir` instead), but every path THIS function actually
-/// receives still does: [`run_reclaim`]'s match sends `kind ==
-/// "isolated_clone"` rows to its `kept` arm unconditionally and never calls
-/// this function for them (see [`isolated_clone_report`]'s own doc
-/// comment), so the conclusion holds even though its old justification —
-/// "every path here" — no longer describes every row this crate examines.
+/// receives still does: [`run_reclaim`]'s match never sends an isolated-clone
+/// row (`verdict == "isolated_clone"` OR, since fork#325 M4c, `verdict ==
+/// "isolated_clone_reclaimable"`) to this function -- the former falls
+/// through to `kept` unconditionally, the latter is routed to
+/// `remove_isolated_clone_dir` instead (see [`isolated_clone_report`]'s own
+/// doc comment) -- so the conclusion holds even though its old
+/// justification — "every path here" — no longer describes every row this
+/// crate examines.
 /// `git worktree list` still always emits absolute paths, so none of the
 /// paths reaching this function can start with `-` — but the separator
 /// costs nothing and removes the assumption regardless.
@@ -2219,6 +2323,53 @@ fn remove_worktree_dir(repo_dir: &Path, worktree_path: &Path, remover: &str) -> 
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// Physically remove an isolated clone directory (fork#325 M4c) — used only
+/// for [`VERDICT_ISOLATED_CLONE_RECLAIMABLE`] rows, never for a `"linked"`
+/// worktree row (those go through [`remove_worktree_dir`] instead). An
+/// isolated clone is a plain directory containing its own `.git`, not a
+/// `git worktree list`-registered entry, so `git worktree remove` is the
+/// wrong primitive here — it realpath/symlink-resolves its argument against
+/// the registry and exits 128 against anything that isn't a linked worktree
+/// at all (see [`remove_worktree_dir`]'s own doc comment). `std::fs::
+/// remove_dir_all` is the direct analogue.
+///
+/// Mirrors [`remove_worktree_dir`]'s safety shape as closely as the
+/// different removal primitive allows: takes the real `Path`, never a
+/// lossily-converted string; requires `worktree_path` to itself contain a
+/// `.git` DIRECTORY (an isolated clone's own repository metadata, checked
+/// via [`Path::is_dir`] rather than merely [`Path::exists`] — a `.git` FILE
+/// marks a linked worktree, not an isolated clone, and this function must
+/// never be pointed at one) immediately before removing, as a last-moment
+/// structural check that the caller is deleting something shaped like the
+/// isolated clone [`isolated_clone_report`] examined and not an arbitrary
+/// path that has since changed underneath it; and logs the same durable
+/// `tracing::info!` trace on success, sanitized identically, so a
+/// post-incident reader has one place to grep `DOT_AGENT_DECK_LOG` for
+/// either removal path.
+fn remove_isolated_clone_dir(worktree_path: &Path, remover: &str) -> Result<(), String> {
+    if !worktree_path.join(".git").is_dir() {
+        return Err(
+            "refusing to remove: no `.git` directory found at this path any more -- it no \
+             longer looks like the isolated clone that was examined"
+                .to_string(),
+        );
+    }
+    std::fs::remove_dir_all(worktree_path).map_err(|e| {
+        format!("failed to remove isolated clone directory (requested by {remover}): {e}")
+    })?;
+    // Issue #325 / reviewer B1 / auditor F2 precedent, carried to the M4c
+    // removal path: the ONLY durable trace of a confirmed removal. `remover`
+    // is an unauthenticated, caller-supplied string (auditor F3) -- sanitize
+    // it here exactly as `remove_worktree_dir` does, since a log file gets
+    // `cat`/`tail`ed to a terminal too.
+    tracing::info!(
+        path = %sanitize_path_for_terminal_display(worktree_path),
+        remover = %sanitize_for_terminal_display(remover),
+        "isolated clone removed"
+    );
+    Ok(())
 }
 
 /// The full outcome of a `worktree reclaim` run, partitioned by what actually
@@ -2267,6 +2418,29 @@ pub fn run_reclaim(repo_dir: &Path, yes: bool, remover: &str) -> Result<ReclaimO
                 }
             },
             "ask" => pending.push(r),
+            // Fork#325 M4c: gated on `--yes` exactly like `"ask"`, and
+            // deliberately not merged into that same match arm despite the
+            // identical gating -- `"isolated_clone_reclaimable"` must never
+            // route through `remove_worktree_dir` (it isn't a linked
+            // worktree; see that function's own doc comment), so it needs
+            // its own arm calling `remove_isolated_clone_dir` regardless of
+            // how the gating condition happens to line up with `"ask"`
+            // today.
+            VERDICT_ISOLATED_CLONE_RECLAIMABLE if yes => {
+                match remove_isolated_clone_dir(&r.real_path, remover) {
+                    Ok(()) => {
+                        let mut r = r;
+                        r.removed_by = Some(remover.to_string());
+                        removed.push(r);
+                    }
+                    Err(e) => {
+                        let mut r = r;
+                        r.reason = Some(format!("removal failed: {e}"));
+                        kept.push(r);
+                    }
+                }
+            }
+            VERDICT_ISOLATED_CLONE_RECLAIMABLE => pending.push(r),
             _ => kept.push(r),
         }
     }
@@ -2397,20 +2571,36 @@ mod tests {
 
     #[test]
     fn decide_merged_clean_owned_removes() {
-        let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Ours);
+        let v = decide(
+            &PrState::Merged { merge_sha: None },
+            &Cleanliness::Clean,
+            Ownership::Ours,
+        );
         assert_eq!(v, Verdict::Remove);
     }
 
     #[test]
     fn decide_merged_clean_foreign_asks() {
-        let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Foreign);
+        let v = decide(
+            &PrState::Merged { merge_sha: None },
+            &Cleanliness::Clean,
+            Ownership::Foreign,
+        );
         assert!(matches!(v, Verdict::Ask(_)));
     }
 
     #[test]
     fn decide_merged_dirty_keeps_regardless_of_ownership() {
-        let owned = decide(&PrState::Merged, &Cleanliness::Dirty, Ownership::Ours);
-        let foreign = decide(&PrState::Merged, &Cleanliness::Dirty, Ownership::Foreign);
+        let owned = decide(
+            &PrState::Merged { merge_sha: None },
+            &Cleanliness::Dirty,
+            Ownership::Ours,
+        );
+        let foreign = decide(
+            &PrState::Merged { merge_sha: None },
+            &Cleanliness::Dirty,
+            Ownership::Foreign,
+        );
         assert!(matches!(owned, Verdict::Keep(ref r) if r.contains("dirty")));
         assert!(matches!(foreign, Verdict::Keep(ref r) if r.contains("dirty")));
     }
@@ -2418,7 +2608,7 @@ mod tests {
     #[test]
     fn decide_merged_unresolvable_cleanliness_keeps_without_calling_it_dirty() {
         let v = decide(
-            &PrState::Merged,
+            &PrState::Merged { merge_sha: None },
             &Cleanliness::Unresolvable("spawn failed".to_string()),
             Ownership::Ours,
         );
