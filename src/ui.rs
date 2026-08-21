@@ -36417,6 +36417,225 @@ mod tests {
         assert!(ui.orchestration_prompted.contains(&tab_id));
     }
 
+    /// Scenario: Issue #422 item 2 regression guard, in two scenarios sharing one reporting-capable Codex pane fixture. First: a genuine TEXT confirmation arriving at the issue's measured 8.45s worst case must finalize the delivery, holding it to exactly one write throughout `unconfirmed_retry_delay`'s current 10s first-retry window with no confirming event yet applied. Second: ticking past that 10s window with no confirmation applied lets a bare-CR retry legitimately fire, and the genuine confirmation arriving immediately after it must still finalize the delivery cleanly.
+    #[spec("prompt/pane-input/035")]
+    #[test]
+    fn pane_input_035_late_genuine_text_confirmation_survives_the_full_first_retry_window_before_confirming()
+     {
+        const PANE_ID: &str = "late-text-confirm-pane";
+        const AGENT_ID: &str = "late-text-confirm-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts.clone(),
+        ));
+        let now = std::time::Instant::now();
+        let tab_id: TabId = 35;
+        let mut ui = default_ui();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = ready_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+
+        // First write: makes the delivery provisional and arms the
+        // unconfirmed-retry backoff (a reporting-capable Codex pane, same
+        // fixture as `prompt/pane-input/023`/`034`).
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some(PROMPT),
+            "the initial write must remain provisional before any confirming event"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the initial write is the only submission so far"
+        );
+
+        // No confirming event is applied at any of these ticks — sample
+        // points inside `unconfirmed_retry_delay`'s current 10s first-retry
+        // window, not that function's own schedule (there is now only one
+        // step: 10s, then a flat 15s cap). The genuine TEXT confirmation has
+        // NOT arrived yet; nothing should resubmit into the pane before it
+        // does.
+        for millis in [500u64, 1_000, 2_000, 4_000, 8_000] {
+            let tick = now
+                .checked_add(std::time::Duration::from_millis(millis))
+                .expect("tick timestamp");
+            deliver_orchestrator_prompt(
+                &mut ui,
+                pane.as_ref(),
+                &snapshot,
+                tick,
+                tab_id,
+                &[PANE_ID.to_string()],
+                0,
+                &mut role_statuses,
+                &mut prompt,
+            );
+            assert_eq!(
+                prompt.as_deref(),
+                Some(PROMPT),
+                "issue #422 item 2: still no genuine confirmation at +{millis}ms; the delivery must remain provisional"
+            );
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "issue #422 item 2: no bare-CR retry may resubmit to the pane at +{millis}ms before the genuine TEXT confirmation arrives"
+            );
+        }
+
+        // The measured genuine Codex TEXT confirmation latency (per the
+        // issue): 8.45s. Only now does a real matching UserPromptSubmit-derived
+        // event arrive.
+        apply_prompt_confirmation(&mut snapshot, PANE_ID, AGENT_ID, PROMPT);
+        let confirm_at = now
+            .checked_add(std::time::Duration::from_millis(8_450))
+            .expect("confirmation timestamp");
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            confirm_at,
+            tab_id,
+            &[PANE_ID.to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+
+        assert!(
+            prompt.is_none(),
+            "the genuine matching confirmation must finalize the delivery"
+        );
+        assert!(
+            !ui.prompt_delivery.contains_key(PANE_ID)
+                && !ui.send_retry_backoff.contains_key(PANE_ID),
+            "confirmation must clear delivery identity and retry state"
+        );
+        assert_eq!(role_statuses, [OrchestrationRoleStatus::Working]);
+        assert!(ui.orchestration_prompted.contains(&tab_id));
+
+        // Auditor A3: the ticks above never advance past the 10s first
+        // window, so on their own they only re-prove
+        // `unconfirmed_retry_delay(1) >= 8.45s` indirectly — they say nothing
+        // about a retry that DOES fire. This second, independent delivery
+        // ticks past that window with no confirmation applied, so a bare-CR
+        // retry legitimately fires, then applies the genuine confirmation
+        // immediately after: it must still finalize cleanly, proving the
+        // retry firing does not itself false-confirm or otherwise corrupt
+        // the delivery the confirmation is matched against.
+        const PANE_ID_2: &str = "late-text-confirm-pane-past-window";
+        const AGENT_ID_2: &str = "late-text-confirm-agent-past-window";
+
+        let attempts2 = Arc::new(AtomicUsize::new(0));
+        let pane2: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::Applied,
+            attempts2.clone(),
+        ));
+        let now2 = std::time::Instant::now();
+        let tab_id2: TabId = 35;
+        let mut ui2 = default_ui();
+        ui2.orchestration_prompt_anchor_at.insert(tab_id2, now2);
+        ui2.orchestration_ready_since.insert(
+            tab_id2,
+            now2.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot2 = ready_prompt_snapshot(PANE_ID_2, AGENT_ID_2);
+        let mut role_statuses2 = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt2 = Some(PROMPT.to_string());
+
+        // First write: same as the first scenario above.
+        deliver_orchestrator_prompt(
+            &mut ui2,
+            pane2.as_ref(),
+            &snapshot2,
+            now2,
+            tab_id2,
+            &[PANE_ID_2.to_string()],
+            0,
+            &mut role_statuses2,
+            &mut prompt2,
+        );
+        assert_eq!(attempts2.load(Ordering::SeqCst), 1);
+
+        // Tick just past the 10s first-retry window with no confirming event
+        // applied: a bare-CR retry now legitimately fires. This is the
+        // property the fix establishes, not a false positive — `attempts`
+        // moving to 2 here is correct.
+        let past_window = now2
+            .checked_add(std::time::Duration::from_millis(10_050))
+            .expect("tick timestamp");
+        deliver_orchestrator_prompt(
+            &mut ui2,
+            pane2.as_ref(),
+            &snapshot2,
+            past_window,
+            tab_id2,
+            &[PANE_ID_2.to_string()],
+            0,
+            &mut role_statuses2,
+            &mut prompt2,
+        );
+        assert_eq!(
+            attempts2.load(Ordering::SeqCst),
+            2,
+            "a bare-CR retry legitimately fires once the first unconfirmed-retry window elapses"
+        );
+        assert_eq!(
+            prompt2.as_deref(),
+            Some(PROMPT),
+            "a bare-CR retry does not itself finalize the delivery"
+        );
+
+        // The genuine confirmation, arriving shortly after that legitimate
+        // retry, must still finalize cleanly.
+        apply_prompt_confirmation(&mut snapshot2, PANE_ID_2, AGENT_ID_2, PROMPT);
+        let confirm_at2 = now2
+            .checked_add(std::time::Duration::from_millis(10_100))
+            .expect("confirmation timestamp");
+        deliver_orchestrator_prompt(
+            &mut ui2,
+            pane2.as_ref(),
+            &snapshot2,
+            confirm_at2,
+            tab_id2,
+            &[PANE_ID_2.to_string()],
+            0,
+            &mut role_statuses2,
+            &mut prompt2,
+        );
+        assert!(
+            prompt2.is_none(),
+            "the genuine confirmation still finalizes after a legitimate bare-CR retry fired"
+        );
+        assert!(
+            !ui2.prompt_delivery.contains_key(PANE_ID_2)
+                && !ui2.send_retry_backoff.contains_key(PANE_ID_2),
+            "confirmation must clear delivery identity and retry state"
+        );
+        assert_eq!(role_statuses2, [OrchestrationRoleStatus::Working]);
+        assert!(ui2.orchestration_prompted.contains(&tab_id2));
+    }
+
     /// Scenario: Queue seed prompts for reporting, non-reporting, and unidentifiable consumers, including swallowed-CR duplicate submissions joined by a newline or no separator. Reporting panes stay provisional until matching submission evidence arrives, while Pi and identity-less panes write once without arming retries, and every doubled submitted seed clears retry state before a third write.
     #[spec("prompt/pane-input/024")]
     #[test]
