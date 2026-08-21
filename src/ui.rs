@@ -35136,6 +35136,117 @@ mod tests {
         }
     }
 
+    /// Fork issue #201 round 4 (reviewer R4-1): like [`with_recording_daemon`],
+    /// but answers ONE caller-named op with a crafted refusal
+    /// (`AttachResponse::err(_)`) while still recording every op's arrival
+    /// order and answering every OTHER op with `AttachResponse::ok()`.
+    /// Neither existing stub can produce this shape: `with_recording_daemon`
+    /// always answers `ok`, so a refusal can never happen; and
+    /// `with_crafted_response_daemon` answers EVERY request with one fixed
+    /// response, so the pre-spawn `ClaimOrchestrationName` would be refused
+    /// too and the claim this test needs to genuinely exist would never be
+    /// made. This lets a test drive a real, accepted claim and then have
+    /// only the later `ConfirmOrchestrationClaim` come back refused.
+    fn with_recording_daemon_refusing_op(
+        unique_dir: &std::path::Path,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        refuse_op: &'static str,
+    ) -> EmptyAgentsDaemonGuard {
+        let env_lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
+
+        #[cfg(unix)]
+        let socket_addr = unique_dir.join("attach.sock");
+        #[cfg(windows)]
+        let socket_addr = std::path::PathBuf::from(format!(
+            r"\\.\pipe\dot-agent-deck-test-{}",
+            unique_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread_socket_addr = socket_addr.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "build stub refusing-op recording-daemon runtime: {e}"
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let listener =
+                    match crate::daemon_protocol::bind_attach_listener(&thread_socket_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "bind stub refusing-op recording listener: {e}"
+                            )));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+                let ok_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::ok())
+                    .expect("serialize AttachResponse::ok()");
+                let err_payload = serde_json::to_vec(&crate::daemon_protocol::AttachResponse::err(
+                    format!("{refuse_op} refused by stub daemon"),
+                ))
+                .expect("serialize AttachResponse::err()");
+                loop {
+                    let Ok(mut stream) = listener.accept().await else {
+                        return;
+                    };
+                    let Ok(Some((_, payload))) =
+                        crate::daemon_protocol::read_frame(&mut stream).await
+                    else {
+                        continue;
+                    };
+                    let mut refuse_this = false;
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload)
+                        && let Some(op) = v.get("op").and_then(|o| o.as_str())
+                    {
+                        log.lock().unwrap().push(op.to_string());
+                        refuse_this = op == refuse_op;
+                    }
+                    let response_payload = if refuse_this {
+                        &err_payload
+                    } else {
+                        &ok_payload
+                    };
+                    let _ = crate::daemon_protocol::write_frame(
+                        &mut stream,
+                        crate::daemon_protocol::KIND_RESP,
+                        response_payload,
+                    )
+                    .await;
+                }
+            });
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stub refusing-op recording daemon must report readiness within 10s")
+            .expect("stub refusing-op recording daemon must bind successfully");
+
+        // SAFETY: `env_lock` held above; restored by `EmptyAgentsDaemonGuard::drop`.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_ATTACH_SOCKET", &socket_addr);
+        }
+
+        EmptyAgentsDaemonGuard {
+            _env_lock: env_lock,
+            prev_attach,
+        }
+    }
+
     /// Fork issue #201 redesign: like [`with_recording_daemon`], but instead
     /// of logging every request's `op`, invokes `on_request` synchronously
     /// the instant the FIRST request of any kind arrives — before crafting
@@ -35531,6 +35642,90 @@ mod tests {
             log.contains(&"release-orchestration-name".to_string()),
             "a spawn failure AFTER a successful claim must release the token-held claim so \
              the name is immediately claimable again, not stuck until some timeout; got {log:?}"
+        );
+    }
+
+    /// Scenario: Fork issue #201 round 4 (reviewer R4-1) — a genuinely
+    /// SUCCESSFUL `ClaimOrchestrationName`, followed by the daemon refusing
+    /// the subsequent `ConfirmOrchestrationClaim` (not `ok`), must release
+    /// the token-held claim rather than leaving it squatted under a token
+    /// no `StopAgent` will ever match (a confirmed claim is only ever
+    /// released by pane id). `identity_018` covers a spawn failure that
+    /// happens BEFORE confirm is ever sent; `identity_019` covers release
+    /// after a SUCCESSFUL confirm. This is the missing third case: the
+    /// spawn itself succeeds (both role panes are created via
+    /// `CapturingPaneController`, exactly as in `identity_017`) and confirm
+    /// comes back refused. `with_recording_daemon_refusing_op` answers
+    /// `claim-orchestration-name` with `ok` — so the claim genuinely exists
+    /// — and `confirm-orchestration-claim` with a refusal, while recording
+    /// the full op sequence so the test can assert a
+    /// `release-orchestration-name` was actually sent, not merely infer it
+    /// from later behavior.
+    #[spec("orchestration/identity/020")]
+    #[test]
+    fn identity_020_confirm_refusal_after_a_successful_claim_releases_the_token() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&dir).expect("create plain dir");
+
+        let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let _daemon = with_recording_daemon_refusing_op(
+            tmp.path(),
+            ops.clone(),
+            "confirm-orchestration-claim",
+        );
+
+        let config = make_orchestration("review");
+        let pc = Arc::new(CapturingPaneController::new());
+        let req = NewPaneRequest {
+            dir,
+            name: "foo".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+            orchestration_worktree_path: None,
+            orchestration_worktree_slug: None,
+            orchestration_worktree_error: None,
+        };
+
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+
+        assert_eq!(
+            tm.tab_count(),
+            2,
+            "a refused CONFIRM must not tear down an already-successful spawn — the \
+             orchestration tab (Dashboard + Orchestration) stays up"
+        );
+
+        let log = ops.lock().unwrap().clone();
+        assert!(
+            log.contains(&"claim-orchestration-name".to_string()),
+            "the pre-spawn token claim must have been sent and accepted; got {log:?}"
+        );
+        assert!(
+            log.contains(&"confirm-orchestration-claim".to_string()),
+            "the post-spawn confirm must have been sent once the spawn succeeded; got {log:?}"
+        );
+        assert!(
+            log.contains(&"release-orchestration-name".to_string()),
+            "a refused confirm must release the token-held claim so the name doesn't stay \
+             squatted under a token StopAgent will never match; got {log:?}"
         );
     }
 

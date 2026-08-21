@@ -3691,6 +3691,13 @@ without depending on the config struct API.
 - **Does not assert:** the wire-level `StopAgent` handler's own release call, which is unchanged and already covered by `identity_014`; the gating condition itself (`is_agent_still_registered`) that keeps a `respawn_agent_in_pane` successor's still-live claim from being wrongly released — that guard is pre-existing production code this fix reuses, not new surface; the pre-confirm token-holder case, which is a different failure (auditor C3, tracked separately, not fixed by this hook).
 - **Platform coverage:** mac+linux (spawns a real `sleep` child under the platform shell, matching `prompt/pane-input/003`'s existing `sleep`-fixture coverage note).
 
+##### orchestration/identity/020 — Fork PR #532 review round (reviewer R4-1): a genuinely successful `ClaimOrchestrationName` followed by the daemon refusing the subsequent `ConfirmOrchestrationClaim` (not `ok`) must release the token-held claim — otherwise it stays squatted under a token `StopAgent` will never match, since a confirmed claim is only ever released by pane id.
+- **Layer:** fast synthetic direct-call unit test, embedded in `src/ui.rs`'s own `#[cfg(test)] mod tests`. `CapturingPaneController` (both role-pane spawns succeed, as in `identity_017`); a new hand-rolled stub daemon (`with_recording_daemon_refusing_op`) answers `claim-orchestration-name` with `ok` and `confirm-orchestration-claim` with a crafted refusal, while recording the full op sequence.
+- **Agent:** none.
+- **Asserts:** the spawn succeeds and the orchestration tab is pushed (`tm.tab_count() == 2`) despite the refused confirm; the op log contains `claim-orchestration-name`, `confirm-orchestration-claim`, AND `release-orchestration-name` — proving the refusal actually triggers a release rather than merely being tolerated.
+- **Does not assert:** the session-restore call site's own confirm-refusal handling (`src/ui.rs:13566`), which shares the same `if !confirmed { release_orchestration_claim_token(...) }` shape but is not exercised by this test; the exact refusal reason string; a confirm that times out rather than being answered with an explicit refusal (both are treated identically by production code, matching `resp.ok` as `false`/absent either way, but only the explicit-refusal wire shape is exercised here).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
