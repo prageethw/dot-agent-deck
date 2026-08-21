@@ -1512,11 +1512,24 @@ mod tests {
             AgentType::from_command_including_devbox(Some("devbox")),
             None
         );
+        // Pin the `from_command` fallback branch itself: a plain, non-devbox,
+        // already-recognized command must resolve exactly like `from_command`
+        // would. Every other assertion above is devbox-shaped, so nothing
+        // else in this test would catch that fallback line being deleted.
+        assert_eq!(
+            AgentType::from_command_including_devbox(Some("claude")),
+            Some(AgentType::ClaudeCode)
+        );
     }
 
     // Regression guard for `spawn_007_hook_learned_badge_does_not_change_respawn_launch`
-    // (`tests/agent_detection.rs:347`) and its sibling `spawn_008`: the ORIGINAL,
-    // shared `AgentType::from_command` — which `wrap_launch_command`'s callers use
+    // (`tests/agent_detection.rs:347`) — `spawn_007` is the ONLY test that actually
+    // catches this regression; its sibling `spawn_008` sets an explicit
+    // creation-time `agent_type: Some(Codex)` in its fixture, which makes its two
+    // code paths converge regardless of the badge, so it does NOT guard this
+    // invariant (it instead pins the separate "respawn wrap decision follows the
+    // launched command" scenario). The ORIGINAL, shared `AgentType::from_command`
+    // — which `wrap_launch_command`'s callers use
     // to decide whether to auto-wrap a respawned launch command — must NEVER
     // resolve a devbox-wrapped command to an agent type, no matter how
     // agent-shaped the devbox script name looks. The documented invariant at
