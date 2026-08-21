@@ -2465,6 +2465,8 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         shell_synthetic_working: false,
                         model: None,
                     }),
+                    daemon_boot_id: None,
+                    registration_generation: None,
                 };
                 let resp = AttachResponse {
                     ok: true,
@@ -3074,6 +3076,8 @@ async fn live_012_shell_idle_in_the_snapshot_subscribe_window_still_clears_the_c
             shell_synthetic_working: true,
             model: None,
         }),
+        daemon_boot_id: None,
+        registration_generation: None,
     };
     // The paired `ShellIdle`, shaped the way `run_shell_activity_monitor`
     // stamps it: neutral agent type, the owning `agent_id` (so
@@ -3368,6 +3372,8 @@ async fn assert_reconnect_recovers_the_missed_status(reason: ReconnectTeardown) 
             shell_synthetic_working: false,
             model: None,
         }),
+        daemon_boot_id: None,
+        registration_generation: None,
     }));
 
     let (dir, path, listener) = {

@@ -1335,8 +1335,21 @@ async fn handle_connection(
             // identical `last_activity` would otherwise resolve by hash order.
             // Break that tie on the (unique) `session_id` so the same input
             // always selects the same snapshot.
+            //
+            // Fork issue #513: while the lock is already held for the `live`
+            // join above, also join in this `AppState`'s `daemon_boot_id`
+            // (daemon-wide, so every record gets the same value) and each
+            // record's current `pane_registration_generation` entry keyed by
+            // its `pane_id_env`. Lets an out-of-process caller that cannot
+            // see a spawned pane's `DOT_AGENT_DECK_REGISTRATION_GENERATION`/
+            // `DOT_AGENT_DECK_DAEMON_BOOT_ID` env vars (e.g. an L2 test's own
+            // `work-done` subprocess) construct a legitimate `WorkDoneSignal`
+            // for a specific pane instead of guessing. Same-uid-gated like
+            // every other `ListAgents` field — see `AgentRecord::daemon_boot_id`'s
+            // doc for why this exposes no new privilege.
             {
                 let guard = state.read().await;
+                let boot_id = guard.daemon_boot_id().to_string();
                 for record in &mut records {
                     record.live = guard
                         .sessions
@@ -1351,6 +1364,12 @@ async fn handle_connection(
                                 .then_with(|| a.session_id.cmp(&b.session_id))
                         })
                         .map(|s| s.live_snapshot());
+                    record.daemon_boot_id = Some(boot_id.clone());
+                    record.registration_generation = record
+                        .pane_id_env
+                        .as_deref()
+                        .and_then(|pane_id| guard.pane_registration_generation.get(pane_id))
+                        .copied();
                 }
             }
             write_resp(&mut stream, &AttachResponse::agent_records(records)).await?;
@@ -2958,6 +2977,8 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -2976,6 +2997,8 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -3140,6 +3163,8 @@ mod tests {
                 shell_synthetic_working: false,
                 model: None,
             }),
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
