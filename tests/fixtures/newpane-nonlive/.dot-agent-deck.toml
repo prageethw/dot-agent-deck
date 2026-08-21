@@ -1,0 +1,13 @@
+# Fixture for issue #521's non-live-focused-pane hypothesis
+# (orchestration/newpane/004). A single orchestration whose start role runs a
+# script (written into the deck's workdir by the test itself, mirroring
+# `e2e_pane_send_result.rs`'s `pane_input_007` pattern) that declares its own
+# session HistoryOnly via a synthetic hook event, then execs `cat` so the pane
+# stays open and interactive for the rest of the test.
+[[orchestrations]]
+name = "history-only-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "./newpane-nonlive.sh"
+start = true
