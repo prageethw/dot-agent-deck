@@ -214,3 +214,42 @@ jobs:
           fi
 
           echo "Drift is within threshold — nothing to do."
+
+  notify:
+    needs: drift-check
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: File, update, or close the drift-check tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ needs.drift-check.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          MARKER_LABEL="drift-check-alert"
+
+          EXISTING=$(gh issue list --repo "$REPO" --label "$MARKER_LABEL" --state open --json number --jq '.[0].number // empty')
+
+          if [ "$RESULT" = "failure" ]; then
+            if [ -z "$EXISTING" ]; then
+              BODY=$(printf '%s\n\n%s' \
+                "The scheduled/push \`drift-check\` workflow failed. See the run for the exact measurement (drift amount, threshold, oldest un-curated commit): $RUN_URL" \
+                "This issue is filed and updated automatically by \`drift-check.yml\`'s \`notify\` job (fork issue #502) — it will be closed automatically once the check goes green again, so treat a close on this issue as a real recovery signal, not manual bookkeeping. Re-curate the \`fork-only\` stack per \`docs/develop/fork-sync-workflow.md\`'s \"Keep it current\" note.")
+              gh issue create --repo "$REPO" \
+                --title "Drift check is red: main has drifted from fork-only" \
+                --label "$MARKER_LABEL" --label chore --label ci-cd --label priority-high \
+                --body "$BODY"
+            else
+              gh issue comment "$EXISTING" --repo "$REPO" --body "Still red as of $RUN_URL."
+            fi
+          elif [ "$RESULT" = "success" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --repo "$REPO" --comment "Recovered — drift-check passed: $RUN_URL" --reason completed
+            fi
+          fi
+          # cancelled/skipped: do nothing either direction — not a real signal.
