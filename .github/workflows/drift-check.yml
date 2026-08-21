@@ -91,9 +91,15 @@ jobs:
           # A caller who passed an explicit threshold_override and got a
           # non-numeric value must not be silently redirected to the
           # default — that would misreport what was actually evaluated. And
-          # because this script runs `set -uo pipefail` (deliberately
-          # without -e), a failing `[ -gt ]` comparison later would not be
-          # fatal on its own; validate up front instead of relying on that.
+          # because this step specifies no `shell:` override, it runs under
+          # GitHub Actions' default for a Linux `run:` step, `bash -eo
+          # pipefail {0}` — `-e` (errexit) is already active before this
+          # script's own `set -uo pipefail` line even runs, which only adds
+          # `-u` and cannot turn `-e` off. A failing `[ -gt ]` comparison
+          # later would still not be fatal on its own, though: it is
+          # evaluated as an `if` condition, and errexit never fires for a
+          # command tested by `if`/`while`/`until`, `-e` or not. Validate up
+          # front instead of relying on that.
           case "$THRESHOLD" in
             ''|*[!0-9]*)
               {
@@ -278,10 +284,34 @@ jobs:
                 echo "::error::could not read body of issue #$EXISTING — refusing to edit blind"
                 exit 1
               fi
-              NEW_BODY=$(printf '%s\n%s\n%s' \
-                "$(printf '%s' "$CURRENT_BODY" | sed "\\|$STILL_RED_MARKER|,\$d")" \
-                "$STILL_RED_MARKER" \
-                "Most recent still-red run: $RUN_URL")
+
+              # Exactly one marker is expected — it is written once by the
+              # `gh issue create` above and never duplicated by this branch.
+              # Zero means it was stripped or the issue predates the marker;
+              # more than one means a previous run already went wrong. Either
+              # way, editing blind risks corrupting the body further — fail
+              # loudly instead (matches A4's discipline for this job).
+              MARKER_COUNT=$(printf '%s' "$CURRENT_BODY" | grep -Fc "$STILL_RED_MARKER")
+              if [ "$MARKER_COUNT" -ne 1 ]; then
+                echo "::error::issue #$EXISTING body has $MARKER_COUNT occurrence(s) of the still-red marker (expected exactly 1) — refusing to edit a malformed body"
+                exit 1
+              fi
+
+              # Replace ONLY the marker line and the one evidence line after
+              # it, in place — never a to-end-of-body deletion. Any content a
+              # maintainer added below the evidence line (notes, discussion)
+              # must survive this update untouched. Built via `printf` into a
+              # variable, not as a literal multi-line `sed` script embedded
+              # in this YAML block: an embedded literal newline here is at
+              # the mercy of the block scalar's indentation stripping, which
+              # previously left stray leading spaces inside the replacement
+              # text and corrupted the marker/evidence lines themselves.
+              SED_SCRIPT=$(printf '\\|%s|,+1c\\\n%s\\\n%s' \
+                "$STILL_RED_MARKER" "$STILL_RED_MARKER" "Most recent still-red run: $RUN_URL")
+              if ! NEW_BODY=$(printf '%s' "$CURRENT_BODY" | sed -e "$SED_SCRIPT"); then
+                echo "::error::sed failed updating the still-red evidence in issue #$EXISTING — refusing to edit blind"
+                exit 1
+              fi
               gh issue edit "$EXISTING" --repo "$REPO" --body "$NEW_BODY"
             fi
           elif [ "$RESULT" = "success" ]; then
