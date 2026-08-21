@@ -1655,6 +1655,23 @@ fn pump_reader(
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
     {
+        // Fork issue #201 round 3 (auditor B1/C2): a confirmed
+        // orchestration-name claim's only releaser was, until now,
+        // `StopAgent` — an explicit client request. If the orchestrator
+        // pane's process dies on its own (crash, unexpected exit, killed
+        // externally) with no client ever sending `StopAgent`, the claim
+        // held forever with no releaser: `agent_records()` already filters
+        // this now-exited entry out of the live set, so `StopAgent`'s own
+        // lookup would find nothing to release even if it did run later.
+        // Release here, in the same place and behind the same
+        // `is_agent_still_registered` gate that already guards this
+        // thread's other own-initiative cleanup (the delegation sweep
+        // above) — the gate is load-bearing, not incidental: a rebound
+        // successor agent (`respawn_agent_in_pane`) re-registers under a
+        // new agent id while preserving `pane_id_env`, so an ungated
+        // release would free a still-live pane's claim out from under it.
+        // A no-op if this pane never held one.
+        registry.release_orchestration_name(pane_id);
         let swept = registry.sweep_delegations_on_exit(pane_id, &agent_id);
         // Issue #465 M2: only the records for which THIS pane was the WORKER
         // side warrant an "exited without work-done" notice — a record this
@@ -2972,6 +2989,18 @@ pub struct AgentPtyRegistry {
     /// running daemon can reach, and the drop-driven cancellation below now
     /// retires stale tasks long before they could collide anyway.
     delegation_seq: AtomicU64,
+    /// Issue #201 option (b): daemon-side exclusive claim on an
+    /// orchestrator pane's own name/title, checked atomically at the
+    /// moment a claim is actually taken rather than against a
+    /// point-in-time snapshot. Root cause this replaces: `name_collision()`
+    /// (`src/ui.rs`) refuses a New-Pane form submit against
+    /// `live_orchestration_names`, a list captured ONCE at form-open via a
+    /// single `ListAgents` round-trip — two forms opened close together
+    /// both read the same stale snapshot, so neither submit is refused even
+    /// though both would claim the same name. Keyed by name, valued by the
+    /// owning pane id (see [`Self::claim_orchestration_name`] /
+    /// [`Self::release_orchestration_name`]).
+    orchestration_name_claims: Mutex<HashMap<String, String>>,
 }
 
 /// PRD #126: the outstanding-delegation side state — records plus the
@@ -3414,6 +3443,7 @@ impl AgentPtyRegistry {
             delivery_notice_sink: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
+            orchestration_name_claims: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3426,6 +3456,67 @@ impl AgentPtyRegistry {
     /// socket for its lifetime, so a second call would carry the same path.
     pub fn set_hook_socket(&self, path: PathBuf) {
         *self.hook_socket.lock().unwrap() = Some(path);
+    }
+
+    /// Issue #201 option (b): atomically claim an orchestrator pane's own
+    /// name/title. Returns `true` when `name` was unclaimed (now claimed by
+    /// `pane_id`) OR already claimed by this exact `pane_id` (idempotent
+    /// re-claim — a caller confirming its own already-held claim is not a
+    /// conflict). Returns `false` when `name` is held by a *different*
+    /// `pane_id`.
+    ///
+    /// The wire-level caller (`AttachRequest::ClaimOrchestrationName`,
+    /// `src/daemon_protocol.rs`) uses the New-Pane spawn path's real,
+    /// daemon-minted `pane_id_env` for the START role pane — see the
+    /// `Action::SpawnPane` handler in `src/ui.rs`, which claims only once
+    /// that real id is known (the daemon mints `pane_id` in `StartAgent`,
+    /// so no pane id exists yet at form-submit time) and rolls the spawn
+    /// back on refusal.
+    pub fn claim_orchestration_name(&self, name: &str, pane_id: &str) -> bool {
+        let mut claims = self.orchestration_name_claims.lock().unwrap();
+        match claims.get(name) {
+            Some(holder) => holder == pane_id,
+            None => {
+                claims.insert(name.to_string(), pane_id.to_string());
+                true
+            }
+        }
+    }
+
+    /// Issue #201 option (b): release whatever orchestration-name claim (if
+    /// any) belongs to `pane_id` — a no-op if that pane holds no claim.
+    /// Called from `StopAgent`'s handler (`src/daemon_protocol.rs`) for the
+    /// closing pane id, so a claim is freed the moment its owning
+    /// orchestrator pane closes rather than lingering forever.
+    pub fn release_orchestration_name(&self, pane_id: &str) {
+        self.orchestration_name_claims
+            .lock()
+            .unwrap()
+            .retain(|_, holder| holder != pane_id);
+    }
+
+    /// Fork issue #201 redesign: rebind whatever orchestration-name claim
+    /// `token` currently holds onto `pane_id` — the pre-provisioning claim
+    /// is keyed by a caller-minted token (no real pane id exists that
+    /// early), and this is called once the spawn genuinely succeeds and a
+    /// real pane id is known, so `StopAgent`'s existing by-pane-id
+    /// `release_orchestration_name` can free it on close.
+    ///
+    /// Returns `true` and rebinds the claim's holder from `token` to
+    /// `pane_id` when `token` holds a claim. Returns `false` and leaves
+    /// every claim untouched — exact-match, not "steal whatever's
+    /// there" — when `token` holds nothing, including when a different
+    /// token or pane id already holds the name.
+    pub fn confirm_orchestration_claim(&self, token: &str, pane_id: &str) -> bool {
+        let mut claims = self.orchestration_name_claims.lock().unwrap();
+        match claims.iter().find(|(_, holder)| holder.as_str() == token) {
+            Some((name, _)) => {
+                let name = name.clone();
+                claims.insert(name, pane_id.to_string());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Issue #424: install the daemon's sink for [`DeliveryNotice`]s. Called
@@ -8063,6 +8154,251 @@ mod spawn_tests {
 
         registry.close_agent(&id).expect("close should succeed");
         assert!(registry.is_empty());
+    }
+
+    /// Fork issue #201: `name_collision()` (`src/ui.rs`) refuses a New-Pane
+    /// form submit against `live_orchestration_names`, a list captured ONCE
+    /// at form-open via a single `ListAgents` round-trip. Two forms opened
+    /// close together both read the same stale snapshot, so nothing at the
+    /// point identity is actually WRITTEN enforces uniqueness — this pins
+    /// the daemon-side claim (#201 option (b)) that closes that window:
+    /// enforcement at claim time, not at a form's stale read time.
+    ///
+    /// Scenario: two threads race to claim the identical orchestration name
+    /// at the same instant (a `Barrier` forces them to attempt the claim
+    /// together), simulating two New-Pane forms submitting close enough
+    /// together that neither's stale snapshot would have refused the other.
+    /// Exactly one claim succeeds; releasing the winner's claim then lets a
+    /// third, later claimant take the freed name.
+    #[spec("orchestration/identity/012")]
+    #[test]
+    fn identity_012_daemon_side_name_claim_is_exclusive_under_race() {
+        const NAME: &str = "myrepo-orchestrator-1";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let (registry_a, barrier_a) = (registry.clone(), barrier.clone());
+        let claim_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            registry_a.claim_orchestration_name(NAME, "pane-a")
+        });
+        let (registry_b, barrier_b) = (registry.clone(), barrier.clone());
+        let claim_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            registry_b.claim_orchestration_name(NAME, "pane-b")
+        });
+
+        let won_a = claim_a.join().expect("claiming thread a must not panic");
+        let won_b = claim_b.join().expect("claiming thread b must not panic");
+
+        assert_ne!(
+            won_a, won_b,
+            "exactly one of two simultaneous claims for the same name must succeed \
+             (won_a={won_a}, won_b={won_b}) — both succeeding is fork issue #201's race \
+             reopened at the daemon layer; both refusing would wrongly starve every claimant"
+        );
+
+        let winner_pane = if won_a { "pane-a" } else { "pane-b" };
+        registry.release_orchestration_name(winner_pane);
+
+        assert!(
+            registry.claim_orchestration_name(NAME, "pane-c"),
+            "releasing the winner's claim must free the name for a later claimant"
+        );
+    }
+
+    /// Scenario: covers the three non-race edges `identity_012` (its
+    /// exclusive-race guarantee) does not touch, all needed by the
+    /// production caller `Action::SpawnPane` adds in `src/ui.rs`. (1)
+    /// Distinct names must never cross-block each other, so two orchestrator
+    /// panes with different titles both succeed. (2) A pane re-claiming the
+    /// SAME name it already holds must be idempotent — the `Action::SpawnPane`
+    /// rollback path never re-claims deliberately, but a caller-side retry
+    /// after a lost/ambiguous daemon response must not misread its own
+    /// prior success as a conflict. (3) Releasing a pane id that holds no
+    /// claim (a worker pane, a plain agent, or a rollback double-release)
+    /// must be a silent no-op that leaves every OTHER live claim untouched —
+    /// `StopAgent`'s handler calls `release_orchestration_name`
+    /// unconditionally for every closing pane, claim or not.
+    #[spec("orchestration/identity/013")]
+    #[test]
+    fn identity_013_daemon_side_name_claim_distinct_names_idempotent_reclaim_and_noop_release() {
+        let registry = AgentPtyRegistry::new();
+
+        // (1) distinct names never cross-block.
+        assert!(registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"));
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-y"));
+
+        // (2) idempotent re-claim by the SAME holder.
+        assert!(
+            registry.claim_orchestration_name("repo-orchestrator-1", "pane-x"),
+            "a pane re-claiming its own already-held name must succeed, not be refused"
+        );
+        // A DIFFERENT pane is still refused after that idempotent re-claim —
+        // proves the re-claim didn't accidentally release or transfer it.
+        assert!(!registry.claim_orchestration_name("repo-orchestrator-1", "pane-z"));
+
+        // (3) releasing a pane with no claim is a no-op, and never touches
+        // an unrelated pane's live claim.
+        registry.release_orchestration_name("pane-never-claimed-anything");
+        assert!(
+            !registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"),
+            "an unrelated no-op release must not have freed pane-y's claim"
+        );
+
+        // Releasing the real holder still works after the no-op release above.
+        registry.release_orchestration_name("pane-y");
+        assert!(registry.claim_orchestration_name("repo-orchestrator-2", "pane-z"));
+    }
+
+    /// Fork issue #201 redesign (reviewer P2-2/P2-5, auditor A1): the claim
+    /// now happens BEFORE any worktree/pane provisioning, keyed by a
+    /// caller-minted TOKEN rather than a real pane id — no real id exists
+    /// that early. Once the spawn genuinely succeeds and a real pane id is
+    /// known, `Action::SpawnPane` rebinds the token's claim onto it via
+    /// `confirm_orchestration_claim`, so `StopAgent`'s existing
+    /// by-pane-id `release_orchestration_name` still frees it on close —
+    /// without that rebind, a closed orchestration's name would be stuck
+    /// held by a token nothing ever releases.
+    ///
+    /// Scenario: claim a name by TOKEN (simulating the pre-spawn claim),
+    /// confirm/rebind it onto a real pane id (simulating the post-spawn
+    /// confirm), then prove two things: the name is still exclusively held
+    /// (a third party using either the old token or a fresh token is
+    /// refused), and releasing by the now-bound PANE id — exactly what
+    /// `StopAgent`'s handler already does — frees it.
+    #[spec("orchestration/identity/014")]
+    #[test]
+    fn identity_014_confirm_orchestration_claim_rebinds_token_to_real_pane_id() {
+        const NAME: &str = "myrepo-orchestrator-1";
+        const TOKEN: &str = "spawn-token-abc123";
+        const REAL_PANE_ID: &str = "pane-42";
+
+        let registry = AgentPtyRegistry::new();
+
+        // Pre-spawn: claim by token, before any pane exists.
+        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+
+        // Post-spawn: the real pane id is now known — rebind onto it.
+        assert!(
+            registry.confirm_orchestration_claim(TOKEN, REAL_PANE_ID),
+            "confirming a claim actually held by this token must succeed"
+        );
+
+        // The name is still held — a fresh claimant (whether it guesses the
+        // old token or uses a new one) is refused.
+        assert!(!registry.claim_orchestration_name(NAME, TOKEN));
+        assert!(!registry.claim_orchestration_name(NAME, "some-other-token"));
+
+        // `StopAgent`'s existing release-by-pane-id mechanism must still
+        // work post-rebind — this is the whole point of confirming onto the
+        // real id instead of leaving the claim stuck under the token.
+        registry.release_orchestration_name(REAL_PANE_ID);
+        assert!(
+            registry.claim_orchestration_name(NAME, "new-claimant"),
+            "releasing the rebound pane id must free the name for a new claimant"
+        );
+    }
+
+    /// Scenario: a confirm naming the WRONG token (the caller raced, or
+    /// already confirmed once) must be refused and must not disturb the
+    /// claim actually held by the real token — proving confirm is exact-match,
+    /// not "steal whatever's there". Separately, releasing by the ORIGINAL
+    /// TOKEN before any confirm ever happens (the "spawn failed after a
+    /// successful claim" case `Action::SpawnPane`'s rollback needs) frees the
+    /// name immediately, matching `release_orchestration_name`'s existing
+    /// generic-string contract — no separate "release by token" method is
+    /// needed since the holder is just an opaque string either way.
+    #[spec("orchestration/identity/015")]
+    #[test]
+    fn identity_015_confirm_with_wrong_token_is_refused_and_release_by_token_frees_the_name() {
+        const NAME: &str = "myrepo-orchestrator-2";
+        const TOKEN: &str = "spawn-token-xyz789";
+
+        let registry = AgentPtyRegistry::new();
+        assert!(registry.claim_orchestration_name(NAME, TOKEN));
+
+        // A confirm naming a token that never claimed anything must be
+        // refused, and must not rebind or otherwise disturb the real claim.
+        assert!(!registry.confirm_orchestration_claim("wrong-token", "pane-99"));
+        assert!(
+            !registry.claim_orchestration_name(NAME, "some-other-token"),
+            "a rejected confirm must leave the original token's claim intact"
+        );
+
+        // The spawn that would have confirmed this claim failed instead —
+        // `Action::SpawnPane`'s rollback releases the TOKEN-held claim so
+        // the name is claimable again immediately, not stuck until some
+        // pane that never existed times out.
+        registry.release_orchestration_name(TOKEN);
+        assert!(
+            registry.claim_orchestration_name(NAME, "new-claimant"),
+            "releasing the token-held claim after a spawn failure must free the name \
+             immediately"
+        );
+    }
+
+    /// Scenario: fork issue #201 round 3 (auditor B1/C2) — a CONFIRMED
+    /// orchestration-name claim (already rebound onto a real pane id, as
+    /// `identity_014` proves `confirm_orchestration_claim` does) must not
+    /// squat the name forever if the underlying process dies on its own,
+    /// with no client ever sending `StopAgent`. Spawn a briefly-alive
+    /// agent, claim the name directly by its real `pane_id_env` (simulating
+    /// the post-confirm state — no token indirection needed to prove the
+    /// release path), let the process exit on its own and wait for the
+    /// reader thread to observe EOF, then prove the claim was released
+    /// without any explicit close: a fresh claimant can take the name.
+    #[spec("orchestration/identity/019")]
+    #[tokio::test]
+    async fn identity_019_a_confirmed_claim_is_released_when_its_pane_exits_without_stop_agent() {
+        const NAME: &str = "myrepo-orchestrator-3";
+        const PANE_ID_ENV: &str = "issue-201-crash-pane";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 0.3"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID_ENV.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a briefly-alive agent");
+
+        // Simulates the post-confirm state: the claim is bound to the
+        // real, daemon-known pane id, exactly as `confirm_orchestration_claim`
+        // leaves it — see `identity_014`.
+        assert!(registry.claim_orchestration_name(NAME, PANE_ID_ENV));
+
+        // Wait for the reader thread to observe EOF on its own (no
+        // `close_agent`/`StopAgent` call anywhere in this test) — mirrors
+        // `take_pending_seed_native_and_seed_delivered_native_refuse_an_exited_record`'s
+        // fixture for an unprompted process exit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: the briefly-alive agent must have exited"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "exited entry must still be in registry — lazily pruned, not actively reaped"
+        );
+
+        assert!(
+            registry.claim_orchestration_name(NAME, "new-claimant-after-crash"),
+            "a claim confirmed onto a pane whose process then exited on its own, with no \
+             StopAgent ever sent, must be released once the daemon observes the exit — \
+             otherwise the name is squatted for the daemon's entire remaining lifetime"
+        );
+
+        registry.shutdown_all();
     }
 
     #[test]
