@@ -1866,6 +1866,12 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
 /// spawn-time value), the active tool, the tool count and the prompts. The same
 /// registry served via the empty dummy-state `serve_attach` path must return
 /// the record with `live == None` — today's behavior, no harness regression.
+/// Fork issue #513: also reserve a `registration_generation` for the pane
+/// before serving and assert the populated-state `ListAgents` reply joins in
+/// this daemon's `AppState::daemon_boot_id` and that exact generation, while
+/// the dummy-state path still sets a (different, freshly-minted) boot id but
+/// leaves `registration_generation` at `None` since nothing was reserved
+/// against its empty `AppState`.
 #[spec("session/live/002")]
 #[test]
 fn live_002_list_agents_attaches_live_snapshot() {
@@ -1894,9 +1900,16 @@ async fn live_002_list_agents_attaches_live_snapshot_inner() {
 
     // Live, event-derived session state — the store the join must read.
     let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    // Fork issue #513: reserve a registration_generation for this pane so the
+    // ListAgents handler's daemon_boot_id/registration_generation join
+    // (src/daemon_protocol.rs) has something real to attach.
+    let expected_generation;
+    let expected_boot_id;
     {
         let mut guard = state.write().await;
         drive_session_to_working(&mut guard, "sess-live", pane, &agent_id);
+        expected_generation = guard.reserve_registration_generation(pane);
+        expected_boot_id = guard.daemon_boot_id().to_string();
     }
 
     // Populated-state path: ListAgents must attach the snapshot.
@@ -1948,6 +1961,20 @@ async fn live_002_list_agents_attaches_live_snapshot_inner() {
         "last_user_prompt preserved"
     );
 
+    // Fork issue #513: the same join must also attach this daemon's
+    // daemon_boot_id and the pane's reserved registration_generation.
+    assert_eq!(
+        rec.daemon_boot_id.as_deref(),
+        Some(expected_boot_id.as_str()),
+        "ListAgents must join this daemon's AppState::daemon_boot_id"
+    );
+    assert_eq!(
+        rec.registration_generation,
+        Some(expected_generation),
+        "ListAgents must join the pane's registration_generation reserved via \
+         reserve_registration_generation"
+    );
+
     // Dummy-state path: serve_attach uses an empty AppState → no snapshot,
     // exactly today's behavior (older daemon / test harness). No regression.
     let (_ddir, dpath, dhandle) = start_dummy_server_on(registry.clone()).await;
@@ -1964,6 +1991,22 @@ async fn live_002_list_agents_attaches_live_snapshot_inner() {
         drec.live.is_none(),
         "empty dummy-state serve_attach must yield live == None; got {:?}",
         drec.live
+    );
+    // Fork issue #513: the join still runs against the dummy path's empty
+    // AppState, so it still mints and attaches *a* daemon_boot_id (just not
+    // the populated-state one above), but registration_generation stays None
+    // since nothing was ever reserved against that empty AppState.
+    assert!(
+        drec.daemon_boot_id.is_some(),
+        "even the dummy-state AppState mints a daemon_boot_id, so ListAgents \
+         must still set it; got {:?}",
+        drec.daemon_boot_id
+    );
+    assert_eq!(
+        drec.registration_generation, None,
+        "dummy-state AppState has no pane_registration_generation entries, so \
+         this must stay None; got {:?}",
+        drec.registration_generation
     );
 
     handle.abort();
