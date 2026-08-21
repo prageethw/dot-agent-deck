@@ -4374,6 +4374,8 @@ exit 0
             // PRD #162: no live session state in this cwd-derivation fixture;
             // matches the registry's own `agent_records()` default (`None`).
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         }
     }
 
