@@ -91,9 +91,15 @@ jobs:
           # A caller who passed an explicit threshold_override and got a
           # non-numeric value must not be silently redirected to the
           # default — that would misreport what was actually evaluated. And
-          # because this script runs `set -uo pipefail` (deliberately
-          # without -e), a failing `[ -gt ]` comparison later would not be
-          # fatal on its own; validate up front instead of relying on that.
+          # because this step specifies no `shell:` override, it runs under
+          # GitHub Actions' default for a Linux `run:` step, `bash -eo
+          # pipefail {0}` — `-e` (errexit) is already active before this
+          # script's own `set -uo pipefail` line even runs, which only adds
+          # `-u` and cannot turn `-e` off. A failing `[ -gt ]` comparison
+          # later would still not be fatal on its own, though: it is
+          # evaluated as an `if` condition, and errexit never fires for a
+          # command tested by `if`/`while`/`until`, `-e` or not. Validate up
+          # front instead of relying on that.
           case "$THRESHOLD" in
             ''|*[!0-9]*)
               {
@@ -214,3 +220,103 @@ jobs:
           fi
 
           echo "Drift is within threshold — nothing to do."
+
+  notify:
+    needs: drift-check
+    # A `workflow_dispatch` run's result reflects whatever `threshold_override`
+    # (or `fork_branch_override`) the dispatcher chose, not real drift state —
+    # that is the whole point of those inputs (see their descriptions above).
+    # So a dispatch run must never touch the tracking issue: it can forge
+    # both a false alert (threshold_override=0) and a false recovery
+    # (threshold_override=100000) against real, unrelated drift. Only
+    # `schedule` and `push` ever reach this job — those two triggers carry no
+    # override and are the only trustworthy signal sources.
+    if: always() && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: File, update, or close the drift-check tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RESULT: ${{ needs.drift-check.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          MARKER_LABEL="drift-check-alert"
+          STILL_RED_MARKER="<!-- drift-check-notify:latest-still-red -->"
+
+          # A failed `gh issue list` must not be silently read as "no open
+          # issue exists" — that risks filing a duplicate on top of one we
+          # simply failed to see. Check its exit status explicitly, matching
+          # the "could not determine must never look like a pass" principle
+          # the drift-check job above already commits to.
+          if ! EXISTING=$(gh issue list --repo "$REPO" --label "$MARKER_LABEL" --state open --json number --jq '.[0].number // empty'); then
+            echo "::error::could not query existing $MARKER_LABEL issues — refusing to act on an unknown state"
+            exit 1
+          fi
+
+          if [ "$RESULT" = "failure" ]; then
+            if [ -z "$EXISTING" ]; then
+              # Cause-neutral: `drift-check` fails on real drift, a missed
+              # sync push, an unresolvable override, or plain infra trouble —
+              # this issue must not assert a specific cause it hasn't
+              # verified. The run itself is the source of truth for which.
+              BODY=$(printf '%s\n\n%s\n\n%s\n%s' \
+                "The scheduled/push \`drift-check\` workflow is failing. See the run for the specific cause (drift over threshold, could-not-determine, or an infra failure) and, if applicable, the exact measurement: $RUN_URL" \
+                "This issue is filed and updated automatically by \`drift-check.yml\`'s \`notify\` job (fork issue #502) — it will be closed automatically once the check goes green again, so treat a close on this issue as a real recovery signal, not manual bookkeeping. Re-curate the \`fork-only\` stack per \`docs/develop/fork-sync-workflow.md\`'s \"Keep it current\" note if the cause is drift." \
+                "$STILL_RED_MARKER" \
+                "Most recent still-red run: $RUN_URL")
+              gh issue create --repo "$REPO" \
+                --title "Drift check is failing" \
+                --label "$MARKER_LABEL" --label chore --label ci-cd --label priority-high --label size-low \
+                --body "$BODY"
+            else
+              # Do NOT post a new comment on every red run — replayed against
+              # this repo's real run history that produced ~68 comments in 7
+              # days on one issue, which trains maintainers to ignore the
+              # channel (fork issue #502's own failure mode, from the other
+              # side). The issue being open is already the signal; only the
+              # "most recent still-red" evidence in the body needs updating.
+              if ! CURRENT_BODY=$(gh issue view "$EXISTING" --repo "$REPO" --json body --jq '.body'); then
+                echo "::error::could not read body of issue #$EXISTING — refusing to edit blind"
+                exit 1
+              fi
+
+              # Exactly one marker is expected — it is written once by the
+              # `gh issue create` above and never duplicated by this branch.
+              # Zero means it was stripped or the issue predates the marker;
+              # more than one means a previous run already went wrong. Either
+              # way, editing blind risks corrupting the body further — fail
+              # loudly instead (matches A4's discipline for this job).
+              MARKER_COUNT=$(printf '%s' "$CURRENT_BODY" | grep -Fc "$STILL_RED_MARKER")
+              if [ "$MARKER_COUNT" -ne 1 ]; then
+                echo "::error::issue #$EXISTING body has $MARKER_COUNT occurrence(s) of the still-red marker (expected exactly 1) — refusing to edit a malformed body"
+                exit 1
+              fi
+
+              # Replace ONLY the marker line and the one evidence line after
+              # it, in place — never a to-end-of-body deletion. Any content a
+              # maintainer added below the evidence line (notes, discussion)
+              # must survive this update untouched. Built via `printf` into a
+              # variable, not as a literal multi-line `sed` script embedded
+              # in this YAML block: an embedded literal newline here is at
+              # the mercy of the block scalar's indentation stripping, which
+              # previously left stray leading spaces inside the replacement
+              # text and corrupted the marker/evidence lines themselves.
+              SED_SCRIPT=$(printf '\\|%s|,+1c\\\n%s\\\n%s' \
+                "$STILL_RED_MARKER" "$STILL_RED_MARKER" "Most recent still-red run: $RUN_URL")
+              if ! NEW_BODY=$(printf '%s' "$CURRENT_BODY" | sed -e "$SED_SCRIPT"); then
+                echo "::error::sed failed updating the still-red evidence in issue #$EXISTING — refusing to edit blind"
+                exit 1
+              fi
+              gh issue edit "$EXISTING" --repo "$REPO" --body "$NEW_BODY"
+            fi
+          elif [ "$RESULT" = "success" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue close "$EXISTING" --repo "$REPO" --comment "Recovered — drift-check passed: $RUN_URL" --reason completed
+            fi
+          fi
+          # cancelled/skipped: do nothing either direction — not a real signal.
