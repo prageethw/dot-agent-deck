@@ -245,6 +245,8 @@ mod tests {
             rows: 0,
             cols: 0,
             live,
+            daemon_boot_id: None,
+            registration_generation: None,
         }
     }
 

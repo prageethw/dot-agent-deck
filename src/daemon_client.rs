@@ -355,6 +355,8 @@ impl DaemonClient {
                 // Legacy `agents`-only daemon shape carries no live session
                 // state; the TUI falls back to a bare placeholder.
                 live: None,
+                daemon_boot_id: None,
+                registration_generation: None,
             })
             .collect())
     }
@@ -1229,6 +1231,8 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -1252,6 +1256,8 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

@@ -35779,6 +35779,8 @@ mod tests {
             rows: 24,
             cols: 80,
             live: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let _daemon = with_crafted_response_daemon(
             tmp.path(),

@@ -206,6 +206,28 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
         .join(&summary_file_name);
     let pointer_needle_text = pointer_needle(&worker_pane);
 
+    // Fork issue #513: this CLI invocation is a NEW subprocess launched from
+    // the test harness's own process, not the worker pane's real spawned
+    // child — so it never inherited the `DOT_AGENT_DECK_REGISTRATION_GENERATION`
+    // / `DOT_AGENT_DECK_DAEMON_BOOT_ID` env vars a real spawn injects
+    // (`src/spawn.rs`). Without them the signal defaults to `generation: 0`
+    // / `daemon_boot_id: ""`, which `handle_work_done`'s fork-#358 fail-closed
+    // guard never matches, and the report is silently refused before the
+    // labelling logic under test ever runs. Query the daemon's own
+    // `ListAgents` for the values it just assigned this pane and set them
+    // explicitly, so this subprocess constructs the same legitimate signal a
+    // real spawned worker would have.
+    let worker_record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(worker_pane.as_str()))
+        .expect("the worker pane must still be present in ListAgents");
+    let worker_boot_id = worker_record
+        .daemon_boot_id
+        .expect("ListAgents must report a daemon_boot_id (fork issue #513)");
+    let worker_generation = worker_record
+        .registration_generation
+        .expect("the worker pane must carry a registration_generation once registered as an orchestration role (fork issue #513)");
+
     // The REAL CLI, as the footer tells a worker to run it, against the deck's
     // own daemon. Nothing was delegated, so the daemon owes this pane nothing.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -214,6 +236,11 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
         .arg(format!("A person asked me to do this. {SENTINEL}"))
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &worker_pane)
+        .env(
+            "DOT_AGENT_DECK_REGISTRATION_GENERATION",
+            worker_generation.to_string(),
+        )
+        .env("DOT_AGENT_DECK_DAEMON_BOOT_ID", &worker_boot_id)
         .env("HOME", deck.home_dir())
         .current_dir(deck.workdir())
         .output()
