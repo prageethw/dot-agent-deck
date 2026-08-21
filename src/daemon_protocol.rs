@@ -1208,6 +1208,20 @@ async fn compute_write_and_submit_outcome(
                             // permissively. Matching on `expected_session` (rather
                             // than `if let Some`) makes that `None`-caller case an
                             // explicit arm instead of a silently skipped one.
+                            //
+                            // Auditor finding A2: the unconditional form of this arm
+                            // refused EVERY `None`-caller write on an attached pane,
+                            // including the deck's own legitimate 10s
+                            // no-`SessionStart` fallback (`ui.rs`) for agent types
+                            // that never emit a `SessionStart` hook — and because the
+                            // refusal maps to the non-terminal `Stale`, every retry
+                            // was refused identically forever (a permanent deadlock).
+                            // Narrow the refusal to a pane that actually HAS a
+                            // conversation it failed to correctly name: either a
+                            // recorded hook session, or at least one prior
+                            // generation that closed. A pane with neither has
+                            // nothing to fail to name, so refusing it serves no
+                            // security purpose.
                             match expected_session.as_deref() {
                                 Some(expected) => match guard.pane_hook_session_id(&pane_for_check)
                                 {
@@ -1216,7 +1230,12 @@ async fn compute_write_and_submit_outcome(
                                     None if has_live_attach => return false,
                                     None => {}
                                 },
-                                None if has_live_attach => return false,
+                                None if has_live_attach
+                                    && (guard.pane_hook_session_id(&pane_for_check).is_some()
+                                        || guard.pane_generation_closures(&pane_for_check) > 0) =>
+                                {
+                                    return false;
+                                }
                                 None => {}
                             }
                             true
