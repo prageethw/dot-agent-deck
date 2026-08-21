@@ -35,7 +35,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TuiDeck;
+use common::{TuiDeck, open_orchestration, write_executable};
 use dot_agent_deck::event::{
     AgentEvent, AgentType, CLEAR_SESSION_START_METADATA_KEY, CLEAR_SESSION_START_METADATA_VALUE,
     EventType,
@@ -82,33 +82,6 @@ const STATE_APPLIED_TIMEOUT: Duration = Duration::from_secs(30);
 /// did NOT happen; raising those would invert what the test proves while making
 /// it slower. Leave them alone.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Drive the new-pane dialog to open the (single) orchestration in the
-/// `remit-reassert-orchestration` fixture. With no `[[modes]]` defined the
-/// Mode chip row is `[No mode] [Orch: remit-reassert] [schedule]`, so ONE
-/// Right selects the orchestration; selecting an orchestration hides the
-/// Command field, so a second Enter submits the form. Lands with the
-/// orchestrator (start) role focused in `PaneInput` mode. Mirrors
-/// `tests/e2e_orchestration_focus.rs::open_orchestration`.
-fn open_orchestration(deck: &TuiDeck) {
-    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
-    deck.send_keys(b" "); // Space -> confirm current dir -> new-pane form
-    deck.wait_for_string("No mode"); // form up, Mode field focused at "No mode"
-    deck.send_keys(b"\x1b[C"); // Right -> [Orch: remit-reassert]
-    deck.send_keys(b"\r"); // Mode -> Name
-    deck.send_keys(b"\r"); // submit (Command hidden for an orchestration)
-}
-
-/// Write `contents` to `path` and mark it executable (unix `0o755`). Mirrors
-/// `tests/e2e_pane_send_result.rs::write_executable`.
-#[cfg(unix)]
-fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write executable test script");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod executable test script");
-}
 
 /// The synthetic orchestrator role script: a BACKGROUNDED subshell declares
 /// the role live immediately (fast-path readiness for the spawn-time remit
@@ -230,6 +203,17 @@ while IFS= read -r line; do
     confirm_submission "$line"
 done
 "#;
+
+// `write_executable` and `open_orchestration` (the latter behaves
+// identically here — with no `[[modes]]` defined the Mode chip row is
+// `[No mode] [Orch: remit-reassert] [schedule]`, so ONE Right selects the
+// orchestration, and selecting it hides the Command field so a second Enter
+// submits the form) are shared with `tests/e2e_orchestration_newpane.rs` via
+// `tests/common/mod.rs` — the two files' private copies were flagged by
+// SonarCloud's new-code duplication gate (issue #521 fix round). See
+// `common::open_orchestration`'s doc comment for why this pair,
+// specifically, is shared rather than following this suite's usual per-file
+// convention.
 
 /// The fixture's full daemon registry record for `role`. Mirrors
 /// `tests/e2e_orchestration_focus.rs::role_agent_record`.
