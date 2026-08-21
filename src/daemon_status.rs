@@ -246,6 +246,8 @@ mod tests {
             cols: 0,
             live,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         }
     }
 

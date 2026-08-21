@@ -343,6 +343,8 @@ async fn handle_connection(
                         cols: 80,
                         live: None,
                         spawned_at_ms: None,
+                        daemon_boot_id: None,
+                        registration_generation: None,
                     }]
                 })
                 .unwrap_or_default();

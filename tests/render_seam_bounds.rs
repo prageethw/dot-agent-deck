@@ -57,6 +57,7 @@ fn fixture_session() -> SessionState {
         display_name: None,
         shell_synthetic_working: false,
         model: None,
+        expects_agent_report: false,
     }
 }
 

@@ -359,6 +359,8 @@ impl DaemonClient {
                 // predates the field, so it reported no spawn time and none may
                 // be invented for it. Absence renders as nothing.
                 spawned_at_ms: None,
+                daemon_boot_id: None,
+                registration_generation: None,
             })
             .collect())
     }
@@ -1252,6 +1254,8 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -1276,6 +1280,8 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

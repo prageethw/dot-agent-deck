@@ -23131,6 +23131,7 @@ pub fn render_orchestration_frame_to_buffer(
                 display_name: None,
                 shell_synthetic_working: false,
                 model: None,
+                expects_agent_report: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -29667,6 +29668,7 @@ mod tests {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar =
                     TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
@@ -29748,6 +29750,7 @@ mod tests {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar =
                     TabBarInfo::new(false, vec!["Dashboard".into()], 0, vec![], vec![false]);
@@ -38643,6 +38646,8 @@ mod tests {
             cols: 80,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
         };
         let _daemon = with_crafted_response_daemon(
             tmp.path(),
