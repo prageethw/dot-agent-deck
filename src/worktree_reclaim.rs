@@ -2713,7 +2713,10 @@ mod tests {
         }];
         let json = serde_json::to_string(&WorktreeListDocument::new(reports)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 3);
+        // fork#325 M4c: SCHEMA_VERSION bumps 3 -> 4 for the new documented
+        // `verdict` value -- same reasoning as the field-addition bumps
+        // above, updated only so this pre-existing test keeps compiling.
+        assert_eq!(parsed["schema_version"], 4);
         assert!(json.contains("wt-a"));
     }
 
