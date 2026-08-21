@@ -217,7 +217,15 @@ jobs:
 
   notify:
     needs: drift-check
-    if: always()
+    # A `workflow_dispatch` run's result reflects whatever `threshold_override`
+    # (or `fork_branch_override`) the dispatcher chose, not real drift state —
+    # that is the whole point of those inputs (see their descriptions above).
+    # So a dispatch run must never touch the tracking issue: it can forge
+    # both a false alert (threshold_override=0) and a false recovery
+    # (threshold_override=100000) against real, unrelated drift. Only
+    # `schedule` and `push` ever reach this job — those two triggers carry no
+    # override and are the only trustworthy signal sources.
+    if: always() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -232,20 +240,49 @@ jobs:
           set -uo pipefail
 
           MARKER_LABEL="drift-check-alert"
+          STILL_RED_MARKER="<!-- drift-check-notify:latest-still-red -->"
 
-          EXISTING=$(gh issue list --repo "$REPO" --label "$MARKER_LABEL" --state open --json number --jq '.[0].number // empty')
+          # A failed `gh issue list` must not be silently read as "no open
+          # issue exists" — that risks filing a duplicate on top of one we
+          # simply failed to see. Check its exit status explicitly, matching
+          # the "could not determine must never look like a pass" principle
+          # the drift-check job above already commits to.
+          if ! EXISTING=$(gh issue list --repo "$REPO" --label "$MARKER_LABEL" --state open --json number --jq '.[0].number // empty'); then
+            echo "::error::could not query existing $MARKER_LABEL issues — refusing to act on an unknown state"
+            exit 1
+          fi
 
           if [ "$RESULT" = "failure" ]; then
             if [ -z "$EXISTING" ]; then
-              BODY=$(printf '%s\n\n%s' \
-                "The scheduled/push \`drift-check\` workflow failed. See the run for the exact measurement (drift amount, threshold, oldest un-curated commit): $RUN_URL" \
-                "This issue is filed and updated automatically by \`drift-check.yml\`'s \`notify\` job (fork issue #502) — it will be closed automatically once the check goes green again, so treat a close on this issue as a real recovery signal, not manual bookkeeping. Re-curate the \`fork-only\` stack per \`docs/develop/fork-sync-workflow.md\`'s \"Keep it current\" note.")
+              # Cause-neutral: `drift-check` fails on real drift, a missed
+              # sync push, an unresolvable override, or plain infra trouble —
+              # this issue must not assert a specific cause it hasn't
+              # verified. The run itself is the source of truth for which.
+              BODY=$(printf '%s\n\n%s\n\n%s\n%s' \
+                "The scheduled/push \`drift-check\` workflow is failing. See the run for the specific cause (drift over threshold, could-not-determine, or an infra failure) and, if applicable, the exact measurement: $RUN_URL" \
+                "This issue is filed and updated automatically by \`drift-check.yml\`'s \`notify\` job (fork issue #502) — it will be closed automatically once the check goes green again, so treat a close on this issue as a real recovery signal, not manual bookkeeping. Re-curate the \`fork-only\` stack per \`docs/develop/fork-sync-workflow.md\`'s \"Keep it current\" note if the cause is drift." \
+                "$STILL_RED_MARKER" \
+                "Most recent still-red run: $RUN_URL")
               gh issue create --repo "$REPO" \
-                --title "Drift check is red: main has drifted from fork-only" \
-                --label "$MARKER_LABEL" --label chore --label ci-cd --label priority-high \
+                --title "Drift check is failing" \
+                --label "$MARKER_LABEL" --label chore --label ci-cd --label priority-high --label size-low \
                 --body "$BODY"
             else
-              gh issue comment "$EXISTING" --repo "$REPO" --body "Still red as of $RUN_URL."
+              # Do NOT post a new comment on every red run — replayed against
+              # this repo's real run history that produced ~68 comments in 7
+              # days on one issue, which trains maintainers to ignore the
+              # channel (fork issue #502's own failure mode, from the other
+              # side). The issue being open is already the signal; only the
+              # "most recent still-red" evidence in the body needs updating.
+              if ! CURRENT_BODY=$(gh issue view "$EXISTING" --repo "$REPO" --json body --jq '.body'); then
+                echo "::error::could not read body of issue #$EXISTING — refusing to edit blind"
+                exit 1
+              fi
+              NEW_BODY=$(printf '%s\n%s\n%s' \
+                "$(printf '%s' "$CURRENT_BODY" | sed "\\|$STILL_RED_MARKER|,\$d")" \
+                "$STILL_RED_MARKER" \
+                "Most recent still-red run: $RUN_URL")
+              gh issue edit "$EXISTING" --repo "$REPO" --body "$NEW_BODY"
             fi
           elif [ "$RESULT" = "success" ]; then
             if [ -n "$EXISTING" ]; then
