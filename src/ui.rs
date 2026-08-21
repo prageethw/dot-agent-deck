@@ -11139,24 +11139,30 @@ fn dispatch_action(
                             // daemon-minted START-role pane id is known,
                             // rebind the token's claim onto it so
                             // `StopAgent`'s existing by-pane-id
-                            // `ReleaseOrchestrationName` frees it on close —
-                            // without this rebind a closed orchestration's
-                            // name would stay stuck held by a token nothing
-                            // ever releases. Fire-and-forget: the spawn
-                            // already succeeded, so a confirm failure (e.g.
-                            // the daemon somehow not knowing about the pane
-                            // it just minted) is not a reason to tear down a
-                            // working orchestration — it would only leave
-                            // the name claimed under the token instead of
-                            // the pane id, a narrow bookkeeping gap rather
-                            // than a correctness one.
-                            let _ = send_daemon_request_blocking_with_timeout(
-                                &crate::daemon_protocol::AttachRequest::ConfirmOrchestrationClaim {
-                                    token: orchestration_claim_token.clone(),
-                                    pane_id: role_pane_ids[start_idx].clone(),
-                                },
-                                DAEMON_REQUEST_TIMEOUT,
+                            // `ReleaseOrchestrationName` frees it on close.
+                            // The spawn already succeeded, so a refused or
+                            // timed-out confirm is not a reason to tear down
+                            // a working orchestration — but it IS a reason to
+                            // release the token: if left alone, the claim
+                            // would stay keyed by the token forever, since
+                            // `StopAgent` only ever releases by pane id. A
+                            // release here is safe even if the confirm
+                            // actually applied and only the response was
+                            // lost — the holder is then already the pane id,
+                            // so a release-by-token call matches nothing.
+                            let confirmed = matches!(
+                                send_daemon_request_blocking_with_timeout(
+                                    &crate::daemon_protocol::AttachRequest::ConfirmOrchestrationClaim {
+                                        token: orchestration_claim_token.clone(),
+                                        pane_id: role_pane_ids[start_idx].clone(),
+                                    },
+                                    DAEMON_REQUEST_TIMEOUT,
+                                ),
+                                Ok(ref resp) if resp.ok
                             );
+                            if !confirmed {
+                                release_orchestration_claim_token(&orchestration_claim_token);
+                            }
                             // PRD #110 followup: snapshot each role
                             // pane's daemon agent_id before the
                             // placeholder insert so the strict-
@@ -13590,13 +13596,19 @@ pub fn run_tui(
                                     Ok(ref resp) if resp.ok
                                 );
                                 if restore_claimed {
-                                    let _ = send_daemon_request_blocking_with_timeout(
-                                        &crate::daemon_protocol::AttachRequest::ConfirmOrchestrationClaim {
-                                            token: restore_claim_token,
-                                            pane_id: role_pane_ids[saved_start_idx].clone(),
-                                        },
-                                        DAEMON_REQUEST_TIMEOUT,
+                                    let restore_confirmed = matches!(
+                                        send_daemon_request_blocking_with_timeout(
+                                            &crate::daemon_protocol::AttachRequest::ConfirmOrchestrationClaim {
+                                                token: restore_claim_token.clone(),
+                                                pane_id: role_pane_ids[saved_start_idx].clone(),
+                                            },
+                                            DAEMON_REQUEST_TIMEOUT,
+                                        ),
+                                        Ok(ref resp) if resp.ok
                                     );
+                                    if !restore_confirmed {
+                                        release_orchestration_claim_token(&restore_claim_token);
+                                    }
                                 } else {
                                     ui.session_warnings.push(format!(
                                         "Warning: could not claim orchestration name {restore_claim_name:?} \

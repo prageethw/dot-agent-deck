@@ -1655,6 +1655,23 @@ fn pump_reader(
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
     {
+        // Fork issue #201 round 3 (auditor B1/C2): a confirmed
+        // orchestration-name claim's only releaser was, until now,
+        // `StopAgent` — an explicit client request. If the orchestrator
+        // pane's process dies on its own (crash, unexpected exit, killed
+        // externally) with no client ever sending `StopAgent`, the claim
+        // held forever with no releaser: `agent_records()` already filters
+        // this now-exited entry out of the live set, so `StopAgent`'s own
+        // lookup would find nothing to release even if it did run later.
+        // Release here, in the same place and behind the same
+        // `is_agent_still_registered` gate that already guards this
+        // thread's other own-initiative cleanup (the delegation sweep
+        // above) — the gate is load-bearing, not incidental: a rebound
+        // successor agent (`respawn_agent_in_pane`) re-registers under a
+        // new agent id while preserving `pane_id_env`, so an ungated
+        // release would free a still-live pane's claim out from under it.
+        // A no-op if this pane never held one.
+        registry.release_orchestration_name(pane_id);
         let swept = registry.sweep_delegations_on_exit(pane_id, &agent_id);
         // Issue #465 M2: only the records for which THIS pane was the WORKER
         // side warrant an "exited without work-done" notice — a record this
@@ -8320,6 +8337,68 @@ mod spawn_tests {
             "releasing the token-held claim after a spawn failure must free the name \
              immediately"
         );
+    }
+
+    /// Scenario: fork issue #201 round 3 (auditor B1/C2) — a CONFIRMED
+    /// orchestration-name claim (already rebound onto a real pane id, as
+    /// `identity_014` proves `confirm_orchestration_claim` does) must not
+    /// squat the name forever if the underlying process dies on its own,
+    /// with no client ever sending `StopAgent`. Spawn a briefly-alive
+    /// agent, claim the name directly by its real `pane_id_env` (simulating
+    /// the post-confirm state — no token indirection needed to prove the
+    /// release path), let the process exit on its own and wait for the
+    /// reader thread to observe EOF, then prove the claim was released
+    /// without any explicit close: a fresh claimant can take the name.
+    #[spec("orchestration/identity/019")]
+    #[tokio::test]
+    async fn identity_019_a_confirmed_claim_is_released_when_its_pane_exits_without_stop_agent() {
+        const NAME: &str = "myrepo-orchestrator-3";
+        const PANE_ID_ENV: &str = "issue-201-crash-pane";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 0.3"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID_ENV.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a briefly-alive agent");
+
+        // Simulates the post-confirm state: the claim is bound to the
+        // real, daemon-known pane id, exactly as `confirm_orchestration_claim`
+        // leaves it — see `identity_014`.
+        assert!(registry.claim_orchestration_name(NAME, PANE_ID_ENV));
+
+        // Wait for the reader thread to observe EOF on its own (no
+        // `close_agent`/`StopAgent` call anywhere in this test) — mirrors
+        // `take_pending_seed_native_and_seed_delivered_native_refuse_an_exited_record`'s
+        // fixture for an unprompted process exit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: the briefly-alive agent must have exited"
+        );
+        assert_eq!(
+            registry.len(),
+            1,
+            "exited entry must still be in registry — lazily pruned, not actively reaped"
+        );
+
+        assert!(
+            registry.claim_orchestration_name(NAME, "new-claimant-after-crash"),
+            "a claim confirmed onto a pane whose process then exited on its own, with no \
+             StopAgent ever sent, must be released once the daemon observes the exit — \
+             otherwise the name is squatted for the daemon's entire remaining lifetime"
+        );
+
+        registry.shutdown_all();
     }
 
     #[test]
