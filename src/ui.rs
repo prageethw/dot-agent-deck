@@ -27,7 +27,9 @@ use crate::features::Features;
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
-use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
+use crate::project_config::{
+    ModeConfig, OrchestrationConfig, OrchestrationRoleConfig, load_project_config,
+};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, ConfirmationCapability, attempt_delivery_id, attempt_writes_payload,
     log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted,
@@ -9874,6 +9876,32 @@ fn auto_generate_worktree_slug(dir: &Path) -> String {
     format!("orchestrator-{}", std::process::id())
 }
 
+/// Shared by both `open_orchestration_tab` call sites (live-open and
+/// restore-from-saved-config): registers each role pane and seeds its
+/// placeholder session, snapshotting `expects_agent_report` from the role's
+/// configured command. `dir` differs per caller (`dir_str` vs
+/// `saved_pane.dir`), which is the only thing that varies between the two.
+fn insert_role_placeholder_sessions(
+    st: &mut AppState,
+    role_pane_ids: &[String],
+    role_agent_ids: &[Option<String>],
+    roles: &[OrchestrationRoleConfig],
+    dir: &str,
+) {
+    for (i, (id, agent_id)) in role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate() {
+        st.register_pane(id.clone());
+        let expects_agent_report =
+            crate::event::AgentType::from_command(Some(&roles[i].command)).is_some();
+        st.insert_placeholder_session_awaiting_report(
+            id.clone(),
+            Some(dir.to_string()),
+            None,
+            agent_id.clone(),
+            expects_agent_report,
+        );
+    }
+}
+
 /// PRD #80: the single funnel. Every command [`Action`] — whether it came from
 /// a keystroke (today) or a button click (M2 on) — executes here and nowhere
 /// else. The keystroke branch in `run_tui` is a thin `KeyEvent -> Option<
@@ -10993,23 +11021,13 @@ fn dispatch_action(
                                 // `SessionStart` hook fires — preserving
                                 // the orchestration readiness gate's
                                 // 10-second fallback (pre-M2.13 contract).
-                                for (i, (id, agent_id)) in
-                                    role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate()
-                                {
-                                    st.register_pane(id.clone());
-                                    let expects_agent_report =
-                                        crate::event::AgentType::from_command(Some(
-                                            &orch_config.roles[i].command,
-                                        ))
-                                        .is_some();
-                                    st.insert_placeholder_session_awaiting_report(
-                                        id.clone(),
-                                        Some(dir_str.clone()),
-                                        None,
-                                        agent_id.clone(),
-                                        expects_agent_report,
-                                    );
-                                }
+                                insert_role_placeholder_sessions(
+                                    &mut st,
+                                    &role_pane_ids,
+                                    &role_agent_ids,
+                                    &orch_config.roles,
+                                    &dir_str,
+                                );
                                 // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
                                 for (i, role) in orch_config.roles.iter().enumerate() {
                                     st.pane_role_map
@@ -13294,23 +13312,13 @@ pub fn run_tui(
                                     .collect();
                                 {
                                     let mut st = state.blocking_write();
-                                    for (i, (id, agent_id)) in
-                                        role_pane_ids.iter().zip(role_agent_ids.iter()).enumerate()
-                                    {
-                                        st.register_pane(id.clone());
-                                        let expects_agent_report =
-                                            crate::event::AgentType::from_command(Some(
-                                                &orch_config.roles[i].command,
-                                            ))
-                                            .is_some();
-                                        st.insert_placeholder_session_awaiting_report(
-                                            id.clone(),
-                                            Some(saved_pane.dir.clone()),
-                                            None,
-                                            agent_id.clone(),
-                                            expects_agent_report,
-                                        );
-                                    }
+                                    insert_role_placeholder_sessions(
+                                        &mut st,
+                                        &role_pane_ids,
+                                        &role_agent_ids,
+                                        &orch_config.roles,
+                                        &saved_pane.dir,
+                                    );
                                     for (i, role) in orch_config.roles.iter().enumerate() {
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
