@@ -3042,13 +3042,17 @@ mod tests {
         ));
 
         // The first confirmation window is the deterministic blocked retry.
-        // Rebind while it is waiting, before the 500ms retry is resolved.
+        // Rebind while it is waiting, before the retry is resolved. Issue
+        // #422 item 2 raised the first unconfirmed-retry delay to 10 s, so
+        // against this task's 3 s deadline the window is now deadline-capped
+        // to ~2.9 s rather than the pre-fix 500 ms — the outer wait below
+        // must stay comfortably above that.
         tokio::time::sleep(Duration::from_millis(100)).await;
         registry
             .close_agent(&original_id)
             .expect("close original target");
         let replacement_id = spawn_shell_target(&registry, PANE_ID);
-        tokio::time::timeout(Duration::from_secs(2), confirmation)
+        tokio::time::timeout(Duration::from_secs(4), confirmation)
             .await
             .expect("replacement must terminate confirmation task")
             .expect("confirmation task must not panic");
@@ -3370,7 +3374,11 @@ mod tests {
                 generation: None,
                 can_report_prompts: false,
                 codex_hook_trust_failed: false,
-                deadline: Instant::now() + Duration::from_secs(3),
+                // Issue #422 item 2: the late arm only becomes a write once the
+                // FIRST unconfirmed-retry window (now 10 s, up from 500 ms) has
+                // fully elapsed, so the deadline here must stay comfortably
+                // above that window rather than clamping it short.
+                deadline: Instant::now() + Duration::from_secs(15),
             },
         ));
         spawned_tx
@@ -3381,7 +3389,9 @@ mod tests {
                 EventType::SessionStart,
             )))
             .expect("send late native capability claim");
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        // Issue #422 item 2: must clear the new 10 s first-window delay before
+        // the arm-then-write can happen (was 750ms against the old 500ms window).
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
         let spawned_output = spawned_registry
             .snapshot(&spawned_agent)
             .expect("deck-spawned target snapshot");
@@ -3943,14 +3953,17 @@ mod tests {
                 generation: None,
                 can_report_prompts: true,
                 codex_hook_trust_failed: false,
-                deadline: Instant::now() + Duration::from_secs(3),
+                deadline: Instant::now() + Duration::from_secs(15),
             },
         ));
 
-        // Let the confirmation task install its first 500 ms watch timer before
-        // moving virtual time. After `advance`, the only await it can reach is
-        // the writer we still own, so the caller-side clock precheck has
-        // necessarily completed before this test records the user's input.
+        // Let the confirmation task install its first unconfirmed-retry watch
+        // timer (issue #422 item 2: 10 s) before moving virtual time. After
+        // `advance`, the only await it can reach is the writer we still own,
+        // so the caller-side clock precheck has necessarily completed before
+        // this test records the user's input. The deadline above must stay
+        // comfortably past that first watch window, or the advance below
+        // would jump past the deadline itself rather than just the window.
         tokio::task::yield_now().await;
         tokio::time::advance(unconfirmed_retry_delay(1) + Duration::from_millis(1)).await;
         for _ in 0..3 {
