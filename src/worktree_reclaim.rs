@@ -2727,10 +2727,7 @@ mod tests {
     #[test]
     fn decide_merged_clean_owned_removes() {
         let v = decide(
-            &PrState::Merged {
-                merge_sha: None,
-                merge_tree_sha: None,
-            },
+            &PrState::Merged { head_ref_oid: None },
             &Cleanliness::Clean,
             Ownership::Ours,
         );
@@ -2740,10 +2737,7 @@ mod tests {
     #[test]
     fn decide_merged_clean_foreign_asks() {
         let v = decide(
-            &PrState::Merged {
-                merge_sha: None,
-                merge_tree_sha: None,
-            },
+            &PrState::Merged { head_ref_oid: None },
             &Cleanliness::Clean,
             Ownership::Foreign,
         );
@@ -2753,18 +2747,12 @@ mod tests {
     #[test]
     fn decide_merged_dirty_keeps_regardless_of_ownership() {
         let owned = decide(
-            &PrState::Merged {
-                merge_sha: None,
-                merge_tree_sha: None,
-            },
+            &PrState::Merged { head_ref_oid: None },
             &Cleanliness::Dirty,
             Ownership::Ours,
         );
         let foreign = decide(
-            &PrState::Merged {
-                merge_sha: None,
-                merge_tree_sha: None,
-            },
+            &PrState::Merged { head_ref_oid: None },
             &Cleanliness::Dirty,
             Ownership::Foreign,
         );
@@ -2775,10 +2763,7 @@ mod tests {
     #[test]
     fn decide_merged_unresolvable_cleanliness_keeps_without_calling_it_dirty() {
         let v = decide(
-            &PrState::Merged {
-                merge_sha: None,
-                merge_tree_sha: None,
-            },
+            &PrState::Merged { head_ref_oid: None },
             &Cleanliness::Unresolvable("spawn failed".to_string()),
             Ownership::Ours,
         );
@@ -4947,47 +4932,24 @@ mod tests {
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Same shape as [`write_merged_gh_stub`], additionally answering BOTH
-    /// `gh pr list ...` (carrying `mergeCommit.oid` AND `number` -- the
-    /// commit-SHA field the pre-tightening M4c rule used, kept for realism/
-    /// logging, plus the PR number the graphql lookup below needs to
-    /// address a specific pull request) AND `gh api graphql -f query=...`
-    /// (carrying `mergeCommit.oid` again alongside `mergeCommit.tree.oid`,
-    /// the CONTENT-equality field the tightened rule actually compares --
-    /// fork#325 M4c tightening, auditor A8). `gh pr list --json`'s flat
-    /// field-selection interface cannot reach `tree.oid` at all (confirmed:
-    /// it exposes a fixed field set with no sub-selection into
-    /// `mergeCommit`), which is why this needs a second `gh` subcommand
-    /// rather than one more `--json` field on the first -- see the shape
-    /// this mirrors, confirmed live against a real merged PR:
-    /// `gh api graphql -f query='query{repository(owner:"OWNER",name:"NAME"){pullRequest(number:N){mergeCommit{oid tree{oid}}}}}'`
-    /// returning `{"data":{"repository":{"pullRequest":{"mergeCommit":{"oid":"...","tree":{"oid":"..."}}}}}}`.
-    /// The script branches on `$1`/`$2` only, exactly as
-    /// [`write_merged_gh_stub`]/[`write_merged_gh_stub_with_merge_sha`]
-    /// already did for `pr`/`list` -- it does not otherwise validate the
-    /// invocation's arguments (e.g. the graphql query text, or which PR
-    /// number `gh api graphql` was asked to address), matching the existing
-    /// stubs' own level of fidelity.
+    /// Same shape as [`write_merged_gh_stub`], additionally carrying
+    /// `headRefOid` -- the PR branch's own head commit SHA (fork#325 M4c
+    /// round 3 / PR #526 reviewer B2) -- in the `gh pr list --json` reply.
+    /// This is the ONLY field the redesigned eligibility check compares a
+    /// clone's own `git rev-parse HEAD` against: `gh pr list --json`
+    /// exposes `headRefOid` directly as a flat field, so no second `gh api
+    /// graphql` subcommand (the round-2 `mergeCommit.tree.oid` machinery
+    /// this replaces) is needed at all. The script branches on `$1`/`$2`
+    /// only, exactly as [`write_merged_gh_stub`] already did for `pr`/
+    /// `list` -- it does not otherwise validate the invocation's arguments,
+    /// matching that stub's own level of fidelity.
     #[cfg(unix)]
-    fn write_merged_gh_stub_with_merge_tree_sha(
-        bindir: &Path,
-        branch: &str,
-        pr_number: u64,
-        merge_commit_sha: &str,
-        merge_tree_sha: &str,
-    ) {
+    fn write_merged_gh_stub_with_head_ref_oid(bindir: &Path, branch: &str, head_ref_oid: &str) {
         use std::os::unix::fs::PermissionsExt;
         let gh_script = format!(
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    \
-             printf '%s\\n' '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}},\"mergeCommit\":{{\"oid\":\"{merge_commit_sha}\"}},\"number\":{pr_number}}}]'\n    \
-             exit 0\n\
-             fi\n\
-             if [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n    \
-             printf '%s\\n' '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"mergeCommit\":{{\"oid\":\"{merge_commit_sha}\",\"tree\":{{\"oid\":\"{merge_tree_sha}\"}}}}}}}}}}}}'\n    \
-             exit 0\n\
-             fi\n\
-             exit 1\n"
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}},\"headRefOid\":\"{head_ref_oid}\"}}]'\n    \
+             exit 0\nfi\nexit 1\n"
         );
         std::fs::create_dir_all(bindir).unwrap();
         let gh_path = bindir.join("gh");
@@ -5008,29 +4970,6 @@ mod tests {
         assert!(
             out.status.success(),
             "git rev-parse HEAD failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// `git rev-parse HEAD^{tree}` run inside `dir`, trimmed -- the
-    /// CONTENT-equality analogue of [`git_rev_parse_head`] above (fork#325
-    /// M4c tightening, auditor A8): resolves the tree object HEAD's commit
-    /// points at, the value the tightened rule compares against a merged
-    /// PR's `mergeCommit.tree.oid` instead of comparing commit SHAs, since a
-    /// squash-merge repo's commit SHAs essentially never match between a
-    /// clone still on its own work branch and the PR's own squash commit
-    /// (auditor A8) while their trees, once the work is genuinely merged and
-    /// nothing local remains, do.
-    fn git_rev_parse_head_tree(dir: &Path) -> String {
-        let out = std::process::Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "HEAD^{tree}"])
-            .output()
-            .expect("git rev-parse HEAD^{tree} must spawn");
-        assert!(
-            out.status.success(),
-            "git rev-parse HEAD^{{tree}} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -5936,26 +5875,27 @@ mod tests {
         );
     }
 
-    /// Scenario: fork issue #325 M4c TIGHTENED rule (auditor A1/A2/A3/A8 on
-    /// PR #526; the maintainer approved tightening rather than shipping or
-    /// reverting). An isolated clone that is OWNED (a real attach-lock
-    /// artifact, via the real `provision_isolated_clone_sync` provisioner --
-    /// auditor A2), CLEAN (no uncommitted/untracked content -- auditor A1),
-    /// has exactly one local branch matching its resolved branch with an
-    /// EMPTY `git stash list` (no local-only refs `remove_dir_all` could
-    /// destroy without a copy elsewhere -- auditor A3), and whose HEAD TREE
-    /// equals a merged PR's merge-commit TREE (content equality, not
-    /// commit-SHA equality -- auditor A8: on a squash-merge repo a genuine
-    /// clone's own commit SHA essentially never equals `mergeCommit.oid`)
-    /// must report as auto-reclaim-eligible. RED today on two fronts:
-    /// `isolated_clone_report` consults none of `has_attach_lock`,
-    /// `cleanliness`, or extraneous local refs at all (auditor A1/A2/A3),
-    /// and there is no tree-SHA machinery of any kind yet (auditor A8) --
-    /// only a bare HEAD-commit-SHA comparison the pre-tightening rule used.
+    /// Scenario: fork issue #325 M4c, PR #526 round 3 (reviewer B2). An
+    /// isolated clone that is OWNED (a real attach-lock artifact, via the
+    /// real `provision_isolated_clone_sync` provisioner), CLEAN (no
+    /// uncommitted/untracked content), has exactly one local branch
+    /// matching its resolved branch with an EMPTY `git stash list` (no
+    /// local-only refs `remove_dir_all` could destroy without a copy
+    /// elsewhere), and whose own `git rev-parse HEAD` equals the merged
+    /// PR's `headRefOid` exactly -- the PR branch's own head commit, not
+    /// the merge commit GitHub creates on the base branch -- must report
+    /// as auto-reclaim-eligible. Round 2's `mergeCommit`/tree-SHA
+    /// comparison is dropped entirely here: reviewer B2 measured against
+    /// this very repo that a deck-provisioned clone's HEAD is never equal
+    /// to `mergeCommit.oid` under any GitHub merge strategy (PR #481 head
+    /// `7339edd5f440` vs merge `1ceb919349ef`), so that comparison could
+    /// (almost) never fire in production -- `headRefOid` is exactly the
+    /// clone's own reachable commit history instead.
     #[spec("worktree/reclaim/062")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_062_owned_clean_single_branch_tree_match_reports_reclaim_eligible() {
+    fn worktree_reclaim_062_owned_clean_single_branch_head_ref_oid_match_reports_reclaim_eligible()
+    {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();
@@ -5985,18 +5925,15 @@ mod tests {
 
         // A fresh provisioned clone has exactly one local branch (the one
         // just checked out), a clean working tree, and no stash -- this
-        // fixture is the tightened rule's full positive case with no extra
+        // fixture is the redesigned rule's full positive case with no extra
         // setup needed for the ownership/cleanliness/extraneous-refs gates.
         let clone_head_sha = git_rev_parse_head(&clone_dir);
-        let clone_tree_sha = git_rev_parse_head_tree(&clone_dir);
 
         let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
+        write_merged_gh_stub_with_head_ref_oid(
             &bindir,
             "tightened-positive-branch",
-            2001,
             &clone_head_sha,
-            &clone_tree_sha,
         );
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
@@ -6009,44 +5946,42 @@ mod tests {
         assert_eq!(
             clone_report.verdict.as_str(),
             "isolated_clone_reclaimable",
-            "an owned, clean isolated clone with a single local branch, no stash, and a HEAD \
-             tree SHA equal to the merged PR's merge-commit TREE SHA must report as \
-             auto-reclaim-eligible (fork#325 M4c tightened rule, auditor A1/A2/A3/A8) -- got \
-             verdict {:?} (reason: {:?})",
+            "an owned, clean isolated clone with a single local branch, no stash, and its own \
+             HEAD commit SHA equal to the merged PR's headRefOid must report as \
+             auto-reclaim-eligible (fork#325 M4c, PR #526 round 3, reviewer B2) -- got verdict \
+             {:?} (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
         );
     }
 
-    /// Scenario: fork issue #325 M4c tightening (auditor A3, the same
-    /// content-equality gate `worktree/reclaim/062` proves positively).
-    /// An isolated clone that is owned, clean, and carries no extraneous
-    /// local refs -- otherwise a full match against the tightened rule --
-    /// but whose CURRENT HEAD TREE has diverged from the merged PR's
-    /// merge-commit TREE (an extra local commit made after the point the
-    /// PR merged) must stay exactly as conservative as `"isolated_clone"`.
-    /// Pins the same shape the pre-tightening rule's own `063` already had
-    /// to hold (a diverged clone must never widen past the conservative
-    /// default), now built through the real provisioner so THIS test
-    /// isolates the content-equality gate from the ownership/cleanliness/
+    /// Scenario: fork issue #325 M4c, PR #526 round 3 (reviewer B2, the
+    /// same headRefOid gate `worktree/reclaim/062` proves positively). An
+    /// isolated clone that is owned, clean, and carries no extraneous
+    /// local refs -- otherwise a full match against the redesigned rule --
+    /// but whose CURRENT HEAD commit has diverged from the merged PR's
+    /// `headRefOid` (an extra local commit made after the point the PR
+    /// merged) must stay exactly as conservative as `"isolated_clone"`.
+    /// Built through the real provisioner so this isolates the
+    /// headRefOid-equality gate from the ownership/cleanliness/
     /// extraneous-refs gates `worktree_reclaim_064`-`067` each cover on
     /// their own.
     #[spec("worktree/reclaim/063")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_063_tree_diverged_from_merge_commit_tree_stays_conservative() {
+    fn worktree_reclaim_063_head_commit_diverged_from_pr_head_ref_oid_stays_conservative() {
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         init_repo_with_origin(&repo);
 
-        let clone_dir = scratch.path().join("repo-isolated-tree-diverged");
-        let creator = "issue-dispatch:tree-diverged#2002";
+        let clone_dir = scratch.path().join("repo-isolated-head-diverged");
+        let creator = "issue-dispatch:head-diverged#2002";
         let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
             &repo,
             &clone_dir,
-            "tree-diverged-branch",
+            "head-diverged-branch",
             creator,
         )
         .expect("provision_isolated_clone_sync must succeed against a real source repo");
@@ -6062,19 +5997,17 @@ mod tests {
              got {outcome:?}"
         );
 
-        // The merged PR's merge-commit SHA/tree are the clone's HEAD/tree
-        // right after provisioning -- captured BEFORE the extra local
-        // commit below, so the fixture genuinely diverges from both
-        // afterward.
-        let merge_commit_sha = git_rev_parse_head(&clone_dir);
-        let merge_tree_sha = git_rev_parse_head_tree(&clone_dir);
+        // The merged PR's headRefOid is the clone's own HEAD right after
+        // provisioning -- captured BEFORE the extra local commit below, so
+        // the fixture genuinely diverges from it afterward.
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
 
-        // An extra local commit made after the merge -- HEAD (and its tree)
-        // now point past the merge point, the exact "diverged" shape the
-        // tightened rule must not treat as eligible. Still clean (`git
-        // status --porcelain` is empty for a committed change) and still a
-        // single local branch with no stash, so this isolates the
-        // content-equality gate from the other three.
+        // An extra local commit made after the merge -- HEAD now points
+        // past the merge point, the exact "diverged" shape the redesigned
+        // rule must not treat as eligible. Still clean (`git status
+        // --porcelain` is empty for a committed change) and still a single
+        // local branch with no stash, so this isolates the headRefOid-
+        // equality gate from the other three.
         //
         // `git clone` does not inherit the source's local `user.email`/
         // `user.name` (those are per-repo config in `init_repo_with_origin`,
@@ -6125,13 +6058,7 @@ mod tests {
         );
 
         let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
-            &bindir,
-            "tree-diverged-branch",
-            2002,
-            &merge_commit_sha,
-            &merge_tree_sha,
-        );
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "head-diverged-branch", &head_ref_oid);
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -6143,10 +6070,10 @@ mod tests {
         assert_eq!(
             clone_report.verdict.as_str(),
             "isolated_clone",
-            "an owned, clean isolated clone with no extraneous local refs, but whose HEAD tree \
-             has diverged past the merged PR's merge-commit tree, must stay exactly as \
+            "an owned, clean isolated clone with no extraneous local refs, but whose HEAD \
+             commit has diverged past the merged PR's headRefOid, must stay exactly as \
              conservative as worktree_reclaim_052 -- never an automatic-removal verdict, and \
-             never the tightened M4c reclaim-eligible verdict either -- got {:?} \
+             never the redesigned M4c reclaim-eligible verdict either -- got {:?} \
              (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
@@ -6158,7 +6085,7 @@ mod tests {
             .expect("run_reclaim must succeed against a real git repo");
         assert!(
             !bare.removed.iter().any(|r| r.real_path == clone_dir),
-            "a bare `worktree reclaim` must never remove a tree-diverged isolated clone, got \
+            "a bare `worktree reclaim` must never remove a head-diverged isolated clone, got \
              removed: {:?}",
             bare.removed
                 .iter()
@@ -6167,7 +6094,7 @@ mod tests {
         );
         assert!(
             clone_dir.exists(),
-            "the tree-diverged isolated clone directory must still exist on disk after a bare \
+            "the head-diverged isolated clone directory must still exist on disk after a bare \
              reclaim"
         );
 
@@ -6175,7 +6102,7 @@ mod tests {
             .expect("run_reclaim must succeed against a real git repo");
         assert!(
             !confirmed.removed.iter().any(|r| r.real_path == clone_dir),
-            "`worktree reclaim --yes` must never remove a tree-diverged isolated clone either, \
+            "`worktree reclaim --yes` must never remove a head-diverged isolated clone either, \
              got removed: {:?}",
             confirmed
                 .removed
@@ -6185,21 +6112,21 @@ mod tests {
         );
         assert!(
             clone_dir.exists(),
-            "the tree-diverged isolated clone directory must still exist on disk after \
+            "the head-diverged isolated clone directory must still exist on disk after \
              `reclaim --yes`"
         );
     }
 
-    /// Scenario: fork issue #325 M4c tightening, auditor A1 -- an isolated
-    /// clone that is owned, has a single local branch matching its resolved
-    /// branch, no stash entries, and a HEAD tree equal to the merged PR's
-    /// merge-commit tree -- otherwise a full match against the tightened
+    /// Scenario: fork issue #325 M4c, PR #526 round 3 -- an isolated clone
+    /// that is owned, has a single local branch matching its resolved
+    /// branch, no stash entries, and a HEAD commit equal to the merged
+    /// PR's headRefOid -- otherwise a full match against the redesigned
     /// rule -- but carries an UNCOMMITTED change must stay exactly as
     /// conservative as `"isolated_clone"`, never the reclaim-eligible
     /// verdict. `remove_dir_all` has no equivalent of `git worktree
     /// remove`'s own refusal against a dirty tree, so eligibility itself
     /// must consult cleanliness rather than leaving it a display-only
-    /// field, as it was before this tightening.
+    /// field.
     #[spec("worktree/reclaim/064")]
     #[test]
     #[cfg(unix)]
@@ -6231,22 +6158,15 @@ mod tests {
              got {outcome:?}"
         );
 
-        let merge_commit_sha = git_rev_parse_head(&clone_dir);
-        let merge_tree_sha = git_rev_parse_head_tree(&clone_dir);
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
 
-        // Uncommitted, untracked content -- captured AFTER the SHA/tree the
-        // merge-commit stub below claims to match, so this isolates the
-        // cleanliness gate (A1) from the content-equality gate.
+        // Uncommitted, untracked content -- captured AFTER the SHA the
+        // headRefOid stub below claims to match, so this isolates the
+        // cleanliness gate from the headRefOid-equality gate.
         std::fs::write(clone_dir.join("uncommitted.txt"), "dirty work\n").unwrap();
 
         let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
-            &bindir,
-            "dirty-branch",
-            2003,
-            &merge_commit_sha,
-            &merge_tree_sha,
-        );
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "dirty-branch", &head_ref_oid);
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -6264,21 +6184,20 @@ mod tests {
         assert_eq!(
             clone_report.verdict.as_str(),
             "isolated_clone",
-            "an owned isolated clone with a matching HEAD tree, a single local branch, and no \
-             stash, but an UNCOMMITTED change, must never report the tightened M4c \
+            "an owned isolated clone with a matching HEAD commit, a single local branch, and no \
+             stash, but an UNCOMMITTED change, must never report the redesigned M4c \
              reclaim-eligible verdict -- `remove_dir_all` has no equivalent of `git worktree \
-             remove`'s own refusal against a dirty tree (fork#325 M4c tightening, auditor A1) \
-             -- got {:?} (reason: {:?})",
+             remove`'s own refusal against a dirty tree -- got {:?} (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
         );
     }
 
-    /// Scenario: fork issue #325 M4c tightening, auditor A2 -- the
+    /// Scenario: fork issue #325 M4c, PR #526 round 3 -- the
     /// security-relevant case. An isolated clone that LOOKS otherwise fully
     /// eligible -- a genuine `git clone`, a single local branch matching
-    /// its resolved branch, clean, no stash, and a HEAD tree equal to the
-    /// merged PR's merge-commit tree -- but carries NO deck attach-lock
+    /// its resolved branch, clean, no stash, and a HEAD commit equal to
+    /// the merged PR's headRefOid -- but carries NO deck attach-lock
     /// provenance artifact (the exact M4b forgery shape
     /// `worktree_reclaim_054` already pins for the DISPLAY `owned` field,
     /// now asserted against the DELETION decision instead) must stay
@@ -6309,17 +6228,10 @@ mod tests {
         mark_worktree_owned(&clone_dir, "issue-dispatch:unowned#2004")
             .expect("mark_worktree_owned must succeed");
 
-        let merge_commit_sha = git_rev_parse_head(&clone_dir);
-        let merge_tree_sha = git_rev_parse_head_tree(&clone_dir);
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
 
         let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
-            &bindir,
-            "main",
-            2004,
-            &merge_commit_sha,
-            &merge_tree_sha,
-        );
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "main", &head_ref_oid);
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -6338,23 +6250,21 @@ mod tests {
             clone_report.verdict.as_str(),
             "isolated_clone",
             "a clean, single-branch, content-matching isolated clone that carries NO deck \
-             attach-lock provenance artifact must never report the tightened M4c \
+             attach-lock provenance artifact must never report the redesigned M4c \
              reclaim-eligible verdict -- eligibility must never rest entirely on evidence the \
-             candidate directory itself controls (fork#325 M4c tightening, auditor A2) -- got \
-             {:?} (reason: {:?})",
+             candidate directory itself controls -- got {:?} (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
         );
     }
 
-    /// Scenario: fork issue #325 M4c tightening, auditor A3 -- an isolated
+    /// Scenario: fork issue #325 M4c, PR #526 round 3 -- an isolated
     /// clone that is owned, clean, content-matching, and carries no stash,
     /// but has a SECOND local branch beyond the one it resolved/checked
     /// out, must stay exactly as conservative as `"isolated_clone"`. `git
-    /// rev-parse HEAD`/its tree proves ONE ref is safe to discard;
-    /// `remove_dir_all` destroys the WHOLE clone, including every other
-    /// local branch -- a second branch may hold commits with no copy
-    /// anywhere else.
+    /// rev-parse HEAD` proves ONE ref is safe to discard; `remove_dir_all`
+    /// destroys the WHOLE clone, including every other local branch -- a
+    /// second branch may hold commits with no copy anywhere else.
     #[spec("worktree/reclaim/066")]
     #[test]
     #[cfg(unix)]
@@ -6386,8 +6296,7 @@ mod tests {
              got {outcome:?}"
         );
 
-        let merge_commit_sha = git_rev_parse_head(&clone_dir);
-        let merge_tree_sha = git_rev_parse_head_tree(&clone_dir);
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
 
         // A second local branch, never checked out -- HEAD stays on
         // `extra-branch-main`, the working tree stays clean, but the clone
@@ -6405,13 +6314,7 @@ mod tests {
         );
 
         let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
-            &bindir,
-            "extra-branch-main",
-            2005,
-            &merge_commit_sha,
-            &merge_tree_sha,
-        );
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "extra-branch-main", &head_ref_oid);
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -6424,21 +6327,21 @@ mod tests {
             clone_report.verdict.as_str(),
             "isolated_clone",
             "an owned, clean, content-matching isolated clone carrying a SECOND local branch \
-             must never report the tightened M4c reclaim-eligible verdict -- HEAD-equality \
-             proves one ref safe, never the whole clone `remove_dir_all` would destroy \
-             (fork#325 M4c tightening, auditor A3) -- got {:?} (reason: {:?})",
+             must never report the redesigned M4c reclaim-eligible verdict -- HEAD-equality \
+             proves one ref safe, never the whole clone `remove_dir_all` would destroy -- got \
+             {:?} (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
         );
     }
 
-    /// Scenario: fork issue #325 M4c tightening, auditor A3's other half --
-    /// an isolated clone that is owned, clean (a stash push leaves the
-    /// working tree exactly as committed), content-matching, and has
-    /// exactly one local branch, but carries a NON-EMPTY `git stash list`,
-    /// must stay exactly as conservative as `"isolated_clone"`. A stash
-    /// entry is local-only content `remove_dir_all` would destroy with no
-    /// copy anywhere else -- the same hazard as an extra branch
+    /// Scenario: fork issue #325 M4c, PR #526 round 3 -- an isolated
+    /// clone that is owned, clean (a stash push leaves the working tree
+    /// exactly as committed), content-matching, and has exactly one local
+    /// branch, but carries a NON-EMPTY `git stash list`, must stay
+    /// exactly as conservative as `"isolated_clone"`. A stash entry is
+    /// local-only content `remove_dir_all` would destroy with no copy
+    /// anywhere else -- the same hazard as an extra branch
     /// (`worktree_reclaim_066`), through git's other local-only ref
     /// namespace.
     #[spec("worktree/reclaim/067")]
@@ -6472,8 +6375,7 @@ mod tests {
              got {outcome:?}"
         );
 
-        let merge_commit_sha = git_rev_parse_head(&clone_dir);
-        let merge_tree_sha = git_rev_parse_head_tree(&clone_dir);
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
 
         // `git stash` builds a commit object, which needs its own identity
         // -- `git clone` never inherits the source's local `user.email`/
@@ -6516,13 +6418,7 @@ mod tests {
         );
 
         let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
-            &bindir,
-            "stash-branch",
-            2006,
-            &merge_commit_sha,
-            &merge_tree_sha,
-        );
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "stash-branch", &head_ref_oid);
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -6541,44 +6437,48 @@ mod tests {
             clone_report.verdict.as_str(),
             "isolated_clone",
             "an owned, clean, content-matching, single-branch isolated clone carrying a \
-             NON-EMPTY `git stash list` must never report the tightened M4c reclaim-eligible \
+             NON-EMPTY `git stash list` must never report the redesigned M4c reclaim-eligible \
              verdict -- a stash entry is local-only content `remove_dir_all` would destroy \
-             with no copy anywhere else (fork#325 M4c tightening, auditor A3) -- got {:?} \
-             (reason: {:?})",
+             with no copy anywhere else -- got {:?} (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
         );
     }
 
-    /// Scenario: fork issue #325 M4c tightening, auditor A8 -- the case
-    /// that PROVES the fix rather than merely adding a gate. On a
-    /// squash-merge repo, a genuine isolated clone's own commit SHA
-    /// essentially never equals the PR's `mergeCommit.oid` (GitHub's
-    /// squash merge creates a brand-new commit object, not a
-    /// fast-forward) -- so the PRE-tightening, commit-SHA-only rule was
-    /// inert for exactly the real clones this milestone exists to
-    /// reclaim, while a planted candidate could satisfy it trivially with
-    /// one `git checkout`. An owned, clean, single-branch, no-stash clone
-    /// whose commit SHA does NOT equal the (simulated) squash-merge
-    /// commit's SHA, but whose TREE SHA DOES equal that merge commit's
-    /// tree SHA, must report the tightened reclaim-eligible verdict.
+    /// Scenario: fork issue #325 M4c, PR #526 round 3, reviewer B2 -- the
+    /// case that PROVES the fix rather than merely adding a gate. Reviewer
+    /// B2 measured live against this very repo that `gh pr list`'s
+    /// `mergeCommit.oid` -- the commit GitHub's merge creates ON THE BASE
+    /// BRANCH -- is never equal to a PR branch's own tip under any GitHub
+    /// merge strategy (PR #481 head `7339edd5f440` vs merge
+    /// `1ceb919349ef`; PR #477 head `11d6327f2421` vs merge
+    /// `5742ad1f93dd`), which is why round 2's rule (comparing against
+    /// that field's tree) could almost never fire for a genuine
+    /// deck-provisioned clone. This fixture's `gh` stub carries a
+    /// `headRefOid` that matches the clone's own HEAD commit AND a
+    /// mismatched decoy `mergeCommit.oid` alongside it, even though the
+    /// redesigned `gh pr list --json` call no longer requests that field
+    /// -- proving eligibility is decided from `headRefOid` and would stay
+    /// correct even if a raw `gh` response happened to carry other,
+    /// unrelated-and-differing commit data alongside it.
     #[spec("worktree/reclaim/068")]
     #[test]
     #[cfg(unix)]
-    fn worktree_reclaim_068_tree_match_despite_squash_merge_commit_sha_mismatch_reports_reclaim_eligible()
-     {
+    fn worktree_reclaim_068_head_ref_oid_match_survives_a_mismatched_decoy_merge_commit_field() {
+        use std::os::unix::fs::PermissionsExt;
+
         let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         init_repo_with_origin(&repo);
 
-        let clone_dir = scratch.path().join("repo-isolated-squash-merge");
-        let creator = "issue-dispatch:squash-merge#2007";
+        let clone_dir = scratch.path().join("repo-isolated-decoy-merge-commit");
+        let creator = "issue-dispatch:decoy-merge-commit#2007";
         let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
             &repo,
             &clone_dir,
-            "squash-merge-branch",
+            "decoy-merge-commit-branch",
             creator,
         )
         .expect("provision_isolated_clone_sync must succeed against a real source repo");
@@ -6594,34 +6494,33 @@ mod tests {
              got {outcome:?}"
         );
 
-        let clone_head_sha = git_rev_parse_head(&clone_dir);
-        let clone_tree_sha = git_rev_parse_head_tree(&clone_dir);
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
 
-        // Simulates a real GitHub squash merge: a brand-new commit object
-        // whose SHA the clone's own HEAD (still on its own work branch)
-        // will never equal, but whose TREE is content-identical to the
-        // clone's -- the exact shape a genuinely-merged, nothing-local-
-        // remains clone produces on a squash-merge repo (auditor A8's own
-        // measurement against this repo's real merged PRs: `headRefOid`
-        // never equals `mergeCommit.oid`). Reversing the real SHA keeps it
+        // A decoy `mergeCommit.oid` that deliberately does NOT match the
+        // clone's own HEAD -- reviewer B2's own live measurement shows real
+        // `gh` always returns a `mergeCommit` for a MERGED PR, and never one
+        // equal to the PR branch's own tip. Reversing the real SHA keeps it
         // a plausible-looking 40-char hex string while guaranteeing it
-        // differs from `clone_head_sha` (not merely by construction --
+        // differs from `head_ref_oid` (not merely by construction --
         // asserted below).
-        let fake_squash_merge_commit_sha: String = clone_head_sha.chars().rev().collect();
+        let decoy_merge_commit_sha: String = head_ref_oid.chars().rev().collect();
         assert_ne!(
-            fake_squash_merge_commit_sha, clone_head_sha,
-            "sanity: the simulated squash-merge commit SHA must actually differ from the \
-             clone's own HEAD SHA, or this test would not be exercising the A8 gap at all"
+            decoy_merge_commit_sha, head_ref_oid,
+            "sanity: the decoy mergeCommit SHA must actually differ from the clone's own HEAD, \
+             or this test would not be exercising the B2 regression at all"
         );
 
-        let bindir = scratch.path().join("bin");
-        write_merged_gh_stub_with_merge_tree_sha(
-            &bindir,
-            "squash-merge-branch",
-            2007,
-            &fake_squash_merge_commit_sha,
-            &clone_tree_sha,
+        let branch = "decoy-merge-commit-branch";
+        let gh_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n    printf '%s\\n' \
+             '[{{\"state\":\"MERGED\",\"headRefName\":\"{branch}\",\"headRepositoryOwner\":{{\"login\":\"test-org\"}},\"headRefOid\":\"{head_ref_oid}\",\"mergeCommit\":{{\"oid\":\"{decoy_merge_commit_sha}\"}}}}]'\n    \
+             exit 0\nfi\nexit 1\n"
         );
+        let bindir = scratch.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let gh_path = bindir.join("gh");
+        std::fs::write(&gh_path, gh_script).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path_guard = PathEnvGuard::prepend(&bindir);
 
         let reports = examine_worktrees(&repo).expect("examine_worktrees must succeed");
@@ -6633,14 +6532,218 @@ mod tests {
         assert_eq!(
             clone_report.verdict.as_str(),
             "isolated_clone_reclaimable",
-            "an owned, clean, single-branch, no-stash isolated clone whose commit SHA does \
-             NOT equal the merged PR's merge-commit SHA (the squash-merge shape) but whose \
-             TREE SHA DOES equal the merge commit's tree SHA must still report the tightened \
-             M4c reclaim-eligible verdict -- content equality, not commit-SHA equality, is \
-             what proves nothing local remains (fork#325 M4c tightening, auditor A8) -- got \
-             {:?} (reason: {:?})",
+            "an owned, clean, single-branch, no-stash isolated clone whose HEAD commit equals \
+             the merged PR's headRefOid must report the redesigned M4c reclaim-eligible \
+             verdict even when gh's raw response also carries a mismatched mergeCommit.oid -- \
+             proving eligibility is decided from headRefOid, never mergeCommit (fork#325 M4c, \
+             PR #526 round 3, reviewer B2) -- got {:?} (reason: {:?})",
             clone_report.verdict,
             clone_report.reason
+        );
+    }
+
+    /// Scenario: fork issue #325 M4c, PR #526 round 3, reviewer H1 -- the
+    /// new deletion primitive (`remove_isolated_clone_dir`) had zero test
+    /// coverage; neither new `run_reclaim` arm was exercised. A genuinely
+    /// eligible isolated clone (owned, clean, single-branch, no stash,
+    /// HEAD commit equal to the merged PR's headRefOid) run through
+    /// `worktree reclaim --yes` must actually be removed from disk -- not
+    /// merely reported as removed -- and the returned `ReclaimOutcome`
+    /// must record it under `removed` with `removed_by` set to the
+    /// caller-supplied remover identity.
+    #[spec("worktree/reclaim/069")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_069_yes_actually_removes_an_eligible_isolated_clone_from_disk() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-yes-removes");
+        let creator = "issue-dispatch:yes-removes#2008";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "yes-removes-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "yes-removes-branch", &head_ref_oid);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let remover = "test-remover";
+        let outcome = run_reclaim(&repo, true, remover)
+            .expect("run_reclaim must succeed against a real git repo");
+
+        assert!(
+            outcome.removed.iter().any(|r| r.real_path == clone_dir),
+            "an eligible isolated clone run through `worktree reclaim --yes` must be reported \
+             under `removed`, got removed={:?} pending={:?} kept={:?}",
+            outcome
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .pending
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .kept
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        let removed_report = outcome
+            .removed
+            .iter()
+            .find(|r| r.real_path == clone_dir)
+            .unwrap();
+        assert_eq!(
+            removed_report.removed_by.as_deref(),
+            Some(remover),
+            "the removed isolated clone's report must record who ran the reclaim, got {:?}",
+            removed_report.removed_by
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the isolated clone directory must actually be gone from disk after \
+             `worktree reclaim --yes`, not merely reported as removed"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4c, PR #526 round 3, reviewer H1 -- the
+    /// bare-run half of the same coverage gap `worktree/reclaim/069` closes
+    /// for `--yes`. A genuinely eligible isolated clone run through a BARE
+    /// `worktree reclaim` (no `--yes`) must be left on disk untouched and
+    /// reported under `pending`, never under `removed` -- eligibility alone
+    /// is not consent; the isolated-clone path is gated on `--yes` exactly
+    /// like an ordinary foreign worktree's `Ask` verdict is.
+    #[spec("worktree/reclaim/070")]
+    #[test]
+    #[cfg(unix)]
+    fn worktree_reclaim_070_bare_reclaim_leaves_an_eligible_isolated_clone_pending() {
+        let _lock = GH_PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("repo");
+        init_repo_with_origin(&repo);
+
+        let clone_dir = scratch.path().join("repo-isolated-bare-pending");
+        let creator = "issue-dispatch:bare-pending#2009";
+        let outcome = crate::issue_dispatch_run::provision_isolated_clone_sync(
+            &repo,
+            &clone_dir,
+            "bare-pending-branch",
+            creator,
+        )
+        .expect("provision_isolated_clone_sync must succeed against a real source repo");
+        assert!(
+            matches!(
+                outcome,
+                crate::issue_dispatch_run::IsolatedCloneOutcome::Created {
+                    marker_warning: None,
+                    ..
+                }
+            ),
+            "the real provisioner must succeed and write the ownership marker with no warning, \
+             got {outcome:?}"
+        );
+
+        let head_ref_oid = git_rev_parse_head(&clone_dir);
+        let bindir = scratch.path().join("bin");
+        write_merged_gh_stub_with_head_ref_oid(&bindir, "bare-pending-branch", &head_ref_oid);
+        let _path_guard = PathEnvGuard::prepend(&bindir);
+
+        let outcome = run_reclaim(&repo, false, "test-remover")
+            .expect("run_reclaim must succeed against a real git repo");
+
+        assert!(
+            !outcome.removed.iter().any(|r| r.real_path == clone_dir),
+            "a bare `worktree reclaim` (no --yes) must never remove an eligible isolated \
+             clone, got removed={:?}",
+            outcome
+                .removed
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome.pending.iter().any(|r| r.real_path == clone_dir),
+            "an eligible isolated clone left untouched by a bare reclaim must be reported \
+             under `pending`, got pending={:?} kept={:?}",
+            outcome
+                .pending
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>(),
+            outcome
+                .kept
+                .iter()
+                .map(|r| &r.real_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            clone_dir.exists(),
+            "the isolated clone directory must still exist on disk after a bare reclaim"
+        );
+    }
+
+    /// Scenario: fork issue #325 M4c, PR #526 round 3, reviewer M1/H1 --
+    /// `remove_isolated_clone_dir`'s own last-moment structural check,
+    /// exercised directly rather than through `run_reclaim`. When the path
+    /// it is asked to delete no longer has a `.git` DIRECTORY at removal
+    /// time (simulating the TOCTOU window reviewer M1 flagged between
+    /// `examine_worktrees`' examination pass and the actual delete -- here
+    /// reproduced by a `.git` FILE, the shape of a linked worktree's
+    /// admin-dir redirect, not a plain clone's own repository), the
+    /// function must refuse rather than delete: it returns an `Err`, and
+    /// the directory (including its other contents) is left untouched.
+    #[spec("worktree/reclaim/071")]
+    #[test]
+    fn worktree_reclaim_071_remove_isolated_clone_dir_refuses_when_git_is_not_a_directory() {
+        let scratch = tempfile::tempdir().unwrap();
+        let clone_dir = scratch.path().join("no-longer-a-clone");
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        // A `.git` FILE (a linked worktree's own admin-dir redirect shape),
+        // not a `.git` DIRECTORY (an isolated clone's own repository) --
+        // exactly what `remove_isolated_clone_dir`'s own check requires
+        // immediately before deleting.
+        std::fs::write(clone_dir.join(".git"), b"gitdir: /elsewhere\n").unwrap();
+        std::fs::write(clone_dir.join("some-file.txt"), b"still here\n").unwrap();
+
+        let result = remove_isolated_clone_dir(&clone_dir, "test-remover");
+
+        assert!(
+            result.is_err(),
+            "remove_isolated_clone_dir must refuse when `.git` is no longer a directory at \
+             removal time, got {result:?}"
+        );
+        assert!(
+            clone_dir.exists(),
+            "the directory must be left on disk when the refusal fires, not partially or \
+             fully removed"
+        );
+        assert!(
+            clone_dir.join("some-file.txt").exists(),
+            "the refusal must not touch the directory's other contents"
         );
     }
 }
