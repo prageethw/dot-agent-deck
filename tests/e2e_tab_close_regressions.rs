@@ -214,6 +214,8 @@ async fn handle_connection(
                 cols,
                 live: None,
                 spawned_at_ms: None,
+                daemon_boot_id: None,
+                registration_generation: None,
                 cli_name: None,
                 crashed: None,
             });
@@ -301,6 +303,8 @@ fn mode_record(fixture: &str, mode: &str, agent_id: &str, pane_id: &str) -> Agen
         cols: 80,
         live: None,
         spawned_at_ms: None,
+        daemon_boot_id: None,
+        registration_generation: None,
         cli_name: None,
         crashed: None,
     }

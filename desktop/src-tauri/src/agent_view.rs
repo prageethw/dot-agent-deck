@@ -436,6 +436,8 @@ mod tests {
             cols: 120,
             live: None,
             spawned_at_ms: Some(1_700_000_000_000),
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         }

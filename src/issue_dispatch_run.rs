@@ -5114,6 +5114,8 @@ exit 0
             // PRD #745 M11: likewise no spawn instant — this fixture builds a
             // record by hand rather than by spawning anything.
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         }

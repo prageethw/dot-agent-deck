@@ -1295,6 +1295,8 @@ impl DaemonClient {
                     // predates the field, so it reported no spawn time and none may
                     // be invented for it. Absence renders as nothing.
                     spawned_at_ms: None,
+                    daemon_boot_id: None,
+                    registration_generation: None,
                     // Issue #856: and no binary name. This daemon reported only
                     // ids, so it vouched for no command — and a client that
                     // filled one in from its own table would be reinstating the
@@ -3446,6 +3448,8 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         };
@@ -3509,6 +3513,8 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         };
@@ -3535,6 +3541,8 @@ mod tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         };

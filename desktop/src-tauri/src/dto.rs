@@ -2090,6 +2090,8 @@ mod tests {
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
             // Codex, and `codex` is what a codex daemon resolves.
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: Some("codex".into()),
             crashed: None,
         }

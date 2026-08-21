@@ -2673,6 +2673,27 @@ pub struct AgentRecord {
     /// basis `live` and `last_activity_ms` were added on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at_ms: Option<i64>,
+    /// Fork issue #513: this daemon's `AppState::daemon_boot_id`, joined in by
+    /// the `ListAgents` handler the same way `live` above is — the registry
+    /// itself has no notion of a boot id, so this is `None` here and always
+    /// `Some` by the time a `ListAgents` reply leaves the handler. Lets an
+    /// out-of-process caller (e.g. an L2 test's own `work-done` subprocess,
+    /// which cannot see a spawned pane's `DOT_AGENT_DECK_DAEMON_BOOT_ID` env
+    /// var) construct a legitimate `WorkDoneSignal` for a specific pane
+    /// without guessing it. Same-uid-gated like every other `ListAgents`
+    /// field: a caller with socket access to issue this query already has
+    /// the access needed to attempt a forged `work-done` signal, so exposing
+    /// this grants no new privilege. `skip_serializing_if` keeps the wire
+    /// shape backwards-compatible with daemons predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_boot_id: Option<String>,
+    /// Fork issue #513: sibling to `daemon_boot_id` above — this pane's
+    /// current `AppState::pane_registration_generation` entry, joined in by
+    /// the `ListAgents` handler from `pane_id_env`. `None` when the pane was
+    /// never registered as an orchestration role (no entry exists), or when
+    /// no live session/registry access is available (dummy-state test path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_generation: Option<u64>,
     /// Issue #856: the binary name for the agent this record reports — the
     /// command a user could type — resolved from the **daemon's** copy of
     /// [`crate::agent_registry`].
@@ -7868,6 +7889,8 @@ impl AgentPtyRegistry {
             live: None,
             // PRD #745 M11: absent unless THIS registry forked the child.
             spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+            daemon_boot_id: None,
+            registration_generation: None,
             // Issue #856: stamped at the wire boundary by `attach_cli_names`,
             // after the live join — the registry has no live session here, so
             // resolving it now would read a narrower identity than the reply
@@ -8171,6 +8194,12 @@ impl AgentPtyRegistry {
                 // filter above is what keeps a spawn instant from outliving the
                 // process it describes and ticking up as a phantom uptime.
                 spawned_at_ms: agent.spawned_at.map(|at| at.timestamp_millis()),
+                // Fork issue #513: same reasoning as `live` above — the
+                // registry has no notion of a daemon boot id or a pane's
+                // registration generation; the `ListAgents` handler joins
+                // both in from `AppState`.
+                daemon_boot_id: None,
+                registration_generation: None,
                 // Issue #856: stamped by `attach_cli_names` at the wire
                 // boundary, after the `ListAgents` handler's live join. See
                 // `AgentRecord::cli_name`.
@@ -13049,6 +13078,8 @@ mod spawn_tests {
                 model: None,
             }),
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         }
@@ -13133,6 +13164,8 @@ mod spawn_tests {
             cols: 40,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         };
@@ -13714,6 +13747,8 @@ mod spawn_tests {
             cols: 0,
             live: None,
             spawned_at_ms: None,
+            daemon_boot_id: None,
+            registration_generation: None,
             cli_name: None,
             crashed: None,
         };
